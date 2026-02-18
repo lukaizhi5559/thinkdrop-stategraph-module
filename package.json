@@ -1,0 +1,22 @@
+{
+  "name": "@thinkdrop/stategraph",
+  "version": "1.0.0",
+  "description": "Standalone StateGraph workflow orchestration with progressive MCP integration",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node test/intent-classifier.test.js",
+    "test:full": "node test/full-stategraph.test.js"
+  },
+  "keywords": [
+    "workflow",
+    "orchestration",
+    "stategraph",
+    "intent-classification",
+    "mcp"
+  ],
+  "author": "ThinkDrop AI",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
