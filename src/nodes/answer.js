@@ -139,7 +139,7 @@ module.exports = async function answer(state) {
   } else if (intentType === 'command_execute' || intentType === 'command_guide') {
     systemInstructions += '\n- Interpret the command output as human-readable information\n- Be clear, concise, and helpful';
   } else if (intentType === 'memory_store' || intentType === 'memory_retrieve') {
-    systemInstructions += '\n- Use the provided memories\n- Be accurate and helpful';
+    systemInstructions += '\n- Answer ONLY from the provided memories — do NOT guess or hallucinate\n- If the memories contain screen captures, list the specific apps and window titles you see\n- If the memories do not contain enough information to answer, say so explicitly';
   } else {
     systemInstructions += '\n- Use the provided context\n- Be helpful and concise';
   }
