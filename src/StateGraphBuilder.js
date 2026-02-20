@@ -17,6 +17,7 @@ const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
+const logConversationNode = require('./nodes/logConversation');
 
 class StateGraphBuilder {
   /**
@@ -105,20 +106,22 @@ class StateGraphBuilder {
       throw new Error('[StateGraphBuilder] standard() requires mcpAdapter or llmBackend');
     }
     
-    logger.debug('[StateGraphBuilder] Creating STANDARD graph (intent + real LLM)');
+    logger.debug('[StateGraphBuilder] Creating STANDARD graph (intent + real LLM + conversation log)');
     
-    // Standard nodes: parseIntent → retrieveMemory → answer
+    // Standard nodes: parseIntent → retrieveMemory → answer → logConversation
     const nodes = {
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
-      answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend })
+      answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
+      logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
     };
     
     const edges = {
       start: 'parseIntent',
       parseIntent: 'retrieveMemory',
       retrieveMemory: 'answer',
-      answer: 'end'
+      answer: 'logConversation',
+      logConversation: 'end'
     };
     
     return new StateGraph(nodes, edges, {
@@ -156,7 +159,8 @@ class StateGraphBuilder {
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
-      answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend })
+      answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
+      logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
@@ -202,18 +206,18 @@ class StateGraphBuilder {
         return 'retrieveMemory';
       },
       
-      // Memory store path
-      storeMemory: 'end',
+      // Memory store path: store → logConversation → end
+      storeMemory: 'logConversation',
       
       // Command execution path
       executeCommand: (state) => {
-        // If command already has an answer, skip LLM
+        // If command already has an answer, log and end
         if (state.answer) {
-          return 'end';
+          return 'logConversation';
         }
-        // If automation plan generated, end (will be handled by overlay)
+        // If automation plan generated, log and end
         if (state.automationPlan) {
-          return 'end';
+          return 'logConversation';
         }
         // Otherwise, generate answer with LLM
         return 'answer';
@@ -221,9 +225,9 @@ class StateGraphBuilder {
       
       // Screen intelligence path
       screenIntelligence: (state) => {
-        // If already has answer (from vision API), skip LLM
+        // If already has answer (from vision API), log and end
         if (state.answer) {
-          return 'end';
+          return 'logConversation';
         }
         // Otherwise, process with LLM
         return 'answer';
@@ -232,9 +236,10 @@ class StateGraphBuilder {
       // Web search path
       webSearch: 'retrieveMemory',
       
-      // Standard path
+      // Standard path: all roads lead to logConversation before end
       retrieveMemory: 'answer',
-      answer: 'end'
+      answer: 'logConversation',
+      logConversation: 'end'
     };
     
     return new StateGraph(nodes, edges, {
