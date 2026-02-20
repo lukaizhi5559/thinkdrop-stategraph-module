@@ -40,7 +40,7 @@ module.exports = async function logConversation(state) {
       logger.debug('[Node:LogConversation] No sessionId - routing to session...');
       try {
         const routeResult = await mcpAdapter.callService('conversation', 'session.route', {
-          message: message,
+          text: message,
           userId: context?.userId,
           metadata: {
             intent: intent?.type,

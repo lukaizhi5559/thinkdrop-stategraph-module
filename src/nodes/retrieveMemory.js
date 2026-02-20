@@ -29,15 +29,17 @@ module.exports = async function retrieveMemory(state) {
   try {
     // Parallel fetch: conversation history and memories
     const [conversationResult, memoriesResult] = await Promise.all([
-      // Conversation history
-      mcpAdapter.callService('conversation', 'message.list', {
-        sessionId: context?.sessionId,
-        limit: 10,
-        direction: 'DESC'
-      }).catch(err => {
-        logger.warn('[Node:RetrieveMemory] Conversation fetch failed:', err.message);
-        return { messages: [] };
-      }),
+      // Conversation history (only if sessionId is known)
+      context?.sessionId
+        ? mcpAdapter.callService('conversation', 'message.list', {
+            sessionId: context.sessionId,
+            limit: 10,
+            direction: 'DESC'
+          }).catch(err => {
+            logger.warn('[Node:RetrieveMemory] Conversation fetch failed:', err.message);
+            return { messages: [] };
+          })
+        : Promise.resolve({ messages: [] }),
 
       // Long-term memories (skip for meta-questions)
       intent?.type !== 'context_query' 
