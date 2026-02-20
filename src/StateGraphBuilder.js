@@ -15,6 +15,9 @@ const answerNode = require('./nodes/answer');
 const retrieveMemoryNode = require('./nodes/retrieveMemory');
 const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
+const executeCommandNode = require('./nodes/executeCommand');
+const screenIntelligenceNode = require('./nodes/screenIntelligence');
+const visionNode = require('./nodes/vision');
 
 class StateGraphBuilder {
   /**
@@ -148,10 +151,13 @@ class StateGraphBuilder {
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
+      executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
+      screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
+      vision: (state) => visionNode({ ...state, logger, mcpAdapter }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter })
     };
     
-    // Intent-based routing
+    // Intent-based routing (matches DistilBERT classifier intents)
     const edges = {
       start: 'parseIntent',
       
@@ -165,9 +171,29 @@ class StateGraphBuilder {
           return 'storeMemory';
         }
         
-        // Web search: time-sensitive queries
+        // Memory retrieve: fetch stored information
+        if (intentType === 'memory_retrieve') {
+          return 'retrieveMemory';
+        }
+        
+        // Command execution: all command types (execute, automate, guide)
+        if (intentType === 'command_execute' || intentType === 'command_automate' || intentType === 'command_guide') {
+          return 'executeCommand';
+        }
+        
+        // Screen intelligence: analyze screen content
+        if (intentType === 'screen_intelligence') {
+          return 'screenIntelligence';
+        }
+        
+        // Web search: time-sensitive queries, factual questions, general knowledge
         if (intentType === 'web_search' || intentType === 'question' || intentType === 'general_knowledge') {
           return 'webSearch';
+        }
+        
+        // Greeting: quick response, no memory needed
+        if (intentType === 'greeting') {
+          return 'answer';
         }
         
         // Default: retrieve memory and answer
@@ -176,6 +202,40 @@ class StateGraphBuilder {
       
       // Memory store path
       storeMemory: 'end',
+      
+      // Command execution path
+      executeCommand: (state) => {
+        // If command already has an answer, skip LLM
+        if (state.answer) {
+          return 'end';
+        }
+        // If automation plan generated, end (will be handled by overlay)
+        if (state.automationPlan) {
+          return 'end';
+        }
+        // Otherwise, generate answer with LLM
+        return 'answer';
+      },
+      
+      // Screen intelligence path
+      screenIntelligence: (state) => {
+        // If screen intelligence failed, fallback to vision
+        if (state.screenIntelligenceError) {
+          return 'vision';
+        }
+        // If already has answer (from vision API), skip LLM
+        if (state.answer) {
+          return 'end';
+        }
+        // Otherwise, process with LLM
+        return 'answer';
+      },
+      
+      // Vision fallback path
+      vision: (state) => {
+        // Vision always proceeds to answer for interpretation
+        return 'answer';
+      },
       
       // Web search path
       webSearch: 'retrieveMemory',

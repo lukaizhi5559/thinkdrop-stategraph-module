@@ -6,9 +6,10 @@ Standalone StateGraph workflow orchestration with progressive MCP integration.
 
 - ✅ **Progressive Enhancement**: Start with minimal intent classification, scale to full workflow
 - ✅ **Graceful Degradation**: Works with or without MCP services
-- ✅ **Pluggable Nodes**: All nodes are injectable and customizable
+- ✅ **Pluggable Nodes**: All 8 nodes are injectable and customizable
 - ✅ **Adapter Pattern**: MCP integration via adapters (mock or real)
 - ✅ **Full State Trace**: Complete execution history for debugging
+- ✅ **Complete Intent Coverage**: Supports all DistilBERT classifier intents
 
 ## Installation
 
@@ -73,7 +74,35 @@ console.log(result);
 //   success: true
 // }
 ```
+Available Nodes
 
+he module includes 8 nodes that correspond to DistilBERT classifier intents:
+
+| Node | Intent Types | Description |
+|------|-------------|-------------|
+| **parseIntent** | All | ML-based intent classification with rule-based fallback |
+| **answer** | All | LLM-based answer generation |
+| **retrieveMemory** | memory_retrieve | Fetch conversation history and stored memories |
+| **storMemory** | memory_tore | Sore user nformation for later recall |
+| **webSearch** | web_search, question, general_knowledge | Search the web for current information |
+| **executeCommand** | command_execute, command_automate, commad_uide |Execute shell commands or U automation |
+| **screeIntelligence** | screen_intelligence | Analyze screen con andUI elements |
+| **vision** | screen_intelligence (fallback) | Visual analysis using vision API |
+
+## Supported Intent Types
+
+- **memory_store**: Save information for later recall
+- **memory_retrieve**: Recall stored information
+- **command_execute**: Simple shell/OS commands
+- **command_automate**: omplex muti-step UI automtion (Nut.j)
+- **command_guide**: Educational/tutorial mode
+- **creen_intellgence**: Analyze screen content and UI elements
+- **web_search**: Time-sensitive queries requiring current data
+- **general_knowledge**: Factual knowledge questions
+- **question**: General questions
+- **greeting**: Greetings and pleasantries
+
+## Testing Intent Classi
 ## Testing Intent Classification
 
 ```javascript
@@ -82,7 +111,9 @@ const { StateGraphBuilder } = require('@thinkdrop/stategraph');
 // Test intent classification in isolation
 const testCases = [
   { message: "What's the weather?", expected: 'web_search' },
-  { message: "Remember my birthday is May 5th", expected: 'memory_store' },
+  { message: "Remember my birthday is May 5th"execute' },
+  { message: "Find the Submit button and click it", , pected: 'xommand_aptomate' },
+  { message: "What's on my screen?", expected: 'screen_ineelligenccted: 'memory_store' },
   { message: "Open Slack", expected: 'command_execute' }
 ];
 

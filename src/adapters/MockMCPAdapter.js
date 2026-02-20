@@ -90,7 +90,43 @@ class MockMCPAdapter extends MCPAdapter {
       };
     }
     
-    if (msg.includes('weather') || msg.includes('news') || msg.includes('search') || msg.includes('find')) {
+    // Command guide patterns - check first
+    if (msg.match(/^(show me how|teach me|how do i|how to|guide me)/i)) {
+      return {
+        data: {
+          intent: 'command_guide',
+          confidence: 0.85,
+          entities: [],
+          metadata: { parser: 'mock' }
+        }
+      };
+    }
+    
+    // Command automation patterns (multi-step) - check before web search
+    if ((msg.includes('find') || msg.includes('locate')) && (msg.includes('button') || msg.includes('click') || msg.includes('press'))) {
+      return {
+        data: {
+          intent: 'command_automate',
+          confidence: 0.85,
+          entities: [],
+          metadata: { parser: 'mock' }
+        }
+      };
+    }
+    
+    if ((msg.includes('open') || msg.includes('navigate')) && msg.includes('and') && (msg.includes('compose') || msg.includes('enable') || msg.includes('create'))) {
+      return {
+        data: {
+          intent: 'command_automate',
+          confidence: 0.85,
+          entities: [],
+          metadata: { parser: 'mock' }
+        }
+      };
+    }
+    
+    // Web search patterns - more specific
+    if (msg.includes('weather') || msg.includes('news') || msg.includes('search for') || msg.includes('google')) {
       return {
         data: {
           intent: 'web_search',
@@ -101,7 +137,20 @@ class MockMCPAdapter extends MCPAdapter {
       };
     }
     
-    if (msg.includes('open') || msg.includes('close') || msg.includes('launch') || msg.includes('quit')) {
+    // Generic "find" without UI context = web search
+    if (msg.includes('find') && !msg.match(/(button|click|press|field|menu)/i)) {
+      return {
+        data: {
+          intent: 'web_search',
+          confidence: 0.8,
+          entities: [],
+          metadata: { parser: 'mock' }
+        }
+      };
+    }
+    
+    // Command execution patterns (simple)
+    if (msg.match(/^(open|close|launch|quit)\s+[a-z]/i)) {
       return {
         data: {
           intent: 'command_execute',
@@ -252,7 +301,8 @@ class MockMCPAdapter extends MCPAdapter {
           data: {
             success: true,
             result: '[Mock] Command executed successfully',
-            output: 'Mock command output'
+            output: 'Mock command output',
+            needsInterpretation: false
           }
         };
       
@@ -260,8 +310,24 @@ class MockMCPAdapter extends MCPAdapter {
         return {
           data: {
             success: true,
-            result: '[Mock] Automation completed',
-            steps: ['Step 1', 'Step 2']
+            plan: {
+              planId: 'mock_plan_123',
+              goal: params.command,
+              steps: [
+                { action: 'click', target: 'Submit button', description: 'Click the submit button' },
+                { action: 'type', target: 'Input field', text: 'test', description: 'Type test into input' }
+              ],
+              metadata: { provider: 'mock', confidence: 0.9 }
+            }
+          }
+        };
+      
+      case 'command.guide':
+        return {
+          data: {
+            success: true,
+            guide: `[Mock Guide] Here's how to ${params.command}:\n1. First step\n2. Second step\n3. Final step`,
+            steps: ['First step', 'Second step', 'Final step']
           }
         };
       
@@ -276,10 +342,28 @@ class MockMCPAdapter extends MCPAdapter {
         return {
           data: {
             elements: [
-              { type: 'button', text: 'Submit', bbox: [100, 200, 200, 250] },
-              { type: 'text', text: 'Welcome', bbox: [50, 50, 150, 80] }
+              { type: 'button', text: 'Submit', bbox: [100, 200, 200, 250], confidence: 0.9 },
+              { type: 'text', text: 'Welcome', bbox: [50, 50, 150, 80], confidence: 0.95 },
+              { type: 'input', text: 'Search...', bbox: [300, 100, 500, 130], confidence: 0.85 }
             ],
-            context: 'Mock screen analysis'
+            windows: [
+              { app: 'Chrome', title: 'Example Page', bounds: [0, 0, 1920, 1080] }
+            ],
+            desktopItems: [
+              { name: 'Documents', type: 'folder', position: [50, 100] },
+              { name: 'file.txt', type: 'file', position: [50, 200] }
+            ],
+            llmContext: 'Mock screen analysis: The screen shows a Chrome window with a Submit button, Welcome text, and a search input field. Desktop has Documents folder and file.txt.'
+          }
+        };
+      
+      case 'screen.analyze-vision':
+        return {
+          data: {
+            analysis: '[Mock Vision Analysis] The screen shows a typical web application interface with navigation, content area, and interactive elements.',
+            provider: 'mock',
+            latencyMs: 500,
+            timestamp: new Date().toISOString()
           }
         };
       

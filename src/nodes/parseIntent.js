@@ -85,8 +85,31 @@ function fallbackIntentClassification(state) {
     };
   }
   
-  // Web search patterns
-  if (msg.match(/(weather|news|current|latest|search|find|look up|google)/i)) {
+  // Command guide patterns (educational/tutorial) - check first
+  if (msg.match(/^(show me how|teach me|how do i|how to|guide me|walk me through|explain how)/i)) {
+    return {
+      ...state,
+      intent: { type: 'command_guide', confidence: 0.85, entities: [] },
+      metadata: { parser: 'fallback', processingTimeMs: 0 }
+    };
+  }
+  
+  // Command automation patterns (multi-step, complex workflows) - check before web search
+  // Look for UI element + action combinations
+  if (msg.match(/(find|locate).+(button|link|field|menu|icon).+(and|then)?.+(click|press|select)/i) ||
+      msg.match(/(find|locate).+(and|then).+(click|press|select|open)/i) ||
+      msg.match(/(open|go to|navigate to).+(and|then).+(compose|create|enable|disable|click|type)/i) ||
+      msg.match(/(click|press).+(and|then).+(type|enter|submit)/i)) {
+    return {
+      ...state,
+      intent: { type: 'command_automate', confidence: 0.85, entities: [] },
+      metadata: { parser: 'fallback', processingTimeMs: 0 }
+    };
+  }
+  
+  // Web search patterns - more specific to avoid false positives
+  if (msg.match(/(weather|news|current|latest|search for|look up|google)/i) ||
+      (msg.match(/find/i) && !msg.match(/(button|click|press|select|field|menu)/i))) {
     return {
       ...state,
       intent: { type: 'web_search', confidence: 0.8, entities: [] },
@@ -94,8 +117,8 @@ function fallbackIntentClassification(state) {
     };
   }
   
-  // Command execution patterns
-  if (msg.match(/^(open|close|launch|quit|start|stop|run|execute)/i)) {
+  // Command execution patterns (simple, single-step)
+  if (msg.match(/^(open|close|launch|quit|start|stop|run|execute)\s+[a-z]/i)) {
     return {
       ...state,
       intent: { type: 'command_execute', confidence: 0.85, entities: [] },

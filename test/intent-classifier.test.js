@@ -24,10 +24,19 @@ const testCases = [
   { message: "Find the latest news about AI", expected: 'web_search', description: 'News search' },
   { message: "Search for best restaurants nearby", expected: 'web_search', description: 'Local search' },
   
-  // Command execution
+  // Command execution (simple)
   { message: "Open Slack", expected: 'command_execute', description: 'Open application' },
   { message: "Close Chrome", expected: 'command_execute', description: 'Close application' },
   { message: "Launch Terminal", expected: 'command_execute', description: 'Launch app' },
+  
+  // Command automation (complex multi-step)
+  { message: "Find the Submit button and click it", expected: 'command_automate', description: 'Multi-step automation' },
+  { message: "Open Gmail and compose a new email", expected: 'command_automate', description: 'Complex workflow' },
+  { message: "Navigate to settings and enable dark mode", expected: 'command_automate', description: 'Multi-step UI task' },
+  
+  // Command guide (educational)
+  { message: "Show me how to install Node.js", expected: 'command_guide', description: 'Educational guide' },
+  { message: "Teach me how to use git", expected: 'command_guide', description: 'Tutorial request' },
   
   // Screen intelligence
   { message: "What's on my screen?", expected: 'screen_intelligence', description: 'Screen analysis' },
