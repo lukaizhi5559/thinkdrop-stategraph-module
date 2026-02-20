@@ -17,7 +17,6 @@ const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
-const visionNode = require('./nodes/vision');
 
 class StateGraphBuilder {
   /**
@@ -153,7 +152,6 @@ class StateGraphBuilder {
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
-      vision: (state) => visionNode({ ...state, logger, mcpAdapter }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter })
     };
     
@@ -219,21 +217,11 @@ class StateGraphBuilder {
       
       // Screen intelligence path
       screenIntelligence: (state) => {
-        // If screen intelligence failed, fallback to vision
-        if (state.screenIntelligenceError) {
-          return 'vision';
-        }
         // If already has answer (from vision API), skip LLM
         if (state.answer) {
           return 'end';
         }
         // Otherwise, process with LLM
-        return 'answer';
-      },
-      
-      // Vision fallback path
-      vision: (state) => {
-        // Vision always proceeds to answer for interpretation
         return 'answer';
       },
       

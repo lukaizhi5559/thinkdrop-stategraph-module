@@ -20,7 +20,6 @@ const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
-const visionNode = require('./nodes/vision');
 
 module.exports = {
   // Core
@@ -40,7 +39,6 @@ module.exports = {
     storeMemory: storeMemoryNode,
     webSearch: webSearchNode,
     executeCommand: executeCommandNode,
-    screenIntelligence: screenIntelligenceNode,
-    vision: visionNode
+    screenIntelligence: screenIntelligenceNode
   }
 };

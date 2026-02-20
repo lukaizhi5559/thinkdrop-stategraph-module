@@ -46,9 +46,6 @@ class MockMCPAdapter extends MCPAdapter {
       case 'screen-intelligence':
         return this._mockScreenIntelligenceService(action, params);
       
-      case 'vision':
-        return this._mockVisionService(action, params);
-      
       case 'coreference':
         return this._mockCoreferenceService(action, params);
       
@@ -372,20 +369,6 @@ class MockMCPAdapter extends MCPAdapter {
     }
   }
 
-  _mockVisionService(action, params) {
-    switch (action) {
-      case 'vision.analyze':
-        return {
-          data: {
-            description: 'Mock vision analysis: The screen shows a typical application interface.',
-            confidence: 0.8
-          }
-        };
-      
-      default:
-        throw new Error(`[MockMCP] Unknown vision action: ${action}`);
-    }
-  }
 
   _mockCoreferenceService(action, params) {
     switch (action) {
@@ -410,7 +393,7 @@ class MockMCPAdapter extends MCPAdapter {
 
   async getAvailableServices() {
     // Mock adapter reports all services as available
-    return ['phi4', 'conversation', 'user-memory', 'web-search', 'command', 'screen-intelligence', 'vision', 'coreference'];
+    return ['phi4', 'conversation', 'user-memory', 'web-search', 'command', 'screen-intelligence', 'coreference'];
   }
 }
 
