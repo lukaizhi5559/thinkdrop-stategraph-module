@@ -31,13 +31,14 @@ class StateGraphBuilder {
   static minimal(options = {}) {
     const logger = options.logger || console;
     const mcpAdapter = options.mcpAdapter || null; // No adapter = fallback mode
+    const llmBackend = options.llmBackend || null;
     
     logger.debug('[StateGraphBuilder] Creating MINIMAL graph (intent classification only)');
     
     // Minimal nodes: just parseIntent → answer
     const nodes = {
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
-      answer: (state) => answerNode({ ...state, logger, mcpAdapter })
+      answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend })
     };
     
     // Simple linear flow
@@ -64,13 +65,14 @@ class StateGraphBuilder {
   static basic(options = {}) {
     const logger = options.logger || console;
     const mcpAdapter = options.mcpAdapter || new MockMCPAdapter({ logger });
+    const llmBackend = options.llmBackend || null;
     
     logger.debug('[StateGraphBuilder] Creating BASIC graph (intent + mock responses)');
     
     // Basic nodes: parseIntent → answer with mock data
     const nodes = {
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
-      answer: (state) => answerNode({ ...state, logger, mcpAdapter })
+      answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend })
     };
     
     const edges = {
@@ -97,9 +99,10 @@ class StateGraphBuilder {
   static standard(options = {}) {
     const logger = options.logger || console;
     const mcpAdapter = options.mcpAdapter;
+    const llmBackend = options.llmBackend || null;
     
-    if (!mcpAdapter) {
-      throw new Error('[StateGraphBuilder] standard() requires mcpAdapter');
+    if (!mcpAdapter && !llmBackend) {
+      throw new Error('[StateGraphBuilder] standard() requires mcpAdapter or llmBackend');
     }
     
     logger.debug('[StateGraphBuilder] Creating STANDARD graph (intent + real LLM)');
@@ -108,7 +111,7 @@ class StateGraphBuilder {
     const nodes = {
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
-      answer: (state) => answerNode({ ...state, logger, mcpAdapter })
+      answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend })
     };
     
     const edges = {
@@ -137,12 +140,13 @@ class StateGraphBuilder {
   static full(options = {}) {
     const logger = options.logger || console;
     const mcpAdapter = options.mcpAdapter;
+    const llmBackend = options.llmBackend || null;
     
-    if (!mcpAdapter) {
-      throw new Error('[StateGraphBuilder] full() requires mcpAdapter');
+    if (!mcpAdapter && !llmBackend) {
+      throw new Error('[StateGraphBuilder] full() requires mcpAdapter or llmBackend');
     }
     
-    logger.debug('[StateGraphBuilder] Creating FULL graph (all nodes enabled)');
+    logger.debug(`[StateGraphBuilder] Creating FULL graph (all nodes enabled, llmBackend: ${llmBackend ? llmBackend.getInfo().name : 'MCPLLMBackend/phi4'})`);
     
     // Full nodes with intent-based routing
     const nodes = {
@@ -152,7 +156,7 @@ class StateGraphBuilder {
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
-      answer: (state) => answerNode({ ...state, logger, mcpAdapter })
+      answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend })
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
@@ -251,13 +255,14 @@ class StateGraphBuilder {
   static custom(nodes, edges, options = {}) {
     const logger = options.logger || console;
     const mcpAdapter = options.mcpAdapter;
+    const llmBackend = options.llmBackend || null;
     
     logger.debug('[StateGraphBuilder] Creating CUSTOM graph');
     
-    // Inject logger and mcpAdapter into all nodes
+    // Inject logger, mcpAdapter, and llmBackend into all nodes
     const wrappedNodes = {};
     for (const [name, fn] of Object.entries(nodes)) {
-      wrappedNodes[name] = (state) => fn({ ...state, logger, mcpAdapter });
+      wrappedNodes[name] = (state) => fn({ ...state, logger, mcpAdapter, llmBackend });
     }
     
     return new StateGraph(wrappedNodes, edges, {

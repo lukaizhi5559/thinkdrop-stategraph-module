@@ -12,6 +12,12 @@ const MCPAdapter = require('./adapters/MCPAdapter');
 const MockMCPAdapter = require('./adapters/MockMCPAdapter');
 const RealMCPAdapter = require('./adapters/RealMCPAdapter');
 
+// LLM Backends (pluggable answer generation)
+const LLMBackend = require('./backends/LLMBackend');
+const MCPLLMBackend = require('./backends/MCPLLMBackend');
+const VSCodeLLMBackend = require('./backends/VSCodeLLMBackend');
+const ExternalLLMBackend = require('./backends/ExternalLLMBackend');
+
 // Nodes (for custom graphs)
 const parseIntentNode = require('./nodes/parseIntent');
 const answerNode = require('./nodes/answer');
@@ -30,6 +36,19 @@ module.exports = {
   MCPAdapter,
   MockMCPAdapter,
   RealMCPAdapter,
+
+  // LLM Backends (swap the answer generation backend)
+  backends: {
+    LLMBackend,
+    MCPLLMBackend,
+    VSCodeLLMBackend,
+    ExternalLLMBackend
+  },
+  // Also export flat for convenience
+  LLMBackend,
+  MCPLLMBackend,
+  VSCodeLLMBackend,
+  ExternalLLMBackend,
   
   // Nodes (for custom implementations)
   nodes: {
