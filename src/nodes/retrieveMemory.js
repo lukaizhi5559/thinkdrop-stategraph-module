@@ -28,12 +28,8 @@ function parseDateRange(message) {
   const y = now.getFullYear();
   const m = now.getMonth();
 
-  // CRITICAL: DB stores timestamps in LOCAL time (e.g. "2026-02-20 20:02:08")
-  // Must format dates as local time, NOT UTC (toISOString() would give wrong offset)
-  const iso = (d) => {
-    const pad = (n) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  };
+  // DuckDB CURRENT_TIMESTAMP is UTC — string comparisons must also be UTC
+  const iso = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
   const startOf = (d) => { const r = new Date(d); r.setHours(0,0,0,0); return r; };
   const endOf   = (d) => { const r = new Date(d); r.setHours(23,59,59,999); return r; };
 
