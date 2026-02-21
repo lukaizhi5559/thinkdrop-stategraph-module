@@ -51,6 +51,17 @@ function parseDateRange(message) {
 
   // today / this morning / this afternoon / this evening
   if (/\b(today|this morning|this afternoon|this evening)\b/.test(q)) {
+    // Check for explicit time range first: "7 - 8:30 this morning", "9 to 11am today"
+    const trm = q.match(/\b(\d{1,2})(?::(\d{2}))?\s*(?:am|pm)?\s*(?:to|and|-)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+    if (trm) {
+      let h1 = parseInt(trm[1]), m1 = trm[2] ? parseInt(trm[2]) : 0;
+      let h2 = parseInt(trm[3]), m2 = trm[4] ? parseInt(trm[4]) : 59;
+      const mer = trm[5] || (q.includes('morning') ? 'am' : null);
+      if (mer === 'pm' && h2 < 12) { h1 += (h1 < 12 ? 12 : 0); h2 += 12; }
+      const start = new Date(now); start.setHours(h1, m1, 0, 0);
+      const end   = new Date(now); end.setHours(h2, m2, 59, 999);
+      return { startDate: iso(start), endDate: iso(end) };
+    }
     const tod = parseTimeOfDay(q);
     if (tod) {
       const windowMins = 30;
@@ -122,15 +133,17 @@ function parseDateRange(message) {
     return { startDate: iso(start), endDate: iso(now) };
   }
 
-  // Time-of-day range: "6 to 9am", "around 6 to 9am", "between 6am and 9am"
-  const timeRangeMatch = q.match(/\b(\d{1,2})(?::\d{2})?\s*(?:am|pm)?\s*(?:to|and|-)\s*(\d{1,2})(?::\d{2})?\s*(am|pm)\b/);
+  // Time-of-day range: "6 to 9am", "around 6 to 9am", "between 6am and 9am", "9 - 11am"
+  const timeRangeMatch = q.match(/\b(\d{1,2})(?::(\d{2}))?\s*(?:am|pm)?\s*(?:to|and|-)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
   if (timeRangeMatch) {
     const h1 = parseInt(timeRangeMatch[1]);
-    const h2 = parseInt(timeRangeMatch[2]);
-    const meridiem = timeRangeMatch[3];
+    const m1 = timeRangeMatch[2] ? parseInt(timeRangeMatch[2]) : 0;
+    const h2 = parseInt(timeRangeMatch[3]);
+    const m2 = timeRangeMatch[4] ? parseInt(timeRangeMatch[4]) : 59;
+    const meridiem = timeRangeMatch[5];
     const offset = meridiem === 'pm' && h2 < 12 ? 12 : 0;
-    const start = new Date(now); start.setHours(h1 + offset, 0, 0, 0);
-    const end = new Date(now); end.setHours(h2 + offset, 59, 59, 999);
+    const start = new Date(now); start.setHours(h1 + offset, m1, 0, 0);
+    const end = new Date(now); end.setHours(h2 + offset, m2, 59, 999);
     return { startDate: iso(start), endDate: iso(end) };
   }
 
