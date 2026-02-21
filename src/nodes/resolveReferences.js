@@ -43,11 +43,17 @@ const INTENT_TOPICS = {
  * Layer 1: Detect short follow-up patterns and carry the previous intent.
  * Returns { carriedIntent, resolvedMessage } or null if no carryover applies.
  */
+// Time words that indicate a temporal reference but no standalone intent topic
+const TEMPORAL_WORDS = /\b(today|yesterday|now|this morning|this afternoon|this evening|this week|last week|earlier|recently|at noon|at midnight|around \d|at \d)\b/i;
+
+// Words that indicate a clear standalone intent (not a follow-up)
+const STANDALONE_INTENT_WORDS = /\b(search|find|look up|google|wikipedia|define|explain|how to|what is|who is|weather|news|open|run|execute|install|download|remind|schedule|email|message|call)\b/i;
+
 function detectIntentCarryover(message, conversationHistory) {
   const msg = message.trim().toLowerCase().replace(/[?!.]+$/, '');
 
-  // Patterns that are pure temporal/deictic follow-ups with no standalone intent
-  const FOLLOWUP_PATTERNS = [
+  // Pattern A: Exact short deictic follow-ups (no time word needed)
+  const EXACT_FOLLOWUP_PATTERNS = [
     /^what about now$/,
     /^and now$/,
     /^now what$/,
@@ -60,23 +66,34 @@ function detectIntentCarryover(message, conversationHistory) {
     /^again$/,
     /^one more time$/,
     /^still$/,
-    /^still the same\??$/,
-    /^what about the same\??$/
+    /^still the same$/,
+    /^what about the same$/
   ];
 
-  const isFollowup = FOLLOWUP_PATTERNS.some(p => p.test(msg));
-  if (!isFollowup) return null;
+  const isExactFollowup = EXACT_FOLLOWUP_PATTERNS.some(p => p.test(msg));
+
+  // Pattern B: Short temporal elliptical — message has a time word but no standalone intent topic
+  // e.g. "anything yesterday", "what about today at noon", "what about yesterday", "how about earlier"
+  const hasTemporalWord = TEMPORAL_WORDS.test(msg);
+  const hasStandaloneIntent = STANDALONE_INTENT_WORDS.test(msg);
+  const wordCount = msg.split(/\s+/).filter(Boolean).length;
+
+  // Temporal elliptical: has time word, no standalone intent, and short (≤ 8 words)
+  // Also must match an elliptical prefix pattern OR be very short
+  const ELLIPTICAL_PREFIXES = /^(what about|anything|how about|and|what|show me|tell me about)\b/i;
+  const isTemporalElliptical = hasTemporalWord && !hasStandaloneIntent &&
+    (wordCount <= 6 || ELLIPTICAL_PREFIXES.test(msg));
+
+  if (!isExactFollowup && !isTemporalElliptical) return null;
 
   // Find the most recent user intent from conversation history
-  // We look for the last user message that had a clear intent
   const recentUserMessages = conversationHistory
     .filter(m => m.role === 'user')
     .slice(-5)
     .reverse(); // most recent first
 
-  // Map of previous user messages to likely intents (simple heuristic)
   const SCREEN_PATTERNS = /\b(screen|see|show|look|page|window|what.*(on|in).*screen|what do you see|what.*(visible|showing|displayed))\b/i;
-  const MEMORY_PATTERNS = /\b(was i|did i|have i|what did i|what apps|what sites|history|activity)\b/i;
+  const MEMORY_PATTERNS = /\b(was i|did i|have i|what did i|what apps|what sites|history|activity|working on|looking at|using|worked)\b/i;
 
   let previousIntent = null;
   for (const m of recentUserMessages) {
@@ -91,14 +108,28 @@ function detectIntentCarryover(message, conversationHistory) {
     }
   }
 
+  // For temporal ellipticals with no prior context, default to memory_retrieve
+  // (time-based queries almost always mean "what was I doing at that time")
+  if (!previousIntent && isTemporalElliptical) {
+    previousIntent = 'memory_retrieve';
+  }
+
   if (!previousIntent) return null;
 
   // Build an expanded message that the intent classifier can understand
   const topic = INTENT_TOPICS[previousIntent] || 'that';
   const isNowVariant = /\bnow\b/.test(msg);
-  const resolvedMessage = isNowVariant
-    ? `what do you see on ${topic} right now`
-    : `what about ${topic}`;
+
+  let resolvedMessage;
+  if (previousIntent === 'screen_intelligence') {
+    resolvedMessage = isNowVariant
+      ? `what do you see on ${topic} right now`
+      : `what do you see on ${topic}`;
+  } else {
+    // For memory_retrieve, preserve the temporal context in the resolved message
+    // so parseDateRange in retrieveMemory can extract the date range
+    resolvedMessage = message; // keep original — date parsing handles it
+  }
 
   return { carriedIntent: previousIntent, resolvedMessage };
 }

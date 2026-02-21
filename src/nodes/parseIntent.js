@@ -8,7 +8,7 @@
  */
 
 module.exports = async function parseIntent(state) {
-  const { mcpAdapter, message, resolvedMessage, context } = state;
+  const { mcpAdapter, message, resolvedMessage, carriedIntent, context } = state;
   const logger = state.logger || console;
 
   // Prefer coreference-resolved message for classification
@@ -17,6 +17,21 @@ module.exports = async function parseIntent(state) {
   logger.debug('[Node:ParseIntent] Parsing intent...');
   if (resolvedMessage && resolvedMessage !== message) {
     logger.debug(`[Node:ParseIntent] Using resolved message: "${resolvedMessage}"`);
+  }
+
+  // Short-circuit: resolveReferences already determined intent via carryover
+  if (carriedIntent) {
+    logger.debug(`[Node:ParseIntent] Using carried intent from resolveReferences: ${carriedIntent}`);
+    return {
+      ...state,
+      intent: {
+        type: carriedIntent,
+        confidence: 1.0,
+        entities: [],
+        requiresMemoryAccess: carriedIntent === 'memory_retrieve'
+      },
+      metadata: { parser: 'intent-carryover', processingTimeMs: 0 }
+    };
   }
 
   // Check if MCP adapter is available

@@ -34,13 +34,74 @@ function parseDateRange(message) {
 
   // today / this morning / this afternoon / this evening
   if (/\b(today|this morning|this afternoon|this evening)\b/.test(q)) {
+    // Check for specific time-of-day: "at noon", "at 3", "around 3pm", "at 3:30"
+    const specificTime = q.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/) ||
+                         q.match(/\b(noon|midnight)\b/);
+    if (specificTime) {
+      let hour, minute = 0;
+      if (specificTime[0] === 'noon' || specificTime[1] === 'noon') { hour = 12; }
+      else if (specificTime[0] === 'midnight' || specificTime[1] === 'midnight') { hour = 0; }
+      else {
+        hour = parseInt(specificTime[1]);
+        minute = specificTime[2] ? parseInt(specificTime[2]) : 0;
+        const meridiem = specificTime[3];
+        if (meridiem === 'pm' && hour < 12) hour += 12;
+        else if (meridiem === 'am' && hour === 12) hour = 0;
+        else if (!meridiem && hour < 7) hour += 12; // assume pm for ambiguous hours < 7
+      }
+      const windowMins = 30;
+      const start = new Date(now); start.setHours(hour, Math.max(0, minute - windowMins), 0, 0);
+      const end   = new Date(now); end.setHours(hour, minute + windowMins, 59, 999);
+      return { startDate: iso(start), endDate: iso(end) };
+    }
     return { startDate: iso(startOf(now)), endDate: iso(endOf(now)) };
   }
 
-  // yesterday
+  // yesterday / anything yesterday / what about yesterday
   if (/\byesterday\b/.test(q)) {
     const d = new Date(now); d.setDate(d.getDate() - 1);
+    // Check for specific time-of-day within yesterday
+    const specificTime = q.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/) ||
+                         q.match(/\b(noon|midnight)\b/);
+    if (specificTime) {
+      let hour, minute = 0;
+      if (specificTime[0] === 'noon' || specificTime[1] === 'noon') { hour = 12; }
+      else if (specificTime[0] === 'midnight' || specificTime[1] === 'midnight') { hour = 0; }
+      else {
+        hour = parseInt(specificTime[1]);
+        minute = specificTime[2] ? parseInt(specificTime[2]) : 0;
+        const meridiem = specificTime[3];
+        if (meridiem === 'pm' && hour < 12) hour += 12;
+        else if (meridiem === 'am' && hour === 12) hour = 0;
+        else if (!meridiem && hour < 7) hour += 12;
+      }
+      const windowMins = 30;
+      const start = new Date(d); start.setHours(hour, Math.max(0, minute - windowMins), 0, 0);
+      const end   = new Date(d); end.setHours(hour, minute + windowMins, 59, 999);
+      return { startDate: iso(start), endDate: iso(end) };
+    }
     return { startDate: iso(startOf(d)), endDate: iso(endOf(d)) };
+  }
+
+  // "around 3", "at 3pm", "at noon" (without today/yesterday — assume today)
+  const standaloneTime = q.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/) ||
+                         q.match(/\b(?:at|around)\s+(noon|midnight)\b/);
+  if (standaloneTime && !q.match(/\b(today|yesterday|this|last|week|month|year)\b/)) {
+    let hour, minute = 0;
+    const tok = standaloneTime[1];
+    if (tok === 'noon') { hour = 12; }
+    else if (tok === 'midnight') { hour = 0; }
+    else {
+      hour = parseInt(tok);
+      minute = standaloneTime[2] ? parseInt(standaloneTime[2]) : 0;
+      const meridiem = standaloneTime[3];
+      if (meridiem === 'pm' && hour < 12) hour += 12;
+      else if (meridiem === 'am' && hour === 12) hour = 0;
+    }
+    const windowMins = 30;
+    const start = new Date(now); start.setHours(hour, Math.max(0, minute - windowMins), 0, 0);
+    const end   = new Date(now); end.setHours(hour, minute + windowMins, 59, 999);
+    return { startDate: iso(start), endDate: iso(end) };
   }
 
   // N minutes/mins ago (e.g. "15 mins ago", "1 minute ago", "what about 15 mins ago")
@@ -192,8 +253,33 @@ function parseDateRange(message) {
   return null; // No date reference — no filter, search full history
 }
 
+/**
+ * Build a clean semantic search query from the message.
+ * For short elliptical follow-ups ("what about yesterday", "anything today"),
+ * strip temporal noise and use a generic activity query so the date filter
+ * does the heavy lifting instead of semantic similarity.
+ */
+function buildSearchQuery(message, resolvedMessage) {
+  const q = (resolvedMessage || message || '').toLowerCase().trim();
+
+  // Strip pure temporal/elliptical prefixes that add no semantic value
+  const stripped = q
+    .replace(/^(what about|anything|how about|tell me about|show me)\s+/i, '')
+    .replace(/\b(today|yesterday|this morning|this afternoon|this evening|at noon|at midnight)\b/gi, '')
+    .replace(/\b(around|about|at)\s+\d{1,2}(:\d{2})?\s*(am|pm)?\b/gi, '')
+    .replace(/\b(earlier|later|then|now|recently)\b/gi, '')
+    .trim();
+
+  // If nothing meaningful remains after stripping, use a broad activity query
+  if (!stripped || stripped.length < 3) {
+    return 'apps websites activity screen';
+  }
+
+  return resolvedMessage || message;
+}
+
 module.exports = async function retrieveMemory(state) {
-  const { mcpAdapter, message, context, intent } = state;
+  const { mcpAdapter, message, resolvedMessage, context, intent } = state;
   const logger = state.logger || console;
 
   logger.debug('[Node:RetrieveMemory] Fetching context...');
@@ -228,16 +314,24 @@ module.exports = async function retrieveMemory(state) {
 
       // Long-term memories (skip for meta-questions)
       intent?.type !== 'context_query' 
-        ? mcpAdapter.callService('user-memory', 'memory.search', {
-            query: message,
-            limit: 10,
-            userId: context?.userId,
-            minSimilarity: 0.25,
-            ...(parseDateRange(message) || {})
-          }).catch(err => {
-            logger.warn('[Node:RetrieveMemory] Memory search failed:', err.message);
-            return { results: [] };
-          })
+        ? (() => {
+            const dateRange = parseDateRange(resolvedMessage || message);
+            const searchQuery = buildSearchQuery(message, resolvedMessage);
+            // When a date range is applied, lower similarity threshold — the time filter
+            // does the heavy lifting; we don't want to miss results due to semantic mismatch
+            const minSimilarity = dateRange ? 0.1 : 0.25;
+            logger.debug(`[Node:RetrieveMemory] Search query: "${searchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | minSimilarity: ${minSimilarity}`);
+            return mcpAdapter.callService('user-memory', 'memory.search', {
+              query: searchQuery,
+              limit: 10,
+              userId: context?.userId,
+              minSimilarity,
+              ...(dateRange || {})
+            }).catch(err => {
+              logger.warn('[Node:RetrieveMemory] Memory search failed:', err.message);
+              return { results: [] };
+            });
+          })()
         : Promise.resolve({ results: [] })
     ]);
 
