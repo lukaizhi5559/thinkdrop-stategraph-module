@@ -38,7 +38,7 @@ function parseDateRange(message) {
   function parseTimeOfDay(str) {
     if (/\bnoon\b/.test(str)) return { hour: 12, minute: 0 };
     if (/\bmidnight\b/.test(str)) return { hour: 0, minute: 0 };
-    const m = str.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+    const m = str.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?!\s*(?:min|mins|minutes|hour|hours|hrs|ago|seconds?|sec))\b/);
     if (!m) return null;
     let hour = parseInt(m[1]);
     const minute = m[2] ? parseInt(m[2]) : 0;
@@ -47,6 +47,20 @@ function parseDateRange(message) {
     else if (meridiem === 'am' && hour === 12) hour = 0;
     else if (!meridiem && hour >= 1 && hour <= 6) hour += 12; // 1-6 without am/pm → pm
     return { hour, minute };
+  }
+
+  // before/until Xam/pm (e.g. "before 9am this morning", "until 10pm")
+  const beforeTimeMatch = q.match(/\b(?:before|until|up to|prior to)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+  if (beforeTimeMatch) {
+    let h = parseInt(beforeTimeMatch[1]);
+    const min = beforeTimeMatch[2] ? parseInt(beforeTimeMatch[2]) : 0;
+    const mer = beforeTimeMatch[3];
+    if (mer === 'pm' && h < 12) h += 12;
+    else if (mer === 'am' && h === 12) h = 0;
+    const baseDate = /\byesterday\b/.test(q) ? new Date(now.getTime() - 86400000) : now;
+    const start = new Date(baseDate); start.setHours(0, 0, 0, 0);
+    const end   = new Date(baseDate); end.setHours(h, min, 0, 0);
+    return { startDate: iso(start), endDate: iso(end) };
   }
 
   // today / this morning / this afternoon / this evening
