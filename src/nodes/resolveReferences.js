@@ -4,20 +4,22 @@
  * Runs BEFORE parseIntent so the intent classifier sees a fully-resolved
  * message instead of ambiguous pronouns / follow-up fragments.
  *
- * Examples:
- *   "what about now"          → "what is on the screen now"
- *   "what about that"         → "what about <previous topic>"
- *   "can you explain it more" → "can you explain <previous subject> more"
+ * Two-layer resolution:
  *
- * Calls the coreference-service (Python/FastAPI, port 3005) with:
- *   - message: raw user input
- *   - conversationHistory: last N messages from conversation-service
+ * Layer 1 — JS intent carryover (fast, no network call):
+ *   Detects short temporal/elliptical follow-ups and carries the previous
+ *   intent directly by setting `carriedIntent` in state.
+ *   Examples:
+ *     "what about now"   → carriedIntent: 'screen_intelligence'
+ *     "and now?"         → carriedIntent: 'screen_intelligence'
+ *     "what about that"  → carriedIntent: <previous intent>
  *
- * Returns:
- *   - resolvedMessage: coreference-resolved text (used by parseIntent + answer)
- *   - originalMessage: original raw text (kept for debugging)
- *   - coreferenceReplacements: array of { original, resolved, confidence }
- *   - coreferenceMethod: 'coreferee' | 'neuralcoref' | 'rule_based' | 'fallback'
+ * Layer 2 — Python coreference service (pronoun resolution):
+ *   Only called when the message contains actual pronouns (he/she/it/they/this/that)
+ *   referring to named entities from conversation history.
+ *   Examples:
+ *     "can you explain it more"  → "can you explain <previous subject> more"
+ *     "what did he say"          → "what did <person> say"
  *
  * Graceful degradation: if coreference service is down, falls back to original
  * message so the rest of the graph continues normally.
@@ -25,6 +27,88 @@
 
 function stripHtml(text) {
   return text ? text.replace(/<[^>]*>/g, '') : text;
+}
+
+// Intent label → human-readable topic for message expansion
+const INTENT_TOPICS = {
+  screen_intelligence: 'the screen',
+  memory_retrieve:     'my activity history',
+  web_search:          'that topic',
+  command_execute:     'that command',
+  command_automate:    'that task',
+  general_knowledge:   'that topic'
+};
+
+/**
+ * Layer 1: Detect short follow-up patterns and carry the previous intent.
+ * Returns { carriedIntent, resolvedMessage } or null if no carryover applies.
+ */
+function detectIntentCarryover(message, conversationHistory) {
+  const msg = message.trim().toLowerCase().replace(/[?!.]+$/, '');
+
+  // Patterns that are pure temporal/deictic follow-ups with no standalone intent
+  const FOLLOWUP_PATTERNS = [
+    /^what about now$/,
+    /^and now$/,
+    /^now what$/,
+    /^what now$/,
+    /^how about now$/,
+    /^what about that$/,
+    /^and that$/,
+    /^what about this$/,
+    /^same question$/,
+    /^again$/,
+    /^one more time$/,
+    /^still$/,
+    /^still the same\??$/,
+    /^what about the same\??$/
+  ];
+
+  const isFollowup = FOLLOWUP_PATTERNS.some(p => p.test(msg));
+  if (!isFollowup) return null;
+
+  // Find the most recent user intent from conversation history
+  // We look for the last user message that had a clear intent
+  const recentUserMessages = conversationHistory
+    .filter(m => m.role === 'user')
+    .slice(-5)
+    .reverse(); // most recent first
+
+  // Map of previous user messages to likely intents (simple heuristic)
+  const SCREEN_PATTERNS = /\b(screen|see|show|look|page|window|what.*(on|in).*screen|what do you see|what.*(visible|showing|displayed))\b/i;
+  const MEMORY_PATTERNS = /\b(was i|did i|have i|what did i|what apps|what sites|history|activity)\b/i;
+
+  let previousIntent = null;
+  for (const m of recentUserMessages) {
+    const content = m.content || '';
+    if (SCREEN_PATTERNS.test(content)) {
+      previousIntent = 'screen_intelligence';
+      break;
+    }
+    if (MEMORY_PATTERNS.test(content)) {
+      previousIntent = 'memory_retrieve';
+      break;
+    }
+  }
+
+  if (!previousIntent) return null;
+
+  // Build an expanded message that the intent classifier can understand
+  const topic = INTENT_TOPICS[previousIntent] || 'that';
+  const isNowVariant = /\bnow\b/.test(msg);
+  const resolvedMessage = isNowVariant
+    ? `what do you see on ${topic} right now`
+    : `what about ${topic}`;
+
+  return { carriedIntent: previousIntent, resolvedMessage };
+}
+
+/**
+ * Layer 2: Does this message contain pronouns that need Python coreference?
+ * Only call the service when there's an actual pronoun to resolve.
+ */
+function needsPronounResolution(message) {
+  return /\b(he|she|it|they|him|her|his|their|them|its|this|that|these|those)\b/i.test(message);
 }
 
 module.exports = async function resolveReferences(state) {
@@ -45,32 +129,57 @@ module.exports = async function resolveReferences(state) {
     };
   }
 
+  // ── Fetch fresh conversation history ─────────────────────────────────────
+  let conversationHistory = [];
   try {
-    // ── Fetch fresh conversation history so coreference has full context ──────
-    let conversationHistory = [];
-    try {
-      const sessionId = context?.sessionId;
-      if (sessionId) {
-        const histResult = await mcpAdapter.callService('conversation', 'message.list', {
-          sessionId,
-          limit: 10,
-          direction: 'DESC'
-        });
-        const histData = histResult.data || histResult;
-        conversationHistory = (histData.messages || [])
-          .map(msg => ({
-            role: msg.sender === 'user' ? 'user' : 'assistant',
-            content: stripHtml(msg.text || msg.content || ''),
-            timestamp: msg.timestamp
-          }))
-          .reverse(); // chronological order for coreference context
-        logger.debug(`[Node:ResolveReferences] Fetched ${conversationHistory.length} messages for context`);
-      }
-    } catch (histErr) {
-      logger.debug('[Node:ResolveReferences] Could not fetch history, proceeding without:', histErr.message);
+    const sessionId = context?.sessionId;
+    if (sessionId) {
+      const histResult = await mcpAdapter.callService('conversation', 'message.list', {
+        sessionId,
+        limit: 10,
+        direction: 'DESC'
+      });
+      const histData = histResult.data || histResult;
+      conversationHistory = (histData.messages || [])
+        .map(msg => ({
+          role: msg.sender === 'user' ? 'user' : 'assistant',
+          content: stripHtml(msg.text || msg.content || ''),
+          timestamp: msg.timestamp
+        }))
+        .reverse(); // chronological order
+      logger.debug(`[Node:ResolveReferences] Fetched ${conversationHistory.length} messages for context`);
     }
+  } catch (histErr) {
+    logger.debug('[Node:ResolveReferences] Could not fetch history, proceeding without:', histErr.message);
+  }
 
-    // ── Call coreference service ──────────────────────────────────────────────
+  // ── Layer 1: JS intent carryover (no network call) ────────────────────────
+  const carryover = detectIntentCarryover(message, conversationHistory);
+  if (carryover) {
+    logger.debug(`[Node:ResolveReferences] Intent carryover: "${message}" → "${carryover.resolvedMessage}" (intent: ${carryover.carriedIntent})`);
+    return {
+      ...state,
+      resolvedMessage: carryover.resolvedMessage,
+      originalMessage: message,
+      carriedIntent: carryover.carriedIntent,
+      coreferenceReplacements: [],
+      coreferenceMethod: 'intent-carryover'
+    };
+  }
+
+  // ── Layer 2: Python coreference (pronoun resolution only) ─────────────────
+  if (!needsPronounResolution(message)) {
+    logger.debug('[Node:ResolveReferences] No pronouns detected, skipping coreference service');
+    return {
+      ...state,
+      resolvedMessage: message,
+      originalMessage: message,
+      coreferenceReplacements: [],
+      coreferenceMethod: 'none'
+    };
+  }
+
+  try {
     const result = await mcpAdapter.callService('coreference', 'resolve', {
       message,
       conversationHistory: conversationHistory.slice(-10),
@@ -81,16 +190,25 @@ module.exports = async function resolveReferences(state) {
     });
 
     const data = result.data || result;
-    const resolvedMessage = data.resolvedMessage || message;
+    let resolvedMessage = data.resolvedMessage || message;
     const replacements = data.replacements || [];
     const method = data.method || 'unknown';
 
-    if (replacements.length > 0) {
-      logger.debug(`[Node:ResolveReferences] Resolved ${replacements.length} reference(s) via ${method}`);
+    // Guard: reject bad simple_fallback resolutions that change meaning
+    // (simple_fallback sometimes mangles messages — only accept if confidence is high)
+    if (method === 'simple_fallback' && replacements.length > 0) {
+      const allHighConfidence = replacements.every(r => (r.confidence || 0) >= 0.85);
+      if (!allHighConfidence) {
+        logger.debug('[Node:ResolveReferences] Rejecting low-confidence simple_fallback resolution, using original');
+        resolvedMessage = message;
+      }
+    }
+
+    if (resolvedMessage !== message) {
+      logger.debug(`[Node:ResolveReferences] Resolved via ${method}: "${message}" → "${resolvedMessage}"`);
       replacements.forEach(r =>
         logger.debug(`  "${r.original}" → "${r.resolved}" (${Math.round((r.confidence || 0) * 100)}%)`)
       );
-      logger.debug(`[Node:ResolveReferences] Resolved message: "${resolvedMessage}"`);
     } else {
       logger.debug('[Node:ResolveReferences] No references resolved, message unchanged');
     }
@@ -104,7 +222,6 @@ module.exports = async function resolveReferences(state) {
     };
 
   } catch (error) {
-    // Graceful fallback — coreference service down should never block the graph
     logger.debug('[Node:ResolveReferences] Service unavailable, using original message:', error.message);
     return {
       ...state,
