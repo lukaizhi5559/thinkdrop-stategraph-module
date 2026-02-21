@@ -8,10 +8,16 @@
  */
 
 module.exports = async function parseIntent(state) {
-  const { mcpAdapter, message, context } = state;
+  const { mcpAdapter, message, resolvedMessage, context } = state;
   const logger = state.logger || console;
 
+  // Prefer coreference-resolved message for classification
+  const classifyMessage = resolvedMessage || message;
+
   logger.debug('[Node:ParseIntent] Parsing intent...');
+  if (resolvedMessage && resolvedMessage !== message) {
+    logger.debug(`[Node:ParseIntent] Using resolved message: "${resolvedMessage}"`);
+  }
 
   // Check if MCP adapter is available
   if (!mcpAdapter) {
@@ -22,7 +28,7 @@ module.exports = async function parseIntent(state) {
   try {
     // Try to use phi4 service for ML-based classification
     const result = await mcpAdapter.callService('phi4', 'intent.parse', {
-      message: message,
+      message: classifyMessage,
       context: {
         sessionId: context?.sessionId,
         userId: context?.userId

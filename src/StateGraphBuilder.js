@@ -18,6 +18,7 @@ const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
+const resolveReferencesNode = require('./nodes/resolveReferences');
 
 class StateGraphBuilder {
   /**
@@ -153,6 +154,7 @@ class StateGraphBuilder {
     
     // Full nodes with intent-based routing
     const nodes = {
+      resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
@@ -165,7 +167,8 @@ class StateGraphBuilder {
     
     // Intent-based routing (matches DistilBERT classifier intents)
     const edges = {
-      start: 'parseIntent',
+      start: 'resolveReferences',
+      resolveReferences: 'parseIntent',
       
       // Router: Route based on intent type
       parseIntent: (state) => {
