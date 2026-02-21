@@ -28,30 +28,38 @@ function parseDateRange(message) {
   const y = now.getFullYear();
   const m = now.getMonth();
 
-  const iso = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
+  // CRITICAL: DB stores timestamps in LOCAL time (e.g. "2026-02-20 20:02:08")
+  // Must format dates as local time, NOT UTC (toISOString() would give wrong offset)
+  const iso = (d) => {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  };
   const startOf = (d) => { const r = new Date(d); r.setHours(0,0,0,0); return r; };
   const endOf   = (d) => { const r = new Date(d); r.setHours(23,59,59,999); return r; };
 
+  // Helper: parse a time-of-day from a query string, returns hour (0-23) or null
+  // Checks noon/midnight keywords FIRST, then numeric time
+  function parseTimeOfDay(str) {
+    if (/\bnoon\b/.test(str)) return { hour: 12, minute: 0 };
+    if (/\bmidnight\b/.test(str)) return { hour: 0, minute: 0 };
+    const m = str.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+    if (!m) return null;
+    let hour = parseInt(m[1]);
+    const minute = m[2] ? parseInt(m[2]) : 0;
+    const meridiem = m[3];
+    if (meridiem === 'pm' && hour < 12) hour += 12;
+    else if (meridiem === 'am' && hour === 12) hour = 0;
+    else if (!meridiem && hour >= 1 && hour <= 6) hour += 12; // 1-6 without am/pm → pm
+    return { hour, minute };
+  }
+
   // today / this morning / this afternoon / this evening
   if (/\b(today|this morning|this afternoon|this evening)\b/.test(q)) {
-    // Check for specific time-of-day: "at noon", "at 3", "around 3pm", "at 3:30"
-    const specificTime = q.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/) ||
-                         q.match(/\b(noon|midnight)\b/);
-    if (specificTime) {
-      let hour, minute = 0;
-      if (specificTime[0] === 'noon' || specificTime[1] === 'noon') { hour = 12; }
-      else if (specificTime[0] === 'midnight' || specificTime[1] === 'midnight') { hour = 0; }
-      else {
-        hour = parseInt(specificTime[1]);
-        minute = specificTime[2] ? parseInt(specificTime[2]) : 0;
-        const meridiem = specificTime[3];
-        if (meridiem === 'pm' && hour < 12) hour += 12;
-        else if (meridiem === 'am' && hour === 12) hour = 0;
-        else if (!meridiem && hour < 7) hour += 12; // assume pm for ambiguous hours < 7
-      }
+    const tod = parseTimeOfDay(q);
+    if (tod) {
       const windowMins = 30;
-      const start = new Date(now); start.setHours(hour, Math.max(0, minute - windowMins), 0, 0);
-      const end   = new Date(now); end.setHours(hour, minute + windowMins, 59, 999);
+      const start = new Date(now); start.setHours(tod.hour, Math.max(0, tod.minute - windowMins), 0, 0);
+      const end   = new Date(now); end.setHours(tod.hour, tod.minute + windowMins, 59, 999);
       return { startDate: iso(start), endDate: iso(end) };
     }
     return { startDate: iso(startOf(now)), endDate: iso(endOf(now)) };
@@ -60,48 +68,33 @@ function parseDateRange(message) {
   // yesterday / anything yesterday / what about yesterday
   if (/\byesterday\b/.test(q)) {
     const d = new Date(now); d.setDate(d.getDate() - 1);
-    // Check for specific time-of-day within yesterday
-    const specificTime = q.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/) ||
-                         q.match(/\b(noon|midnight)\b/);
-    if (specificTime) {
-      let hour, minute = 0;
-      if (specificTime[0] === 'noon' || specificTime[1] === 'noon') { hour = 12; }
-      else if (specificTime[0] === 'midnight' || specificTime[1] === 'midnight') { hour = 0; }
-      else {
-        hour = parseInt(specificTime[1]);
-        minute = specificTime[2] ? parseInt(specificTime[2]) : 0;
-        const meridiem = specificTime[3];
-        if (meridiem === 'pm' && hour < 12) hour += 12;
-        else if (meridiem === 'am' && hour === 12) hour = 0;
-        else if (!meridiem && hour < 7) hour += 12;
-      }
+    const tod = parseTimeOfDay(q);
+    if (tod) {
       const windowMins = 30;
-      const start = new Date(d); start.setHours(hour, Math.max(0, minute - windowMins), 0, 0);
-      const end   = new Date(d); end.setHours(hour, minute + windowMins, 59, 999);
+      const start = new Date(d); start.setHours(tod.hour, Math.max(0, tod.minute - windowMins), 0, 0);
+      const end   = new Date(d); end.setHours(tod.hour, tod.minute + windowMins, 59, 999);
       return { startDate: iso(start), endDate: iso(end) };
     }
     return { startDate: iso(startOf(d)), endDate: iso(endOf(d)) };
   }
 
   // "around 3", "at 3pm", "at noon" (without today/yesterday — assume today)
-  const standaloneTime = q.match(/\b(?:at|around|about)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/) ||
-                         q.match(/\b(?:at|around)\s+(noon|midnight)\b/);
-  if (standaloneTime && !q.match(/\b(today|yesterday|this|last|week|month|year)\b/)) {
-    let hour, minute = 0;
-    const tok = standaloneTime[1];
-    if (tok === 'noon') { hour = 12; }
-    else if (tok === 'midnight') { hour = 0; }
-    else {
-      hour = parseInt(tok);
-      minute = standaloneTime[2] ? parseInt(standaloneTime[2]) : 0;
-      const meridiem = standaloneTime[3];
-      if (meridiem === 'pm' && hour < 12) hour += 12;
-      else if (meridiem === 'am' && hour === 12) hour = 0;
+  if (!q.match(/\b(today|yesterday|this|last|week|month|year)\b/)) {
+    const tod = parseTimeOfDay(q);
+    if (tod) {
+      const windowMins = 30;
+      const start = new Date(now); start.setHours(tod.hour, Math.max(0, tod.minute - windowMins), 0, 0);
+      const end   = new Date(now); end.setHours(tod.hour, tod.minute + windowMins, 59, 999);
+      return { startDate: iso(start), endDate: iso(end) };
     }
-    const windowMins = 30;
-    const start = new Date(now); start.setHours(hour, Math.max(0, minute - windowMins), 0, 0);
-    const end   = new Date(now); end.setHours(hour, minute + windowMins, 59, 999);
-    return { startDate: iso(start), endDate: iso(end) };
+  }
+
+  // last N minutes / in last N minutes / past N minutes
+  const minsMatch = q.match(/\b(?:last|past|in\s+(?:the\s+)?last)\s+(\d+)\s*(?:minute|min)s?\b/);
+  if (minsMatch) {
+    const mins = parseInt(minsMatch[1]);
+    const start = new Date(now.getTime() - mins * 60 * 1000);
+    return { startDate: iso(start), endDate: iso(now) };
   }
 
   // N minutes/mins ago (e.g. "15 mins ago", "1 minute ago", "what about 15 mins ago")
