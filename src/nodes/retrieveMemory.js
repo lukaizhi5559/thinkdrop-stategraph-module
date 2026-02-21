@@ -28,8 +28,8 @@ function parseDateRange(message) {
   const y = now.getFullYear();
   const m = now.getMonth();
 
-  // DuckDB CURRENT_TIMESTAMP is UTC — string comparisons must also be UTC
-  const iso = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
+  // DB stores local timestamps (CURRENT_TIMESTAMP returns local time in this setup)
+  const iso = (d) => { const pad = n => String(n).padStart(2,'0'); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
   const startOf = (d) => { const r = new Date(d); r.setHours(0,0,0,0); return r; };
   const endOf   = (d) => { const r = new Date(d); r.setHours(23,59,59,999); return r; };
 
@@ -98,6 +98,12 @@ function parseDateRange(message) {
   if (minsAgoMatch) {
     const mins = parseInt(minsAgoMatch[1]);
     const start = new Date(now.getTime() - mins * 60 * 1000);
+    return { startDate: iso(start), endDate: iso(now) };
+  }
+
+  // a couple minutes ago / a few minutes ago
+  if (/\b(a\s+couple(?:\s+of)?|a\s+few)\s+minutes?\s+ago\b/.test(q)) {
+    const start = new Date(now.getTime() - 5 * 60 * 1000);
     return { startDate: iso(start), endDate: iso(now) };
   }
 
