@@ -6,6 +6,7 @@
   "type": "commonjs",
   "scripts": {
     "test": "node test/intent-classifier.test.js",
+    "test:unit": "node test/unit.test.js",
     "test:full": "node test/full-stategraph.test.js"
   },
   "keywords": [

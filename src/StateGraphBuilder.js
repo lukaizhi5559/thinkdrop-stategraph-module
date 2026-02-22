@@ -16,6 +16,8 @@ const retrieveMemoryNode = require('./nodes/retrieveMemory');
 const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
+const planSkillsNode = require('./nodes/planSkills');
+const recoverSkillNode = require('./nodes/recoverSkill');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
 const resolveReferencesNode = require('./nodes/resolveReferences');
@@ -159,7 +161,9 @@ class StateGraphBuilder {
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
+      planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
+      recoverSkill: (state) => recoverSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
       logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
@@ -185,8 +189,13 @@ class StateGraphBuilder {
           return 'retrieveMemory';
         }
         
-        // Command execution: all command types (execute, automate, guide)
-        if (intentType === 'command_execute' || intentType === 'command_automate' || intentType === 'command_guide') {
+        // Command automation: goes through skill planner first
+        if (intentType === 'command_automate') {
+          return 'planSkills';
+        }
+        
+        // Simple command execution or guide: direct to executeCommand
+        if (intentType === 'command_execute' || intentType === 'command_guide') {
           return 'executeCommand';
         }
         
@@ -212,18 +221,46 @@ class StateGraphBuilder {
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',
       
-      // Command execution path
+      // planSkills → executeCommand (plan ready) or logConversation (plan error)
+      planSkills: (state) => {
+        if (state.planError && !state.skillPlan) {
+          logger.debug(`[StateGraph:Router] planSkills failed: ${state.planError}`);
+          return 'logConversation';
+        }
+        return 'executeCommand';
+      },
+
+      // executeCommand cycle: next step, recover on failure, or done
       executeCommand: (state) => {
-        // If command already has an answer, log and end
-        if (state.answer) {
+        // Step failed — route to recovery
+        if (state.failedStep) {
+          return 'recoverSkill';
+        }
+        // All steps done or has final answer
+        if (state.commandExecuted || state.answer) {
           return 'logConversation';
         }
-        // If automation plan generated, log and end
-        if (state.automationPlan) {
-          return 'logConversation';
+        // More steps remaining — loop back
+        if (Array.isArray(state.skillPlan) && state.skillCursor < state.skillPlan.length) {
+          return 'executeCommand';
         }
-        // Otherwise, generate answer with LLM
-        return 'answer';
+        return 'logConversation';
+      },
+
+      // recoverSkill → retry step, replan, or surface question to user
+      recoverSkill: (state) => {
+        const action = state.recoveryAction;
+        if (action === 'auto_patch') {
+          logger.debug('[StateGraph:Router] Recovery: auto_patch → retry executeCommand');
+          return 'executeCommand';
+        }
+        if (action === 'replan') {
+          logger.debug('[StateGraph:Router] Recovery: replan → planSkills');
+          return 'planSkills';
+        }
+        // ask_user: state.answer is already set with the question
+        logger.debug('[StateGraph:Router] Recovery: ask_user → logConversation');
+        return 'logConversation';
       },
       
       // Screen intelligence path

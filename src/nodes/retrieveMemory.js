@@ -89,6 +89,19 @@ function parseDateRange(message) {
   // yesterday / anything yesterday / what about yesterday
   if (/\byesterday\b/.test(q)) {
     const d = new Date(now); d.setDate(d.getDate() - 1);
+    // Check for explicit time range first: "yesterday around 8 - 10am", "yesterday 9 to 11am"
+    const trm = q.match(/\b(\d{1,2})(?::(\d{2}))?\s*(?:am|pm)?\s*(?:to|and|-)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+    if (trm) {
+      let h1 = parseInt(trm[1]), m1 = trm[2] ? parseInt(trm[2]) : 0;
+      let h2 = parseInt(trm[3]), m2 = trm[4] ? parseInt(trm[4]) : 59;
+      const mer = trm[5] || (q.includes('morning') ? 'am' : null);
+      if (mer === 'pm' && h2 < 12) { h1 += (h1 < 12 ? 12 : 0); h2 += 12; }
+      else if (mer === 'am') { /* keep as-is */ }
+      else if (!mer && h1 >= 1 && h1 <= 6) { h1 += 12; h2 += (h2 < 12 ? 12 : 0); }
+      const start = new Date(d); start.setHours(h1, m1, 0, 0);
+      const end   = new Date(d); end.setHours(h2, m2, 59, 999);
+      return { startDate: iso(start), endDate: iso(end) };
+    }
     const tod = parseTimeOfDay(q);
     if (tod) {
       const windowMins = 30;
@@ -119,17 +132,20 @@ function parseDateRange(message) {
   }
 
   // N minutes/mins ago (e.g. "15 mins ago", "1 minute ago", "what about 15 mins ago")
+  // Extend endDate by 5 minutes to catch messages logged slightly after the referenced time
   const minsAgoMatch = q.match(/\b(\d+)\s*(?:minute|min)s?\s+ago\b/);
   if (minsAgoMatch) {
     const mins = parseInt(minsAgoMatch[1]);
     const start = new Date(now.getTime() - mins * 60 * 1000);
-    return { startDate: iso(start), endDate: iso(now) };
+    const end = new Date(now.getTime() + 5 * 60 * 1000);
+    return { startDate: iso(start), endDate: iso(end) };
   }
 
   // a couple minutes ago / a few minutes ago
   if (/\b(a\s+couple(?:\s+of)?|a\s+few)\s+minutes?\s+ago\b/.test(q)) {
     const start = new Date(now.getTime() - 5 * 60 * 1000);
-    return { startDate: iso(start), endDate: iso(now) };
+    const end = new Date(now.getTime() + 5 * 60 * 1000);
+    return { startDate: iso(start), endDate: iso(end) };
   }
 
   // N hours ago / an hour or 2 ago / a couple hours ago
@@ -320,9 +336,44 @@ module.exports = async function retrieveMemory(state) {
   }
 
   try {
-    // Parallel fetch: conversation history and memories
-    const [conversationResult, memoriesResult] = await Promise.all([
-      // Conversation history (only if sessionId is known)
+    let dateRange = parseDateRange(resolvedMessage || message);
+
+    // If no dateRange and this is a short continuation (≤4 words like "anything else", "what else",
+    // "more", "go on"), inherit the dateRange from the most recent prior user message that had one.
+    // This makes follow-ups stay in the same temporal context as the prior query.
+    const msgWords = (resolvedMessage || message).trim().split(/\s+/).filter(Boolean).length;
+    if (!dateRange && msgWords <= 4 && context?.sessionId) {
+      try {
+        const histResult = await mcpAdapter.callService('conversation', 'message.list', {
+          sessionId: context.sessionId,
+          limit: 10,
+          direction: 'DESC'
+        });
+        const histData = histResult.data || histResult;
+        const recentMsgs = (histData.messages || [])
+          .filter(m => m.sender === 'user')
+          .slice(0, 5); // most recent first (DESC)
+        for (const m of recentMsgs) {
+          const inherited = parseDateRange(m.text || m.content || '');
+          if (inherited) {
+            dateRange = inherited;
+            logger.debug(`[Node:RetrieveMemory] Inherited dateRange from prior message: "${m.text || m.content}" → ${JSON.stringify(dateRange)}`);
+            break;
+          }
+        }
+      } catch (histErr) {
+        logger.debug('[Node:RetrieveMemory] Could not fetch history for dateRange inheritance:', histErr.message);
+      }
+    }
+
+    const searchQuery = buildSearchQuery(message, resolvedMessage);
+    const minSimilarity = dateRange ? 0.1 : 0.25;
+
+    logger.debug(`[Node:RetrieveMemory] Search query: "${searchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | minSimilarity: ${minSimilarity}`);
+
+    // Parallel fetch: current session history + cross-session date query + long-term memories
+    const [conversationResult, crossSessionResult, memoriesResult] = await Promise.all([
+      // Current session conversation history
       context?.sessionId
         ? mcpAdapter.callService('conversation', 'message.list', {
             sessionId: context.sessionId,
@@ -334,41 +385,73 @@ module.exports = async function retrieveMemory(state) {
           })
         : Promise.resolve({ messages: [] }),
 
+      // Cross-session messages by date range (for "yesterday", "last week", etc.)
+      dateRange
+        ? mcpAdapter.callService('conversation', 'message.listByDate', {
+            startDate: dateRange.startDate,
+            endDate: dateRange.endDate,
+            limit: 30,
+            userId: context?.userId
+          }).catch(err => {
+            logger.warn('[Node:RetrieveMemory] Cross-session fetch failed:', err.message);
+            return { messages: [] };
+          })
+        : Promise.resolve({ messages: [] }),
+
       // Long-term memories (skip for meta-questions)
-      intent?.type !== 'context_query' 
-        ? (() => {
-            const dateRange = parseDateRange(resolvedMessage || message);
-            const searchQuery = buildSearchQuery(message, resolvedMessage);
-            // When a date range is applied, lower similarity threshold — the time filter
-            // does the heavy lifting; we don't want to miss results due to semantic mismatch
-            const minSimilarity = dateRange ? 0.1 : 0.25;
-            logger.debug(`[Node:RetrieveMemory] Search query: "${searchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | minSimilarity: ${minSimilarity}`);
-            return mcpAdapter.callService('user-memory', 'memory.search', {
-              query: searchQuery,
-              limit: 10,
-              userId: context?.userId,
-              minSimilarity,
-              ...(dateRange || {})
-            }).catch(err => {
-              logger.warn('[Node:RetrieveMemory] Memory search failed:', err.message);
-              return { results: [] };
-            });
-          })()
+      intent?.type !== 'context_query'
+        ? mcpAdapter.callService('user-memory', 'memory.search', {
+            query: searchQuery,
+            limit: 10,
+            userId: context?.userId,
+            minSimilarity,
+            ...(dateRange || {})
+          }).catch(err => {
+            logger.warn('[Node:RetrieveMemory] Memory search failed:', err.message);
+            return { results: [] };
+          })
         : Promise.resolve({ results: [] })
     ]);
 
     // MCP protocol wraps responses in 'data' field
     const conversationData = conversationResult.data || conversationResult;
+    const crossSessionData = crossSessionResult.data || crossSessionResult;
     const memoriesData = memoriesResult.data || memoriesResult;
 
-    // Process conversation history (reverse to chronological order)
-    const conversationHistory = (conversationData.messages || [])
+    if (crossSessionData.messages?.length > 0) {
+      logger.debug(`[Node:RetrieveMemory] Cross-session fetch: ${crossSessionData.messages.length} messages from date range`);
+    }
+
+    // When a date range is detected, use cross-session messages as the primary history.
+    // If listByDate returned nothing, fall back to current session so the answer node
+    // has at least the recent conversation to work with.
+    const crossSessionMessages = crossSessionData.messages || [];
+    const currentSessionMessages = conversationData.messages || [];
+    const primaryMessages = dateRange
+      ? (crossSessionMessages.length > 0 ? crossSessionMessages : currentSessionMessages)
+      : (() => {
+          // No date range: merge current session + any cross-session, deduplicate
+          const allMessages = [
+            ...(conversationData.messages || []),
+            ...(crossSessionData.messages || [])
+          ];
+          const seenIds = new Set();
+          return allMessages.filter(msg => {
+            if (seenIds.has(msg.id)) return false;
+            seenIds.add(msg.id);
+            return true;
+          });
+        })();
+
+    // Process conversation history (sort chronologically)
+    const conversationHistory = primaryMessages
       .map(msg => ({
         role: msg.sender === 'user' ? 'user' : 'assistant',
         content: msg.text,
         timestamp: msg.timestamp
       }))
-      .reverse();
+      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+      .slice(-30); // keep last 30 for date-range queries (more history needed)
 
     // Process memories
     const memories = (memoriesData.results || []).map(mem => ({

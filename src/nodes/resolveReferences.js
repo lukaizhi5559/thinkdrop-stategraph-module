@@ -40,95 +40,124 @@ const INTENT_TOPICS = {
 };
 
 /**
- * Layer 1: Detect short follow-up patterns and carry the previous intent.
+ * Layer 1: Detect follow-up messages and carry the previous intent forward.
  * Returns { carriedIntent, resolvedMessage } or null if no carryover applies.
+ *
+ * Principle: instead of maintaining an ever-growing list of exact regex patterns,
+ * we classify follow-ups by four orthogonal signals and read prior intent from
+ * conversation history directly. This is robust to new phrasings by design.
+ *
+ * Signal 1 — CONTINUATION: message is very short (≤4 words) with no standalone intent word.
+ *   e.g. "anything else", "what else", "more", "go on", "continue", "and?", "ok so?"
+ *
+ * Signal 2 — TEMPORAL ELLIPTICAL: message has a time word but no standalone intent topic.
+ *   e.g. "anything yesterday", "what about last week", "how about earlier"
+ *
+ * Signal 3 — DEICTIC MEMORY REF: message references retrieved content with an activity verb.
+ *   e.g. "what was I doing with these files", "why did I have those open", "tell me about them"
+ *
+ * Signal 4 — SCREEN NOW: message is a short "now" variant after a screen_intelligence turn.
+ *   e.g. "what about now", "and now?", "how about now"
+ *
+ * Prior intent is read from conversation history content heuristics (no stored metadata needed).
  */
-// Time words that indicate a temporal reference but no standalone intent topic
-const TEMPORAL_WORDS = /\b(today|yesterday|now|this morning|this afternoon|this evening|this week|last week|earlier|recently|at noon|at midnight|around \d|at \d)\b/i;
 
-// Words that indicate a clear standalone intent (not a follow-up)
-const STANDALONE_INTENT_WORDS = /\b(search|find|look up|google|wikipedia|define|explain|how to|what is|who is|weather|news|open|run|execute|install|download|remind|schedule|email|message|call)\b/i;
+// Words that indicate a clear standalone intent — message is NOT a follow-up if these appear.
+const STANDALONE_INTENT_WORDS = /\b(search|look up|google|wikipedia|define|explain|how to|who is|weather|news|open|run|execute|install|download|remind|schedule|email|send|call|create|make|delete|move|copy|rename|launch|start|stop|close|write|generate|build|deploy|find me|show me how)\b/i;
+
+// Time words that indicate a temporal reference
+const TEMPORAL_WORDS = /\b(today|yesterday|now|this morning|this afternoon|this evening|this week|last week|last night|last month|earlier|recently|at noon|at midnight|around \d|at \d)\b/i;
+
+// Deictic pronouns referring to prior retrieved content
+const DEICTIC_MEMORY_REFS = /\b(these|those|them|the ones|the files|the apps|the sites|the messages|the results)\b/i;
+
+// Activity verbs that pair with deictic refs to signal memory follow-up
+const ACTIVITY_VERBS = /\b(doing|working|using|looking|opening|open|running|editing|writing|reading|viewing|accessing|with|for|about|saved|created|deleted|moved|closed|have|had|were|was)\b/i;
+
+// Heuristics to classify prior user message intent from its content
+const PRIOR_SCREEN_SIGNALS = /\b(screen|what do you see|what.*(on|in).*screen|what.*(visible|showing|displayed)|describe.*screen|analyze.*screen|look at.*screen)\b/i;
+const PRIOR_MEMORY_SIGNALS = /\b(was i|did i|have i|what did i|what apps|what sites|what files|history|activity|working on|looking at|mentioned|files|yesterday|last week|last night|last month|earlier today|this morning|what were (we|you)|what did (we|you)|list.*i|show.*i (did|used|worked|opened))\b/i;
+const PRIOR_COMMAND_SIGNALS = /\b(open|run|execute|create|make|delete|move|copy|click|press|type|scroll|launch|install|download|send|email)\b/i;
+
+function inferIntentFromContent(content) {
+  if (PRIOR_SCREEN_SIGNALS.test(content)) return 'screen_intelligence';
+  if (PRIOR_MEMORY_SIGNALS.test(content)) return 'memory_retrieve';
+  if (PRIOR_COMMAND_SIGNALS.test(content)) return 'command_automate';
+  return null;
+}
 
 function detectIntentCarryover(message, conversationHistory) {
   const msg = message.trim().toLowerCase().replace(/[?!.]+$/, '');
-
-  // Pattern A: Exact short deictic follow-ups (no time word needed)
-  const EXACT_FOLLOWUP_PATTERNS = [
-    /^what about now$/,
-    /^and now$/,
-    /^now what$/,
-    /^what now$/,
-    /^how about now$/,
-    /^what about that$/,
-    /^and that$/,
-    /^what about this$/,
-    /^same question$/,
-    /^again$/,
-    /^one more time$/,
-    /^still$/,
-    /^still the same$/,
-    /^what about the same$/
-  ];
-
-  const isExactFollowup = EXACT_FOLLOWUP_PATTERNS.some(p => p.test(msg));
-
-  // Pattern B: Short temporal elliptical — message has a time word but no standalone intent topic
-  // e.g. "anything yesterday", "what about today at noon", "what about yesterday", "how about earlier"
-  const hasTemporalWord = TEMPORAL_WORDS.test(msg);
+  const words = msg.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
   const hasStandaloneIntent = STANDALONE_INTENT_WORDS.test(msg);
-  const wordCount = msg.split(/\s+/).filter(Boolean).length;
+  const hasTemporalWord = TEMPORAL_WORDS.test(msg);
+  const hasDeiticRef = DEICTIC_MEMORY_REFS.test(msg);
+  const hasActivityVerb = ACTIVITY_VERBS.test(msg);
+  const hasNow = /\bnow\b/.test(msg);
 
-  // Temporal elliptical: has time word, no standalone intent, and short (≤ 8 words)
-  // Also must match an elliptical prefix pattern OR be very short
-  const ELLIPTICAL_PREFIXES = /^(what about|anything|how about|and|what|show me|tell me about)\b/i;
+  // Signal 1: CONTINUATION — very short message (≤4 words), no standalone intent
+  // Covers: "anything else", "what else", "more", "go on", "continue", "and?", "ok so?"
+  // Excludes clear subject+verb sentences: "I like these", "these are interesting"
+  const CLEAR_SUBJECT_VERB = /^(i |they |he |she |it |we |these |those |that |this )\w/i;
+  const isContinuation = wordCount <= 4 && !hasStandaloneIntent && !CLEAR_SUBJECT_VERB.test(msg);
+
+  // Signal 2: TEMPORAL ELLIPTICAL — has time word, no standalone intent, short or elliptical prefix
+  const ELLIPTICAL_PREFIXES = /^(what about|anything|how about|and|what|show me|tell me about|anything about)\b/i;
   const isTemporalElliptical = hasTemporalWord && !hasStandaloneIntent &&
-    (wordCount <= 6 || ELLIPTICAL_PREFIXES.test(msg));
+    (wordCount <= 7 || ELLIPTICAL_PREFIXES.test(msg));
 
-  if (!isExactFollowup && !isTemporalElliptical) return null;
+  // Signal 3: DEICTIC MEMORY REF — references retrieved content with activity verb.
+  // Note: does NOT check hasStandaloneIntent — deictic ref is the stronger signal.
+  // "why did I have those open" has 'open' (standalone) but 'those' (deictic) wins.
+  const isDeiticMemoryFollowup = hasDeiticRef && hasActivityVerb;
 
-  // Find the most recent user intent from conversation history
+  // Signal 4: SCREEN NOW — short "now" variant (handled via continuation + prior intent)
+
+  // Location-scoping fragments — "in the misc folder", "on the desktop", "in ~/Documents"
+  // These are always command_automate refinements (narrow the search scope), never memory queries.
+  const isLocationScope = /^(in|on|under|inside|within|at)\b.*(folder|directory|desktop|downloads|documents|home|drive|disk|path|dir|\~\/)/i.test(msg) ||
+    /^(in|on)\s+the\s+\w+(\s+folder)?$/i.test(msg);
+  if (isLocationScope) {
+    return { carriedIntent: 'command_automate', resolvedMessage: message };
+  }
+
+  if (!isContinuation && !isTemporalElliptical && !isDeiticMemoryFollowup) return null;
+
+  // ── Determine prior intent from conversation history ──────────────────────
+  // Read the last 5 user messages, most recent first, and infer intent from content
   const recentUserMessages = conversationHistory
     .filter(m => m.role === 'user')
     .slice(-5)
-    .reverse(); // most recent first
-
-  const SCREEN_PATTERNS = /\b(screen|see|show|look|page|window|what.*(on|in).*screen|what do you see|what.*(visible|showing|displayed))\b/i;
-  const MEMORY_PATTERNS = /\b(was i|did i|have i|what did i|what apps|what sites|history|activity|working on|looking at|using|worked)\b/i;
+    .reverse();
 
   let previousIntent = null;
   for (const m of recentUserMessages) {
     const content = m.content || '';
-    if (SCREEN_PATTERNS.test(content)) {
-      previousIntent = 'screen_intelligence';
-      break;
-    }
-    if (MEMORY_PATTERNS.test(content)) {
-      previousIntent = 'memory_retrieve';
+    const inferred = inferIntentFromContent(content);
+    if (inferred) {
+      previousIntent = inferred;
       break;
     }
   }
 
-  // For temporal ellipticals with no prior context, default to memory_retrieve
-  // (time-based queries almost always mean "what was I doing at that time")
-  if (!previousIntent && isTemporalElliptical) {
-    previousIntent = 'memory_retrieve';
-  }
-
+  // Defaults when no prior intent found:
+  // - Deictic memory refs → memory_retrieve (user is asking about retrieved content)
+  // - Temporal ellipticals → memory_retrieve (time-based = "what was I doing then")
+  // - Pure continuations with no history → null (can't safely infer)
+  if (!previousIntent && isDeiticMemoryFollowup) previousIntent = 'memory_retrieve';
+  if (!previousIntent && isTemporalElliptical) previousIntent = 'memory_retrieve';
   if (!previousIntent) return null;
 
-  // Build an expanded message that the intent classifier can understand
+  // ── Build resolved message ────────────────────────────────────────────────
   const topic = INTENT_TOPICS[previousIntent] || 'that';
-  const isNowVariant = /\bnow\b/.test(msg);
-
   let resolvedMessage;
   if (previousIntent === 'screen_intelligence') {
-    resolvedMessage = isNowVariant
+    resolvedMessage = hasNow
       ? `what do you see on ${topic} right now`
       : `what do you see on ${topic}`;
   } else {
-    // For memory_retrieve, preserve the temporal context in the resolved message
-    // so parseDateRange in retrieveMemory can extract the date range
-    resolvedMessage = message; // keep original — date parsing handles it
+    resolvedMessage = message; // preserve original for date parsing downstream
   }
 
   return { carriedIntent: previousIntent, resolvedMessage };
@@ -194,7 +223,8 @@ module.exports = async function resolveReferences(state) {
       originalMessage: message,
       carriedIntent: carryover.carriedIntent,
       coreferenceReplacements: [],
-      coreferenceMethod: 'intent-carryover'
+      coreferenceMethod: 'intent-carryover',
+      conversationHistory
     };
   }
 
@@ -206,7 +236,8 @@ module.exports = async function resolveReferences(state) {
       resolvedMessage: message,
       originalMessage: message,
       coreferenceReplacements: [],
-      coreferenceMethod: 'none'
+      coreferenceMethod: 'none',
+      conversationHistory
     };
   }
 
@@ -249,7 +280,8 @@ module.exports = async function resolveReferences(state) {
       resolvedMessage,
       originalMessage: message,
       coreferenceReplacements: replacements,
-      coreferenceMethod: method
+      coreferenceMethod: method,
+      conversationHistory
     };
 
   } catch (error) {
@@ -259,7 +291,8 @@ module.exports = async function resolveReferences(state) {
       resolvedMessage: message,
       originalMessage: message,
       coreferenceReplacements: [],
-      coreferenceMethod: 'fallback'
+      coreferenceMethod: 'fallback',
+      conversationHistory
     };
   }
 };

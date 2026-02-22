@@ -34,6 +34,44 @@ module.exports = async function parseIntent(state) {
     };
   }
 
+  // Filesystem query override — must run BEFORE phi4 ML call.
+  // "Do I have X files", "list all apps on my computer", "find files on my desktop" etc.
+  // are always command_automate (mdfind/find/ls), never screen_intelligence or memory_retrieve.
+  const fileSearchPattern = /\b(do i have|are there|have i got|find all|list all|show me all|what files|what apps|what applications)\b.*\b(files?|folders?|apps?|applications?|documents?|photos?|images?|pdfs?|spreadsheets?)\b/i;
+  const fileSearchPattern2 = /\b(list|show|find|search for|do i have|are there)\b.*(files?|folders?|apps?|applications?)\b.*(on my|in my|computer|mac|desktop|laptop|downloads|documents|home)/i;
+  if (fileSearchPattern.test(classifyMessage) || fileSearchPattern2.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Filesystem query override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.95,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'filesystem-override', processingTimeMs: 0 }
+    };
+  }
+
+  // Temporal memory override — must run BEFORE phi4 ML call.
+  // Queries with time references + recall verbs are always memory_retrieve,
+  // regardless of what the ML model classifies (e.g. "list files yesterday" → command_automate).
+  const temporalMemoryPattern = /\b(yesterday|last (week|month|night|year)|this (morning|week|month)|earlier today|a (few )?(days?|weeks?|months?) ago)\b/i;
+  const recallVerbPattern = /\b(what|did|do|list|show|tell|recall|remember|find|which|how many|summarize|were|was|have)\b/i;
+  if (temporalMemoryPattern.test(classifyMessage) && recallVerbPattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Temporal memory override → memory_retrieve: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'memory_retrieve',
+        confidence: 0.95,
+        entities: [],
+        requiresMemoryAccess: true
+      },
+      metadata: { parser: 'temporal-override', processingTimeMs: 0 }
+    };
+  }
+
   // Check if MCP adapter is available
   if (!mcpAdapter) {
     logger.warn('[Node:ParseIntent] No MCP adapter - using rule-based fallback');

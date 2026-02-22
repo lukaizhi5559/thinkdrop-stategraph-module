@@ -17,10 +17,44 @@
  *   - Blocking:  full answer returned at once
  */
 
+const fs = require('fs');
+const path = require('path');
 const MCPLLMBackend = require('../backends/MCPLLMBackend');
 const VSCodeLLMBackend = require('../backends/VSCodeLLMBackend');
 
+// Load intent rules from answer.md at startup — editable without touching code
+function loadAnswerPrompts() {
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, '../prompts/answer.md'), 'utf8');
+    const rules = {};
+    let base = '';
+    let commandOutputLine = '';
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      if (!trimmed.includes('|') && (trimmed.startsWith('Answer') || (base === '' && !trimmed.startsWith('Command')))) {
+        base = base || trimmed;
+        continue;
+      }
+      if (trimmed.startsWith('Command output interpretation')) {
+        commandOutputLine = trimmed;
+        continue;
+      }
+      if (trimmed.includes('|')) {
+        const parts = trimmed.split('|');
+        const intent = parts[0];
+        const ruleLines = parts.slice(1).map(r => `\n- ${r}`);
+        rules[intent] = ruleLines.join('');
+      }
+    }
+    return { base, rules, commandOutputLine };
+  } catch (_) {
+    return null;
+  }
+}
+
 module.exports = async function answer(state) {
+  const ANSWER_PROMPTS = loadAnswerPrompts();
   const {
     mcpAdapter,
     llmBackend,           // Injected pluggable backend (optional)
@@ -116,8 +150,11 @@ module.exports = async function answer(state) {
     }
   }
 
-  // ─── Build system instructions (intent-driven, mirrors answer.cjs) ───────────
-  let systemInstructions = `Answer using the provided context. Be direct and natural.\n\nContext:`;
+  // ─── Build system instructions (intent-driven) ───────────────────────────────
+  const intentType = intent?.type || 'question';
+
+  const baseInstruction = ANSWER_PROMPTS?.base || 'Answer using the provided context. Be direct and natural.';
+  let systemInstructions = `${baseInstruction}\n\nContext:`;
 
   const contextSources = [];
   if (filteredMemories.length > 0) contextSources.push(`- ${filteredMemories.length} user memories`);
@@ -131,21 +168,33 @@ module.exports = async function answer(state) {
 
   systemInstructions += '\n\nRules:';
 
-  const intentType = intent?.type || 'question';
-  if (intentType === 'web_search' || intentType === 'search') {
-    systemInstructions += '\n- Answer using the web search results\n- Be factual and direct';
-  } else if (intentType === 'screen_intelligence' || intentType === 'vision') {
-    systemInstructions += '\n- Describe the screen content\n- Be specific about visible elements';
-  } else if (intentType === 'command_execute' || intentType === 'command_guide') {
-    systemInstructions += '\n- Interpret the command output as human-readable information\n- Be clear, concise, and helpful';
-  } else if (intentType === 'memory_store' || intentType === 'memory_retrieve') {
-    systemInstructions += '\n- Answer ONLY from the provided memories — do NOT guess or hallucinate\n- If the memories contain screen captures, list the specific apps and window titles you see\n- If the memories do not contain enough information to answer, say so explicitly';
+  // Load intent-specific rules from answer.md, fall back to inline defaults
+  const intentRules = ANSWER_PROMPTS?.rules;
+  if (intentRules?.[intentType]) {
+    systemInstructions += intentRules[intentType];
+  } else if (intentRules?.['default']) {
+    systemInstructions += intentRules['default'];
   } else {
-    systemInstructions += '\n- Use the provided context\n- Be helpful and concise';
+    // Inline fallback if .md not loaded
+    if (intentType === 'web_search' || intentType === 'search') {
+      systemInstructions += '\n- Answer using the web search results\n- Be factual and direct';
+    } else if (intentType === 'screen_intelligence' || intentType === 'vision') {
+      systemInstructions += '\n- Describe the screen content\n- Be specific about visible elements';
+    } else if (intentType === 'command_execute' || intentType === 'command_guide') {
+      systemInstructions += '\n- Interpret the command output as human-readable information\n- Be clear, concise, and helpful';
+    } else if (intentType === 'command_automate') {
+      systemInstructions += '\n- Summarize what was automated and the outcome of each step\n- If any step failed or was skipped, explain clearly\n- Be concise — one line per step';
+    } else if (intentType === 'memory_store' || intentType === 'memory_retrieve') {
+      systemInstructions += '\n- Answer using the provided Conversation History and Screen Activity & User Memories\n- The Conversation History contains the actual chat messages — use these to answer questions about past conversations\n- The Memories contain screen captures and activity — use these to answer questions about what the user was doing\n- Be specific: quote or summarize actual messages/topics from the history\n- Do NOT say you lack information if Conversation History or Memories are present in the prompt';
+    } else {
+      systemInstructions += '\n- Use the provided context\n- Be helpful and concise';
+    }
   }
 
   if (needsInterpretation) {
-    systemInstructions += '\n\nCommand output interpretation: Answer in 1 sentence based on the command output below.';
+    const cmdOutputLine = ANSWER_PROMPTS?.commandOutputLine ||
+      'Command output interpretation: Answer in 1 sentence based on the command output below.';
+    systemInstructions += `\n\n${cmdOutputLine}`;
   }
 
   // Inject screen context into system instructions (not into the user query)
@@ -196,6 +245,9 @@ module.exports = async function answer(state) {
   };
 
   // ─── Generate answer ─────────────────────────────────────────────────────────
+  logger.debug(`[Node:Answer] systemInstructions preview: ${systemInstructions.substring(0, 300)}`);
+  logger.debug(`[Node:Answer] conversationHistory: ${conversationHistory.length} msgs, memories: ${filteredMemories.length}`);
+
   try {
     const finalAnswer = await backend.generateAnswer(
       finalQuery,
