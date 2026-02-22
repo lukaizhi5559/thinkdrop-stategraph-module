@@ -66,7 +66,8 @@ module.exports = async function planSkills(state) {
     intent,
     context,
     recoveryContext,
-    conversationHistory = []
+    conversationHistory = [],
+    activeBrowserSessionId = null
   } = state;
 
   const logger = state.logger || console;
@@ -147,10 +148,15 @@ Adjust the plan to avoid the same failure.`;
     }
   }
 
+  // If there's an active browser session from a prior task, tell the LLM to reuse it
+  const browserSessionNote = activeBrowserSessionId
+    ? `\n\nACTIVE BROWSER SESSION: sessionId="${activeBrowserSessionId}" is already open with the correct site. Use this EXACT sessionId for all browser.act steps — do NOT navigate again unless the URL needs to change. Just use smartType or other actions directly on the existing tab.`
+    : '';
+
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${recoveryNote}${priorResultsNote}${conversationNote}`;
+User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResultsNote}${conversationNote}`;
 
   const payload = {
     query: planningQuery,
@@ -227,6 +233,64 @@ User request: "${userMessage}"${recoveryNote}${priorResultsNote}${conversationNo
         commandExecuted: false,
         answer: humanError
       };
+    }
+
+    // ── Enforce active browser session (single-site follow-ups only) ────────
+    // Only reuse the active session when the plan targets a SINGLE sessionId.
+    // Multi-tab plans (distinct sessionIds per site) are intentional — don't touch them.
+    if (activeBrowserSessionId && Array.isArray(skillPlan)) {
+      const browserSteps = skillPlan.filter(s => s.skill === 'browser.act');
+      if (browserSteps.length > 0) {
+        // Collect distinct sessionIds the LLM chose
+        const plannedSessionIds = new Set(browserSteps.map(s => s.args?.sessionId).filter(Boolean));
+        const isMultiTab = plannedSessionIds.size > 1;
+
+        if (isMultiTab) {
+          // Multi-site comparison plan — leave all sessionIds and navigates intact
+          logger.debug(`[Node:PlanSkills] Multi-tab plan detected (${plannedSessionIds.size} sessions) — preserving all navigates`);
+        } else {
+          // Single-site follow-up — enforce active sessionId and strip redundant navigate
+          skillPlan = skillPlan.map(step => {
+            if (step.skill !== 'browser.act') return step;
+            return { ...step, args: { ...step.args, sessionId: activeBrowserSessionId } };
+          });
+
+          // Check if the navigate step goes to the same domain as the active session
+          const navigateStep = skillPlan.find(s => s.skill === 'browser.act' && s.args?.action === 'navigate');
+          const activeBrowserUrl = state.activeBrowserUrl || null;
+
+          // Normalize known domain aliases (e.g. chat.openai.com ↔ chatgpt.com)
+          const DOMAIN_ALIASES = {
+            'chat.openai.com': 'chatgpt.com',
+            'chatgpt.com': 'chat.openai.com',
+            'www.google.com': 'google.com',
+            'google.com': 'www.google.com',
+          };
+          const normalizeDomain = (h) => DOMAIN_ALIASES[h] ? [h, DOMAIN_ALIASES[h]] : [h];
+
+          const isSameDomain = navigateStep && activeBrowserUrl
+            ? (() => {
+                try {
+                  const navHost = new URL(navigateStep.args.url).hostname;
+                  const activeHost = new URL(activeBrowserUrl).hostname;
+                  return normalizeDomain(navHost).includes(activeHost);
+                } catch (_) { return false; }
+              })()
+            : false;
+
+          if (isSameDomain) {
+            const withoutNavigate = skillPlan.filter(s => !(s.skill === 'browser.act' && s.args?.action === 'navigate'));
+            if (withoutNavigate.length > 0) {
+              skillPlan = withoutNavigate;
+              logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — stripped navigate (same domain), ${skillPlan.length} steps remain`);
+            }
+          } else if (navigateStep) {
+            logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — kept navigate (different/unknown domain)`);
+          } else {
+            logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — no navigate step`);
+          }
+        }
+      }
     }
 
     logger.debug(`[Node:PlanSkills] Plan ready: ${skillPlan.length} steps`);

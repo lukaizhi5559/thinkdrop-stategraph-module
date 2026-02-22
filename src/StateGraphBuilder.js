@@ -21,6 +21,7 @@ const recoverSkillNode = require('./nodes/recoverSkill');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
 const resolveReferencesNode = require('./nodes/resolveReferences');
+const synthesizeNode = require('./nodes/synthesize');
 
 class StateGraphBuilder {
   /**
@@ -165,6 +166,7 @@ class StateGraphBuilder {
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
       recoverSkill: (state) => recoverSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
+      synthesize: (state) => synthesizeNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
       logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
     };
@@ -236,11 +238,11 @@ class StateGraphBuilder {
         if (state.failedStep) {
           return 'recoverSkill';
         }
-        // All steps done or has final answer
+        // All steps done — answer is already set by executeCommand, skip answer node
         if (state.commandExecuted || state.answer) {
           return 'logConversation';
         }
-        // More steps remaining — loop back
+        // More steps remaining — loop back (synthesize now runs inline, no special routing needed)
         if (Array.isArray(state.skillPlan) && state.skillCursor < state.skillPlan.length) {
           return 'executeCommand';
         }
@@ -279,6 +281,7 @@ class StateGraphBuilder {
       // Standard path: all roads lead to logConversation before end
       retrieveMemory: 'answer',
       answer: 'logConversation',
+      synthesize: 'logConversation',
       logConversation: 'end'
     };
     

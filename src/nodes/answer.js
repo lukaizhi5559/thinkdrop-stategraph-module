@@ -72,7 +72,10 @@ module.exports = async function answer(state) {
     retryCount = 0,
     commandOutput = null,
     executedCommand = null,
-    needsInterpretation = false
+    needsInterpretation = false,
+    needsSynthesis = false,
+    synthesisContext = null,
+    synthesisPrompt = null
   } = state;
 
   const logger = state.logger || console;

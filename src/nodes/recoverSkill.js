@@ -232,6 +232,92 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger) 
     };
   }
 
+  // browser.act failures
+  if (skill === 'browser.act') {
+    const action = args.action || '';
+
+    // No input found — use page text to detect what's actually on the page (works for any site)
+    if (combinedError.includes('no visible input elements')) {
+      const sessionId = args.sessionId || 'default';
+      const currentUrl = failedStep.url || '';
+      const pageContext = (failedStep.pageContext || '').toLowerCase();
+
+      // Detect login/auth/marketing page from actual page content — no hardcoded URL map needed
+      const isLoginPage = pageContext.includes('sign in') || pageContext.includes('log in') ||
+        pageContext.includes('login') || pageContext.includes('create account') ||
+        pageContext.includes('continue with google') || pageContext.includes('continue with email') ||
+        pageContext.includes('enter your email') || pageContext.includes('get started') ||
+        pageContext.includes('sign up') || pageContext.includes('register');
+
+      if (isLoginPage && stepRetryCount === 0) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: page text indicates login/marketing page (${currentUrl}) → ASK_USER`);
+        return {
+          action: 'ASK_USER',
+          question: `The browser landed on a login or sign-up page instead of the app. Please log in to "${currentUrl}" in the browser, then reply "continue" to resume.`,
+          options: ['I am now logged in — continue', 'Abort the task']
+        };
+      }
+
+      // No login signals detected, or second failure — generic ask
+      if (stepRetryCount >= 1) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: no input found (retry ${stepRetryCount}) → ASK_USER`);
+        return {
+          action: 'ASK_USER',
+          question: `The browser couldn't find a text input on the page at "${currentUrl}". The page may require login or the site may have changed its layout.`,
+          options: ['I am logged in — skip this step and continue', 'Abort the task']
+        };
+      }
+    }
+
+    // Selector not found — REPLAN: replace waitForSelector+type with smartType (auto-discovers input)
+    if (combinedError.includes('timeout') && (combinedError.includes('selector') || args.selector)) {
+      if (stepRetryCount === 0) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act selector timeout → REPLAN with smartType`);
+        return {
+          action: 'REPLAN',
+          suggestion: `The selector "${args.selector}" was not found — the page likely uses a contenteditable div or a different input type. Replace any waitForSelector + type steps with a single smartType step, which auto-discovers the correct input element (works for input, textarea, and contenteditable divs).`,
+          constraint: `Replace the failed step with: { "skill": "browser.act", "args": { "action": "smartType", "text": "<the text to type>", "sessionId": "${args.sessionId || 'default'}" } }. Do NOT use waitForSelector before smartType — it handles waiting internally. Use the same sessionId as the rest of the plan.`
+        };
+      }
+      // Second failure after smartType also failed — ask user
+      logger.debug(`[Node:RecoverSkill] Fast-path: browser.act selector timeout (retry ${stepRetryCount}) → ASK_USER`);
+      return {
+        action: 'ASK_USER',
+        question: `The browser couldn't find any input element on the page to type into. Would you like me to take a screenshot so you can see what's visible?`,
+        options: ['Yes, take a screenshot', 'Cancel']
+      };
+    }
+
+    // Navigation failed (wrong URL, network error)
+    if (action === 'navigate' && (combinedError.includes('net::err') || combinedError.includes('failed to navigate'))) {
+      logger.debug(`[Node:RecoverSkill] Fast-path: browser.act navigate failed → ASK_USER`);
+      return {
+        action: 'ASK_USER',
+        question: `The browser couldn't load "${args.url}". Is the URL correct, or would you like to try a different address?`,
+        options: ['Try a different URL', 'Cancel']
+      };
+    }
+
+    // Browser/target closed unexpectedly — retry by reopening session
+    if (combinedError.includes('target closed') || combinedError.includes('browser closed') || combinedError.includes('browser has been closed')) {
+      if (stepRetryCount === 0) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act browser closed → REPLAN with new sessionId`);
+        return {
+          action: 'REPLAN',
+          suggestion: `The browser session was closed unexpectedly. Restart the task with a new sessionId.`,
+          constraint: `Use a new sessionId (e.g. "s${Date.now()}") — the previous session is gone.`
+        };
+      }
+      // Second attempt still failing — browser context is truly dead, ask user to restart
+      logger.debug(`[Node:RecoverSkill] Fast-path: browser.act browser closed (retry ${stepRetryCount}) → ASK_USER`);
+      return {
+        action: 'ASK_USER',
+        question: `The browser keeps closing unexpectedly. Please restart the app and try again.`,
+        options: ['Restart and retry', 'Cancel']
+      };
+    }
+  }
+
   // mkdir on root → suggest Desktop
   if (skill === 'shell.run' && args.cmd === 'mkdir') {
     if (combinedError.includes('permission denied') || combinedError.includes('read-only')) {

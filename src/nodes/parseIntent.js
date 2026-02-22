@@ -34,6 +34,52 @@ module.exports = async function parseIntent(state) {
     };
   }
 
+  // Browser automation override — must run BEFORE phi4 ML call.
+  // Detects by STRUCTURE, not by site name — works for any website or app, including new ones.
+  //
+  // Common English words that are NOT app/site destinations — used to avoid false positives
+  // when "on/in/using" appears in normal sentences ("search for files on my computer").
+  const NOT_A_SITE = /^(my|the|a|an|this|that|your|our|their|its|his|her|here|there|it|me|us|them|him|her|computer|mac|laptop|desktop|phone|device|system|machine|server|disk|drive|folder|file|screen|page|app|browser|internet|web|online|local|remote|cloud|network|home|work|office|school|store|shop|market|place|site|world|earth|time|day|week|month|year|morning|night|now|today|yesterday|tomorrow)$/i;
+  const isDestinationWord = (word) => word && word.length >= 2 && !NOT_A_SITE.test(word);
+
+  // Signal 1: URL in the message — any http/https/www or domain-like token
+  const urlPattern = /\b(https?:\/\/|www\.)\S+|\b\S+\.(com|org|io|ai|app|net|co|dev|gov|edu)\b/i;
+
+  // Signal 2: Navigation verb + destination — "go to X", "goto X", "navigate to X"
+  //   Works for any destination word (lowercase or uppercase, any site name)
+  const navVerbMatch = classifyMessage.match(/\b(go to|goto|navigate to|open|launch)\s+(\S+)/i);
+  const navVerbDest = navVerbMatch ? navVerbMatch[2].replace(/[.,!?]+$/, '') : null;
+  const hasNavVerb = navVerbDest && (urlPattern.test(navVerbDest) || isDestinationWord(navVerbDest));
+
+  // Signal 3: Action verb + destination preposition + named target (any word, any case)
+  //   "search for X on chatgpt", "search on gemini for X", "ask perplexity about X"
+  //   "type into notion", "post on linkedin", "check github for issues"
+  const destPrepMatch = classifyMessage.match(/\b(search|look up|ask|query|type|find|post|send|submit|check|browse|visit|go)\b.{0,50}\b(on|in|using|at|via|through|into)\s+(\S+)/i);
+  const destPrepWord = destPrepMatch ? destPrepMatch[3].replace(/[.,!?]+$/, '') : null;
+  const hasDestPrep = destPrepWord && isDestinationWord(destPrepWord);
+
+  // Signal 4: "[verb] [site] for/about X" — verb directly before destination, then purpose
+  //   "ask chatgpt for", "search gemini about", "check perplexity if"
+  const verbSiteForMatch = classifyMessage.match(/\b(ask|search|check|query|browse|visit)\s+(\S+)\s+(for|about|if|whether|how|what|when|where|who)\b/i);
+  const verbSiteDest = verbSiteForMatch ? verbSiteForMatch[2].replace(/[.,!?]+$/, '') : null;
+  const hasVerbSiteFor = verbSiteDest && isDestinationWord(verbSiteDest);
+
+  const isBrowserAutomation = urlPattern.test(classifyMessage) || hasNavVerb || hasDestPrep || hasVerbSiteFor;
+
+  if (isBrowserAutomation) {
+    logger.debug(`[Node:ParseIntent] Browser automation override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.97,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'browser-override', processingTimeMs: 0 }
+    };
+  }
+
   // Filesystem query override — must run BEFORE phi4 ML call.
   // "Do I have X files", "list all apps on my computer", "find files on my desktop" etc.
   // are always command_automate (mdfind/find/ls), never screen_intelligence or memory_retrieve.

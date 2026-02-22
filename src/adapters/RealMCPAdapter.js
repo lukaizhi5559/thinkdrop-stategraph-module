@@ -14,12 +14,12 @@ class RealMCPAdapter extends MCPAdapter {
     this.logger = options.logger || console;
   }
 
-  async callService(serviceName, action, params) {
+  async callService(serviceName, action, params, options = {}) {
     try {
       this.logger.debug(`[RealMCP] Calling ${serviceName}.${action}`);
       
-      // Delegate to existing MCPClient
-      const result = await this.mcpClient.callService(serviceName, action, params);
+      // Delegate to existing MCPClient — pass options so timeoutMs override works
+      const result = await this.mcpClient.callService(serviceName, action, params, options);
       
       return result;
     } catch (error) {

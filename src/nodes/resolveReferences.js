@@ -78,10 +78,44 @@ const ACTIVITY_VERBS = /\b(doing|working|using|looking|opening|open|running|edit
 const PRIOR_SCREEN_SIGNALS = /\b(screen|what do you see|what.*(on|in).*screen|what.*(visible|showing|displayed)|describe.*screen|analyze.*screen|look at.*screen)\b/i;
 const PRIOR_MEMORY_SIGNALS = /\b(was i|did i|have i|what did i|what apps|what sites|what files|history|activity|working on|looking at|mentioned|files|yesterday|last week|last night|last month|earlier today|this morning|what were (we|you)|what did (we|you)|list.*i|show.*i (did|used|worked|opened))\b/i;
 const PRIOR_COMMAND_SIGNALS = /\b(open|run|execute|create|make|delete|move|copy|click|press|type|scroll|launch|install|download|send|email)\b/i;
+// Browser automation signals — navigation to a specific site/app
+const PRIOR_BROWSER_SIGNALS = /\b(go to|goto|navigate to|open|launch|search.*on|ask.*on|type.*into|search.*in|search.*using|search.*via|search.*at)\b/i;
+
+// Words that are NOT site/app names — same list as parseIntent
+const NOT_A_SITE_WORD = /^(my|the|a|an|this|that|your|our|their|its|his|her|here|there|it|me|us|them|him|her|computer|mac|laptop|desktop|phone|device|system|machine|server|disk|drive|folder|file|screen|page|app|browser|internet|web|online|local|remote|cloud|network|home|work|office|school|store|shop|market|place|site|world|earth|time|day|week|month|year|morning|night|now|today|yesterday|tomorrow|for|and|or|but|the|in|on|at|to|of|with|by|from|up|about|into|through|during|before|after|above|below|between|out|off|over|under|again|further|then|once)$/i;
+
+/**
+ * Extract the destination site/app from a prior browser automation message.
+ * e.g. "go to chatgpt and search for pizza" → "chatgpt"
+ *      "search for vegan foods on gemini" → "gemini"
+ *      "search gemini for soups" → "gemini"
+ */
+function extractPriorSite(content) {
+  // Pattern: "go to X", "goto X", "navigate to X", "open X"
+  const navMatch = content.match(/\b(go to|goto|navigate to|open|launch)\s+(\S+)/i);
+  if (navMatch) {
+    const word = navMatch[2].replace(/[.,!?]+$/, '');
+    if (!NOT_A_SITE_WORD.test(word)) return word;
+  }
+  // Pattern: "search for X on [site]", "type into [site]", "ask [site] about X"
+  const onMatch = content.match(/\b(on|in|using|at|via|through|into)\s+(\S+)\s*$/i);
+  if (onMatch) {
+    const word = onMatch[2].replace(/[.,!?]+$/, '');
+    if (!NOT_A_SITE_WORD.test(word)) return word;
+  }
+  // Pattern: "search [site] for X" — site directly after verb
+  const verbSiteMatch = content.match(/\b(search|ask|check|query|browse|visit)\s+(\S+)\s+(for|about|if|how|what)/i);
+  if (verbSiteMatch) {
+    const word = verbSiteMatch[2].replace(/[.,!?]+$/, '');
+    if (!NOT_A_SITE_WORD.test(word)) return word;
+  }
+  return null;
+}
 
 function inferIntentFromContent(content) {
   if (PRIOR_SCREEN_SIGNALS.test(content)) return 'screen_intelligence';
   if (PRIOR_MEMORY_SIGNALS.test(content)) return 'memory_retrieve';
+  if (PRIOR_BROWSER_SIGNALS.test(content)) return 'command_automate';
   if (PRIOR_COMMAND_SIGNALS.test(content)) return 'command_automate';
   return null;
 }
@@ -95,6 +129,32 @@ function detectIntentCarryover(message, conversationHistory) {
   const hasDeiticRef = DEICTIC_MEMORY_REFS.test(msg);
   const hasActivityVerb = ACTIVITY_VERBS.test(msg);
   const hasNow = /\bnow\b/.test(msg);
+
+  // Browser follow-up: "search for X now", "now search for X", "search for X again", "also search for X"
+  // NOTE: intentionally does NOT check hasStandaloneIntent — "search" is a standalone word but
+  // "search for X now" is still a browser follow-up when prior context was browser automation.
+  // The guard is: prior history must contain a browser automation message.
+  const BROWSER_FOLLOWUP_MARKERS = /\b(now|again|also|too|next|then|still|instead)\b/i;
+  const SEARCH_VERB = /\b(search for|look up|find|ask about|query|type)\b/i;
+  const hasBrowserFollowupShape = SEARCH_VERB.test(msg) && BROWSER_FOLLOWUP_MARKERS.test(msg);
+
+  if (hasBrowserFollowupShape && conversationHistory.length > 0) {
+    const recentUserMsgs = conversationHistory.filter(m => m.role === 'user').slice(-5).reverse();
+    let priorSite = null;
+    let priorIsBrowser = false;
+    for (const m of recentUserMsgs) {
+      const content = m.content || '';
+      if (PRIOR_BROWSER_SIGNALS.test(content)) {
+        priorIsBrowser = true;
+        priorSite = extractPriorSite(content);
+        if (priorSite) break;
+      }
+    }
+    if (priorIsBrowser) {
+      const enriched = priorSite ? `${message} on ${priorSite}` : message;
+      return { carriedIntent: 'command_automate', resolvedMessage: enriched };
+    }
+  }
 
   // Signal 1: CONTINUATION — very short message (≤4 words), no standalone intent
   // Covers: "anything else", "what else", "more", "go on", "continue", "and?", "ok so?"
