@@ -153,6 +153,28 @@ module.exports = async function parseIntent(state) {
     };
   }
 
+  // File-write destination override — must run BEFORE phi4 ML call.
+  // Any prompt containing a file-write instruction ("save to ~/Desktop/file.md",
+  // "write to /tmp/out.txt") is always command_automate — the plan must write the file.
+  const fileWriteDestPattern = (
+    /\b(save|write|output|store|put)\b.{0,80}(to|into|as)\s+(~[/]|[/]|[.][/])[\w/.]+/i.test(classifyMessage) ||  // explicit path
+    /\b(save|write|output|store|put)\b.{0,80}(to|into)\s+(a\s+)?(file|txt|text file|markdown file|md file|\.txt|\.md|\.csv|\.json)\b/i.test(classifyMessage) ||  // "save to a file"
+    /\b(save|write|output)\b.{0,80}(on|in|to)\s+(my\s+)?(desktop|documents|downloads|home folder|home directory)\b/i.test(classifyMessage)  // "save to my desktop/documents"
+  );
+  if (fileWriteDestPattern) {
+    logger.debug(`[Node:ParseIntent] File-write destination override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.97,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'file-write-override', processingTimeMs: 0 }
+    };
+  }
+
   // Filesystem query override — must run BEFORE phi4 ML call.
   // "Do I have X files", "list all apps on my computer", "find files on my desktop" etc.
   // are always command_automate (mdfind/find/ls), never screen_intelligence or memory_retrieve.
@@ -175,7 +197,7 @@ module.exports = async function parseIntent(state) {
   // Temporal memory override — must run BEFORE phi4 ML call.
   // Queries with time references + recall verbs are always memory_retrieve,
   // regardless of what the ML model classifies (e.g. "list files yesterday" → command_automate).
-  const temporalMemoryPattern = /\b(yesterday|last (week|month|night|year)|this (morning|week|month)|earlier today|a (few )?(days?|weeks?|months?) ago)\b/i;
+  const temporalMemoryPattern = /\b(yesterday|last (week|month|night|year)|this (morning|week|month)|earlier today|a (few )?(days?|weeks?|months?) ago|(\d+|one|two|three|four|five|six|seven|eight|nine|ten) (days?|weeks?|months?) ago)\b/i;
   const recallVerbPattern = /\b(what|did|do|list|show|tell|recall|remember|find|which|how many|summarize|were|was|have)\b/i;
   if (temporalMemoryPattern.test(classifyMessage) && recallVerbPattern.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Temporal memory override → memory_retrieve: "${classifyMessage}"`);
@@ -214,6 +236,23 @@ module.exports = async function parseIntent(state) {
     const finalConfidence = intentData.confidence || 0.5;
     
     logger.debug(`[Node:ParseIntent] Classified as: ${finalIntent} (confidence: ${finalConfidence.toFixed(2)})`);
+
+    // Post-phi4 correction: low-confidence memory_store with retrieval verbs → memory_retrieve.
+    // phi4 sometimes misclassifies "give the date of that day", "tell me what X was" as memory_store.
+    const lowConfRetrievalVerb = /^(give|tell|show|what|which|when|where|who|how|list|find|recall|describe|explain)\b/i;
+    if (finalIntent === 'memory_store' && finalConfidence < 0.6 && lowConfRetrievalVerb.test(classifyMessage.trim())) {
+      logger.debug(`[Node:ParseIntent] Post-phi4 correction: low-confidence memory_store + retrieval verb → memory_retrieve`);
+      return {
+        ...state,
+        intent: {
+          type: 'memory_retrieve',
+          confidence: 0.80,
+          entities: intentData.entities || [],
+          requiresMemoryAccess: true
+        },
+        metadata: { parser: 'phi4-corrected-retrieve', processingTimeMs: intentData.metadata?.processingTimeMs || 0 }
+      };
+    }
 
     // Post-phi4 correction: low-confidence memory_store with action verbs → command_automate.
     // phi4 sometimes misclassifies "I need to renew/book/apply/fix..." as memory_store.

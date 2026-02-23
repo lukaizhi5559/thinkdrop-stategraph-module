@@ -175,7 +175,7 @@ User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResults
       intent: 'command_automate'
     },
     options: {
-      maxTokens: 1000,
+      maxTokens: 2000,
       temperature: 0.1,
       fastMode: false
     }

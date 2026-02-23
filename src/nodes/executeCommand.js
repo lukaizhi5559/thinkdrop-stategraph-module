@@ -75,17 +75,31 @@ module.exports = async function executeCommand(state) {
     const savedFilePaths = [...(state.savedFilePaths || [])];
 
     // Fallback: shell.run bash scripts with write patterns
+    // Handles both absolute paths (/Users/...) and home-relative paths (~/...)
+    const homeDir = require('os').homedir();
     skillResults.forEach((r) => {
       if (r.skill === 'shell.run' && r.ok && r.args?.cmd === 'bash') {
-        const script = (r.args?.argv || []).find(a => typeof a === 'string') || '';
-        const writeMatch = script.match(/(?:cat\s*>+|tee\s+|cp\s+\S+\s+|mv\s+\S+\s+)['"]?([^\s'"]+\.[a-zA-Z0-9]+)['"]?/);
-        if (writeMatch && writeMatch[1] && writeMatch[1].startsWith('/')) {
-          savedFilePaths.push(writeMatch[1]);
+        // argv is ['-c', 'script...'] — the script is always at index 1, not the first string
+        const argv = r.args?.argv || [];
+        const script = argv[1] || argv.find(a => typeof a === 'string' && a !== '-c') || '';
+        // Match destination path in write patterns — handles both /abs/path and ~/rel/path
+        // Covers: echo/printf/cat > file, tee file, cp src dest, mv src dest
+        const writeMatch = script.match(/(?:echo\s[^>]*>+|printf\s[^>]*>+|cat\s*>+|tee\s+|cp\s+\S+\s+|mv\s+\S+\s+)\s*['"]?((?:~|\/)[^\s'"]+\.[a-zA-Z0-9]+)['"]?/);
+        if (writeMatch && writeMatch[1]) {
+          const rawPath = writeMatch[1];
+          const absPath = rawPath.startsWith('~/') ? rawPath.replace('~', homeDir) : rawPath;
+          if (!savedFilePaths.includes(absPath)) savedFilePaths.push(absPath);
         }
       }
     });
 
-    logger.debug(`[Node:ExecuteCommand] all_done: savedFilePaths=${JSON.stringify([...new Set(savedFilePaths)])}`);
+    logger.info(`[Node:ExecuteCommand] all_done: savedFilePaths=${JSON.stringify([...new Set(savedFilePaths)])} (from state: ${JSON.stringify(state.savedFilePaths || [])}, skillResults: ${skillResults.length})`);
+    skillResults.forEach((r, i) => {
+      if (r.skill === 'shell.run' && r.args?.cmd === 'bash') {
+        const script = (r.args?.argv || []).find(a => typeof a === 'string') || '';
+        logger.info(`[Node:ExecuteCommand] all_done step[${i}] script: ${script.substring(0, 120)}`);
+      }
+    });
     if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults, savedFilePaths: [...new Set(savedFilePaths)] });
 
     // Build a rich commandOutput summary for the answer node to interpret
@@ -154,6 +168,118 @@ module.exports = async function executeCommand(state) {
 
   const step = skillPlan[skillCursor];
   const { skill, args = {}, optional = false, description } = step;
+
+  // ── needs_install pseudo-skill ───────────────────────────────────────────
+  // Checks if a CLI tool is installed. If missing, pauses the plan and emits
+  // a 'needs_install' progress event so the UI can show a confirmation card.
+  // Waits for the user to confirm (install) or skip before continuing.
+  if (skill === 'needs_install') {
+    const { tool, installCmd, reason, source = 'brew', description: toolDescription } = args;
+
+    if (!tool || !installCmd) {
+      logger.warn('[Node:ExecuteCommand] needs_install: missing tool or installCmd — skipping');
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: true, stdout: 'Skipped (missing args)' }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false
+      };
+    }
+
+    // Check if already installed
+    const { execSync } = require('child_process');
+    let alreadyInstalled = false;
+    try {
+      execSync(`which ${tool}`, { stdio: 'ignore' });
+      alreadyInstalled = true;
+    } catch (_) {
+      alreadyInstalled = false;
+    }
+
+    if (alreadyInstalled) {
+      logger.debug(`[Node:ExecuteCommand] needs_install: ${tool} already installed — skipping prompt`);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: description || `${tool} already installed`, stdout: `${tool} is already installed` });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: true, stdout: `${tool} is already installed` }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false
+      };
+    }
+
+    // Tool is missing — emit needs_install event and wait for user confirmation
+    logger.info(`[Node:ExecuteCommand] needs_install: ${tool} not found — requesting user confirmation`);
+    if (progressCallback) progressCallback({
+      type: 'needs_install',
+      stepIndex: skillCursor,
+      totalSteps: skillPlan.length,
+      tool,
+      installCmd,
+      reason,
+      source,
+      toolDescription: toolDescription || null,
+      description: description || `Install ${tool}?`
+    });
+
+    // Wait for confirmation via confirmInstallCallback (injected by main.js into state)
+    const confirmInstallCallback = state.confirmInstallCallback || null;
+    let confirmed = false;
+    if (typeof confirmInstallCallback === 'function') {
+      try {
+        confirmed = await confirmInstallCallback(tool);
+      } catch (err) {
+        logger.warn(`[Node:ExecuteCommand] needs_install: confirmation timed out or errored — skipping: ${err.message}`);
+        confirmed = false;
+      }
+    } else {
+      logger.warn('[Node:ExecuteCommand] needs_install: no confirmInstallCallback in state — auto-skipping');
+      confirmed = false;
+    }
+
+    if (!confirmed) {
+      logger.info(`[Node:ExecuteCommand] needs_install: user skipped install of ${tool}`);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: description || `Skipped install of ${tool}`, stdout: `Skipped — ${tool} not installed` });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: true, stdout: `Skipped — ${tool} not installed`, skipped: true }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false
+      };
+    }
+
+    // User confirmed — run the install command
+    logger.info(`[Node:ExecuteCommand] needs_install: installing ${tool} via: ${installCmd}`);
+    if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: `Installing ${tool}...` });
+
+    try {
+      const installResult = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'shell.run',
+        args: { cmd: 'bash', argv: ['-c', installCmd], timeoutMs: 300000 }
+      }, { timeoutMs: 360000 });
+      const raw = installResult.data || installResult;
+      const installOk = raw.ok ?? raw.success ?? false;
+      const installStdout = raw.stdout || (installOk ? `${tool} installed successfully` : `Install failed`);
+
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: `Installed ${tool}`, stdout: installStdout });
+      logger.info(`[Node:ExecuteCommand] needs_install: install ${installOk ? 'succeeded' : 'failed'} for ${tool}`);
+
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: installOk, stdout: installStdout }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false
+      };
+    } catch (err) {
+      logger.error(`[Node:ExecuteCommand] needs_install: install threw: ${err.message}`);
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill: 'needs_install', description: `Install of ${tool} failed`, error: err.message });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: false, error: err.message }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false
+      };
+    }
+  }
 
   // ── synthesize pseudo-skill ──────────────────────────────────────────────
   // Runs the LLM synthesis INLINE so the answer is in state before any
@@ -377,7 +503,7 @@ module.exports = async function executeCommand(state) {
     const stepResult = {
       step: skillCursor + 1,
       skill,
-      args,
+      args: resolvedArgs,
       description: description || null,
       ok: skill === 'ui.screen.verify'
         ? verifyOk
@@ -454,6 +580,32 @@ module.exports = async function executeCommand(state) {
       ? raw.url
       : state.activeBrowserUrl || null;
 
+    const isLastStep = skillCursor + 1 >= skillPlan.length;
+
+    // If this was the last step, emit all_done now (the graph routes to logConversation
+    // immediately — it never loops back for a second executeCommand pass, so the
+    // skillCursor >= skillPlan.length block at the top is never reached).
+    if (isLastStep && progressCallback) {
+      const finalSavedPaths = [...(state.savedFilePaths || [])];
+      const finalHomeDir = require('os').homedir();
+      updatedResults.forEach((r) => {
+        if (r.skill === 'shell.run' && r.ok && r.args?.cmd === 'bash') {
+          // argv is ['-c', 'script...'] — the script is always at index 1, not the first string
+          const argv = r.args?.argv || [];
+          const script = argv[1] || argv.find(a => typeof a === 'string' && a !== '-c') || '';
+          const wm = script.match(/(?:echo\s[^>]*>+|printf\s[^>]*>+|cat\s*>+|tee\s+|cp\s+\S+\s+|mv\s+\S+\s+)\s*['"']?((?:~|\/)[^\s'"']+\.[a-zA-Z0-9]+)['"']?/);
+          if (wm && wm[1]) {
+            const rawPath = wm[1];
+            const abs = rawPath.startsWith('~/') ? rawPath.replace('~', finalHomeDir) : rawPath;
+            if (!finalSavedPaths.includes(abs)) finalSavedPaths.push(abs);
+          }
+        }
+      });
+      const completedCount = updatedResults.filter(r => r.ok).length;
+      logger.info(`[Node:ExecuteCommand] last-step all_done: savedFilePaths=${JSON.stringify(finalSavedPaths)}`);
+      progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults: updatedResults, savedFilePaths: finalSavedPaths });
+    }
+
     // Step succeeded (or was optional) — advance cursor
     return {
       ...state,
@@ -462,7 +614,7 @@ module.exports = async function executeCommand(state) {
       failedStep: null,
       activeBrowserSessionId,
       activeBrowserUrl,
-      commandExecuted: skillCursor + 1 >= skillPlan.length,
+      commandExecuted: isLastStep,
       answer: undefined  // answer is built in the 'all steps done' block on the next pass
     };
 

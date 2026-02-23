@@ -22,8 +22,23 @@ const MONTHS = ['january','february','march','april','may','june','july','august
  *   "January 10th - 15th", "Jan 10 to Jan 15"
  *   "last year in Jan between 10th and 15th"
  */
+// Map word-form numbers to integers (one through thirty)
+const WORD_NUMBERS = { one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9, ten:10, eleven:11, twelve:12, thirteen:13, fourteen:14, fifteen:15, sixteen:16, seventeen:17, eighteen:18, nineteen:19, twenty:20, 'twenty-one':21, 'twenty-two':22, 'twenty-three':23, 'twenty-four':24, 'twenty-five':25, 'twenty-six':26, 'twenty-seven':27, 'twenty-eight':28, 'twenty-nine':29, thirty:30 };
+
+/**
+ * Normalise word-form numbers in a query to digits so downstream regexes work.
+ * e.g. "four days ago" → "4 days ago", "three weeks ago" → "3 weeks ago"
+ */
+function normaliseWordNumbers(str) {
+  return str.replace(/\b(twenty-(?:one|two|three|four|five|six|seven|eight|nine)|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty)\b/gi, (m) => {
+    const n = WORD_NUMBERS[m.toLowerCase()];
+    return n !== undefined ? String(n) : m;
+  });
+}
+
 function parseDateRange(message) {
-  const q = (message || '').toLowerCase();
+  const raw = (message || '').toLowerCase();
+  const q = normaliseWordNumbers(raw);
   const now = new Date();
   const y = now.getFullYear();
   const m = now.getMonth();
@@ -192,6 +207,27 @@ function parseDateRange(message) {
     return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
   }
 
+  // N days ago (e.g. "4 days ago", "what was I doing 4 days ago")
+  const daysAgoMatch = q.match(/\b(\d+)\s+days?\s+ago\b/);
+  if (daysAgoMatch) {
+    const d = new Date(now); d.setDate(d.getDate() - parseInt(daysAgoMatch[1]));
+    return { startDate: iso(startOf(d)), endDate: iso(endOf(d)) };
+  }
+
+  // N weeks ago (e.g. "2 weeks ago")
+  const weeksAgoMatch = q.match(/\b(\d+)\s+weeks?\s+ago\b/);
+  if (weeksAgoMatch) {
+    const d = new Date(now); d.setDate(d.getDate() - parseInt(weeksAgoMatch[1]) * 7);
+    return { startDate: iso(startOf(d)), endDate: iso(endOf(d)) };
+  }
+
+  // N months ago (e.g. "3 months ago")
+  const monthsAgoMatch = q.match(/\b(\d+)\s+months?\s+ago\b/);
+  if (monthsAgoMatch) {
+    const d = new Date(now); d.setMonth(d.getMonth() - parseInt(monthsAgoMatch[1]));
+    return { startDate: iso(startOf(d)), endDate: iso(endOf(d)) };
+  }
+
   // last N weeks
   const weeksMatch = q.match(/\blast\s+(\d+)\s+weeks?\b/);
   if (weeksMatch) {
@@ -342,7 +378,7 @@ module.exports = async function retrieveMemory(state) {
     // "more", "go on"), inherit the dateRange from the most recent prior user message that had one.
     // This makes follow-ups stay in the same temporal context as the prior query.
     const msgWords = (resolvedMessage || message).trim().split(/\s+/).filter(Boolean).length;
-    if (!dateRange && msgWords <= 4 && context?.sessionId) {
+    if (!dateRange && msgWords <= 8 && context?.sessionId) {
       try {
         const histResult = await mcpAdapter.callService('conversation', 'message.list', {
           sessionId: context.sessionId,
