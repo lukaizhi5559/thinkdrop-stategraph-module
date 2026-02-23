@@ -80,6 +80,7 @@ module.exports = async function recoverSkill(state) {
     skillCursor,
     skillResults = [],
     stepRetryCount = 0,
+    replanCount = 0,
     message,
     resolvedMessage,
     context
@@ -111,10 +112,27 @@ module.exports = async function recoverSkill(state) {
     backend = new MCPLLMBackend(mcpAdapter);
   }
 
+  // ── Replan limit: abort after 3 replans to prevent infinite loops ───────────
+  const MAX_REPLANS = 3;
+  if (replanCount >= MAX_REPLANS) {
+    logger.warn(`[Node:RecoverSkill] Replan limit reached (${replanCount}/${MAX_REPLANS}) — aborting`);
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      pendingQuestion: {
+        question: `I tried ${replanCount} different approaches but couldn't complete: "${resolvedMessage || message}". The step that kept failing was: ${failedStep.skill} — ${failedStep.error || 'no details'}. What would you like to do?`,
+        options: ['Try again from scratch', 'Cancel this task'],
+        context: failedStep
+      },
+      commandExecuted: false,
+      answer: `I tried ${replanCount} different approaches but couldn't complete the task.\n\nFailing step: ${failedStep.skill}\nError: ${failedStep.error || 'unknown'}\n\nWhat would you like to do?`
+    };
+  }
+
   // ── Fast-path: known recoverable patterns (no LLM call needed) ──────────────
-  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger);
+  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults);
   if (fastRecovery) {
-    return applyRecovery(fastRecovery, state, skillPlan, skillCursor, stepRetryCount, logger);
+    return applyRecovery(fastRecovery, state, skillPlan, skillCursor, stepRetryCount, replanCount, logger);
   }
 
   // ── LLM-based recovery ───────────────────────────────────────────────────────
@@ -194,7 +212,7 @@ Decide the recovery strategy.`;
       throw new Error('Could not parse recovery decision from LLM');
     }
 
-    return applyRecovery(decision, state, skillPlan, skillCursor, stepRetryCount, logger);
+    return applyRecovery(decision, state, skillPlan, skillCursor, stepRetryCount, replanCount, logger);
 
   } catch (error) {
     logger.error('[Node:RecoverSkill] Recovery LLM failed:', error.message);
@@ -218,9 +236,60 @@ Decide the recovery strategy.`;
 // Fast-path recovery: handle well-known failure patterns without an LLM call
 // ---------------------------------------------------------------------------
 
-function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger) {
+function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults) {
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
+
+  // ui.screen.verify: failed for any reason (vision LLM said verified=false, or the call itself failed)
+  if (skill === 'ui.screen.verify') {
+    const reasoning  = failedStep.reasoning  || (failedStep.error ? `Vision check error: ${failedStep.error}` : 'Visual verification could not confirm success.');
+    const visionSuggestion = failedStep.suggestion || '';
+
+    // Look back at the preceding ui.findAndClick step to build a specific constraint
+    const precedingClick = (skillResults || []).slice().reverse().find(r => r.skill === 'ui.findAndClick');
+    let clickContext = '';
+    if (precedingClick) {
+      clickContext = ` The preceding click was ui.findAndClick with label="${precedingClick.args?.label}" — this click did NOT produce the expected result.`;
+    }
+
+    // Detect if the failing click was a DM/messaging sidebar click — suggest keyboard shortcut
+    const precedingLabel = (precedingClick?.args?.label || '').toLowerCase();
+    const isDmClick = precedingLabel.includes('dm') || precedingLabel.includes('direct message') ||
+      precedingLabel.includes('conversation') || precedingLabel.includes('sidebar');
+
+    let constraint;
+    let suggestion;
+    if (isDmClick) {
+      const nameMatch = (precedingClick?.args?.label || '').match(/^(\w+)/);
+      const personName = nameMatch ? nameMatch[1] : 'the person';
+      constraint = `Visual verification failed after clicking a DM/sidebar row.${clickContext} Vision LLM reported: "${reasoning}". Clicking sidebar rows in messaging apps opens profile cards, NOT DM threads. Use the keyboard shortcut instead: (1) ui.typeText {CMD+K} to open the quick switcher, (2) ui.typeText the person's name, (3) ui.typeText {ENTER} to open the DM. Do NOT use ui.findAndClick on the sidebar for DMs.`;
+      suggestion = `Use keyboard shortcut to open DM: ui.typeText {CMD+K}, then type "${personName}", then {ENTER}. Do NOT click the sidebar row.`;
+    } else {
+      constraint = `Visual verification failed after the click step.${clickContext} Vision LLM reported: "${reasoning}"${visionSuggestion ? ` Suggestion: ${visionSuggestion}` : ''}. Try a DIFFERENT approach — use a more specific label, a different element, or add a settleMs delay. Do NOT repeat the same label that just failed.`;
+      suggestion = visionSuggestion || `The click on "${precedingClick?.args?.label || 'the element'}" did not produce the expected result. Try a different label or approach.`;
+    }
+
+    logger.debug(`[Node:RecoverSkill] Fast-path: ui.screen.verify failed → REPLAN`, { verified: failedStep.verified, error: failedStep.error, precedingLabel: precedingClick?.args?.label, isDmClick });
+    return {
+      action: 'REPLAN',
+      constraint,
+      suggestion,
+      note: `ui.screen.verify: ${reasoning}`
+    };
+  }
+
+  // ui.findAndClick: OmniParser unavailable or low confidence — ask user to do it manually
+  // The ResultsWindow confirm button lets the user signal "done" and resume the plan
+  if (skill === 'ui.findAndClick' && failedStep.needsManualStep) {
+    const instruction = failedStep.instruction || `Please click "${args.label}" on screen, then confirm when done.`;
+    const reason = failedStep.reason ? ` (${failedStep.reason})` : '';
+    logger.debug(`[Node:RecoverSkill] Fast-path: ui.findAndClick needsManualStep → ASK_USER`);
+    return {
+      action: 'ASK_USER',
+      question: `${instruction}${reason}`,
+      options: ['Done, I clicked it', 'Skip this step', 'Cancel']
+    };
+  }
 
   // Skill not yet implemented — no amount of replanning will fix this
   if (combinedError.includes('not yet implemented')) {
@@ -331,8 +400,11 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger) 
     }
   }
 
-  // Command not found
-  if (combinedError.includes('command not found') || combinedError.includes('no such file or directory')) {
+  // Command not found — only when the actual binary is missing, not when bash runs a failing script
+  // bash/sh/zsh are always present on macOS — never ask to install them
+  const SHELL_INTERPRETERS = ['bash', 'sh', 'zsh', 'python3', 'python', 'node', 'ruby', 'perl'];
+  const isShellInterpreter = SHELL_INTERPRETERS.includes(args.cmd);
+  if (combinedError.includes('command not found') && !isShellInterpreter) {
     if (skill === 'shell.run') {
       logger.debug('[Node:RecoverSkill] Fast-path: command not found → ASK_USER');
       return {
@@ -392,12 +464,14 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger) 
     }
 
     // Other commands: silent AUTO_PATCH with backoff (2x then 3x timeout)
+    // shell.run service rejects timeoutMs > 300000 — never patch beyond that
+    const MAX_TIMEOUT = 300000;
     const retryAttempt = stepRetryCount + 1;
     const currentTimeout = args.timeoutMs || 10000;
     const multipliers = [2, 3]; // retry 1 → 2x, retry 2 → 3x
 
-    if (retryAttempt <= multipliers.length) {
-      const newTimeout = currentTimeout * multipliers[retryAttempt - 1];
+    if (retryAttempt <= multipliers.length && currentTimeout < MAX_TIMEOUT) {
+      const newTimeout = Math.min(currentTimeout * multipliers[retryAttempt - 1], MAX_TIMEOUT);
       logger.debug(`[Node:RecoverSkill] Fast-path: timeout retry ${retryAttempt} → AUTO_PATCH timeoutMs ${currentTimeout}ms → ${newTimeout}ms`);
       return {
         action: 'AUTO_PATCH',
@@ -423,7 +497,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger) 
 // Apply a recovery decision to state
 // ---------------------------------------------------------------------------
 
-function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, logger) {
+function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, replanCount, logger) {
   const { failedStep } = state;
 
   switch (decision.action) {
@@ -449,17 +523,21 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, logge
     }
 
     case 'REPLAN': {
-      logger.debug(`[Node:RecoverSkill] REPLAN: ${decision.suggestion}`);
+      const suggestion = decision.suggestion || 'Retry the previous step with a more specific element label or different approach.';
+      const constraint = decision.constraint || null;
+      const failureReason = failedStep.error || failedStep.reason || 'Step did not produce the expected result.';
+      logger.debug(`[Node:RecoverSkill] REPLAN (attempt ${replanCount + 1}): ${suggestion}`);
       return {
         ...state,
         recoveryAction: 'replan',
+        replanCount: replanCount + 1,
         recoveryContext: {
           failedSkill: failedStep.skill,
           failedStep: failedStep.step,
-          failureReason: failedStep.error,
-          suggestion: decision.suggestion,
+          failureReason,
+          suggestion,
           alternativeCwd: decision.alternativeCwd || null,
-          constraint: decision.constraint || null
+          constraint
         },
         failedStep: null,
         skillPlan: null,

@@ -68,7 +68,25 @@ module.exports = async function executeCommand(state) {
   if (skillCursor >= skillPlan.length) {
     const completedCount = skillResults.filter(r => r.ok).length;
     logger.debug(`[Node:ExecuteCommand] All ${skillPlan.length} steps complete`);
-    if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults });
+
+    // Collect file paths written during this plan for the UI "Open file" link.
+    // Primary source: accumulated state.savedFilePaths set by synthesize steps (explicit saveToFile arg).
+    // Fallback: detect shell.run write patterns (cat >, tee, mv destination).
+    const savedFilePaths = [...(state.savedFilePaths || [])];
+
+    // Fallback: shell.run bash scripts with write patterns
+    skillResults.forEach((r) => {
+      if (r.skill === 'shell.run' && r.ok && r.args?.cmd === 'bash') {
+        const script = (r.args?.argv || []).find(a => typeof a === 'string') || '';
+        const writeMatch = script.match(/(?:cat\s*>+|tee\s+|cp\s+\S+\s+|mv\s+\S+\s+)['"]?([^\s'"]+\.[a-zA-Z0-9]+)['"]?/);
+        if (writeMatch && writeMatch[1] && writeMatch[1].startsWith('/')) {
+          savedFilePaths.push(writeMatch[1]);
+        }
+      }
+    });
+
+    logger.debug(`[Node:ExecuteCommand] all_done: savedFilePaths=${JSON.stringify([...new Set(savedFilePaths)])}`);
+    if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults, savedFilePaths: [...new Set(savedFilePaths)] });
 
     // Build a rich commandOutput summary for the answer node to interpret
     const stepSummaries = skillResults.map((r, i) => {
@@ -91,21 +109,38 @@ module.exports = async function executeCommand(state) {
       ? [...skillResults].reverse().find(r => r.skill === 'browser.act' && r.ok)
       : null;
 
+    // Check if any image.analyze step produced a description — surface it directly
+    const imageAnalyzeResult = [...skillResults].reverse().find(r => r.skill === 'image.analyze' && r.ok && r.stdout);
+
     let answer;
     if (failedCount === 0) {
-      if (hasBrowserSteps && lastBrowserResult?.url) {
+      if (imageAnalyzeResult) {
+        answer = imageAnalyzeResult.stdout;
+      } else if (hasBrowserSteps && lastBrowserResult?.url) {
         const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
         answer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
       } else {
         answer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
       }
     } else {
-      answer = `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`;
+      const imageAnalyzeFailure = skillResults.find(r => r.skill === 'image.analyze' && !r.ok);
+      answer = imageAnalyzeFailure
+        ? `Image analysis failed: ${imageAnalyzeFailure.error || 'unknown error'}`
+        : `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`;
     }
 
     // Preserve the last active browser sessionId so follow-up tasks reuse the same tab
     const lastBrowserStep = [...skillResults].reverse().find(r => r.skill === 'browser.act' && r.ok);
     const activeBrowserSessionId = lastBrowserStep?.args?.sessionId || state.activeBrowserSessionId || null;
+
+    // Stream the answer to the UI if it contains meaningful content (e.g. image.analyze result).
+    // The answer node is bypassed for command_automate, so we push it here via streamCallback.
+    const streamCallback = state.streamCallback || null;
+    logger.info(`[Node:ExecuteCommand] image.analyze all_done: hasStreamCallback=${typeof streamCallback === 'function'}, answerLength=${answer?.length ?? 'null'}, imageAnalyzeResult=${!!imageAnalyzeResult}`);
+    if (imageAnalyzeResult && answer && typeof streamCallback === 'function') {
+      logger.info(`[Node:ExecuteCommand] Streaming image.analyze answer (${answer.length} chars)`);
+      streamCallback(answer);
+    }
 
     return {
       ...state,
@@ -138,12 +173,45 @@ module.exports = async function executeCommand(state) {
       .map(r => ({ source: r.args?.sessionId || 'unknown', url: r.url || '', text: r.result }));
     logger.debug(`[Node:ExecuteCommand] synthesize: found ${pageTextResults.length} getPageText results`);
 
+    // Include shell.run stdout (e.g. cat file output) as well as browser getPageText results
+    const shellStdoutResults = skillResults
+      .filter(r => r.skill === 'shell.run' && r.ok && r.stdout && r.stdout.trim().length > 0)
+      .map(r => `=== Shell output (${r.description || r.args?.cmd || 'shell.run'}) ===\n${r.stdout}`);
+
     const synthesisContext = pageTextResults.length > 0
-      ? pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`).join('\n\n')
-      : skillResults.filter(r => r.ok && r.result).map(r => String(r.result)).join('\n\n');
+      ? [...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`), ...shellStdoutResults].join('\n\n')
+      : shellStdoutResults.length > 0
+        ? shellStdoutResults.join('\n\n')
+        : skillResults.filter(r => r.ok && r.result).map(r => String(r.result)).join('\n\n');
 
     const synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
-    const synthesisFilePath = args.saveToFile || null;
+    let synthesisFilePath = args.saveToFile || null;
+
+    // If saveToFile contains {{prev_stdout}}, resolve it now using the previous step's stdout
+    if (synthesisFilePath && synthesisFilePath.includes('{{prev_stdout}}')) {
+      const prevStep = skillResults[skillResults.length - 1];
+      const prevStdout = prevStep?.stdout?.trim() || '';
+      synthesisFilePath = synthesisFilePath.replace(/\{\{prev_stdout\}\}/g, prevStdout);
+      logger.debug(`[Node:ExecuteCommand] synthesize: resolved saveToFile via {{prev_stdout}}: ${synthesisFilePath}`);
+    }
+
+    // If saveToFile is still relative/missing but a prior shell.run step output a single absolute path,
+    // use that path's directory (handles single-pipeline find+read where stdout = file content, not path)
+    if (!synthesisFilePath || !synthesisFilePath.startsWith('/')) {
+      const pathMod = require('path');
+      // Look for a pure-find step whose stdout is a single absolute file path
+      const purePathStep = skillResults.find(r =>
+        r.skill === 'shell.run' && r.ok && r.stdout &&
+        /^\/[^\n]+\.[a-zA-Z0-9]+$/.test(r.stdout.trim())
+      );
+      if (purePathStep) {
+        const foundPath = purePathStep.stdout.trim();
+        const dir = pathMod.dirname(foundPath);
+        const base = pathMod.basename(foundPath, pathMod.extname(foundPath));
+        synthesisFilePath = pathMod.join(dir, base + '.txt');
+        logger.debug(`[Node:ExecuteCommand] synthesize: saveToFile from pure-find step stdout: ${synthesisFilePath}`);
+      }
+    }
 
     // Run LLM inline
     const llmBackend = state.llmBackend;
@@ -153,8 +221,14 @@ module.exports = async function executeCommand(state) {
 
     if (llmBackend) {
       const isStreaming = typeof streamCallback === 'function';
-      const synthesisQuery = `${synthesisPrompt}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
-      const synthesisInstructions = `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual.`;
+      // Use file-editing instructions when shell stdout is present (file content), otherwise use web research instructions
+      const hasFileContent = shellStdoutResults.length > 0;
+      const synthesisQuery = hasFileContent
+        ? `${synthesisPrompt}\n\nHere is the current file content:\n\n${synthesisContext}`
+        : `${synthesisPrompt}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
+      const synthesisInstructions = hasFileContent
+        ? `You are a file editing assistant. The user has asked you to modify a file. You have been given the current file content. Your job is to output the COMPLETE updated file content with ONLY the requested changes applied. Output the full file text only — no preamble, no explanation, no markdown code fences, no commentary. Preserve all existing structure, headings, and formatting. Only change what was explicitly requested.`
+        : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual.`;
       const synthPayload = {
         query: synthesisQuery,
         context: {
@@ -202,8 +276,14 @@ module.exports = async function executeCommand(state) {
       logger.warn(`[Node:ExecuteCommand] synthesize: could not write temp file: ${tmpErr.message}`);
     }
 
-    // Emit step_done with the actual answer as stdout
-    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'synthesize', description: description || 'Comparing results...', stdout: synthesisAnswer });
+    // Emit step_done with the actual answer as stdout (and savedFilePath if written)
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'synthesize', description: description || 'Comparing results...', stdout: synthesisAnswer, savedFilePath: synthesisFilePath || null });
+
+    // Accumulate explicit saveToFile paths across multiple synthesize steps
+    const prevSavedFiles = state.savedFilePaths || [];
+    const newSavedFiles = synthesisFilePath && !synthesisAnswer.startsWith('[')
+      ? [...prevSavedFiles, synthesisFilePath]
+      : prevSavedFiles;
 
     return {
       ...state,
@@ -212,23 +292,31 @@ module.exports = async function executeCommand(state) {
       failedStep: null,
       synthesisAnswer,          // available as {{synthesisAnswer}} in subsequent step args
       synthesisAnswerFile,      // available as {{synthesisAnswerFile}} — use in shell.run for full bash power
+      savedFilePaths: newSavedFiles,  // accumulated explicit saveToFile paths for UI file links
       needsSynthesis: false,
       commandExecuted: false,
       answer: undefined
     };
   }
 
-  // Substitute {{synthesisAnswer}} and {{synthesisAnswerFile}} templates so post-synthesize steps can use the result
+  // Substitute template variables in step args so steps can reference prior results:
+  //   {{synthesisAnswer}}     — full text output of the last synthesize step
+  //   {{synthesisAnswerFile}} — temp file path containing synthesisAnswer
+  //   {{prev_stdout}}         — stdout of the immediately preceding step (enables find→read→write chains)
   const synthesisAnswer = state.synthesisAnswer || '';
   const synthesisAnswerFile = state.synthesisAnswerFile || '';
+  const prevStdout = skillResults.length > 0 ? (skillResults[skillResults.length - 1].stdout || '').trim() : '';
   let resolvedArgs = args;
-  if (synthesisAnswer || synthesisAnswerFile) {
+  if (synthesisAnswer || synthesisAnswerFile || prevStdout) {
     let argsJson = JSON.stringify(args);
     if (synthesisAnswer) {
       argsJson = argsJson.replace(/\{\{synthesisAnswer\}\}/g, synthesisAnswer.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
     }
     if (synthesisAnswerFile) {
       argsJson = argsJson.replace(/\{\{synthesisAnswerFile\}\}/g, synthesisAnswerFile.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
+    }
+    if (prevStdout) {
+      argsJson = argsJson.replace(/\{\{prev_stdout\}\}/g, prevStdout.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
     }
     resolvedArgs = JSON.parse(argsJson);
   }
@@ -247,6 +335,22 @@ module.exports = async function executeCommand(state) {
 
     const raw = result.data || result;
 
+    // For ui.waitFor steps: synthesize a human-readable stdout from matched condition
+    let waitForStdout = null;
+    if (skill === 'ui.waitFor' && raw.success) {
+      const parts = [];
+      if (raw.matched) {
+        parts.push(`Matched: ${raw.condition}="${raw.value}"`);
+        if (raw.appName && raw.appName !== 'unknown') parts.push(`app=${raw.appName}`);
+        if (raw.url) parts.push(raw.url);
+        if (raw.windowTitle && raw.windowTitle !== 'unknown') parts.push(`"${raw.windowTitle}"`);
+        parts.push(`(${raw.elapsed}ms, ${raw.pollCount} polls)`);
+      } else {
+        parts.push(`Timed out waiting for ${raw.condition}="${raw.value}"`);
+      }
+      waitForStdout = parts.join(' — ');
+    }
+
     // For browser.act steps: synthesize a human-readable stdout from url+title+result
     // so the UI step list shows something meaningful instead of "No output"
     let browserStdout = null;
@@ -261,28 +365,53 @@ module.exports = async function executeCommand(state) {
       if (parts.length) browserStdout = parts.join(' — ');
     }
 
+    // ui.screen.verify ok logic:
+    //   verified: true  → real pass
+    //   verified: null  → degraded (vision unavailable) → treat as pass (skip verification)
+    //   verified: false → real failure → trigger recoverSkill
+    const verifyOk = raw.success === true && (raw.verified === true || raw.verified === null);
+    if (skill === 'ui.screen.verify' && raw.degraded) {
+      logger.warn('[Node:ExecuteCommand] ui.screen.verify degraded — vision unavailable, skipping verification', { reasoning: raw.reasoning });
+    }
+
     const stepResult = {
       step: skillCursor + 1,
       skill,
       args,
       description: description || null,
-      ok: raw.ok ?? raw.success ?? false,
-      stdout: raw.stdout || browserStdout || null,
+      ok: skill === 'ui.screen.verify'
+        ? verifyOk
+        : (raw.ok ?? raw.success ?? false),
+      stdout: raw.stdout || waitForStdout || browserStdout || null,
       stderr: raw.stderr || null,
       exitCode: raw.exitCode ?? null,
       result: raw.result ?? null,
       url: raw.url ?? null,
       pageContext: raw.pageContext ?? null,
       error: raw.error || null,
-      executionTime: raw.executionTime || null
+      executionTime: raw.executionTime || null,
+      needsManualStep: raw.needsManualStep || false,
+      instruction: raw.instruction || null,
+      reason: raw.reason || null,
+      verified: raw.verified !== undefined ? raw.verified : null,
+      reasoning: raw.reasoning || null,
+      suggestion: raw.suggestion || null
     };
 
     // Detect shell.run search commands that returned no results — treat as soft failure
     // so recoverSkill can REPLAN with a different search strategy (e.g. mdfind → find)
     // NOTE: only applies to shell.run, never browser.act
+    // NOTE: bash scripts that also contain write/edit ops (sed -i, cp, mv, echo >, tee, cat >)
+    //       are NOT pure searches — no output is expected and is a success.
     const SEARCH_CMDS = ['mdfind', 'find', 'grep', 'locate'];
-    const isBashSearchScript = args.cmd === 'bash' && Array.isArray(args.argv) &&
-      args.argv.some(a => typeof a === 'string' && SEARCH_CMDS.some(sc => a.includes(sc)));
+    const WRITE_OPS = ['sed -i', 'sed -E -i', 'cp ', 'mv ', 'echo ', 'tee ', 'cat >', 'cat>',
+                       'printf ', 'write ', 'rm ', 'mkdir ', 'touch ', 'chmod ', 'chown '];
+    const bashScript = args.cmd === 'bash' && Array.isArray(args.argv)
+      ? args.argv.find(a => typeof a === 'string') || ''
+      : '';
+    const isBashSearchScript = bashScript.length > 0 &&
+      SEARCH_CMDS.some(sc => bashScript.includes(sc)) &&
+      !WRITE_OPS.some(wo => bashScript.includes(wo));
     const isSearchCmd = skill === 'shell.run' && (SEARCH_CMDS.includes(args.cmd) || isBashSearchScript);
     const noOutput = !stepResult.stdout || stepResult.stdout.trim().length === 0;
 
@@ -311,6 +440,9 @@ module.exports = async function executeCommand(state) {
     }
 
     if (stepResult.ok || optional) {
+      if (skill === 'image.analyze') {
+        logger.info(`[Node:ExecuteCommand] image.analyze step_done stdout length: ${stepResult.stdout?.length ?? 'null'}, preview: ${String(stepResult.stdout || '').slice(0, 80)}`);
+      }
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: description || skill, stdout: stepResult.stdout, exitCode: stepResult.exitCode });
     }
 

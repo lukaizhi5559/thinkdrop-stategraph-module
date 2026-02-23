@@ -153,10 +153,17 @@ Adjust the plan to avoid the same failure.`;
     ? `\n\nACTIVE BROWSER SESSION: sessionId="${activeBrowserSessionId}" is already open with the correct site. Use this EXACT sessionId for all browser.act steps — do NOT navigate again unless the URL needs to change. Just use smartType or other actions directly on the existing tab.`
     : '';
 
+  // Include any tagged context (highlighted text or [File: /path] tags from Shift+Cmd+C)
+  const selectedText = state.selectedText || '';
+  let taggedContextNote = '';
+  if (selectedText && selectedText.trim()) {
+    taggedContextNote = `\n\nTAGGED CONTEXT (user highlighted this before asking):\n${selectedText.trim()}\n\nIf the tagged context contains a [File: /path/to/file] tag, the user is referring to that file. Plan steps to read it using the appropriate command for its file type (see skill rules).`;
+  }
+
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResultsNote}${conversationNote}`;
+User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
 
   const payload = {
     query: planningQuery,
@@ -203,6 +210,21 @@ User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResults
       return {
         ...state,
         planError: `Failed to parse skill plan from LLM output: ${rawPlan.substring(0, 200)}`
+      };
+    }
+
+    // Check if LLM returned a clarifying question instead of a plan
+    if (!Array.isArray(skillPlan) && skillPlan.ask) {
+      const question = skillPlan.ask;
+      const options = Array.isArray(skillPlan.options) ? skillPlan.options : [];
+      logger.debug(`[Node:PlanSkills] LLM needs clarification: ${question}`);
+      if (progressCallback) progressCallback({ type: 'plan_error', error: question });
+      return {
+        ...state,
+        recoveryAction: 'ask_user',
+        pendingQuestion: { question, options, context: null },
+        commandExecuted: false,
+        answer: question
       };
     }
 

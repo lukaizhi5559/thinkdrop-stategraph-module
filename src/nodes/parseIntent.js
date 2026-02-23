@@ -34,6 +34,42 @@ module.exports = async function parseIntent(state) {
     };
   }
 
+  // File tag override — must run BEFORE phi4 ML call.
+  // When the message contains a [File: /path] tag (from Shift+Cmd+C or drag-and-drop),
+  // always route to command_automate so planSkills reads the file via shell.run.
+  if (/\[File:\s*[^\]]+\]/.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] File tag override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.99,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'file-tag-override', processingTimeMs: 0 }
+    };
+  }
+
+  // Past-tense action report override — must run BEFORE browser automation override.
+  // "sent a message to X", "sent an email to X", "called X", "messaged X", "told X" etc.
+  // User is reporting something they did → always memory_store.
+  // Must come BEFORE browser override because "sent ... in slack" matches destPrepMatch.
+  const pastTenseActionReport = /^(sent (a |an )?(message|email|text|slack|dm|note|reply|response|invite|request)|called |messaged |texted |emailed |told |informed |notified |pinged |dm'd |dmed )/i;
+  if (pastTenseActionReport.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Past-tense action report override → memory_store: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'memory_store',
+        confidence: 0.95,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'past-tense-action-override', processingTimeMs: 0 }
+    };
+  }
+
   // Browser automation override — must run BEFORE phi4 ML call.
   // Detects by STRUCTURE, not by site name — works for any website or app, including new ones.
   //
@@ -77,6 +113,43 @@ module.exports = async function parseIntent(state) {
         requiresMemoryAccess: false
       },
       metadata: { parser: 'browser-override', processingTimeMs: 0 }
+    };
+  }
+
+  // UI mouse action override — must run BEFORE phi4 ML call.
+  // "hover over X", "move mouse to X", "move the mouse to X", "mouse over X" → always command_automate.
+  // These are direct UI testing/automation commands that phi4 would misclassify.
+  const uiMouseActionPattern = /\b(hover over|hover on|move (the )?mouse (to|over|onto)|mouse over|point (the )?mouse (at|to|over)|move cursor (to|over)|position (the )?(mouse|cursor) (on|over|at|to))\b/i;
+  if (uiMouseActionPattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] UI mouse action override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.98,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'ui-mouse-action-override', processingTimeMs: 0 }
+    };
+  }
+
+  // Action-request override — must run BEFORE phi4 ML call.
+  // "I need to X", "I need you to X", "can you do X for me", "help me X", "do X for me"
+  // where X is a task verb → always command_automate.
+  // Covers: renew license, book appointment, fill form, buy ticket, apply for, sign up, etc.
+  const actionRequestPattern = /\b(i need (you to|to)|can you (do|help|go|search|find|book|buy|apply|fill|sign|renew|register|schedule|order|check|look up|navigate|open|create|send|submit|download|install|update|delete|remove|fix|set up)|help me (do|go|search|find|book|buy|apply|fill|sign|renew|register|schedule|order|check|navigate|open|create|send|submit|fix|set up)|do this for me|please (do|go|search|find|book|buy|apply|fill|sign|renew|register|schedule|order|check|navigate|open|create|send|submit))\b/i;
+  if (actionRequestPattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Action-request override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.95,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'action-request-override', processingTimeMs: 0 }
     };
   }
 
@@ -141,6 +214,23 @@ module.exports = async function parseIntent(state) {
     const finalConfidence = intentData.confidence || 0.5;
     
     logger.debug(`[Node:ParseIntent] Classified as: ${finalIntent} (confidence: ${finalConfidence.toFixed(2)})`);
+
+    // Post-phi4 correction: low-confidence memory_store with action verbs → command_automate.
+    // phi4 sometimes misclassifies "I need to renew/book/apply/fix..." as memory_store.
+    const lowConfActionVerb = /\b(renew|book|apply|register|schedule|order|buy|purchase|sign up|fill out|submit|install|download|update|fix|set up|create|send|navigate|open|search|find|go to)\b/i;
+    if (finalIntent === 'memory_store' && finalConfidence < 0.5 && lowConfActionVerb.test(classifyMessage)) {
+      logger.debug(`[Node:ParseIntent] Post-phi4 correction: low-confidence memory_store + action verb → command_automate`);
+      return {
+        ...state,
+        intent: {
+          type: 'command_automate',
+          confidence: 0.85,
+          entities: intentData.entities || [],
+          requiresMemoryAccess: false
+        },
+        metadata: { parser: 'phi4-corrected', processingTimeMs: intentData.metadata?.processingTimeMs || 0 }
+      };
+    }
     
     return {
       ...state,
