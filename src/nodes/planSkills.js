@@ -43,15 +43,25 @@ function loadSystemPrompt() {
 
 const SKILL_SYSTEM_PROMPT_FALLBACK = `You are an automation planner. Convert the user's request into an ordered list of skill steps.
 
-Available skills: shell.run, browser.act, ui.findAndClick, ui.typeText, ui.waitFor
+Available skills: shell.run, browser.act, ui.axClick, ui.moveMouse, ui.click, ui.typeText, ui.waitFor, api_suggest, guide.step, needs_install
 
 shell.run|args:{cmd,argv[],cwd?,timeoutMs?,dryRun?,stdin?}
-browser.act|args:{action,url?,selector?,text?,sessionId?,timeoutMs?,headless?}
-ui.findAndClick|args:{label,app?,confidence?,timeoutMs?}
-ui.typeText|args:{text,delayMs?}|tokens:{ENTER}{TAB}{ESC}{CMD+K}{CMD+C}{CMD+V}{BACKSPACE}
-ui.waitFor|args:{condition,value?,timeoutMs?,pollIntervalMs?}|conditions:textIncludes,textRegex,appIsActive,titleIncludes,urlIncludes,changed
+browser.act|args:{action,url?,selector?,text?,sessionId?,timeoutMs?}
+ui.axClick|args:{app,label,role?,button?,settleMs?,timeoutMs?}|clicks_native_app_element_via_OS_accessibility_API
+ui.moveMouse|args:{label,settleMs?,confidence?,timeoutMs?}|OmniParser_LAST_RESORT_only
+ui.click|args:{button?,modifier?,x?,y?,settleMs?}|use_after_ui.moveMouse
+ui.typeText|args:{text,delayMs?}|tokens:{ENTER}{TAB}{ESC}{CMD+K}{CMD+C}{CMD+V}{BACKSPACE}{UP}{DOWN}
+ui.waitFor|args:{condition,value?,timeoutMs?}|conditions:text,app,url,windowTitle
 
-Policy: no sudo/su/passwd. argv is string[] — no shell interpolation. Always specify cwd when creating files.
+Priority: shell.run > browser.act > keyboard shortcuts (ui.typeText) > ui.axClick (native only) > ui.moveMouse+ui.click (last resort).
+ui.findAndClick does NOT exist — never use it.
+ui.axClick ONLY works for true native macOS apps (TextEdit, Calendar, Finder, Mail, Safari). It does NOT work for Electron apps (Slack, Discord, VS Code, Cursor, Figma) — use keyboard shortcuts instead.
+For Slack: always use osascript activate + {CMD+K} + type + {DOWN}{ENTER}. Never use ui.axClick for Slack.
+For dropdown/switcher results after typing: use {DOWN} then {ENTER}, never any click skill.
+After switching Slack workspace with {ENTER}, always add ui.waitFor + osascript activate before the next {CMD+K}.
+api_suggest: use as FIRST step when task is RECURRING or programmatic AND the service has an API. Almost all SaaS/cloud services have APIs (Slack, Gmail, Discord, Notion, GitHub, Twilio, n8n, Stripe, Zapier, OpenAI, etc.). Do NOT use for one-off tasks.
+guide.step: use for ANY task where the user must act manually step by step (government sites, DMV, forms, license renewal, API token setup, CAPTCHAs, login walls). MANDATORY pattern: browser.act navigate URL (sessionId) → browser.act highlight (label, instruction, sessionId) → guide.step (instruction, sessionId) → repeat highlight+guide.step for each step. Playwright opens a VISIBLE Chrome Testing window. highlight injects glow + speech bubble; guide.step polls window.__tdGuideTriggered and auto-advances when user clicks highlighted element. sessionId is REQUIRED in guide.step.
+Policy: no sudo/su/passwd. argv is string[] — no shell interpolation.
 Output ONLY a valid JSON array. No explanation, no markdown fences.
 If the request cannot be safely automated, output: { "error": "explain why it cannot be done" }`;
 
@@ -67,7 +77,9 @@ module.exports = async function planSkills(state) {
     context,
     recoveryContext,
     conversationHistory = [],
-    activeBrowserSessionId = null
+    activeBrowserSessionId = null,
+    activeBrowserPageElements = null,
+    completedGuideSteps = []
   } = state;
 
   const logger = state.logger || console;
@@ -149,15 +161,116 @@ Adjust the plan to avoid the same failure.`;
   }
 
   // If there's an active browser session from a prior task, tell the LLM to reuse it
-  const browserSessionNote = activeBrowserSessionId
-    ? `\n\nACTIVE BROWSER SESSION: sessionId="${activeBrowserSessionId}" is already open with the correct site. Use this EXACT sessionId for all browser.act steps — do NOT navigate again unless the URL needs to change. Just use smartType or other actions directly on the existing tab.`
-    : '';
+  // Also inject real scanned elements so the LLM plans with exact labels — no guessing.
+  let browserSessionNote = '';
+  if (activeBrowserSessionId) {
+    const activeUrl = state.activeBrowserUrl || null;
+    const activeUrlNote = activeUrl ? ` Currently on: ${activeUrl}.` : '';
+    browserSessionNote = `\n\nACTIVE BROWSER SESSION: sessionId="${activeBrowserSessionId}" is already open.${activeUrlNote} Use this EXACT sessionId for all browser.act steps. If the task targets a DIFFERENT website than the current URL, include a browser.act navigate step first. If the task is a follow-up on the SAME site, skip navigate.`;
+    if (activeBrowserPageElements?.elements?.length > 0) {
+      const elList = activeBrowserPageElements.elements
+        .slice(0, 40)
+        .map(e => `  - [${e.tag}] "${e.label}"${e.href ? ` → ${e.href}` : ''}`)
+        .join('\n');
+      browserSessionNote += `\n\nCURRENT PAGE ELEMENTS (${activeBrowserPageElements.url}):\nUse ONLY these exact labels in highlight steps — do not invent labels:\n${elList}`;
+    }
+  }
 
   // Include any tagged context (highlighted text or [File: /path] tags from Shift+Cmd+C)
   const selectedText = state.selectedText || '';
   let taggedContextNote = '';
   if (selectedText && selectedText.trim()) {
     taggedContextNote = `\n\nTAGGED CONTEXT (user highlighted this before asking):\n${selectedText.trim()}\n\nIf the tagged context contains a [File: /path/to/file] tag, the user is referring to that file. Plan steps to read it using the appropriate command for its file type (see skill rules).`;
+  }
+
+  // ── Two-phase guide planning: scan first, plan with real elements ───────────
+  // For fresh guide tasks (no active session, no existing page elements):
+  //   Phase 1: Ask LLM for just the starting URL — one fast LLM call.
+  //   Navigate + scan that URL — get the real interactive elements.
+  //   Phase 2: Ask LLM for the full plan injecting the real element list.
+  // This eliminates all label guessing on the first plan.
+  let livePageElements = activeBrowserPageElements;
+  let livePageUrl = state.activeBrowserUrl || null;
+  // Only pre-scan for tasks that look like browser/guide tasks (government sites, forms, registration, etc.)
+  // Avoid pre-scanning shell tasks like "convert this file" or "run npm install".
+  const GUIDE_KEYWORDS = /\b(renew|register|apply|passport|visa|dmv|license|permit|form|appointment|enroll|sign up|login|account|government|gov|portal|website|browser|navigate|open|go to|verify|lookup)\b/i;
+  // Suppress two-phase guide for file/shell/bridge tasks — these never need a browser pre-scan
+  const NO_GUIDE_KEYWORDS = /\b(bridge|bridge file|the bridge|file\.bridge|fs\.read|file\.watch|codebase|read the|check the bridge|watch the|tail|directory|folder|repo|shell|npm|git|python|bash|script|file|log)\b/i;
+  const isGuideTask = !activeBrowserPageElements && !recoveryContext && mcpAdapter && GUIDE_KEYWORDS.test(userMessage) && !NO_GUIDE_KEYWORDS.test(userMessage);
+
+  if (isGuideTask) {
+    try {
+      const available = await backend.isAvailable().catch(() => false);
+      if (available) {
+        // Phase 1: get starting URL only
+        const urlQuery = `What is the correct starting URL for this task? Reply with ONLY a JSON object: {"url": "https://...", "sessionId": "guideSession"}
+Task: "${userMessage}"`;
+        const urlRaw = await backend.generateAnswer(urlQuery, {
+          query: urlQuery,
+          context: { systemInstructions: 'You are a URL resolver. Output only {"url":"...","sessionId":"..."}. No markdown, no explanation.', conversationHistory: [], intent: 'command_automate' },
+          options: { maxTokens: 80, temperature: 0.0, fastMode: true }
+        }, { maxTokens: 80, temperature: 0.0, fastMode: true }, null);
+
+        let startUrl = null;
+        let startSessionId = 'guideSession';
+        try {
+          const m = urlRaw.match(/\{[^}]+\}/);
+          if (m) { const p = JSON.parse(m[0]); startUrl = p.url; startSessionId = p.sessionId || 'guideSession'; }
+        } catch (_) {}
+
+        if (startUrl) {
+          logger.info(`[Node:PlanSkills] Two-phase guide: navigating to ${startUrl} for pre-scan`);
+          if (progressCallback) progressCallback({ type: 'planning', message: 'Scanning page...' });
+
+          // Navigate
+          const navRes = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'browser.act', args: { action: 'navigate', url: startUrl, sessionId: startSessionId }
+          }, { timeoutMs: 15000 }).catch(e => ({ ok: false, error: e.message }));
+          const nav = navRes?.data || navRes;
+
+          if (nav?.ok !== false) {
+            // Scan
+            const scanRes = await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'browser.act', args: { action: 'scanCurrentPage', sessionId: startSessionId }
+            }, { timeoutMs: 10000 }).catch(e => ({ ok: false, error: e.message }));
+            const scan = scanRes?.data || scanRes;
+
+            if (scan?.ok && scan?.result?.elements?.length > 0) {
+              livePageElements = { url: scan.result.url, elements: scan.result.elements };
+              livePageUrl = scan.result.url;
+              logger.info(`[Node:PlanSkills] Pre-scan: ${scan.result.elements.length} elements on ${scan.result.url}`);
+              // Store the session so executeCommand knows it's already open
+              state = { ...state, activeBrowserSessionId: startSessionId, activeBrowserUrl: livePageUrl, activeBrowserPageElements: livePageElements };
+            }
+          }
+        }
+      }
+    } catch (preScanErr) {
+      logger.warn(`[Node:PlanSkills] Pre-scan failed (non-fatal): ${preScanErr.message}`);
+    }
+  }
+
+  // Rebuild browserSessionNote with live elements (may have just been populated above).
+  // Filter out any elements that match already-completed guide steps so the LLM
+  // doesn't re-plan steps the user already did.
+  if (livePageElements?.elements?.length > 0) {
+    const sid = state.activeBrowserSessionId || 'guideSession';
+    const effectiveCompleted = state.completedGuideSteps || completedGuideSteps || [];
+    const completedLabels = new Set(
+      effectiveCompleted.map(s => s.label?.toLowerCase().trim()).filter(Boolean)
+    );
+    const filteredEls = livePageElements.elements.filter(e => {
+      if (!e.label) return true;
+      return !completedLabels.has(e.label.toLowerCase().trim());
+    });
+    const elList = filteredEls
+      .slice(0, 40)
+      .map(e => `  - [${e.tag}] "${e.label}"${e.href ? ` → ${e.href}` : ''}`)
+      .join('\n');
+    const doneNote = effectiveCompleted.length > 0
+      ? `\nALREADY COMPLETED (do NOT repeat these): ${effectiveCompleted.map(s => `"${s.label}"`).join(', ')}`
+      : '';
+    browserSessionNote = `\n\nACTIVE BROWSER SESSION: sessionId="${sid}" is already open at ${livePageUrl}. Use this EXACT sessionId for all browser.act steps. If this task targets the SAME site, skip navigate. If it targets a DIFFERENT site, include a navigate step first.${doneNote}\n\nCURRENT PAGE ELEMENTS (${livePageUrl}):\nUse ONLY these exact labels in highlight steps — do not invent labels:\n${elList}`;
   }
 
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
@@ -241,7 +354,7 @@ User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResults
         const retryPlan = parsePlan(retryRaw, logger);
         if (retryPlan && Array.isArray(retryPlan)) {
           logger.debug(`[Node:PlanSkills] Retry succeeded: ${retryPlan.length} steps`);
-          if (progressCallback) progressCallback({ type: 'plan_ready', steps: retryPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })) });
+          if (progressCallback) progressCallback({ type: 'plan_ready', steps: retryPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })), intent: state.intent?.type || 'command_automate' });
           return { ...state, skillPlan: retryPlan, skillCursor: 0, recoveryContext: null, planError: null };
         }
       }
@@ -260,7 +373,9 @@ User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResults
     // ── Enforce active browser session (single-site follow-ups only) ────────
     // Only reuse the active session when the plan targets a SINGLE sessionId.
     // Multi-tab plans (distinct sessionIds per site) are intentional — don't touch them.
-    if (activeBrowserSessionId && Array.isArray(skillPlan)) {
+    // Use state.activeBrowserSessionId (not destructured) — pre-scan may have updated it.
+    const effectiveSessionId = state.activeBrowserSessionId || activeBrowserSessionId;
+    if (effectiveSessionId && Array.isArray(skillPlan)) {
       const browserSteps = skillPlan.filter(s => s.skill === 'browser.act');
       if (browserSteps.length > 0) {
         // Collect distinct sessionIds the LLM chose
@@ -274,7 +389,7 @@ User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResults
           // Single-site follow-up — enforce active sessionId and strip redundant navigate
           skillPlan = skillPlan.map(step => {
             if (step.skill !== 'browser.act') return step;
-            return { ...step, args: { ...step.args, sessionId: activeBrowserSessionId } };
+            return { ...step, args: { ...step.args, sessionId: effectiveSessionId } };
           });
 
           // Check if the navigate step goes to the same domain as the active session
@@ -319,7 +434,7 @@ User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResults
     skillPlan.forEach((s, i) =>
       logger.debug(`  Step ${i + 1}: ${s.skill} — ${s.description || JSON.stringify(s.args)}`)
     );
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })) });
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })), intent: state.intent?.type || 'command_automate' });
 
     return {
       ...state,

@@ -30,6 +30,36 @@
  *   (graph routes to recoverSkill)
  */
 
+const os = require('os');
+const fs = require('fs');
+const path = require('path');
+
+// Persistent scheduler — writes pending-schedule.json + launchd plist
+// so macOS can relaunch the app at the target time if it was closed.
+let _scheduler = null;
+function getScheduler() {
+  if (!_scheduler) {
+    try {
+      _scheduler = require(path.join(__dirname, '../../../src/main/scheduler.js'));
+    } catch (_) {
+      // Not available in test/non-Electron environments — no-op
+      _scheduler = { registerSchedule: () => {}, clearPendingSchedule: () => {} };
+    }
+  }
+  return _scheduler;
+}
+
+function loadSmartFillPrompt() {
+  const promptPath = path.join(__dirname, '../prompts/smart-fill.md');
+  try {
+    return fs.readFileSync(promptPath, 'utf8').trim();
+  } catch (_) {
+    return null;
+  }
+}
+
+const SMART_FILL_SYSTEM_PROMPT = loadSmartFillPrompt() || 'You are a DOM field mapper. Output only valid JSON mapping role names to CSS selectors. No explanation.';
+
 module.exports = async function executeCommand(state) {
   const {
     mcpAdapter,
@@ -68,6 +98,19 @@ module.exports = async function executeCommand(state) {
   if (skillCursor >= skillPlan.length) {
     const completedCount = skillResults.filter(r => r.ok).length;
     logger.debug(`[Node:ExecuteCommand] All ${skillPlan.length} steps complete`);
+
+    // ── Final overlay cleanup ─────────────────────────────────────────────
+    // Remove all ThinkDrop highlight overlays and data-td-target attributes
+    // from the page so the browser layout is not corrupted after automation.
+    const lastGuideSessionId = state.activeBrowserSessionId
+      || skillResults.slice().reverse().find(r => r.skill === 'browser.act' && r.args?.sessionId)?.args?.sessionId
+      || null;
+    if (lastGuideSessionId && mcpAdapter) {
+      mcpAdapter.callService('command', 'command.automate', {
+        skill: 'browser.act',
+        args: { action: 'highlight', sessionId: lastGuideSessionId, clear: true }
+      }, { timeoutMs: 5000 }).catch(() => {});
+    }
 
     // Collect file paths written during this plan for the UI "Open file" link.
     // Primary source: accumulated state.savedFilePaths set by synthesize steps (explicit saveToFile arg).
@@ -169,6 +212,160 @@ module.exports = async function executeCommand(state) {
   const step = skillPlan[skillCursor];
   const { skill, args = {}, optional = false, description } = step;
 
+  // ── Guide cancellation check — runs before EVERY step ────────────────────
+  // Checked here so Stop Guide aborts immediately at the start of any step,
+  // not just after waitForTrigger resolves. Covers browser.act highlight steps
+  // between guide.step entries that previously kept running after cancel.
+  const isGuideCancelledEarly = typeof state.isGuideCancelled === 'function' ? state.isGuideCancelled : () => false;
+  if (isGuideCancelledEarly()) {
+    logger.info(`[Node:ExecuteCommand] Guide cancelled — aborting at step ${skillCursor + 1} (${skill})`);
+    const cancelSessionId = state.activeBrowserSessionId
+      || skillResults.slice().reverse().find(r => r.skill === 'browser.act' && r.args?.sessionId)?.args?.sessionId
+      || null;
+    if (cancelSessionId && mcpAdapter) {
+      mcpAdapter.callService('command', 'command.automate', {
+        skill: 'browser.act',
+        args: { action: 'highlight', sessionId: cancelSessionId, clear: true }
+      }, { timeoutMs: 5000 }).catch(() => {});
+    }
+    if (progressCallback) progressCallback({ type: 'all_done', totalCount: skillResults.length, skillResults });
+    return {
+      ...state,
+      skillResults: [...skillResults, { step: skillCursor + 1, skill, args, description, ok: true, stdout: 'Guide cancelled by user' }],
+      skillCursor: skillPlan.length,
+      commandExecuted: true,
+      failedStep: null,
+      activeBrowserSessionId: null,
+      activeBrowserUrl: null
+    };
+  }
+
+  // ── schedule pseudo-skill ────────────────────────────────────────────────
+  // Defers the remaining plan steps until a specific clock time or after a
+  // delay. Shows a live countdown in the UI via 'schedule_tick' progress events.
+  // Args: { time?: string (e.g. "8:00 PM"), delayMs?: number, label?: string }
+  if (skill === 'schedule') {
+    const { time, delayMs: rawDelayMs, label = 'Waiting...' } = args;
+
+    // Resolve target time → ms from now
+    let waitMs = 0;
+    if (rawDelayMs && typeof rawDelayMs === 'number' && rawDelayMs > 0) {
+      waitMs = rawDelayMs;
+    } else if (time && typeof time === 'string') {
+      // Parse "8:00 PM", "20:00", "9:30 AM", "21:00" etc.
+      const now = new Date();
+      const timeStr = time.trim().toUpperCase();
+      const match12 = timeStr.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/);
+      const match24 = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+      let targetDate = null;
+      if (match12) {
+        let hours = parseInt(match12[1], 10);
+        const mins = parseInt(match12[2] || '0', 10);
+        const meridiem = match12[3];
+        if (meridiem === 'PM' && hours < 12) hours += 12;
+        if (meridiem === 'AM' && hours === 12) hours = 0;
+        targetDate = new Date(now);
+        targetDate.setHours(hours, mins, 0, 0);
+      } else if (match24) {
+        const hours = parseInt(match24[1], 10);
+        const mins = parseInt(match24[2], 10);
+        targetDate = new Date(now);
+        targetDate.setHours(hours, mins, 0, 0);
+      }
+      if (targetDate) {
+        // If target time already passed today, schedule for tomorrow
+        if (targetDate <= now) targetDate.setDate(targetDate.getDate() + 1);
+        waitMs = targetDate.getTime() - now.getTime();
+      }
+    }
+
+    if (waitMs <= 0) {
+      // Already past target time or no valid time given — skip immediately
+      logger.info(`[Node:ExecuteCommand] schedule: no valid future time — skipping`);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: description || 'Schedule: skipped (time already passed)', stdout: 'Skipped' });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: 'Skipped — time already passed' }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false
+      };
+    }
+
+    const targetIso = new Date(Date.now() + waitMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    logger.info(`[Node:ExecuteCommand] schedule: waiting ${Math.round(waitMs / 1000)}s until ${targetIso} — "${label}"`);
+
+    // Register a persistent launchd task so macOS launches ThinkDrop at the
+    // target time even if the user closes the app before the countdown ends.
+    const scheduleId = `sched_${Date.now()}`;
+    const remainingSteps = skillPlan.slice(skillCursor + 1); // steps after this schedule step
+    try {
+      getScheduler().registerSchedule({
+        id: scheduleId,
+        targetMs: Date.now() + waitMs,
+        label,
+        prompt: state.message || '',
+        skillPlan: remainingSteps,
+      });
+    } catch (schedErr) {
+      logger.warn(`[Node:ExecuteCommand] schedule: launchd registration failed (non-fatal): ${schedErr.message}`);
+    }
+
+    if (progressCallback) progressCallback({
+      type: 'schedule_start',
+      stepIndex: skillCursor,
+      totalSteps: skillPlan.length,
+      skill: 'schedule',
+      description: description || label,
+      waitMs,
+      targetTime: targetIso,
+      label
+    });
+
+    // Live countdown — tick every second
+    await new Promise((resolve) => {
+      let remaining = waitMs;
+      const TICK = 1000;
+      const interval = setInterval(() => {
+        remaining -= TICK;
+        if (remaining <= 0) {
+          clearInterval(interval);
+          resolve(undefined);
+          return;
+        }
+        const secsLeft = Math.ceil(remaining / 1000);
+        const minsLeft = Math.floor(secsLeft / 60);
+        const secs = secsLeft % 60;
+        const countdownLabel = minsLeft > 0
+          ? `${minsLeft}m ${secs}s until ${targetIso}`
+          : `${secs}s until ${targetIso}`;
+        if (progressCallback) progressCallback({
+          type: 'schedule_tick',
+          stepIndex: skillCursor,
+          totalSteps: skillPlan.length,
+          skill: 'schedule',
+          description: `${label} — ${countdownLabel}`,
+          remainingMs: remaining,
+          targetTime: targetIso,
+          label
+        });
+      }, TICK);
+      // Also schedule the final resolve at exactly waitMs
+      setTimeout(() => { clearInterval(interval); resolve(undefined); }, waitMs);
+    });
+
+    logger.info(`[Node:ExecuteCommand] schedule: wait complete — continuing plan`);
+    // App stayed open — clear the launchd plist so macOS doesn't relaunch later
+    try { getScheduler().clearPendingSchedule(scheduleId); } catch (_) {}
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: description || `Scheduled wait complete — running now`, stdout: `Waited until ${targetIso}` });
+
+    return {
+      ...state,
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: `Waited until ${targetIso}` }],
+      skillCursor: skillCursor + 1,
+      commandExecuted: false
+    };
+  }
+
   // ── needs_install pseudo-skill ───────────────────────────────────────────
   // Checks if a CLI tool is installed. If missing, pauses the plan and emits
   // a 'needs_install' progress event so the UI can show a confirmation card.
@@ -263,6 +460,19 @@ module.exports = async function executeCommand(state) {
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: `Installed ${tool}`, stdout: installStdout });
       logger.info(`[Node:ExecuteCommand] needs_install: install ${installOk ? 'succeeded' : 'failed'} for ${tool}`);
 
+      // If install succeeded and no more steps follow, stream a "skill ready" confirmation
+      // so the user knows the tool is available and how to use it.
+      const isLastStep = skillCursor + 1 >= skillPlan.length;
+      if (installOk && isLastStep) {
+        const toolDescription = args.description || '';
+        const confirmation = `✅ **${tool} is now installed!**${toolDescription ? '\n\n' + toolDescription : ''}\n\nYou can now use it — just ask me naturally (e.g. "use ${tool} to...")`;
+        if (typeof state.streamCallback === 'function') {
+          state.streamCallback(confirmation);
+        } else if (progressCallback) {
+          progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: confirmation, stdout: confirmation });
+        }
+      }
+
       return {
         ...state,
         skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: installOk, stdout: installStdout }],
@@ -279,6 +489,499 @@ module.exports = async function executeCommand(state) {
         commandExecuted: false
       };
     }
+  }
+
+  // ── api_suggest pseudo-skill ─────────────────────────────────────────────
+  // Pauses the plan and surfaces an API-first offer to the user.
+  // The LLM uses this when a task is better served by an app's API (e.g. Slack,
+  // Gmail, Notion) than by UI automation. Emits ask_user with two choices:
+  //   1. "Set up [App] API" — user wants the API/webhook approach
+  //   2. "Show me how (guided)" — user wants a step-by-step guided walkthrough
+  //   3. "Try shortcuts anyway" — user wants to attempt keyboard automation
+  //
+  // Args:
+  //   app         {string}  App name (e.g. "Slack", "Gmail")
+  //   reason      {string}  Why API is recommended
+  //   apiDocsUrl  {string}  Link to API docs / token setup page
+  //   apiSetupPrompt {string} Follow-up prompt to send if user picks "Set up API"
+  //   guidePrompt {string}  Follow-up prompt to send if user picks "Show me how"
+  if (skill === 'api_suggest') {
+    const { app: suggestApp, reason: suggestReason, apiDocsUrl, apiSetupPrompt, guidePrompt } = args;
+
+    const question = `💡 The best way to automate this with **${suggestApp || 'this app'}** is via its API — it's faster, more reliable, and works even when the app is closed.\n\n${suggestReason || ''}\n\nHow would you like to proceed?`;
+    const options = [
+      apiSetupPrompt || `Set up ${suggestApp || 'app'} API`,
+      guidePrompt   || `Show me how to do it manually (guided)`,
+      `Try keyboard shortcuts anyway`
+    ];
+
+    logger.info(`[Node:ExecuteCommand] api_suggest: surfacing API offer for ${suggestApp}`);
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'api_suggest', description: description || `API recommendation for ${suggestApp}`, stdout: question });
+
+    return {
+      ...state,
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'api_suggest', args, description, ok: true, stdout: question }],
+      skillCursor: skillCursor + 1,
+      commandExecuted: false,
+      pendingQuestion: { question, options },
+      failedStep: null
+    };
+  }
+
+  // ── guide.step pseudo-skill ──────────────────────────────────────────────
+  // Pauses the plan and shows the user a guided instruction card.
+  // Supports two resume modes:
+  //
+  // MODE 1 — Page-event mode (preferred, when sessionId is provided):
+  //   The highlight action injects a click listener on the target element that
+  //   sets window.__tdGuideTriggered = true on the page. guide.step polls this
+  //   flag via mcpAdapter (browser.act evaluate). When the user clicks the
+  //   highlighted element in the browser, the plan auto-advances — no button needed.
+  //
+  // MODE 2 — IPC fallback (when no sessionId):
+  //   Shows "✓ Done — Continue" button in ResultsWindow. User clicks it,
+  //   guide:continue IPC fires, confirmGuideCallback Promise resolves.
+  //
+  // Args:
+  //   instruction {string}  What the user needs to do (shown in card + browser bubble)
+  //   sessionId   {string}  Playwright session to poll for page-event trigger
+  //   url         {string}  Optional URL context shown in card
+  //   timeoutMs   {number}  Max wait time (default: 5 minutes)
+  if (skill === 'guide.step') {
+    const { instruction, sessionId: guideSessionId, url: guideUrl, timeoutMs: guideTimeout = 300000 } = args;
+
+    if (!instruction) {
+      logger.warn('[Node:ExecuteCommand] guide.step: missing instruction — skipping');
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'guide.step', description: description || 'Guide step', stdout: 'Skipped (no instruction)' });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'Skipped (no instruction)' }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false
+      };
+    }
+
+    logger.info(`[Node:ExecuteCommand] guide.step: showing instruction — mode=${guideSessionId ? 'page-event' : 'ipc-fallback'}`);
+    if (progressCallback) progressCallback({
+      type: 'guide_step',
+      stepIndex: skillCursor,
+      totalSteps: skillPlan.length,
+      instruction,
+      sessionId: guideSessionId || null,
+      url: guideUrl || null,
+      description: description || 'Follow the steps below',
+      mode: guideSessionId ? 'page_event' : 'ipc'
+    });
+
+    let continued = false;
+
+    if (guideSessionId && mcpAdapter) {
+      // ── MODE 1: waitForTrigger — CDP exposeBinding, CSP-safe, event-driven ──
+      // The highlight overlay attaches blur/change/click listener per element type.
+      // When the user interacts, listener calls window.__tdTrigger() — a CDP binding
+      // registered once per session in getSession(). No eval, no polling, no CSP issues.
+      logger.info(`[Node:ExecuteCommand] guide.step: waiting for page trigger on session=${guideSessionId}`);
+      let triggered = false;
+
+      try {
+        await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'browser.act',
+          args: { action: 'waitForTrigger', sessionId: guideSessionId, timeoutMs: guideTimeout }
+        }, { timeoutMs: guideTimeout + 5000 });
+        triggered = true;
+      } catch (err) {
+        triggered = true;
+        logger.info(`[Node:ExecuteCommand] guide.step: waitForTrigger ended (${err.message?.slice(0, 60)}) — auto-continuing`);
+      }
+
+      continued = true;
+      logger.info(`[Node:ExecuteCommand] guide.step: page trigger fired — continuing`);
+
+      // Check if user clicked "Stop Guide" — if so, abort cleanly instead of continuing.
+      const isGuideCancelled = typeof state.isGuideCancelled === 'function' ? state.isGuideCancelled : () => false;
+      if (isGuideCancelled()) {
+        logger.info(`[Node:ExecuteCommand] guide.step: guide cancelled by user — aborting`);
+        if (progressCallback) progressCallback({ type: 'all_done', totalCount: skillResults.length, skillResults });
+        return {
+          ...state,
+          skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'Guide cancelled by user' }],
+          skillCursor: skillPlan.length,
+          commandExecuted: true,
+          failedStep: null,
+          activeBrowserSessionId: null,
+          activeBrowserUrl: null
+        };
+      }
+
+      // Wait for navigation to settle — user click likely triggered a page change.
+      // Use waitForNavigation (load state) which handles the new page properly.
+      try {
+        await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'browser.act',
+          args: { action: 'waitForNavigation', sessionId: guideSessionId, waitUntil: 'domcontentloaded', timeoutMs: 8000 }
+        }, { timeoutMs: 12000 });
+      } catch (_) {
+        // No navigation happened or already settled — brief pause for JS to render
+        await new Promise(r => setTimeout(r, 800));
+      }
+
+      // ── Post-navigation rescan ──────────────────────────────────────────────
+      // Scan the new page and patch the NEXT highlight step with real labels.
+      // This prevents the LLM's pre-planned labels from being wrong after navigation.
+      const nextHighlightIdx = skillPlan.findIndex(
+        (s, i) => i > skillCursor && s.skill === 'browser.act' && s.args?.action === 'highlight'
+      );
+      if (nextHighlightIdx !== -1) {
+        try {
+          const rescanResult = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'browser.act',
+            args: { action: 'scanCurrentPage', sessionId: guideSessionId }
+          }, { timeoutMs: 8000 });
+          const rescan = rescanResult?.data || rescanResult;
+
+          if (rescan?.ok && rescan?.result?.elements?.length > 0) {
+            const newPageUrl = rescan.result.url;
+            const els = rescan.result.elements;
+            logger.info(`[Node:ExecuteCommand] Post-nav rescan: ${els.length} elements on ${newPageUrl}`);
+
+            // Track what the user just clicked so planSkills can filter it out
+            // of future element lists — prevents the LLM from re-planning it.
+            const clickedLabel = args.label || description || null;
+            const prevUrl = state.activeBrowserUrl || '';
+            const existingCompleted = state.completedGuideSteps || [];
+            const completedGuideSteps = clickedLabel
+              ? [...existingCompleted, { label: clickedLabel, url: prevUrl }]
+              : existingCompleted;
+
+            // Detect whether this is a real page change or just a hash/anchor scroll.
+            // Hash-only changes (e.g. /renew.html → /renew.html#Step%20One) stay on the
+            // same page — same content, same elements — no replan needed.
+            const isSamePagePath = (() => {
+              try {
+                const prev = new URL(prevUrl);
+                const next = new URL(newPageUrl);
+                return prev.hostname === next.hostname && prev.pathname === next.pathname;
+              } catch (_) { return false; }
+            })();
+
+            if (isSamePagePath) {
+              // Same page (hash scroll or no navigation) — just continue the existing plan.
+              logger.info(`[Node:ExecuteCommand] Post-nav rescan: same page path (hash change only) — continuing plan`);
+              return {
+                ...state,
+                skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing' }],
+                skillCursor: skillCursor + 1,
+                activeBrowserUrl: newPageUrl,
+                activeBrowserPageElements: { url: newPageUrl, elements: els },
+                completedGuideSteps,
+                commandExecuted: false
+              };
+            }
+
+            // Real page change — force a replan with real elements from the new page.
+            const updatedResults = [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing' }];
+            const replanSignal = {
+              step: skillCursor + 1,
+              skill: 'guide.step',
+              args,
+              ok: false,
+              error: `replan_after_navigation: user clicked "${clickedLabel || 'a link'}" on ${prevUrl || 'previous page'} and navigated to ${newPageUrl} — replan remaining steps with real page elements from the new page`
+            };
+            logger.info(`[Node:ExecuteCommand] Post-nav rescan: forcing replan with ${els.length} real elements from ${newPageUrl}`);
+            return {
+              ...state,
+              skillResults: updatedResults,
+              skillCursor: skillCursor + 1,
+              failedStep: replanSignal,
+              activeBrowserSessionId: guideSessionId,
+              activeBrowserUrl: newPageUrl,
+              activeBrowserPageElements: { url: newPageUrl, elements: els },
+              completedGuideSteps,
+              commandExecuted: false
+            };
+          }
+        } catch (rescanErr) {
+          logger.debug(`[Node:ExecuteCommand] Post-nav rescan failed (non-fatal): ${rescanErr.message}`);
+        }
+      }
+
+    } else {
+      // ── MODE 2: IPC fallback — wait for guide:continue from ResultsWindow ──
+      const confirmGuideCallback = state.confirmGuideCallback || null;
+      if (typeof confirmGuideCallback === 'function') {
+        try {
+          continued = await confirmGuideCallback();
+        } catch (err) {
+          logger.warn(`[Node:ExecuteCommand] guide.step: IPC timed out — auto-continuing: ${err.message}`);
+          continued = true;
+        }
+      } else {
+        logger.warn('[Node:ExecuteCommand] guide.step: no confirmGuideCallback — auto-continuing');
+        continued = true;
+      }
+    }
+
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'guide.step', description: description || 'Guide step', stdout: 'User action detected — continuing' });
+
+    return {
+      ...state,
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing' }],
+      skillCursor: skillCursor + 1,
+      commandExecuted: false
+    };
+  }
+
+  // ── smartFill pseudo-skill ───────────────────────────────────────────────
+  // Universal form-filling: snapshot the live DOM, ask the LLM to identify
+  // which visible input maps to each role (to/subject/body or any field map),
+  // then type into the exact selectors the LLM resolved.
+  // Works for any web form — email compose, social media, banking, sign-up forms.
+  //
+  // Args:
+  //   sessionId:  string  — browser session to inspect
+  //   fields:     object  — { roleName: "value to type", ... }
+  //               e.g. { to: "user@example.com", subject: "Hello", body: "..." }
+  //   sendSelector: string (optional) — click this after filling (e.g. Send button)
+  if (skill === 'smartFill') {
+    const sessionId = args.sessionId || 'default';
+    const fieldMap  = args.fields || {
+      ...(args.to      ? { to:      args.to      } : {}),
+      ...(args.subject ? { subject: args.subject } : {}),
+      ...(args.body    ? { body:    args.body    } : {}),
+    };
+    const sendSelector = args.sendSelector || null;
+
+    logger.debug(`[Node:ExecuteCommand] smartFill step — sessionId=${sessionId} fields=${Object.keys(fieldMap).join(',')}`);
+    if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'smartFill', description: description || 'Inspecting form and filling fields...' });
+
+    // ── Step 1: Snapshot the live DOM ────────────────────────────────────────
+    let pageSnapshot = '';
+    try {
+      const snapResult = await mcpAdapter.call('command.command.automate', {
+        skill: 'browser.act',
+        args: { action: 'getPageSnapshot', sessionId, maxChars: 1500 }
+      });
+      if (snapResult?.ok && snapResult?.result) {
+        pageSnapshot = String(snapResult.result);
+        logger.debug(`[Node:ExecuteCommand] smartFill: snapshot captured (${pageSnapshot.length} chars)`);
+      }
+    } catch (snapErr) {
+      logger.warn(`[Node:ExecuteCommand] smartFill: snapshot failed — ${snapErr.message}`);
+    }
+
+    if (!pageSnapshot) {
+      const errResult = { step: skillCursor + 1, skill: 'smartFill', args, description, ok: false, error: 'Could not capture page snapshot — browser session may not be open' };
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill: 'smartFill', description: description || 'smartFill', error: errResult.error });
+      return { ...state, skillResults: [...skillResults, errResult], skillCursor, failedStep: errResult, commandExecuted: false };
+    }
+
+    // ── Step 2: LLM maps field roles → exact CSS selectors ───────────────────
+    const llmBackend = state.llmBackend;
+    const context    = state.context;
+    let resolvedSelectors = {}; // { roleName: selector }
+
+    const fieldRoles = Object.keys(fieldMap).map(role => `  "${role}": "${fieldMap[role].substring(0, 60)}"`).join('\n');
+    const fieldMapQuery = `Page snapshot:\n${pageSnapshot}\n\nFields to fill:\n${fieldRoles}`;
+
+    if (llmBackend) {
+      try {
+        const raw = await llmBackend.generateAnswer(fieldMapQuery, {
+          query: fieldMapQuery,
+          context: { systemInstructions: SMART_FILL_SYSTEM_PROMPT, sessionId: context?.sessionId, userId: context?.userId, intent: 'command_automate' },
+          options: { maxTokens: 300, temperature: 0.0, fastMode: true }
+        }, { maxTokens: 300, temperature: 0.0, fastMode: true }, null);
+
+        logger.debug(`[Node:ExecuteCommand] smartFill: LLM selector map raw: ${raw.substring(0, 300)}`);
+
+        // Parse JSON — strip markdown fences if present
+        const jsonStr = raw.replace(/```[a-z]*\n?/g, '').replace(/```/g, '').trim();
+        const firstBrace = jsonStr.indexOf('{');
+        const lastBrace  = jsonStr.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace !== -1) {
+          resolvedSelectors = JSON.parse(jsonStr.substring(firstBrace, lastBrace + 1));
+          logger.debug(`[Node:ExecuteCommand] smartFill: resolved selectors: ${JSON.stringify(resolvedSelectors)}`);
+        }
+      } catch (llmErr) {
+        logger.warn(`[Node:ExecuteCommand] smartFill: LLM field mapping failed — ${llmErr.message}. Falling back to heuristics.`);
+      }
+    }
+
+    // ── Step 3: Heuristic fallback if LLM failed or returned nulls ───────────
+    // Parse the snapshot to extract field descriptors and score them per role
+    const snapshotLines = pageSnapshot.split('\n');
+    const inputLines = snapshotLines.filter(l => l.trim().startsWith('<input') || l.trim().startsWith('<textarea') || l.trim().startsWith('<div') || l.trim().startsWith('<span'));
+
+    const heuristicSelector = (role) => {
+      // Broad keyword map covering email, social, forms, banking, sign-up, etc.
+      const keywords = {
+        // ── Email compose ──────────────────────────────────────────────────
+        to:           ['to recipients', 'recipient', 'addressee', '"to"', 'send to', 'email to'],
+        subject:      ['subject', 'subjectbox', 'email subject', 're:'],
+        body:         ['message body', 'compose', 'message body', 'email body', 'write here'],
+        // ── Social media ───────────────────────────────────────────────────
+        post:         ['what\'s on your mind', 'start a post', 'compose tweet', 'what\'s happening', 'create post', 'write a post', 'share something'],
+        caption:      ['caption', 'add a caption', 'write a caption'],
+        comment:      ['add a comment', 'write a comment', 'leave a comment', 'reply'],
+        // ── Generic forms ──────────────────────────────────────────────────
+        name:         ['full name', 'your name', 'first name', 'last name', 'display name'],
+        firstname:    ['first name', 'given name', 'forename'],
+        lastname:     ['last name', 'surname', 'family name'],
+        email:        ['email address', 'your email', 'enter email', 'email'],
+        phone:        ['phone number', 'mobile', 'telephone', 'cell'],
+        password:     ['password', 'create password', 'new password'],
+        username:     ['username', 'user name', 'handle', 'screen name'],
+        address:      ['street address', 'address line', 'mailing address'],
+        city:         ['city', 'town'],
+        zip:          ['zip', 'postal code', 'postcode'],
+        message:      ['message', 'your message', 'write your message', 'description', 'details'],
+        search:       ['search', 'find', 'look up', 'query'],
+        // ── Banking / checkout ─────────────────────────────────────────────
+        cardnumber:   ['card number', 'credit card', 'debit card', 'card no'],
+        expiry:       ['expiry', 'expiration', 'exp date', 'mm/yy', 'mm/yyyy'],
+        cvv:          ['cvv', 'cvc', 'security code', 'card code'],
+        amount:       ['amount', 'transfer amount', 'payment amount', 'how much'],
+      };
+      const kws = keywords[role.toLowerCase()] || [role.toLowerCase()];
+
+      // Pass 1: keyword match against aria-label, name, placeholder in snapshot lines
+      for (const line of inputLines) {
+        const lower = line.toLowerCase();
+        // Skip search boxes for non-search roles
+        if (role !== 'search' && (lower.includes('name="q"') || lower.includes('aria-label="search') || lower.includes('placeholder="search'))) continue;
+        for (const kw of kws) {
+          if (lower.includes(kw)) {
+            const ariaMatch  = line.match(/aria-label="([^"]+)"/);
+            if (ariaMatch)  return `[aria-label="${ariaMatch[1]}"]`;
+            const nameMatch  = line.match(/name="([^"]+)"/);
+            if (nameMatch)  return `[name="${nameMatch[1]}"]`;
+            const tidMatch   = line.match(/data-testid="([^"]+)"/);
+            if (tidMatch)   return `[data-testid="${tidMatch[1]}"]`;
+            const phMatch    = line.match(/placeholder="([^"]+)"/);
+            if (phMatch)    return `[placeholder="${phMatch[1]}"]`;
+          }
+        }
+      }
+
+      // Pass 2: positional fallback — map role index to DOM order
+      // e.g. for { to, subject, body }: first input = to, second = subject, third = body (contenteditable)
+      const roleKeys = Object.keys(fieldMap);
+      const roleIndex = roleKeys.indexOf(role);
+      if (roleIndex !== -1 && roleIndex < inputLines.length) {
+        const line = inputLines[roleIndex];
+        const ariaMatch = line.match(/aria-label="([^"]+)"/);
+        if (ariaMatch) return `[aria-label="${ariaMatch[1]}"]`;
+        const nameMatch = line.match(/name="([^"]+)"/);
+        if (nameMatch) return `[name="${nameMatch[1]}"]`;
+        const tidMatch  = line.match(/data-testid="([^"]+)"/);
+        if (tidMatch)  return `[data-testid="${tidMatch[1]}"]`;
+      }
+
+      return null;
+    };
+
+    for (const role of Object.keys(fieldMap)) {
+      if (!resolvedSelectors[role]) {
+        const fallback = heuristicSelector(role);
+        if (fallback) {
+          resolvedSelectors[role] = fallback;
+          logger.debug(`[Node:ExecuteCommand] smartFill: heuristic fallback for "${role}": ${fallback}`);
+        }
+      }
+    }
+
+    // ── Step 4: Type into each resolved field ─────────────────────────────────
+    const filled = [];
+    const errors = [];
+
+    for (const role of Object.keys(fieldMap)) {
+      const selector = resolvedSelectors[role];
+      const value    = fieldMap[role];
+      if (!selector) { errors.push(`${role}: no selector found`); continue; }
+
+      // For "to" field: append {TAB} to confirm recipient chip (not {ENTER} which triggers search)
+      const textToType = role === 'to' ? `${value}{TAB}` : value;
+      // For "body": click first to focus, then type
+      const needsClick = role === 'body';
+
+      try {
+        if (needsClick) {
+          await mcpAdapter.call('command.command.automate', {
+            skill: 'browser.act',
+            args: { action: 'click', selector, sessionId }
+          });
+        }
+        await mcpAdapter.call('command.command.automate', {
+          skill: 'browser.act',
+          args: { action: 'type', selector, text: textToType, sessionId, clear: true }
+        });
+        filled.push(`${role} → ${selector}`);
+        logger.debug(`[Node:ExecuteCommand] smartFill: filled "${role}" with selector "${selector}"`);
+      } catch (typeErr) {
+        errors.push(`${role} (${selector}): ${typeErr.message}`);
+        logger.warn(`[Node:ExecuteCommand] smartFill: failed to fill "${role}": ${typeErr.message}`);
+      }
+    }
+
+    const allFailed = filled.length === 0 && errors.length > 0;
+    const stdout = `Filled: ${filled.join(', ')}${errors.length ? ` | Errors: ${errors.join(', ')}` : ''}`;
+
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'smartFill', description: description || 'Fill form fields', stdout });
+
+    const stepResult = { step: skillCursor + 1, skill: 'smartFill', args, description, ok: !allFailed, result: { filled, errors, selectors: resolvedSelectors }, stdout };
+
+    if (allFailed) {
+      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+    }
+
+    return {
+      ...state,
+      skillResults: [...skillResults, stepResult],
+      skillCursor: skillCursor + 1,
+      failedStep: null,
+      commandExecuted: false,
+      answer: undefined
+    };
+  }
+
+  // ── list_skills pseudo-skill ─────────────────────────────────────────────
+  // Invoked when user says "list skills" or "what skills are available"
+  // Returns a formatted list of all registered skills with one-line descriptions.
+  if (skill === 'list_skills') {
+    const skillList = [
+      { name: 'file.bridge',       desc: 'Bidirectional .md file channel between ThinkDrop and Windsurf/Cursor. Actions: read, write, poll, status, clear, init, watch' },
+      { name: 'fs.read',           desc: 'Read files and explore codebases. Actions: read, tree, search, explore, tail, stat' },
+      { name: 'file.watch',        desc: 'Watch files for changes. Actions: start, stop, list, poll, read' },
+      { name: 'shell.run',         desc: 'Run shell commands, scripts, and CLI tools' },
+      { name: 'browser.act',       desc: 'Control a browser: navigate, click, type, scan, scrape, screenshot. Actions: navigate, smartClick, smartType, getPageText, scanCurrentPage, screenshot, ...' },
+      { name: 'image.analyze',     desc: 'Analyze a screenshot or image file with vision AI' },
+      { name: 'ui.axClick',        desc: 'Click UI elements via macOS Accessibility (no browser needed)' },
+      { name: 'ui.findAndClick',   desc: 'Find and click a UI element by label or description' },
+      { name: 'ui.typeText',       desc: 'Type text into the focused UI element' },
+      { name: 'ui.moveMouse',      desc: 'Move the mouse cursor to a position' },
+      { name: 'ui.waitFor',        desc: 'Wait for a UI condition (element appears, text changes, etc.)' },
+      { name: 'ui.screen.verify',  desc: 'Verify what is on screen using vision AI' },
+      { name: 'schedule',          desc: 'Schedule a task to run at a future time or after a delay' },
+      { name: 'synthesize',        desc: 'Run an inline LLM call to summarize, compare, or analyze results from prior steps' },
+      { name: 'guide.step',        desc: 'Interactive step-by-step browser guide with visual highlights and user prompts' },
+    ];
+    const output = [
+      '## ThinkDrop Skills',
+      '',
+      'Say a skill name directly to invoke it. Example: `file.bridge read` or `fs.read tree ~/projects/myapp`',
+      '',
+      ...skillList.map(s => `**\`${s.name}\`** — ${s.desc}`),
+      '',
+      'Tip: Add arguments after the skill name, e.g. `file.bridge write Tell Windsurf to refactor LoginForm.tsx`',
+    ].join('\n');
+    if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'list_skills', description: 'Listing available skills' });
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'list_skills', description: 'Available skills', stdout: output });
+    if (typeof state.streamCallback === 'function') state.streamCallback(output);
+    return {
+      ...state,
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'list_skills', args, description, ok: true, result: output, stdout: output }],
+      skillCursor: skillCursor + 1,
+      failedStep: null,
+    };
   }
 
   // ── synthesize pseudo-skill ──────────────────────────────────────────────
@@ -304,11 +1007,47 @@ module.exports = async function executeCommand(state) {
       .filter(r => r.skill === 'shell.run' && r.ok && r.stdout && r.stdout.trim().length > 0)
       .map(r => `=== Shell output (${r.description || r.args?.cmd || 'shell.run'}) ===\n${r.stdout}`);
 
-    const synthesisContext = pageTextResults.length > 0
-      ? [...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`), ...shellStdoutResults].join('\n\n')
-      : shellStdoutResults.length > 0
-        ? shellStdoutResults.join('\n\n')
-        : skillResults.filter(r => r.ok && r.result).map(r => String(r.result)).join('\n\n');
+    // Include file.bridge read results — extract blocks array and format as readable text
+    const fileBridgeResults = skillResults
+      .filter(r => r.skill === 'file.bridge' && r.ok && r.args?.action === 'read')
+      .map(r => {
+        const raw = r._raw || {};
+        const blocks = raw.blocks || [];
+        if (blocks.length === 0) return `=== Bridge file (${raw.bridgeFile || '~/.thinkdrop/bridge.md'}) ===\n(No blocks found)`;
+        const blockText = blocks.map(b =>
+          `--- ${b.prefix}:${b.type} [id=${b.id}] [status=${b.status}]${b.refId ? ` [ref=${b.refId}]` : ''} [ts=${b.ts}] ---\n${b.body}`
+        ).join('\n\n');
+        return `=== Bridge file: ${blocks.length} block(s) (${raw.bridgeFile || '~/.thinkdrop/bridge.md'}) ===\n\n${blockText}`;
+      });
+
+    // Include fs.read results — tree, file content, search matches
+    const fsReadResults = skillResults
+      .filter(r => r.skill === 'fs.read' && r.ok)
+      .map(r => {
+        const raw = r._raw || {};
+        const action = r.args?.action || 'read';
+        if (action === 'tree') return `=== Directory tree: ${raw.path} ===\n${raw.tree || ''}`;
+        if (action === 'search') return `=== Search results (pattern: ${raw.pattern}) ===\n${raw.output || ''}`;
+        if (action === 'tail') return `=== File tail: ${raw.path} ===\n${raw.content || ''}`;
+        if (action === 'stat') return `=== File stat: ${raw.path} ===\n${JSON.stringify(raw, null, 2)}`;
+        // read or explore
+        const parts = [];
+        if (raw.tree) parts.push(`Directory tree:\n${raw.tree}`);
+        const files = [...(raw.keyFiles || []), ...(raw.entryPoints || []), ...(raw.files || [])];
+        files.forEach(f => parts.push(`--- File: ${f.path} (${f.lines} lines) ---\n${f.content}`));
+        return `=== fs.read (${action}: ${raw.path}) ===\n${parts.join('\n\n')}`;
+      });
+
+    const allContextParts = [
+      ...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`),
+      ...shellStdoutResults,
+      ...fileBridgeResults,
+      ...fsReadResults,
+    ];
+
+    const synthesisContext = allContextParts.length > 0
+      ? allContextParts.join('\n\n')
+      : skillResults.filter(r => r.ok && r.result).map(r => String(r.result)).join('\n\n');
 
     const synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
     let synthesisFilePath = args.saveToFile || null;
@@ -321,9 +1060,15 @@ module.exports = async function executeCommand(state) {
       logger.debug(`[Node:ExecuteCommand] synthesize: resolved saveToFile via {{prev_stdout}}: ${synthesisFilePath}`);
     }
 
+    // Expand ~/path → absolute path (Node.js fs does not expand ~)
+    if (synthesisFilePath && synthesisFilePath.startsWith('~/')) {
+      synthesisFilePath = synthesisFilePath.replace('~', os.homedir());
+      logger.debug(`[Node:ExecuteCommand] synthesize: expanded ~ in saveToFile: ${synthesisFilePath}`);
+    }
+
     // If saveToFile is still relative/missing but a prior shell.run step output a single absolute path,
     // use that path's directory (handles single-pipeline find+read where stdout = file content, not path)
-    if (!synthesisFilePath || !synthesisFilePath.startsWith('/')) {
+    if (!synthesisFilePath || (!synthesisFilePath.startsWith('/') && !synthesisFilePath.startsWith(os.homedir()))) {
       const pathMod = require('path');
       // Look for a pure-find step whose stdout is a single absolute file path
       const purePathStep = skillResults.find(r =>
@@ -379,7 +1124,6 @@ module.exports = async function executeCommand(state) {
     }
 
     const fs = require('fs');
-    const os = require('os');
     const path = require('path');
 
     // Write to explicit saveToFile if requested
@@ -429,11 +1173,20 @@ module.exports = async function executeCommand(state) {
   //   {{synthesisAnswer}}     — full text output of the last synthesize step
   //   {{synthesisAnswerFile}} — temp file path containing synthesisAnswer
   //   {{prev_stdout}}         — stdout of the immediately preceding step (enables find→read→write chains)
+  //   {{prev_watchId}}        — watchId from the last file.watch start step
   const synthesisAnswer = state.synthesisAnswer || '';
   const synthesisAnswerFile = state.synthesisAnswerFile || '';
   const prevStdout = skillResults.length > 0 ? (skillResults[skillResults.length - 1].stdout || '').trim() : '';
+  // Resolve prev_watchId: find the most recent file.watch step that returned a watchId
+  const prevWatchId = (() => {
+    for (let i = skillResults.length - 1; i >= 0; i--) {
+      const r = skillResults[i];
+      if (r.skill === 'file.watch' && r.watchId) return r.watchId;
+    }
+    return '';
+  })();
   let resolvedArgs = args;
-  if (synthesisAnswer || synthesisAnswerFile || prevStdout) {
+  if (synthesisAnswer || synthesisAnswerFile || prevStdout || prevWatchId) {
     let argsJson = JSON.stringify(args);
     if (synthesisAnswer) {
       argsJson = argsJson.replace(/\{\{synthesisAnswer\}\}/g, synthesisAnswer.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
@@ -444,14 +1197,31 @@ module.exports = async function executeCommand(state) {
     if (prevStdout) {
       argsJson = argsJson.replace(/\{\{prev_stdout\}\}/g, prevStdout.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
     }
+    if (prevWatchId) {
+      argsJson = argsJson.replace(/\{\{prev_watchId\}\}/g, prevWatchId.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
+    }
     resolvedArgs = JSON.parse(argsJson);
   }
 
   logger.debug(`[Node:ExecuteCommand] Step ${skillCursor + 1}/${skillPlan.length}: ${skill}${description ? ` — ${description}` : ''}`);
   if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: description || skill });
 
-  // Use the step's timeoutMs (may have been patched by recoverSkill AUTO_PATCH) as the HTTP timeout
-  const stepTimeoutMs = resolvedArgs.timeoutMs || 60000;
+  // Handle _waitBeforeMs injected by recoverSkill AUTO_PATCH for mid-navigation retries
+  if (resolvedArgs._waitBeforeMs) {
+    logger.debug(`[Node:ExecuteCommand] Waiting ${resolvedArgs._waitBeforeMs}ms before retry (page navigation settle)`);
+    await new Promise(r => setTimeout(r, resolvedArgs._waitBeforeMs));
+    // Strip the internal flag before sending to MCP
+    const { _waitBeforeMs, ...cleanArgs } = resolvedArgs;
+    resolvedArgs = cleanArgs;
+  }
+
+  // Use the step's timeoutMs (may have been patched by recoverSkill AUTO_PATCH) as the HTTP timeout.
+  // Special case: file.bridge poll uses pollTimeoutMs for the internal poll duration — the HTTP
+  // timeout must be longer than that or the MCPClient kills the request before the poll completes.
+  let stepTimeoutMs = resolvedArgs.timeoutMs || 60000;
+  if (skill === 'file.bridge' && resolvedArgs.action === 'poll' && resolvedArgs.pollTimeoutMs) {
+    stepTimeoutMs = Math.max(stepTimeoutMs, resolvedArgs.pollTimeoutMs + 10000);
+  }
 
   try {
     const result = await mcpAdapter.callService('command', 'command.automate', {
@@ -511,7 +1281,9 @@ module.exports = async function executeCommand(state) {
       stdout: raw.stdout || waitForStdout || browserStdout || null,
       stderr: raw.stderr || null,
       exitCode: raw.exitCode ?? null,
-      result: raw.result ?? null,
+      result: raw.result ?? (skill === 'file.watch' ? raw : null),
+      watchId: skill === 'file.watch' ? (raw.watchId || null) : null,
+      _raw: (skill === 'file.bridge' || skill === 'fs.read') ? raw : undefined,
       url: raw.url ?? null,
       pageContext: raw.pageContext ?? null,
       error: raw.error || null,
@@ -579,6 +1351,62 @@ module.exports = async function executeCommand(state) {
     const activeBrowserUrl = skill === 'browser.act' && stepResult.ok && raw.url
       ? raw.url
       : state.activeBrowserUrl || null;
+
+    // ── Post-navigate scan ────────────────────────────────────────────────────
+    // After a successful navigate, scan the live page and patch the next highlight
+    // step with real element labels from the actual loaded page (handles redirects,
+    // 404s, and dynamic content — no URL guessing needed).
+    if (skill === 'browser.act' && resolvedArgs.action === 'navigate' && stepResult.ok && resolvedArgs.sessionId && mcpAdapter) {
+      const navSessionId = resolvedArgs.sessionId;
+      const nextHighlightIdx = skillPlan.findIndex(
+        (s, i) => i > skillCursor && s.skill === 'browser.act' && s.args?.action === 'highlight'
+      );
+      if (nextHighlightIdx !== -1) {
+        try {
+          const scanRes = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'browser.act',
+            args: { action: 'scanCurrentPage', sessionId: navSessionId }
+          }, { timeoutMs: 8000 });
+          const scan = scanRes?.data || scanRes;
+
+          // 404 detection — scanCurrentPage returns ok:false + errorType:'page_not_found'
+          if (!scan?.ok && scan?.errorType === 'page_not_found') {
+            const badUrl = scan?.url || resolvedArgs.url;
+            logger.warn(`[Node:ExecuteCommand] Navigate landed on 404 (${badUrl}) — marking step failed for replan`);
+            const failedNav = { ...stepResult, ok: false, error: `navigate_404: ${badUrl} is a 404 page. Use a different URL.` };
+            if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: failedNav.error });
+            return {
+              ...state,
+              skillResults: [...skillResults, failedNav],
+              skillCursor,
+              failedStep: failedNav,
+              commandExecuted: false
+            };
+          }
+
+          if (scan?.ok && scan?.result?.elements?.length > 0) {
+            const els = scan.result.elements;
+            const actualUrl = scan.result.url;
+            logger.info(`[Node:ExecuteCommand] Post-navigate scan: ${els.length} elements on ${actualUrl}`);
+            // Store real page elements in state — planSkills injects these into the LLM prompt
+            // on replan so it picks exact labels instead of guessing.
+            return {
+              ...state,
+              skillResults: updatedResults,
+              skillCursor: skillCursor + 1,
+              failedStep: null,
+              activeBrowserSessionId,
+              activeBrowserUrl: actualUrl || activeBrowserUrl,
+              activeBrowserPageElements: { url: actualUrl, elements: els },
+              commandExecuted: false,
+              answer: undefined
+            };
+          }
+        } catch (scanErr) {
+          logger.debug(`[Node:ExecuteCommand] Post-navigate scan failed (non-fatal): ${scanErr.message}`);
+        }
+      }
+    }
 
     const isLastStep = skillCursor + 1 >= skillPlan.length;
 

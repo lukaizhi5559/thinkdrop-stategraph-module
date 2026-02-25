@@ -112,8 +112,10 @@ module.exports = async function recoverSkill(state) {
     backend = new MCPLLMBackend(mcpAdapter);
   }
 
-  // ── Replan limit: abort after 3 replans to prevent infinite loops ───────────
-  const MAX_REPLANS = 3;
+  // ── Replan limit: abort after too many replans to prevent infinite loops ─────
+  // Guide flows legitimately navigate multiple pages (each triggers one replan),
+  // so the limit must be high enough to cover a full multi-step guide journey.
+  const MAX_REPLANS = 10;
   if (replanCount >= MAX_REPLANS) {
     logger.warn(`[Node:RecoverSkill] Replan limit reached (${replanCount}/${MAX_REPLANS}) — aborting`);
     return {
@@ -161,6 +163,137 @@ module.exports = async function recoverSkill(state) {
     .map((s, i) => `  Step ${skillCursor + 2 + i}: ${s.skill} — ${s.description || JSON.stringify(s.args)}`)
     .join('\n') || '  (none)';
 
+  // ── Per-skill diagnostic context ─────────────────────────────────────────
+  // Each skill type gets relevant evidence injected so the LLM can reason
+  // about the actual failure rather than guessing from the error string alone.
+  let skillContextSection = '';
+
+  // ── browser.act: live page snapshot (visible inputs, buttons, URL) ───────
+  if (failedStep.skill === 'browser.act' && mcpAdapter && failedStep.args?.sessionId) {
+    try {
+      const snapshotResult = await mcpAdapter.call('command.command.automate', {
+        skill: 'browser.act',
+        args: { action: 'getPageSnapshot', sessionId: failedStep.args.sessionId, maxChars: 1200 }
+      });
+      if (snapshotResult?.ok && snapshotResult?.result) {
+        skillContextSection = `\nLive page snapshot at time of failure:\n${String(snapshotResult.result).substring(0, 1200)}\n`;
+        logger.debug(`[Node:RecoverSkill] browser.act page snapshot captured (${String(snapshotResult.result).length} chars)`);
+      }
+    } catch (snapErr) {
+      logger.debug(`[Node:RecoverSkill] browser.act page snapshot failed (non-fatal): ${snapErr.message}`);
+    }
+  }
+
+  // ── shell.run: stdout/stderr preview + cwd existence + cmd availability ──
+  if (failedStep.skill === 'shell.run') {
+    const fsSync = require('fs');
+    const { execFileSync } = require('child_process');
+    const lines = [];
+
+    // Stdout preview (first 600 chars — often contains the real error message)
+    const stdout = (failedStep.stdout || '').trim();
+    if (stdout) lines.push(`stdout (first 600 chars):\n${stdout.substring(0, 600)}`);
+
+    // Stderr preview (first 600 chars)
+    const stderr = (failedStep.stderr || '').trim();
+    if (stderr) lines.push(`stderr (first 600 chars):\n${stderr.substring(0, 600)}`);
+
+    // Exit code meaning
+    const exitCode = failedStep.exitCode;
+    if (exitCode !== undefined && exitCode !== null) {
+      const exitMeaning = exitCode === 1 ? 'general error' : exitCode === 2 ? 'misuse of shell command' :
+        exitCode === 126 ? 'command not executable' : exitCode === 127 ? 'command not found' :
+        exitCode === 130 ? 'terminated by Ctrl+C' : exitCode === 137 ? 'killed (OOM or SIGKILL)' :
+        exitCode === 139 ? 'segfault' : exitCode === 255 ? 'exit status out of range / SSH error' : '';
+      lines.push(`Exit code: ${exitCode}${exitMeaning ? ` (${exitMeaning})` : ''}`);
+    }
+
+    // cwd existence check
+    const cwd = failedStep.args?.cwd;
+    if (cwd) {
+      const cwdExists = fsSync.existsSync(cwd);
+      lines.push(`cwd "${cwd}": ${cwdExists ? 'EXISTS' : 'DOES NOT EXIST — this is likely the cause'}`);
+    }
+
+    // cmd availability check (skip shell interpreters — always present)
+    const cmd = failedStep.args?.cmd;
+    const SHELL_CMDS = new Set(['bash', 'sh', 'zsh', 'python3', 'python', 'node', 'ruby', 'perl']);
+    if (cmd && !SHELL_CMDS.has(cmd)) {
+      try {
+        const which = execFileSync('which', [cmd], { timeout: 2000, encoding: 'utf8' }).trim();
+        lines.push(`"${cmd}" binary: found at ${which}`);
+      } catch (_) {
+        lines.push(`"${cmd}" binary: NOT FOUND on PATH — install it or use a different command`);
+      }
+    }
+
+    // Prior successful shell.run stdout (gives LLM context about what was found/built before)
+    const priorShellOutputs = skillResults
+      .filter(r => r.skill === 'shell.run' && r.ok && r.stdout?.trim())
+      .slice(-2)
+      .map(r => `  Step ${r.step} stdout: ${String(r.stdout).trim().substring(0, 200)}`);
+    if (priorShellOutputs.length) lines.push(`Prior shell.run outputs:\n${priorShellOutputs.join('\n')}`);
+
+    if (lines.length) {
+      skillContextSection = `\nshell.run diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
+      logger.debug(`[Node:RecoverSkill] shell.run context injected (${lines.length} items)`);
+    }
+  }
+
+  // ── image.analyze: file existence, size, extension ───────────────────────
+  if (failedStep.skill === 'image.analyze') {
+    const fsSync = require('fs');
+    const path = require('path');
+    const filePath = failedStep.args?.filePath;
+    const lines = [];
+    if (filePath) {
+      const exists = fsSync.existsSync(filePath);
+      lines.push(`filePath "${filePath}": ${exists ? 'EXISTS' : 'DOES NOT EXIST'}`);
+      if (exists) {
+        try {
+          const stat = fsSync.statSync(filePath);
+          lines.push(`File size: ${stat.size} bytes`);
+        } catch (_) {}
+      }
+      const ext = path.extname(filePath).toLowerCase();
+      const SUPPORTED = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.heic', '.heif']);
+      lines.push(`Extension "${ext}": ${SUPPORTED.has(ext) ? 'supported' : 'NOT SUPPORTED — use a supported image format'}`);
+    }
+    if (lines.length) {
+      skillContextSection = `\nimage.analyze diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
+      logger.debug(`[Node:RecoverSkill] image.analyze context injected`);
+    }
+  }
+
+  // ── ui.findAndClick / ui.click / ui.typeText / ui.waitFor ────────────────
+  // Inject the last successful step's stdout (often contains what was visible
+  // on screen) and the prior ui step results for context.
+  if (['ui.findAndClick', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.moveMouse', 'ui.screen.verify'].includes(failedStep.skill)) {
+    const lines = [];
+
+    // What the prior ui step saw/did
+    const priorUiSteps = skillResults
+      .filter(r => r.skill?.startsWith('ui.') && r.ok)
+      .slice(-3)
+      .map(r => `  Step ${r.step} (${r.skill}): ${r.args?.label || r.args?.text || r.args?.condition || JSON.stringify(r.args).substring(0, 80)} → ${r.stdout ? String(r.stdout).trim().substring(0, 120) : 'ok'}`);
+    if (priorUiSteps.length) lines.push(`Prior ui.* steps:\n${priorUiSteps.join('\n')}`);
+
+    // Stderr from the failed step (OmniParser/vision errors often appear here)
+    const stderr = (failedStep.stderr || '').trim();
+    if (stderr) lines.push(`stderr: ${stderr.substring(0, 400)}`);
+
+    // Specific context for findAndClick
+    if (failedStep.skill === 'ui.findAndClick' && failedStep.args?.label) {
+      lines.push(`Attempted to click label: "${failedStep.args.label}"`);
+      lines.push(`Hint: if this label is not visible, the window may be minimized, behind another window, or the label text may differ from what is shown on screen.`);
+    }
+
+    if (lines.length) {
+      skillContextSection = `\nui skill diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
+      logger.debug(`[Node:RecoverSkill] ui.* context injected (${failedStep.skill})`);
+    }
+  }
+
   const recoveryQuery = `Original user request: "${resolvedMessage || message}"
 
 Failed step:
@@ -170,7 +303,7 @@ Failed step:
   Error: ${failedStep.error}
   Exit code: ${failedStep.exitCode ?? 'N/A'}
   Stderr: ${failedStep.stderr || '(none)'}
-
+${skillContextSection}
 Completed steps so far:
 ${completedSteps}
 
@@ -338,22 +471,95 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
       }
     }
 
-    // Selector not found — REPLAN: replace waitForSelector+type with smartType (auto-discovers input)
+    // Selector not found — distinguish between input fields and buttons
     if (combinedError.includes('timeout') && (combinedError.includes('selector') || args.selector)) {
-      if (stepRetryCount === 0) {
-        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act selector timeout → REPLAN with smartType`);
+      const isClickAction = action === 'click';
+      const isTypeAction = action === 'type' || action === 'waitForSelector' || action === 'smartType';
+
+      // Click timeout: the button/element wasn't visible — suggest keyboard shortcut or better selector
+      if (isClickAction) {
+        if (stepRetryCount === 0) {
+          logger.debug(`[Node:RecoverSkill] Fast-path: browser.act click timeout → REPLAN with keyboard shortcut or better selector`);
+          return {
+            action: 'REPLAN',
+            suggestion: `The click selector "${args.selector}" timed out — the element was found but not visible/enabled. For Gmail Send button, use keyboard shortcut instead: press Meta+Enter (Cmd+Enter) to send. For other buttons, try a more specific selector scoped to the active compose/modal window.`,
+            constraint: `If this is a Gmail Send button, replace the click step with: { "skill": "browser.act", "args": { "action": "keyboard", "key": "Meta+Enter", "sessionId": "${args.sessionId || 'default'}" } }. For other providers, use a selector scoped to the compose container (e.g. inside .nH, .compose-window, or [role='dialog']).`
+          };
+        }
+        // Second click failure — ask user
+        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act click timeout (retry ${stepRetryCount}) → ASK_USER`);
         return {
-          action: 'REPLAN',
-          suggestion: `The selector "${args.selector}" was not found — the page likely uses a contenteditable div or a different input type. Replace any waitForSelector + type steps with a single smartType step, which auto-discovers the correct input element (works for input, textarea, and contenteditable divs).`,
-          constraint: `Replace the failed step with: { "skill": "browser.act", "args": { "action": "smartType", "text": "<the text to type>", "sessionId": "${args.sessionId || 'default'}" } }. Do NOT use waitForSelector before smartType — it handles waiting internally. Use the same sessionId as the rest of the plan.`
+          action: 'ASK_USER',
+          question: `The browser couldn't click "${args.selector}" — the element was not visible or enabled. The email may already be composed. Would you like me to try sending with a keyboard shortcut (Cmd+Enter)?`,
+          options: ['Yes, try Cmd+Enter to send', 'Cancel']
         };
       }
-      // Second failure after smartType also failed — ask user
-      logger.debug(`[Node:RecoverSkill] Fast-path: browser.act selector timeout (retry ${stepRetryCount}) → ASK_USER`);
+
+      // waitForSelector timeout: the compose window opened but the specific selector wasn't found.
+      // Do NOT replace smartFill with smartType — just skip the waitForSelector and proceed.
+      if (action === 'waitForSelector') {
+        if (stepRetryCount === 0) {
+          logger.debug(`[Node:RecoverSkill] Fast-path: browser.act waitForSelector timeout → REPLAN skip wait, keep smartFill`);
+          return {
+            action: 'REPLAN',
+            suggestion: `The waitForSelector for "${args.selector}" timed out — the compose window may already be open with a different DOM structure. Remove the failed waitForSelector step and proceed directly to the smartFill step. Do NOT replace smartFill with smartType or individual type steps.`,
+            constraint: `Remove the waitForSelector step that failed. Keep the smartFill step exactly as-is (with to, subject, body, sessionId). smartFill inspects the live DOM itself and does not need a prior waitForSelector. Use the same sessionId as the rest of the plan.`
+          };
+        }
+        // Second waitForSelector failure — ask user
+        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act waitForSelector timeout (retry ${stepRetryCount}) → ASK_USER`);
+        return {
+          action: 'ASK_USER',
+          question: `The compose window doesn't seem to be opening. Is Gmail showing a compose window in the browser?`,
+          options: ['Yes, compose is open', 'No, try again', 'Cancel']
+        };
+      }
+
+      // Type timeout: input field not found — suggest smartType
+      if (isTypeAction) {
+        if (stepRetryCount === 0) {
+          logger.debug(`[Node:RecoverSkill] Fast-path: browser.act type selector timeout → REPLAN with smartType`);
+          return {
+            action: 'REPLAN',
+            suggestion: `The selector "${args.selector}" was not found for typing — the page likely uses a contenteditable div or a different input type. Replace the failed type step with a smartType step, which auto-discovers the correct input element (works for input, textarea, and contenteditable divs).`,
+            constraint: `Replace the failed type step with: { "skill": "browser.act", "args": { "action": "smartType", "text": "<the text to type>", "sessionId": "${args.sessionId || 'default'}" } }. Do NOT use waitForSelector before smartType — it handles waiting internally. Use the same sessionId as the rest of the plan.`
+          };
+        }
+        // Second failure after smartType also failed — ask user
+        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act type selector timeout (retry ${stepRetryCount}) → ASK_USER`);
+        return {
+          action: 'ASK_USER',
+          question: `The browser couldn't find any input element on the page to type into. Would you like me to take a screenshot so you can see what's visible?`,
+          options: ['Yes, take a screenshot', 'Cancel']
+        };
+      }
+    }
+
+    // guide.step navigated to a new page — replan remaining steps with real page elements.
+    // The new activeBrowserPageElements are already in state from the post-nav rescan.
+    if (combinedError.includes('replan_after_navigation')) {
+      // Extract "user clicked X on prevUrl and navigated to newUrl" from error message
+      const clickMatch = combinedError.match(/user clicked "([^"]+)" on ([^\s]+) and navigated to ([^\s]+)/);
+      const completedLabel = clickMatch ? clickMatch[1] : null;
+      const fromUrl = clickMatch ? clickMatch[2] : null;
+      const toUrl = clickMatch ? clickMatch[3] : (state?.activeBrowserUrl || null);
+      logger.debug(`[Node:RecoverSkill] Fast-path: replan_after_navigation from ${fromUrl} → ${toUrl} (completed: "${completedLabel}")`);
       return {
-        action: 'ASK_USER',
-        question: `The browser couldn't find any input element on the page to type into. Would you like me to take a screenshot so you can see what's visible?`,
-        options: ['Yes, take a screenshot', 'Cancel']
+        action: 'REPLAN',
+        suggestion: `The user just clicked "${completedLabel || 'a link'}" and the browser navigated from ${fromUrl || 'the previous page'} to ${toUrl || 'a new page'}. Plan the NEXT steps from this new page using ONLY the CURRENT PAGE ELEMENTS listed in the prompt.`,
+        constraint: `CRITICAL: Do NOT highlight or guide the user to click "${completedLabel}" again — that step is already DONE. The new page may have a sidebar or nav with links from the old page — IGNORE those. Focus only on the main content of the new page (${toUrl || 'current page'}) and use only exact labels from CURRENT PAGE ELEMENTS.`
+      };
+    }
+
+    // Navigate landed on 404 page — REPLAN with correct URL hint
+    if (combinedError.includes('navigate_404')) {
+      const badUrl = args.url || '';
+      const domain = badUrl ? (() => { try { return new URL(badUrl).hostname; } catch (_) { return ''; } })() : '';
+      logger.debug(`[Node:RecoverSkill] Fast-path: navigate_404 ${badUrl} → REPLAN with URL correction`);
+      return {
+        action: 'REPLAN',
+        suggestion: `The URL "${badUrl}" returned a 404 Page Not Found. Choose a correct URL for this task. For travel.state.gov passport tasks use https://travel.state.gov/content/travel/en/passports.html as the starting point — do NOT invent sub-paths. Navigate from the main section page using the site's own links.`,
+        constraint: `Do NOT use "${badUrl}" — it is a 404 page. Start from the top-level section page of ${domain || 'the site'} and navigate from there.`
       };
     }
 
@@ -367,8 +573,21 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
       };
     }
 
-    // Browser/target closed unexpectedly — retry by reopening session
-    if (combinedError.includes('target closed') || combinedError.includes('browser closed') || combinedError.includes('browser has been closed')) {
+    // Browser/target closed — distinguish transient navigation from truly dead browser.
+    // "Target page, context or browser has been closed" fires transiently when a guide.step
+    // user click navigates the page and the next step hits mid-navigation context.
+    // In that case AUTO_PATCH (retry same step after a short wait) — do NOT replan.
+    if (combinedError.includes('target closed') || combinedError.includes('target page') || combinedError.includes('browser closed') || combinedError.includes('browser has been closed')) {
+      const isTransientNavigation = (action === 'highlight' || action === 'evaluate') && stepRetryCount === 0;
+      if (isTransientNavigation) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act ${action} hit mid-navigation context close → AUTO_PATCH retry after wait`);
+        return {
+          action: 'AUTO_PATCH',
+          patchedArgs: { ...args, _waitBeforeMs: 1500 },
+          note: `Page navigated — retrying ${action} after 1.5s for page to settle`,
+          _isTimeoutRetry: true
+        };
+      }
       if (stepRetryCount === 0) {
         logger.debug(`[Node:RecoverSkill] Fast-path: browser.act browser closed → REPLAN with new sessionId`);
         return {
@@ -527,6 +746,9 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
       const constraint = decision.constraint || null;
       const failureReason = failedStep.error || failedStep.reason || 'Step did not produce the expected result.';
       logger.debug(`[Node:RecoverSkill] REPLAN (attempt ${replanCount + 1}): ${suggestion}`);
+      // If the browser was closed, clear the persisted session so main.js doesn't
+      // inject the dead sessionId into the next initialState.
+      const isBrowserClosed = suggestion.includes('browser session was closed') || constraint?.includes('new sessionId');
       return {
         ...state,
         recoveryAction: 'replan',
@@ -542,7 +764,8 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
         failedStep: null,
         skillPlan: null,
         skillCursor: 0,
-        stepRetryCount: 0
+        stepRetryCount: 0,
+        ...(isBrowserClosed ? { activeBrowserSessionId: null, activeBrowserUrl: null } : {})
       };
     }
 

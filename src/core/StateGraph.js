@@ -32,7 +32,7 @@ class StateGraph {
    * @param {Function} onProgress - Optional callback for progress updates (nodeName, state, duration)
    * @returns {Object} Final state with trace
    */
-  async execute(initialState, onProgress = null) {
+  async execute(initialState, onProgress = null, abortSignal = null) {
     const state = {
       ...initialState,
       trace: [],
@@ -48,6 +48,14 @@ class StateGraph {
 
     while (currentNode && currentNode !== 'end' && iterations < maxIterations) {
       iterations++;
+
+      // Check abort signal between nodes
+      if (abortSignal && abortSignal.aborted) {
+        this.logger.info('[StateGraph] Aborted by signal — stopping before node:', currentNode);
+        state.error = 'Cancelled by user';
+        state.cancelled = true;
+        break;
+      }
 
       // Check for infinite loops
       const visitKey = `${currentNode}_${iterations}`;

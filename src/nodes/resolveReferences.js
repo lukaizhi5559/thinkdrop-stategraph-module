@@ -63,7 +63,12 @@ const INTENT_TOPICS = {
  */
 
 // Words that indicate a clear standalone intent — message is NOT a follow-up if these appear.
+// Also includes memory-recall patterns so they break command_automate carryover.
 const STANDALONE_INTENT_WORDS = /\b(search|look up|google|wikipedia|define|explain|how to|who is|weather|news|open|run|execute|install|download|remind|schedule|email|send|call|create|make|delete|move|copy|rename|launch|start|stop|close|write|generate|build|deploy|find me|show me how)\b/i;
+
+// Memory-recall question patterns — these should NEVER carry command_automate forward.
+// e.g. "how have I", "list the email", "did I email", "what emails did I", "who did I"
+const MEMORY_RECALL_QUESTION = /^(how (have|many|much|often)\b|did i\b|what (emails?|messages?|texts?|did i|have i)\b|who did i\b|list (the |all |my )?(emails?|messages?|texts?|addresses?|contacts?|history|activity|sms|chats?)\b|show (me )?(the |my )?(emails?|messages?|texts?|history|activity|list of emails?|list of messages?)\b|what.*(i (sent|emailed|texted|wrote|did))\b)/i;
 
 // Time words that indicate a temporal reference
 const TEMPORAL_WORDS = /\b(today|yesterday|now|this morning|this afternoon|this evening|this week|last week|last night|last month|earlier|recently|at noon|at midnight|around \d|at \d)\b/i;
@@ -122,6 +127,12 @@ function inferIntentFromContent(content) {
 
 function detectIntentCarryover(message, conversationHistory) {
   const msg = message.trim().toLowerCase().replace(/[?!.]+$/, '');
+
+  // Memory-recall questions NEVER carry command_automate forward.
+  // e.g. "how have I sent emails today", "list the email addresses I emailed"
+  // These should always go to memory_retrieve, not re-trigger browser automation.
+  if (MEMORY_RECALL_QUESTION.test(msg)) return null;
+
   const words = msg.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
   const hasStandaloneIntent = STANDALONE_INTENT_WORDS.test(msg);
@@ -163,8 +174,12 @@ function detectIntentCarryover(message, conversationHistory) {
   const isContinuation = wordCount <= 4 && !hasStandaloneIntent && !CLEAR_SUBJECT_VERB.test(msg);
 
   // Signal 2: TEMPORAL ELLIPTICAL — has time word, no standalone intent, short or elliptical prefix
+  // EXCEPTION: system-info queries like "what's today's date", "what time is it" must NEVER
+  // carry over memory_retrieve — they need command_automate (shell.run date).
+  const SYSTEM_INFO_QUERY = /\b(today'?s?\s*date|what('s| is)\s*(today'?s?|the\s*current|the)?\s*(date|time|day)|what\s*time\s*is\s*it|what\s*day\s*is\s*(today|it)|current\s*(date|time))\b/i;
   const ELLIPTICAL_PREFIXES = /^(what about|anything|how about|and|what|show me|tell me about|anything about)\b/i;
   const isTemporalElliptical = hasTemporalWord && !hasStandaloneIntent &&
+    !SYSTEM_INFO_QUERY.test(msg) &&
     (wordCount <= 7 || ELLIPTICAL_PREFIXES.test(msg));
 
   // Signal 3: DEICTIC MEMORY REF — references retrieved content with activity verb.

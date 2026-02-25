@@ -19,6 +19,43 @@ module.exports = async function parseIntent(state) {
     logger.debug(`[Node:ParseIntent] Using resolved message: "${resolvedMessage}"`);
   }
 
+  // ── Hard overrides — run BEFORE carriedIntent and BEFORE phi4 ML ──────────
+  // These must never be bypassed by resolveReferences carryover.
+
+  // File tag override — [File: /path] tag from drag-and-drop or Shift+Cmd+C
+  if (/\[File:\s*[^\]]+\]/.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] File tag override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'file-tag-override', processingTimeMs: 0 } };
+  }
+
+  // ── Skill-name direct invocation ─────────────────────────────────────────
+  // Users can invoke skills directly by name: "file.bridge read", "fs.read explore ~/projects/myapp"
+  // The word.word format is unique to ThinkDrop skills — no conflict with normal sentences.
+  // Also catches: "list skills", "what skills are available", "show me the skills"
+  const KNOWN_SKILLS = [
+    'file.bridge', 'fs.read', 'file.watch',
+    'shell.run', 'browser.act',
+    'ui.axClick', 'ui.findAndClick', 'ui.moveMouse', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.screen.verify',
+    'image.analyze', 'needs_install', 'synthesize', 'schedule',
+    'guide.step',
+  ];
+
+  const LIST_SKILLS_PATTERN = /^(list|show|what are( the)?|show me( the)?|tell me( the)?|what)\s+(skills|available skills|thinkdrop skills|all skills)/i;
+
+  // Check if the message starts with or contains a known skill name
+  const msgLower = classifyMessage.trim().toLowerCase();
+  const invokedSkill = KNOWN_SKILLS.find(s => msgLower === s || msgLower.startsWith(s + ' ') || msgLower.startsWith(s + ':'));
+
+  if (invokedSkill) {
+    logger.debug(`[Node:ParseIntent] Skill-name invocation → command_automate: "${classifyMessage}" (skill: ${invokedSkill})`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: invokedSkill }], requiresMemoryAccess: false }, metadata: { parser: 'skill-name-invocation', processingTimeMs: 0 } };
+  }
+
+  if (LIST_SKILLS_PATTERN.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] list-skills override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'list_skills' }], requiresMemoryAccess: false }, metadata: { parser: 'list-skills-override', processingTimeMs: 0 } };
+  }
+
   // Short-circuit: resolveReferences already determined intent via carryover
   if (carriedIntent) {
     logger.debug(`[Node:ParseIntent] Using carried intent from resolveReferences: ${carriedIntent}`);
@@ -31,23 +68,6 @@ module.exports = async function parseIntent(state) {
         requiresMemoryAccess: carriedIntent === 'memory_retrieve'
       },
       metadata: { parser: 'intent-carryover', processingTimeMs: 0 }
-    };
-  }
-
-  // File tag override — must run BEFORE phi4 ML call.
-  // When the message contains a [File: /path] tag (from Shift+Cmd+C or drag-and-drop),
-  // always route to command_automate so planSkills reads the file via shell.run.
-  if (/\[File:\s*[^\]]+\]/.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] File tag override → command_automate: "${classifyMessage}"`);
-    return {
-      ...state,
-      intent: {
-        type: 'command_automate',
-        confidence: 0.99,
-        entities: [],
-        requiresMemoryAccess: false
-      },
-      metadata: { parser: 'file-tag-override', processingTimeMs: 0 }
     };
   }
 
@@ -100,6 +120,64 @@ module.exports = async function parseIntent(state) {
   const verbSiteDest = verbSiteForMatch ? verbSiteForMatch[2].replace(/[.,!?]+$/, '') : null;
   const hasVerbSiteFor = verbSiteDest && isDestinationWord(verbSiteDest);
 
+  // System-info override — "what's today's date", "what time is it", "what's my battery", etc.
+  // These are trivially answerable by shell.run — must go to command_automate, not general_query.
+  const sysInfoPattern = /\b(what('s| is)( the)?|tell me( the)?|show me( the)?|get( the)?)\s+(today'?s?|current|the)\s+(date|time|day|battery|wifi|disk|ip address|timezone|hostname|username)\b|\b(what('s| is)( today'?s?| the current| the)?)\s+(date|time|day)\b|\btoday'?s?\s+date\b|\bwhat day is (today|it)\b|\bwhat time is it\b/i;
+  if (sysInfoPattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] System-info override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.98, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'system-info-override', processingTimeMs: 0 } };
+  }
+
+  // IDE/bridge setup override — catches "I want my IDE to communicate with ThinkDrop",
+  // "connect Cursor to ThinkDrop", "how do I link Warp to you", etc.
+  // Must run BEFORE the how-to guard so these don't get swallowed by general_query.
+  const ideSetupPattern = /\b(connect|setup|set up|link|integrate|configure|use|get|add|communicate|talk|work with)\b.{0,60}\b(ide|windsurf|cursor|warp|zed|vscode|vs code|copilot|editor|bridge|thinkdrop bridge)\b|\b(ide|windsurf|cursor|warp|zed|editor)\b.{0,60}\b(communicate|talk|connect|work with|integration|setup|set up|linked?|bridge)\b|\b(my|my\s+\w+)\s+(ide|editor|windsurf|cursor|warp)\b.{0,60}\b(communicate|talk|connect|to you|with you|thinkdrop)\b/i;
+  if (ideSetupPattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] IDE-setup override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.97, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'ide-setup-override', processingTimeMs: 0 } };
+  }
+
+  // How-to guard — must run BEFORE memory-query guard and browser override.
+  // "How do I X", "how can I X", "how to X" are general_query (answer node decides
+  // whether to answer or offer a guide). They are NOT browser automation or memory_retrieve.
+  // EXCEPTION: IDE/bridge setup questions already handled above.
+  const ideSetupException = ideSetupPattern;
+  const howToPattern = /^(how (do|can|would|should|do you|can you|would you|to)|what('s| is) the (best |easiest |fastest )?way to|what steps|what are the steps)/i;
+  if (howToPattern.test(classifyMessage.trim()) && !ideSetupException.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] How-to guard → general_query: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'general_query',
+        confidence: 0.90,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'how-to-guard', processingTimeMs: 0 }
+    };
+  }
+
+  // Memory-query guard — must run BEFORE browser automation override.
+  // Questions like "did I visit amazon", "have I been to X", "over the week did I X"
+  // are memory_retrieve even though they contain site names or visit verbs.
+  // Pattern: question structure (did I / have I / was I) + optional time ref + any verb
+  // NOTE: 'do i' removed — it matches "How do I..." which is a how-to question, not memory recall
+  const memoryQueryPattern = /\b(did i|have i|was i|had i|have i ever|did i ever|when did i|how many times did i|how often did i)\b/i;
+  const pastWeekPattern = /\b(over the (week|past week|last week|month|past month)|this week|last week|last month|yesterday|this morning|recently|lately|in the (past|last) \d+ (days?|weeks?|months?))\b/i;
+  if (memoryQueryPattern.test(classifyMessage) || (pastWeekPattern.test(classifyMessage) && /\b(visit|go|went|use|open|check|browse|look at|view)\b/i.test(classifyMessage))) {
+    logger.debug(`[Node:ParseIntent] Memory-query guard → memory_retrieve: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'memory_retrieve',
+        confidence: 0.92,
+        entities: [],
+        requiresMemoryAccess: true
+      },
+      metadata: { parser: 'memory-query-guard', processingTimeMs: 0 }
+    };
+  }
+
   const isBrowserAutomation = urlPattern.test(classifyMessage) || hasNavVerb || hasDestPrep || hasVerbSiteFor;
 
   if (isBrowserAutomation) {
@@ -134,11 +212,30 @@ module.exports = async function parseIntent(state) {
     };
   }
 
+  // Guide-task guard — must run BEFORE action-request override AND phi4 ML call.
+  // "renew X", "apply for X", "register for X", "sign up for X", "fill out X form"
+  // are government/manual tasks that should flow through the answer node to get
+  // the guide offer first — NOT directly to planSkills as command_automate.
+  const guideTaskPattern = /\b(renew|apply for|register for|sign up for|fill out|complete|submit an? application|get a|obtain a|replace my|update my)\b.{0,60}\b(license|passport|id|permit|registration|visa|certificate|insurance|benefit|form|application|dmv|real id|driver|vehicle)\b/i;
+  if (guideTaskPattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Guide-task guard → general_query (answer node): "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'general_query',
+        confidence: 0.90,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'guide-task-guard', processingTimeMs: 0 }
+    };
+  }
+
   // Action-request override — must run BEFORE phi4 ML call.
   // "I need to X", "I need you to X", "can you do X for me", "help me X", "do X for me"
   // where X is a task verb → always command_automate.
-  // Covers: renew license, book appointment, fill form, buy ticket, apply for, sign up, etc.
-  const actionRequestPattern = /\b(i need (you to|to)|can you (do|help|go|search|find|book|buy|apply|fill|sign|renew|register|schedule|order|check|look up|navigate|open|create|send|submit|download|install|update|delete|remove|fix|set up)|help me (do|go|search|find|book|buy|apply|fill|sign|renew|register|schedule|order|check|navigate|open|create|send|submit|fix|set up)|do this for me|please (do|go|search|find|book|buy|apply|fill|sign|renew|register|schedule|order|check|navigate|open|create|send|submit))\b/i;
+  // EXCLUDED: renew/apply/register/sign-up/fill out — handled by guide-task-guard above.
+  const actionRequestPattern = /\b(i need (you to|to) (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|check|look up|navigate|find|search)|can you (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|navigate|find|search)|help me (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|navigate|find|search)|do this for me)\b/i;
   if (actionRequestPattern.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Action-request override → command_automate: "${classifyMessage}"`);
     return {
@@ -172,6 +269,47 @@ module.exports = async function parseIntent(state) {
         requiresMemoryAccess: false
       },
       metadata: { parser: 'file-write-override', processingTimeMs: 0 }
+    };
+  }
+
+  // File bridge override — must run BEFORE phi4 ML call.
+  // "write to windsurf", "tell windsurf to", "send to cursor", "check the bridge file",
+  // "read what windsurf wrote", "poll for windsurf response" → always command_automate.
+  const fileBridgePattern = /\b(write to (windsurf|cursor|warp|the bridge|bridge file)|tell (windsurf|cursor|warp) to|send (this |an? )?(instruction|message|task|result|context) to (windsurf|cursor|warp)|check (the )?bridge( file)?|act on (the )?bridge|execute (the |bridge )?(bridge )?instructions?|do what the bridge says|run the bridge task|read (what |the )?(windsurf|cursor|warp) (wrote|responded|said|returned)|poll (for )?(windsurf|cursor) (response|reply|result)|bridge (file|channel)|init(ialize)? (the )?bridge|clear (the )?bridge)/i;
+  if (fileBridgePattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] File-bridge override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.97,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'file-bridge-override', processingTimeMs: 0 }
+    };
+  }
+
+  // Codebase / file-read override — must run BEFORE phi4 ML call.
+  // "read the codebase at X", "understand the app at ~/path", "explore ~/projects/foo",
+  // "analyze the project", "read and understand X" → always command_automate (fs.read skill).
+  // Also catches: watch a file, tail a log, show directory tree.
+  const codebaseReadVerbPattern = /\b(read and understand|read.*codebase|understand.*codebase|explore.*codebase|analyze.*codebase|examine.*codebase|read the (app|project|repo|repository|code)|understand the (app|project|repo|repository|code)|explore the (app|project|repo|code)|analyze the (app|project|repo|code)|show me the (directory |folder |file )?structure|directory structure|folder structure|file tree|give me an overview of|map out the)\b/i;
+  const codebaseReadPathPattern = /\b(read|understand|explore|analyze|examine|inspect|index|scan|overview of)\b.{0,80}(codebase|repo|repository)\b/i;
+  const codebasePathPattern = /\b(read|understand|explore|analyze|examine)\b.{1,60}(~\/|\/Users\/|\/home\/)/;
+  const fileWatchPattern = /\b(watch|monitor|tail|follow)\b.{0,60}\b(file|log|\.log)\b/i;
+  const treePattern = /\b(show|list|print|display|map)\b.{0,40}\b(directory tree|folder tree|file tree|structure of|tree of)\b/i;
+  if (codebaseReadVerbPattern.test(classifyMessage) || codebaseReadPathPattern.test(classifyMessage) || codebasePathPattern.test(classifyMessage) || fileWatchPattern.test(classifyMessage) || treePattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Codebase/file-read override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.97,
+        entities: [],
+        requiresMemoryAccess: false
+      },
+      metadata: { parser: 'codebase-read-override', processingTimeMs: 0 }
     };
   }
 
