@@ -244,8 +244,14 @@ module.exports = async function recoverSkill(state) {
   if (failedStep.skill === 'image.analyze') {
     const fsSync = require('fs');
     const path = require('path');
-    const filePath = failedStep.args?.filePath;
+    const rawFilePath = failedStep.args?.filePath;
+    // filePath may be an Array when LLM patches it with multiple files — normalize to string for diagnostics
+    const filePath = Array.isArray(rawFilePath) ? rawFilePath[0] : rawFilePath;
     const lines = [];
+    if (Array.isArray(rawFilePath)) {
+      lines.push(`filePath is an Array (${rawFilePath.length} files) — image.analyze only accepts a single string path; plan must loop over each file separately`);
+      lines.push(`Files: ${rawFilePath.slice(0, 5).join(', ')}${rawFilePath.length > 5 ? ` ... (${rawFilePath.length - 5} more)` : ''}`);
+    }
     if (filePath) {
       const exists = fsSync.existsSync(filePath);
       lines.push(`filePath "${filePath}": ${exists ? 'EXISTS' : 'DOES NOT EXIST'}`);
@@ -602,6 +608,23 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
         action: 'ASK_USER',
         question: `The browser keeps closing unexpectedly. Please restart the app and try again.`,
         options: ['Restart and retry', 'Cancel']
+      };
+    }
+  }
+
+  // curl network errors (exit 52=empty reply, exit 92=HTTP/2 stream error) — not fixable by retry.
+  // Skip AUTO_PATCH and go straight to REPLAN with browser.act instead.
+  if (skill === 'shell.run' && (args.cmd === 'curl' || (args.cmd === 'bash' && (args.argv || []).some(a => String(a).includes('curl'))))) {
+    const exitCode = failedStep.exitCode;
+    const isCurlNetworkError = exitCode === 52 || exitCode === 92 || exitCode === 6 || exitCode === 7 || exitCode === 35;
+    if (isCurlNetworkError) {
+      const exitMeanings = { 52: 'empty reply from server', 92: 'HTTP/2 stream error', 6: 'could not resolve host', 7: 'failed to connect', 35: 'SSL handshake failed' };
+      const url = (args.argv || []).find(a => String(a).startsWith('http')) || args.argv?.slice(-1)[0] || '';
+      logger.debug(`[Node:RecoverSkill] Fast-path: curl exit ${exitCode} (${exitMeanings[exitCode]}) → REPLAN with browser.act`);
+      return {
+        action: 'REPLAN',
+        suggestion: `curl failed with exit code ${exitCode} (${exitMeanings[exitCode] || 'network error'}) on "${url}". curl cannot reach this endpoint. Use browser.act navigate + getPageText instead to fetch the content.`,
+        constraint: `Do NOT retry curl. Use browser.act: navigate to "${url || 'the target URL'}", then waitForContent, then getPageText.`
       };
     }
   }

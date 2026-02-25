@@ -190,12 +190,11 @@ module.exports = async function executeCommand(state) {
     const lastBrowserStep = [...skillResults].reverse().find(r => r.skill === 'browser.act' && r.ok);
     const activeBrowserSessionId = lastBrowserStep?.args?.sessionId || state.activeBrowserSessionId || null;
 
-    // Stream the answer to the UI if it contains meaningful content (e.g. image.analyze result).
-    // The answer node is bypassed for command_automate, so we push it here via streamCallback.
+    // Stream the answer to the UI — answer node is bypassed for command_automate,
+    // so we push the execution result here via streamCallback for the Results window.
     const streamCallback = state.streamCallback || null;
-    logger.info(`[Node:ExecuteCommand] image.analyze all_done: hasStreamCallback=${typeof streamCallback === 'function'}, answerLength=${answer?.length ?? 'null'}, imageAnalyzeResult=${!!imageAnalyzeResult}`);
-    if (imageAnalyzeResult && answer && typeof streamCallback === 'function') {
-      logger.info(`[Node:ExecuteCommand] Streaming image.analyze answer (${answer.length} chars)`);
+    if (answer && typeof streamCallback === 'function') {
+      logger.info(`[Node:ExecuteCommand] Streaming execution answer (${answer.length} chars)`);
       streamCallback(answer);
     }
 
@@ -1038,16 +1037,39 @@ module.exports = async function executeCommand(state) {
         return `=== fs.read (${action}: ${raw.path}) ===\n${parts.join('\n\n')}`;
       });
 
+    // Include image.analyze results — each entry includes the file path and the vision description
+    const imageAnalyzeResults = skillResults
+      .filter(r => r.skill === 'image.analyze' && r.ok && r.stdout && r.stdout.trim())
+      .map(r => {
+        const filePath = r.args?.filePath || 'unknown file';
+        return `=== Image analysis: ${filePath} ===\n${r.stdout.trim()}`;
+      });
+
     const allContextParts = [
       ...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`),
       ...shellStdoutResults,
       ...fileBridgeResults,
       ...fsReadResults,
+      ...imageAnalyzeResults,
     ];
+
+    // If no within-run context, check conversationHistory for prior image.analyze / skill output
+    // This handles cross-turn synthesis: "put this in a text document" after a previous analysis run.
+    const conversationHistory = state.conversationHistory || [];
+    let crossTurnContext = '';
+    if (allContextParts.length === 0 && conversationHistory.length > 0) {
+      // Find the most recent assistant message that contains step outputs
+      const recentOutputMsg = [...conversationHistory].reverse()
+        .find(m => m.role === 'assistant' && m.content && m.content.includes('Step outputs:'));
+      if (recentOutputMsg) {
+        crossTurnContext = recentOutputMsg.content;
+        logger.debug(`[Node:ExecuteCommand] synthesize: using cross-turn context from conversation history (${crossTurnContext.length} chars)`);
+      }
+    }
 
     const synthesisContext = allContextParts.length > 0
       ? allContextParts.join('\n\n')
-      : skillResults.filter(r => r.ok && r.result).map(r => String(r.result)).join('\n\n');
+      : crossTurnContext || skillResults.filter(r => r.ok && r.result).map(r => String(r.result)).join('\n\n');
 
     const synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
     let synthesisFilePath = args.saveToFile || null;
@@ -1094,11 +1116,14 @@ module.exports = async function executeCommand(state) {
       const isStreaming = typeof streamCallback === 'function';
       // Use file-editing instructions when shell stdout is present (file content), otherwise use web research instructions
       const hasFileContent = shellStdoutResults.length > 0;
+      const hasImageAnalysis = imageAnalyzeResults.length > 0 || crossTurnContext.includes('Image analysis:');
       const synthesisQuery = hasFileContent
         ? `${synthesisPrompt}\n\nHere is the current file content:\n\n${synthesisContext}`
         : `${synthesisPrompt}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
       const synthesisInstructions = hasFileContent
         ? `You are a file editing assistant. The user has asked you to modify a file. You have been given the current file content. Your job is to output the COMPLETE updated file content with ONLY the requested changes applied. Output the full file text only — no preamble, no explanation, no markdown code fences, no commentary. Preserve all existing structure, headings, and formatting. Only change what was explicitly requested.`
+        : hasImageAnalysis
+        ? `You are a report writer. The user has analyzed a folder of images/screenshots and wants a summary. You have been given the vision AI analysis of each image. Write a clear, structured report using ONLY the actual file names and descriptions provided — do NOT invent or guess file names, sizes, or content. Use the exact file path from each "Image analysis: <path>" heading as the file name.`
         : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual.`;
       const synthPayload = {
         query: synthesisQuery,
@@ -1270,6 +1295,20 @@ module.exports = async function executeCommand(state) {
       logger.warn('[Node:ExecuteCommand] ui.screen.verify degraded — vision unavailable, skipping verification', { reasoning: raw.reasoning });
     }
 
+    // For fs.read tree/explore: synthesize stdout from the tree string so
+    // (a) priorResultsNote in planSkills gets real filenames on replan,
+    // (b) the post-fs.read plan patch can read it from stepResult.stdout as fallback.
+    let fsReadStdout = null;
+    if (skill === 'fs.read' && raw.ok) {
+      if (raw.tree) {
+        fsReadStdout = raw.tree;
+      } else if (raw.result?.tree) {
+        fsReadStdout = raw.result.tree;
+      } else if (raw.files && Array.isArray(raw.files)) {
+        fsReadStdout = raw.files.map(f => f.path || f).join('\n');
+      }
+    }
+
     const stepResult = {
       step: skillCursor + 1,
       skill,
@@ -1278,7 +1317,7 @@ module.exports = async function executeCommand(state) {
       ok: skill === 'ui.screen.verify'
         ? verifyOk
         : (raw.ok ?? raw.success ?? false),
-      stdout: raw.stdout || waitForStdout || browserStdout || null,
+      stdout: raw.stdout || waitForStdout || browserStdout || fsReadStdout || null,
       stderr: raw.stderr || null,
       exitCode: raw.exitCode ?? null,
       result: raw.result ?? (skill === 'file.watch' ? raw : null),
@@ -1408,17 +1447,119 @@ module.exports = async function executeCommand(state) {
       }
     }
 
-    const isLastStep = skillCursor + 1 >= skillPlan.length;
+    // ── Post-fs.read plan patch ───────────────────────────────────────────────
+    // planSkills runs BEFORE fs.read executes, so the LLM can only invent placeholder
+    // filenames (Screenshot1.png, image1.png, etc.). Once fs.read succeeds and returns
+    // real paths, patch any downstream image.analyze steps that reference non-existent
+    // files with the actual paths found in the directory listing.
+    let patchedSkillPlan = skillPlan;
+    if (skill === 'fs.read' && stepResult.ok) {
+      const fsRaw = stepResult._raw || {};
+      const fsAction = resolvedArgs.action;
+      const fsBasePath = resolvedArgs.path ? String(resolvedArgs.path).replace(/^~/, require('os').homedir()) : null;
+
+      // Extract real image paths from tree or explore stdout
+      const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.heic', '.heif']);
+      let realImagePaths = [];
+
+      // tree output: "/base/path/\n├── file1.png (123KB)\n└── file2.jpg (456KB)"
+      const treeStr = fsRaw.tree || fsRaw.result?.tree || '';
+      if ((fsAction === 'tree' || fsAction === 'explore') && treeStr && fsBasePath) {
+        const pathMod = require('path');
+        const lines = treeStr.split('\n');
+        for (const line of lines) {
+          // Strip tree drawing chars and extract filename
+          const name = line.replace(/^[│├└─\s]+/, '').replace(/\s*\([\d.]+[KMB]+\)\s*$/, '').trim();
+          if (!name || name.endsWith('/')) continue;
+          const ext = pathMod.extname(name).toLowerCase();
+          if (IMAGE_EXTS.has(ext)) {
+            realImagePaths.push(pathMod.join(fsBasePath, name));
+          }
+        }
+      }
+
+      // Also check fs.read result.files array (explore action returns this)
+      const resultFiles = fsRaw.result?.files || [];
+      if (resultFiles.length > 0) {
+        for (const f of resultFiles) {
+          const fp = f.path || f;
+          if (typeof fp === 'string') {
+            const ext = require('path').extname(fp).toLowerCase();
+            if (IMAGE_EXTS.has(ext) && !realImagePaths.includes(fp)) {
+              realImagePaths.push(fp);
+            }
+          }
+        }
+      }
+
+      if (realImagePaths.length > 0) {
+        logger.info(`[Node:ExecuteCommand] fs.read patch: found ${realImagePaths.length} real image paths — patching downstream image.analyze steps`);
+
+        // Find all downstream image.analyze steps
+        const downstreamAnalyzeIdxs = [];
+        for (let i = skillCursor + 1; i < skillPlan.length; i++) {
+          if (skillPlan[i].skill === 'image.analyze') downstreamAnalyzeIdxs.push(i);
+        }
+
+        if (downstreamAnalyzeIdxs.length > 0) {
+          const pathMod = require('path');
+          const fsSync = require('fs');
+          const newPlan = [...skillPlan];
+
+          if (downstreamAnalyzeIdxs.length === realImagePaths.length) {
+            // 1:1 mapping — replace each placeholder with the real path
+            downstreamAnalyzeIdxs.forEach((planIdx, i) => {
+              const oldPath = newPlan[planIdx].args?.filePath;
+              newPlan[planIdx] = {
+                ...newPlan[planIdx],
+                args: { ...newPlan[planIdx].args, filePath: realImagePaths[i] },
+                description: `Analyze ${pathMod.basename(realImagePaths[i])}`
+              };
+              logger.info(`[Node:ExecuteCommand] fs.read patch: step[${planIdx + 1}] "${oldPath}" → "${realImagePaths[i]}"`);
+            });
+            patchedSkillPlan = newPlan;
+          } else {
+            // Mismatch — rebuild: remove all placeholder image.analyze steps, insert
+            // one real step per discovered file before the first synthesize/other step
+            const synthesizeIdx = newPlan.findIndex((s, i) => i > skillCursor && s.skill === 'synthesize');
+            const insertBefore = synthesizeIdx !== -1 ? synthesizeIdx : newPlan.length;
+
+            // Remove all old image.analyze steps from plan
+            const withoutOldAnalyze = newPlan.filter((s, i) => i <= skillCursor || s.skill !== 'image.analyze');
+
+            // Build new image.analyze steps with real paths
+            const newAnalyzeSteps = realImagePaths.map((fp, i) => ({
+              skill: 'image.analyze',
+              args: { filePath: fp, query: newPlan[downstreamAnalyzeIdxs[0]]?.args?.query || 'Describe what is shown in this screenshot in detail.' },
+              description: `Analyze ${pathMod.basename(fp)}`
+            }));
+
+            // Find new insertBefore in withoutOldAnalyze
+            const newInsertBefore = withoutOldAnalyze.findIndex((s, i) => i > skillCursor && s.skill === 'synthesize');
+            const insertIdx = newInsertBefore !== -1 ? newInsertBefore : withoutOldAnalyze.length;
+
+            patchedSkillPlan = [
+              ...withoutOldAnalyze.slice(0, insertIdx),
+              ...newAnalyzeSteps,
+              ...withoutOldAnalyze.slice(insertIdx)
+            ];
+            logger.info(`[Node:ExecuteCommand] fs.read patch: rebuilt plan with ${newAnalyzeSteps.length} real image.analyze steps`);
+          }
+        }
+      }
+    }
+
+    const isLastStep = skillCursor + 1 >= (patchedSkillPlan || skillPlan).length;
 
     // If this was the last step, emit all_done now (the graph routes to logConversation
     // immediately — it never loops back for a second executeCommand pass, so the
     // skillCursor >= skillPlan.length block at the top is never reached).
-    if (isLastStep && progressCallback) {
+    let lastStepAnswer;
+    if (isLastStep) {
       const finalSavedPaths = [...(state.savedFilePaths || [])];
       const finalHomeDir = require('os').homedir();
       updatedResults.forEach((r) => {
         if (r.skill === 'shell.run' && r.ok && r.args?.cmd === 'bash') {
-          // argv is ['-c', 'script...'] — the script is always at index 1, not the first string
           const argv = r.args?.argv || [];
           const script = argv[1] || argv.find(a => typeof a === 'string' && a !== '-c') || '';
           const wm = script.match(/(?:echo\s[^>]*>+|printf\s[^>]*>+|cat\s*>+|tee\s+|cp\s+\S+\s+|mv\s+\S+\s+)\s*['"']?((?:~|\/)[^\s'"']+\.[a-zA-Z0-9]+)['"']?/);
@@ -1430,20 +1571,45 @@ module.exports = async function executeCommand(state) {
         }
       });
       const completedCount = updatedResults.filter(r => r.ok).length;
+      const failedCount = updatedResults.filter(r => !r.ok).length;
+      const hasBrowserSteps = updatedResults.some(r => r.skill === 'browser.act');
+      const lastBrowserResult = hasBrowserSteps
+        ? [...updatedResults].reverse().find(r => r.skill === 'browser.act' && r.ok)
+        : null;
+      const imageAnalyzeResult = [...updatedResults].reverse().find(r => r.skill === 'image.analyze' && r.ok && r.stdout);
+
+      if (imageAnalyzeResult) {
+        lastStepAnswer = imageAnalyzeResult.stdout;
+      } else if (hasBrowserSteps && lastBrowserResult?.url) {
+        const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
+        lastStepAnswer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
+      } else if (failedCount === 0) {
+        lastStepAnswer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
+      } else {
+        lastStepAnswer = `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`;
+      }
+
       logger.info(`[Node:ExecuteCommand] last-step all_done: savedFilePaths=${JSON.stringify(finalSavedPaths)}`);
-      progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults: updatedResults, savedFilePaths: finalSavedPaths });
+      if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults: updatedResults, savedFilePaths: finalSavedPaths });
+
+      // Stream answer to Results window immediately — graph won't loop back here
+      if (lastStepAnswer && typeof state.streamCallback === 'function') {
+        logger.info(`[Node:ExecuteCommand] Streaming last-step answer (${lastStepAnswer.length} chars)`);
+        state.streamCallback(lastStepAnswer);
+      }
     }
 
     // Step succeeded (or was optional) — advance cursor
     return {
       ...state,
+      skillPlan: patchedSkillPlan,   // carry forward the (possibly patched) plan with real image paths
       skillResults: updatedResults,
       skillCursor: skillCursor + 1,
       failedStep: null,
       activeBrowserSessionId,
       activeBrowserUrl,
       commandExecuted: isLastStep,
-      answer: undefined  // answer is built in the 'all steps done' block on the next pass
+      answer: lastStepAnswer  // set so voice service _stategraphLaneResponse gets it for TTS
     };
 
   } catch (error) {

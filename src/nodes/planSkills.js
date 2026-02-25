@@ -141,9 +141,20 @@ Adjust the plan to avoid the same failure.`;
   if (skillResults.length > 0) {
     const resultLines = skillResults
       .filter(r => r.ok && r.stdout && r.stdout.trim())
-      .map(r => `- ${r.skill || 'shell.run'} output: ${r.stdout.trim().split('\n').slice(0, 3).join('; ')}`);
+      .map(r => {
+        const lines = r.stdout.trim().split('\n');
+        // For fs.read results — include ALL lines so LLM gets every real filename
+        const isFs = r.skill === 'fs.read';
+        const snippet = isFs ? lines.join('\n') : lines.slice(0, 3).join('; ');
+        return `- ${r.skill || 'shell.run'} output:\n${snippet}`;
+      });
     if (resultLines.length > 0) {
-      priorResultsNote = `\n\nPREVIOUS STEP RESULTS (use these to resolve references like "that file", "it", "the result"):\n${resultLines.join('\n')}`;
+      // Check if any fs.read result is present — add strong instruction to use real paths
+      const hasFsRead = skillResults.some(r => r.skill === 'fs.read' && r.ok);
+      const fsNote = hasFsRead
+        ? '\nIMPORTANT: The fs.read result above contains the EXACT file paths in the folder. Use ONLY these real paths in image.analyze steps — do NOT invent placeholder names like image1.png, image2.png. Each image.analyze step must use ONE real path string (not an array).'
+        : '';
+      priorResultsNote = `\n\nPREVIOUS STEP RESULTS (use these to resolve references like "that file", "it", "the result"):${fsNote}\n${resultLines.join('\n')}`;
     }
   }
 
@@ -154,7 +165,15 @@ Adjust the plan to avoid the same failure.`;
     const recentTurns = conversationHistory.slice(-6); // last 3 exchanges
     const turnLines = recentTurns
       .filter(m => m.content && m.content.trim())
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.trim().substring(0, 200)}`);
+      .map(m => {
+        const role = m.role === 'user' ? 'User' : 'Assistant';
+        const content = m.content.trim();
+        // Assistant messages with step outputs (from logConversation richAssistantText)
+        // contain critical filenames/paths — include up to 2000 chars for those.
+        // User messages: 300 chars is plenty.
+        const limit = (m.role === 'assistant' && content.includes('Step outputs:')) ? 2000 : 300;
+        return `${role}: ${content.substring(0, limit)}`;
+      });
     if (turnLines.length > 0) {
       conversationNote = `\n\nRECENT CONVERSATION (use this to resolve references like "that file", "it", "the result"):\n${turnLines.join('\n')}`;
     }
@@ -288,7 +307,7 @@ User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResults
       intent: 'command_automate'
     },
     options: {
-      maxTokens: 2000,
+      maxTokens: 600,
       temperature: 0.1,
       fastMode: false
     }

@@ -93,11 +93,34 @@ module.exports = async function logConversation(state) {
       );
     }
 
-    if (answer && typeof answer === 'string' && !answer.startsWith('[')) {
+    // For command_automate: store rich skill output so follow-up prompts have real context.
+    // commandOutput contains per-step summaries with actual stdout (fs.read tree, image.analyze
+    // descriptions, shell output, etc.). answer alone is usually "All N steps completed."
+    // which is useless for the next turn's planSkills conversationNote.
+    const skillResults = state.skillResults || [];
+    let richAssistantText = answer;
+    if (intent?.type === 'command_automate' && skillResults.length > 0) {
+      const keyOutputs = skillResults
+        .filter(r => r.ok && r.stdout && r.stdout.trim().length > 0)
+        .map(r => {
+          const label = r.description || r.skill;
+          // For fs.read: include full tree output (filenames are critical for follow-ups)
+          // For others: truncate to 300 chars
+          const out = r.skill === 'fs.read'
+            ? r.stdout.trim()
+            : r.stdout.trim().slice(0, 300);
+          return `[${label}]:\n${out}`;
+        });
+      if (keyOutputs.length > 0) {
+        richAssistantText = `${answer || 'Done.'}\n\nStep outputs:\n${keyOutputs.join('\n\n')}`;
+      }
+    }
+
+    if (richAssistantText && typeof richAssistantText === 'string' && !richAssistantText.startsWith('[')) {
       logPromises.push(
         mcpAdapter.callService('conversation', 'message.add', {
           sessionId,
-          text: answer,
+          text: richAssistantText,
           sender: 'assistant',
           metadata: {
             intent: intent?.type,

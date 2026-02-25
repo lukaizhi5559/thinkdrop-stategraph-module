@@ -136,6 +136,18 @@ Output this JSON object (not an array) to ask the user:
 - Recipient name is given (Mary) but no email address → ask: "What is Mary's email address?"
 - Do NOT draft the email with `[Mary's email]` as a placeholder and attempt to send it
 
+## shell.run — network calls
+
+**For fetching web content or weather data, prefer `browser.act` navigate + `getPageText` over `curl`.** Curl frequently fails with network errors (exit 52 = empty reply, exit 92 = HTTP/2 error) and has no JS rendering.
+
+If `shell.run` with `curl` is the right tool:
+- Always use `https://` in the URL (never bare hostname)
+- Set `timeoutMs: 10000` — network calls that take >10s have failed
+- Use `curl --max-time 8` to enforce a hard timeout inside the command
+- Prefer APIs that return plain text: `curl "https://wttr.in/Philadelphia,PA?format=3"` (not `wttr.in/PA` — too ambiguous)
+
+**Never retry the same curl URL twice** — if curl fails, immediately replan with `browser.act`.
+
 ## NEVER give up — always produce a plan
 
 **NEVER output `{ "error": "..." }`. This is forbidden.** If you are unsure how to accomplish something, reason through what macOS tools, shell commands, or APIs could help. There is almost always a path:
@@ -1001,7 +1013,23 @@ Use `browser.act waitForContent` for Playwright sessions. Use `ui.waitFor` for n
 Takes a screenshot + vision LLM to verify a step succeeded. Args: `prompt` (what to look for), `settleMs` (wait before screenshot), `timeoutMs`. Returns `{ verified, confidence, reasoning, suggestion }`. Use ONLY after navigation clicks that open new views, after critical sends, or after app launch with login screens. Do NOT use after simple clicks.
 
 ## image.analyze
-Args: `filePath` (required), `query` (optional), `timeoutMs`. Use for tagged image files `[File: *.png/jpg]`. NEVER use `ui.screen.verify` for file images.
+Args: `filePath` (required, **must be a single string path — NOT an array**), `query` (optional), `timeoutMs`. Use for tagged image files `[File: *.png/jpg]`. NEVER use `ui.screen.verify` for file images.
+
+**CRITICAL — scanning a folder with multiple images:**
+- First use `fs.read` with `action: "tree"` or `action: "explore"` to get the real file list.
+- Then plan ONE `image.analyze` step per file using the EXACT path from the `fs.read` result.
+- NEVER pass an array to `filePath`. NEVER invent placeholder names like `image1.png`, `image2.png`.
+- If there are 4 files, plan 4 separate `image.analyze` steps with the 4 real paths.
+
+Example for 3 files found in `/Users/me/Desktop/some-screenshots/`:
+```json
+[
+  { "skill": "fs.read", "args": { "action": "tree", "path": "/Users/me/Desktop/some-screenshots", "maxDepth": 1 }, "description": "List files in folder" },
+  { "skill": "image.analyze", "args": { "filePath": "/Users/me/Desktop/some-screenshots/Screenshot 2026-02-25 at 1.31.33 PM.png", "query": "Describe what is shown" }, "description": "Analyze file 1" },
+  { "skill": "image.analyze", "args": { "filePath": "/Users/me/Desktop/some-screenshots/get-smart-search-online.png", "query": "Describe what is shown" }, "description": "Analyze file 2" },
+  { "skill": "synthesize", "args": { "prompt": "Summarize all image analyses above into a detailed report." }, "description": "Summarize all screenshots" }
+]
+```
 
 ## needs_install
 Args: `tool`, `installCmd`, `reason`, `source` (brew/npm/pip/apt), `description`. Use before any non-built-in CLI tool (ffmpeg, pdftotext, jq, imagemagick, yt-dlp, gh, aws). Built-ins need no install: osascript, curl, sips, textutil, screencapture, pbcopy, pbpaste, open, mdfind, zip, git, python3, node, npm. Always use `needs_install` before running a tool that may not exist.

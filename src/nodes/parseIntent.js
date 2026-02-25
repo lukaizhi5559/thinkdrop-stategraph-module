@@ -22,6 +22,24 @@ module.exports = async function parseIntent(state) {
   // ── Hard overrides — run BEFORE carriedIntent and BEFORE phi4 ML ──────────
   // These must never be bypassed by resolveReferences carryover.
 
+  // Filesystem / folder action override:
+  // "I need you to scan the folder X", "scan the folder X", "read the files in X",
+  // "analyze the screenshots in X", "list files in X", "show me the files on my desktop"
+  // These are always command_automate (fs.read / image.analyze), never memory_retrieve.
+  if (/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|open|explore)\b.{0,60}\b(folder|directory|dir|path|file|files|screenshot|screenshots|image|images|photo|photos|desktop|downloads|documents|home directory|~\/)\b/i.test(classifyMessage) ||
+      /\bI need you to\b.{0,80}\b(folder|directory|file|files|screenshot|desktop)\b/i.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Filesystem action override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'filesystem-action-override', processingTimeMs: 0 } };
+  }
+
+  // Capability question override:
+  // "Do you have a skill to X", "Can you X for me", "Is there a skill that X"
+  // These mean "use a skill to do X" = command_automate, not screen_intelligence.
+  if (/\b(do you have (a skill|the ability|a way|a tool) to\b|can you (use|run|execute|do) .{0,40}\b(skill|command|shell|terminal|browser)\b|is there a skill (to|that|for)\b)/i.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Capability-question override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'capability-question-override', processingTimeMs: 0 } };
+  }
+
   // File tag override — [File: /path] tag from drag-and-drop or Shift+Cmd+C
   if (/\[File:\s*[^\]]+\]/.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] File tag override → command_automate: "${classifyMessage}"`);
@@ -44,11 +62,34 @@ module.exports = async function parseIntent(state) {
 
   // Check if the message starts with or contains a known skill name
   const msgLower = classifyMessage.trim().toLowerCase();
-  const invokedSkill = KNOWN_SKILLS.find(s => msgLower === s || msgLower.startsWith(s + ' ') || msgLower.startsWith(s + ':'));
+  const invokedSkill = KNOWN_SKILLS.find(s => {
+    const sl = s.toLowerCase();
+    // Direct invocation: message starts with the skill name
+    if (msgLower === sl || msgLower.startsWith(sl + ' ') || msgLower.startsWith(sl + ':')) return true;
+    // Natural-language invocation: "use the shell.run", "use shell.run", "use the browser.act skill"
+    // The dot-word pattern is unique to ThinkDrop skills — safe to match anywhere in the sentence
+    const idx = msgLower.indexOf(sl);
+    if (idx !== -1) {
+      // Must be preceded by a word boundary (space or start)
+      const before = idx === 0 ? '' : msgLower[idx - 1];
+      const after = msgLower[idx + sl.length] || '';
+      if ((before === '' || before === ' ' || before === '\t') &&
+          (after === '' || after === ' ' || after === ':' || after === ',' || after === '.')) {
+        return true;
+      }
+    }
+    return false;
+  });
 
-  if (invokedSkill) {
-    logger.debug(`[Node:ParseIntent] Skill-name invocation → command_automate: "${classifyMessage}" (skill: ${invokedSkill})`);
-    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: invokedSkill }], requiresMemoryAccess: false }, metadata: { parser: 'skill-name-invocation', processingTimeMs: 0 } };
+  // Also catch natural-language references to skill categories without the dot-name:
+  // "use a shell skill", "use the shell skill", "run a shell command", "use browser automation"
+  const SKILL_CATEGORY_PATTERN = /\b(use (a |the |a |the )?shell (skill|command|run)|run (a |the )?shell|use (a |the )?browser (skill|automation|act)|use (a |the )?ui skill)\b/i;
+  const naturalSkillInvocation = !invokedSkill && SKILL_CATEGORY_PATTERN.test(classifyMessage);
+
+  if (invokedSkill || naturalSkillInvocation) {
+    const skillHint = invokedSkill || (SKILL_CATEGORY_PATTERN.test(classifyMessage) && classifyMessage.match(/browser/i) ? 'browser.act' : 'shell.run');
+    logger.debug(`[Node:ParseIntent] Skill-name invocation → command_automate: "${classifyMessage}" (skill: ${skillHint})`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: skillHint }], requiresMemoryAccess: false }, metadata: { parser: 'skill-name-invocation', processingTimeMs: 0 } };
   }
 
   if (LIST_SKILLS_PATTERN.test(classifyMessage)) {

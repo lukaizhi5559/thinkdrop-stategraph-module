@@ -133,6 +133,13 @@ function detectIntentCarryover(message, conversationHistory) {
   // These should always go to memory_retrieve, not re-trigger browser automation.
   if (MEMORY_RECALL_QUESTION.test(msg)) return null;
 
+  // Filesystem / capability action messages NEVER carry over any prior intent.
+  // "I need you to scan the folder X", "scan folder X", "do you have a skill to X"
+  // These are new commands, not follow-ups — parseIntent hard-overrides handle them.
+  const FILESYSTEM_ACTION = /\b(scan|read|list|analyze|summarize|go through|look (at|through)|explore)\b.{0,60}\b(folder|directory|dir|file|files|screenshot|screenshots|image|images|photo|photos|desktop|downloads|documents|~\/)\b/i;
+  const CAPABILITY_QUESTION = /\b(do you have (a skill|the ability|a way|a tool) to\b|can you (use|run|execute|do) .{0,40}\b(skill|command|shell|terminal|browser)\b|is there a skill (to|that|for)\b)/i;
+  if (FILESYSTEM_ACTION.test(msg) || CAPABILITY_QUESTION.test(msg)) return null;
+
   const words = msg.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
   const hasStandaloneIntent = STANDALONE_INTENT_WORDS.test(msg);
@@ -337,6 +344,22 @@ module.exports = async function resolveReferences(state) {
       const allHighConfidence = replacements.every(r => (r.confidence || 0) >= 0.85);
       if (!allHighConfidence) {
         logger.debug('[Node:ResolveReferences] Rejecting low-confidence simple_fallback resolution, using original');
+        resolvedMessage = message;
+      }
+      // Also reject if any replacement modifies an adjective/determiner before a path/location noun
+      // e.g. "that folder" → "Assistant folder" corrupts the folder name the user intended
+      const PATH_NOUN = /\b(folder|directory|file|path|dir|desktop|document|screenshot|image|photo)\b/i;
+      const corruptsPathContext = replacements.some(r => {
+        if (!r.original || !r.resolved) return false;
+        const origLower = String(r.original).toLowerCase().trim();
+        const resolvedLower = String(r.resolved).toLowerCase().trim();
+        // If the original was a determiner/pronoun and the replacement sits before a path noun
+        const isDeterminer = /^(that|this|those|these|the|it|its)$/.test(origLower);
+        const isBeforePathNoun = PATH_NOUN.test(resolvedMessage.toLowerCase().replace(resolvedLower, '').slice(resolvedMessage.toLowerCase().indexOf(resolvedLower)));
+        return isDeterminer && isBeforePathNoun;
+      });
+      if (corruptsPathContext) {
+        logger.debug('[Node:ResolveReferences] Rejecting simple_fallback that corrupts path/folder context, using original');
         resolvedMessage = message;
       }
     }
