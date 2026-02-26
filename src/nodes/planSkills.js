@@ -79,7 +79,8 @@ module.exports = async function planSkills(state) {
     conversationHistory = [],
     activeBrowserSessionId = null,
     activeBrowserPageElements = null,
-    completedGuideSteps = []
+    completedGuideSteps = [],
+    profileContext = null
   } = state;
 
   const logger = state.logger || console;
@@ -202,6 +203,14 @@ Adjust the plan to avoid the same failure.`;
     taggedContextNote = `\n\nTAGGED CONTEXT (user highlighted this before asking):\n${selectedText.trim()}\n\nIf the tagged context contains a [File: /path/to/file] tag, the user is referring to that file. Plan steps to read it using the appropriate command for its file type (see skill rules).`;
   }
 
+  // Inject resolved personal profile facts (phone numbers, names, addresses) from enrichIntent
+  let profileContextNote = '';
+  if (profileContext?.facts?.length > 0) {
+    const factLines = profileContext.facts.map(f => `- ${f.field}: ${f.value}`).join('\n');
+    profileContextNote = `\n\nUSER PROFILE FACTS (use these exact values — do NOT substitute placeholders):\n${factLines}`;
+    logger.debug(`[Node:PlanSkills] Injecting ${profileContext.facts.length} profile fact(s) into planning query`);
+  }
+
   // ── Two-phase guide planning: scan first, plan with real elements ───────────
   // For fresh guide tasks (no active session, no existing page elements):
   //   Phase 1: Ask LLM for just the starting URL — one fast LLM call.
@@ -295,7 +304,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${recoveryNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
+User request: "${userMessage}"${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
 
   const payload = {
     query: planningQuery,

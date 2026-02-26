@@ -116,7 +116,7 @@ module.exports = async function logConversation(state) {
       }
     }
 
-    if (richAssistantText && typeof richAssistantText === 'string' && !richAssistantText.startsWith('[')) {
+    if (richAssistantText && typeof richAssistantText === 'string') {
       logPromises.push(
         mcpAdapter.callService('conversation', 'message.add', {
           sessionId,

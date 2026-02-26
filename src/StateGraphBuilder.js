@@ -22,6 +22,7 @@ const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
 const resolveReferencesNode = require('./nodes/resolveReferences');
 const synthesizeNode = require('./nodes/synthesize');
+const enrichIntentNode = require('./nodes/enrichIntent');
 
 class StateGraphBuilder {
   /**
@@ -159,6 +160,7 @@ class StateGraphBuilder {
     const nodes = {
       resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
+      enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
@@ -176,50 +178,50 @@ class StateGraphBuilder {
       start: 'resolveReferences',
       resolveReferences: 'parseIntent',
       
-      // Router: Route based on intent type
-      parseIntent: (state) => {
+      // Always pass through enrichIntent — it handles MODE B (answer to enrichment question)
+      // regardless of what parseIntent classified the reply as.
+      parseIntent: 'enrichIntent',
+
+      // enrichIntent router: handles MODE B re-routing + MODE A gap/resolve routing
+      enrichIntent: (state) => {
         const intentType = state.intent?.type || 'general_query';
-        logger.debug(`[StateGraph:Router] Intent: ${intentType}`);
-        
-        // Memory store: save information
+        logger.debug(`[StateGraph:Router] enrichIntent exit — intent: ${intentType}`);
+
+        // Enrichment gaps remain — ask user first (surface the question via logConversation)
+        if (Array.isArray(state.enrichmentNeeded) && state.enrichmentNeeded.length > 0) {
+          logger.debug('[StateGraph:Router] enrichIntent: gaps unresolved — asking user');
+          return 'logConversation';
+        }
+
+        // MODE B re-route: enrichIntent stored answers and set intent=command_automate
+        // or MODE A success: command_automate with profile complete — proceed to plan
+        if (intentType === 'command_automate') {
+          logger.debug('[StateGraph:Router] enrichIntent: command_automate — planSkills');
+          return 'planSkills';
+        }
+
+        // All other intents: route the same as parseIntent used to
         if (intentType === 'memory_store') {
           return 'storeMemory';
         }
-        
-        // Memory retrieve: fetch stored information
         if (intentType === 'memory_retrieve') {
           return 'retrieveMemory';
         }
-        
-        // Command automation: goes through skill planner first
-        if (intentType === 'command_automate') {
-          return 'planSkills';
-        }
-        
-        // Simple command execution or guide: direct to executeCommand
         if (intentType === 'command_execute' || intentType === 'command_guide') {
           return 'executeCommand';
         }
-        
-        // Screen intelligence: analyze screen content
         if (intentType === 'screen_intelligence') {
           return 'screenIntelligence';
         }
-        
-        // Web search: time-sensitive queries, factual questions, general knowledge
         if (intentType === 'web_search' || intentType === 'question' || intentType === 'general_knowledge') {
           return 'webSearch';
         }
-        
-        // Greeting: quick response, no memory needed
         if (intentType === 'greeting') {
           return 'answer';
         }
-        
-        // Default: retrieve memory and answer
         return 'retrieveMemory';
       },
-      
+
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',
       
