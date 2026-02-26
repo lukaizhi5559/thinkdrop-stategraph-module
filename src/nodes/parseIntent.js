@@ -219,6 +219,20 @@ module.exports = async function parseIntent(state) {
     };
   }
 
+  // GitHub / code-hosting API query override — must run BEFORE browser automation check.
+  // Questions like "is there a PR created in the last 2 hours", "list open issues on github",
+  // "show me recent commits" are command_automate (shell.run GitHub API), NOT web_search.
+  // Pattern: GitHub/git entity + temporal or list phrasing.
+  const githubApiPattern = /\b(pull request|pr|issue|commit|branch|release|tag|merge|fork|repo|repository|workflow|action|check|run|deployment)\b.{0,80}\b(created|opened|merged|closed|pushed|within|in the (last|past)|recent|today|yesterday|this week|last \d+|list|show|any|all|find)\b|\b(list|show|find|any|are there|is there|was there|were there)\b.{0,60}\b(pull request|pr|issue|commit|branch|release|tag|open|closed|merged|recent)\b/i;
+  if (githubApiPattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] GitHub API query override → command_automate: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: { type: 'command_automate', confidence: 0.96, entities: [], requiresMemoryAccess: false },
+      metadata: { parser: 'github-api-override', processingTimeMs: 0 }
+    };
+  }
+
   const isBrowserAutomation = urlPattern.test(classifyMessage) || hasNavVerb || hasDestPrep || hasVerbSiteFor;
 
   if (isBrowserAutomation) {

@@ -342,13 +342,37 @@ Decide the recovery strategy.`;
       throw new Error('LLM backend unavailable');
     }
 
-    const rawDecision = await backend.generateAnswer(recoveryQuery, payload, payload.options, null);
+    let rawDecision = await backend.generateAnswer(recoveryQuery, payload, payload.options, null);
     logger.debug(`[Node:RecoverSkill] LLM decision: ${rawDecision.substring(0, 300)}`);
 
-    const decision = parseDecision(rawDecision, logger);
+    let decision = parseDecision(rawDecision, logger);
 
+    // Retry once with a stricter prompt if the LLM returned plain text (e.g. "I apologize...")
     if (!decision) {
-      throw new Error('Could not parse recovery decision from LLM');
+      logger.warn('[Node:RecoverSkill] LLM returned non-JSON — retrying with strict JSON prompt');
+      const retryPayload = {
+        ...payload,
+        query: `${recoveryQuery}\n\nYou MUST respond with ONLY a JSON object. No apologies, no explanation, no markdown. Pick one:\n{"action":"ASK_USER","question":"${failedStep.skill} step failed: ${(failedStep.error || 'unknown error').replace(/"/g, "'")}. How would you like to proceed?","options":["Skip this step","Abort the task","Try a different approach"]}\nor\n{"action":"REPLAN","suggestion":"try a different approach","alternativeCwd":null,"constraint":"avoid the same error"}\nor\n{"action":"AUTO_PATCH","patchedArgs":{},"note":"patched"}`,
+        context: {
+          ...payload.context,
+          systemInstructions: 'Output ONLY valid JSON. One of: AUTO_PATCH, REPLAN, or ASK_USER. No text before or after the JSON object.'
+        }
+      };
+      rawDecision = await backend.generateAnswer(retryPayload.query, retryPayload, retryPayload.options, null).catch(() => null);
+      if (rawDecision) {
+        logger.debug(`[Node:RecoverSkill] Retry LLM decision: ${rawDecision.substring(0, 300)}`);
+        decision = parseDecision(rawDecision, logger);
+      }
+    }
+
+    // If still no valid JSON after retry, default to ASK_USER rather than throwing
+    if (!decision) {
+      logger.warn('[Node:RecoverSkill] LLM still non-JSON after retry — defaulting to ASK_USER');
+      decision = {
+        action: 'ASK_USER',
+        question: `Step ${failedStep.step} (${failedStep.skill}) failed: ${failedStep.error || 'unknown error'}. How would you like to proceed?`,
+        options: ['Skip this step and continue', 'Abort the task', 'Try a different approach']
+      };
     }
 
     return applyRecovery(decision, state, skillPlan, skillCursor, stepRetryCount, replanCount, logger);
@@ -443,6 +467,32 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   // browser.act failures
   if (skill === 'browser.act') {
     const action = args.action || '';
+
+    // GitHub API fast-path: browser.act cannot post comments/reviews on github.com because the
+    // browser session has no GitHub login cookies. Detect this early and switch to curl + keychain.
+    const sessionUrl = (failedStep.url || args.url || '').toLowerCase();
+    const isGitHubPage = sessionUrl.includes('github.com') ||
+      (state?.activeBrowserUrl || '').toLowerCase().includes('github.com');
+    const isInputFailure = combinedError.includes('no visible input elements') ||
+      combinedError.includes('no matching field found') ||
+      combinedError.includes('smartfill requires') ||
+      (combinedError.includes('timeout') && (combinedError.includes('textarea') || combinedError.includes('comment')));
+
+    if (isGitHubPage && isInputFailure) {
+      // Extract PR/issue number and owner/repo from the URL in skillResults navigate step
+      const navigateStep = skillResults.find(r => r.skill === 'browser.act' && r.action === 'navigate');
+      const prUrlMatch = (navigateStep?.url || state?.activeBrowserUrl || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+      const owner = prUrlMatch ? prUrlMatch[1] : '<owner>';
+      const repo = prUrlMatch ? prUrlMatch[2] : '<repo>';
+      const prNumber = prUrlMatch ? prUrlMatch[3] : '<number>';
+
+      logger.debug(`[Node:RecoverSkill] Fast-path: browser.act input failure on GitHub (${owner}/${repo}#${prNumber}) → REPLAN with GitHub REST API`);
+      return {
+        action: 'REPLAN',
+        suggestion: `browser.act cannot interact with GitHub — the isolated browser has no login session. Switch to the GitHub REST API via shell.run curl with the token from macOS keychain. To post a comment on PR #${prNumber}: POST to https://api.github.com/repos/${owner}/${repo}/issues/${prNumber}/comments with body {"body":"<comment text>"}. To review PR files: GET https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files`,
+        constraint: `NEVER use browser.act for any GitHub action (comment, review, merge, label, etc.) — the browser has no GitHub session. ALWAYS use shell.run curl with: TOKEN=$(security find-internet-password -s github.com -w 2>/dev/null | head -1). Use the GitHub REST API v3 (Accept: application/vnd.github.v3+json).`
+      };
+    }
 
     // No input found — use page text to detect what's actually on the page (works for any site)
     if (combinedError.includes('no visible input elements')) {

@@ -301,6 +301,44 @@ Task: "${userMessage}"`;
     browserSessionNote = `\n\nACTIVE BROWSER SESSION: sessionId="${sid}" is already open at ${livePageUrl}. Use this EXACT sessionId for all browser.act steps. If this task targets the SAME site, skip navigate. If it targets a DIFFERENT site, include a navigate step first.${doneNote}\n\nCURRENT PAGE ELEMENTS (${livePageUrl}):\nUse ONLY these exact labels in highlight steps — do not invent labels:\n${elList}`;
   }
 
+  // ── RAG: fetch relevant skill prompt snippets from DuckDB ───────────────────
+  // Search skill_prompts table for snippets matching the user's request.
+  // Matched snippets are injected at the top of the system prompt so the LLM
+  // gets precise, focused guidance without loading the full plan-skills.md rules.
+  let skillPromptSnippets = [];
+  let skillPromptMatched = false;
+  if (mcpAdapter && userMessage) {
+    try {
+      const spRes = await mcpAdapter.callService('user-memory', 'skill_prompt.search', {
+        query: userMessage,
+        topK: 3
+      }, { timeoutMs: 3000 }).catch(() => null);
+      const results = spRes?.data?.results || spRes?.results || [];
+      if (results.length > 0) {
+        skillPromptSnippets = results;
+        skillPromptMatched = true;
+        logger.debug(`[Node:PlanSkills] RAG: ${results.length} skill prompt snippet(s) matched (top score: ${results[0].similarity})`);
+      } else {
+        logger.debug('[Node:PlanSkills] RAG: no skill prompt snippets matched — using full plan-skills.md');
+      }
+    } catch (spErr) {
+      logger.warn(`[Node:PlanSkills] RAG skill_prompt.search failed (non-fatal): ${spErr.message}`);
+    }
+  }
+
+  // Build injected snippets block — placed at top of system prompt for maximum LLM attention
+  let ragSnippetsBlock = '';
+  if (skillPromptSnippets.length > 0) {
+    const snippetLines = skillPromptSnippets
+      .map((s, i) => `### Pattern ${i + 1} [${(s.tags || []).join(', ')}] (relevance: ${s.similarity})\n${s.promptText}`)
+      .join('\n\n');
+    ragSnippetsBlock = `## RETRIEVED SKILL PATTERNS — follow these exactly for this task\n\n${snippetLines}\n\n---\n\n`;
+  }
+
+  const effectiveSystemPrompt = ragSnippetsBlock
+    ? ragSnippetsBlock + SKILL_SYSTEM_PROMPT
+    : SKILL_SYSTEM_PROMPT;
+
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
@@ -309,7 +347,7 @@ User request: "${userMessage}"${recoveryNote}${profileContextNote}${browserSessi
   const payload = {
     query: planningQuery,
     context: {
-      systemInstructions: SKILL_SYSTEM_PROMPT,
+      systemInstructions: effectiveSystemPrompt,
       conversationHistory: [],
       sessionId: context?.sessionId,
       userId: context?.userId,
@@ -463,6 +501,46 @@ User request: "${userMessage}"${recoveryNote}${profileContextNote}${browserSessi
       logger.debug(`  Step ${i + 1}: ${s.skill} — ${s.description || JSON.stringify(s.args)}`)
     );
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })), intent: state.intent?.type || 'command_automate' });
+
+    // ── RAG learn: if no snippet matched, extract a reusable pattern and save it ─
+    // This is fire-and-forget — it runs async after the plan is returned.
+    // Skip for recovery replans (recoveryContext set) — those are one-off patches, not reusable.
+    // Skip short plans (1-step) — not worth storing.
+    if (!skillPromptMatched && !recoveryContext && mcpAdapter && skillPlan.length >= 2) {
+      setImmediate(async () => {
+        try {
+          // Ask LLM to extract a short, reusable skill pattern from the plan
+          const extractQuery = `Given this user task and the skill plan generated for it, write a concise reusable skill pattern (2-5 sentences max) that captures HOW to accomplish this type of task. Focus on which skills to use, in what order, and any critical args or constraints. Do NOT include specific values (URLs, filenames, names) — keep it generic so it applies to similar future tasks.
+
+User task: "${userMessage}"
+Generated plan summary: ${skillPlan.slice(0, 4).map(s => `${s.skill}(${s.description || JSON.stringify(s.args).substring(0, 60)})`).join(' → ')}
+
+Output ONLY the pattern text. No markdown, no explanation.`;
+
+          const patternRaw = await backend.generateAnswer(extractQuery, {
+            query: extractQuery,
+            context: { systemInstructions: 'You extract reusable skill patterns from task examples. Be concise and generic.', conversationHistory: [], intent: 'extract_pattern' },
+            options: { maxTokens: 150, temperature: 0.1, fastMode: true }
+          }, { maxTokens: 150, temperature: 0.1, fastMode: true }, null).catch(() => null);
+
+          if (patternRaw && patternRaw.trim().length > 20) {
+            // Derive tags from skills used and key words in the user message
+            const skillsUsed = [...new Set(skillPlan.map(s => s.skill))];
+            const taskWords = userMessage.toLowerCase().match(/\b(github|git|pr|pull request|slack|gmail|jira|linear|notion|file|image|email|message|calendar|weather|search|browser|install|build|deploy|convert|compress|rename|move|delete)\b/g) || [];
+            const tags = [...new Set([...skillsUsed, ...taskWords])].slice(0, 6);
+
+            await mcpAdapter.callService('user-memory', 'skill_prompt.upsert', {
+              tags,
+              promptText: patternRaw.trim()
+            }, { timeoutMs: 5000 }).catch(e => logger.warn(`[Node:PlanSkills] RAG save failed: ${e.message}`));
+
+            logger.info(`[Node:PlanSkills] RAG: saved new skill pattern (tags: ${tags.join(', ')})`);
+          }
+        } catch (learnErr) {
+          logger.warn(`[Node:PlanSkills] RAG learn failed (non-fatal): ${learnErr.message}`);
+        }
+      });
+    }
 
     return {
       ...state,
