@@ -21,6 +21,7 @@ const recoverSkillNode = require('./nodes/recoverSkill');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
 const resolveReferencesNode = require('./nodes/resolveReferences');
+const parseSkillNode = require('./nodes/parseSkill');
 const synthesizeNode = require('./nodes/synthesize');
 const enrichIntentNode = require('./nodes/enrichIntent');
 
@@ -159,6 +160,7 @@ class StateGraphBuilder {
     // Full nodes with intent-based routing
     const nodes = {
       resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter }),
+      parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
       enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
@@ -176,10 +178,15 @@ class StateGraphBuilder {
     // Intent-based routing (matches DistilBERT classifier intents)
     const edges = {
       start: 'resolveReferences',
-      resolveReferences: 'parseIntent',
-      
-      // Always pass through enrichIntent — it handles MODE B (answer to enrichment question)
-      // regardless of what parseIntent classified the reply as.
+      resolveReferences: 'parseSkill',
+      parseSkill: (state) => {
+        // If parseSkill matched an installed skill, skip parseIntent entirely
+        if (state.matchedSkillName) {
+          logger.debug(`[StateGraph:Router] parseSkill matched "${state.matchedSkillName}" — skipping to enrichIntent`);
+          return 'enrichIntent';
+        }
+        return 'parseIntent';
+      },
       parseIntent: 'enrichIntent',
 
       // enrichIntent router: handles MODE B re-routing + MODE A gap/resolve routing

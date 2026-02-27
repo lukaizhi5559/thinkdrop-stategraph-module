@@ -97,6 +97,97 @@ module.exports = async function parseIntent(state) {
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'list_skills' }], requiresMemoryAccess: false }, metadata: { parser: 'list-skills-override', processingTimeMs: 0 } };
   }
 
+  // External skill management overrides:
+  //   "install skill at <path>" WITH path → command_automate (planner executes install)
+  //   "install a skill" WITHOUT path → skill_clarify intent (answer node asks for path)
+  //   "remove skill <name>" WITH name → command_automate
+  //   "remove skill" WITHOUT name → skill_clarify (ask which skill)
+  //   "list my skills" → command_automate
+  const INSTALL_SKILL_WITH_PATH = /\b(install|add|register|load)\s+(a\s+)?(skill|external skill)\s+(at|from|in)\s*\S/i;
+  const INSTALL_SKILL_INTENT   = /\b(install|add|register|load)\s+(a\s+|an\s+|my\s+)?(skill|external skill|custom skill)\b/i;
+  const REMOVE_SKILL_WITH_NAME = /\b(remove|uninstall|delete|disable)\s+(skill|external skill)\s+\S/i;
+  const REMOVE_SKILL_INTENT    = /\b(remove|uninstall|delete|disable)\s+(a\s+)?(skill|external skill|custom skill)\b/i;
+  const MY_SKILLS_PATTERN      = /\b(list|show|what|which)\s+(my\s+)?(installed\s+)?(skills|external skills|custom skills)\b/i;
+  const NEED_SKILL_INTENT      = /\b(i\s+)?(need|want|create|make|build)\s+(a\s+|an\s+|my\s+)?(skill|custom skill|external skill)\b/i;
+
+  if (INSTALL_SKILL_WITH_PATH.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] install-skill override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'skill.install' }], requiresMemoryAccess: false }, metadata: { parser: 'install-skill-override', processingTimeMs: 0 } };
+  }
+
+  if (INSTALL_SKILL_INTENT.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] install-skill (no path yet) → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'skill.install' }], requiresMemoryAccess: false }, metadata: { parser: 'install-skill-intent', processingTimeMs: 0 } };
+  }
+
+  if (REMOVE_SKILL_WITH_NAME.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] remove-skill override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'skill.remove' }], requiresMemoryAccess: false }, metadata: { parser: 'remove-skill-override', processingTimeMs: 0 } };
+  }
+
+  if (REMOVE_SKILL_INTENT.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] remove-skill (no name yet) → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'skill.remove' }], requiresMemoryAccess: false }, metadata: { parser: 'remove-skill-intent', processingTimeMs: 0 } };
+  }
+
+  if (NEED_SKILL_INTENT.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] need-skill intent → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'skill.install' }], requiresMemoryAccess: false }, metadata: { parser: 'need-skill-intent', processingTimeMs: 0 } };
+  }
+
+  if (MY_SKILLS_PATTERN.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] my-skills override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'skill.list' }], requiresMemoryAccess: false }, metadata: { parser: 'my-skills-override', processingTimeMs: 0 } };
+  }
+
+  // Personal-attribute retrieval override — must run BEFORE carriedIntent AND phi4.
+  // Only fires for short terminal queries: "what's my name", "who is my wife",
+  // "where is my gym", "what's my phone number".
+  // Excluded: queries with action verbs after the noun ("where is my code going wrong",
+  // "tell me my options for deploying") — those are general_query / command_automate.
+  // Rule: "what's/who is/where is" + "my" + noun(s) + END (optionally with "?")
+  const personalAttributeQuery = /^(what'?s|what is|whats|who is|who'?s|where is|where'?s)\s+my\s+[\w\s']{1,30}\??\s*$/i;
+  if (personalAttributeQuery.test(classifyMessage.trim())) {
+    logger.debug(`[Node:ParseIntent] Personal-attribute retrieval override → memory_retrieve: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'memory_retrieve',
+        confidence: 0.95,
+        entities: [],
+        requiresMemoryAccess: true,
+      },
+      metadata: { parser: 'personal-attribute-override', processingTimeMs: 0 },
+    };
+  }
+
+  // Personal-fact declaration backstop — phi4 now handles these via seeds + score boost.
+  // This regex only fires for unambiguous cases phi4 could still miss at startup
+  // (before seeds are embedded) or in extreme edge cases.
+  // Standard:  "my <role> is <value>"  — optional leading filler word stripped first.
+  // Inverted:  "<Name> is my <known-role>"  — role must be a relationship/contact word.
+  const PERSONAL_FACT_FILLER = /^(?:no|nope|yes|yeah|actually|well|wait|so|okay|right|anyway|hmm|um|uh|oh|ah),?\s+/i;
+  const strippedMessage = classifyMessage.trim().replace(PERSONAL_FACT_FILLER, '');
+  const RELATIONSHIP_ROLES = /^(?:wife|husband|partner|mom|mother|dad|father|son|daughter|brother|sister|cousin|aunt|uncle|friend|coworker|colleague|boss|manager|doctor|dentist|vet|lawyer|therapist|trainer|coach|neighbor|roommate|mechanic|pastor|barber|stylist|tutor|mentor)\b/i;
+  const invertedMatch = classifyMessage.trim().match(/^[A-Z][\w\s.'-]{1,40}\s+(?:is|are|was)\s+my\s+(\w+)/);
+  const isPersonalFact =
+    /^my\s+[\w\s']{1,30}\s+(?:name\s+)?(?:is|are|was)\s+\S/i.test(strippedMessage) ||
+    (invertedMatch && RELATIONSHIP_ROLES.test(invertedMatch[1]));
+  if (isPersonalFact) {
+    logger.debug(`[Node:ParseIntent] Personal-fact declaration override → memory_store: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: {
+        type: 'memory_store',
+        confidence: 0.95,
+        entities: [],
+        requiresMemoryAccess: false,
+        factDeclaration: true,
+      },
+      metadata: { parser: 'personal-fact-override', processingTimeMs: 0 }
+    };
+  }
+
   // Short-circuit: resolveReferences already determined intent via carryover
   if (carriedIntent) {
     logger.debug(`[Node:ParseIntent] Using carried intent from resolveReferences: ${carriedIntent}`);

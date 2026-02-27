@@ -490,6 +490,37 @@ module.exports = async function executeCommand(state) {
     }
   }
 
+  // ── needs_skill pseudo-skill ─────────────────────────────────────────────
+  // Emitted by the planner when ThinkDrop cannot fulfill a request natively
+  // and no installed external skill matches. Tells the user what capability
+  // is missing and where to find the scaffolded starter skill contract.
+  if (skill === 'needs_skill') {
+    const { capability, suggestion } = args;
+
+    const message = [
+      `I don't have a native skill for: **${capability || 'this request'}**.`,
+      suggestion ? `\n\n${suggestion}` : '',
+      '\n\nOnce you\'ve edited the starter files, say: **"install skill at ~/.thinkdrop/skills/<name>/skill.md"** to activate it.'
+    ].join('');
+
+    logger.info(`[Node:ExecuteCommand] needs_skill: capability gap — ${capability}`);
+    if (progressCallback) progressCallback({
+      type: 'step_done',
+      stepIndex: skillCursor,
+      totalSteps: skillPlan.length,
+      skill: 'needs_skill',
+      description: description || `Capability gap: ${capability}`,
+      stdout: message
+    });
+
+    return {
+      ...state,
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_skill', args, description, ok: true, stdout: message }],
+      skillCursor: skillCursor + 1,
+      commandExecuted: false
+    };
+  }
+
   // ── api_suggest pseudo-skill ─────────────────────────────────────────────
   // Pauses the plan and surfaces an API-first offer to the user.
   // The LLM uses this when a task is better served by an app's API (e.g. Slack,
@@ -942,11 +973,68 @@ module.exports = async function executeCommand(state) {
     };
   }
 
+  // ── skill.install pseudo-skill ───────────────────────────────────────────
+  // Reads a skill contract .md file from disk and registers it in the skill registry.
+  // Args: { skillPath: string } — absolute path to the skill.md file.
+  if (skill === 'skill.install') {
+    if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: description || 'Installing skill...' });
+
+    const rawPath = args.skillPath || args.path || args.contractPath || '';
+    const skillPath = rawPath.replace(/~/g, require('os').homedir());
+
+    if (!skillPath) {
+      const errMsg = 'skill.install requires a skillPath argument (absolute path to the skill.md file)';
+      logger.warn(`[Node:ExecuteCommand] skill.install: ${errMsg}`);
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: 'Install failed', error: errMsg });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'skill.install', args, description, ok: false, error: errMsg }],
+        skillCursor: skillCursor + 1,
+        failedStep: { skill: 'skill.install', error: errMsg, stepIndex: skillCursor },
+      };
+    }
+
+    try {
+      const fs = require('fs');
+      if (!fs.existsSync(skillPath)) {
+        throw new Error(`Skill contract file not found: ${skillPath}`);
+      }
+      const contractMd = fs.readFileSync(skillPath, 'utf8');
+
+      const installRes = await mcpAdapter.callService('user-memory', 'skill.install', { contractMd }, { timeoutMs: 10000 });
+      const raw = installRes?.data || installRes;
+      const skillName = raw?.name || rawPath.split('/').slice(-2, -1)[0] || 'skill';
+      const created = raw?.created !== false;
+      const resultMsg = created ? `✅ Skill **${skillName}** installed successfully` : `✅ Skill **${skillName}** updated`;
+
+      logger.info(`[Node:ExecuteCommand] skill.install: ${created ? 'installed' : 'updated'} ${skillName}`);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: resultMsg, stdout: resultMsg });
+      if (typeof state.streamCallback === 'function') state.streamCallback(resultMsg);
+
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'skill.install', args, description, ok: true, result: raw, stdout: resultMsg }],
+        skillCursor: skillCursor + 1,
+        failedStep: null,
+      };
+    } catch (err) {
+      const errMsg = err.message || 'skill.install failed';
+      logger.error(`[Node:ExecuteCommand] skill.install error: ${errMsg}`);
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: 'Install failed', error: errMsg });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'skill.install', args, description, ok: false, error: errMsg }],
+        skillCursor: skillCursor + 1,
+        failedStep: { skill: 'skill.install', error: errMsg, stepIndex: skillCursor },
+      };
+    }
+  }
+
   // ── list_skills pseudo-skill ─────────────────────────────────────────────
   // Invoked when user says "list skills" or "what skills are available"
   // Returns a formatted list of all registered skills with one-line descriptions.
   if (skill === 'list_skills') {
-    const skillList = [
+    const builtinSkills = [
       { name: 'file.bridge',       desc: 'Bidirectional .md file channel between ThinkDrop and Windsurf/Cursor. Actions: read, write, poll, status, clear, init, watch' },
       { name: 'fs.read',           desc: 'Read files and explore codebases. Actions: read, tree, search, explore, tail, stat' },
       { name: 'file.watch',        desc: 'Watch files for changes. Actions: start, stop, list, poll, read' },
@@ -963,15 +1051,40 @@ module.exports = async function executeCommand(state) {
       { name: 'synthesize',        desc: 'Run an inline LLM call to summarize, compare, or analyze results from prior steps' },
       { name: 'guide.step',        desc: 'Interactive step-by-step browser guide with visual highlights and user prompts' },
     ];
-    const output = [
+
+    // Fetch installed user skills from MCP
+    // skill.listNames returns { data: { results: [{ name, description }] } } via MCP wrapper
+    let installedSkills = [];
+    try {
+      const listRes = await mcpAdapter.callService('user-memory', 'skill.listNames', {}, { timeoutMs: 5000 });
+      const raw = listRes?.data || listRes;
+      const names = Array.isArray(raw?.results) ? raw.results : Array.isArray(raw) ? raw : [];
+      installedSkills = names
+        .filter(s => s && (typeof s === 'string' || s.name))
+        .map(s => ({
+          name: typeof s === 'string' ? s : s.name,
+          desc: (typeof s === 'object' && s.description) ? s.description : 'Installed skill',
+        }));
+    } catch (_e) {
+      // non-fatal — skip installed skills section if MCP unavailable
+    }
+
+    const outputParts = [
       '## ThinkDrop Skills',
       '',
       'Say a skill name directly to invoke it. Example: `file.bridge read` or `fs.read tree ~/projects/myapp`',
       '',
-      ...skillList.map(s => `**\`${s.name}\`** — ${s.desc}`),
-      '',
-      'Tip: Add arguments after the skill name, e.g. `file.bridge write Tell Windsurf to refactor LoginForm.tsx`',
-    ].join('\n');
+      '### Built-in Skills',
+      ...builtinSkills.map(s => `**\`${s.name}\`** — ${s.desc}`),
+    ];
+
+    if (installedSkills.length > 0) {
+      outputParts.push('', '### Installed Skills', ...installedSkills.map(s => `**\`${s.name}\`** — ${s.desc}`));
+    }
+
+    outputParts.push('', 'Tip: Add arguments after the skill name, e.g. `file.bridge write Tell Windsurf to refactor LoginForm.tsx`');
+
+    const output = outputParts.join('\n');
     if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'list_skills', description: 'Listing available skills' });
     if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'list_skills', description: 'Available skills', stdout: output });
     if (typeof state.streamCallback === 'function') state.streamCallback(output);
@@ -1154,7 +1267,10 @@ module.exports = async function executeCommand(state) {
     // Write to explicit saveToFile if requested
     if (synthesisFilePath && synthesisAnswer && !synthesisAnswer.startsWith('[')) {
       try {
-        fs.writeFileSync(synthesisFilePath, synthesisAnswer, 'utf8');
+        // Strip internal === Shell output (...) === markers that executeCommand injects for LLM context
+        // but must never appear in saved files (e.g. skill.md contracts, text files, etc.)
+        const cleanedAnswer = synthesisAnswer.replace(/^=== Shell output \(.*?\) ===\s*/gm, '').trim();
+        fs.writeFileSync(synthesisFilePath, cleanedAnswer, 'utf8');
         logger.debug(`[Node:ExecuteCommand] synthesize: saved to ${synthesisFilePath}`);
       } catch (writeErr) {
         logger.warn(`[Node:ExecuteCommand] synthesize: could not write file: ${writeErr.message}`);
@@ -1226,6 +1342,16 @@ module.exports = async function executeCommand(state) {
       argsJson = argsJson.replace(/\{\{prev_watchId\}\}/g, prevWatchId.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
     }
     resolvedArgs = JSON.parse(argsJson);
+  }
+
+  // Expand ~ in shell.run argv — the LLM may generate paths with single-quoted tilde
+  // (e.g. '~/.thinkdrop/...') which bash cannot expand. Pre-expand here unconditionally.
+  if (skill === 'shell.run' && Array.isArray(resolvedArgs.argv)) {
+    const _homeDir = require('os').homedir();
+    resolvedArgs = {
+      ...resolvedArgs,
+      argv: resolvedArgs.argv.map(a => typeof a === 'string' ? a.replace(/~/g, _homeDir) : a),
+    };
   }
 
   logger.debug(`[Node:ExecuteCommand] Step ${skillCursor + 1}/${skillPlan.length}: ${skill}${description ? ` — ${description}` : ''}`);

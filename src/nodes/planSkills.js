@@ -326,6 +326,20 @@ Task: "${userMessage}"`;
     }
   }
 
+  // Fetch installed user skills — inject into prompt so LLM uses external.skill instead of needs_skill
+  let installedSkillsNote = '';
+  if (mcpAdapter) {
+    try {
+      const isRes = await mcpAdapter.callService('user-memory', 'skill.listNames', {}, { timeoutMs: 3000 }).catch(() => null);
+      const isRaw = isRes?.data || isRes;
+      const isNames = Array.isArray(isRaw?.results) ? isRaw.results : [];
+      if (isNames.length > 0) {
+        const lines = isNames.map(s => `  - name: ${s.name} — ${s.description || 'no description'}`).join('\n');
+        installedSkillsNote = `\n\nINSTALLED SKILLS (MUST use external.skill for these — NEVER use needs_skill):\n${lines}\n  Usage: { "skill": "external.skill", "args": { "name": "<skill-name>", ...skillArgs } }`;
+      }
+    } catch (_) { /* non-fatal */ }
+  }
+
   // Build injected snippets block — placed at top of system prompt for maximum LLM attention
   let ragSnippetsBlock = '';
   if (skillPromptSnippets.length > 0) {
@@ -342,7 +356,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
+User request: "${userMessage}"${installedSkillsNote}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
 
   const payload = {
     query: planningQuery,
@@ -390,6 +404,12 @@ User request: "${userMessage}"${recoveryNote}${profileContextNote}${browserSessi
         ...state,
         planError: `Failed to parse skill plan from LLM output: ${rawPlan.substring(0, 200)}`
       };
+    }
+
+    // If LLM returned a single step object instead of an array, wrap it
+    if (!Array.isArray(skillPlan) && skillPlan && typeof skillPlan === 'object' && skillPlan.skill) {
+      logger.debug(`[Node:PlanSkills] LLM returned single-step object — wrapping in array`);
+      skillPlan = [skillPlan];
     }
 
     // Check if LLM returned a clarifying question instead of a plan
