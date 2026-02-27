@@ -132,7 +132,7 @@ module.exports = async function recoverSkill(state) {
   }
 
   // ── Fast-path: known recoverable patterns (no LLM call needed) ──────────────
-  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults);
+  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl);
   if (fastRecovery) {
     return applyRecovery(fastRecovery, state, skillPlan, skillCursor, stepRetryCount, replanCount, logger);
   }
@@ -399,7 +399,7 @@ Decide the recovery strategy.`;
 // Fast-path recovery: handle well-known failure patterns without an LLM call
 // ---------------------------------------------------------------------------
 
-function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults) {
+function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl) {
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
 
@@ -472,7 +472,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     // browser session has no GitHub login cookies. Detect this early and switch to curl + keychain.
     const sessionUrl = (failedStep.url || args.url || '').toLowerCase();
     const isGitHubPage = sessionUrl.includes('github.com') ||
-      (state?.activeBrowserUrl || '').toLowerCase().includes('github.com');
+      (activeBrowserUrl || '').toLowerCase().includes('github.com');
     const isInputFailure = combinedError.includes('no visible input elements') ||
       combinedError.includes('no matching field found') ||
       combinedError.includes('smartfill requires') ||
@@ -481,7 +481,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     if (isGitHubPage && isInputFailure) {
       // Extract PR/issue number and owner/repo from the URL in skillResults navigate step
       const navigateStep = skillResults.find(r => r.skill === 'browser.act' && r.action === 'navigate');
-      const prUrlMatch = (navigateStep?.url || state?.activeBrowserUrl || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+      const prUrlMatch = (navigateStep?.url || activeBrowserUrl || '').match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
       const owner = prUrlMatch ? prUrlMatch[1] : '<owner>';
       const repo = prUrlMatch ? prUrlMatch[2] : '<repo>';
       const prNumber = prUrlMatch ? prUrlMatch[3] : '<number>';
@@ -598,7 +598,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
       const clickMatch = combinedError.match(/user clicked "([^"]+)" on ([^\s]+) and navigated to ([^\s]+)/);
       const completedLabel = clickMatch ? clickMatch[1] : null;
       const fromUrl = clickMatch ? clickMatch[2] : null;
-      const toUrl = clickMatch ? clickMatch[3] : (state?.activeBrowserUrl || null);
+      const toUrl = clickMatch ? clickMatch[3] : (activeBrowserUrl || null);
       logger.debug(`[Node:RecoverSkill] Fast-path: replan_after_navigation from ${fromUrl} → ${toUrl} (completed: "${completedLabel}")`);
       return {
         action: 'REPLAN',

@@ -443,18 +443,47 @@ module.exports = async function executeCommand(state) {
       };
     }
 
-    // User confirmed — run the install command
+    // User confirmed — run the install command with live stdout streaming
     logger.info(`[Node:ExecuteCommand] needs_install: installing ${tool} via: ${installCmd}`);
     if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: `Installing ${tool}...` });
 
     try {
-      const installResult = await mcpAdapter.callService('command', 'command.automate', {
-        skill: 'shell.run',
-        args: { cmd: 'bash', argv: ['-c', installCmd], timeoutMs: 300000 }
-      }, { timeoutMs: 360000 });
-      const raw = installResult.data || installResult;
-      const installOk = raw.ok ?? raw.success ?? false;
-      const installStdout = raw.stdout || (installOk ? `${tool} installed successfully` : `Install failed`);
+      const { spawn } = require('child_process');
+      const installOk = await new Promise((resolve) => {
+        const child = spawn('bash', ['-c', installCmd], {
+          env: { ...process.env, HOMEBREW_NO_AUTO_UPDATE: '1', HOMEBREW_NO_EMOJI: '1' },
+          timeout: 300000,
+        });
+        const allLines = [];
+        const emit = (line) => {
+          if (!line.trim()) return;
+          allLines.push(line);
+          if (progressCallback) progressCallback({ type: 'install_output', tool, line: line.trimEnd() });
+        };
+        let stdoutBuf = '', stderrBuf = '';
+        child.stdout.on('data', (chunk) => {
+          stdoutBuf += chunk.toString();
+          const parts = stdoutBuf.split('\n');
+          stdoutBuf = parts.pop();
+          parts.forEach(emit);
+        });
+        child.stderr.on('data', (chunk) => {
+          stderrBuf += chunk.toString();
+          const parts = stderrBuf.split('\n');
+          stderrBuf = parts.pop();
+          parts.forEach(emit);
+        });
+        child.on('close', (code) => {
+          if (stdoutBuf.trim()) emit(stdoutBuf);
+          if (stderrBuf.trim()) emit(stderrBuf);
+          resolve(code === 0);
+        });
+        child.on('error', (err) => {
+          emit(`Error: ${err.message}`);
+          resolve(false);
+        });
+      });
+      const installStdout = installOk ? `${tool} installed successfully` : `Install failed`;
 
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: `Installed ${tool}`, stdout: installStdout });
       logger.info(`[Node:ExecuteCommand] needs_install: install ${installOk ? 'succeeded' : 'failed'} for ${tool}`);

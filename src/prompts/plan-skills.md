@@ -65,10 +65,26 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 
 navigate|click|hover|smartType|type|keyboard|select|scroll|screenshot|evaluate|sleep|waitForContent|discoverInputs|getText|getPageText|getAttribute|waitForSelector|waitForNavigation|newPage|back|forward|reload|close|waitForAuth|highlight|scanSite|smartFill
 
+**Browser scraping patterns — ALWAYS wait for content before getPageText:**
+
+| Site | Pattern to wait for page/input ready |
+|------|---------------------------------------|
+| YouTube search | `waitForSelector` `selector:"ytd-video-renderer"` → `getPageText` |
+| Google search | `waitForSelector` `selector:"#search"` → `getPageText` |
+| ChatGPT (navigate to page) | `waitForSelector` `selector:"#prompt-textarea"` `timeoutMs:20000` — THEN `smartType` |
+| ChatGPT (after submitting prompt) | `sleep` `delay:15000` → `getPageText` |
+| Perplexity / Claude / Gemini | `waitForSelector` `selector:"textarea"` `timeoutMs:20000` — THEN `smartType` |
+| Perplexity / Claude / Gemini (after submit) | `waitForContent` `minLength:1500` `timeoutMs:60000` → `getPageText` |
+| Any search/results page | `waitForContent` `minLength:800` `timeoutMs:30000` → `getPageText` |
+
+**NEVER use `waitForNavigation` alone before `getPageText`** — it resolves before JS-rendered content loads. Always follow with `waitForSelector` or `waitForContent`.
+
 - `highlight` — injects glow border + speech bubble on element; clicking it sets `window.__tdGuideTriggered = true` to auto-advance `guide.step`
-- `waitForAuth` — uses persistent browser profile at `~/.thinkdrop/browser-sessions/<profile>/`; waits for login on first run, instant on subsequent runs
+- `waitForAuth` — **REQUIRED args: `url` (string) + `profile` (string)**. Uses persistent browser profile at `~/.thinkdrop/browser-sessions/<profile>/`. Example: `{"action":"waitForAuth","url":"https://gmail.com","profile":"gmail","authSuccessUrl":"mail.google.com/mail"}`. **DO NOT use for ChatGPT, Claude, Perplexity, YouTube, or any AI chatbot** — just `navigate` directly and interact. Only use `waitForAuth` for OAuth/login flows (Gmail, GitHub, etc.).
 - `smartFill` — fills a form with `{field: value}` pairs; auto-discovers fields including contenteditable areas (use for Gmail compose)
 - `scanSite` — headless scan, returns `{title, url, elements:[{tag,type,label,selector}]}`; use returned labels in `highlight` steps
+
+**IMPORTANT — avoid blank tab accumulation:** `waitForTrigger` opens a new `about:blank` tab per `sessionId`. For simple multi-site tasks (ChatGPT → Perplexity → scrape), use a single `sessionId` (e.g. `"default"`) and navigate between sites with `navigate`. Only create separate named sessions (`sessionId: "chatgpt-session"`) if you need two sites open simultaneously.
 
 ## guide.step — interactive walkthroughs
 
