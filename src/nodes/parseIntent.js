@@ -12,7 +12,8 @@ module.exports = async function parseIntent(state) {
   const logger = state.logger || console;
 
   // Prefer coreference-resolved message for classification
-  const classifyMessage = resolvedMessage || message;
+  // NOTE: declared as let so the non-English translation block can update it before phi4.
+  let classifyMessage = resolvedMessage || message;
 
   logger.debug('[Node:ParseIntent] Parsing intent...');
   if (resolvedMessage && resolvedMessage !== message) {
@@ -495,6 +496,55 @@ module.exports = async function parseIntent(state) {
       },
       metadata: { parser: 'temporal-override', processingTimeMs: 0 }
     };
+  }
+
+  // Non-English translation — phi4/Xenova is English-only and misclassifies non-English
+  // text. Detect non-Latin script or accent characters and translate to English first,
+  // then feed the English translation to phi4 for accurate intent classification.
+  // The ORIGINAL message is preserved in state.originalMessage so answer.js and
+  // executeCommand.js respond in the user's actual language.
+  {
+    const _txt = classifyMessage;
+    const _isNonEnglish = (
+      /[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF\u3040-\u30FF\uAC00-\uD7AF]/.test(_txt) || // CJK/JP/KO
+      /[\u0600-\u06FF]/.test(_txt) || // Arabic
+      /[\u0400-\u04FF]/.test(_txt) || // Cyrillic
+      /[\u0900-\u097F]/.test(_txt) || // Devanagari
+      /[¿¡áéíóúüñàâçèêëîïôùûæœäöüßàèìòùã]/i.test(_txt) // Latin accents (ES/FR/DE/IT/PT)
+    );
+
+    if (_isNonEnglish && state.llmBackend) {
+      try {
+        const translated = await state.llmBackend.generateAnswer(
+          _txt,
+          {
+            query: _txt,
+            context: {
+              systemInstructions: 'Translate the following text to English. Output ONLY the English translation, nothing else. No explanation, no preamble.',
+              conversationHistory: [],
+              intent: 'translate',
+            },
+            options: { maxTokens: 200, temperature: 0 },
+          },
+          { maxTokens: 200, temperature: 0 },
+          null
+        ).catch(() => null);
+
+        if (translated && translated.trim()) {
+          logger.info(`[Node:ParseIntent] Translated for phi4: "${_txt.substring(0, 60)}" → "${translated.trim().substring(0, 60)}"`);
+          // Update classifyMessage so phi4 receives English (it's declared as let above).
+          // Also propagate to state so downstream nodes carry the translation.
+          // Store original so answer.js / executeCommand.js respond in user's language.
+          classifyMessage = translated.trim();
+          state = {
+            ...state,
+            message: translated.trim(),
+            resolvedMessage: translated.trim(),
+            originalMessage: state.originalMessage || message,
+          };
+        }
+      } catch (_) {}
+    }
   }
 
   // Check if MCP adapter is available

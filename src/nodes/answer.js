@@ -80,8 +80,10 @@ module.exports = async function answer(state) {
 
   const logger = state.logger || console;
 
-  // Use resolved message if available (coreference resolution)
-  let queryMessage = resolvedMessage || message;
+  // Use originalMessage when parseIntent translated non-English input for phi4 classification.
+  // originalMessage holds the user's actual words; message/resolvedMessage hold the English
+  // translation that was only used for intent classification — not for answering.
+  let queryMessage = state.originalMessage || resolvedMessage || message;
   if (typeof queryMessage !== 'string') {
     queryMessage = typeof queryMessage === 'object'
       ? JSON.stringify(queryMessage)
@@ -153,11 +155,61 @@ module.exports = async function answer(state) {
     }
   }
 
+  // ─── Resolve response language FIRST so it prefixes the entire system prompt ──
+  const LANG_NAMES = { zh: 'Chinese (Mandarin)', es: 'Spanish', fr: 'French', pt: 'Portuguese', ar: 'Arabic', ja: 'Japanese', ko: 'Korean', hi: 'Hindi', de: 'German', it: 'Italian', ru: 'Russian' };
+  const _isVoiceSource = context?.source === 'voice';
+
+  function _detectTextLanguage(text) {
+    if (!text || text.length < 3) return null;
+    const cjk     = (text.match(/[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/g) || []).length;
+    const hiragana = (text.match(/[\u3040-\u309F\u30A0-\u30FF]/g) || []).length;
+    const hangul   = (text.match(/[\uAC00-\uD7AF\u1100-\u11FF]/g) || []).length;
+    const arabic   = (text.match(/[\u0600-\u06FF]/g) || []).length;
+    const cyrillic = (text.match(/[\u0400-\u04FF]/g) || []).length;
+    const devanagari = (text.match(/[\u0900-\u097F]/g) || []).length;
+    const total = text.replace(/\s/g, '').length || 1;
+    if (cjk / total > 0.15) return hiragana > cjk * 0.3 ? 'ja' : 'zh';
+    if (hangul / total > 0.15) return 'ko';
+    if (arabic / total > 0.15) return 'ar';
+    if (cyrillic / total > 0.15) return 'ru';
+    if (devanagari / total > 0.15) return 'hi';
+    if (/[¿¡áéíóúüñ]/i.test(text)) return 'es';
+    if (/[àâçèéêëîïôùûüæœ]/i.test(text)) return 'fr';
+    if (/[àèìòùâêîôûã]/i.test(text)) return 'pt';
+    if (/[äöüß]/i.test(text)) return 'de';
+    if (/[àèìòùé]/i.test(text)) return 'it';
+    return null;
+  }
+
+  let resolvedResponseLanguage = (state.responseLanguage && state.responseLanguage !== 'en') ? state.responseLanguage : null;
+  if (!resolvedResponseLanguage && _isVoiceSource) {
+    try {
+      const os = require('os');
+      const journalPath = path.join(os.homedir(), '.thinkdrop', 'voice-state.json');
+      const journalRaw = fs.readFileSync(journalPath, 'utf8');
+      const journalState = JSON.parse(journalRaw);
+      const sl = journalState?.voice?.sessionLanguage;
+      if (sl && sl !== 'en') resolvedResponseLanguage = sl;
+    } catch (_) {}
+  }
+  if (!resolvedResponseLanguage && !_isVoiceSource) {
+    resolvedResponseLanguage = _detectTextLanguage(queryMessage) || null;
+  }
+
+  // Build language override prefix — placed at TOP of system prompt so it cannot be overridden
+  // by dense English context that follows (Rules, memories, history are all in English).
+  let langOverridePrefix = '';
+  if (resolvedResponseLanguage) {
+    const langName = LANG_NAMES[resolvedResponseLanguage] || resolvedResponseLanguage;
+    logger.info(`[Node:Answer] detectedLanguage=${resolvedResponseLanguage} (source: ${_isVoiceSource ? 'voice-journal' : 'text-detect'}) — injecting ${langName} instruction`);
+    langOverridePrefix = `LANGUAGE OVERRIDE: The user's message is in ${langName}. You MUST write your ENTIRE response in ${langName} only. Do NOT use English under any circumstance.\n\n`;
+  }
+
   // ─── Build system instructions (intent-driven) ───────────────────────────────
   const intentType = intent?.type || 'question';
 
   const baseInstruction = ANSWER_PROMPTS?.base || 'Answer using the provided context. Be direct and natural.';
-  let systemInstructions = `${baseInstruction}\n\nContext:`;
+  let systemInstructions = `${langOverridePrefix}${baseInstruction}\n\nContext:`;
 
   const contextSources = [];
   if (filteredMemories.length > 0) contextSources.push(`- ${filteredMemories.length} user memories`);
@@ -199,6 +251,8 @@ module.exports = async function answer(state) {
       'Command output interpretation: Answer in 1 sentence based on the command output below.';
     systemInstructions += `\n\n${cmdOutputLine}`;
   }
+
+  // Language detection and injection already handled above (langOverridePrefix at top of systemInstructions).
 
   // Inject screen context into system instructions (not into the user query)
   if (state.context && typeof state.context === 'string') {

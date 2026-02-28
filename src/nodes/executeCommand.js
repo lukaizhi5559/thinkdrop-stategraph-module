@@ -34,6 +34,18 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+// Read sessionLanguage from voice journal (single source of truth).
+// Returns e.g. 'zh', 'es', or 'en'. Never throws.
+function _readSessionLanguage() {
+  try {
+    const journalPath = path.join(os.homedir(), '.thinkdrop', 'voice-state.json');
+    const raw = fs.readFileSync(journalPath, 'utf8');
+    return JSON.parse(raw)?.voice?.sessionLanguage || 'en';
+  } catch (_) { return 'en'; }
+}
+
+const _LANG_NAMES = { zh: 'Chinese (Mandarin)', es: 'Spanish', fr: 'French', pt: 'Portuguese', ar: 'Arabic', ja: 'Japanese', ko: 'Korean', hi: 'Hindi', de: 'German', it: 'Italian', ru: 'Russian' };
+
 // Persistent scheduler — writes pending-schedule.json + launchd plist
 // so macOS can relaunch the app at the target time if it was closed.
 let _scheduler = null;
@@ -607,7 +619,12 @@ module.exports = async function executeCommand(state) {
   //   url         {string}  Optional URL context shown in card
   //   timeoutMs   {number}  Max wait time (default: 5 minutes)
   if (skill === 'guide.step') {
-    const { instruction, sessionId: guideSessionId, url: guideUrl, timeoutMs: guideTimeout = 300000 } = args;
+    const { instruction, sessionId: guideSessionId_llm, url: guideUrl, timeoutMs: guideTimeout = 300000 } = args;
+    // Prefer the sessionId from the most recent browser.act step — the LLM may generate
+    // a different name (e.g. "webBrowsingSession") than what navigate actually used
+    // (derived from hostname, e.g. "www.google.com"). Mismatched sessionId → about:blank tab.
+    const lastBrowserResult = skillResults.slice().reverse().find(r => r.skill === 'browser.act' && r.args?.sessionId);
+    const guideSessionId = lastBrowserResult?.args?.sessionId || guideSessionId_llm;
 
     if (!instruction) {
       logger.warn('[Node:ExecuteCommand] guide.step: missing instruction — skipping');
@@ -1262,11 +1279,49 @@ module.exports = async function executeCommand(state) {
       const synthesisQuery = hasFileContent
         ? `${synthesisPrompt}\n\nHere is the current file content:\n\n${synthesisContext}`
         : `${synthesisPrompt}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
-      const synthesisInstructions = hasFileContent
+      // Detect response language from the original user message (same approach as answer.js).
+      // Voice: read sessionLanguage from journal. Text: detect from script/accent heuristics.
+      const _SYNTH_LANG_NAMES = { zh: 'Chinese (Mandarin)', es: 'Spanish', fr: 'French', pt: 'Portuguese', ar: 'Arabic', ja: 'Japanese', ko: 'Korean', hi: 'Hindi', de: 'German', it: 'Italian', ru: 'Russian' };
+      const _synthSourceText = state.originalMessage || state.resolvedMessage || state.message || '';
+      function _synthDetectLang(text) {
+        if (!text || text.length < 3) return null;
+        const cjk = (text.match(/[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/g) || []).length;
+        const hiragana = (text.match(/[\u3040-\u309F\u30A0-\u30FF]/g) || []).length;
+        const hangul = (text.match(/[\uAC00-\uD7AF\u1100-\u11FF]/g) || []).length;
+        const arabic = (text.match(/[\u0600-\u06FF]/g) || []).length;
+        const cyrillic = (text.match(/[\u0400-\u04FF]/g) || []).length;
+        const devanagari = (text.match(/[\u0900-\u097F]/g) || []).length;
+        const total = text.replace(/\s/g, '').length || 1;
+        if (cjk / total > 0.15) return hiragana > cjk * 0.3 ? 'ja' : 'zh';
+        if (hangul / total > 0.15) return 'ko';
+        if (arabic / total > 0.15) return 'ar';
+        if (cyrillic / total > 0.15) return 'ru';
+        if (devanagari / total > 0.15) return 'hi';
+        if (/[¿¡áéíóúüñ]/i.test(text)) return 'es';
+        if (/[àâçèéêëîïôùûüæœ]/i.test(text)) return 'fr';
+        if (/[àèìòùâêîôûã]/i.test(text)) return 'pt';
+        if (/[äöüß]/i.test(text)) return 'de';
+        if (/[àèìòùé]/i.test(text)) return 'it';
+        return null;
+      }
+      let _synthLang = null;
+      if (state.context?.source === 'voice') {
+        try {
+          const _voiceJournalPath = require('path').join(require('os').homedir(), '.thinkdrop', 'voice-state.json');
+          const _voiceJournal = JSON.parse(require('fs').readFileSync(_voiceJournalPath, 'utf8'));
+          const sl = _voiceJournal?.voice?.sessionLanguage;
+          if (sl && sl !== 'en') _synthLang = sl;
+        } catch (_) {}
+      }
+      if (!_synthLang) _synthLang = _synthDetectLang(_synthSourceText);
+      const _synthLangSuffix = (_synthLang && _synthLang !== 'en')
+        ? `\n\nIMPORTANT: The user wrote in ${_SYNTH_LANG_NAMES[_synthLang] || _synthLang}. You MUST respond entirely in ${_SYNTH_LANG_NAMES[_synthLang] || _synthLang}.`
+        : '';
+      const synthesisInstructions = (hasFileContent
         ? `You are a file editing assistant. The user has asked you to modify a file. You have been given the current file content. Your job is to output the COMPLETE updated file content with ONLY the requested changes applied. Output the full file text only — no preamble, no explanation, no markdown code fences, no commentary. Preserve all existing structure, headings, and formatting. Only change what was explicitly requested.`
         : hasImageAnalysis
         ? `You are a report writer. The user has analyzed a folder of images/screenshots and wants a summary. You have been given the vision AI analysis of each image. Write a clear, structured report using ONLY the actual file names and descriptions provided — do NOT invent or guess file names, sizes, or content. Use the exact file path from each "Image analysis: <path>" heading as the file name.`
-        : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual.`;
+        : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual.`) + _synthLangSuffix;
       const synthPayload = {
         query: synthesisQuery,
         context: {
@@ -1746,6 +1801,22 @@ module.exports = async function executeCommand(state) {
 
       logger.info(`[Node:ExecuteCommand] last-step all_done: savedFilePaths=${JSON.stringify(finalSavedPaths)}`);
       if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults: updatedResults, savedFilePaths: finalSavedPaths });
+
+      // Translate last-step answer to sessionLanguage if non-English.
+      // These are short status strings ("Done!", "All 3 steps completed") that need translation.
+      const _lastStepLang = (state.context?.source === 'voice') ? _readSessionLanguage() : 'en';
+      if (_lastStepLang && _lastStepLang !== 'en' && lastStepAnswer && state.llmBackend) {
+        try {
+          const langName = _LANG_NAMES[_lastStepLang] || _lastStepLang;
+          const translated = await state.llmBackend.generateAnswer(
+            lastStepAnswer,
+            { query: lastStepAnswer, context: { systemInstructions: `Translate the following text to ${langName}. Output ONLY the translation, nothing else.`, conversationHistory: [], intent: 'command_automate' }, options: { maxTokens: 100, temperature: 0 } },
+            { maxTokens: 100, temperature: 0 },
+            null
+          ).catch(() => lastStepAnswer);
+          if (translated && translated.trim()) lastStepAnswer = translated.trim();
+        } catch (_) {}
+      }
 
       // Stream answer to Results window immediately — graph won't loop back here
       if (lastStepAnswer && typeof state.streamCallback === 'function') {

@@ -468,6 +468,19 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   if (skill === 'browser.act') {
     const action = args.action || '';
 
+    // smartFill misuse on non-email pages: smartFill is ONLY for email compose (Gmail/Outlook).
+    // If the LLM uses it for a search box or maps input, it always fails with "requires at least one of: to, subject, body".
+    // Break the loop immediately — replan with smartType.
+    if (combinedError.includes('smartfill requires at least one of')) {
+      const sessionId = args.sessionId || 'default';
+      logger.debug(`[Node:RecoverSkill] Fast-path: smartFill misuse on non-email page → REPLAN with smartType`);
+      return {
+        action: 'REPLAN',
+        suggestion: `smartFill was used on a non-email page — it only works for Gmail/Outlook compose. Replace it with smartType to type into the search or input field.`,
+        constraint: `NEVER use smartFill on search boxes, maps inputs, or any non-email page. Use smartType instead: { "skill": "browser.act", "args": { "action": "smartType", "text": "<text to enter>", "sessionId": "${sessionId}" } }. Do NOT use waitForSelector before smartType. Do NOT use smartFill again in this plan.`
+      };
+    }
+
     // GitHub API fast-path: browser.act cannot post comments/reviews on github.com because the
     // browser session has no GitHub login cookies. Detect this early and switch to curl + keychain.
     const sessionUrl = (failedStep.url || args.url || '').toLowerCase();
@@ -551,23 +564,46 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
         };
       }
 
-      // waitForSelector timeout: the compose window opened but the specific selector wasn't found.
-      // Do NOT replace smartFill with smartType — just skip the waitForSelector and proceed.
+      // waitForSelector timeout: the element wasn't found in time.
+      // Detect email compose context (Gmail/Outlook) vs generic search/form context.
       if (action === 'waitForSelector') {
+        const selector = (args.selector || '').toLowerCase();
+        const isEmailCompose = selector.includes('compose') || selector.includes('subject') ||
+          selector.includes('to=') || selector.includes('[name="to"]') ||
+          (args.sessionId || '').toLowerCase().includes('gmail') ||
+          (args.sessionId || '').toLowerCase().includes('mail');
+
         if (stepRetryCount === 0) {
-          logger.debug(`[Node:RecoverSkill] Fast-path: browser.act waitForSelector timeout → REPLAN skip wait, keep smartFill`);
+          if (isEmailCompose) {
+            logger.debug(`[Node:RecoverSkill] Fast-path: browser.act waitForSelector timeout (email compose) → REPLAN skip wait, keep smartFill`);
+            return {
+              action: 'REPLAN',
+              suggestion: `The waitForSelector for "${args.selector}" timed out — the compose window may already be open with a different DOM structure. Remove the failed waitForSelector step and proceed directly to the smartFill step. Do NOT replace smartFill with smartType or individual type steps.`,
+              constraint: `Remove the waitForSelector step that failed. Keep the smartFill step exactly as-is (with to, subject, body, sessionId). smartFill inspects the live DOM itself and does not need a prior waitForSelector. Use the same sessionId as the rest of the plan.`
+            };
+          } else {
+            logger.debug(`[Node:RecoverSkill] Fast-path: browser.act waitForSelector timeout (non-email) → REPLAN skip wait, use smartType`);
+            return {
+              action: 'REPLAN',
+              suggestion: `The waitForSelector for "${args.selector}" timed out — the element may have a different selector on this page. Remove the failed waitForSelector step and use smartType to type directly into the page's active input. Do NOT use smartFill (it is for email compose only).`,
+              constraint: `Remove the waitForSelector step. Use smartType with the text to enter, and the same sessionId. Example: { "skill": "browser.act", "args": { "action": "smartType", "text": "<text>", "sessionId": "${args.sessionId || 'default'}" } }. Do NOT use smartFill. Do NOT use waitForSelector again.`
+            };
+          }
+        }
+        // Second waitForSelector failure
+        if (isEmailCompose) {
+          logger.debug(`[Node:RecoverSkill] Fast-path: browser.act waitForSelector timeout (email, retry ${stepRetryCount}) → ASK_USER`);
           return {
-            action: 'REPLAN',
-            suggestion: `The waitForSelector for "${args.selector}" timed out — the compose window may already be open with a different DOM structure. Remove the failed waitForSelector step and proceed directly to the smartFill step. Do NOT replace smartFill with smartType or individual type steps.`,
-            constraint: `Remove the waitForSelector step that failed. Keep the smartFill step exactly as-is (with to, subject, body, sessionId). smartFill inspects the live DOM itself and does not need a prior waitForSelector. Use the same sessionId as the rest of the plan.`
+            action: 'ASK_USER',
+            question: `The compose window doesn't seem to be opening. Is the email compose window visible in the browser?`,
+            options: ['Yes, compose is open', 'No, try again', 'Cancel']
           };
         }
-        // Second waitForSelector failure — ask user
-        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act waitForSelector timeout (retry ${stepRetryCount}) → ASK_USER`);
+        logger.debug(`[Node:RecoverSkill] Fast-path: browser.act waitForSelector timeout (non-email, retry ${stepRetryCount}) → REPLAN smartType`);
         return {
-          action: 'ASK_USER',
-          question: `The compose window doesn't seem to be opening. Is Gmail showing a compose window in the browser?`,
-          options: ['Yes, compose is open', 'No, try again', 'Cancel']
+          action: 'REPLAN',
+          suggestion: `waitForSelector for "${args.selector}" failed again. Skip all waitForSelector steps and use smartType to type directly.`,
+          constraint: `Remove all remaining waitForSelector steps. Use smartType to enter text. Do NOT use smartFill. Use the same sessionId: "${args.sessionId || 'default'}".`
         };
       }
 

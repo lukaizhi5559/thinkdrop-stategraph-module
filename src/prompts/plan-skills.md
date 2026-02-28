@@ -59,7 +59,8 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 - **Reading/writing files** — always `shell.run bash -c`, never open a GUI app
 - **Editing an existing file** — read it first, then synthesize, then write
 - **`ui.moveMouse`** — last resort only, when `ui.axClick` and keyboard shortcuts both failed
-- **`image.analyze`** — for local image files only; never use for live screenshots (use `ui.screen.verify` for that)
+- **`image.analyze`** — for local image files only (tagged file path). Never use for live screenshots.
+- **`screen.capture`** — takes a live screenshot + OCR and returns visible text as `stdout`. Use this when the user asks to "save what's on screen", "extract what you see", or "read the current screen". Chain with `synthesize(saveToFile)` to write to a file.
 
 ## browser.act key actions
 
@@ -80,11 +81,28 @@ navigate|click|hover|smartType|type|keyboard|select|scroll|screenshot|evaluate|s
 **NEVER use `waitForNavigation` alone before `getPageText`** — it resolves before JS-rendered content loads. Always follow with `waitForSelector` or `waitForContent`.
 
 - `highlight` — injects glow border + speech bubble on element; clicking it sets `window.__tdGuideTriggered = true` to auto-advance `guide.step`
-- `waitForAuth` — **REQUIRED args: `url` (string) + `profile` (string)**. Uses persistent browser profile at `~/.thinkdrop/browser-sessions/<profile>/`. Example: `{"action":"waitForAuth","url":"https://gmail.com","profile":"gmail","authSuccessUrl":"mail.google.com/mail"}`. **DO NOT use for ChatGPT, Claude, Perplexity, YouTube, or any AI chatbot** — just `navigate` directly and interact. Only use `waitForAuth` for OAuth/login flows (Gmail, GitHub, etc.).
+- `waitForAuth` — Waits for the user to complete a login flow in the current browser session. **REQUIRED args: `url` (string)**. `profile` is optional — only needed on a cold start with no existing session. **Always use the same `sessionId` as your other steps** (e.g. `"sessionId":"guideSession"`). If the two-phase pre-scan already navigated to the site, `waitForAuth` reuses that tab — it does NOT open a second browser window. Example: `{"action":"waitForAuth","url":"https://mail.google.com","profile":"gmail","authSuccessUrl":"mail.google.com/mail","sessionId":"guideSession"}`. **DO NOT use for ChatGPT, Claude, Perplexity, YouTube, or any AI chatbot** — just `navigate` directly. Only use `waitForAuth` for OAuth/login-gated flows (Gmail, GitHub, Notion, etc.).
 - `smartFill` — fills a form with `{field: value}` pairs; auto-discovers fields including contenteditable areas (use for Gmail compose)
 - `scanSite` — headless scan, returns `{title, url, elements:[{tag,type,label,selector}]}`; use returned labels in `highlight` steps
 
-**IMPORTANT — avoid blank tab accumulation:** `waitForTrigger` opens a new `about:blank` tab per `sessionId`. For simple multi-site tasks (ChatGPT → Perplexity → scrape), use a single `sessionId` (e.g. `"default"`) and navigate between sites with `navigate`. Only create separate named sessions (`sessionId: "chatgpt-session"`) if you need two sites open simultaneously.
+**Browser tab routing — automatic, site-based:**
+- Each unique hostname automatically gets its own tab (e.g. `google.com` tab, `chat.openai.com` tab).
+- Navigating to the same site always **reuses** the existing tab — no duplicate tabs.
+- Navigating to a **different** site opens a **new** tab automatically.
+- **You do NOT need to set `sessionId` for normal browsing** — it is derived from the URL hostname.
+- Only set `sessionId` explicitly if you need to force two tabs on the same site (e.g. `"sessionId":"chatgpt-compare"`) or reuse a specific named session.
+
+**IMPORTANT — extracting info from current screen vs current browser tab:**
+- "What's on my screen" / "save what you see" / "extract the info in front of you" → use `screen.capture` (OCR of the full screen), NOT `browser.act`. No browser tab is needed.
+- "Extract info from this Google/web page" → use `browser.act getPageText`. Do NOT navigate away first if the page is already open.
+
+**Screen-to-file pattern (the only correct approach):**
+```json
+[
+  { "skill": "screen.capture", "args": {} },
+  { "skill": "synthesize", "args": { "prompt": "Format the screen text for saving.", "saveToFile": "/Users/lukaizhi/Desktop/filename.txt" } }
+]
+```
 
 ## guide.step — interactive walkthroughs
 

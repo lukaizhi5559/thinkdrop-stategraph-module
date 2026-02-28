@@ -276,7 +276,15 @@ module.exports = async function resolveReferences(state) {
   // ── Fetch fresh conversation history ─────────────────────────────────────
   let conversationHistory = [];
   try {
-    const sessionId = context?.sessionId;
+    let sessionId = context?.sessionId;
+    // No explicit sessionId (fresh prompt window) — route to get the active session
+    if (!sessionId) {
+      try {
+        const routeResult = await mcpAdapter.callService('conversation', 'session.route', {});
+        sessionId = (routeResult.data || routeResult)?.sessionId || null;
+        if (sessionId) logger.debug(`[Node:ResolveReferences] No sessionId in context, routed to: ${sessionId}`);
+      } catch (_) {}
+    }
     if (sessionId) {
       const histResult = await mcpAdapter.callService('conversation', 'message.list', {
         sessionId,

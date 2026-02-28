@@ -44,7 +44,7 @@ class StateGraphBuilder {
     
     // Minimal nodes: just parseIntent → answer
     const nodes = {
-      parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
+      parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend })
     };
     
@@ -78,7 +78,7 @@ class StateGraphBuilder {
     
     // Basic nodes: parseIntent → answer with mock data
     const nodes = {
-      parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
+      parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend })
     };
     
@@ -116,7 +116,7 @@ class StateGraphBuilder {
     
     // Standard nodes: parseIntent → retrieveMemory → answer → logConversation
     const nodes = {
-      parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
+      parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
       logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
@@ -161,7 +161,7 @@ class StateGraphBuilder {
     const nodes = {
       resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter }),
       parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter }),
-      parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter }),
+      parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
