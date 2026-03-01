@@ -259,6 +259,12 @@ module.exports = async function resolveReferences(state) {
   const { mcpAdapter, message, context } = state;
   const logger = state.logger || console;
 
+  // ── skill_build fast-path — skip all resolution for skill build requests ───
+  if (state.skillBuildRequest && state.intent?.type === 'skill_build') {
+    logger.info('[Node:ResolveReferences] skill_build passthrough — skipping coreference resolution');
+    return state;
+  }
+
   logger.debug('[Node:ResolveReferences] Resolving coreferences...');
   logger.debug(`[Node:ResolveReferences] Original: "${message}"`);
 

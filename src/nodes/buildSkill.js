@@ -20,15 +20,32 @@
 'use strict';
 
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
 const FETCH_TIMEOUT_MS = 8000;
 const MAX_SKILL_MD_CHARS = 6000; // truncate very long SKILL.md to stay under context limits
 
-// ── Fetch SKILL.md from GitHub raw URL ───────────────────────────────────────
+// ── Fetch SKILL.md — from GitHub raw URL or local file:// path ───────────────
 
 function fetchSkillMd(rawUrl) {
   return new Promise((resolve) => {
     if (!rawUrl) { resolve(null); return; }
+
+    // Local scaffold: file:// or absolute path
+    if (rawUrl.startsWith('file://') || rawUrl.startsWith('/') || rawUrl.startsWith('~')) {
+      try {
+        let localPath = rawUrl.startsWith('file://') ? rawUrl.slice(7) : rawUrl;
+        // Expand ~ to home directory (file://~/.thinkdrop/... → /Users/xxx/.thinkdrop/...)
+        if (localPath.startsWith('~')) localPath = os.homedir() + localPath.slice(1);
+        const content = fs.readFileSync(localPath, 'utf8');
+        resolve(content.slice(0, MAX_SKILL_MD_CHARS));
+      } catch (_) {
+        resolve(null);
+      }
+      return;
+    }
 
     const timer = setTimeout(() => resolve(null), FETCH_TIMEOUT_MS);
 
@@ -58,11 +75,15 @@ ThinkDrop is a desktop AI assistant (Electron/macOS). Skills extend it with new 
 A skill is a single CommonJS .cjs file that exports one async function:
   module.exports = async (args) => { ... return string | object; }
 
-## Available primitives the skill CAN call (via HTTP to localhost services)
-- shell.run     — run a shell command: POST http://localhost:3007/command.automate  { skill:'shell.run', args:{ cmd, cwd? } }
-- fs.read       — read file: POST http://localhost:3007/command.automate  { skill:'fs.read', args:{ path } }
-- browser.act   — browser automation: POST http://localhost:3007/command.automate  { skill:'browser.act', args:{ action, ... } }
-- file.watch    — watch file: POST http://localhost:3007/command.automate  { skill:'file.watch', args:{ path, event? } }
+## Always-available modules (pre-installed in ThinkDrop runtime — no install needed)
+- All Node.js built-ins: fs, path, os, http, https, crypto, child_process, util, events, stream, url, querystring, buffer
+- keytar — macOS Keychain: const keytar = require('keytar')
+- node-cron — cron scheduling: const cron = require('node-cron')
+
+## Third-party packages (auto-installed per skill — use freely, installer handles it)
+ThinkDrop will automatically run npm install in the skill's own directory for any packages you require.
+Commonly needed ones: twilio, googleapis, nodemailer, axios, openai, node-fetch, cheerio, uuid, lodash
+Example: const twilio = require('twilio') — will be installed automatically.
 
 ## Security rules (CRITICAL — validator will reject violations)
 1. NEVER hardcode secrets, API keys, passwords, or tokens in the source.
@@ -108,9 +129,9 @@ function buildPrompt({ request, skillMd, feedback, draft, round }) {
     prompt += `Write the complete ThinkDrop .cjs skill now. Skill name: "${name}"`;
   } else {
     prompt += `Fix the ThinkDrop skill "${displayName}" based on validator feedback.\n\n`;
-    prompt += `## Validator issues (round ${round - 1}):\n${feedback}\n\n`;
+    prompt += `## Validator feedback (round ${round - 1}):\n${feedback}\n\n`;
     prompt += `## Current draft to fix:\n\`\`\`js\n${draft}\n\`\`\`\n\n`;
-    prompt += `Apply ALL fixes. Return the complete corrected .cjs file.`;
+    prompt += `Apply ALL fixes exactly as instructed. Return the complete corrected .cjs file.`;
   }
 
   return prompt;
@@ -198,6 +219,10 @@ async function buildSkill(state) {
   }
 
   logger.info(`[Node:BuildSkill] Draft generated: ${draft.length} chars`);
+
+  if (progressCallback) {
+    progressCallback({ type: 'skill_build_draft', skillName: name, round: skillBuildRound, draft });
+  }
 
   return {
     ...state,

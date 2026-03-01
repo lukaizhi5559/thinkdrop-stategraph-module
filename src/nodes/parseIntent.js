@@ -11,6 +11,14 @@ module.exports = async function parseIntent(state) {
   const { mcpAdapter, message, resolvedMessage, carriedIntent, context } = state;
   const logger = state.logger || console;
 
+  // ── skill_build fast-path: never re-classify skill build requests ──────────
+  // main.js sets intent.type='skill_build' + skillBuildRequest before calling execute().
+  // parseIntent must not overwrite this — phi4 would misclassify the synthetic message.
+  if (state.skillBuildRequest && state.intent?.type === 'skill_build') {
+    logger.info('[Node:ParseIntent] skill_build passthrough — preserving skill_build intent');
+    return state;
+  }
+
   // Prefer coreference-resolved message for classification
   // NOTE: declared as let so the non-English translation block can update it before phi4.
   let classifyMessage = resolvedMessage || message;
@@ -378,11 +386,24 @@ module.exports = async function parseIntent(state) {
     };
   }
 
+  // Service-automation override — must run BEFORE action-request and phi4 ML call.
+  // "watch my Gmail", "monitor my inbox", "send me a daily text summary",
+  // "check my calendar and remind me" etc. → command_automate (triggers needs_skill
+  // in executeCommand so user gets directed to the Skill Store to install the right skill).
+  const serviceAutomationPattern =
+    /\b(watch|monitor|poll|track|check|fetch|sync|forward|filter|archive|summarize|notify|alert|read)\b.{0,100}\b(gmail|inbox|email|emails|mail|messages?|texts?|sms|slack|discord|telegram|whatsapp|calendar|google calendar|schedule|events?|appointments?|notion|airtable|jira|trello|asana|linear|hubspot|salesforce|sheets?|spreadsheet|drive|dropbox|twitter|instagram|linkedin|reddit)\b/i;
+  const scheduledNotifyPattern =
+    /\b(send|give|text|notify|alert)\b.{0,80}\b(daily|weekly|every night|every morning|each day|nightly|at \d|around \d|9 ?[ap]m|8 ?[ap]m|morning|evening|night)\b.{0,80}\b(summary|digest|briefing|reminder|alert|report|update)\b/i;
+  if (serviceAutomationPattern.test(classifyMessage) || scheduledNotifyPattern.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Service-automation override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.97, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'service-automation-override', processingTimeMs: 0 } };
+  }
+
   // Action-request override — must run BEFORE phi4 ML call.
   // "I need to X", "I need you to X", "can you do X for me", "help me X", "do X for me"
   // where X is a task verb → always command_automate.
   // EXCLUDED: renew/apply/register/sign-up/fill out — handled by guide-task-guard above.
-  const actionRequestPattern = /\b(i need (you to|to) (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|check|look up|navigate|find|search)|can you (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|navigate|find|search)|help me (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|navigate|find|search)|do this for me)\b/i;
+  const actionRequestPattern = /\b(i need (you to|to) (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|check|look up|navigate|find|search|watch|monitor|track|notify|summarize|poll|sync|fetch|forward)|can you (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|navigate|find|search|watch|monitor|track)|help me (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|navigate|find|search)|do this for me)\b/i;
   if (actionRequestPattern.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Action-request override → command_automate: "${classifyMessage}"`);
     return {

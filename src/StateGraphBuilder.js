@@ -171,7 +171,7 @@ class StateGraphBuilder {
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
       planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
-      executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
+      executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter, llmBackend }),
       recoverSkill: (state) => recoverSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       evaluateSkills: (state) => evaluateSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
       buildSkill: (state) => buildSkillNode.run({ ...state, logger, mcpAdapter, llmBackend }),
@@ -256,6 +256,11 @@ class StateGraphBuilder {
 
       // executeCommand cycle: next step, recover on failure, or done
       executeCommand: (state) => {
+        // Missing external.skill — trigger build pipeline
+        if (state.skillBuildPhase === 'building') {
+          logger.debug('[StateGraph:Router] executeCommand: missing external.skill → buildSkill');
+          return 'buildSkill';
+        }
         // Step failed — route to recovery
         if (state.failedStep) {
           return 'recoverSkill';
@@ -312,7 +317,9 @@ class StateGraphBuilder {
       // buildSkill → validateSkill → (PASS) installSkill → done
       //                            → (FAIL, rounds left) buildSkill (fix loop)
       //                            → (FAIL, max rounds) logConversation (error)
-      // installSkill → (needs secret) installSkill (resume after ASK_USER answer)
+      // installSkill → (needs secret) logConversation (paused for user input)
+      //              → (smoke FAIL, rounds left) buildSkill (smoke fix loop)
+      //              → (smoke FAIL, max rounds) logConversation (error)
       //              → (done) logConversation
       buildSkill: (state) => {
         if (state.skillBuildPhase === 'error') return 'logConversation';
@@ -330,8 +337,14 @@ class StateGraphBuilder {
       installSkill: (state) => {
         const phase = state.skillBuildPhase;
         if (phase === 'asking')  return 'logConversation'; // paused for user input
-        if (phase === 'done')    return 'logConversation';
+        if (phase === 'fixing')  return 'buildSkill';      // smoke test failed — rebuild
         if (phase === 'error')   return 'logConversation';
+        // If skill was built on-demand (triggered by missing external.skill), resume original plan
+        if (phase === 'done' && state.postBuildResumePlan) {
+          logger.debug('[StateGraph:Router] installSkill done — resuming original executeCommand plan');
+          return 'executeCommand';
+        }
+        if (phase === 'done')    return 'logConversation';
         return 'logConversation';
       },
 

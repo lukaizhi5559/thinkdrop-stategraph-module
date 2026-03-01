@@ -217,10 +217,25 @@ Adjust the plan to avoid the same failure.`;
   // Otherwise always pre-scan so the LLM knows real page elements (inputs, buttons, links)
   // before generating the plan — eliminates selector guessing entirely.
   const PURE_LOCAL_TASK = /\b(file\.bridge|fs\.read|file\.watch|check the bridge|the bridge|bridge file|watch the|tail -f|directory listing|repo structure|npm install|git (commit|push|pull|clone|status)|python\s|bash\s|shell\s|convert (this|the) file|read (the|this) file|write (the|this) file)\b/i;
+  // Service-automation tasks require a skill to be installed — they can NEVER be done
+  // via browser.act. Skip pre-scan entirely so the LLM goes straight to needs_skill.
+  // IMPORTANT: Only match PERSISTENT/RECURRING patterns, not one-off actions.
+  // "watch my Gmail" = background daemon (needs_skill) ✓
+  // "summarize this Notion page" = one-off browser task — must NOT match ✗
+  // "notify Slack about this PR" = one-off API call — must NOT match ✗
+  const SERVICE_AUTOMATION_TASK =
+    // Pattern A: persistent monitoring verb + service (watch/monitor/poll are unambiguously background)
+    /\b(watch|monitor|poll|keep checking|continuously check)\b.{0,100}\b(gmail|inbox|email|emails|mail|messages?|texts?|sms|slack|discord|telegram|whatsapp|calendar|google calendar|events?|appointments?|airtable|jira|trello|asana|linear|hubspot|salesforce)\b/i;
+  // Pattern B: action verb + recurring time signal + service
+  // Requires ALL THREE: an outbound-action verb (send/text/notify/...) + a recurring time word + a service name.
+  // This prevents false positives like "daily standup in Slack" or "my daily calendar has a meeting".
+  const SCHEDULED_SERVICE_TASK =
+    /\b(send|text|notify|alert|give|deliver|forward|email)\b.{0,120}\b(every (day|night|morning|evening|week|hour)|daily|weekly|nightly|each (day|morning|night)|each week)\b.{0,120}\b(gmail|inbox|email|mail|sms|text|slack|discord|calendar|summary|digest|briefing|reminder)\b|\b(send|text|notify|alert|give|deliver|forward|email)\b.{0,60}\b(daily|weekly|nightly|every (day|night|morning|week))\b.{0,60}\b(summary|digest|briefing|reminder|update|report)\b/i;
+  const isServiceAutomation = SERVICE_AUTOMATION_TASK.test(userMessage) || SCHEDULED_SERVICE_TASK.test(userMessage);
   // A task is a browser task if it mentions any URL, site name, navigation verb, or web concept
   const HAS_BROWSER_SIGNAL = /\b(https?:\/\/|\.com|\.ai|\.org|\.io|\.gov|go to|navigate|open|website|online|web|internet|search|look up|find|research|browse|perplexity|deepseek|chatgpt|claude|gemini|grok|copilot|google|youtube|github\.com|twitter|instagram|facebook|linkedin|reddit|amazon|netflix|spotify|maps|register|apply|passport|visa|dmv|form|portal|login|account|sign up|enroll|appointment|verify|lookup|renew|permit|license)\b/i;
   const isGuideTask = !activeBrowserPageElements && !recoveryContext && mcpAdapter &&
-    HAS_BROWSER_SIGNAL.test(userMessage) && !PURE_LOCAL_TASK.test(userMessage);
+    HAS_BROWSER_SIGNAL.test(userMessage) && !PURE_LOCAL_TASK.test(userMessage) && !isServiceAutomation;
 
   if (isGuideTask) {
     try {
@@ -420,7 +435,7 @@ User request: "${userMessage}"${installedSkillsNote}${siteRulesBlock}${recoveryN
       intent: 'command_automate'
     },
     options: {
-      maxTokens: 600,
+      maxTokens: 1200,
       temperature: 0.1,
       fastMode: false
     }

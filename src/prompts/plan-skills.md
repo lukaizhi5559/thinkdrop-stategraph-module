@@ -1,4 +1,3 @@
-needs_install|args:{tool:string,installCmd:string,reason:string,source?:string,description?:string}|pauses_plan_asks_user_to_confirm_install
 api_suggest|args:{app:string,reason:string,apiDocsUrl?:string,apiSetupPrompt?:string,guidePrompt?:string}|surfaces_API_offer_when_task_is_better_served_by_API
 guide.step|args:{instruction:string,sessionId:string,timeoutMs?:number}|pauses_plan_shows_instruction_card_polls_window.__tdGuideTriggered_auto_advances_when_user_clicks_highlighted_element
 schedule|args:{time?:string,delayMs?:number,label?:string}|waits_until_clock_time_or_delay_then_continues_plan
@@ -190,7 +189,23 @@ The skill contract's "What this skill does" section describes inputs — extract
 
 ## needs_skill — capability gap
 
-Use `needs_skill` as the ONLY step when ThinkDrop cannot fulfill the request natively AND no installed skill matches. Generate a complete starter contract scaffold via `shell.run` so the user can save and install it.
+**Use `needs_skill` as the FIRST AND ONLY step (no browser.act, no shell.run, no api_suggest before it) when the request requires ongoing background automation that ThinkDrop cannot do natively.**
+
+### Always use `needs_skill` immediately for these task types — do NOT attempt browser.act or api_suggest first:
+
+| Task type | Example |
+|-----------|---------|
+| Email / inbox monitoring | "watch my Gmail and summarize daily", "alert me when I get mail from X" |
+| Scheduled SMS / text notifications | "send me a daily text summary at 9pm", "text me my schedule every morning" |
+| Calendar monitoring & reminders | "check my Google Calendar and remind me of events", "daily calendar briefing" |
+| Slack / Discord / messaging monitoring | "watch my Slack and summarize daily", "alert me on new Discord messages" |
+| Any recurring/scheduled background task | "every day at X", "every night", "every morning", "weekly digest" |
+| Third-party service sync | "sync Notion", "poll Airtable", "monitor my Jira issues" |
+| OAuth-gated data access requiring a long-running daemon | Gmail API, Google Calendar API, Twilio SMS, etc. |
+
+**Why:** These tasks require a persistent background process (cron job, daemon, or webhook) with API credentials. ThinkDrop's browser.act is session-based and cannot run in the background. A custom skill (installed at `~/.thinkdrop/skills/`) is the correct mechanism.
+
+**Rule:** If the user asks to **watch / monitor / track / poll / summarize on a schedule / send daily/weekly/nightly notifications** involving any external service → emit `needs_skill` immediately. Never navigate to the service's website or suggest an API setup as a substitute.
 
 ```json
 [
@@ -205,9 +220,9 @@ Use `needs_skill` as the ONLY step when ThinkDrop cannot fulfill the request nat
     "skill": "shell.run",
     "args": {
       "cmd": "bash",
-      "argv": ["-c", "mkdir -p ~/.thinkdrop/skills/weather.sms.daily && cat > ~/.thinkdrop/skills/weather.sms.daily/skill.md << 'EOF'\n---\nname: weather.sms.daily\ndescription: Sends a daily weather SMS summary\nversion: 1.0.0\nexec_path: ~/.thinkdrop/skills/weather.sms.daily/index.cjs\nexec_type: node\n---\n\n## Input Schema\n```json\n{\n  \"city\": \"string\",\n  \"phone\": \"string\"\n}\n```\n\n## What this skill does\nFetches weather for the given city and sends a daily SMS summary to the phone number.\n\n## Example plan step\n```json\n{ \"skill\": \"external.skill\", \"args\": { \"name\": \"weather.sms.daily\", \"city\": \"New York\", \"phone\": \"+15551234567\" } }\n```\nEOF\ncat > ~/.thinkdrop/skills/weather.sms.daily/index.cjs << 'EOF'\n'use strict';\n// TODO: implement your skill logic here\nmodule.exports = async function(args) {\n  const { city, phone } = args;\n  // Your implementation here\n  return `Skill weather.sms.daily ran for city=${city} phone=${phone}`;\n};\nEOF\necho 'Skill scaffolded at ~/.thinkdrop/skills/weather.sms.daily/'"]
-    },
-    "description": "Scaffold starter skill files"
+      "argv": ["-c", "D=~/.thinkdrop/skills/weather.sms.daily && mkdir -p $D && printf '%s\\n' '---' 'name: weather.sms.daily' 'description: Sends a daily weather SMS summary' 'version: 1.0.0' 'exec_path: ~/.thinkdrop/skills/weather.sms.daily/index.cjs' 'exec_type: node' '---' '' '## What this skill does' 'Fetches weather and sends a daily SMS.' > $D/skill.md && printf '%s\\n' \"'use strict';\" 'module.exports = async function(args) {' '  // TODO: implement skill logic' '  return JSON.stringify(args);' '};' > $D/index.cjs && echo 'Scaffolded at ~/.thinkdrop/skills/weather.sms.daily/'"],
+      "description": "Scaffold starter skill files"
+    }
   }
 ]
 ```

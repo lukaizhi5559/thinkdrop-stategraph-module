@@ -377,160 +377,6 @@ module.exports = async function executeCommand(state) {
     };
   }
 
-  // ── needs_install pseudo-skill ───────────────────────────────────────────
-  // Checks if a CLI tool is installed. If missing, pauses the plan and emits
-  // a 'needs_install' progress event so the UI can show a confirmation card.
-  // Waits for the user to confirm (install) or skip before continuing.
-  if (skill === 'needs_install') {
-    const { tool, installCmd, reason, source = 'brew', description: toolDescription } = args;
-
-    if (!tool || !installCmd) {
-      logger.warn('[Node:ExecuteCommand] needs_install: missing tool or installCmd — skipping');
-      return {
-        ...state,
-        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: true, stdout: 'Skipped (missing args)' }],
-        skillCursor: skillCursor + 1,
-        commandExecuted: false
-      };
-    }
-
-    // Check if already installed
-    const { execSync } = require('child_process');
-    let alreadyInstalled = false;
-    try {
-      execSync(`which ${tool}`, { stdio: 'ignore' });
-      alreadyInstalled = true;
-    } catch (_) {
-      alreadyInstalled = false;
-    }
-
-    if (alreadyInstalled) {
-      logger.debug(`[Node:ExecuteCommand] needs_install: ${tool} already installed — skipping prompt`);
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: description || `${tool} already installed`, stdout: `${tool} is already installed` });
-      return {
-        ...state,
-        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: true, stdout: `${tool} is already installed` }],
-        skillCursor: skillCursor + 1,
-        commandExecuted: false
-      };
-    }
-
-    // Tool is missing — emit needs_install event and wait for user confirmation
-    logger.info(`[Node:ExecuteCommand] needs_install: ${tool} not found — requesting user confirmation`);
-    if (progressCallback) progressCallback({
-      type: 'needs_install',
-      stepIndex: skillCursor,
-      totalSteps: skillPlan.length,
-      tool,
-      installCmd,
-      reason,
-      source,
-      toolDescription: toolDescription || null,
-      description: description || `Install ${tool}?`
-    });
-
-    // Wait for confirmation via confirmInstallCallback (injected by main.js into state)
-    const confirmInstallCallback = state.confirmInstallCallback || null;
-    let confirmed = false;
-    if (typeof confirmInstallCallback === 'function') {
-      try {
-        confirmed = await confirmInstallCallback(tool);
-      } catch (err) {
-        logger.warn(`[Node:ExecuteCommand] needs_install: confirmation timed out or errored — skipping: ${err.message}`);
-        confirmed = false;
-      }
-    } else {
-      logger.warn('[Node:ExecuteCommand] needs_install: no confirmInstallCallback in state — auto-skipping');
-      confirmed = false;
-    }
-
-    if (!confirmed) {
-      logger.info(`[Node:ExecuteCommand] needs_install: user skipped install of ${tool}`);
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: description || `Skipped install of ${tool}`, stdout: `Skipped — ${tool} not installed` });
-      return {
-        ...state,
-        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: true, stdout: `Skipped — ${tool} not installed`, skipped: true }],
-        skillCursor: skillCursor + 1,
-        commandExecuted: false
-      };
-    }
-
-    // User confirmed — run the install command with live stdout streaming
-    logger.info(`[Node:ExecuteCommand] needs_install: installing ${tool} via: ${installCmd}`);
-    if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: `Installing ${tool}...` });
-
-    try {
-      const { spawn } = require('child_process');
-      const installOk = await new Promise((resolve) => {
-        const child = spawn('bash', ['-c', installCmd], {
-          env: { ...process.env, HOMEBREW_NO_AUTO_UPDATE: '1', HOMEBREW_NO_EMOJI: '1' },
-          timeout: 300000,
-        });
-        const allLines = [];
-        const emit = (line) => {
-          if (!line.trim()) return;
-          allLines.push(line);
-          if (progressCallback) progressCallback({ type: 'install_output', tool, line: line.trimEnd() });
-        };
-        let stdoutBuf = '', stderrBuf = '';
-        child.stdout.on('data', (chunk) => {
-          stdoutBuf += chunk.toString();
-          const parts = stdoutBuf.split('\n');
-          stdoutBuf = parts.pop();
-          parts.forEach(emit);
-        });
-        child.stderr.on('data', (chunk) => {
-          stderrBuf += chunk.toString();
-          const parts = stderrBuf.split('\n');
-          stderrBuf = parts.pop();
-          parts.forEach(emit);
-        });
-        child.on('close', (code) => {
-          if (stdoutBuf.trim()) emit(stdoutBuf);
-          if (stderrBuf.trim()) emit(stderrBuf);
-          resolve(code === 0);
-        });
-        child.on('error', (err) => {
-          emit(`Error: ${err.message}`);
-          resolve(false);
-        });
-      });
-      const installStdout = installOk ? `${tool} installed successfully` : `Install failed`;
-
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: `Installed ${tool}`, stdout: installStdout });
-      logger.info(`[Node:ExecuteCommand] needs_install: install ${installOk ? 'succeeded' : 'failed'} for ${tool}`);
-
-      // If install succeeded and no more steps follow, stream a "skill ready" confirmation
-      // so the user knows the tool is available and how to use it.
-      const isLastStep = skillCursor + 1 >= skillPlan.length;
-      if (installOk && isLastStep) {
-        const toolDescription = args.description || '';
-        const confirmation = `✅ **${tool} is now installed!**${toolDescription ? '\n\n' + toolDescription : ''}\n\nYou can now use it — just ask me naturally (e.g. "use ${tool} to...")`;
-        if (typeof state.streamCallback === 'function') {
-          state.streamCallback(confirmation);
-        } else if (progressCallback) {
-          progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_install', description: confirmation, stdout: confirmation });
-        }
-      }
-
-      return {
-        ...state,
-        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: installOk, stdout: installStdout }],
-        skillCursor: skillCursor + 1,
-        commandExecuted: false
-      };
-    } catch (err) {
-      logger.error(`[Node:ExecuteCommand] needs_install: install threw: ${err.message}`);
-      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill: 'needs_install', description: `Install of ${tool} failed`, error: err.message });
-      return {
-        ...state,
-        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_install', args, description, ok: false, error: err.message }],
-        skillCursor: skillCursor + 1,
-        commandExecuted: false
-      };
-    }
-  }
-
   // ── needs_skill pseudo-skill ─────────────────────────────────────────────
   // Emitted by the planner when ThinkDrop cannot fulfill a request natively
   // and no installed external skill matches. Tells the user what capability
@@ -1612,6 +1458,117 @@ module.exports = async function executeCommand(state) {
     const updatedResults = [...skillResults, stepResult];
 
     if (!stepResult.ok && !optional) {
+      // ── Missing external skill — trigger build pipeline ─────────────────────
+      // When external.skill fails because the skill file doesn't exist, don't
+      // send to recoverSkill (which has no way to build code). Instead, kick off
+      // the skill build pipeline so buildSkill → validateSkill → installSkill runs.
+      const isMissingSkill = skill === 'external.skill' &&
+        typeof stepResult.error === 'string' &&
+        stepResult.error.includes('Skill file not found');
+
+      if (isMissingSkill) {
+        const missingSkillName = resolvedArgs.name || args.name;
+        logger.info(`[Node:ExecuteCommand] external.skill "${missingSkillName}" not found — asking user to confirm build`);
+
+        // Emit a confirmation card so the user can approve before we build anything.
+        // The card shows the skill name, what it will do, and Build / Cancel buttons.
+        // Reuses the existing install:confirm IPC + confirmInstallCallback pattern from main.js.
+        const originalPrompt = state.message || state.input || state.prompt || '';
+
+        // Ask the LLM to generate a clean one-sentence skill description in the user's language.
+        // Falls back to the raw prompt if LLM is unavailable or too slow.
+        let skillSummary = originalPrompt.length > 100
+          ? originalPrompt.slice(0, 100) + '\u2026'
+          : originalPrompt;
+        const llmBackend = state.llmBackend || null;
+        logger.info(`[Node:ExecuteCommand] skill desc LLM: backend=${llmBackend ? llmBackend.getInfo?.()?.name || 'present' : 'none'}, prompt="${originalPrompt.slice(0, 60)}"`);
+        if (llmBackend && originalPrompt) {
+          try {
+            const descText = await Promise.race([
+              llmBackend.generateAnswer(
+                originalPrompt,
+                {
+                  query: originalPrompt,
+                  context: {
+                    conversationHistory: [],
+                    systemInstructions: 'Reply with ONE short sentence (max 15 words) describing what this automation skill will do. Use the same language as the user request. No quotes, no preamble.',
+                    intent: 'general_query',
+                  },
+                  options: { maxTokens: 40, temperature: 0.3, fastMode: true },
+                },
+                { maxTokens: 40, temperature: 0.3, fastMode: true },
+                null
+              ),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+            ]);
+            logger.info(`[Node:ExecuteCommand] skill desc LLM result: "${typeof descText === 'string' ? descText.slice(0, 80) : JSON.stringify(descText).slice(0, 80)}"`);
+            const text = (typeof descText === 'string' ? descText : '').trim().replace(/^["']|["']$/g, '');
+            if (text && text.length > 5) skillSummary = text;
+          } catch (err) {
+            logger.warn(`[Node:ExecuteCommand] skill desc LLM failed: ${err.message} — using raw prompt fallback`);
+          }
+        }
+
+        if (progressCallback) progressCallback({
+          type: 'skill_build_confirm',
+          skillName: missingSkillName,
+          summary: skillSummary,
+        });
+
+        // Wait for user confirmation (same IPC as needs_install: install:confirm)
+        const confirmInstallCallback = state.confirmInstallCallback || null;
+        let confirmed = false;
+        if (typeof confirmInstallCallback === 'function') {
+          try {
+            confirmed = await confirmInstallCallback(missingSkillName);
+          } catch (err) {
+            logger.warn(`[Node:ExecuteCommand] skill build confirm: timed out or errored — cancelling: ${err.message}`);
+            confirmed = false;
+          }
+        } else {
+          logger.warn('[Node:ExecuteCommand] skill build confirm: no confirmInstallCallback in state — auto-confirming');
+          confirmed = true; // safe default when running headless/test
+        }
+
+        if (!confirmed) {
+          logger.info(`[Node:ExecuteCommand] User declined to build skill "${missingSkillName}"`);
+          if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: `Skipped — skill build cancelled by user` });
+          return {
+            ...state,
+            skillResults: updatedResults,
+            skillCursor: skillCursor + 1,
+            failedStep: null,
+            commandExecuted: false,
+            answer: `I'd need to build the **${missingSkillName}** skill to do that, but you cancelled the install. You can ask me again any time to set it up.`,
+          };
+        }
+
+        logger.info(`[Node:ExecuteCommand] User confirmed — triggering skill build pipeline for "${missingSkillName}"`);
+        if (progressCallback) progressCallback({
+          type: 'skill_build_triggered',
+          skillName: missingSkillName,
+          reason: 'Building and installing skill...',
+        });
+
+        return {
+          ...state,
+          skillResults: updatedResults,
+          skillCursor,
+          failedStep: null,
+          commandExecuted: false,
+          // Skill build pipeline state
+          skillBuildRequest: state.message || originalPrompt || `Build skill: ${missingSkillName}`,
+          skillBuildName: missingSkillName,
+          skillBuildPhase: 'building',
+          skillBuildRound: 0,
+          skillBuildDraft: null,
+          skillBuildFeedback: null,
+          // After build completes, resume the original plan from the failed step
+          postBuildResumePlan: skillPlan,
+          postBuildResumeCursor: skillCursor,
+        };
+      }
+
       // Step failed and is not optional — hand off to recoverSkill
       logger.warn(`[Node:ExecuteCommand] Step ${skillCursor + 1} failed: ${stepResult.error}`);
       if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: stepResult.error, stderr: stepResult.stderr });
