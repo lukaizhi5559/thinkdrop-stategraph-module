@@ -53,6 +53,8 @@ Prefer `fs.read` with `action: "explore"` to understand a codebase, `action: "tr
 
 Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prompt MUST NOT include file content — it is auto-injected from prior `shell.run` stdout. Always instruct it to output the COMPLETE replacement content, no preamble.
 
+**`synthesize` ordering rule — CRITICAL:** Place ALL `synthesize` steps AFTER all data-collection steps (browser.act, shell.run, getPageText, waitForStableText) are complete. **NEVER interleave `synthesize` between browser steps on different sites.** Wrong: [chatgpt scrape → synthesize → gmail scrape → synthesize]. Right: [chatgpt scrape → gmail scrape → synthesize all → send].
+
 ## Critical skill selection rules
 
 - **Opening apps** — always `shell.run open -a AppName`, never `ui.findAndClick`
@@ -64,21 +66,37 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 
 ## browser.act key actions
 
-navigate|click|hover|smartType|type|keyboard|select|scroll|screenshot|evaluate|sleep|waitForContent|discoverInputs|getText|getPageText|getAttribute|waitForSelector|waitForNavigation|newPage|back|forward|reload|close|waitForAuth|highlight|scanSite|smartFill
+navigate|click|hover|smartType|type|keyboard|select|scroll|screenshot|evaluate|sleep|waitForContent|waitForStableText|discoverInputs|getText|getPageText|getAttribute|waitForSelector|waitForNavigation|newPage|back|forward|reload|close|waitForAuth|highlight|scanSite|smartFill
 
-**Browser scraping patterns — ALWAYS wait for content before getPageText:**
+**Browser scraping patterns — use `waitForStableText` as the universal content-ready action:**
 
-| Site | Pattern to wait for page/input ready |
-|------|---------------------------------------|
-| YouTube search | `waitForSelector` `selector:"ytd-video-renderer"` → `getPageText` |
-| Google search | `waitForSelector` `selector:"#search"` → `getPageText` |
-| ChatGPT (navigate to page) | `waitForSelector` `selector:"#prompt-textarea"` `timeoutMs:20000` — THEN `smartType` |
-| ChatGPT (after submitting prompt) | `sleep` `delay:15000` → `getPageText` |
-| Perplexity / Claude / Gemini | `waitForSelector` `selector:"textarea"` `timeoutMs:20000` — THEN `smartType` |
-| Perplexity / Claude / Gemini (after submit) | `waitForContent` `minLength:1500` `timeoutMs:60000` → `getPageText` |
-| Any search/results page | `waitForContent` `minLength:800` `timeoutMs:30000` → `getPageText` |
+`waitForStableText` polls extracted page text every 1.5s until it stops growing (2 stable polls) or reaches 2000 chars. Returns the text directly — no separate `getPageText` step needed. Never hangs: returns best text so far at `timeoutMs` deadline.
 
-**NEVER use `waitForNavigation` alone before `getPageText`** — it resolves before JS-rendered content loads. Always follow with `waitForSelector` or `waitForContent`.
+**CRITICAL — General pattern for any site (follow this EXACTLY, no exceptions):**
+1. `navigate` → URL — **ALWAYS include this as the first step for every site, even if an active session is shown. Skipping navigate causes smartType to fail on unloaded pages.**
+2. `smartType` → text to enter (**NEVER use `waitForSelector` before `smartType`** — smartType auto-discovers any input: `input`, `textarea`, `div[contenteditable]`, `[role="textbox"]`)
+3. `keyboard` → `Enter` (or `Return`)
+4. `waitForStableText` → waits for content to stop growing, returns it directly
+
+**Reading results (no input needed):**
+- After navigation lands on a results page: use `waitForStableText` `timeoutMs:15000`
+- After submitting a prompt to an AI chatbot: use `waitForStableText` `minChars:100` `timeoutMs:60000`
+- **AI chatbot prompts must be complete sentences/questions** — never send a bare keyword like `"pizza"`. Send `"Tell me about pizza"` or `"What is pizza?"` so the bot gives a direct answer instead of asking a clarifying question.
+- After a slow page load: use `waitForStableText` `timeoutMs:20000`
+- **Static content pages (Wikipedia, news articles, docs, product pages):** use `getPageText` NOT `waitForStableText` — static pages are already fully loaded after `navigate`, `waitForStableText` exits too early on them. `getPageText` returns the full article content.
+
+**NEVER use `waitForSelector` to find an input field** — site layouts change. `smartType` handles all input types on all sites without selectors.
+**NEVER use a fixed `sleep` before `getPageText`** — too short for slow pages, too long for fast ones.
+**NEVER use `waitForNavigation` alone before reading content** — it resolves before JS-rendered content loads.
+**NEVER navigate to a Gmail search URL like `#search/pizza`** — hash fragments are lost after login redirects. Always use `navigate` to `https://mail.google.com` then `smartType` + `keyboard Enter` to trigger the search.
+
+`waitForStableText` args (all optional):
+- `minChars` (default 100) — stop early once at least this many chars present
+- `maxChars` (default 4000) — truncate returned text
+- `pollMs` (default 1500) — ms between polls
+- `stableFor` (default 2) — consecutive equal-length polls before exit
+- `timeoutMs` (default 15000) — hard deadline; returns best text so far (never hangs)
+- `selector` (optional) — scope to a specific element
 
 - `highlight` — injects glow border + speech bubble on element; clicking it sets `window.__tdGuideTriggered = true` to auto-advance `guide.step`
 - `waitForAuth` — Waits for the user to complete a login flow in the current browser session. **REQUIRED args: `url` (string)**. `profile` is optional — only needed on a cold start with no existing session. **Always use the same `sessionId` as your other steps** (e.g. `"sessionId":"guideSession"`). If the two-phase pre-scan already navigated to the site, `waitForAuth` reuses that tab — it does NOT open a second browser window. Example: `{"action":"waitForAuth","url":"https://mail.google.com","profile":"gmail","authSuccessUrl":"mail.google.com/mail","sessionId":"guideSession"}`. **DO NOT use for ChatGPT, Claude, Perplexity, YouTube, or any AI chatbot** — just `navigate` directly. Only use `waitForAuth` for OAuth/login-gated flows (Gmail, GitHub, Notion, etc.).
@@ -89,8 +107,10 @@ navigate|click|hover|smartType|type|keyboard|select|scroll|screenshot|evaluate|s
 - Each unique hostname automatically gets its own tab (e.g. `google.com` tab, `chat.openai.com` tab).
 - Navigating to the same site always **reuses** the existing tab — no duplicate tabs.
 - Navigating to a **different** site opens a **new** tab automatically.
+- **Always include a `navigate` step as the first step for each site**, even if an active session is shown above — this ensures the page is in a known state before interacting.
 - **You do NOT need to set `sessionId` for normal browsing** — it is derived from the URL hostname.
 - Only set `sessionId` explicitly if you need to force two tabs on the same site (e.g. `"sessionId":"chatgpt-compare"`) or reuse a specific named session.
+- **IMPORTANT: If you do set `sessionId` explicitly on one step, use the EXACT same value on ALL subsequent steps** (smartType, keyboard, getPageText, etc.) — mixing explicit and omitted sessionId across steps causes actions to target different tabs.
 
 **IMPORTANT — extracting info from current screen vs current browser tab:**
 - "What's on my screen" / "save what you see" / "extract the info in front of you" → use `screen.capture` (OCR of the full screen), NOT `browser.act`. No browser tab is needed.
@@ -106,13 +126,30 @@ navigate|click|hover|smartType|type|keyboard|select|scroll|screenshot|evaluate|s
 
 ## guide.step — interactive walkthroughs
 
-For government sites, CAPTCHAs, login walls, OAuth setup, or any task requiring manual user action between steps:
+**ONLY use `guide.step` when automation genuinely cannot complete the action:**
+- Government sites, CAPTCHAs, reCAPTCHA challenges
+- OAuth login walls (Gmail, GitHub, Notion sign-in flows)
+- Two-factor authentication prompts
+- Tasks that explicitly say "show me how" / "walk me through" / "guide me"
+
+**DO NOT use `guide.step` for:**
+- Clicking a button (use `browser.act → click` instead)
+- Playing audio/video (use `browser.act → click` on the play/listen button)
+- Submitting a form you can fill automatically
+- Any action where `browser.act` can do it directly
+
+**PREFERRED automation pattern for button clicks:**
+```json
+{ "skill": "browser.act", "args": { "action": "click", "selector": "#listen-button", "sessionId": "..." } }
+```
+
+When `guide.step` IS appropriate:
 1. `browser.act navigate` — open URL in visible Playwright browser
 2. `browser.act highlight` — inject glow + speech bubble on target element (same `sessionId`)
 3. `guide.step` — show instruction card, poll `window.__tdGuideTriggered`, auto-advance on click
 4. Repeat highlight → guide.step per step
 
-**Form-filling rule:** Create one `highlight` + `guide.step` pair PER FORM FIELD. Never collapse a full form into a single step.
+**Form-filling rule:** Create one `highlight` + `guide.step` pair PER FORM FIELD only when the form cannot be auto-filled. Never collapse a full form into a single step.
 
 ## api_suggest — when to use
 

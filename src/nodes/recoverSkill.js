@@ -132,7 +132,7 @@ module.exports = async function recoverSkill(state) {
   }
 
   // ── Fast-path: known recoverable patterns (no LLM call needed) ──────────────
-  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl);
+  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl, replanCount);
   if (fastRecovery) {
     return applyRecovery(fastRecovery, state, skillPlan, skillCursor, stepRetryCount, replanCount, logger);
   }
@@ -171,10 +171,11 @@ module.exports = async function recoverSkill(state) {
   // ── browser.act: live page snapshot (visible inputs, buttons, URL) ───────
   if (failedStep.skill === 'browser.act' && mcpAdapter && failedStep.args?.sessionId) {
     try {
-      const snapshotResult = await mcpAdapter.call('command.command.automate', {
+      const snapshotRes = await mcpAdapter.callService('command', 'command.automate', {
         skill: 'browser.act',
         args: { action: 'getPageSnapshot', sessionId: failedStep.args.sessionId, maxChars: 1200 }
-      });
+      }, { timeoutMs: 8000 });
+      const snapshotResult = snapshotRes?.data || snapshotRes;
       if (snapshotResult?.ok && snapshotResult?.result) {
         skillContextSection = `\nLive page snapshot at time of failure:\n${String(snapshotResult.result).substring(0, 1200)}\n`;
         logger.debug(`[Node:RecoverSkill] browser.act page snapshot captured (${String(snapshotResult.result).length} chars)`);
@@ -399,7 +400,7 @@ Decide the recovery strategy.`;
 // Fast-path recovery: handle well-known failure patterns without an LLM call
 // ---------------------------------------------------------------------------
 
-function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl) {
+function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0) {
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
 
@@ -520,7 +521,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
         pageContext.includes('enter your email') || pageContext.includes('get started') ||
         pageContext.includes('sign up') || pageContext.includes('register');
 
-      if (isLoginPage && stepRetryCount === 0) {
+      if (isLoginPage) {
         logger.debug(`[Node:RecoverSkill] Fast-path: page text indicates login/marketing page (${currentUrl}) → ASK_USER`);
         return {
           action: 'ASK_USER',
@@ -529,13 +530,14 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
         };
       }
 
-      // No login signals detected, or second failure — generic ask
-      if (stepRetryCount >= 1) {
-        logger.debug(`[Node:RecoverSkill] Fast-path: no input found (retry ${stepRetryCount}) → ASK_USER`);
+      // If we've already replanned twice for the same error, stop looping — ask the user.
+      // replanCount persists across replans (unlike stepRetryCount which resets each replan).
+      if (replanCount >= 2) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: no input found after ${replanCount} replans → ASK_USER (loop break)`);
         return {
           action: 'ASK_USER',
-          question: `The browser couldn't find a text input on the page at "${currentUrl}". The page may require login or the site may have changed its layout.`,
-          options: ['I am logged in — skip this step and continue', 'Abort the task']
+          question: `The browser couldn't find a text input on "${currentUrl}" after ${replanCount} attempts. The page may require login or have changed its layout. Please check the browser and log in if needed, then reply "continue" to resume.`,
+          options: ['I am logged in — continue', 'Abort the task']
         };
       }
     }
@@ -545,22 +547,43 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
       const isClickAction = action === 'click';
       const isTypeAction = action === 'type' || action === 'waitForSelector' || action === 'smartType';
 
+      // Hard loop-break: if we've already replanned 3+ times for selector timeouts, stop.
+      // This prevents the LLM from endlessly guessing new selectors for non-existent elements.
+      if (replanCount >= 3 && isTypeAction) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: selector timeout after ${replanCount} replans → ASK_USER (loop break)`);
+        return {
+          action: 'ASK_USER',
+          question: `The browser couldn't find the input element after ${replanCount} attempts. The page at "${failedStep.url || args.sessionId}" may require login or the site layout may have changed.`,
+          options: ['I am logged in — continue', 'Try a completely different approach', 'Abort the task']
+        };
+      }
+
       // Click timeout: the button/element wasn't visible — suggest keyboard shortcut or better selector
       if (isClickAction) {
-        if (stepRetryCount === 0) {
-          logger.debug(`[Node:RecoverSkill] Fast-path: browser.act click timeout → REPLAN with keyboard shortcut or better selector`);
+        // Hard loop-break: stepRetryCount resets to 0 on every replan so the retry guard below
+        // never fires across replans. After 2 replans, stop looping and ask the user.
+        if (replanCount >= 2) {
+          logger.debug(`[Node:RecoverSkill] Fast-path: browser.act click timeout after ${replanCount} replans → ASK_USER (loop break)`);
           return {
-            action: 'REPLAN',
-            suggestion: `The click selector "${args.selector}" timed out — the element was found but not visible/enabled. For Gmail Send button, use keyboard shortcut instead: press Meta+Enter (Cmd+Enter) to send. For other buttons, try a more specific selector scoped to the active compose/modal window.`,
-            constraint: `If this is a Gmail Send button, replace the click step with: { "skill": "browser.act", "args": { "action": "keyboard", "key": "Meta+Enter", "sessionId": "${args.sessionId || 'default'}" } }. For other providers, use a selector scoped to the compose container (e.g. inside .nH, .compose-window, or [role='dialog']).`
+            action: 'ASK_USER',
+            question: `I tried ${replanCount} different selectors to click the button but it isn't responding. Some buttons (like audio/listen buttons) require a real user click. Would you like to click it yourself in the browser?`,
+            options: ['I clicked it — continue', 'Try a completely different approach', 'Cancel this task']
           };
         }
-        // Second click failure — ask user
+        if (stepRetryCount === 0) {
+          logger.debug(`[Node:RecoverSkill] Fast-path: browser.act click timeout → REPLAN with waitForSelector + better selector`);
+          return {
+            action: 'REPLAN',
+            suggestion: `The click selector "${args.selector}" timed out — the element may not be visible or enabled yet. Add a waitForSelector step before the click to wait for the element to appear, then try a different selector. For Gmail Send, use Meta+Enter keyboard shortcut instead of clicking.`,
+            constraint: `Before the click step, add a waitForSelector: { "skill": "browser.act", "args": { "action": "waitForSelector", "selector": "${args.selector || 'button'}", "timeoutMs": 10000, "sessionId": "${args.sessionId || 'default'}" } }. If this is Gmail, use Meta+Enter keyboard shortcut.`
+          };
+        }
+        // Second click failure on same step — ask user
         logger.debug(`[Node:RecoverSkill] Fast-path: browser.act click timeout (retry ${stepRetryCount}) → ASK_USER`);
         return {
           action: 'ASK_USER',
-          question: `The browser couldn't click "${args.selector}" — the element was not visible or enabled. The email may already be composed. Would you like me to try sending with a keyboard shortcut (Cmd+Enter)?`,
-          options: ['Yes, try Cmd+Enter to send', 'Cancel']
+          question: `The browser couldn't click "${args.selector}" — the element was not visible or enabled. Would you like me to try a keyboard shortcut instead?`,
+          options: ['Yes, try a keyboard shortcut', 'Cancel']
         };
       }
 
@@ -572,6 +595,16 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
           selector.includes('to=') || selector.includes('[name="to"]') ||
           (args.sessionId || '').toLowerCase().includes('gmail') ||
           (args.sessionId || '').toLowerCase().includes('mail');
+
+        // Hard loop-break: waitForSelector keeps getting re-added by LLM across replans
+        if (replanCount >= 2 && !isEmailCompose) {
+          logger.debug(`[Node:RecoverSkill] Fast-path: waitForSelector re-failed after ${replanCount} replans → ASK_USER`);
+          return {
+            action: 'ASK_USER',
+            question: `The browser couldn't find the input "${args.selector}" after multiple attempts. The page may require login or have changed its layout. Please check the browser, then reply "continue" to resume.`,
+            options: ['I am logged in — continue', 'Abort the task']
+          };
+        }
 
         if (stepRetryCount === 0) {
           if (isEmailCompose) {
@@ -862,6 +895,7 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
         ...state,
         recoveryAction: 'replan',
         replanCount: replanCount + 1,
+        evaluationFromFailure: true,
         recoveryContext: {
           failedSkill: failedStep.skill,
           failedStep: failedStep.step,

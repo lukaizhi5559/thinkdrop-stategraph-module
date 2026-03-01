@@ -33,12 +33,30 @@ class StateGraph {
    * @returns {Object} Final state with trace
    */
   async execute(initialState, onProgress = null, abortSignal = null) {
+    // ── Capturing logger proxy ───────────────────────────────────────────────
+    // Wraps the real logger so every info/warn/error line is ALSO appended to
+    // state.runLog[]. evaluateSkills reads runLog and sends it to the LLM judge
+    // so it can diagnose failures from actual log output — not just skillResults.
+    // Max 200 entries (ring buffer) to keep LLM context manageable.
+    const RUN_LOG_MAX = 200;
+    const runLog = [];
+    const baseLogger = this.logger;
+    const capturingLogger = {
+      debug: (...args) => { baseLogger.debug(...args); },
+      info:  (...args) => { baseLogger.info(...args);  if (runLog.length < RUN_LOG_MAX) runLog.push(`[INFO]  ${args.join(' ')}`); },
+      warn:  (...args) => { baseLogger.warn(...args);  if (runLog.length < RUN_LOG_MAX) runLog.push(`[WARN]  ${args.join(' ')}`); },
+      error: (...args) => { baseLogger.error(...args); if (runLog.length < RUN_LOG_MAX) runLog.push(`[ERROR] ${args.join(' ')}`); },
+      log:   (...args) => { baseLogger.log?.(...args); }
+    };
+
     const state = {
       ...initialState,
       trace: [],
       startTime: Date.now(),
       currentNode: this.startNode,
-      mcpAdapter: this.mcpAdapter // Inject adapter into state for nodes
+      mcpAdapter: this.mcpAdapter, // Inject adapter into state for nodes
+      logger: capturingLogger,     // Override with capturing proxy
+      runLog                       // Shared reference — nodes append via logger, evaluateSkills reads
     };
 
     let currentNode = this.startNode;

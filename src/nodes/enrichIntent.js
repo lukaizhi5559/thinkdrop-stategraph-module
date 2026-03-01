@@ -167,12 +167,58 @@ function extractEntityRefs(msg) {
   return refs;
 }
 
+// ── Language detection (same heuristics as answer.js) ────────────────────────
+function _detectEnrichLang(text) {
+  if (!text || text.length < 2) return null;
+  const cjk = (text.match(/[\u4E00-\u9FFF\u3400-\u4DBF\uF900-\uFAFF]/g) || []).length;
+  const hiragana = (text.match(/[\u3040-\u309F\u30A0-\u30FF]/g) || []).length;
+  const hangul = (text.match(/[\uAC00-\uD7AF\u1100-\u11FF]/g) || []).length;
+  const arabic = (text.match(/[\u0600-\u06FF]/g) || []).length;
+  const cyrillic = (text.match(/[\u0400-\u04FF]/g) || []).length;
+  const devanagari = (text.match(/[\u0900-\u097F]/g) || []).length;
+  const total = text.replace(/\s/g, '').length || 1;
+  if (cjk / total > 0.15) return hiragana > cjk * 0.3 ? 'ja' : 'zh';
+  if (hangul / total > 0.15) return 'ko';
+  if (arabic / total > 0.15) return 'ar';
+  if (cyrillic / total > 0.15) return 'ru';
+  if (devanagari / total > 0.15) return 'hi';
+  // Latin-script heuristics — order matters: most-distinctive chars first
+  if (/[¿¡áéíóúüñ]/i.test(text)) return 'es';         // Spanish-unique: ¿¡ñ
+  if (/[àâçèéêëîïôùûüæœ]/i.test(text)) return 'fr';   // French-unique: œæç
+  if (/[àèìòùâêîôûã]/i.test(text)) return 'pt';        // Portuguese: ã nasal
+  if (/[äöüß]/i.test(text)) return 'de';                // German: äöüß
+  if (/[àèìòùé]/i.test(text)) return 'it';              // Italian (lowest priority)
+  return null;
+}
+
+const _ENRICH_LANG_NAMES = { zh: 'Chinese (Mandarin)', ja: 'Japanese', ko: 'Korean', ar: 'Arabic', ru: 'Russian', es: 'Spanish', fr: 'French', de: 'German', pt: 'Portuguese', hi: 'Hindi', it: 'Italian' };
+
 module.exports = async function enrichIntent(state) {
   const { mcpAdapter, message, resolvedMessage, intent, context, conversationHistory = [] } = state;
   const logger = state.logger || console;
 
   const userId = context?.userId || 'local_user';
   const userMessage = (resolvedMessage || message || '').trim();
+
+  // Detect user language so clarification questions are asked in their language
+  // Mirrors answer.js: voice → journal sessionLanguage, text → script heuristics
+  const _rawMsg = state.originalMessage || message || '';
+  const _isVoiceEnrich = context?.source === 'voice';
+  let _userLang = null;
+  if (_isVoiceEnrich) {
+    try {
+      const _os = require('os');
+      const _path = require('path');
+      const _fs = require('fs');
+      const _jPath = _path.join(_os.homedir(), '.thinkdrop', 'voice-state.json');
+      const _jState = JSON.parse(_fs.readFileSync(_jPath, 'utf8'));
+      const _sl = _jState?.voice?.sessionLanguage;
+      if (_sl && _sl !== 'en') _userLang = _sl;
+    } catch (_) {}
+  }
+  if (!_userLang) _userLang = _detectEnrichLang(_rawMsg) || null;
+  const _langName = _userLang ? (_ENRICH_LANG_NAMES[_userLang] || _userLang) : null;
+  const _langInstruction = _langName ? `\n\nIMPORTANT: Ask this question in ${_langName} only. Do NOT use English.` : '';
 
   // ── Find most recent assistant message (needed for MODE B/C/D detection) ──
   const recentAssistant = [...conversationHistory].reverse().find(m => m.role === 'assistant');
@@ -322,14 +368,14 @@ module.exports = async function enrichIntent(state) {
     const entityGaps = await Promise.all(unresolvedEntities.map(async ref => ({
       field: `entity:${ref.entityType}:${ref.label}`,
       ref,
-      question: await buildEntityQuestion(ref, commandMessage, mcpAdapter, logger),
+      question: await buildEntityQuestion(ref, commandMessage, mcpAdapter, logger, _langInstruction),
     })));
 
     const fieldList = entityGaps.map(g => g.field).join(',');
     const marker = `[${ENTITY_QUESTION_MARKER} fields=${fieldList}]`;
     const questionText = entityGaps.length === 1
       ? `${marker}\n${entityGaps[0].question}`
-      : `${marker}\nI need a few details:\n${entityGaps.map((g, i) => `${i + 1}. ${g.question}`).join('\n')}`;
+      : `${marker}\n${entityGaps.map((g, i) => `${i + 1}. ${g.question}`).join('\n')}`;
 
     logger.info(`[Node:EnrichIntent] Unknown entities — asking user: ${unresolvedEntities.map(r => r.ref).join(', ')}`);
     return {
@@ -342,7 +388,10 @@ module.exports = async function enrichIntent(state) {
 
   // ─── STEP 4: Scalar profile gap detection ────────────────────────────────
   // Covers: user's own name, phone, email, address, skill ops
-  const triggered = GAP_DETECTORS.filter(d => d.pattern.test(commandMessage));
+  // SKIP when message was auto-translated: translation artifacts (e.g. "near my house"
+  // from "在我家很近") falsely fire address/phone/name detectors.
+  const _wasTranslated = state.originalMessage && state.originalMessage !== commandMessage;
+  const triggered = _wasTranslated ? [] : GAP_DETECTORS.filter(d => d.pattern.test(commandMessage));
   if (triggered.length === 0 && entityRefs.length === 0) {
     logger.debug('[Node:EnrichIntent] No gaps detected — passthrough');
     return state;
@@ -353,7 +402,8 @@ module.exports = async function enrichIntent(state) {
 
   await Promise.all(triggered.map(async (detector) => {
     if (!detector.storeTemplate) {
-      unresolvedGaps.push({ field: detector.field, question: detector.question });
+      const q = await translateQuestion(detector.question, _langInstruction, mcpAdapter, logger);
+      unresolvedGaps.push({ field: detector.field, question: q });
       return;
     }
     try {
@@ -373,11 +423,13 @@ module.exports = async function enrichIntent(state) {
         resolvedFacts.push({ field: detector.field, value, rawText: hit.text });
         logger.info(`[Node:EnrichIntent] Resolved ${detector.field}: "${value}"`);
       } else {
-        unresolvedGaps.push({ field: detector.field, question: detector.question });
+        const q = await translateQuestion(detector.question, _langInstruction, mcpAdapter, logger);
+        unresolvedGaps.push({ field: detector.field, question: q });
       }
     } catch (err) {
       logger.warn(`[Node:EnrichIntent] Gap lookup failed for ${detector.field}: ${err.message}`);
-      unresolvedGaps.push({ field: detector.field, question: detector.question });
+      const q = await translateQuestion(detector.question, _langInstruction, mcpAdapter, logger);
+      unresolvedGaps.push({ field: detector.field, question: q });
     }
   }));
 
@@ -409,7 +461,7 @@ module.exports = async function enrichIntent(state) {
       seen.add(g.field);
       return true;
     });
-    const questionText = buildCombinedQuestion(deduped);
+    const questionText = buildCombinedQuestion(deduped, _langInstruction);
     return {
       ...state,
       resolvedMessage: enrichedMessage !== commandMessage ? enrichedMessage : (resolvedMessage || message),
@@ -790,10 +842,30 @@ function extractScalarFromAnswer(field, text) {
 const extractScalarValue = extractScalarFromAnswer;
 
 /**
+ * Translate a hardcoded English question into the user's language via phi4.
+ * Falls back to the original English if LLM is unavailable or langInstruction is empty.
+ */
+async function translateQuestion(englishQuestion, langInstruction, mcpAdapter, logger) {
+  if (!langInstruction || !mcpAdapter) return englishQuestion;
+  try {
+    const prompt = `Translate this question into the target language specified below. Output only the translated question, nothing else.\n\nQuestion: "${englishQuestion}"${langInstruction}`;
+    const res = await mcpAdapter.callService('phi4', 'general.answer', {
+      message: prompt,
+      stream: false,
+    }, { timeoutMs: 4000 }).catch(() => null);
+    const text = res?.data?.answer || res?.answer || '';
+    if (text && text.trim().length > 3) return text.trim().replace(/^["']|["']$/g, '');
+  } catch (err) {
+    logger?.debug(`[EnrichIntent] translateQuestion failed: ${err.message}`);
+  }
+  return englishQuestion;
+}
+
+/**
  * Build the question to ask when an entity is unknown.
  * Adapts per entity type and the action being requested.
  */
-async function buildEntityQuestion(ref, commandMessage, mcpAdapter, logger) {
+async function buildEntityQuestion(ref, commandMessage, mcpAdapter, logger, langInstruction = '') {
   const { label, entityType } = ref;
 
   // Fallback template if LLM is unavailable
@@ -807,7 +879,8 @@ async function buildEntityQuestion(ref, commandMessage, mcpAdapter, logger) {
       `To complete this, I need to know about "${ref.ref}" (a ${entityType}).`,
       `Write a single short, natural, conversational question (1 sentence, no markdown, no options list) to ask the user for the information I need.`,
       `Only ask for what is strictly necessary to complete the request — nothing more.`,
-    ].join('\n');
+      langInstruction,
+    ].filter(Boolean).join('\n');
 
     const res = await mcpAdapter.callService('phi4', 'general.answer', {
       message: prompt,
@@ -865,12 +938,12 @@ function replaceMemoryValue(originalText, newValue) {
 /**
  * Build question text with embedded field markers for MODE B parsing.
  */
-function buildCombinedQuestion(gaps) {
+function buildCombinedQuestion(gaps, langInstruction = '') {
   const fieldList = gaps.map(g => g.field).join(',');
   const marker = `[${ENRICHMENT_MARKER} fields=${fieldList}]`;
   if (gaps.length === 1) {
-    return `${marker}\nTo complete this, I need a bit more information.\n\n${gaps[0].question}`;
+    return `${marker}\n${gaps[0].question}`;
   }
   const lines = gaps.map((g, i) => `${i + 1}. ${g.question}`).join('\n');
-  return `${marker}\nI need a few details:\n\n${lines}\n\nPlease reply with each answer on a separate line.`;
+  return `${marker}\n${lines}`;
 }

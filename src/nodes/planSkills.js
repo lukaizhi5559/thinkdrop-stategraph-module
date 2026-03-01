@@ -90,6 +90,15 @@ module.exports = async function planSkills(state) {
     return state;
   }
 
+  // ── Login resume: skip replanning, return existing plan as-is ────────────────
+  // When the user confirmed a login (resumeFromLogin=true), the existing skillPlan
+  // is still valid — just continue from skillCursor. No LLM call needed.
+  if (state.resumeFromLogin && Array.isArray(state.skillPlan) && state.skillPlan.length > 0) {
+    logger.info(`[Node:PlanSkills] resumeFromLogin=true — skipping replan, resuming existing plan at step ${state.skillCursor + 1}/${state.skillPlan.length}`);
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: state.skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })) });
+    return { ...state, resumeFromLogin: false };
+  }
+
   logger.debug('[Node:PlanSkills] Planning skill steps...');
   if (progressCallback) progressCallback({ type: 'planning', message: 'Generating skill plan...' });
 
@@ -219,12 +228,15 @@ Adjust the plan to avoid the same failure.`;
   // This eliminates all label guessing on the first plan.
   let livePageElements = activeBrowserPageElements;
   let livePageUrl = state.activeBrowserUrl || null;
-  // Only pre-scan for tasks that look like browser/guide tasks (government sites, forms, registration, etc.)
-  // Avoid pre-scanning shell tasks like "convert this file" or "run npm install".
-  const GUIDE_KEYWORDS = /\b(renew|register|apply|passport|visa|dmv|license|permit|form|appointment|enroll|sign up|login|account|government|gov|portal|website|browser|navigate|open|go to|verify|lookup)\b/i;
-  // Suppress two-phase guide for file/shell/bridge tasks — these never need a browser pre-scan
-  const NO_GUIDE_KEYWORDS = /\b(bridge|bridge file|the bridge|file\.bridge|fs\.read|file\.watch|codebase|read the|check the bridge|watch the|tail|directory|folder|repo|shell|npm|git|python|bash|script|file|log)\b/i;
-  const isGuideTask = !activeBrowserPageElements && !recoveryContext && mcpAdapter && GUIDE_KEYWORDS.test(userMessage) && !NO_GUIDE_KEYWORDS.test(userMessage);
+  // Pre-scan fires for ALL browser tasks — skip only for pure shell/file/memory tasks.
+  // Rule: if the task has NO browser signal AND is clearly a local/shell/file task → skip.
+  // Otherwise always pre-scan so the LLM knows real page elements (inputs, buttons, links)
+  // before generating the plan — eliminates selector guessing entirely.
+  const PURE_LOCAL_TASK = /\b(file\.bridge|fs\.read|file\.watch|check the bridge|the bridge|bridge file|watch the|tail -f|directory listing|repo structure|npm install|git (commit|push|pull|clone|status)|python\s|bash\s|shell\s|convert (this|the) file|read (the|this) file|write (the|this) file)\b/i;
+  // A task is a browser task if it mentions any URL, site name, navigation verb, or web concept
+  const HAS_BROWSER_SIGNAL = /\b(https?:\/\/|\.com|\.ai|\.org|\.io|\.gov|go to|navigate|open|website|online|web|internet|search|look up|find|research|browse|perplexity|deepseek|chatgpt|claude|gemini|grok|copilot|google|youtube|github\.com|twitter|instagram|facebook|linkedin|reddit|amazon|netflix|spotify|maps|register|apply|passport|visa|dmv|form|portal|login|account|sign up|enroll|appointment|verify|lookup|renew|permit|license)\b/i;
+  const isGuideTask = !activeBrowserPageElements && !recoveryContext && mcpAdapter &&
+    HAS_BROWSER_SIGNAL.test(userMessage) && !PURE_LOCAL_TASK.test(userMessage);
 
   if (isGuideTask) {
     try {
@@ -326,6 +338,62 @@ Task: "${userMessage}"`;
     }
   }
 
+  // ── Context rules: fetch per-site/app prompt rules from DuckDB ─────────────
+  // Extracts hostnames from URLs in the message + active browser URL (context_type=site)
+  // and app names from state.activeAppName / message keywords (context_type=app).
+  // Injected as a block into the LLM prompt — lightweight exact-match, no embeddings.
+  // ThinkDrop AI writes rules via context_rule.upsert after diagnosing failures.
+  let siteRulesBlock = '';
+  if (mcpAdapter && (userMessage || state.activeBrowserUrl || state.activeAppName)) {
+    try {
+      const contextKeys = new Set();
+
+      // Extract hostnames from URLs in the message and active browser URL
+      const urlRegex = /https?:\/\/([a-zA-Z0-9.-]+)/g;
+      const searchText = `${userMessage || ''} ${state.activeBrowserUrl || ''}`;
+      let m;
+      while ((m = urlRegex.exec(searchText)) !== null) {
+        contextKeys.add(m[1].toLowerCase().replace(/^www\./, ''));
+      }
+      if (state.activeBrowserUrl) {
+        try {
+          const h = new URL(state.activeBrowserUrl).hostname.toLowerCase().replace(/^www\./, '');
+          if (h) contextKeys.add(h);
+        } catch (_) {}
+      }
+
+      // Add active app name for native app rules (e.g. 'slack', 'excel', 'discord')
+      if (state.activeAppName) {
+        contextKeys.add(state.activeAppName.toLowerCase().trim());
+      }
+      // Also detect common app names mentioned in the message
+      const APP_KEYWORDS = ['slack', 'discord', 'excel', 'outlook', 'teams', 'notion', 'figma', 'zoom', 'xcode', 'vscode', 'terminal', 'finder'];
+      const msgLower = (userMessage || '').toLowerCase();
+      for (const app of APP_KEYWORDS) {
+        if (msgLower.includes(app)) contextKeys.add(app);
+      }
+
+      const keys = [...contextKeys];
+      if (keys.length > 0) {
+        const crRes = await mcpAdapter.callService('user-memory', 'context_rule.search', {
+          contextKeys: keys
+        }, { timeoutMs: 3000 }).catch(() => null);
+        const crResults = crRes?.data?.results || crRes?.results || [];
+        if (crResults.length > 0) {
+          const ruleLines = crResults
+            .map(r => `- [${r.contextKey}${r.category !== 'general' ? ` / ${r.category}` : ''}] ${r.ruleText}`)
+            .join('\n');
+          siteRulesBlock = `\n\nSITE/APP-SPECIFIC RULES (learned from prior interactions — follow exactly):\n${ruleLines}`;
+          logger.info(`[Node:PlanSkills] Context rules: ${crResults.length} rule(s) injected for [${keys.join(', ')}]`);
+        } else {
+          logger.debug(`[Node:PlanSkills] Context rules: none found for [${keys.join(', ')}]`);
+        }
+      }
+    } catch (crErr) {
+      logger.warn(`[Node:PlanSkills] context_rule.search failed (non-fatal): ${crErr.message}`);
+    }
+  }
+
   // Fetch installed user skills — inject into prompt so LLM uses external.skill instead of needs_skill
   let installedSkillsNote = '';
   if (mcpAdapter) {
@@ -356,7 +424,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${installedSkillsNote}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
+User request: "${userMessage}"${installedSkillsNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
 
   const payload = {
     query: planningQuery,
@@ -501,17 +569,43 @@ User request: "${userMessage}"${installedSkillsNote}${recoveryNote}${profileCont
               })()
             : false;
 
-          if (isSameDomain) {
+          const isEvalRetry = (state.evaluationRetryCount || 0) > 0;
+          if (isSameDomain && !isEvalRetry) {
             const withoutNavigate = skillPlan.filter(s => !(s.skill === 'browser.act' && s.args?.action === 'navigate'));
             if (withoutNavigate.length > 0) {
               skillPlan = withoutNavigate;
               logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — stripped navigate (same domain), ${skillPlan.length} steps remain`);
             }
+          } else if (isSameDomain && isEvalRetry) {
+            logger.debug(`[Node:PlanSkills] Eval retry ${state.evaluationRetryCount} — keeping navigate despite same domain (fix rule may change URL)`);
           } else if (navigateStep) {
             logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — kept navigate (different/unknown domain)`);
           } else {
             logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — no navigate step`);
           }
+        }
+      }
+    }
+
+    // ── Stamp missing sessionIds from navigate URL ──────────────────────────
+    // When the LLM generates browser.act steps with no sessionId (common for
+    // single-site tasks), derive it from the navigate step's URL hostname —
+    // the same derivation the command service uses. This prevents subsequent
+    // steps (waitForStableText, smartType, etc.) from falling back to 'default'
+    // and opening a blank tab instead of reusing the page just navigated to.
+    if (Array.isArray(skillPlan)) {
+      const navigateStep = skillPlan.find(s => s.skill === 'browser.act' && s.args?.action === 'navigate' && s.args?.url);
+      const existingSessionIds = new Set(skillPlan.filter(s => s.skill === 'browser.act').map(s => s.args?.sessionId).filter(Boolean));
+      const isMultiTab = existingSessionIds.size > 1;
+      if (!isMultiTab && navigateStep && !navigateStep.args?.sessionId) {
+        let derivedSession = null;
+        try { derivedSession = new URL(navigateStep.args.url).hostname; } catch (_) {}
+        if (derivedSession) {
+          skillPlan = skillPlan.map(step => {
+            if (step.skill !== 'browser.act' || step.args?.sessionId) return step;
+            return { ...step, args: { ...step.args, sessionId: derivedSession } };
+          });
+          logger.info(`[Node:PlanSkills] Stamped missing sessionIds with "${derivedSession}" (derived from navigate URL)`);
         }
       }
     }
@@ -582,26 +676,53 @@ Output ONLY the pattern text. No markdown, no explanation.`;
 
 /**
  * Extract and parse a JSON array from LLM output.
- * LLMs sometimes wrap JSON in markdown fences — strip them.
+ * LLMs sometimes wrap JSON in markdown fences or append trailing explanation text.
+ * This parser finds the outermost [ ] or { } and extracts only that balanced block.
  */
 function parsePlan(raw, logger) {
   if (!raw || typeof raw !== 'string') return null;
 
   let text = raw.trim();
 
-  // Strip markdown code fences if present
-  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+  // Strip markdown code fences if present (```json ... ``` or ``` ... ```)
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```[\s\S]*$/, '').trim();
 
-  // Find the first [ or { to start parsing
+  // Find first [ or { — prefer [ (array) over { (object) when both present
   const arrayStart = text.indexOf('[');
   const objectStart = text.indexOf('{');
 
-  let jsonStr = text;
+  let open, close;
   if (arrayStart !== -1 && (objectStart === -1 || arrayStart < objectStart)) {
-    jsonStr = text.substring(arrayStart);
+    open = '['; close = ']';
+    text = text.substring(arrayStart);
   } else if (objectStart !== -1) {
-    jsonStr = text.substring(objectStart);
+    open = '{'; close = '}';
+    text = text.substring(objectStart);
+  } else {
+    logger.warn('[Node:PlanSkills] JSON parse failed: no [ or { found in output');
+    return null;
   }
+
+  // Walk the string to find the matching closing bracket (handles nested objects/arrays)
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let endIdx = -1;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === open) depth++;
+    else if (ch === close) {
+      depth--;
+      if (depth === 0) { endIdx = i; break; }
+    }
+  }
+
+  const jsonStr = endIdx !== -1 ? text.substring(0, endIdx + 1) : text;
 
   try {
     return JSON.parse(jsonStr);

@@ -1156,9 +1156,9 @@ module.exports = async function executeCommand(state) {
       logger.debug(`[Node:ExecuteCommand]   [${i}] skill=${r.skill} action=${r.args?.action} ok=${r.ok} result=${r.result ? String(r.result).substring(0, 80) : 'null'}`);
     });
     const pageTextResults = skillResults
-      .filter(r => r.skill === 'browser.act' && r.args?.action === 'getPageText' && r.ok && r.result)
+      .filter(r => r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText') && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0)
       .map(r => ({ source: r.args?.sessionId || 'unknown', url: r.url || '', text: r.result }));
-    logger.debug(`[Node:ExecuteCommand] synthesize: found ${pageTextResults.length} getPageText results`);
+    logger.debug(`[Node:ExecuteCommand] synthesize: found ${pageTextResults.length} getPageText/waitForStableText results`);
 
     // Include shell.run stdout (e.g. cat file output) as well as browser getPageText results
     const shellStdoutResults = skillResults
@@ -1351,6 +1351,12 @@ module.exports = async function executeCommand(state) {
     // Write to explicit saveToFile if requested
     if (synthesisFilePath && synthesisAnswer && !synthesisAnswer.startsWith('[')) {
       try {
+        // Auto-create missing parent directories — LLM may generate paths like ~/temp/ that don't exist
+        const parentDir = path.dirname(synthesisFilePath);
+        if (!fs.existsSync(parentDir)) {
+          fs.mkdirSync(parentDir, { recursive: true });
+          logger.debug(`[Node:ExecuteCommand] synthesize: created directory ${parentDir}`);
+        }
         // Strip internal === Shell output (...) === markers that executeCommand injects for LLM context
         // but must never appear in saved files (e.g. skill.md contracts, text files, etc.)
         const cleanedAnswer = synthesisAnswer.replace(/^=== Shell output \(.*?\) ===\s*/gm, '').trim();
@@ -1438,8 +1444,33 @@ module.exports = async function executeCommand(state) {
     };
   }
 
+  // ── Session inheritance: browser.act steps with no sessionId inherit from last navigate ──
+  // Without this, actions like waitForStableText/getPageText with no sessionId open a new
+  // blank tab instead of targeting the page that was just navigated to.
+  // Derive session from: (1) last navigate args.sessionId, (2) last navigate returned URL
+  // hostname (command service derives session from hostname when no sessionId given),
+  // (3) state.activeBrowserSessionId from prior steps.
+  if (skill === 'browser.act' && !resolvedArgs.sessionId && resolvedArgs.action !== 'navigate') {
+    const lastNavigate = [...skillResults].reverse().find(r => r.skill === 'browser.act' && r.args?.action === 'navigate' && r.ok);
+    let inheritedSession = lastNavigate?.args?.sessionId || state.activeBrowserSessionId || null;
+    if (!inheritedSession && lastNavigate?.url) {
+      // Derive hostname-based session the same way the command service does
+      try {
+        inheritedSession = new URL(lastNavigate.url).hostname;
+      } catch (_) {}
+    }
+    if (inheritedSession) {
+      resolvedArgs = { ...resolvedArgs, sessionId: inheritedSession };
+      logger.info(`[Node:ExecuteCommand] Session inherit: "${inheritedSession}" → ${resolvedArgs.action} (lastNavigate.url=${lastNavigate?.url})`);
+    } else {
+      logger.info(`[Node:ExecuteCommand] Session inherit: no session found for ${resolvedArgs.action} (lastNavigate=${JSON.stringify(lastNavigate?.url)}, active=${state.activeBrowserSessionId})`);
+    }
+  }
+
+  const externalSkillName = skill === 'external.skill' && resolvedArgs.name ? resolvedArgs.name : null;
+  const stepStartDescription = description || (externalSkillName ? `external.skill — ${externalSkillName}` : skill);
   logger.debug(`[Node:ExecuteCommand] Step ${skillCursor + 1}/${skillPlan.length}: ${skill}${description ? ` — ${description}` : ''}`);
-  if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: description || skill });
+  if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription });
 
   // Handle _waitBeforeMs injected by recoverSkill AUTO_PATCH for mid-navigation retries
   if (resolvedArgs._waitBeforeMs) {
@@ -1456,6 +1487,11 @@ module.exports = async function executeCommand(state) {
   let stepTimeoutMs = resolvedArgs.timeoutMs || 60000;
   if (skill === 'file.bridge' && resolvedArgs.action === 'poll' && resolvedArgs.pollTimeoutMs) {
     stepTimeoutMs = Math.max(stepTimeoutMs, resolvedArgs.pollTimeoutMs + 10000);
+  }
+  // browser.act actions need at least 30s: smartType has a 5×1s retry loop, waitForContent
+  // polls up to 45s, and any LLM-supplied timeoutMs:5000 would kill these before they finish.
+  if (skill === 'browser.act') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 30000);
   }
 
   try {
@@ -1590,7 +1626,11 @@ module.exports = async function executeCommand(state) {
       if (skill === 'image.analyze') {
         logger.info(`[Node:ExecuteCommand] image.analyze step_done stdout length: ${stepResult.stdout?.length ?? 'null'}, preview: ${String(stepResult.stdout || '').slice(0, 80)}`);
       }
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: description || skill, stdout: stepResult.stdout, exitCode: stepResult.exitCode });
+      const resolvedSkillName = skill === 'external.skill'
+        ? (stepResult.skillName || resolvedArgs.name || 'external.skill')
+        : null;
+      const stepDoneDescription = description || (resolvedSkillName ? `external.skill — ${resolvedSkillName}` : skill);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepDoneDescription, stdout: stepResult.stdout || stepResult.output, exitCode: stepResult.exitCode });
     }
 
     // Track the active browser sessionId and URL for follow-up tasks
@@ -1602,58 +1642,87 @@ module.exports = async function executeCommand(state) {
       : state.activeBrowserUrl || null;
 
     // ── Post-navigate scan ────────────────────────────────────────────────────
-    // After a successful navigate, scan the live page and patch the next highlight
-    // step with real element labels from the actual loaded page (handles redirects,
-    // 404s, and dynamic content — no URL guessing needed).
+    // After every successful navigate, scan the live page to get real elements.
+    // This fires for ALL next steps (not just highlight) so smartType, click, and
+    // any subsequent step gets accurate element context — no selector guessing.
     if (skill === 'browser.act' && resolvedArgs.action === 'navigate' && stepResult.ok && resolvedArgs.sessionId && mcpAdapter) {
       const navSessionId = resolvedArgs.sessionId;
-      const nextHighlightIdx = skillPlan.findIndex(
-        (s, i) => i > skillCursor && s.skill === 'browser.act' && s.args?.action === 'highlight'
-      );
-      if (nextHighlightIdx !== -1) {
-        try {
-          const scanRes = await mcpAdapter.callService('command', 'command.automate', {
-            skill: 'browser.act',
-            args: { action: 'scanCurrentPage', sessionId: navSessionId }
-          }, { timeoutMs: 8000 });
-          const scan = scanRes?.data || scanRes;
+      try {
+        const scanRes = await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'browser.act',
+          args: { action: 'scanCurrentPage', sessionId: navSessionId }
+        }, { timeoutMs: 8000 });
+        const scan = scanRes?.data || scanRes;
 
-          // 404 detection — scanCurrentPage returns ok:false + errorType:'page_not_found'
-          if (!scan?.ok && scan?.errorType === 'page_not_found') {
-            const badUrl = scan?.url || resolvedArgs.url;
-            logger.warn(`[Node:ExecuteCommand] Navigate landed on 404 (${badUrl}) — marking step failed for replan`);
-            const failedNav = { ...stepResult, ok: false, error: `navigate_404: ${badUrl} is a 404 page. Use a different URL.` };
-            if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: failedNav.error });
-            return {
-              ...state,
-              skillResults: [...skillResults, failedNav],
-              skillCursor,
-              failedStep: failedNav,
-              commandExecuted: false
-            };
-          }
+        // 404 detection — scanCurrentPage returns ok:false + errorType:'page_not_found'
+        if (!scan?.ok && scan?.errorType === 'page_not_found') {
+          const badUrl = scan?.url || resolvedArgs.url;
+          logger.warn(`[Node:ExecuteCommand] Navigate landed on 404 (${badUrl}) — marking step failed for replan`);
+          const failedNav = { ...stepResult, ok: false, error: `navigate_404: ${badUrl} is a 404 page. Use a different URL.` };
+          if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: failedNav.error });
+          return {
+            ...state,
+            skillResults: [...skillResults, failedNav],
+            skillCursor,
+            failedStep: failedNav,
+            commandExecuted: false
+          };
+        }
 
-          if (scan?.ok && scan?.result?.elements?.length > 0) {
-            const els = scan.result.elements;
-            const actualUrl = scan.result.url;
-            logger.info(`[Node:ExecuteCommand] Post-navigate scan: ${els.length} elements on ${actualUrl}`);
-            // Store real page elements in state — planSkills injects these into the LLM prompt
-            // on replan so it picks exact labels instead of guessing.
+        if (scan?.ok && scan?.result?.elements?.length > 0) {
+          const els = scan.result.elements;
+          const actualUrl = scan.result.url;
+          logger.info(`[Node:ExecuteCommand] Post-navigate scan: ${els.length} elements on ${actualUrl}`);
+
+          // ── Login page detection ──────────────────────────────────────────
+          // Only trigger on definitive auth/login URL patterns — never on page labels.
+          // Label matching ("Log in", "Sign in") causes false positives on sites like
+          // chatgpt.com that show these buttons even when the page is fully accessible.
+          // Definitive login URLs: Google accounts, /login, /signin, /sign-in paths, OAuth endpoints.
+          const isLoginUrl = /accounts\.google\.com\/|\/login(\?|$|\/)|\/signin(\?|$|\/)|\/sign-in(\?|$|\/)|\/sign_in(\?|$|\/)|\/oauth\/|\/sso(\?|$|\/)|\/auth\/login|\/auth\/signin/i.test(actualUrl);
+
+          if (isLoginUrl) {
+            // Check if the NEXT step in the plan is waitForAuth — if so, skip ahead
+            // to the ASK_USER so the user can log in. waitForAuth timeout was 60s+ and hung.
+            const nextStep = skillPlan[skillCursor + 1];
+            const nextIsWaitForAuth = nextStep?.skill === 'browser.act' && nextStep?.args?.action === 'waitForAuth';
+            const targetSite = (() => { try { return new URL(resolvedArgs.url || actualUrl).hostname; } catch (_) { return actualUrl; } })();
+
+            logger.info(`[Node:ExecuteCommand] Post-navigate: login page detected on ${actualUrl} — surfacing ASK_USER${nextIsWaitForAuth ? ' (skipping queued waitForAuth)' : ''}`);
             return {
               ...state,
               skillResults: updatedResults,
-              skillCursor: skillCursor + 1,
+              // Skip past the waitForAuth step if it's next — user will confirm when done
+              skillCursor: nextIsWaitForAuth ? skillCursor + 2 : skillCursor + 1,
               failedStep: null,
               activeBrowserSessionId,
               activeBrowserUrl: actualUrl || activeBrowserUrl,
               activeBrowserPageElements: { url: actualUrl, elements: els },
+              recoveryAction: 'ask_user',
+              pendingQuestion: {
+                question: `The browser landed on the login page for **${targetSite}**. Please log in, then click "I'm logged in — continue".`,
+                options: ["I'm logged in — continue", 'Skip this site', 'Abort the task'],
+                context: { loginUrl: actualUrl }
+              },
               commandExecuted: false,
-              answer: undefined
+              answer: `I need you to log in to **${targetSite}** in the browser. Once you're signed in, click "I'm logged in — continue" below.`
             };
           }
-        } catch (scanErr) {
-          logger.debug(`[Node:ExecuteCommand] Post-navigate scan failed (non-fatal): ${scanErr.message}`);
+
+          return {
+            ...state,
+            skillResults: updatedResults,
+            skillCursor: skillCursor + 1,
+            failedStep: null,
+            activeBrowserSessionId,
+            activeBrowserUrl: actualUrl || activeBrowserUrl,
+            activeBrowserPageElements: { url: actualUrl, elements: els },
+            commandExecuted: false,
+            answer: undefined
+          };
         }
+      } catch (scanErr) {
+        logger.debug(`[Node:ExecuteCommand] Post-navigate scan failed (non-fatal): ${scanErr.message}`);
       }
     }
 

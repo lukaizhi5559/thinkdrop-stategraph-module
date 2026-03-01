@@ -24,6 +24,7 @@ const resolveReferencesNode = require('./nodes/resolveReferences');
 const parseSkillNode = require('./nodes/parseSkill');
 const synthesizeNode = require('./nodes/synthesize');
 const enrichIntentNode = require('./nodes/enrichIntent');
+const evaluateSkillsNode = require('./nodes/evaluateSkills');
 
 class StateGraphBuilder {
   /**
@@ -169,6 +170,7 @@ class StateGraphBuilder {
       planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
       recoverSkill: (state) => recoverSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
+      evaluateSkills: (state) => evaluateSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
       synthesize: (state) => synthesizeNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -247,18 +249,36 @@ class StateGraphBuilder {
         if (state.failedStep) {
           return 'recoverSkill';
         }
-        // All steps done — answer is already set by executeCommand, skip answer node
-        if (state.commandExecuted || state.answer) {
-          return 'logConversation';
-        }
-        // More steps remaining — loop back (synthesize now runs inline, no special routing needed)
+        // More steps remaining — loop back
         if (Array.isArray(state.skillPlan) && state.skillCursor < state.skillPlan.length) {
           return 'executeCommand';
+        }
+        // All steps done — evaluate result quality before logging
+        if (state.commandExecuted || state.answer) {
+          return 'evaluateSkills';
+        }
+        return 'evaluateSkills';
+      },
+
+      // evaluateSkills: PASS/ASK_USER → done, FIX → replan with stored context rule
+      // Special case: failure-path PASS (no rule derived) still routes to planSkills
+      // because recoveryContext from recoverSkill is still set for the replan.
+      evaluateSkills: (state) => {
+        const verdict = state.evaluationVerdict;
+        if (verdict === 'FIX' && state.evaluationFix) {
+          logger.info(`[StateGraph:Router] evaluateSkills FIX → planSkills (retry ${state.evaluationRetryCount})`);
+          return 'planSkills';
+        }
+        // recoverSkill set recoveryAction='replan' — evaluateSkills was inserted in that path.
+        // If no FIX rule was derived (PASS fallback), still continue to planSkills with recoveryContext.
+        if (verdict === 'PASS' && state.recoveryAction === 'replan' && state.recoveryContext) {
+          logger.debug('[StateGraph:Router] evaluateSkills PASS (failure path) → planSkills with recoveryContext');
+          return 'planSkills';
         }
         return 'logConversation';
       },
 
-      // recoverSkill → retry step, replan, or surface question to user
+      // recoverSkill → retry step, replan (via evaluateSkills for FIX rule), or surface question to user
       recoverSkill: (state) => {
         const action = state.recoveryAction;
         if (action === 'auto_patch') {
@@ -266,8 +286,11 @@ class StateGraphBuilder {
           return 'executeCommand';
         }
         if (action === 'replan') {
-          logger.debug('[StateGraph:Router] Recovery: replan → planSkills');
-          return 'planSkills';
+          // Route through evaluateSkills so it can judge the failure and save a context rule.
+          // evaluateSkills detects evaluationFromFailure=true and uses the failure-path prompt.
+          // From there: FIX → planSkills (with saved rule), PASS → planSkills, ASK_USER → logConversation.
+          logger.debug('[StateGraph:Router] Recovery: replan → evaluateSkills (failure judge) → planSkills');
+          return 'evaluateSkills';
         }
         // ask_user: state.answer is already set with the question
         logger.debug('[StateGraph:Router] Recovery: ask_user → logConversation');

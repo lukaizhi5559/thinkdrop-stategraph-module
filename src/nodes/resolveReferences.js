@@ -280,7 +280,7 @@ module.exports = async function resolveReferences(state) {
     // No explicit sessionId (fresh prompt window) — route to get the active session
     if (!sessionId) {
       try {
-        const routeResult = await mcpAdapter.callService('conversation', 'session.route', {});
+        const routeResult = await mcpAdapter.callService('conversation', 'session.route', { text: message });
         sessionId = (routeResult.data || routeResult)?.sessionId || null;
         if (sessionId) logger.debug(`[Node:ResolveReferences] No sessionId in context, routed to: ${sessionId}`);
       } catch (_) {}

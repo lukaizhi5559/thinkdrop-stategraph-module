@@ -542,6 +542,42 @@ module.exports = async function parseIntent(state) {
             resolvedMessage: translated.trim(),
             originalMessage: state.originalMessage || message,
           };
+
+          // Re-run critical overrides on the translated text — they ran earlier on the
+          // original non-English text and could not match. Greetings like "How are you today?"
+          // at the start of a multi-intent message must not pull the whole message into
+          // memory_retrieve when the rest of it is a clear command_automate task.
+          //
+          // Strip leading social greeting before re-checking (e.g. "How are you today? Can you...")
+          const _greetingStrip = /^(how are you[^?]*\?|hi[,!]?|hello[,!]?|hey[,!]?|good (morning|afternoon|evening)[,!]?|i'm (fine|good|ok|okay|great)[,!]?)\s*/i;
+          const _strippedTranslated = classifyMessage.replace(_greetingStrip, '').trim();
+          const _checkMsg = _strippedTranslated || classifyMessage;
+
+          // File-write destination re-check
+          const _fileWriteHit = (
+            /\b(save|write|output|store|put)\b.{0,80}(to|into|as)\s+(~[/]|[/]|[.][/])[\w/.]+/i.test(_checkMsg) ||
+            /\b(save|write|output|store|put)\b.{0,80}(to|into)\s+(a\s+)?(file|txt|text file|markdown file|md file|\.txt|\.md|\.csv|\.json)\b/i.test(_checkMsg) ||
+            /\b(save|write|output)\b.{0,80}(on|in|to)\s+(my\s+)?(desktop|documents|downloads|home folder|home directory)\b/i.test(_checkMsg)
+          );
+          if (_fileWriteHit) {
+            logger.debug(`[Node:ParseIntent] Post-translation file-write override → command_automate`);
+            return { ...state, intent: { type: 'command_automate', confidence: 0.97, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'post-translation-file-write', processingTimeMs: 0 } };
+          }
+
+          // Action-request re-check on stripped message
+          const _actionHit = /\b(i need (you to|to) (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|check|look up|navigate|find|search)|can you (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|navigate|find|search)|help me (do|go|open|create|send|submit|download|install|update|delete|remove|fix|set up|book|buy|schedule|order|navigate|find|search))\b/i.test(_checkMsg);
+          if (_actionHit) {
+            logger.debug(`[Node:ParseIntent] Post-translation action-request override → command_automate`);
+            return { ...state, intent: { type: 'command_automate', confidence: 0.95, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'post-translation-action-request', processingTimeMs: 0 } };
+          }
+
+          // Search-and-save pattern: "find X ... save/store/write it to ..."
+          // Very common in Chinese: 帮我找X然后存到桌面
+          const _searchSaveHit = /\b(find|search|look up|locate|search for)\b.{0,120}\b(save|store|write|output|put)\b/i.test(_checkMsg);
+          if (_searchSaveHit) {
+            logger.debug(`[Node:ParseIntent] Post-translation search-and-save override → command_automate`);
+            return { ...state, intent: { type: 'command_automate', confidence: 0.96, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'post-translation-search-save', processingTimeMs: 0 } };
+          }
         }
       } catch (_) {}
     }
