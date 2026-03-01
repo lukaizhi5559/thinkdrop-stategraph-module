@@ -21,8 +21,6 @@
  */
 
 const fs = require('fs');
-const MCPLLMBackend = require('../backends/MCPLLMBackend');
-const VSCodeLLMBackend = require('../backends/VSCodeLLMBackend');
 
 function loadSystemPrompt() {
   const path = require('path');
@@ -102,25 +100,11 @@ module.exports = async function planSkills(state) {
   logger.debug('[Node:PlanSkills] Planning skill steps...');
   if (progressCallback) progressCallback({ type: 'planning', message: 'Generating skill plan...' });
 
-  // ── Resolve LLM backend (same priority as answer node) ──────────────────────
-  let backend = llmBackend;
-
-  if (!backend && useOnlineMode) {
-    backend = new VSCodeLLMBackend({
-      wsUrl:             process.env.WEBSOCKET_URL     || 'ws://localhost:4000/ws/stream',
-      apiKey:            process.env.WEBSOCKET_API_KEY || 'test-api-key-123',
-      userId:            context?.userId               || 'default_user',
-      connectTimeoutMs:  5000,
-      responseTimeoutMs: 30000,
-    });
-  }
-
-  if (!backend && mcpAdapter) {
-    backend = new MCPLLMBackend(mcpAdapter);
-  }
+  // ── Resolve LLM backend ──────────────────────────────────────────────────────
+  const backend = llmBackend;
 
   if (!backend) {
-    logger.warn('[Node:PlanSkills] No LLM backend — cannot plan skills');
+    logger.warn('[Node:PlanSkills] No llmBackend in state — cannot plan skills');
     return {
       ...state,
       planError: 'No LLM backend available for skill planning'

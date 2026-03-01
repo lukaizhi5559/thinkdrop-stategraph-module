@@ -25,6 +25,9 @@ const parseSkillNode = require('./nodes/parseSkill');
 const synthesizeNode = require('./nodes/synthesize');
 const enrichIntentNode = require('./nodes/enrichIntent');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
+const buildSkillNode = require('./nodes/buildSkill');
+const validateSkillNode = require('./nodes/validateSkill');
+const installSkillNode = require('./nodes/installSkill');
 
 class StateGraphBuilder {
   /**
@@ -171,6 +174,9 @@ class StateGraphBuilder {
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter }),
       recoverSkill: (state) => recoverSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       evaluateSkills: (state) => evaluateSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
+      buildSkill: (state) => buildSkillNode.run({ ...state, logger, mcpAdapter, llmBackend }),
+      validateSkill: (state) => validateSkillNode.run({ ...state, logger, mcpAdapter, llmBackend }),
+      installSkill: (state) => installSkillNode.run({ ...state, logger, mcpAdapter }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
       synthesize: (state) => synthesizeNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -207,6 +213,11 @@ class StateGraphBuilder {
         if (intentType === 'command_automate') {
           logger.debug('[StateGraph:Router] enrichIntent: command_automate — planSkills');
           return 'planSkills';
+        }
+
+        if (intentType === 'skill_build') {
+          logger.debug('[StateGraph:Router] enrichIntent: skill_build — buildSkill pipeline');
+          return 'buildSkill';
         }
 
         // All other intents: route the same as parseIntent used to
@@ -297,6 +308,33 @@ class StateGraphBuilder {
         return 'logConversation';
       },
       
+      // ── Skill build pipeline ───────────────────────────────────────────────
+      // buildSkill → validateSkill → (PASS) installSkill → done
+      //                            → (FAIL, rounds left) buildSkill (fix loop)
+      //                            → (FAIL, max rounds) logConversation (error)
+      // installSkill → (needs secret) installSkill (resume after ASK_USER answer)
+      //              → (done) logConversation
+      buildSkill: (state) => {
+        if (state.skillBuildPhase === 'error') return 'logConversation';
+        return 'validateSkill';
+      },
+
+      validateSkill: (state) => {
+        const phase = state.skillBuildPhase;
+        if (phase === 'installing') return 'installSkill';
+        if (phase === 'fixing')     return 'buildSkill';
+        if (phase === 'error')      return 'logConversation';
+        return 'logConversation';
+      },
+
+      installSkill: (state) => {
+        const phase = state.skillBuildPhase;
+        if (phase === 'asking')  return 'logConversation'; // paused for user input
+        if (phase === 'done')    return 'logConversation';
+        if (phase === 'error')   return 'logConversation';
+        return 'logConversation';
+      },
+
       // Screen intelligence path
       screenIntelligence: (state) => {
         // If already has answer (from vision API), log and end

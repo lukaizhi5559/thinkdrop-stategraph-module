@@ -40,8 +40,6 @@
  */
 
 const fs = require('fs');
-const MCPLLMBackend = require('../backends/MCPLLMBackend');
-const VSCodeLLMBackend = require('../backends/VSCodeLLMBackend');
 
 function loadRecoveryPrompt() {
   const path = require('path');
@@ -95,22 +93,8 @@ module.exports = async function recoverSkill(state) {
 
   logger.debug(`[Node:RecoverSkill] Recovering from: ${failedStep.skill} — ${failedStep.error}`);
 
-  // ── Resolve LLM backend ──────────────────────────────────────────────────────
-  let backend = llmBackend;
-
-  if (!backend && useOnlineMode) {
-    backend = new VSCodeLLMBackend({
-      wsUrl:             process.env.WEBSOCKET_URL     || 'ws://localhost:4000/ws/stream',
-      apiKey:            process.env.WEBSOCKET_API_KEY || 'test-api-key-123',
-      userId:            context?.userId               || 'default_user',
-      connectTimeoutMs:  5000,
-      responseTimeoutMs: 30000,
-    });
-  }
-
-  if (!backend && mcpAdapter) {
-    backend = new MCPLLMBackend(mcpAdapter);
-  }
+  // ── Resolve LLM backend ──────────────────────────────────────────────
+  const backend = llmBackend;
 
   // ── Replan limit: abort after too many replans to prevent infinite loops ─────
   // Guide flows legitimately navigate multiple pages (each triggers one replan),

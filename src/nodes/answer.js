@@ -19,8 +19,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const MCPLLMBackend = require('../backends/MCPLLMBackend');
-const VSCodeLLMBackend = require('../backends/VSCodeLLMBackend');
 
 // Load intent rules from answer.md at startup — editable without touching code
 function loadAnswerPrompts() {
@@ -96,31 +94,10 @@ module.exports = async function answer(state) {
   logger.debug(`[Node:Answer] Generating answer (streaming: ${isStreaming}, retry: ${retryCount})`);
 
   // ─── Resolve which backend to use ───────────────────────────────────────────
-  // Priority:
-  //   1. Explicitly injected llmBackend (from StateGraphService / StateGraphBuilder)
-  //   2. useOnlineMode=true → VSCodeLLMBackend (bibscrip-backend WebSocket)
-  //   3. mcpAdapter present → MCPLLMBackend (local phi4)
-  //   4. Placeholder
-  let backend = llmBackend;
-
-  if (!backend && useOnlineMode) {
-    backend = new VSCodeLLMBackend({
-      wsUrl:             process.env.WEBSOCKET_URL     || 'ws://localhost:4000/ws/stream',
-      apiKey:            process.env.WEBSOCKET_API_KEY || 'test-api-key-123',
-      userId:            context?.userId               || 'default_user',
-      connectTimeoutMs:  5000,
-      responseTimeoutMs: 60000,
-    });
-    logger.debug(`[Node:Answer] Using VSCodeLLMBackend (online mode) → ${backend.wsUrl}`);
-  }
-
-  if (!backend && mcpAdapter) {
-    backend = new MCPLLMBackend(mcpAdapter);
-    logger.debug('[Node:Answer] Using MCPLLMBackend (phi4)');
-  }
+  const backend = llmBackend;
 
   if (!backend) {
-    logger.warn('[Node:Answer] No LLM backend available - returning placeholder');
+    logger.warn('[Node:Answer] No llmBackend in state — returning placeholder');
     return {
       ...state,
       answer: `[No LLM backend configured - Intent: ${intent?.type || 'unknown'}]`,
@@ -133,26 +110,11 @@ module.exports = async function answer(state) {
   if (!available) {
     const info = backend.getInfo();
     logger.warn(`[Node:Answer] Backend unavailable: ${info.name}`);
-
-    // Online mode: fall back to MCPLLMBackend (phi4) if WebSocket is down
-    if (useOnlineMode && mcpAdapter) {
-      logger.debug('[Node:Answer] Online backend unavailable, falling back to MCPLLMBackend (phi4)');
-      backend = new MCPLLMBackend(mcpAdapter);
-      const fallbackAvailable = await backend.isAvailable().catch(() => false);
-      if (!fallbackAvailable) {
-        return {
-          ...state,
-          answer: `[Both online backend and local phi4 are unavailable]`,
-          metadata: { ...state.metadata, answerSource: 'unavailable' }
-        };
-      }
-    } else {
-      return {
-        ...state,
-        answer: `[${info.name} is not available]`,
-        metadata: { ...state.metadata, answerSource: 'unavailable' }
-      };
-    }
+    return {
+      ...state,
+      answer: `[${info.name} is not available]`,
+      metadata: { ...state.metadata, answerSource: 'unavailable' }
+    };
   }
 
   // ─── Resolve response language FIRST so it prefixes the entire system prompt ──

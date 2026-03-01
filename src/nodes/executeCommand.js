@@ -553,6 +553,12 @@ module.exports = async function executeCommand(state) {
       description: description || `Capability gap: ${capability}`,
       stdout: message
     });
+    // Auto-trigger the Skill Store UI pre-filtered to this capability gap
+    if (progressCallback) progressCallback({
+      type: 'skill_store_trigger',
+      capability: capability || '',
+      suggestion: suggestion || '',
+    });
 
     return {
       ...state,

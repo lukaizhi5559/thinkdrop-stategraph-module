@@ -9,9 +9,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const MCPLLMBackend = require('../backends/MCPLLMBackend');
-const VSCodeLLMBackend = require('../backends/VSCodeLLMBackend');
-
 const MAX_EVAL_RETRIES = 2;
 
 function loadEvalPrompt() {
@@ -68,18 +65,8 @@ module.exports = async function evaluateSkills(state) {
   if (progressCallback) progressCallback({ type: 'evaluating', message: isFailurePath ? 'Analyzing failure...' : 'Evaluating result...' });
   logger.info(`[Node:EvaluateSkills] ${isFailurePath ? 'Failure-path evaluation' : 'Post-run evaluation'} (retry ${evaluationRetryCount}/${MAX_EVAL_RETRIES})`);
 
-  let backend = llmBackend;
-  if (!backend && useOnlineMode) {
-    backend = new VSCodeLLMBackend({
-      wsUrl: process.env.WEBSOCKET_URL || 'ws://localhost:4000/ws/stream',
-      apiKey: process.env.WEBSOCKET_API_KEY || 'test-api-key-123',
-      userId: context?.userId || 'default_user',
-      connectTimeoutMs: 5000,
-      responseTimeoutMs: 20000,
-    });
-  }
-  if (!backend && mcpAdapter) backend = new MCPLLMBackend(mcpAdapter);
-  if (!backend) { logger.warn('[Node:EvaluateSkills] No LLM backend — skipping'); return state; }
+  const backend = llmBackend;
+  if (!backend) { logger.warn('[Node:EvaluateSkills] No llmBackend in state — skipping'); return state; }
 
   // Build rich step log — mirrors the field descriptions in evaluate-skills.md
   const stepLogs = skillResults.map((r, i) => {
