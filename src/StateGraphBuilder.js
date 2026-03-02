@@ -340,7 +340,7 @@ class StateGraphBuilder {
         if (phase === 'fixing')  return 'buildSkill';      // smoke test failed — rebuild
         if (phase === 'error')   return 'logConversation';
         // If skill was built on-demand (triggered by missing external.skill), resume original plan
-        if (phase === 'done' && state.postBuildResumePlan) {
+        if (phase === 'done' && state.skillBuiltOnDemand) {
           logger.debug('[StateGraph:Router] installSkill done — resuming original executeCommand plan');
           return 'executeCommand';
         }

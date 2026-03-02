@@ -1557,7 +1557,11 @@ module.exports = async function executeCommand(state) {
           failedStep: null,
           commandExecuted: false,
           // Skill build pipeline state
-          skillBuildRequest: state.message || originalPrompt || `Build skill: ${missingSkillName}`,
+          skillBuildRequest: {
+            name: missingSkillName,
+            displayName: missingSkillName.replace(/\./g, ' '),
+            description: state.message || originalPrompt || `Build skill: ${missingSkillName}`,
+          },
           skillBuildName: missingSkillName,
           skillBuildPhase: 'building',
           skillBuildRound: 0,

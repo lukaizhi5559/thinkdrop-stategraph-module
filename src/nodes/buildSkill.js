@@ -155,6 +155,13 @@ async function buildSkill(state) {
     return { ...state, skillBuildPhase: 'error', skillBuildError: 'No skill build request found.' };
   }
 
+  // If draft is already ready and phase is 'installing', skip generation — pass through to validateSkill
+  // This handles: normal resume after user provides a secret, and developer edit mode
+  if (state.skillBuildPhase === 'installing' && state.skillBuildDraft) {
+    logger.info(`[Node:BuildSkill] Draft already ready (phase=installing) — skipping generation, passing through`);
+    return { ...state };
+  }
+
   const { name, rawUrl } = skillBuildRequest;
   logger.info(`[Node:BuildSkill] Building skill "${name}" (round ${skillBuildRound})`);
 
@@ -203,8 +210,9 @@ async function buildSkill(state) {
 
   let draft = '';
   try {
-    const onToken = streamCallback ? (t) => streamCallback(t) : null;
-    draft = await llm.generateAnswer(userPrompt, buildPayload, { maxTokens: 2000, temperature: 0.2 }, onToken);
+    // Do NOT stream tokens to streamCallback — the generated code should only appear
+    // in the SkillBuildProgress expand/collapse view, not the ResultsWindow text area.
+    draft = await llm.generateAnswer(userPrompt, buildPayload, { maxTokens: 2000, temperature: 0.2 }, null);
     draft = (draft || '').trim();
 
     // Strip markdown fences if the LLM wrapped the code anyway

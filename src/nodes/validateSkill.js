@@ -140,7 +140,9 @@ Output ONLY valid JSON:
 }
 
 PASS only if ALL required capabilities are implemented with real code (no placeholders, no TODOs, no fake hostnames).
-FAIL if any required capability is missing, stubbed, or using a placeholder.`;
+FAIL if any required capability is missing, stubbed, or using a placeholder.
+
+IMPORTANT: OAuth2 redirect URIs like 'http://localhost:3000/oauth2callback' or 'urn:ietf:wg:oauth:2.0:oob' are VALID for local desktop apps — do NOT flag them as placeholders. Only flag clearly fake hostnames like 'example.com', 'your-actual-production-url.com', or 'placeholder.com'.`;
 
 // ── Layer 3: Corrective feedback generator ────────────────────────────────────
 // Given the list of failures from intent analysis + static checks, generates
@@ -190,30 +192,34 @@ async function researchApiPattern(mcpAdapter, query, logger) {
   if (!mcpAdapter) return null;
   try {
     logger.info(`[Node:ValidateSkill] Researching: ${query}`);
-    const sessionId = `validate-research-${Date.now()}`;
 
-    // Use DuckDuckGo for quick lookups — no auth needed, reliable results
-    const searchUrl = `https://duckduckgo.com/?q=${encodeURIComponent(query + ' nodejs example site:npmjs.com OR site:github.com OR site:stackoverflow.com')}&ia=web`;
+    // Use npm registry search API — no bot detection, fast, reliable
+    const npmQuery = query.replace(/[^a-zA-Z0-9 ]/g, ' ').trim().split(' ').slice(0, 5).join('+');
+    const npmUrl = `https://registry.npmjs.org/-/v1/search?text=${npmQuery}&size=3`;
 
-    const navRes = await mcpAdapter.callService('command', 'command.automate', {
-      skill: 'browser.act',
-      args: { action: 'navigate', url: searchUrl, sessionId, timeoutMs: 10000 }
-    }, { timeoutMs: 12000 }).catch(e => ({ ok: false, error: e.message }));
+    const http = require('http');
+    const https = require('https');
+    const result = await new Promise((resolve) => {
+      const client = npmUrl.startsWith('https') ? https : http;
+      const req = client.get(npmUrl, { timeout: 5000 }, (res) => {
+        let body = '';
+        res.on('data', d => body += d);
+        res.on('end', () => resolve(body));
+      });
+      req.on('error', () => resolve(''));
+      req.on('timeout', () => { req.destroy(); resolve(''); });
+    });
 
-    const nav = navRes?.data || navRes;
-    if (nav?.ok === false) return null;
-
-    // Get page text
-    const textRes = await mcpAdapter.callService('command', 'command.automate', {
-      skill: 'browser.act',
-      args: { action: 'getPageText', sessionId, timeoutMs: 8000 }
-    }, { timeoutMs: 10000 }).catch(() => null);
-
-    const text = textRes?.data?.result || textRes?.result || '';
-    if (!text || text.length < 100) return null;
-
-    // Return first 1500 chars of page text as research context
-    return text.slice(0, 1500);
+    if (!result || result.length < 50) return null;
+    try {
+      const parsed = JSON.parse(result);
+      const packages = (parsed.objects || []).map(o =>
+        `${o.package.name}@${o.package.version}: ${o.package.description || ''}`
+      ).join('\n');
+      return packages.length > 20 ? `Related npm packages:\n${packages}` : null;
+    } catch (_) {
+      return null;
+    }
   } catch (err) {
     logger.warn(`[Node:ValidateSkill] Research failed (non-fatal): ${err.message}`);
     return null;

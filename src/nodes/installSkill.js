@@ -86,7 +86,25 @@ const USER_MEMORY_KEY = process.env.MCP_USER_MEMORY_API_KEY || 'k7F9qLp3XzR2vH8s
 
 // ── Detect required secrets from draft code ───────────────────────────────────
 
-function detectRequiredSecrets(code) {
+// Derive human-readable service name from skill name or secret key
+function deriveServiceContext(skillName, secretKey) {
+  const s = (skillName + ' ' + secretKey).toLowerCase();
+  if (s.includes('gmail') || s.includes('googleapis') || s.includes('google')) return 'Google / Gmail';
+  if (s.includes('twilio')) return 'Twilio';
+  if (s.includes('clicksend')) return 'ClickSend';
+  if (s.includes('sendgrid')) return 'SendGrid';
+  if (s.includes('mailgun')) return 'Mailgun';
+  if (s.includes('stripe')) return 'Stripe';
+  if (s.includes('openai')) return 'OpenAI';
+  if (s.includes('slack')) return 'Slack';
+  if (s.includes('discord')) return 'Discord';
+  if (s.includes('github')) return 'GitHub';
+  if (s.includes('aws') || s.includes('amazon')) return 'AWS';
+  if (s.includes('azure')) return 'Azure';
+  return null;
+}
+
+function detectRequiredSecrets(code, skillName) {
   const secrets = [];
   // Match: keytar.getPassword('thinkdrop', 'skill:<name>:<KEY>')
   const re = /keytar\.getPassword\s*\(\s*['"]thinkdrop['"]\s*,\s*['"]skill:[^'"]+:([A-Z_]+)['"]\s*\)/g;
@@ -94,10 +112,14 @@ function detectRequiredSecrets(code) {
   while ((m = re.exec(code)) !== null) {
     const key = m[1];
     if (!secrets.find(s => s.key === key)) {
+      const serviceContext = deriveServiceContext(skillName || '', key);
       secrets.push({
         key,
         label: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
-        hint: `Required by the skill. Will be stored securely in macOS Keychain.`,
+        serviceContext,
+        hint: serviceContext
+          ? `Your ${serviceContext} ${key.replace(/_/g, ' ').toLowerCase()}. Will be stored securely in macOS Keychain.`
+          : `Required by the skill. Will be stored securely in macOS Keychain.`,
       });
     }
   }
@@ -321,6 +343,121 @@ function runSmokeTest(skillPath, logger) {
   });
 }
 
+// ── cli.agent silent credential resolver ──────────────────────────────────────
+
+const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
+
+function callCommandService(skill, args, timeoutMs = 15000) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({ payload: { skill, args } });
+    const req = http.request({
+      hostname: '127.0.0.1',
+      port: COMMAND_SERVICE_PORT,
+      path: '/command.automate',
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: timeoutMs,
+    }, res => {
+      let raw = '';
+      res.on('data', c => { raw += c; });
+      res.on('end', () => {
+        try { resolve((JSON.parse(raw).data) || {}); }
+        catch { resolve({}); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({}); });
+    req.on('error', () => resolve({}));
+    req.write(body);
+    req.end();
+  });
+}
+
+/**
+ * Attempts to silently resolve a secret via cli.agent.
+ * Returns the resolved value string if successful, null otherwise.
+ * Never throws — always falls back gracefully.
+ */
+async function tryResolveViaCliAgent(secretItem, mcpAdapter, logger) {
+  const { key, serviceContext } = secretItem;
+  if (!serviceContext) return null;
+
+  try {
+    // Step 1: check if an agent already exists for this service
+    const queryResult = await callCommandService('cli.agent', {
+      action: 'query_agent',
+      service: serviceContext,
+    }, 8000);
+
+    // Step 2: if no agent exists, try to build one (discovers CLI, generates descriptor)
+    if (!queryResult?.found) {
+      logger.info(`[InstallSkill] No cli.agent found for "${serviceContext}" — attempting build`);
+      const buildResult = await callCommandService('cli.agent', {
+        action: 'build_agent',
+        service: serviceContext,
+      }, 20000);
+
+      if (!buildResult?.ok || buildResult?.needsInstall) {
+        logger.info(`[InstallSkill] cli.agent build skipped for "${serviceContext}": ${buildResult?.error || 'CLI not installed'}`);
+        return null;
+      }
+    }
+
+    // Step 3: try to extract the token via the CLI's tokenCmd
+    const runResult = await callCommandService('cli.agent', {
+      action: 'run',
+      service: serviceContext,
+      cli: queryResult?.cliTool,
+      argv: getTokenArgv(serviceContext, key),
+      timeoutMs: 10000,
+    }, 12000);
+
+    if (!runResult?.ok || !runResult?.stdout?.trim()) return null;
+
+    const extracted = parseTokenFromOutput(runResult.stdout, key, serviceContext);
+    return extracted || null;
+  } catch (err) {
+    logger.info(`[InstallSkill] cli.agent resolution failed for "${key}": ${err.message}`);
+    return null;
+  }
+}
+
+function getTokenArgv(serviceContext, secretKey) {
+  const key = (serviceContext || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const TOKEN_CMDS = {
+    github:   ['auth', 'token'],
+    aws:      ['configure', 'get', secretKey.toLowerCase().includes('secret') ? 'aws_secret_access_key' : 'aws_access_key_id'],
+    stripe:   ['config', '--list'],
+    heroku:   ['auth:token'],
+    netlify:  ['status'],
+    fly:      ['auth', 'token'],
+    gcloud:   ['auth', 'print-access-token'],
+    firebase: ['login:ci'],
+  };
+  return TOKEN_CMDS[key] || ['--version'];
+}
+
+function parseTokenFromOutput(stdout, secretKey, serviceContext) {
+  const svc = (serviceContext || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const text = stdout.trim();
+
+  if (svc === 'github') {
+    const match = text.match(/^(ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)/m);
+    return match ? match[1] : (text.length > 10 && !text.includes(' ') ? text : null);
+  }
+  if (svc === 'heroku' || svc === 'fly') {
+    return text.length > 10 && !text.includes('\n') ? text : null;
+  }
+  if (svc === 'stripe') {
+    const match = text.match(/test_secret_key\s*=\s*(sk_test_[A-Za-z0-9]+)/);
+    return match ? match[1] : null;
+  }
+  if (svc === 'aws') {
+    const match = text.match(/^([A-Z0-9]{20}|[A-Za-z0-9/+=]{40})$/m);
+    return match ? match[1] : null;
+  }
+  return null;
+}
+
 // ── Node ──────────────────────────────────────────────────────────────────────
 
 async function installSkill(state) {
@@ -343,17 +480,37 @@ async function installSkill(state) {
   }
 
   // Step 1: detect required secrets
-  const allSecrets = detectRequiredSecrets(skillBuildDraft);
+  const allSecrets = detectRequiredSecrets(skillBuildDraft, name);
 
   // Build ask queue if first time here (askQueue not yet set)
   const askQueue = skillBuildAskQueue !== undefined
     ? skillBuildAskQueue
     : allSecrets.filter(s => !(s.key in skillBuildSecrets));
 
-  // Step 2: if there are secrets still to collect → ASK_USER
+  // Step 2: if there are secrets still to collect, try cli.agent first before asking user
   if (askQueue.length > 0) {
-    const next = askQueue[0];
-    const remaining = askQueue.slice(1);
+    // Attempt silent resolution via cli.agent for each pending secret
+    const resolvedSecrets = { ...skillBuildSecrets };
+    const stillNeeded = [];
+
+    for (const item of askQueue) {
+      const resolved = await tryResolveViaCliAgent(item, state.mcpAdapter, logger);
+      if (resolved !== null) {
+        resolvedSecrets[item.key] = resolved;
+        logger.info(`[Node:InstallSkill] cli.agent resolved secret "${item.key}" silently`);
+      } else {
+        stillNeeded.push(item);
+      }
+    }
+
+    // If cli.agent resolved everything, continue to install with no user prompt
+    if (stillNeeded.length === 0) {
+      return { ...state, skillBuildSecrets: resolvedSecrets, skillBuildAskQueue: [], pendingQuestion: null };
+    }
+
+    // Otherwise ask user for the first unresolved secret
+    const next = stillNeeded[0];
+    const remaining = stillNeeded.slice(1);
 
     logger.info(`[Node:InstallSkill] Asking for secret: ${next.key}`);
 
@@ -364,10 +521,13 @@ async function installSkill(state) {
     return {
       ...state,
       skillBuildPhase: 'asking',
+      skillBuildSecrets: resolvedSecrets,
       skillBuildAskQueue: remaining,
       skillBuildCurrentSecretKey: next.key,
       pendingQuestion: {
-        question: `The skill "${displayName}" needs: **${next.label}**\n${next.hint}\n\nPlease enter the value (it will be stored securely in macOS Keychain):`,
+        question: next.hint,
+        keyLabel: next.label,
+        serviceContext: next.serviceContext || null,
         options: [],
       },
     };
@@ -531,6 +691,7 @@ async function installSkill(state) {
       postBuildResumePlan: null,
       postBuildResumeCursor: null,
       failedStep: null,
+      skillBuiltOnDemand: true,
     } : {}),
   };
 }
