@@ -93,6 +93,55 @@ module.exports = async function recoverSkill(state) {
 
   logger.debug(`[Node:RecoverSkill] Recovering from: ${failedStep.skill} — ${failedStep.error}`);
 
+  // ── Runtime failure feedback → agent failure_log ─────────────────────────
+  // When a skill that uses an agent fails, write the error back to the agent's
+  // failure_log in DuckDB so validate_agent sees real production failures,
+  // not just version drift or CLI health. This is the human feedback loop.
+  if (mcpAdapter && failedStep.skill) {
+    try {
+      // Detect agent service from the skill name or args
+      const _agentFromStep = (step) => {
+        if (!step) return null;
+        // external.skill with a known service in the name (e.g. github-pr-notifier)
+        const skillLower = (step.skill || '').toLowerCase();
+        const AGENT_SERVICES = [
+          'github','twilio','aws','stripe','heroku','netlify','vercel','firebase',
+          'gcloud','fly','doctl','docker','terraform','kubectl','shopify','supabase',
+          'railway','render','planetscale','neon','doppler','turso','gmail','himalaya',
+          'slack','discord','notion','airtable','openai','anthropic','linear','sendgrid',
+          'mailgun','pinecone','cohere','huggingface',
+        ];
+        const matched = AGENT_SERVICES.find(svc =>
+          skillLower.includes(svc) ||
+          (step.args?.service || '').toLowerCase().includes(svc) ||
+          (step.args?.agentId || '').toLowerCase().includes(svc)
+        );
+        if (!matched) return null;
+        const agentId = step.args?.agentId || `${matched}.agent`;
+        const agentType = ['gmail','slack','discord','notion','airtable'].includes(matched) ? 'browser' : 'cli';
+        return { agentId, agentType };
+      };
+
+      const agentInfo = _agentFromStep(failedStep);
+      if (agentInfo) {
+        const { agentId, agentType } = agentInfo;
+        const failureEntry = JSON.stringify({
+          ts: new Date().toISOString(),
+          skill: failedStep.skill,
+          error: failedStep.error || 'unknown',
+          stderr: (failedStep.stderr || '').slice(0, 400),
+          exitCode: failedStep.exitCode,
+        });
+        const skillName = agentType === 'browser' ? 'browser.agent' : 'cli.agent';
+        mcpAdapter.callService('command', 'command.automate', {
+          skill: skillName,
+          args: { action: 'record_failure', id: agentId, failureEntry },
+        }, { timeoutMs: 3000 }).catch(() => {}); // fire-and-forget
+        logger.debug(`[Node:RecoverSkill] Wrote runtime failure to ${agentId} failure_log`);
+      }
+    } catch (_) { /* non-fatal — never block recovery */ }
+  }
+
   // ── Resolve LLM backend ──────────────────────────────────────────────
   const backend = llmBackend;
 

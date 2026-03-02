@@ -407,6 +407,36 @@ Task: "${userMessage}"`;
     } catch (_) { /* non-fatal */ }
   }
 
+  // ── Agent registry: inject healthy agent descriptors into planning context ──
+  // Query the agent registry (cli.agent + browser.agent) for all healthy agents.
+  // Their descriptors tell the LLM which services have resolved auth, CLI tools,
+  // and navigation patterns — so it doesn't plan redundant auth steps or prompt
+  // the user for credentials that are already available.
+  let agentContextNote = '';
+  if (mcpAdapter) {
+    try {
+      const agentRes = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'cli.agent',
+        args: { action: 'list_agents' },
+      }, { timeoutMs: 4000 }).catch(() => null);
+
+      const agentRows = agentRes?.data?.agents || agentRes?.agents || [];
+      const healthyAgents = agentRows.filter(a => a.status === 'healthy' || a.status === 'degraded');
+
+      if (healthyAgents.length > 0) {
+        const agentLines = healthyAgents.map(a => {
+          const caps = Array.isArray(a.capabilities) ? a.capabilities.slice(0, 6).join(', ') : '';
+          const typeTag = a.type === 'browser' ? '[browser]' : '[cli]';
+          return `  - ${typeTag} ${a.id} (service: ${a.service}, tool: ${a.cliTool || 'browser'}) — capabilities: ${caps || 'see descriptor'}`;
+        }).join('\n');
+
+        agentContextNote = `\n\nAVAILABLE AGENTS (already configured — auth/credentials resolved, no user prompt needed):\n${agentLines}\n  When a task uses one of these services, assume credentials are available and plan skill steps that use the service directly. Do NOT add auth setup steps for these services. For recurring/background tasks using these services, use needs_skill to build the automation skill.`;
+
+        logger.debug(`[Node:PlanSkills] Agent context: ${healthyAgents.length} healthy agent(s) injected`);
+      }
+    } catch (_) { /* non-fatal */ }
+  }
+
   // Build injected snippets block — placed at top of system prompt for maximum LLM attention
   let ragSnippetsBlock = '';
   if (skillPromptSnippets.length > 0) {
@@ -423,7 +453,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${installedSkillsNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
+User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
 
   const payload = {
     query: planningQuery,

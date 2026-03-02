@@ -87,30 +87,181 @@ const USER_MEMORY_KEY = process.env.MCP_USER_MEMORY_API_KEY || 'k7F9qLp3XzR2vH8s
 // ── Detect required secrets from draft code ───────────────────────────────────
 
 // Derive human-readable service name from skill name or secret key
+// Known aliases — used to produce clean display names and normalised service keys.
+// This list does NOT gate anything — if no alias matches, the service name is
+// extracted directly from the skill name or secret key so every service works.
+const SERVICE_ALIASES = [
+  { match: ['gmail', 'googleapis', 'google'],   name: 'Google' },
+  { match: ['twilio'],                           name: 'Twilio' },
+  { match: ['clicksend'],                        name: 'ClickSend' },
+  { match: ['sendgrid'],                         name: 'SendGrid' },
+  { match: ['mailgun'],                          name: 'Mailgun' },
+  { match: ['stripe'],                           name: 'Stripe' },
+  { match: ['openai'],                           name: 'OpenAI' },
+  { match: ['slack'],                            name: 'Slack' },
+  { match: ['discord'],                          name: 'Discord' },
+  { match: ['github'],                           name: 'GitHub' },
+  { match: ['aws', 'amazon'],                    name: 'AWS' },
+  { match: ['azure'],                            name: 'Azure' },
+  { match: ['notion'],                           name: 'Notion' },
+  { match: ['linear'],                           name: 'Linear' },
+  { match: ['jira', 'atlassian'],                name: 'Jira' },
+  { match: ['confluence'],                       name: 'Confluence' },
+  { match: ['salesforce'],                       name: 'Salesforce' },
+  { match: ['hubspot'],                          name: 'HubSpot' },
+  { match: ['airtable'],                         name: 'Airtable' },
+  { match: ['asana'],                            name: 'Asana' },
+  { match: ['trello'],                           name: 'Trello' },
+  { match: ['monday'],                           name: 'Monday' },
+  { match: ['clickup'],                          name: 'ClickUp' },
+  { match: ['figma'],                            name: 'Figma' },
+  { match: ['dropbox'],                          name: 'Dropbox' },
+  { match: ['box'],                              name: 'Box' },
+  { match: ['zoom'],                             name: 'Zoom' },
+  { match: ['calendly'],                         name: 'Calendly' },
+  { match: ['typeform'],                         name: 'Typeform' },
+  { match: ['mailchimp'],                        name: 'Mailchimp' },
+  { match: ['intercom'],                         name: 'Intercom' },
+  { match: ['zendesk'],                          name: 'Zendesk' },
+  { match: ['shopify'],                          name: 'Shopify' },
+  { match: ['firebase'],                         name: 'Firebase' },
+  { match: ['supabase'],                         name: 'Supabase' },
+  { match: ['mongodb', 'mongo'],                 name: 'MongoDB' },
+  { match: ['postgres', 'postgresql'],           name: 'PostgreSQL' },
+  { match: ['mysql'],                            name: 'MySQL' },
+  { match: ['redis'],                            name: 'Redis' },
+  { match: ['heroku'],                           name: 'Heroku' },
+  { match: ['netlify'],                          name: 'Netlify' },
+  { match: ['vercel'],                           name: 'Vercel' },
+  { match: ['fly', 'flyio'],                     name: 'Fly.io' },
+  { match: ['gcloud', 'gcp'],                    name: 'GCP' },
+  { match: ['digitalocean', 'doctl'],            name: 'DigitalOcean' },
+  { match: ['cloudflare'],                       name: 'Cloudflare' },
+  { match: ['terraform'],                        name: 'Terraform' },
+  { match: ['kubernetes', 'kubectl'],            name: 'Kubernetes' },
+  { match: ['docker'],                           name: 'Docker' },
+  { match: ['anthropic', 'claude'],              name: 'Anthropic' },
+  { match: ['cohere'],                           name: 'Cohere' },
+  { match: ['replicate'],                        name: 'Replicate' },
+  { match: ['huggingface'],                      name: 'HuggingFace' },
+  { match: ['pinecone'],                         name: 'Pinecone' },
+  { match: ['twitch'],                           name: 'Twitch' },
+  { match: ['youtube'],                          name: 'YouTube' },
+  { match: ['twitter', 'x_api', 'xapi'],         name: 'Twitter/X' },
+  { match: ['instagram'],                        name: 'Instagram' },
+  { match: ['linkedin'],                         name: 'LinkedIn' },
+  { match: ['facebook', 'meta'],                 name: 'Meta' },
+  { match: ['telegram'],                         name: 'Telegram' },
+  { match: ['whatsapp'],                         name: 'WhatsApp' },
+  { match: ['resend'],                           name: 'Resend' },
+  { match: ['postmark'],                         name: 'Postmark' },
+  { match: ['brevo', 'sendinblue'],              name: 'Brevo' },
+  { match: ['plaid'],                            name: 'Plaid' },
+  { match: ['paypal'],                           name: 'PayPal' },
+  { match: ['square'],                           name: 'Square' },
+];
+
 function deriveServiceContext(skillName, secretKey) {
-  const s = (skillName + ' ' + secretKey).toLowerCase();
-  if (s.includes('gmail') || s.includes('googleapis') || s.includes('google')) return 'Google / Gmail';
-  if (s.includes('twilio')) return 'Twilio';
-  if (s.includes('clicksend')) return 'ClickSend';
-  if (s.includes('sendgrid')) return 'SendGrid';
-  if (s.includes('mailgun')) return 'Mailgun';
-  if (s.includes('stripe')) return 'Stripe';
-  if (s.includes('openai')) return 'OpenAI';
-  if (s.includes('slack')) return 'Slack';
-  if (s.includes('discord')) return 'Discord';
-  if (s.includes('github')) return 'GitHub';
-  if (s.includes('aws') || s.includes('amazon')) return 'AWS';
-  if (s.includes('azure')) return 'Azure';
+  const s = (skillName + ' ' + secretKey).toLowerCase().replace(/[_\-\.]/g, ' ');
+
+  // Fast-path: check known aliases first
+  for (const alias of SERVICE_ALIASES) {
+    if (alias.match.some(m => s.includes(m))) return alias.name;
+  }
+
+  // Generic fallback: extract service name from the skill name itself.
+  // e.g. 'notion-watcher' → 'Notion', 'linear_sync' → 'Linear',
+  //      'CALENDAR_API_KEY' → 'Calendar', 'MY_CUSTOM_TOKEN' → null (too generic)
+  const skillToken = (skillName || '').toLowerCase().replace(/[_\-\.]/g, ' ').trim();
+
+  // Strip common suffixes to get the core service word
+  const stripped = skillToken
+    .replace(/\b(skill|watcher|monitor|sync|fetch|send|get|post|api|token|key|secret|service|agent|integration|connector|handler|worker|job|task|cron)\b/g, '')
+    .trim()
+    .split(/\s+/)
+    .filter(w => w.length > 2)[0];
+
+  if (stripped && stripped.length > 2) {
+    // Capitalise first letter
+    return stripped.charAt(0).toUpperCase() + stripped.slice(1);
+  }
+
+  // Last resort: try the secret key itself (e.g. NOTION_API_KEY → 'Notion')
+  const keyToken = (secretKey || '').toLowerCase().replace(/_/g, ' ').split(' ')[0];
+  if (keyToken && keyToken.length > 2 && !['api', 'key', 'secret', 'token', 'auth', 'pass', 'pwd'].includes(keyToken)) {
+    return keyToken.charAt(0).toUpperCase() + keyToken.slice(1);
+  }
+
   return null;
 }
 
-function detectRequiredSecrets(code, skillName) {
+// ---------------------------------------------------------------------------
+// LLM-driven secret detection
+// Understands any keytar usage pattern: variable service names, computed keys,
+// template literals, destructured calls — not just the hardcoded literal form.
+// Falls back to regex for the common literal form if LLM unavailable.
+// ---------------------------------------------------------------------------
+
+function loadSecretDetectionPrompt() {
+  try {
+    return fs.readFileSync(path.join(__dirname, '../prompts/install-skill.md'), 'utf8').trim();
+  } catch (_) {
+    return 'You are a code analyzer. Find all keytar secrets in the code. Output ONLY a JSON array: [{ "key": "KEY_NAME", "service": "ServiceName", "required": true, "hint": "..." }]. Return [] if none found.';
+  }
+}
+
+const SECRET_DETECTION_SYSTEM_PROMPT = loadSecretDetectionPrompt();
+
+async function detectRequiredSecrets(code, skillName, llmBackend) {
   const secrets = [];
-  // Match: keytar.getPassword('thinkdrop', 'skill:<name>:<KEY>')
-  const re = /keytar\.getPassword\s*\(\s*['"]thinkdrop['"]\s*,\s*['"]skill:[^'"]+:([A-Z_]+)['"]\s*\)/g;
+
+  // --- LLM-driven path (preferred) ---
+  if (llmBackend) {
+    try {
+      const raw = await Promise.race([
+        llmBackend.generateAnswer(code, {
+          query: code,
+          context: {
+            conversationHistory: [],
+            systemInstructions: SECRET_DETECTION_SYSTEM_PROMPT,
+            intent: 'general_query',
+          },
+          options: { maxTokens: 600, temperature: 0.1, fastMode: true },
+        }, { maxTokens: 600, temperature: 0.1, fastMode: true }, null),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 10000)),
+      ]);
+
+      const text = (typeof raw === 'string' ? raw : '').trim();
+      const match = text.match(/\[[\s\S]*\]/);
+      if (match) {
+        const items = JSON.parse(match[0]);
+        for (const item of items) {
+          if (item.key && !secrets.find(s => s.key === item.key)) {
+            const serviceContext = item.service || deriveServiceContext(skillName || '', item.key);
+            secrets.push({
+              key: item.key,
+              label: item.key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+              serviceContext,
+              hint: item.hint || (serviceContext
+                ? `Your ${serviceContext} ${item.key.replace(/_/g, ' ').toLowerCase()}. Will be stored securely in macOS Keychain.`
+                : `Required by the skill. Will be stored securely in macOS Keychain.`),
+              required: item.required !== false,
+            });
+          }
+        }
+        if (secrets.length > 0) return secrets;
+      }
+    } catch (_) {
+      logger.warn(`[Node:InstallSkill] LLM secret detection failed — falling back to regex`);
+    }
+  }
+
+  // --- Regex fallback: handles the canonical literal pattern + broad keytar coverage ---
+  // Pattern 1: keytar.getPassword('thinkdrop', 'skill:<name>:<KEY>')
+  const re1 = /keytar\.getPassword\s*\(\s*['"]thinkdrop['"]\s*,\s*['"]skill:[^'"]+:([A-Z_a-z0-9]+)['"]\s*\)/g;
   let m;
-  while ((m = re.exec(code)) !== null) {
-    const key = m[1];
+  while ((m = re1.exec(code)) !== null) {
+    const key = m[1].toUpperCase();
     if (!secrets.find(s => s.key === key)) {
       const serviceContext = deriveServiceContext(skillName || '', key);
       secrets.push({
@@ -120,9 +271,36 @@ function detectRequiredSecrets(code, skillName) {
         hint: serviceContext
           ? `Your ${serviceContext} ${key.replace(/_/g, ' ').toLowerCase()}. Will be stored securely in macOS Keychain.`
           : `Required by the skill. Will be stored securely in macOS Keychain.`,
+        required: true,
       });
     }
   }
+
+  // Pattern 2: keytar.getPassword(service, key) — any form
+  const re2 = /keytar\.getPassword\s*\([^)]+\)/g;
+  while ((m = re2.exec(code)) !== null) {
+    // Already captured above if literal; skip if no new KEY found
+    const inner = m[0];
+    const keyMatch = inner.match(/['"`]([A-Z_]{4,})['"`]/);
+    if (keyMatch) {
+      const key = keyMatch[1];
+      if (!secrets.find(s => s.key === key)) {
+        const serviceContext = deriveServiceContext(skillName || '', key);
+        secrets.push({ key, label: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()), serviceContext, hint: `Required by the skill. Will be stored in macOS Keychain.`, required: true });
+      }
+    }
+  }
+
+  // Pattern 3: process.env.XYZ used as credentials (common in LLM-generated code)
+  const re3 = /process\.env\.([A-Z_]{4,}(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API|AUTH)[A-Z_]*)/g;
+  while ((m = re3.exec(code)) !== null) {
+    const key = m[1];
+    if (!secrets.find(s => s.key === key)) {
+      const serviceContext = deriveServiceContext(skillName || '', key);
+      secrets.push({ key, label: key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()), serviceContext, hint: `${key} environment variable (will be injected from Keychain). Will be stored securely.`, required: true });
+    }
+  }
+
   return secrets;
 }
 
@@ -373,8 +551,11 @@ function callCommandService(skill, args, timeoutMs = 15000) {
 }
 
 /**
- * Attempts to silently resolve a secret via cli.agent.
- * Returns the resolved value string if successful, null otherwise.
+ * Attempts to silently resolve a secret via cli.agent or browser.agent.
+ * Returns:
+ *   string  — resolved credential value (silent success)
+ *   null    — could not resolve, caller should prompt user
+ *   { hintOverride: string } — agent found context but needs user input with better hint
  * Never throws — always falls back gracefully.
  */
 async function tryResolveViaCliAgent(secretItem, mcpAdapter, logger) {
@@ -382,32 +563,88 @@ async function tryResolveViaCliAgent(secretItem, mcpAdapter, logger) {
   if (!serviceContext) return null;
 
   try {
-    // Step 1: check if an agent already exists for this service
-    const queryResult = await callCommandService('cli.agent', {
+    // Step 1: build agent if not yet registered (LLM-driven — handles any service)
+    let queryResult = await callCommandService('cli.agent', {
       action: 'query_agent',
       service: serviceContext,
     }, 8000);
 
-    // Step 2: if no agent exists, try to build one (discovers CLI, generates descriptor)
     if (!queryResult?.found) {
-      logger.info(`[InstallSkill] No cli.agent found for "${serviceContext}" — attempting build`);
+      logger.info(`[InstallSkill] No agent for "${serviceContext}" — building…`);
       const buildResult = await callCommandService('cli.agent', {
         action: 'build_agent',
         service: serviceContext,
-      }, 20000);
+      }, 25000);
 
-      if (!buildResult?.ok || buildResult?.needsInstall) {
-        logger.info(`[InstallSkill] cli.agent build skipped for "${serviceContext}": ${buildResult?.error || 'CLI not installed'}`);
+      // If cli.agent signals this is an OAuth service, try browser.agent
+      if (buildResult?.isOAuth || buildResult?.delegateTo === 'browser.agent') {
+        logger.info(`[InstallSkill] "${serviceContext}" is OAuth — delegating to browser.agent`);
+        const browserBuild = await callCommandService('browser.agent', {
+          action: 'build_agent',
+          service: serviceContext,
+        }, 30000);
+
+        if (browserBuild?.ok) {
+          // browser.agent built a descriptor — update hint so user gets the right auth URL
+          const descriptor = browserBuild.descriptor || '';
+          const urlLine = descriptor.match(/start_url:\s*(.+)/);
+          const authUrl = urlLine ? urlLine[1].trim() : null;
+          if (authUrl) {
+            return {
+              hintOverride: `Authenticate with ${serviceContext} at ${authUrl}. Once logged in, the session is stored for future use.`,
+            };
+          }
+        }
         return null;
+      }
+
+      // If cli.agent built an api_key-only descriptor, surface the URL from descriptor
+      if (buildResult?.isApiKey && buildResult?.descriptor) {
+        const urlLine = buildResult.descriptor.match(/api_key_url:\s*(.+)/);
+        const apiUrl  = urlLine ? urlLine[1].trim() : null;
+        if (apiUrl) {
+          return {
+            hintOverride: `Get your ${serviceContext} API key at: ${apiUrl}`,
+          };
+        }
+        return null;
+      }
+
+      // Re-query after successful build
+      if (buildResult?.ok && !buildResult?.needsInstall) {
+        queryResult = await callCommandService('cli.agent', {
+          action: 'query_agent',
+          service: serviceContext,
+        }, 8000);
       }
     }
 
-    // Step 3: try to extract the token via the CLI's tokenCmd
+    if (!queryResult?.found) return null;
+
+    // For api_key-type agents (no CLI), return hintOverride with URL from descriptor
+    if (queryResult?.type === 'api_key' || !queryResult?.cliTool) {
+      const descriptor = queryResult?.descriptor || '';
+      const urlLine = descriptor.match(/api_key_url:\s*(.+)/);
+      const apiUrl  = urlLine ? urlLine[1].trim() : null;
+      if (apiUrl) {
+        return { hintOverride: `Get your ${serviceContext} API key at: ${apiUrl}` };
+      }
+      return null;
+    }
+
+    // Step 2: descriptor-driven token extraction
+    const descriptor = queryResult?.descriptor || '';
+    const tokenArgv  = getTokenArgvFromDescriptor(descriptor, serviceContext, key);
+    if (!tokenArgv) {
+      logger.info(`[InstallSkill] No tokenCmd for "${serviceContext}" — cannot extract silently`);
+      return null;
+    }
+
     const runResult = await callCommandService('cli.agent', {
       action: 'run',
       service: serviceContext,
       cli: queryResult?.cliTool,
-      argv: getTokenArgv(serviceContext, key),
+      argv: tokenArgv,
       timeoutMs: 10000,
     }, 12000);
 
@@ -416,45 +653,103 @@ async function tryResolveViaCliAgent(secretItem, mcpAdapter, logger) {
     const extracted = parseTokenFromOutput(runResult.stdout, key, serviceContext);
     return extracted || null;
   } catch (err) {
-    logger.info(`[InstallSkill] cli.agent resolution failed for "${key}": ${err.message}`);
+    logger.info(`[InstallSkill] agent resolution failed for "${key}": ${err.message}`);
     return null;
   }
 }
 
-function getTokenArgv(serviceContext, secretKey) {
-  const key = (serviceContext || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  const TOKEN_CMDS = {
-    github:   ['auth', 'token'],
-    aws:      ['configure', 'get', secretKey.toLowerCase().includes('secret') ? 'aws_secret_access_key' : 'aws_access_key_id'],
-    stripe:   ['config', '--list'],
-    heroku:   ['auth:token'],
-    netlify:  ['status'],
-    fly:      ['auth', 'token'],
-    gcloud:   ['auth', 'print-access-token'],
-    firebase: ['login:ci'],
+// ---------------------------------------------------------------------------
+// Descriptor-driven token extraction
+// Reads tokenCmd from the agent descriptor's front-matter instead of
+// a hardcoded lookup table. Falls back to a universal heuristic parser.
+// ---------------------------------------------------------------------------
+
+function getTokenArgvFromDescriptor(descriptor, serviceContext, secretKey) {
+  if (descriptor) {
+    // Try to read tokenCmd from descriptor front-matter
+    const tcMatch = descriptor.match(/token_cmd:\s*(.+)/);
+    if (tcMatch) {
+      try {
+        const parsed = JSON.parse(tcMatch[1].trim());
+        if (Array.isArray(parsed)) return parsed;
+      } catch {}
+      // Handle YAML list format:
+      // token_cmd:
+      //   - auth
+      //   - token
+      const listItems = [];
+      const listMatch = descriptor.match(/token_cmd:\s*\n((?:\s+-\s+.+\n?)+)/);
+      if (listMatch) {
+        for (const line of listMatch[1].split('\n')) {
+          const item = line.replace(/^\s+-\s+/, '').trim();
+          if (item) listItems.push(item);
+        }
+        if (listItems.length) return listItems;
+      }
+    }
+  }
+
+  // Fallback: universal read-only token commands by service key
+  const svc = (serviceContext || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const UNIVERSAL_TOKEN_CMDS = {
+    github:      ['auth', 'token'],
+    aws:         ['sts', 'get-caller-identity'],
+    stripe:      ['config', '--list'],
+    heroku:      ['auth:token'],
+    netlify:     ['status'],
+    fly:         ['auth', 'token'],
+    gcloud:      ['auth', 'print-access-token'],
+    firebase:    ['login:ci'],
+    vercel:      ['whoami'],
+    doctl:       ['auth', 'token'],
+    supabase:    ['status'],
+    railway:     ['whoami'],
+    doppler:     ['me', '--json'],
+    shopify:     ['auth', 'whoami'],
+    wrangler:    ['whoami'],
+    neon:        ['whoami'],
+    turso:       ['auth', 'whoami'],
+    planetscale: ['auth', 'whoami'],
+    kubectl:     ['config', 'current-context'],
   };
-  return TOKEN_CMDS[key] || ['--version'];
+  return UNIVERSAL_TOKEN_CMDS[svc] || null;
 }
 
+// Universal token parser: tries common patterns across all services.
+// Ordered from most-specific to most-general to avoid false positives.
 function parseTokenFromOutput(stdout, secretKey, serviceContext) {
-  const svc = (serviceContext || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const svc  = (serviceContext || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const text = stdout.trim();
+  if (!text) return null;
 
-  if (svc === 'github') {
-    const match = text.match(/^(ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+)/m);
-    return match ? match[1] : (text.length > 10 && !text.includes(' ') ? text : null);
-  }
-  if (svc === 'heroku' || svc === 'fly') {
-    return text.length > 10 && !text.includes('\n') ? text : null;
-  }
-  if (svc === 'stripe') {
-    const match = text.match(/test_secret_key\s*=\s*(sk_test_[A-Za-z0-9]+)/);
-    return match ? match[1] : null;
-  }
-  if (svc === 'aws') {
-    const match = text.match(/^([A-Z0-9]{20}|[A-Za-z0-9/+=]{40})$/m);
-    return match ? match[1] : null;
-  }
+  // Service-specific parsers (high confidence)
+  const SERVICE_PARSERS = {
+    github:   t => { const m = t.match(/^(gh[ps]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/m); return m?.[1] || (t.length > 10 && !/\s/.test(t) ? t : null); },
+    heroku:   t => t.length > 10 && !t.includes('\n') ? t.trim() : null,
+    fly:      t => t.length > 10 && !t.includes('\n') ? t.trim() : null,
+    stripe:   t => { const m = t.match(/(sk_(?:test|live)_[A-Za-z0-9]+)/); return m?.[1] || null; },
+    aws:      t => { const key = t.match(/(?:AccessKeyId|access_key)(?:\s*[:=]\s*|\s+)(\w{16,})/i); const sec = t.match(/(?:SecretAccessKey|secret_key)(?:\s*[:=]\s*|\s+)([A-Za-z0-9/+=]{30,})/i); return secretKey?.toLowerCase().includes('secret') ? (sec?.[1] || null) : (key?.[1] || null); },
+    gcloud:   t => t.match(/^ya29\.[A-Za-z0-9_-]+/m)?.[0] || t.slice(0, 200).trim() || null,
+    firebase: t => t.match(/([A-Za-z0-9_-]{100,})/)?.[1] || null,
+    vercel:   t => t.match(/(\S+@\S+\.\S+)/)?.[1] || null,  // whoami returns email
+    netlify:  t => { const m = t.match(/Logged in as\s+(\S+)/i); return m?.[1] || null; },
+    doppler:  t => { try { return JSON.parse(t)?.token || null; } catch { return null; } },
+    railway:  t => t.match(/([A-Za-z0-9_-]{20,})/)?.[1] || null,
+    doctl:    t => t.match(/([A-Za-z0-9_-]{60,})/)?.[1] || null,
+    supabase: t => { const m = t.match(/API URL:\s*(https:\/\/[^\s]+)/); return m?.[1] || null; },
+  };
+
+  if (SERVICE_PARSERS[svc]) return SERVICE_PARSERS[svc](text);
+
+  // Universal heuristic: if output is a single token-like line, return it
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  if (lines.length === 1 && lines[0].length > 8 && !/\s/.test(lines[0])) return lines[0];
+
+  // Look for key=value or key: value patterns containing the secret key name
+  const keyPattern = (secretKey || '').replace(/_/g, '[_\\s-]*');
+  const kvMatch = text.match(new RegExp(`${keyPattern}\\s*[=:]\\s*([A-Za-z0-9_/+=\\-]{8,})`, 'i'));
+  if (kvMatch) return kvMatch[1];
+
   return null;
 }
 
@@ -469,6 +764,7 @@ async function installSkill(state) {
     skillBuildAskQueue,
     pendingQuestion: _pq,
     progressCallback,
+    llmBackend,
   } = state;
 
   const { name, displayName, description } = skillBuildRequest || {};
@@ -479,8 +775,8 @@ async function installSkill(state) {
     return { ...state, skillBuildPhase: 'error', skillBuildError: 'Missing skill draft or name.' };
   }
 
-  // Step 1: detect required secrets
-  const allSecrets = detectRequiredSecrets(skillBuildDraft, name);
+  // Step 1: detect required secrets — LLM-driven, regex fallback
+  const allSecrets = await detectRequiredSecrets(skillBuildDraft, name, llmBackend || null);
 
   // Build ask queue if first time here (askQueue not yet set)
   const askQueue = skillBuildAskQueue !== undefined
@@ -495,24 +791,48 @@ async function installSkill(state) {
 
     for (const item of askQueue) {
       const resolved = await tryResolveViaCliAgent(item, state.mcpAdapter, logger);
-      if (resolved !== null) {
+      if (typeof resolved === 'string' && resolved.length > 0) {
+        // Silent resolution — CLI extracted the token
         resolvedSecrets[item.key] = resolved;
-        logger.info(`[Node:InstallSkill] cli.agent resolved secret "${item.key}" silently`);
+        logger.info(`[Node:InstallSkill] agent resolved secret "${item.key}" silently`);
+      } else if (resolved && typeof resolved === 'object' && resolved.hintOverride) {
+        // Agent found context but needs user input — upgrade the hint text
+        stillNeeded.push({ ...item, hint: resolved.hintOverride });
       } else {
         stillNeeded.push(item);
       }
     }
 
-    // If cli.agent resolved everything, continue to install with no user prompt
+    // If agent resolved everything silently, continue to install with no user prompt
     if (stillNeeded.length === 0) {
       return { ...state, skillBuildSecrets: resolvedSecrets, skillBuildAskQueue: [], pendingQuestion: null };
     }
 
-    // Otherwise ask user for the first unresolved secret
+    // Otherwise ask user for the first unresolved secret (with agent-enriched hint)
     const next = stillNeeded[0];
     const remaining = stillNeeded.slice(1);
 
     logger.info(`[Node:InstallSkill] Asking for secret: ${next.key}`);
+
+    // Scan the service's login/setup page to get actual field definitions.
+    // This lets the UI card render proper labelled inputs (email, password, API key, etc.)
+    // instead of a single generic text field. Falls back gracefully on timeout/error.
+    let scannedFields = null;
+    if (next.serviceContext) {
+      try {
+        const scanResult = await callCommandService('browser.agent', {
+          action: 'scan_page',
+          service: next.serviceContext,
+          secretKey: next.key,
+        }, 25000);
+        if (scanResult?.ok && scanResult.fields && scanResult.fields.length > 0) {
+          scannedFields = scanResult.fields;
+          logger.info(`[Node:InstallSkill] scan_page: got ${scannedFields.length} field(s) for ${next.serviceContext}`);
+        }
+      } catch (scanErr) {
+        logger.warn(`[Node:InstallSkill] scan_page failed (${scanErr.message}) — using generic input`);
+      }
+    }
 
     if (progressCallback) {
       progressCallback({ type: 'skill_build_phase', phase: 'asking', skillName: name });
@@ -529,6 +849,7 @@ async function installSkill(state) {
         keyLabel: next.label,
         serviceContext: next.serviceContext || null,
         options: [],
+        scannedFields: scannedFields || null,
       },
     };
   }

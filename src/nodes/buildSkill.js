@@ -20,6 +20,7 @@
 'use strict';
 
 const https = require('https');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -66,52 +67,21 @@ function fetchSkillMd(rawUrl) {
   });
 }
 
-// ── System prompt ─────────────────────────────────────────────────────────────
+// ── System prompt — loaded from prompts/build-skill.md ───────────────────────
 
-const CREATOR_SYSTEM_PROMPT = `You are ThinkDrop's Skill Creator Agent. Your job is to write a production-quality ThinkDrop skill in Node.js.
+function loadCreatorSystemPrompt() {
+  try {
+    return fs.readFileSync(path.join(__dirname, '../prompts/build-skill.md'), 'utf8').trim();
+  } catch (_) {
+    return 'You are ThinkDrop\'s Skill Creator Agent. Write a production-quality Node.js CommonJS skill. Output ONLY raw .cjs code.';
+  }
+}
 
-## What ThinkDrop skills are
-ThinkDrop is a desktop AI assistant (Electron/macOS). Skills extend it with new capabilities.
-A skill is a single CommonJS .cjs file that exports one async function:
-  module.exports = async (args) => { ... return string | object; }
-
-## Always-available modules (pre-installed in ThinkDrop runtime — no install needed)
-- All Node.js built-ins: fs, path, os, http, https, crypto, child_process, util, events, stream, url, querystring, buffer
-- keytar — macOS Keychain: const keytar = require('keytar')
-- node-cron — cron scheduling: const cron = require('node-cron')
-
-## Third-party packages (auto-installed per skill — use freely, installer handles it)
-ThinkDrop will automatically run npm install in the skill's own directory for any packages you require.
-Commonly needed ones: twilio, googleapis, nodemailer, axios, openai, node-fetch, cheerio, uuid, lodash
-Example: const twilio = require('twilio') — will be installed automatically.
-
-## Security rules (CRITICAL — validator will reject violations)
-1. NEVER hardcode secrets, API keys, passwords, or tokens in the source.
-2. Use keytar for secrets: const keytar = require('keytar'); await keytar.getPassword('thinkdrop', 'skill:<name>:<KEY>')
-3. NEVER use eval(), new Function(), or dynamic require() with user input.
-4. NEVER access paths outside the user's home directory without explicit args.
-5. Validate all args before use. Return { ok: false, error: '...' } on bad input.
-6. Use const http = require('http') or https for network calls — never fetch() (Node CJS).
-7. All timeouts must have a default (e.g. 10000ms). Never hang indefinitely.
-
-## Skill contract
-- Export: module.exports = async (args) => string | { ok: boolean, output: string, [extras] }
-- On success: return a human-readable string or { ok: true, output: '...' }
-- On failure: return { ok: false, error: '...' }
-- Include a comment block at the top: skill name, description, args schema, returns schema.
-- Keep it focused: one skill = one capability. Do NOT bundle multiple unrelated features.
-
-## If the skill needs an API key or credentials
-Add a setup() pattern at the top of the function:
-  const apiKey = await keytar.getPassword('thinkdrop', 'skill:<name>:API_KEY');
-  if (!apiKey) return { ok: false, error: 'API key not set. Ask the user to provide it.' };
-
-## Output format
-Respond with ONLY the raw .cjs source code. No markdown fences. No explanation. Just the code.`;
+const CREATOR_SYSTEM_PROMPT = loadCreatorSystemPrompt();
 
 // ── Build prompt ──────────────────────────────────────────────────────────────
 
-function buildPrompt({ request, skillMd, feedback, draft, round }) {
+function buildPrompt({ request, skillMd, agentDescriptors, feedback, draft, round }) {
   const { name, displayName, description, category } = request;
 
   let prompt = '';
@@ -120,6 +90,15 @@ function buildPrompt({ request, skillMd, feedback, draft, round }) {
     prompt += `Create a ThinkDrop skill for: "${displayName}"\n`;
     prompt += `Category: ${category}\n`;
     prompt += `Description: ${description}\n\n`;
+
+    if (agentDescriptors && agentDescriptors.length > 0) {
+      prompt += `## Available Agent Descriptors (use EXACTLY these CLI commands, API patterns, and auth flows — do not invent alternatives):\n`;
+      for (const ag of agentDescriptors) {
+        prompt += `\n### ${ag.id} (${ag.type} agent — service: ${ag.service})\n`;
+        prompt += (ag.descriptor || '').slice(0, 2000) + '\n';
+      }
+      prompt += '\n';
+    }
 
     if (skillMd) {
       prompt += `## OpenClaw reference (use as context/guide, NOT as implementation — adapt for ThinkDrop):\n`;
@@ -181,6 +160,50 @@ async function buildSkill(state) {
     }
   }
 
+  // Step 1b: fetch relevant agent descriptors (only on first round)
+  // Find agents whose service matches keywords in the skill name or description.
+  // Injects exact CLI commands and API patterns into the LLM prompt so generated
+  // code uses proven patterns rather than guessing.
+  let agentDescriptors = [];
+  if (skillBuildRound === 1 && state.mcpAdapter) {
+    try {
+      const agentRes = await state.mcpAdapter.callService('command', 'command.automate', {
+        skill: 'cli.agent',
+        args: { action: 'list_agents' },
+      }, { timeoutMs: 4000 }).catch(() => null);
+
+      const allAgents = agentRes?.data?.agents || agentRes?.agents || [];
+      const healthyAgents = allAgents.filter(a => a.status === 'healthy' || a.status === 'degraded');
+
+      if (healthyAgents.length > 0) {
+        // Match agents whose service name appears in the skill name or description
+        const searchText = `${name} ${skillBuildRequest.description || ''}`.toLowerCase();
+        const relevantAgents = healthyAgents.filter(a =>
+          searchText.includes((a.service || '').toLowerCase()) ||
+          searchText.includes((a.id || '').toLowerCase().replace('.agent', ''))
+        );
+
+        if (relevantAgents.length > 0) {
+          // Fetch full descriptors for each relevant agent
+          for (const agent of relevantAgents.slice(0, 3)) {
+            const skillName2 = agent.type === 'browser' ? 'browser.agent' : 'cli.agent';
+            const qRes = await state.mcpAdapter.callService('command', 'command.automate', {
+              skill: skillName2,
+              args: { action: 'query_agent', id: agent.id },
+            }, { timeoutMs: 4000 }).catch(() => null);
+            const descriptor = qRes?.data?.descriptor || qRes?.descriptor || null;
+            if (descriptor) {
+              agentDescriptors.push({ id: agent.id, type: agent.type, service: agent.service, descriptor });
+            }
+          }
+          logger.info(`[Node:BuildSkill] Injecting ${agentDescriptors.length} agent descriptor(s): ${agentDescriptors.map(a => a.id).join(', ')}`);
+        }
+      }
+    } catch (agentErr) {
+      logger.warn(`[Node:BuildSkill] Agent descriptor fetch failed (non-fatal): ${agentErr.message}`);
+    }
+  }
+
   if (progressCallback) {
     progressCallback({ type: 'skill_build_phase', phase: 'building', skillName: name, round: skillBuildRound });
   }
@@ -194,6 +217,7 @@ async function buildSkill(state) {
   const userPrompt = buildPrompt({
     request: skillBuildRequest,
     skillMd,
+    agentDescriptors,
     feedback: skillBuildFeedback,
     draft: skillBuildDraft,
     round: skillBuildRound,

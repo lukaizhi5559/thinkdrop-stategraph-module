@@ -378,39 +378,191 @@ module.exports = async function executeCommand(state) {
   }
 
   // ── needs_skill pseudo-skill ─────────────────────────────────────────────
-  // Emitted by the planner when ThinkDrop cannot fulfill a request natively
-  // and no installed external skill matches. Tells the user what capability
-  // is missing and where to find the scaffolded starter skill contract.
+  // Emitted by the planner when the request requires a persistent background
+  // skill (cron, daemon, webhook) that doesn't exist yet.
+  // Instead of stopping with a scaffold stub, we now:
+  //   1. Infer service name from capability/suggestion
+  //   2. Silently build any missing cli.agent / browser.agent for that service
+  //   3. Show skill_build_confirm card — user approves
+  //   4. Trigger buildSkill pipeline — LLM generates real code with agent descriptors
+  //   5. installSkill resolves credentials via the agent — no manual secret prompts
   if (skill === 'needs_skill') {
     const { capability, suggestion } = args;
+    const originalPrompt = state.message || state.input || state.prompt || '';
 
-    const message = [
-      `I don't have a native skill for: **${capability || 'this request'}**.`,
-      suggestion ? `\n\n${suggestion}` : '',
-      '\n\nOnce you\'ve edited the starter files, say: **"install skill at ~/.thinkdrop/skills/<name>/skill.md"** to activate it.'
-    ].join('');
+    // Derive a clean skill name via LLM — kebab-case, max 4 tokens, service-first
+    // e.g. capability="watch Gmail inbox and send daily SMS summary", suggestion="gmail + twilio"
+    //   → "gmail-daily-sms-summary"
+    let derivedSkillName = 'custom-skill';
+    const llmForName = state.llmBackend || null;
+    if (llmForName) {
+      try {
+        const nameRaw = await Promise.race([
+          llmForName.generateAnswer(`capability: ${capability || ''}\nservices: ${suggestion || ''}\nrequest: ${originalPrompt || ''}`, {
+            query: capability || originalPrompt,
+            context: {
+              conversationHistory: [],
+              systemInstructions: 'Generate a short kebab-case skill name (max 4 words, no stop words) that describes this automation skill. Use the service name first. Examples: "gmail-daily-digest", "github-pr-notifier", "slack-standup-bot", "twilio-weather-sms". Output ONLY the kebab-case name, nothing else.',
+              intent: 'general_query',
+            },
+            options: { maxTokens: 20, temperature: 0.2, fastMode: true },
+          }, { maxTokens: 20, temperature: 0.2, fastMode: true }, null),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+        ]);
+        const candidate = (typeof nameRaw === 'string' ? nameRaw : '')
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9-]/g, '-')
+          .replace(/-+/g, '-')
+          .replace(/^-|-$/g, '')
+          .split('-').slice(0, 4).join('-');
+        if (candidate && candidate.length > 3) derivedSkillName = candidate;
+      } catch (_) {}
+    }
 
-    logger.info(`[Node:ExecuteCommand] needs_skill: capability gap — ${capability}`);
+    // Heuristic fallback: service names from suggestion + first verb from capability
+    if (derivedSkillName === 'custom-skill') {
+      const services = (suggestion || '')
+        .toLowerCase().replace(/[^a-z0-9\s]/g, ' ').trim().split(/[\s+,]+/).filter(w => w.length > 2).slice(0, 2);
+      const verb = (capability || '').toLowerCase().replace(/[^a-z\s]/g, '').trim().split(/\s+/)
+        .find(w => ['send', 'watch', 'monitor', 'sync', 'fetch', 'post', 'notify', 'track', 'alert', 'digest', 'summarize', 'schedule'].includes(w)) || '';
+      const parts = [...services, verb].filter(Boolean).slice(0, 4);
+      if (parts.length > 0) derivedSkillName = parts.join('-');
+    }
+
+    logger.info(`[Node:ExecuteCommand] needs_skill: "${capability}" — triggering build pipeline as "${derivedSkillName}"`);
+
+    // Step 1: infer service + silently build agent before skill generation
+    const _inferSvc = (text) => {
+      const t = (text || '').toLowerCase();
+      const SERVICE_HINTS = [
+        'gmail', 'google', 'github', 'slack', 'discord', 'twilio', 'stripe',
+        'heroku', 'netlify', 'vercel', 'aws', 'gcp', 'firebase', 'notion',
+        'linear', 'jira', 'airtable', 'asana', 'trello', 'monday', 'clickup',
+        'hubspot', 'salesforce', 'shopify', 'intercom', 'zendesk', 'sendgrid',
+        'mailchimp', 'mailgun', 'postmark', 'resend', 'twitch', 'youtube',
+        'twitter', 'instagram', 'linkedin', 'telegram', 'whatsapp', 'dropbox',
+        'figma', 'zoom', 'calendly', 'supabase', 'mongodb', 'postgres', 'redis',
+        'docker', 'kubernetes', 'terraform', 'fly', 'digitalocean', 'cloudflare',
+        'openai', 'anthropic', 'plaid', 'paypal', 'square',
+      ];
+      return SERVICE_HINTS.find(svc => t.includes(svc)) || null;
+    };
+
+    const agentServiceHint = _inferSvc(`${capability} ${suggestion} ${originalPrompt}`);
+    if (agentServiceHint && mcpAdapter) {
+      try {
+        if (progressCallback) progressCallback({
+          type: 'step_start',
+          stepIndex: skillCursor,
+          totalSteps: skillPlan.length,
+          skill: 'cli.agent',
+          description: `Setting up ${agentServiceHint} agent…`,
+        });
+
+        const existingAgent = await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'cli.agent',
+          args: { action: 'query_agent', service: agentServiceHint },
+        }, { timeoutMs: 5000 }).catch(() => null);
+
+        const alreadyHealthy = existingAgent?.data?.found && existingAgent?.data?.status === 'healthy';
+
+        if (!alreadyHealthy) {
+          const buildRes = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'cli.agent',
+            args: { action: 'build_agent', service: agentServiceHint },
+          }, { timeoutMs: 25000 }).catch(() => null);
+
+          if (!buildRes?.data?.ok || buildRes?.data?.needsInstall) {
+            await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'browser.agent',
+              args: { action: 'build_agent', service: agentServiceHint },
+            }, { timeoutMs: 30000 }).catch(() => null);
+          }
+          logger.info(`[Node:ExecuteCommand] needs_skill: agent auto-build for "${agentServiceHint}" complete`);
+        }
+      } catch (agentErr) {
+        logger.warn(`[Node:ExecuteCommand] needs_skill: agent build failed (non-fatal): ${agentErr.message}`);
+      }
+    }
+
+    // Step 2: generate a clean one-sentence description for the confirm card
+    let skillSummary = capability || (originalPrompt.length > 100 ? originalPrompt.slice(0, 100) + '\u2026' : originalPrompt);
+    const llmBackendNeeds = state.llmBackend || null;
+    if (llmBackendNeeds && originalPrompt) {
+      try {
+        const descText = await Promise.race([
+          llmBackendNeeds.generateAnswer(originalPrompt, {
+            query: originalPrompt,
+            context: {
+              conversationHistory: [],
+              systemInstructions: 'Reply with ONE short sentence (max 15 words) describing what this automation skill will do. Use the same language as the user request. No quotes, no preamble.',
+              intent: 'general_query',
+            },
+            options: { maxTokens: 40, temperature: 0.3, fastMode: true },
+          }, { maxTokens: 40, temperature: 0.3, fastMode: true }, null),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+        ]);
+        const text = (typeof descText === 'string' ? descText : '').trim().replace(/^["']|["']$/g, '');
+        if (text && text.length > 5) skillSummary = text;
+      } catch (_) {}
+    }
+
+    // Step 3: show confirm card — user approves before we build
     if (progressCallback) progressCallback({
-      type: 'step_done',
-      stepIndex: skillCursor,
-      totalSteps: skillPlan.length,
-      skill: 'needs_skill',
-      description: description || `Capability gap: ${capability}`,
-      stdout: message
+      type: 'skill_build_confirm',
+      skillName: derivedSkillName,
+      summary: skillSummary,
     });
-    // Auto-trigger the Skill Store UI pre-filtered to this capability gap
+
+    const confirmInstallCallback = state.confirmInstallCallback || null;
+    let confirmed = false;
+    if (typeof confirmInstallCallback === 'function') {
+      try {
+        confirmed = await confirmInstallCallback(derivedSkillName);
+      } catch (_) { confirmed = false; }
+    } else {
+      confirmed = true; // headless/test: auto-confirm
+    }
+
+    if (!confirmed) {
+      logger.info(`[Node:ExecuteCommand] needs_skill: user declined build for "${derivedSkillName}"`);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_skill', description: `Skipped — skill build cancelled` });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_skill', args, description, ok: true, stdout: `Skill build cancelled.` }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false,
+        answer: `I'd need to build the **${derivedSkillName}** skill to do that, but you cancelled. Ask me again any time.`,
+      };
+    }
+
+    // Step 4: trigger buildSkill pipeline — same state shape as missing external.skill
+    logger.info(`[Node:ExecuteCommand] needs_skill: user confirmed — triggering skill build for "${derivedSkillName}"`);
     if (progressCallback) progressCallback({
-      type: 'skill_store_trigger',
-      capability: capability || '',
-      suggestion: suggestion || '',
+      type: 'skill_build_triggered',
+      skillName: derivedSkillName,
+      reason: 'Building and installing skill…',
     });
 
     return {
       ...state,
-      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_skill', args, description, ok: true, stdout: message }],
-      skillCursor: skillCursor + 1,
-      commandExecuted: false
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_skill', args, description, ok: true, stdout: `Building skill: ${derivedSkillName}` }],
+      skillCursor,
+      failedStep: null,
+      commandExecuted: false,
+      skillBuildRequest: {
+        name: derivedSkillName,
+        displayName: derivedSkillName.replace(/-/g, ' '),
+        description: capability || originalPrompt || `Build skill: ${derivedSkillName}`,
+      },
+      skillBuildName: derivedSkillName,
+      skillBuildPhase: 'building',
+      skillBuildRound: 1,
+      skillBuildDraft: null,
+      skillBuildFeedback: null,
+      postBuildResumePlan: skillPlan,
+      postBuildResumeCursor: skillCursor + 1, // advance past the needs_skill step
     };
   }
 
@@ -1470,6 +1622,74 @@ module.exports = async function executeCommand(state) {
         const missingSkillName = resolvedArgs.name || args.name;
         logger.info(`[Node:ExecuteCommand] external.skill "${missingSkillName}" not found — asking user to confirm build`);
 
+        // ── Agent auto-build: silently build missing agent before skill build ──
+        // If the missing skill name implies a service (e.g. "gmail-watcher" → "gmail",
+        // "github-pr-notifier" → "github"), try to build the cli.agent or browser.agent
+        // for that service now so installSkill won't need to prompt for credentials.
+        // Fire-and-forget with a short timeout — never blocks the skill build flow.
+        const _inferServiceFromSkillName = (sName) => {
+          const n = (sName || '').toLowerCase().replace(/[_\-\.]/g, ' ');
+          const SERVICE_HINTS = [
+            'gmail', 'google', 'github', 'slack', 'discord', 'twilio', 'stripe',
+            'heroku', 'netlify', 'vercel', 'aws', 'gcp', 'gcloud', 'firebase',
+            'notion', 'linear', 'jira', 'airtable', 'asana', 'trello', 'monday',
+            'clickup', 'hubspot', 'salesforce', 'shopify', 'intercom', 'zendesk',
+            'sendgrid', 'mailchimp', 'mailgun', 'postmark', 'resend', 'brevo',
+            'twitch', 'youtube', 'twitter', 'instagram', 'linkedin', 'telegram',
+            'whatsapp', 'dropbox', 'figma', 'zoom', 'calendly', 'typeform',
+            'supabase', 'mongodb', 'postgres', 'redis', 'docker', 'kubernetes',
+            'terraform', 'fly', 'digitalocean', 'cloudflare', 'openai', 'anthropic',
+            'plaid', 'paypal', 'square',
+          ];
+          return SERVICE_HINTS.find(svc => n.includes(svc)) || null;
+        };
+
+        const agentServiceHint = _inferServiceFromSkillName(missingSkillName);
+        if (agentServiceHint && mcpAdapter) {
+          try {
+            logger.info(`[Node:ExecuteCommand] Auto-building agent for service "${agentServiceHint}" before skill build`);
+            if (progressCallback) progressCallback({
+              type: 'step_start',
+              stepIndex: skillCursor,
+              totalSteps: skillPlan.length,
+              skill: 'cli.agent',
+              description: `Setting up ${agentServiceHint} agent…`,
+            });
+
+            // Check if agent already exists and is healthy
+            const existingAgent = await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'cli.agent',
+              args: { action: 'query_agent', service: agentServiceHint },
+            }, { timeoutMs: 5000 }).catch(() => null);
+
+            const alreadyHealthy = existingAgent?.data?.found && existingAgent?.data?.status === 'healthy';
+
+            if (!alreadyHealthy) {
+              // Try cli.agent build first (faster — no browser needed)
+              const buildRes = await mcpAdapter.callService('command', 'command.automate', {
+                skill: 'cli.agent',
+                args: { action: 'build_agent', service: agentServiceHint },
+              }, { timeoutMs: 25000 }).catch(() => null);
+
+              const cliBuildOk = buildRes?.data?.ok && !buildRes?.data?.needsInstall;
+
+              // If CLI not available for this service, try browser.agent
+              if (!cliBuildOk) {
+                await mcpAdapter.callService('command', 'command.automate', {
+                  skill: 'browser.agent',
+                  args: { action: 'build_agent', service: agentServiceHint },
+                }, { timeoutMs: 30000 }).catch(() => null);
+              }
+
+              logger.info(`[Node:ExecuteCommand] Agent auto-build for "${agentServiceHint}" complete (cli: ${cliBuildOk})`);
+            } else {
+              logger.info(`[Node:ExecuteCommand] Agent for "${agentServiceHint}" already healthy — skipping build`);
+            }
+          } catch (agentErr) {
+            logger.warn(`[Node:ExecuteCommand] Agent auto-build failed (non-fatal): ${agentErr.message}`);
+          }
+        }
+
         // Emit a confirmation card so the user can approve before we build anything.
         // The card shows the skill name, what it will do, and Build / Cancel buttons.
         // Reuses the existing install:confirm IPC + confirmInstallCallback pattern from main.js.
@@ -1564,12 +1784,12 @@ module.exports = async function executeCommand(state) {
           },
           skillBuildName: missingSkillName,
           skillBuildPhase: 'building',
-          skillBuildRound: 0,
+          skillBuildRound: 1,
           skillBuildDraft: null,
           skillBuildFeedback: null,
           // After build completes, resume the original plan from the failed step
           postBuildResumePlan: skillPlan,
-          postBuildResumeCursor: skillCursor,
+          postBuildResumeCursor: skillCursor + 1, // advance past the missing external.skill step
         };
       }
 

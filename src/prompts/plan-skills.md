@@ -191,6 +191,8 @@ The skill contract's "What this skill does" section describes inputs — extract
 
 **Use `needs_skill` as the FIRST AND ONLY step (no browser.act, no shell.run, no api_suggest before it) when the request requires ongoing background automation that ThinkDrop cannot do natively.**
 
+ThinkDrop will automatically build, install, and configure the skill — including resolving any API credentials. You do NOT need to scaffold files or add a `shell.run` step after `needs_skill`.
+
 ### Always use `needs_skill` immediately for these task types — do NOT attempt browser.act or api_suggest first:
 
 | Task type | Example |
@@ -203,31 +205,35 @@ The skill contract's "What this skill does" section describes inputs — extract
 | Third-party service sync | "sync Notion", "poll Airtable", "monitor my Jira issues" |
 | OAuth-gated data access requiring a long-running daemon | Gmail API, Google Calendar API, Twilio SMS, etc. |
 
-**Why:** These tasks require a persistent background process (cron job, daemon, or webhook) with API credentials. ThinkDrop's browser.act is session-based and cannot run in the background. A custom skill (installed at `~/.thinkdrop/skills/`) is the correct mechanism.
+**Why:** These tasks require a persistent background process (cron job, daemon, or webhook) with API credentials. ThinkDrop's browser.act is session-based and cannot run in the background. A custom skill (installed at `~/.thinkdrop/skills/`) is the correct mechanism. ThinkDrop's agent pipeline handles credential setup automatically.
 
-**Rule:** If the user asks to **watch / monitor / track / poll / summarize on a schedule / send daily/weekly/nightly notifications** involving any external service → emit `needs_skill` immediately. Never navigate to the service's website or suggest an API setup as a substitute.
+**Rule:** If the user asks to **watch / monitor / track / poll / summarize on a schedule / send daily/weekly/nightly notifications** involving any external service → emit `needs_skill` immediately. Never navigate to the service's website, never add a `shell.run` scaffold step, and never suggest an API setup as a substitute.
+
+`capability` should be a concise description of what the skill will do (max 10 words). `suggestion` should name the service(s) involved.
 
 ```json
 [
   {
     "skill": "needs_skill",
     "args": {
-      "capability": "send daily SMS weather alerts",
-      "suggestion": "Create a skill at ~/.thinkdrop/skills/weather.sms.daily/"
-    }
-  },
-  {
-    "skill": "shell.run",
-    "args": {
-      "cmd": "bash",
-      "argv": ["-c", "D=~/.thinkdrop/skills/weather.sms.daily && mkdir -p $D && printf '%s\\n' '---' 'name: weather.sms.daily' 'description: Sends a daily weather SMS summary' 'version: 1.0.0' 'exec_path: ~/.thinkdrop/skills/weather.sms.daily/index.cjs' 'exec_type: node' '---' '' '## What this skill does' 'Fetches weather and sends a daily SMS.' > $D/skill.md && printf '%s\\n' \"'use strict';\" 'module.exports = async function(args) {' '  // TODO: implement skill logic' '  return JSON.stringify(args);' '};' > $D/index.cjs && echo 'Scaffolded at ~/.thinkdrop/skills/weather.sms.daily/'"],
-      "description": "Scaffold starter skill files"
+      "capability": "send daily SMS weather alerts at 9pm",
+      "suggestion": "twilio + openweathermap"
     }
   }
 ]
 ```
 
-After scaffolding, tell the user: **"Starter skill created at `~/.thinkdrop/skills/<name>/`. Edit `index.cjs` with your logic, then say: 'install skill at ~/.thinkdrop/skills/<name>/skill.md' to activate it."**
+```json
+[
+  {
+    "skill": "needs_skill",
+    "args": {
+      "capability": "watch Gmail inbox and send daily SMS summary",
+      "suggestion": "gmail + twilio"
+    }
+  }
+]
+```
 
 ## Installing and removing skills
 
