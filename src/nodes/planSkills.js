@@ -101,19 +101,22 @@ module.exports = async function planSkills(state) {
   // If creatorPlanning ran successfully and skillCreator produced a .skill.cjs,
   // skip all LLM planning — the skill IS the plan. Return a single external.skill
   // step so executeCommand runs it directly with no confirm-build prompt.
-  if (state.creatorSkillName && state.creatorSkillPath && !state.recoveryContext) {
+  // Allow creator fast-path even during recovery replans — creatorSkillName is the
+  // ground truth and must NOT be overridden by LLM hallucination during recovery.
+  if (state.creatorSkillName && state.creatorSkillPath) {
     const fs = require('fs');
     if (fs.existsSync(state.creatorSkillPath)) {
       logger.info(`[Node:PlanSkills] Creator skill ready — bypassing LLM plan, running "${state.creatorSkillName}" directly`);
+      const secretKeys = Array.isArray(state.creatorSkillSecrets) ? state.creatorSkillSecrets : [];
       const skillPlan = [{
         skill: 'external.skill',
-        args:  { name: state.creatorSkillName },
+        args:  { name: state.creatorSkillName, secretKeys },
         description: `Run "${state.creatorSkillName}" (built by creator.agent)`,
       }];
       if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })) });
       return { ...state, skillPlan, skillCursor: 0, recoveryContext: null, planError: null };
     }
-    logger.warn(`[Node:PlanSkills] Creator skill file missing at "${state.creatorSkillPath}" — falling through to LLM plan`);
+    logger.warn(`[Node:PlanSkills] Creator skill file missing at "${state.creatorSkillPath}" — falling through to LLM plan with name constraint`);
   }
 
   logger.debug('[Node:PlanSkills] Planning skill steps...');

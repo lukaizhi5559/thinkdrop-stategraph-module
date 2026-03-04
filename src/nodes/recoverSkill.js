@@ -165,7 +165,7 @@ module.exports = async function recoverSkill(state) {
   }
 
   // ── Fast-path: known recoverable patterns (no LLM call needed) ──────────────
-  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl, replanCount);
+  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl, replanCount, state.creatorSkillPath);
   if (fastRecovery) {
     return applyRecovery(fastRecovery, state, skillPlan, skillCursor, stepRetryCount, replanCount, logger);
   }
@@ -433,7 +433,7 @@ Decide the recovery strategy.`;
 // Fast-path recovery: handle well-known failure patterns without an LLM call
 // ---------------------------------------------------------------------------
 
-function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0) {
+function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0, creatorSkillPath = null) {
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
 
@@ -486,6 +486,59 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
       question: `${instruction}${reason}`,
       options: ['Done, I clicked it', 'Skip this step', 'Cancel']
     };
+  }
+
+  // Cannot find module '<pkg>' on external.skill — auto-install the missing package
+  // This fires when a generated skill requires a npm package that isn't installed yet.
+  // We inject a shell.run npm install step immediately before the failing step and retry.
+  if (skill === 'external.skill' && (combinedError.includes('cannot find module') || combinedError.includes("module not found"))) {
+    const path = require('path');
+    // Extract module name: "Cannot find module 'node-fetch'" → 'node-fetch'
+    const moduleMatch = (error + ' ' + stderr).match(/cannot find module ['"]((?:@[^/"']+\/)?[^/"'@][^"']*)['"]?/i);
+    const missingPkg = moduleMatch ? moduleMatch[1] : null;
+
+    if (missingPkg && stepRetryCount === 0) {
+      // Packages that ship only TypeScript source — npm install succeeds but require() fails
+      // because there is no compiled api.js / index.js. These MUST be replaced with native https.
+      const BROKEN_TS_ONLY_PACKAGES = ['clicksend'];
+      if (BROKEN_TS_ONLY_PACKAGES.includes(missingPkg)) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: '${missingPkg}' is a TS-only package (no compiled JS) → REPLAN with https`);
+        return {
+          action: 'REPLAN',
+          suggestion: `The package '${missingPkg}' ships only TypeScript source and cannot be required in Node.js. Rewrite the skill to use Node.js built-in 'https' module to call the ${missingPkg} REST API directly instead of using the npm package.`,
+          constraint: `NEVER require('${missingPkg}'). Use 'https.request()' with Basic Auth (Buffer.from('username:apiKey').toString('base64')) to call the REST endpoint. Get username and apiKey from context.secrets.`,
+        };
+      }
+
+      // Derive the skill directory: prefer creatorSkillPath (most reliable), then args, then skill name
+      const skillPath = creatorSkillPath || args.skillPath || args.path || null;
+      const skillName = args.name || args.skillName || null;
+      const skillDir = skillPath
+        ? path.dirname(skillPath)
+        : skillName
+          ? path.join(process.env.HOME || '/Users/unknown', '.thinkdrop', 'skills', skillName)
+          : null;
+
+      if (skillDir) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: Cannot find module '${missingPkg}' → INSTALL_AND_RETRY in ${skillDir}`);
+        return {
+          action: 'INSTALL_AND_RETRY',
+          missingPkg,
+          skillDir,
+          note: `Auto-installing missing dependency '${missingPkg}' in ${skillDir}`,
+        };
+      }
+    }
+
+    // Can't determine skill dir — replan with install instruction
+    if (missingPkg) {
+      logger.debug(`[Node:RecoverSkill] Fast-path: Cannot find module '${missingPkg}' (no skillDir) → REPLAN`);
+      return {
+        action: 'REPLAN',
+        suggestion: `The skill failed because '${missingPkg}' is not installed. Add a shell.run step to run 'npm install ${missingPkg}' in the skill directory before running the skill.`,
+        constraint: `Before external.skill, add: shell.run { cmd: 'npm', argv: ['install', '${missingPkg}'], cwd: '~/.thinkdrop/skills', timeoutMs: 60000 }. Then retry external.skill.`
+      };
+    }
   }
 
   // Skill not yet implemented — no amount of replanning will fix this
@@ -895,6 +948,34 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
   const { failedStep } = state;
 
   switch (decision.action) {
+    case 'INSTALL_AND_RETRY': {
+      logger.debug(`[Node:RecoverSkill] INSTALL_AND_RETRY: ${decision.note}`);
+      // Inject npm install step immediately before the failing cursor step
+      const installStep = {
+        skill: 'shell.run',
+        args: {
+          cmd: 'bash',
+          argv: ['-c', `cd "${decision.skillDir}" && [ ! -f package.json ] && echo '{"name":"skill","version":"1.0.0"}' > package.json; npm install --save ${decision.missingPkg}`],
+          timeoutMs: 90000,
+        },
+        description: `Install missing dependency '${decision.missingPkg}'`,
+      };
+      const patchedPlan = [
+        ...skillPlan.slice(0, cursor),
+        installStep,
+        ...skillPlan.slice(cursor),
+      ];
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        skillCursor: cursor,   // retry from the install step (one before the original failing step)
+        failedStep: null,
+        stepRetryCount: stepRetryCount + 1,
+        recoveryNote: decision.note,
+      };
+    }
+
     case 'AUTO_PATCH': {
       logger.debug(`[Node:RecoverSkill] AUTO_PATCH: ${decision.note}`);
       const patchedPlan = skillPlan.map((step, i) => {

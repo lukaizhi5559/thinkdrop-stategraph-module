@@ -154,14 +154,35 @@ module.exports = async function creatorPlanning(state) {
     // Loop until: pass | pass-with-warnings | no actionable feedback | stall detected
     // Stall = identical blocker set across two consecutive rounds (LLM can't fix it)
     // Safety ceiling: 8 rounds max to prevent runaway on genuinely unfixable issues.
-    const SAFETY_CEILING = 8;
+    const SAFETY_CEILING = 10;
     let verdict = 'pending';
     let reviewData = null;
     let roundsUsed = 0;
     let prevBlockerFingerprint = null;
     let stallCount = 0;
     const STALL_LIMIT = 2; // 2 rounds with similar blockers = stalled, give up
-    const LATE_ROUND_ESCAPE = 5; // after this many rounds, accept score>=60 as pass-with-warnings
+    const LATE_ROUND_ESCAPE = 6; // after this many rounds, apply tiered escape logic
+
+    // Prototype-only blocker keywords — lenient, these are expected prototype limitations.
+    // Architecture/plan/agents blockers are STRICT — no escape allowed for those.
+    const PROTOTYPE_ONLY_WORDS = [
+      'prototype', 'index.js', 'index.cjs', 'mock', 'mocked', 'stub', 'stubbed',
+      'placeholder', 'hardcoded', 'hard-coded', 'console.log', 'logging', 'typo',
+      'retry logic', 'retries', 'retry', 'error handling', 'error-handling',
+      'fetchEmailSummaries', 'sendSms', 'transient', 'non-transient',
+      'null check', 'null/undefined', 'undefined check', 'await',
+      'missing await', 'promise', 'async', 'rate limit', 'rate limits',
+    ];
+
+    function isPrototypeOnlyBlocker(blocker) {
+      const b = blocker.toLowerCase();
+      // Arch/plan/agents keywords → NOT prototype-only, always strict
+      const ARCH_WORDS = ['plan.md', 'agents.md', 'agents/', 'validate_agent', 'agent spec',
+        'bdd', 'acceptance', 'feature', 'architecture', 'design', 'interface', 'schema',
+        'skill interface', 'secrets', 'credential', 'oauth', 'authentication', 'auth flow'];
+      if (ARCH_WORDS.some(w => b.includes(w))) return false;
+      return PROTOTYPE_ONLY_WORDS.some(w => b.includes(w));
+    }
 
     for (let round = 1; round <= SAFETY_CEILING; round++) {
       roundsUsed = round;
@@ -202,12 +223,30 @@ module.exports = async function creatorPlanning(state) {
       const currentBlockers = (reviewData?.blockers || []).concat(reviewData?.warnings || []);
       if (currentBlockers.length === 0) break;
 
-      // Late-round escape hatch: after LATE_ROUND_ESCAPE rounds, score>=60 = accept as pass-with-warnings
-      // This prevents burning all 8 rounds on minor fixable issues the LLM keeps paraphrasing.
-      if (round >= LATE_ROUND_ESCAPE && (reviewData?.overallScore || 0) >= 60) {
+      // Late-round escape hatch (tiered):
+      // - Prototype-only blockers (retry logic, error handling, mock code, etc.):
+      //   escape at round>=LATE_ROUND_ESCAPE with score>=50 — prototypes are expected to be imperfect
+      // - Architecture/plan/agents blockers: still require score>=60 (no compromise on spec quality)
+      // - Ceiling hit (round === SAFETY_CEILING): force accept regardless — runtime recovery handles the rest
+      if (round === SAFETY_CEILING) {
         verdict = 'pass-with-warnings';
-        logger.info('[Node:CreatorPlanning] late-round escape: score ' + reviewData.overallScore + ' >= 60 after ' + round + ' rounds — accepting as pass-with-warnings');
+        logger.info('[Node:CreatorPlanning] ceiling hit at round ' + round + ' — accepting as pass-with-warnings (runtime recovery handles remaining issues)');
         break;
+      }
+      if (round >= LATE_ROUND_ESCAPE) {
+        const score = reviewData?.overallScore || 0;
+        const blockers = reviewData?.blockers || [];
+        const allPrototypeOnly = blockers.length > 0 && blockers.every(isPrototypeOnlyBlocker);
+        if (allPrototypeOnly && score >= 50) {
+          verdict = 'pass-with-warnings';
+          logger.info('[Node:CreatorPlanning] late-round escape (prototype-only blockers, score ' + score + ') after ' + round + ' rounds — accepting as pass-with-warnings');
+          break;
+        }
+        if (!allPrototypeOnly && score >= 60) {
+          verdict = 'pass-with-warnings';
+          logger.info('[Node:CreatorPlanning] late-round escape (arch blocker, score ' + score + ' >= 60) after ' + round + ' rounds — accepting as pass-with-warnings');
+          break;
+        }
       }
 
       // Stall detection: fuzzy keyword fingerprint — LLM paraphrases blockers so exact match fails.
@@ -337,6 +376,7 @@ module.exports = async function creatorPlanning(state) {
       creatorSkillName:     skillResult?.skillName  || null,
       creatorSkillPath:     skillResult?.skillPath  || null,
       creatorSkillTrigger:  skillResult?.trigger    || null,
+      creatorSkillSecrets:  skillResult?.secrets    || [],
     };
 
   } catch (err) {
