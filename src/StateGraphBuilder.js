@@ -25,9 +25,8 @@ const parseSkillNode = require('./nodes/parseSkill');
 const synthesizeNode = require('./nodes/synthesize');
 const enrichIntentNode = require('./nodes/enrichIntent');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
-const buildSkillNode = require('./nodes/buildSkill');
-const validateSkillNode = require('./nodes/validateSkill');
-const installSkillNode = require('./nodes/installSkill');
+const creatorPlanningNode = require('./nodes/creatorPlanning');
+const gatherContextNode = require('./nodes/gatherContext');
 
 class StateGraphBuilder {
   /**
@@ -164,19 +163,18 @@ class StateGraphBuilder {
     // Full nodes with intent-based routing
     const nodes = {
       resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter }),
-      parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter }),
+      parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
+      gatherContext: (state) => gatherContextNode({ ...state, logger, mcpAdapter, llmBackend }),
+      creatorPlanning: (state) => creatorPlanningNode({ ...state, logger, mcpAdapter }),
       planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter, llmBackend }),
       recoverSkill: (state) => recoverSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       evaluateSkills: (state) => evaluateSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
-      buildSkill: (state) => buildSkillNode.run({ ...state, logger, mcpAdapter, llmBackend }),
-      validateSkill: (state) => validateSkillNode.run({ ...state, logger, mcpAdapter, llmBackend }),
-      installSkill: (state) => installSkillNode.run({ ...state, logger, mcpAdapter }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
       synthesize: (state) => synthesizeNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -211,13 +209,14 @@ class StateGraphBuilder {
         // MODE B re-route: enrichIntent stored answers and set intent=command_automate
         // or MODE A success: command_automate with profile complete — proceed to plan
         if (intentType === 'command_automate') {
-          logger.debug('[StateGraph:Router] enrichIntent: command_automate — planSkills');
-          return 'planSkills';
-        }
-
-        if (intentType === 'skill_build') {
-          logger.debug('[StateGraph:Router] enrichIntent: skill_build — buildSkill pipeline');
-          return 'buildSkill';
+          // Skill already installed (parseSkill matched) — skip gatherContext + creatorPlanning,
+          // go straight to planSkills which will emit external.skill as the only step.
+          if (state.matchedSkillName) {
+            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${state.matchedSkillName}" — skipping to planSkills`);
+            return 'planSkills';
+          }
+          logger.debug('[StateGraph:Router] enrichIntent: command_automate, no skill match — gatherContext');
+          return 'gatherContext';
         }
 
         // All other intents: route the same as parseIntent used to
@@ -245,6 +244,20 @@ class StateGraphBuilder {
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',
       
+      // gatherContext → creatorPlanning (always, gather is non-blocking if skipped)
+      gatherContext: (state) => {
+        return 'creatorPlanning';
+      },
+
+      // creatorPlanning → planSkills (pass/warnings) or logConversation (reviewer fail)
+      creatorPlanning: (state) => {
+        if (state.planError) {
+          logger.debug(`[StateGraph:Router] creatorPlanning reviewer blocked: ${state.planError}`);
+          return 'logConversation';
+        }
+        return 'planSkills';
+      },
+
       // planSkills → executeCommand (plan ready) or logConversation (plan error)
       planSkills: (state) => {
         if (state.planError && !state.skillPlan) {
@@ -256,11 +269,6 @@ class StateGraphBuilder {
 
       // executeCommand cycle: next step, recover on failure, or done
       executeCommand: (state) => {
-        // Missing external.skill — trigger build pipeline
-        if (state.skillBuildPhase === 'building') {
-          logger.debug('[StateGraph:Router] executeCommand: missing external.skill → buildSkill');
-          return 'buildSkill';
-        }
         // Step failed — route to recovery
         if (state.failedStep) {
           return 'recoverSkill';
@@ -313,41 +321,6 @@ class StateGraphBuilder {
         return 'logConversation';
       },
       
-      // ── Skill build pipeline ───────────────────────────────────────────────
-      // buildSkill → validateSkill → (PASS) installSkill → done
-      //                            → (FAIL, rounds left) buildSkill (fix loop)
-      //                            → (FAIL, max rounds) logConversation (error)
-      // installSkill → (needs secret) logConversation (paused for user input)
-      //              → (smoke FAIL, rounds left) buildSkill (smoke fix loop)
-      //              → (smoke FAIL, max rounds) logConversation (error)
-      //              → (done) logConversation
-      buildSkill: (state) => {
-        if (state.skillBuildPhase === 'error') return 'logConversation';
-        return 'validateSkill';
-      },
-
-      validateSkill: (state) => {
-        const phase = state.skillBuildPhase;
-        if (phase === 'installing') return 'installSkill';
-        if (phase === 'fixing')     return 'buildSkill';
-        if (phase === 'error')      return 'logConversation';
-        return 'logConversation';
-      },
-
-      installSkill: (state) => {
-        const phase = state.skillBuildPhase;
-        if (phase === 'asking')  return 'logConversation'; // paused for user input
-        if (phase === 'fixing')  return 'buildSkill';      // smoke test failed — rebuild
-        if (phase === 'error')   return 'logConversation';
-        // If skill was built on-demand (triggered by missing external.skill), resume original plan
-        if (phase === 'done' && state.skillBuiltOnDemand) {
-          logger.debug('[StateGraph:Router] installSkill done — resuming original executeCommand plan');
-          return 'executeCommand';
-        }
-        if (phase === 'done')    return 'logConversation';
-        return 'logConversation';
-      },
-
       // Screen intelligence path
       screenIntelligence: (state) => {
         // If already has answer (from vision API), log and end

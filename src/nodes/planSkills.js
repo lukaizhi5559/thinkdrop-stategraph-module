@@ -97,6 +97,25 @@ module.exports = async function planSkills(state) {
     return { ...state, resumeFromLogin: false };
   }
 
+  // ── Creator shortcut: skill was already built by creatorPlanning ─────────────
+  // If creatorPlanning ran successfully and skillCreator produced a .skill.cjs,
+  // skip all LLM planning — the skill IS the plan. Return a single external.skill
+  // step so executeCommand runs it directly with no confirm-build prompt.
+  if (state.creatorSkillName && state.creatorSkillPath && !state.recoveryContext) {
+    const fs = require('fs');
+    if (fs.existsSync(state.creatorSkillPath)) {
+      logger.info(`[Node:PlanSkills] Creator skill ready — bypassing LLM plan, running "${state.creatorSkillName}" directly`);
+      const skillPlan = [{
+        skill: 'external.skill',
+        args:  { name: state.creatorSkillName },
+        description: `Run "${state.creatorSkillName}" (built by creator.agent)`,
+      }];
+      if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })) });
+      return { ...state, skillPlan, skillCursor: 0, recoveryContext: null, planError: null };
+    }
+    logger.warn(`[Node:PlanSkills] Creator skill file missing at "${state.creatorSkillPath}" — falling through to LLM plan`);
+  }
+
   logger.debug('[Node:PlanSkills] Planning skill steps...');
   if (progressCallback) progressCallback({ type: 'planning', message: 'Generating skill plan...' });
 
@@ -113,6 +132,22 @@ module.exports = async function planSkills(state) {
 
   const userMessage = resolvedMessage || message;
   const os = process.platform;
+
+  // ── Creator planning context (injected by creatorPlanning node) ────────────
+  // When creator.agent ran before us, inject its structured plan.md + agents.md
+  // so the LLM skill planner has a richer, pre-validated architecture to work from.
+  const creatorPlanMd   = state.creatorPlanMd   || null;
+  const creatorAgentsMd = state.creatorAgentsMd || null;
+  const creatorBddTests = state.creatorBddTests || null;
+  let creatorContextNote = '';
+  if (creatorPlanMd || creatorAgentsMd) {
+    const parts = [];
+    if (creatorPlanMd)   parts.push('## Project Plan (from creator.agent)\n' + creatorPlanMd.slice(0, 2000));
+    if (creatorAgentsMd) parts.push('## Agent Specs (from creator.agent)\n' + creatorAgentsMd.slice(0, 1500));
+    if (creatorBddTests) parts.push('## BDD Acceptance Tests\n' + creatorBddTests.slice(0, 800));
+    creatorContextNote = '\n\nCREATOR PLAN CONTEXT (pre-validated architecture — use this to inform your skill plan):\n' + parts.join('\n\n');
+    logger.info('[Node:PlanSkills] Creator context injected', { planLen: creatorPlanMd?.length, agentsLen: creatorAgentsMd?.length });
+  }
   const homeDir = process.env.HOME || process.env.USERPROFILE || '/Users/unknown';
 
   // Build recovery context suffix if re-planning after failure
@@ -453,7 +488,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
+User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   const payload = {
     query: planningQuery,

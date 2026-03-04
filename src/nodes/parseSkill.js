@@ -25,8 +25,17 @@
  * Graceful degradation: if user-memory service is unavailable, passes through.
  */
 
+const SEMANTIC_SYSTEM_PROMPT = `You are a skill-matching assistant. Given a user's request and a list of installed skills (with names and descriptions), determine if any skill clearly matches what the user wants to do.
+
+Rules:
+- Only match if the skill's purpose CLEARLY covers the user's request — same service, same action type.
+- Do NOT match on loose similarity (e.g. "weather" skill does not match "check my email").
+- If the user is asking to BUILD or CREATE something new, return null — do not match an existing skill.
+- Return ONLY the exact skill name string (e.g. "gmail.daily.summary") or the word null.
+- No explanation, no punctuation, no quotes around the name.`;
+
 module.exports = async function parseSkill(state) {
-  const { mcpAdapter, message, resolvedMessage } = state;
+  const { mcpAdapter, message, resolvedMessage, llmBackend } = state;
   const logger = state.logger || console;
 
   const classifyMessage = (resolvedMessage || message || '').trim();
@@ -88,6 +97,53 @@ module.exports = async function parseSkill(state) {
         return _matchedState(state, skillName);
       }
     }
+  }
+
+  // ── Strategy 3: LLM semantic match ──────────────────────────────────────────
+  // Only fires when both string strategies miss AND we have an LLM backend.
+  // Builds a compact skill menu (name + description) and asks the LLM for a
+  // clear match. Falls through gracefully on timeout, missing backend, or null.
+  if (!llmBackend) {
+    logger.debug(`[Node:ParseSkill] No skill match (no llmBackend for semantic fallback): "${classifyMessage.substring(0, 80)}"`);
+    return state;
+  }
+
+  // Only attempt if at least some skills have descriptions — otherwise the LLM
+  // has nothing useful to compare against.
+  const skillsWithDesc = installedSkills.filter(s => s.description || s.summary);
+  if (skillsWithDesc.length === 0) {
+    logger.debug(`[Node:ParseSkill] No skill match (no descriptions for semantic match): "${classifyMessage.substring(0, 80)}"`);
+    return state;
+  }
+
+  const skillMenu = skillsWithDesc
+    .map(s => `- ${s.name}: ${(s.description || s.summary || '').slice(0, 120)}`)
+    .join('\n');
+
+  const semanticPrompt = `User request: "${classifyMessage}"\n\nInstalled skills:\n${skillMenu}\n\nDoes any skill clearly match this request? Return the exact skill name or null.`;
+
+  try {
+    const raw = await Promise.race([
+      llmBackend.generateAnswer(SEMANTIC_SYSTEM_PROMPT, semanticPrompt, { temperature: 0 }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('semantic timeout')), 5000)),
+    ]);
+
+    const candidate = (raw || '').trim().replace(/^["']|["']$/g, '').toLowerCase();
+
+    if (candidate && candidate !== 'null' && candidate !== 'none' && candidate !== '') {
+      // Verify the returned name is actually an installed skill (LLM can hallucinate)
+      const confirmed = installedSkills.find(s => s.name.toLowerCase() === candidate);
+      if (confirmed) {
+        logger.info(`[Node:ParseSkill] Semantic match: "${classifyMessage.substring(0, 60)}" → skill "${confirmed.name}"`);
+        return _matchedState(state, confirmed.name);
+      } else {
+        logger.debug(`[Node:ParseSkill] Semantic LLM returned unknown skill "${candidate}" — ignoring`);
+      }
+    } else {
+      logger.debug(`[Node:ParseSkill] Semantic LLM returned null — no match`);
+    }
+  } catch (e) {
+    logger.debug(`[Node:ParseSkill] Semantic match skipped: ${e.message}`);
   }
 
   logger.debug(`[Node:ParseSkill] No skill match for: "${classifyMessage.substring(0, 80)}"`);
