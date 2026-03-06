@@ -22,6 +22,9 @@ Only add something to `unknowns` if it is genuinely missing or ambiguous from th
 - **`task_description`** — NEVER ask the user to describe or repeat their task. The user's request IS the task description. It is always complete as given.
 - **`specific_service_email`** — NEVER ask which email service if the user already named one (Gmail, Outlook, Yahoo, iCloud, etc.).
 - **`service_email`** — NEVER ask which email service if the user already named one.
+- **`schedule_tz` / `timezone` / `user_timezone`** — NEVER ask for timezone. It is ALWAYS pre-resolved from the user's OS (injected as `system_tz` in the context). Use `resolvedFacts.system_tz` as the timezone. Never generate this as an unknown.
+- **`schedule_time`** — NEVER ask for the time if the user already stated a time or approximation ("around 9", "9pm", "at night", "9 at night"). Extract it immediately as a resolved fact.
+- **`schedule_frequency`** — NEVER ask for frequency if the user already stated it ("daily", "weekly", "every day", etc.).
 - Any fact that appears in the "Already known" section of the prompt — do NOT re-ask for it.
 - Any service, time, frequency, or platform explicitly mentioned in the user's request — extract it, do NOT ask about it.
 

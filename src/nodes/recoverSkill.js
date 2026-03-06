@@ -206,7 +206,7 @@ module.exports = async function recoverSkill(state) {
     try {
       const snapshotRes = await mcpAdapter.callService('command', 'command.automate', {
         skill: 'browser.act',
-        args: { action: 'getPageSnapshot', sessionId: failedStep.args.sessionId, maxChars: 1200 }
+        args: { action: 'snapshot', sessionId: failedStep.args.sessionId }
       }, { timeoutMs: 8000 });
       const snapshotResult = snapshotRes?.data || snapshotRes;
       if (snapshotResult?.ok && snapshotResult?.result) {
@@ -849,10 +849,11 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
 
   // Command not found — only when the actual binary is missing, not when bash runs a failing script
   // bash/sh/zsh are always present on macOS — never ask to install them
-  const SHELL_INTERPRETERS = ['bash', 'sh', 'zsh', 'python3', 'python', 'node', 'ruby', 'perl'];
-  const isShellInterpreter = SHELL_INTERPRETERS.includes(args.cmd);
-  if (combinedError.includes('command not found') && !isShellInterpreter) {
-    if (skill === 'shell.run') {
+  // Guard: args.cmd only exists for shell.run — other skills (skill.install, browser.act, etc.) don't have it
+  if (skill === 'shell.run' && args.cmd) {
+    const SHELL_INTERPRETERS = ['bash', 'sh', 'zsh', 'python3', 'python', 'node', 'ruby', 'perl'];
+    const isShellInterpreter = SHELL_INTERPRETERS.includes(args.cmd);
+    if (combinedError.includes('command not found') && !isShellInterpreter) {
       logger.debug('[Node:RecoverSkill] Fast-path: command not found → ASK_USER');
       return {
         action: 'ASK_USER',

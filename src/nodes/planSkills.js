@@ -302,7 +302,7 @@ Task: "${userMessage}"`;
           // Navigate
           const navRes = await mcpAdapter.callService('command', 'command.automate', {
             skill: 'browser.act', args: { action: 'navigate', url: startUrl, sessionId: startSessionId }
-          }, { timeoutMs: 15000 }).catch(e => ({ ok: false, error: e.message }));
+          }, { timeoutMs: 35000 }).catch(e => ({ ok: false, error: e.message }));
           const nav = navRes?.data || navRes;
 
           if (nav?.ok !== false) {

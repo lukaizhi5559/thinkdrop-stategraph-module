@@ -244,8 +244,12 @@ class StateGraphBuilder {
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',
       
-      // gatherContext → creatorPlanning (always, gather is non-blocking if skipped)
+      // gatherContext → planSkills (EXECUTE one-shot) or creatorPlanning (BUILD new skill)
       gatherContext: (state) => {
+        if (state.gatherContextSkipped) {
+          logger.debug('[StateGraph:Router] gatherContext skipped (EXECUTE task) — routing direct to planSkills');
+          return 'planSkills';
+        }
         return 'creatorPlanning';
       },
 

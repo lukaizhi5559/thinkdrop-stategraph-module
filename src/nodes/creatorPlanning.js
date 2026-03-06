@@ -52,6 +52,12 @@ module.exports = async function creatorPlanning(state) {
     return state;
   }
 
+  // Skip for one-shot EXECUTE tasks — no skill needs to be built
+  if (state.gatherContextSkipped) {
+    logger.debug('[Node:CreatorPlanning] skipping — one-shot EXECUTE task, no skill build needed');
+    return state;
+  }
+
   if (!mcpAdapter) {
     logger.warn('[Node:CreatorPlanning] no mcpAdapter — cannot run creator pipeline');
     return { ...state, planError: 'Project planning failed: no MCP adapter available' };
