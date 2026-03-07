@@ -130,6 +130,11 @@ function inferIntentFromContent(content) {
 function detectIntentCarryover(message, conversationHistory) {
   const msg = message.trim().toLowerCase().replace(/[?!.]+$/, '');
 
+  // Hard ceiling: messages longer than 15 words have enough content for phi4 to classify
+  // on their own — never treat them as follow-ups regardless of what words they contain.
+  // Genuine conversational continuations ("anything else?", "what about now?") are always short.
+  if (msg.split(/\s+/).length > 15) return null;
+
   // Memory-recall questions NEVER carry command_automate forward.
   // e.g. "how have I sent emails today", "list the email addresses I emailed"
   // These should always go to memory_retrieve, not re-trigger browser automation.
@@ -194,6 +199,7 @@ function detectIntentCarryover(message, conversationHistory) {
   // Signal 3: DEICTIC MEMORY REF — references retrieved content with activity verb.
   // Note: does NOT check hasStandaloneIntent — deictic ref is the stronger signal.
   // "why did I have those open" has 'open' (standalone) but 'those' (deictic) wins.
+  // Long messages are already excluded by the 15-word ceiling above.
   const isDeiticMemoryFollowup = hasDeiticRef && hasActivityVerb;
 
   // Signal 4: SCREEN NOW — short "now" variant (handled via continuation + prior intent)

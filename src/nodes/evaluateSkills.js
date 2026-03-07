@@ -38,6 +38,12 @@ module.exports = async function evaluateSkills(state) {
   const logger = state.logger || console;
   const userMessage = resolvedMessage || message;
 
+  // examine blocked: executeCommand already set answer + examineBlocked=true — skip eval entirely
+  if (state.examineBlocked) {
+    logger.info(`[Node:EvaluateSkills] examineBlocked — skipping evaluation, surfacing user message`);
+    return { ...state, evaluationVerdict: 'ASK_USER' };
+  }
+
   // Failure path: called from recoverSkill REPLAN — skip PASS shortcut, always judge the failure
   if (!evaluationFromFailure) {
     if (!skillPlan || skillPlan.length === 0) return state;
@@ -52,6 +58,35 @@ module.exports = async function evaluateSkills(state) {
     if (replanCount > 0 && allStepsPassed) {
       logger.info(`[Node:EvaluateSkills] Skipping post-run eval — task succeeded after recovery (replanCount=${replanCount})`);
       return { ...state, evaluationVerdict: 'PASS' };
+    }
+    // Skip re-evaluation when synthesize already ran and saved output WITH real content.
+    // BUT: if all browser data-collection steps returned auth walls or empty results,
+    // the synthesize output is hollow — force evaluation so the LLM judge can write
+    // context_rule fixes (e.g. wrong URL, login-required site, selector mismatch).
+    const synthesizeResult = Array.isArray(skillResults) && skillResults.find(r => r.skill === 'synthesize' && r.ok);
+    if (synthesizeResult) {
+      // Check data quality: count browser steps that had real content vs auth walls / empty
+      const browserDataSteps = skillResults.filter(r =>
+        r.skill === 'browser.act' &&
+        (r.args?.action === 'waitForStableText' || r.args?.action === 'getPageText')
+      );
+      const AUTH_WALL_MARKER = /\[auth wall|not logged in|no data collected\]/i;
+      const HOLLOW_CONTENT = /no relevant .{0,60} information|couldn't find .{0,60} data|no .{0,60} results/i;
+      const badDataSteps = browserDataSteps.filter(r => {
+        const out = String(r.stdout || r.result || '');
+        return !out || out.trim().length < 20 || AUTH_WALL_MARKER.test(out);
+      });
+      const synthesizeOutput = String(synthesizeResult.stdout || synthesizeResult.result || '');
+      const allHollow = browserDataSteps.length > 0 && badDataSteps.length === browserDataSteps.length;
+      const outputIsHollow = HOLLOW_CONTENT.test(synthesizeOutput);
+
+      if (allHollow || outputIsHollow) {
+        logger.info(`[Node:EvaluateSkills] Synthesize ran but output is hollow (${badDataSteps.length}/${browserDataSteps.length} data steps were auth walls/empty) — forcing evaluation for self-healing`);
+        // Fall through to evaluation — do NOT skip
+      } else {
+        logger.info(`[Node:EvaluateSkills] Skipping post-run eval — synthesize completed with real content`);
+        return { ...state, evaluationVerdict: 'PASS' };
+      }
     }
     // Skip evaluation for guide.step plans — user hasn't acted yet, nothing to judge
     const hasGuideStep = skillPlan.some(s => s.skill === 'guide.step');

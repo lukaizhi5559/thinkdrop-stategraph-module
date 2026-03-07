@@ -212,6 +212,34 @@ module.exports = async function parseIntent(state) {
     };
   }
 
+  // ── Learned intent override check (before phi4) ───────────────────────────
+  // If the user has previously corrected a misclassification for a similar phrase,
+  // use that stored correction directly. This prevents the same phrasing from ever
+  // misclassifying again without burdening phi4.
+  if (mcpAdapter) {
+    try {
+      const overrideResult = await mcpAdapter.callAction('user-memory', 'intent_override.search', {
+        prompt: classifyMessage
+      });
+      const match = overrideResult?.match;
+      if (match?.correctIntent) {
+        logger.info(`[Node:ParseIntent] Intent override match (sim=${match.similarity?.toFixed(3)}): "${classifyMessage.slice(0, 60)}" → ${match.correctIntent} (learned from: "${match.examplePrompt?.slice(0, 50)}")`);
+        return {
+          ...state,
+          intent: {
+            type: match.correctIntent,
+            confidence: match.similarity,
+            entities: [],
+            requiresMemoryAccess: match.correctIntent === 'memory_retrieve'
+          },
+          metadata: { parser: 'intent-override', processingTimeMs: 0 }
+        };
+      }
+    } catch (e) {
+      logger.debug(`[Node:ParseIntent] intent_override.search skipped: ${e.message}`);
+    }
+  }
+
   // Past-tense action report override — must run BEFORE browser automation override.
   // "sent a message to X", "sent an email to X", "called X", "messaged X", "told X" etc.
   // User is reporting something they did → always memory_store.

@@ -1296,8 +1296,30 @@ module.exports = async function executeCommand(state) {
   }
 
   const externalSkillName = skill === 'external.skill' && resolvedArgs.name ? resolvedArgs.name : null;
-  const stepStartDescription = description || (externalSkillName ? `external.skill — ${externalSkillName}` : skill);
-  logger.debug(`[Node:ExecuteCommand] Step ${skillCursor + 1}/${skillPlan.length}: ${skill}${description ? ` — ${description}` : ''}`);
+  // Build a human-readable label: "browser.act — navigate (perplexity)", "shell.run — bash", etc.
+  function buildRichDescription(sk, args) {
+    if (description) return description;
+    if (sk === 'browser.act') {
+      const action = args.action || '';
+      const session = args.sessionId || '';
+      const urlHost = args.url ? (() => { try { return new URL(args.url).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })() : '';
+      const label = session || urlHost;
+      return label ? `browser.act — ${action} (${label})` : `browser.act — ${action}`;
+    }
+    if (sk === 'shell.run') {
+      const cmd = args.cmd || args.command || '';
+      const argv0 = Array.isArray(args.argv) ? args.argv[0] : '';
+      return cmd ? `shell.run — ${cmd}${argv0 ? ' ' + argv0 : ''}` : 'shell.run';
+    }
+    if (sk === 'synthesize') {
+      const p = (args.prompt || '').slice(0, 40);
+      return p ? `synthesize — ${p}…` : 'synthesize';
+    }
+    if (externalSkillName) return `external.skill — ${externalSkillName}`;
+    return sk;
+  }
+  const stepStartDescription = buildRichDescription(skill, resolvedArgs);
+  logger.debug(`[Node:ExecuteCommand] Step ${skillCursor + 1}/${skillPlan.length}: ${stepStartDescription}`);
   if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription });
 
   // Handle _waitBeforeMs injected by recoverSkill AUTO_PATCH for mid-navigation retries
@@ -1431,6 +1453,36 @@ module.exports = async function executeCommand(state) {
       stepResult.error = `search_no_results: search returned no results for the given query`;
     }
 
+    // ── browser.act examine: NEEDS_USER / authRequired → fail fast with user message ──
+    // When the page examiner detects a condition the user must fix (not logged in,
+    // element doesn't exist, paywall, etc.) surface the message immediately and
+    // halt — no point retrying, the issue requires human action.
+    if (skill === 'browser.act' && resolvedArgs?.action === 'examine' && raw.needsUser) {
+      const examineMsg = raw.userMessage || raw.issue || 'The page is not in the right state to complete this task.';
+      const examineExtras = [];
+      if (raw.missingElements?.length) examineExtras.push(`Missing: ${raw.missingElements.join(', ')}`);
+      if (raw.availableAlternatives?.length) examineExtras.push(`Available: ${raw.availableAlternatives.join(', ')}`);
+      const fullMsg = examineExtras.length ? `${examineMsg} (${examineExtras.join(' | ')})` : examineMsg;
+      logger.warn(`[Node:ExecuteCommand] examine NEEDS_USER: ${fullMsg}`);
+      if (progressCallback) progressCallback({
+        type: 'step_failed',
+        stepIndex: skillCursor,
+        skill,
+        description: description || skill,
+        error: fullMsg,
+        needsUser: true,
+      });
+      return {
+        ...state,
+        skillResults: [...skillResults, { ...stepResult, ok: false, error: fullMsg }],
+        skillCursor,
+        failedStep: { ...stepResult, ok: false, error: fullMsg },
+        commandExecuted: false,
+        answer: fullMsg,
+        examineBlocked: true,
+      };
+    }
+
     const updatedResults = [...skillResults, stepResult];
 
     if (!stepResult.ok && !optional) {
@@ -1500,6 +1552,64 @@ module.exports = async function executeCommand(state) {
         : null;
       const stepDoneDescription = description || (resolvedSkillName ? `external.skill — ${resolvedSkillName}` : skill);
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepDoneDescription, stdout: stepResult.stdout || stepResult.output, exitCode: stepResult.exitCode });
+
+      // ── Auth wall detected by waitForStableText ───────────────────────────
+      // When waitForStableText returns authRequired:true the page is a login wall.
+      // Record it in the step result and fast-forward past any remaining
+      // fill/press/waitForStableText steps for the same sessionId so the plan
+      // continues to the next site automatically — no user intervention needed.
+      if (skill === 'browser.act' && resolvedArgs.action === 'waitForStableText' && raw.authRequired) {
+        const authSessionId = resolvedArgs.sessionId || '';
+        const authSite = (() => {
+          try {
+            // Try to get site name from the URL of the most recent navigate for this session
+            const navStep = [...skillResults].reverse().find(r => r.skill === 'browser.act' && r.args?.action === 'navigate' && r.args?.sessionId === authSessionId);
+            return new URL(navStep?.args?.url || state.activeBrowserUrl || '').hostname.replace(/^www\./, '');
+          } catch (_) { return authSessionId || 'this site'; }
+        })();
+        logger.info(`[Node:ExecuteCommand] Auth wall on ${authSite} (session=${authSessionId}) — skipping remaining steps for this site`);
+
+        // Patch this step's stdout so synthesize sees a meaningful note, not empty
+        stepResult.stdout = `[Auth wall on ${authSite} — not logged in, no data collected]`;
+        stepResult.authRequired = true;
+
+        // Fast-forward: skip all consecutive fill/press/waitForStableText steps
+        // that follow and target the same sessionId (they would just type into the login form)
+        const SKIPPABLE = new Set(['fill', 'type', 'press', 'click', 'waitForStableText', 'waitForContent', 'waitForSelector']);
+        let lookahead = skillCursor + 1;
+        while (lookahead < skillPlan.length) {
+          const next = skillPlan[lookahead];
+          const nextArgs = next?.args || {};
+          const nextAction = nextArgs.action || '';
+          const nextSession = nextArgs.sessionId || '';
+          // Stop skipping when we hit a different site (tab-new, navigate to new URL, or different sessionId)
+          if (next?.skill !== 'browser.act') break;
+          if (!SKIPPABLE.has(nextAction)) break;
+          if (nextSession && nextSession !== authSessionId) break;
+          logger.info(`[Node:ExecuteCommand] Auth wall skip: step ${lookahead + 1} (${nextAction})`);
+          lookahead++;
+        }
+        // Return updated state jumping past the skipped steps
+        if (lookahead > skillCursor + 1) {
+          const skippedCount = lookahead - skillCursor - 1;
+          const skippedResults = skillPlan.slice(skillCursor + 1, lookahead).map((s, i) => ({
+            step: skillCursor + 2 + i,
+            skill: s.skill,
+            args: s.args || {},
+            ok: true,
+            stdout: `[Skipped — auth wall on ${authSite}]`,
+            description: s.description || null,
+          }));
+          logger.info(`[Node:ExecuteCommand] Auth wall: fast-forwarded ${skippedCount} steps`);
+          return {
+            ...state,
+            skillCursor: lookahead - 1,
+            skillResults: [...updatedResults, ...skippedResults],
+            activeBrowserSessionId,
+            activeBrowserUrl,
+          };
+        }
+      }
     }
 
     // Track the active browser sessionId and URL for follow-up tasks

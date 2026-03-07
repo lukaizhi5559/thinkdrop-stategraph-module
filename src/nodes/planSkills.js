@@ -22,6 +22,34 @@
 
 const fs = require('fs');
 
+/**
+ * Build a human-readable description for a plan step.
+ * e.g. { skill: 'browser.act', args: { action: 'navigate', url: 'https://www.perplexity.ai', sessionId: 'perplexity' } }
+ * → "browser.act — navigate (perplexity)"
+ */
+function buildStepDescription(step) {
+  const { skill, args = {} } = step;
+  if (skill === 'browser.act') {
+    const action = args.action || '';
+    const session = args.sessionId || '';
+    const urlHost = args.url ? (() => { try { return new URL(args.url).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })() : '';
+    const label = session || urlHost;
+    return label ? `browser.act — ${action} (${label})` : `browser.act — ${action}`;
+  }
+  if (skill === 'shell.run') {
+    const cmd = args.cmd || args.command || '';
+    const argv0 = Array.isArray(args.argv) ? args.argv[0] : '';
+    return cmd ? `shell.run — ${cmd}${argv0 ? ' ' + argv0 : ''}` : 'shell.run';
+  }
+  if (skill === 'synthesize') {
+    const p = (args.prompt || '').slice(0, 40);
+    return p ? `synthesize — ${p}…` : 'synthesize';
+  }
+  if (skill === 'external.skill') return `external.skill — ${args.name || ''}`;
+  if (skill === 'guide.step') return `guide.step — ${(args.instruction || '').slice(0, 40)}`;
+  return skill;
+}
+
 function loadSystemPrompt() {
   const path = require('path');
   const isWindows = process.platform === 'win32';
@@ -93,7 +121,7 @@ module.exports = async function planSkills(state) {
   // is still valid — just continue from skillCursor. No LLM call needed.
   if (state.resumeFromLogin && Array.isArray(state.skillPlan) && state.skillPlan.length > 0) {
     logger.info(`[Node:PlanSkills] resumeFromLogin=true — skipping replan, resuming existing plan at step ${state.skillCursor + 1}/${state.skillPlan.length}`);
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: state.skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })) });
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: state.skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })) });
     return { ...state, resumeFromLogin: false };
   }
 
@@ -250,10 +278,11 @@ Adjust the plan to avoid the same failure.`;
   // This eliminates all label guessing on the first plan.
   let livePageElements = activeBrowserPageElements;
   let livePageUrl = state.activeBrowserUrl || null;
-  // Pre-scan fires for ALL browser tasks — skip only for pure shell/file/memory tasks.
-  // Rule: if the task has NO browser signal AND is clearly a local/shell/file task → skip.
-  // Otherwise always pre-scan so the LLM knows real page elements (inputs, buttons, links)
-  // before generating the plan — eliminates selector guessing entirely.
+  // Pre-scan fires for interactive browser tasks — skip for pure content-extraction tasks.
+  // Content-only tasks (research, find info, summarize, save to file) only use
+  // navigate + getPageText + synthesize — no element interaction needed, so pre-scan
+  // just wastes 5-10s and opens an extra Chrome window for no reason.
+  const CONTENT_ONLY_TASK = /\b(find (all |the )?(info|information|details|facts|data) (about|on)|research|look up|tell me (all |everything )?about|gather (info|information|facts)|summarize|what (is|are|was|were)|who (is|was|are|were)|history of|biography|explain)\b/i;
   const PURE_LOCAL_TASK = /\b(file\.bridge|fs\.read|file\.watch|check the bridge|the bridge|bridge file|watch the|tail -f|directory listing|repo structure|npm install|git (commit|push|pull|clone|status)|python\s|bash\s|shell\s|convert (this|the) file|read (the|this) file|write (the|this) file)\b/i;
   // Service-automation tasks require a skill to be installed — they can NEVER be done
   // via browser.act. Skip pre-scan entirely so the LLM goes straight to needs_skill.
@@ -272,8 +301,11 @@ Adjust the plan to avoid the same failure.`;
   const isServiceAutomation = SERVICE_AUTOMATION_TASK.test(userMessage) || SCHEDULED_SERVICE_TASK.test(userMessage);
   // A task is a browser task if it mentions any URL, site name, navigation verb, or web concept
   const HAS_BROWSER_SIGNAL = /\b(https?:\/\/|\.com|\.ai|\.org|\.io|\.gov|go to|navigate|open|website|online|web|internet|search|look up|find|research|browse|perplexity|deepseek|chatgpt|claude|gemini|grok|copilot|google|youtube|github\.com|twitter|instagram|facebook|linkedin|reddit|amazon|netflix|spotify|maps|register|apply|passport|visa|dmv|form|portal|login|account|sign up|enroll|appointment|verify|lookup|renew|permit|license)\b/i;
-  const isGuideTask = !activeBrowserPageElements && !recoveryContext && mcpAdapter &&
-    HAS_BROWSER_SIGNAL.test(userMessage) && !PURE_LOCAL_TASK.test(userMessage) && !isServiceAutomation;
+  // Pre-scan is disabled: playwright-cli's snapshot command captures precise YAML
+  // element refs (e1, e21, etc.) on-demand during execution — far better than a
+  // pre-flight scan taken 30s before interaction when page state may have changed.
+  // Plans use navigate → snapshot → interact with live refs at execution time.
+  const isGuideTask = false;
 
   if (isGuideTask) {
     try {
@@ -575,7 +607,7 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
         const retryPlan = parsePlan(retryRaw, logger);
         if (retryPlan && Array.isArray(retryPlan)) {
           logger.debug(`[Node:PlanSkills] Retry succeeded: ${retryPlan.length} steps`);
-          if (progressCallback) progressCallback({ type: 'plan_ready', steps: retryPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })), intent: state.intent?.type || 'command_automate' });
+          if (progressCallback) progressCallback({ type: 'plan_ready', steps: retryPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })), intent: state.intent?.type || 'command_automate' });
           return { ...state, skillPlan: retryPlan, skillCursor: 0, recoveryContext: null, planError: null };
         }
       }
@@ -654,25 +686,40 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
       }
     }
 
-    // ── Stamp missing sessionIds from navigate URL ──────────────────────────
-    // When the LLM generates browser.act steps with no sessionId (common for
-    // single-site tasks), derive it from the navigate step's URL hostname —
-    // the same derivation the command service uses. This prevents subsequent
-    // steps (waitForStableText, smartType, etc.) from falling back to 'default'
-    // and opening a blank tab instead of reusing the page just navigated to.
+    // ── Stamp missing sessionIds ────────────────────────────────────────────
+    // Priority 1: if a pre-scan already opened guideSession at the same URL as
+    // the plan's first navigate step, reuse guideSession so executeCommand calls
+    // 'goto' (reuses the existing window) instead of 'open' (spawns a new one).
+    // Priority 2: fall back to hostname derived from navigate URL.
     if (Array.isArray(skillPlan)) {
       const navigateStep = skillPlan.find(s => s.skill === 'browser.act' && s.args?.action === 'navigate' && s.args?.url);
       const existingSessionIds = new Set(skillPlan.filter(s => s.skill === 'browser.act').map(s => s.args?.sessionId).filter(Boolean));
       const isMultiTab = existingSessionIds.size > 1;
       if (!isMultiTab && navigateStep && !navigateStep.args?.sessionId) {
+        // Check if guideSession pre-scan already opened this URL
+        const preScanSessionId = state.activeBrowserSessionId;
+        const preScanUrl = state.activeBrowserUrl;
         let derivedSession = null;
-        try { derivedSession = new URL(navigateStep.args.url).hostname; } catch (_) {}
+        if (preScanSessionId && preScanUrl && navigateStep.args?.url) {
+          try {
+            const preScanHost = new URL(preScanUrl).hostname;
+            const navHost = new URL(navigateStep.args.url).hostname;
+            if (preScanHost === navHost) {
+              derivedSession = preScanSessionId;
+              logger.info(`[Node:PlanSkills] Stamped missing sessionIds with "${derivedSession}" (reusing pre-scan session — avoids new window)`);
+            }
+          } catch (_) {}
+        }
+        // Fallback: derive from navigate URL hostname
+        if (!derivedSession) {
+          try { derivedSession = new URL(navigateStep.args.url).hostname; } catch (_) {}
+          if (derivedSession) logger.info(`[Node:PlanSkills] Stamped missing sessionIds with "${derivedSession}" (derived from navigate URL)`);
+        }
         if (derivedSession) {
           skillPlan = skillPlan.map(step => {
             if (step.skill !== 'browser.act' || step.args?.sessionId) return step;
             return { ...step, args: { ...step.args, sessionId: derivedSession } };
           });
-          logger.info(`[Node:PlanSkills] Stamped missing sessionIds with "${derivedSession}" (derived from navigate URL)`);
         }
       }
     }
@@ -681,7 +728,7 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
     skillPlan.forEach((s, i) =>
       logger.debug(`  Step ${i + 1}: ${s.skill} — ${s.description || JSON.stringify(s.args)}`)
     );
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.skill, args: s.args })), intent: state.intent?.type || 'command_automate' });
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })), intent: state.intent?.type || 'command_automate' });
 
     // ── RAG learn: if no snippet matched, extract a reusable pattern and save it ─
     // This is fire-and-forget — it runs async after the plan is returned.

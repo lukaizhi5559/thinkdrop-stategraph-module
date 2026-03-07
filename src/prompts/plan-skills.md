@@ -65,7 +65,7 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 
 ## browser.act key actions
 
-navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|select|check|uncheck|press|keyboard|scroll|screenshot|pdf|getText|getPageText|evaluate|waitForSelector|waitForContent|waitForStableText|scanCurrentPage|newPage|tab-new|tab-list|tab-close|tab-select|state-save|state-load|resize
+navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|select|check|uncheck|press|keyboard|scroll|screenshot|pdf|getText|getPageText|evaluate|waitForSelector|waitForContent|waitForStableText|scanCurrentPage|newPage|tab-new|tab-list|tab-close|tab-select|state-save|state-load|resize|examine
 
 **browser.act is a pure playwright-cli terminal skill** — every action spawns a `playwright-cli` subprocess. No Node API, no npm packages. Sessions are managed by playwright-cli daemon via `-s=<sessionId>`. The `snapshot` command captures the accessibility tree and returns numbered element refs (`e1`, `e21`, etc.) used for click/fill/hover.
 
@@ -87,12 +87,63 @@ click/fill/hover automatically take a fresh snapshot and resolve the `selector` 
 - Element refs (`e1`, `e21`, etc.) from a `snapshot` result can be passed directly
 - For typing into a search box without a known label: use `fill` with `selector` set to the placeholder text or visible label
 
+**CRITICAL — AI chatbots use contenteditable divs, not `<input>` fields.**
+`fill` will fail with "Element is not an input/textarea" on most AI chat UIs.
+Use `fill` as normal; the skill handles the fallback. Do NOT add a separate `click` step before `fill`.
+
+**CRITICAL — Multi-site tasks: use ONE sessionId + tabs, NOT multiple sessionIds.**
+Multiple `sessionId`s open SEPARATE browser windows. Use `tab-new` within ONE session instead.
+
+**Multi-site pattern (visiting multiple sites to collect data):**
+```json
+[
+  { "skill": "browser.act", "args": { "action": "navigate", "url": "<site1-url>", "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "snapshot", "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "fill", "selector": "<visible input label or placeholder>", "text": "<query>", "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "press", "key": "Enter", "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "waitForStableText", "timeoutMs": 60000, "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "tab-new", "url": "<site2-url>", "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "snapshot", "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "fill", "selector": "<visible input label or placeholder>", "text": "<query>", "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "press", "key": "Enter", "sessionId": "browser" } },
+  { "skill": "browser.act", "args": { "action": "waitForStableText", "timeoutMs": 60000, "sessionId": "browser" } }
+]
+```
+
+Rules:
+- **ALWAYS add a `snapshot` step immediately after `navigate` or `tab-new` and before `fill`** — this ensures the element tree is fresh for the new page so `fill` targets the correct input
+- **ALL steps use the same `sessionId`** (e.g. `"browser"`) — never switch sessionId mid-plan for multi-site tasks
+- `tab-new` with `url` opens a new tab AND navigates to the URL in one step — no separate `navigate` needed after `tab-new`
+- After `tab-new`, all subsequent actions automatically target the newest tab
+- `tab-select` with `tabIndex: 0` (first tab), `tabIndex: 1` (second), etc. — use to go back to a previous tab
+- `tab-list` — use to check what tabs are open and their indices
+- **Check SITE/APP-SPECIFIC RULES (injected below) before choosing a URL** — learned corrections for specific sites take priority over your defaults
+
 **CRITICAL — General pattern for any interactive site:**
 1. `navigate` → URL — always first
-2. `snapshot` → (optional) force-refresh element tree if page has slow dynamic content
+2. `examine` → **ALWAYS add after `navigate` when the task requires clicking, filling, or finding specific elements** — scans the page against your intent and detects: not logged in, wrong page/section, missing elements, modals blocking content, paywall, etc. If `examine` returns `status !== "OK"`, the plan is aborted with a user-friendly message — no wasted steps.
 3. `fill` → selector=input label, text=query
 4. `press` → key=`Enter`
 5. `waitForStableText` → wait for content to stabilise, returns page text
+
+**`examine` args:**
+- `intent` — what you are trying to do (e.g. `"click the Bible Study project"`)
+- `nextActions` — array of the upcoming step descriptions (e.g. `["click Bible Study", "waitForStableText"]`)
+- `sessionId` — same as other steps
+
+**`examine` status values:**
+- `OK` — page is ready, proceed
+- `RECOVERABLE` — automation can fix it (auto-replans with context_rule written)
+- `NEEDS_USER` — user must act first (not logged in, paywall, item doesn't exist) — **plan stops with clear message**
+- `BLOCKED` — page broken/404
+
+```json
+[
+  { "skill": "browser.act", "args": { "action": "navigate", "url": "https://chat.openai.com", "sessionId": "chatgpt" } },
+  { "skill": "browser.act", "args": { "action": "examine", "intent": "click the Bible Study project", "nextActions": ["click Bible Study"], "sessionId": "chatgpt" } },
+  { "skill": "browser.act", "args": { "action": "click", "selector": "Bible Study", "sessionId": "chatgpt" } }
+]
+```
 
 **Reading page content (no interaction needed):**
 - **Static pages (Wikipedia, news, docs, product pages):** use `getPageText` — returns `document.body.innerText` immediately after `navigate`

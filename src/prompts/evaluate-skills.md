@@ -84,9 +84,26 @@ You will receive a structured execution log. Here is what each field means:
 - Content truncated → fix: use `getPageText` instead of `waitForStableText`
 
 **ASK_USER** — only when:
-- Credentials/login required and no session exists
+- ALL sites failed with auth walls AND no alternative URL is known
 - Retry cap reached (`retryCount >= 2`)
 - Multiple steps failed for unrelated reasons (systemic issue)
+
+**DO NOT emit ASK_USER when only some sites hit auth walls** — emit FIX with corrected URL rules instead.
+
+## Auth wall detection
+
+When a `waitForStableText` result contains `[auth wall` or `[Skipped — auth wall` or result is empty/short AND the synthesize output says "No relevant information", this means the browser was redirected to a login page instead of the actual site.
+
+**Always emit FIX for auth wall failures** with:
+- `category: "navigation"`
+- `ruleText`: the correct alternative URL for that service that does NOT require login, OR a note that this service requires the user to be logged in and the plan should use `guide.step` to prompt login first.
+
+**Auth wall FIX examples:**
+- `x.com` auth wall → `ruleText`: "Use https://grok.com instead of https://x.com/i/grok — x.com redirects to login wall without a session"
+- `gemini.google.com` auth wall → `ruleText`: "gemini.google.com requires Google login. Add a guide.step before fill to prompt user to log in first"
+- `chat.openai.com` auth wall → `ruleText`: "chat.openai.com requires login. Add a guide.step before fill to prompt user to log in first"
+
+Write one FIX rule per affected site (one `contextKey` per response). If multiple sites failed, pick the one most likely to be fixable with a URL change first.
 
 ## ruleText format
 
