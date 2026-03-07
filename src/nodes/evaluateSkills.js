@@ -59,6 +59,28 @@ module.exports = async function evaluateSkills(state) {
       logger.info(`[Node:EvaluateSkills] Skipping post-run eval — task succeeded after recovery (replanCount=${replanCount})`);
       return { ...state, evaluationVerdict: 'PASS' };
     }
+    // Skip post-run evaluation for pure interaction tasks (navigate + click/fill/examine)
+    // when ALL steps passed — there's no content to judge, only actions. The LLM tends to
+    // hallucinate URL mismatches (e.g. chatgpt.com vs chat.openai.com) on these tasks.
+    const CONTENT_ACTIONS = new Set(['getPageText', 'waitForStableText', 'getText', 'scanCurrentPage']);
+    const hasContentStep = skillResults.some(r => CONTENT_ACTIONS.has(r.args?.action));
+    if (!hasContentStep && allStepsPassed) {
+      logger.info(`[Node:EvaluateSkills] Skipping post-run eval — pure interaction task, all steps OK (no content to judge)`);
+      return { ...state, evaluationVerdict: 'PASS' };
+    }
+    // Skip evaluation when the plan was a search/navigation task:
+    // interaction steps (fill/press/click/navigate) ALL passed + content step returned ok:true.
+    // waitForStableText may return sparse content on pages with dynamic ads — that's not a failure.
+    // The LLM judge reliably FIXes on empty waitForStableText even when the search succeeded.
+    const INTERACTION_ACTIONS = new Set(['fill', 'press', 'click', 'navigate', 'goto', 'type', 'examine']);
+    const interactionSteps = skillResults.filter(r => INTERACTION_ACTIONS.has(r.args?.action));
+    const contentSteps = skillResults.filter(r => CONTENT_ACTIONS.has(r.args?.action));
+    const allInteractionPassed = interactionSteps.length > 0 && interactionSteps.every(r => r.ok !== false);
+    const allContentOk = contentSteps.length > 0 && contentSteps.every(r => r.ok !== false);
+    if (allInteractionPassed && allContentOk && evaluationRetryCount === 0) {
+      logger.info(`[Node:EvaluateSkills] Skipping post-run eval — all interaction+content steps OK (interaction task with content polling)`);
+      return { ...state, evaluationVerdict: 'PASS' };
+    }
     // Skip re-evaluation when synthesize already ran and saved output WITH real content.
     // BUT: if all browser data-collection steps returned auth walls or empty results,
     // the synthesize output is hollow — force evaluation so the LLM judge can write
@@ -93,6 +115,53 @@ module.exports = async function evaluateSkills(state) {
     if (hasGuideStep) {
       logger.info(`[Node:EvaluateSkills] Skipping — plan contains guide.step (user interaction pending)`);
       return { ...state, evaluationVerdict: 'PASS' };
+    }
+  }
+
+  // ── Self-healing: detect playwright tool errors and auto-diagnose ──────────
+  // When a browser.act step fails with a known tool-level error (not a page
+  // state error), call browser.act diagnose to probe playwright-cli and write
+  // a permanent context_rule fix — so the system repairs itself without looping.
+  const TOOL_ERROR_PATTERNS = [
+    /TypeError: result is not a function/i,
+    /page\._evaluateFunction/i,
+    /UtilityScript\.evaluate/i,
+    /unexpected token/i,
+    /is not a (function|constructor)/i,
+  ];
+  const failedBrowserSteps = skillResults.filter(r =>
+    r.skill === 'browser.act' && !r.ok &&
+    TOOL_ERROR_PATTERNS.some(p => p.test(String(r.error || r.result || r.stdout || '')))
+  );
+  if (failedBrowserSteps.length > 0 && evaluationRetryCount === 0) {
+    const failedStep = failedBrowserSteps[0];
+    const errorText  = String(failedStep.error || failedStep.result || failedStep.stdout || '').slice(0, 300);
+    const failedAction = failedStep.args?.action || '';
+    logger.info(`[Node:EvaluateSkills] Tool error detected in "${failedAction}" — triggering self-heal diagnose`);
+    try {
+      const diagResult = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'browser.act',
+        args: {
+          action: 'diagnose',
+          failedAction,
+          errorText,
+          sessionId: failedStep.args?.sessionId || 'default',
+        },
+      });
+      const diag = diagResult?.data || diagResult?.raw || diagResult || {};
+      if (diag.fixes && diag.fixes.length > 0) {
+        logger.info(`[Node:EvaluateSkills] Self-heal diagnose: ${diag.fixes[0].slice(0, 120)}`);
+        // Inject fix into state context so planSkills replan has it
+        const healContext = `TOOL FIX (auto-diagnosed): ${diag.fixes.join(' | ')}`;
+        return {
+          ...state,
+          evaluationVerdict: 'FIX',
+          evaluationRetryCount: evaluationRetryCount + 1,
+          context: [...(Array.isArray(state.context) ? state.context : []), healContext],
+        };
+      }
+    } catch (diagErr) {
+      logger.warn(`[Node:EvaluateSkills] Self-heal diagnose failed: ${diagErr.message}`);
     }
   }
 
@@ -207,17 +276,27 @@ Output ONLY valid JSON.`;
   // FIX: store context rule + trigger replan
   if (verdict.verdict === 'FIX' && verdict.contextKey && verdict.ruleText) {
     if (mcpAdapter) {
-      try {
-        await mcpAdapter.callService('user-memory', 'context_rule.upsert', {
-          contextKey: verdict.contextKey,
-          ruleText: verdict.ruleText,
-          contextType: verdict.contextType || 'site',
-          category: verdict.category || 'general',
-          source: 'evaluate_skills_auto'
-        }, { timeoutMs: 5000 });
-        logger.info(`[Node:EvaluateSkills] Stored fix rule for "${verdict.contextKey}": ${verdict.ruleText}`);
-      } catch (storeErr) {
-        logger.warn(`[Node:EvaluateSkills] Failed to store rule: ${storeErr.message}`);
+      // Collect ALL hostnames touched during this run (planned + actual redirects).
+      // Write the rule under every hostname so planSkills finds it regardless of
+      // which domain it searches — this is the dynamic alias solution.
+      const ruleKeys = new Set([verdict.contextKey]);
+      for (const r of (skillResults || [])) {
+        if (r.url) { try { ruleKeys.add(new URL(r.url).hostname.replace(/^www\./, '')); } catch (_) {} }
+        if (r.args?.url) { try { ruleKeys.add(new URL(r.args.url).hostname.replace(/^www\./, '')); } catch (_) {} }
+      }
+      for (const key of ruleKeys) {
+        try {
+          await mcpAdapter.callService('user-memory', 'context_rule.upsert', {
+            contextKey: key,
+            ruleText: verdict.ruleText,
+            contextType: verdict.contextType || 'site',
+            category: verdict.category || 'general',
+            source: 'evaluate_skills_auto'
+          }, { timeoutMs: 5000 });
+          logger.info(`[Node:EvaluateSkills] Stored fix rule for "${key}": ${verdict.ruleText}`);
+        } catch (storeErr) {
+          logger.warn(`[Node:EvaluateSkills] Failed to store rule for "${key}": ${storeErr.message}`);
+        }
       }
     }
 
@@ -246,7 +325,12 @@ Output ONLY valid JSON.`;
         failedStep: (skillPlan || []).length,
         failureReason: verdict.reason,
         suggestion: verdict.retryHint || 'Apply the stored context rule and retry',
-        constraint: verdict.ruleText
+        constraint: verdict.ruleText,
+        // Include the actual URL reached so planSkills knows the real page state
+        actualUrl: (() => {
+          const lastWithUrl = [...(skillResults || [])].reverse().find(r => r.url);
+          return lastWithUrl?.url || state.activeBrowserUrl || null;
+        })()
       }
     };
   }

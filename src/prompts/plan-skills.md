@@ -157,6 +157,7 @@ Rules:
 **NEVER use a fixed `sleep` before reading content.**
 **NEVER use `waitForSelector` to find an input — use `fill` with the label instead.**
 **NEVER navigate to hash-fragment URLs like `#search/query` — use `navigate` + `fill` + `press Enter`.**
+**NEVER click a search button by label (e.g. `click "Search button"`, `click "Go"`, `click "Search"` after fill) — always submit search forms with `press Enter`. Clicking a search button by label is unreliable; `press Enter` always works.**
 
 **Browser tab routing — automatic, session-based:**
 - `sessionId` defaults to the URL hostname (e.g. `en.wikipedia.org`)

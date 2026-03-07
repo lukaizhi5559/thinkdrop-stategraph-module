@@ -218,7 +218,7 @@ module.exports = async function parseIntent(state) {
   // misclassifying again without burdening phi4.
   if (mcpAdapter) {
     try {
-      const overrideResult = await mcpAdapter.callAction('user-memory', 'intent_override.search', {
+      const overrideResult = await mcpAdapter.callService('user-memory', 'intent_override.search', {
         prompt: classifyMessage
       });
       const match = overrideResult?.match;

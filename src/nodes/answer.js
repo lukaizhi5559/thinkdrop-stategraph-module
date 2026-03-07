@@ -350,7 +350,7 @@ module.exports = async function answer(state) {
 
           if (correctIntent && correctIntent !== wrongIntent) {
             logger.info(`[Node:Answer] Intent correction detected: "${prevPrompt.slice(0, 60)}" was ${wrongIntent} → should be ${correctIntent}`);
-            mcpAdapter.callAction('user-memory', 'intent_override.upsert', {
+            mcpAdapter.callService('user-memory', 'intent_override.upsert', {
               examplePrompt: prevPrompt,
               correctIntent,
               wrongIntent,

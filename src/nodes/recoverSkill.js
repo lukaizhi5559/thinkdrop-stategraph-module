@@ -555,6 +555,33 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   if (skill === 'browser.act') {
     const action = args.action || '';
 
+    // Element not found on click — the selector didn't match any link/button on the page.
+    // Fast-path: take a fresh snapshot, then replan with examine + click using the exact snapshot label.
+    // This avoids the LLM guessing ASK_USER and instead self-heals with a new snapshot pass.
+    if ((action === 'click' || action === 'dblclick') &&
+        (combinedError.includes('element not found') || combinedError.includes('could not locate'))) {
+      const sessionId = args.sessionId || 'default';
+      const originalSelector = args.selector || '';
+
+      // Hard loop-break: after 2 replans we've already tried snapshot + examine twice — ask user
+      if (replanCount >= 2) {
+        logger.debug(`[Node:RecoverSkill] Fast-path: element not found after ${replanCount} replans → ASK_USER (loop break)`);
+        return {
+          action: 'ASK_USER',
+          question: `I can't find "${originalSelector}" on the page after ${replanCount} attempts. The element label in the snapshot might differ. Can you tell me the exact text as it appears on the page?`,
+          options: ['Tell me the exact label text', 'Skip this step', 'Cancel']
+        };
+      }
+
+      // First or second failure: take snapshot, use examine to identify real label, replan click
+      logger.debug(`[Node:RecoverSkill] Fast-path: element not found "${originalSelector}" → REPLAN with snapshot+examine`);
+      return {
+        action: 'REPLAN',
+        suggestion: `The element "${originalSelector}" was not found on the page. The actual label in the accessibility tree may differ in case or wording (e.g. "Lemans" vs "LeMans"). Take a fresh snapshot to get real element labels, run examine to identify the correct element, then click using the EXACT label from the snapshot.`,
+        constraint: `CRITICAL: Do NOT use "${originalSelector}" as the selector again — it failed. Steps: (1) browser.act snapshot sessionId="${sessionId}", (2) browser.act examine intent="click ${originalSelector}" sessionId="${sessionId}", (3) browser.act click with the EXACT label text from the snapshot (match case exactly). The sidebar project list uses the exact name as stored — look for case-insensitive variants like "${originalSelector.toLowerCase()}", "${originalSelector.charAt(0).toUpperCase() + originalSelector.slice(1).toLowerCase()}".`
+      };
+    }
+
     // smartFill misuse on non-email pages: smartFill is ONLY for email compose (Gmail/Outlook).
     // If the LLM uses it for a search box or maps input, it always fails with "requires at least one of: to, subject, body".
     // Break the loop immediately — replan with smartType.

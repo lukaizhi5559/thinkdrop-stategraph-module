@@ -186,13 +186,14 @@ module.exports = async function planSkills(state) {
   if (recoveryContext) {
     recoveryNote = `
 
-RECOVERY CONTEXT (previous attempt failed):
+RECOVERY CONTEXT (previous attempt failed — DO NOT repeat the same plan):
 - Failed step: ${recoveryContext.failedSkill} (step ${recoveryContext.failedStep})
 - Failure reason: ${recoveryContext.failureReason}
+- Actual URL reached: ${recoveryContext.actualUrl || 'unknown'}
 - Suggestion: ${recoveryContext.suggestion}
 - Constraint: ${recoveryContext.constraint || 'none'}
 ${recoveryContext.alternativeCwd ? `- Use cwd: "${recoveryContext.alternativeCwd}" instead` : ''}
-Adjust the plan to avoid the same failure.`;
+You MUST produce a DIFFERENT plan than the one that just failed. Use the actual URL above to understand what page is currently loaded. If the search failed, try a different selector, use examine first to identify the correct input, or navigate to a specific search URL directly.`;
   }
 
   // Build prior results context so LLM can resolve references like "that file"
@@ -441,6 +442,18 @@ Task: "${userMessage}"`;
       for (const app of APP_KEYWORDS) {
         if (msgLower.includes(app)) contextKeys.add(app);
       }
+      // Also scan actual visited URLs from prior skillResults — rules may have been
+      // written under the redirect target (e.g. chatgpt.com) not the planned URL.
+      // This is the dynamic alias fix: no hardcoded pairs needed.
+      const priorResults = Array.isArray(state.skillResults) ? state.skillResults : [];
+      for (const r of priorResults) {
+        if (r.url) {
+          try { contextKeys.add(new URL(r.url).hostname.toLowerCase().replace(/^www\./, '')); } catch (_) {}
+        }
+        if (r.args?.url) {
+          try { contextKeys.add(new URL(r.args.url).hostname.toLowerCase().replace(/^www\./, '')); } catch (_) {}
+        }
+      }
 
       const keys = [...contextKeys];
       if (keys.length > 0) {
@@ -623,6 +636,57 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
       };
     }
 
+    // ── URL hallucination guard ─────────────────────────────────────────────
+    // The LLM sometimes echoes a previously-visited wrong URL (e.g. "bibegateway.com")
+    // from conversation history even when the user typed the correct name this time.
+    // Heuristic: planned navigate host-base not found in user message → check if
+    // activeBrowserSessionId is a better match for what the user said this turn.
+    if (Array.isArray(skillPlan) && userMessage) {
+      const navIdx = skillPlan.findIndex(s => s.skill === 'browser.act' && s.args?.action === 'navigate' && s.args?.url);
+      if (navIdx !== -1) {
+        try {
+          const navUrl = skillPlan[navIdx].args.url;
+          const plannedHost = new URL(navUrl).hostname.replace(/^www\./, '');
+          const plannedBase = plannedHost.split('.')[0]; // e.g. "bibegateway"
+          const msgLow = userMessage.toLowerCase();
+          // If the planned base does not appear verbatim in the user message,
+          // and the active session is also that old base — the LLM hallucinated from history.
+          const oldSessionBase = (state.activeBrowserSessionId || '').split('.')[0].toLowerCase();
+          if (!msgLow.includes(plannedBase) && oldSessionBase === plannedBase) {
+            // Extract site-name words (4+ chars) from user message that could be a hostname
+            const siteWords = (msgLow.match(/\b[a-z]{4,}\b/g) || []).filter(w =>
+              !['goto', 'open', 'navigate', 'look', 'find', 'search', 'first', 'john', 'and', 'with', 'that', 'this', 'then', 'when', 'from', 'into', 'about', 'over', 'some', 'have', 'been', 'will', 'your', 'they', 'them', 'what', 'which', 'also', 'just', 'like', 'well', 'very', 'make', 'need', 'want', 'take', 'give', 'come', 'here', 'there', 'where', 'while'].includes(w)
+            );
+            // The correct site name is the siteWord that shares most characters with plannedBase
+            let bestWord = null, bestScore = 0;
+            for (const w of siteWords) {
+              // Simple overlap: count shared chars at start
+              let shared = 0;
+              const minLen = Math.min(w.length, plannedBase.length);
+              for (let i = 0; i < minLen; i++) {
+                if (w[i] === plannedBase[i]) shared++;
+                else break;
+              }
+              if (shared > bestScore) { bestScore = shared; bestWord = w; }
+            }
+            if (bestWord && bestScore >= 4 && bestWord !== plannedBase) {
+              // Build a corrected URL using the user's typed site name
+              const tld = plannedHost.includes('.') ? plannedHost.slice(plannedBase.length) : '.com';
+              const correctedUrl = `https://www.${bestWord}${tld}`;
+              try {
+                new URL(correctedUrl); // validate
+                logger.info(`[Node:PlanSkills] URL hallucination guard: corrected "${navUrl}" → "${correctedUrl}" (user said "${bestWord}", LLM echoed old session "${plannedBase}")`);
+                skillPlan = skillPlan.map((s, i) => {
+                  if (i !== navIdx) return s;
+                  return { ...s, args: { ...s.args, url: correctedUrl } };
+                });
+              } catch (_) { /* invalid URL — leave as-is */ }
+            }
+          }
+        } catch (_) { /* non-fatal */ }
+      }
+    }
+
     // ── Enforce active browser session (single-site follow-ups only) ────────
     // Only reuse the active session when the plan targets a SINGLE sessionId.
     // Multi-tab plans (distinct sessionIds per site) are intentional — don't touch them.
@@ -639,12 +703,6 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
           // Multi-site comparison plan — leave all sessionIds and navigates intact
           logger.debug(`[Node:PlanSkills] Multi-tab plan detected (${plannedSessionIds.size} sessions) — preserving all navigates`);
         } else {
-          // Single-site follow-up — enforce active sessionId and strip redundant navigate
-          skillPlan = skillPlan.map(step => {
-            if (step.skill !== 'browser.act') return step;
-            return { ...step, args: { ...step.args, sessionId: effectiveSessionId } };
-          });
-
           // Check if the navigate step goes to the same domain as the active session
           const navigateStep = skillPlan.find(s => s.skill === 'browser.act' && s.args?.action === 'navigate');
           const activeBrowserUrl = state.activeBrowserUrl || null;
@@ -669,18 +727,53 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
             : false;
 
           const isEvalRetry = (state.evaluationRetryCount || 0) > 0;
+
           if (isSameDomain && !isEvalRetry) {
+            // Same domain — enforce active session and strip redundant navigate
+            skillPlan = skillPlan.map(step => {
+              if (step.skill !== 'browser.act') return step;
+              return { ...step, args: { ...step.args, sessionId: effectiveSessionId } };
+            });
             const withoutNavigate = skillPlan.filter(s => !(s.skill === 'browser.act' && s.args?.action === 'navigate'));
             if (withoutNavigate.length > 0) {
               skillPlan = withoutNavigate;
-              logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — stripped navigate (same domain), ${skillPlan.length} steps remain`);
+              logger.debug(`[Node:PlanSkills] Reused active session "${effectiveSessionId}" — stripped navigate (same domain), ${skillPlan.length} steps remain`);
             }
           } else if (isSameDomain && isEvalRetry) {
-            logger.debug(`[Node:PlanSkills] Eval retry ${state.evaluationRetryCount} — keeping navigate despite same domain (fix rule may change URL)`);
+            // Same domain eval retry — keep navigate but enforce session
+            skillPlan = skillPlan.map(step => {
+              if (step.skill !== 'browser.act') return step;
+              return { ...step, args: { ...step.args, sessionId: effectiveSessionId } };
+            });
+            logger.debug(`[Node:PlanSkills] Eval retry ${state.evaluationRetryCount} — keeping navigate despite same domain`);
           } else if (navigateStep) {
-            logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — kept navigate (different/unknown domain)`);
+            // Different domain — derive session ID from target hostname, NOT the old session.
+            // Using the old session ID (e.g. "chatgpt") for biblegateway steps is misleading
+            // in the UI and can confuse snapshot cache lookups.
+            let targetSessionId;
+            try {
+              const targetHost = new URL(navigateStep.args.url).hostname.replace(/^www\./, '');
+              // Use first segment of hostname as session name (e.g. "biblegateway" from "biblegateway.com")
+              targetSessionId = targetHost.split('.')[0];
+            } catch (_) {
+              targetSessionId = effectiveSessionId;
+            }
+            // Only override steps that have no sessionId or still carry the old one
+            skillPlan = skillPlan.map(step => {
+              if (step.skill !== 'browser.act') return step;
+              const sid = step.args?.sessionId;
+              // If the LLM already chose a distinct session, respect it
+              if (sid && sid !== effectiveSessionId) return step;
+              return { ...step, args: { ...step.args, sessionId: targetSessionId } };
+            });
+            logger.debug(`[Node:PlanSkills] Different domain — reassigned session "${effectiveSessionId}" → "${targetSessionId}" for new navigate`);
           } else {
-            logger.debug(`[Node:PlanSkills] Reused active session "${activeBrowserSessionId}" — no navigate step`);
+            // No navigate — keep active session
+            skillPlan = skillPlan.map(step => {
+              if (step.skill !== 'browser.act') return step;
+              return { ...step, args: { ...step.args, sessionId: effectiveSessionId } };
+            });
+            logger.debug(`[Node:PlanSkills] Reused active session "${effectiveSessionId}" — no navigate step`);
           }
         }
       }
