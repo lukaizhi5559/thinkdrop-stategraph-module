@@ -442,6 +442,39 @@ describe('parseDateRange — relative time expressions', () => {
   });
 });
 
+describe('parseDateRange — N days ago with time modifiers', () => {
+  it('"2 days ago" → full day 2026-02-19', () => {
+    const r = withFixedDate(() => parseDateRange('what was I doing 2 days ago'));
+    expect(r?.startDate).toBe('2026-02-19 00:00:00');
+    expect(r?.endDate).toBe('2026-02-19 23:59:59');
+  });
+  it('"two days ago" → full day 2026-02-19 (word number normalised)', () => {
+    const r = withFixedDate(() => parseDateRange('what was I doing two days ago'));
+    expect(r?.startDate).toBe('2026-02-19 00:00:00');
+    expect(r?.endDate).toBe('2026-02-19 23:59:59');
+  });
+  it('"2 days ago around the same time" → full day 2026-02-19 (not today)', () => {
+    const r = withFixedDate(() => parseDateRange('what about 2 days ago around the same time'));
+    expect(r?.startDate).toBe('2026-02-19 00:00:00');
+    expect(r?.endDate).toBe('2026-02-19 23:59:59');
+  });
+  it('"2 days ago around noon" → noon ±30m on 2026-02-19', () => {
+    const r = withFixedDate(() => parseDateRange('what was I doing 2 days ago around noon'));
+    expect(r?.startDate).toBe('2026-02-19 11:30:00');
+    expect(r?.endDate).toBe('2026-02-19 12:30:59');
+  });
+  it('"3 days ago 9 - 11am" → 09:00 to 11:59 on 2026-02-18', () => {
+    const r = withFixedDate(() => parseDateRange('what was I doing 3 days ago 9 - 11am'));
+    expect(r?.startDate).toBe('2026-02-18 09:00:00');
+    expect(r?.endDate).toBe('2026-02-18 11:59:59');
+  });
+  it('"4 days ago at 3pm" → 14:30 to 15:30 on 2026-02-17', () => {
+    const r = withFixedDate(() => parseDateRange('what was I doing 4 days ago at 3pm'));
+    expect(r?.startDate).toBe('2026-02-17 14:30:00');
+    expect(r?.endDate).toBe('2026-02-17 15:30:59');
+  });
+});
+
 describe('parseDateRange — named months', () => {
   it('"in January" → full January of current or prior year', () => {
     const r = withFixedDate(() => parseDateRange('what did we discuss in January'));

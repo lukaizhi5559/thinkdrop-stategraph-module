@@ -127,8 +127,9 @@ function parseDateRange(message) {
     return { startDate: iso(startOf(d)), endDate: iso(endOf(d)) };
   }
 
-  // "around 3", "at 3pm", "at noon" (without today/yesterday — assume today)
-  if (!q.match(/\b(today|yesterday|this|last|week|month|year)\b/)) {
+  // "around 3", "at 3pm", "at noon" (without today/yesterday/ago — assume today)
+  // Must exclude 'ago' to prevent '2 days ago around noon' from matching here
+  if (!q.match(/\b(today|yesterday|this|last|week|month|year|ago)\b/)) {
     const tod = parseTimeOfDay(q);
     if (tod) {
       const windowMins = 30;
@@ -179,7 +180,8 @@ function parseDateRange(message) {
   }
 
   // Time-of-day range: "6 to 9am", "around 6 to 9am", "between 6am and 9am", "9 - 11am"
-  const timeRangeMatch = q.match(/\b(\d{1,2})(?::(\d{2}))?\s*(?:am|pm)?\s*(?:to|and|-)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+  // Guard: skip if 'ago' is present — let daysAgoMatch / weeksAgoMatch handle it
+  const timeRangeMatch = !/\bago\b/.test(q) && q.match(/\b(\d{1,2})(?::(\d{2}))?\s*(?:am|pm)?\s*(?:to|and|-)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
   if (timeRangeMatch) {
     const h1 = parseInt(timeRangeMatch[1]);
     const m1 = timeRangeMatch[2] ? parseInt(timeRangeMatch[2]) : 0;
@@ -208,9 +210,33 @@ function parseDateRange(message) {
   }
 
   // N days ago (e.g. "4 days ago", "what was I doing 4 days ago")
+  // Also handles "N days ago around Xam", "N days ago between X and Y", "N days ago around the same time"
   const daysAgoMatch = q.match(/\b(\d+)\s+days?\s+ago\b/);
   if (daysAgoMatch) {
     const d = new Date(now); d.setDate(d.getDate() - parseInt(daysAgoMatch[1]));
+    // Check for explicit time range: require at least one am/pm to avoid matching digits in "3 days ago"
+    const trm = q.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:to|and|-)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/);
+    if (trm) {
+      let h1 = parseInt(trm[1]), m1 = trm[2] ? parseInt(trm[2]) : 0;
+      let h2 = parseInt(trm[4]), m2 = trm[5] ? parseInt(trm[5]) : 59;
+      const mer1 = trm[3], mer2 = trm[6];
+      const mer = mer2 || mer1;
+      if (mer === 'pm' && h2 < 12) { if (h1 < 12 && !mer1) h1 += 12; h2 += 12; }
+      else if (mer === 'am' && h1 === 12) h1 = 0;
+      const start = new Date(d); start.setHours(h1, m1, 0, 0);
+      const end   = new Date(d); end.setHours(h2, m2, 59, 999);
+      return { startDate: iso(start), endDate: iso(end) };
+    }
+    // Check for single time-of-day ("around noon", "at 3pm")
+    const tod = parseTimeOfDay(q);
+    if (tod && !/\bsame\b/.test(q)) {
+      const windowMins = 30;
+      const start = new Date(d); start.setHours(tod.hour, 0, 0, 0); start.setMinutes(tod.minute - windowMins);
+      const end   = new Date(d); end.setHours(tod.hour, 0, 0, 0);   end.setMinutes(tod.minute + windowMins);
+      end.setSeconds(59);
+      return { startDate: iso(start), endDate: iso(end) };
+    }
+    // "around the same time" / "same hours" — return full day, let caller inherit prior range
     return { startDate: iso(startOf(d)), endDate: iso(endOf(d)) };
   }
 
