@@ -83,8 +83,9 @@ click/fill/hover automatically take a fresh snapshot and resolve the `selector` 
 ```
 
 **Selector rules:**
-- Pass the **visible label or aria-name** as `selector` (e.g. `"Sign in"`, `"Email"`, `"Search"`)
-- Element refs (`e1`, `e21`, etc.) from a `snapshot` result can be passed directly
+- **When CURRENT PAGE ELEMENTS are provided above with `[eN]` refs: use the `eN` ref as the `selector` value — do NOT use the label text.** e.g. `"selector": "e42"` not `"selector": "Bible Study"`
+- **When `[eN]` refs are provided, NEVER add an `examine` step** — the refs are already known and up-to-date.
+- When no refs are provided (fresh navigate with no pre-scan): pass the **visible label or aria-name** as `selector` (e.g. `"Sign in"`, `"Email"`, `"Search"`)
 - For typing into a search box without a known label: use `fill` with `selector` set to the placeholder text or visible label
 
 **CRITICAL — AI chatbots use contenteditable divs, not `<input>` fields.**
@@ -93,6 +94,7 @@ Use `fill` as normal; the skill handles the fallback. Do NOT add a separate `cli
 
 **CRITICAL — Multi-site tasks: use ONE sessionId + tabs, NOT multiple sessionIds.**
 Multiple `sessionId`s open SEPARATE browser windows. Use `tab-new` within ONE session instead.
+**NEVER use site names as sessionIds** (e.g. `"perplexity"`, `"chatgpt"`, `"gemini"`) when visiting multiple sites — always use a single generic name like `"browser"` for ALL steps in the plan.
 
 **Multi-site pattern (visiting multiple sites to collect data):**
 ```json

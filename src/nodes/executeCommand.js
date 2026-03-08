@@ -181,18 +181,27 @@ module.exports = async function executeCommand(state) {
     // Check if any image.analyze step produced a description — surface it directly
     const imageAnalyzeResult = [...skillResults].reverse().find(r => r.skill === 'image.analyze' && r.ok && r.stdout);
 
+    // Last waitForStableText/getPageText result — the actual page content the user asked for.
+    // waitForStableText returns `result` (string), getPageText returns `stdout`.
+    const pageTextResult = [...skillResults].reverse().find(r =>
+      r.skill === 'browser.act' && r.ok &&
+      ['waitForStableText', 'getPageText'].includes(r.args?.action) &&
+      (r.result || r.stdout)
+    );
+    const pageTextContent = pageTextResult
+      ? (typeof pageTextResult.result === 'string' && pageTextResult.result ? pageTextResult.result : pageTextResult.stdout)
+      : null;
+
     let answer;
-    if (failedCount === 0) {
-      if (imageAnalyzeResult) {
-        answer = imageAnalyzeResult.stdout;
-      } else if (hasBrowserSteps && lastBrowserResult?.url) {
-        const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
-        answer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
-      } else {
-        answer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
-      }
+    if (imageAnalyzeResult) {
+      answer = imageAnalyzeResult.stdout;
+    } else if (pageTextContent) {
+      answer = pageTextContent.trim();
+    } else if (hasBrowserSteps && lastBrowserResult?.url) {
+      const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
+      answer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
     } else {
-      const imageAnalyzeFailure = skillResults.find(r => r.skill === 'image.analyze' && !r.ok);
+      answer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
       answer = imageAnalyzeFailure
         ? `Image analysis failed: ${imageAnalyzeFailure.error || 'unknown error'}`
         : `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`;
@@ -1054,9 +1063,20 @@ module.exports = async function executeCommand(state) {
       }
     }
 
-    const synthesisContext = allContextParts.length > 0
+    const _rawSynthesisContext = allContextParts.length > 0
       ? allContextParts.join('\n\n')
       : crossTurnContext || skillResults.filter(r => r.ok && r.result).map(r => String(r.result)).join('\n\n');
+    // Cap context to ~60k chars (~15k tokens) to prevent LLM context overflow on large fs.read/explore results.
+    // Trim from the middle so we keep the directory tree (start) and most recent file content (end).
+    const _SYNTH_CTX_LIMIT = 60000;
+    const synthesisContext = _rawSynthesisContext.length > _SYNTH_CTX_LIMIT
+      ? (() => {
+          const half = Math.floor(_SYNTH_CTX_LIMIT / 2);
+          const trimmed = _rawSynthesisContext.slice(0, half) + '\n\n[... content truncated for length ...]\n\n' + _rawSynthesisContext.slice(_rawSynthesisContext.length - half);
+          logger.warn(`[Node:ExecuteCommand] synthesize: context truncated from ${_rawSynthesisContext.length} → ${trimmed.length} chars`);
+          return trimmed;
+        })()
+      : _rawSynthesisContext;
 
     const synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
     let synthesisFilePath = args.saveToFile || null;
@@ -1104,6 +1124,8 @@ module.exports = async function executeCommand(state) {
       // Use file-editing instructions when shell stdout is present (file content), otherwise use web research instructions
       const hasFileContent = shellStdoutResults.length > 0;
       const hasImageAnalysis = imageAnalyzeResults.length > 0 || crossTurnContext.includes('Image analysis:');
+      const _editKeywords = /\b(edit|modify|update|change|replace|rewrite|add|remove|delete|insert|append|fix|correct|rename|move|sort|format|clean up)\b/i;
+      const isFileEdit = hasFileContent && _editKeywords.test(synthesisPrompt);
       const synthesisQuery = hasFileContent
         ? `${synthesisPrompt}\n\nHere is the current file content:\n\n${synthesisContext}`
         : `${synthesisPrompt}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
@@ -1145,8 +1167,10 @@ module.exports = async function executeCommand(state) {
       const _synthLangSuffix = (_synthLang && _synthLang !== 'en')
         ? `\n\nIMPORTANT: The user wrote in ${_SYNTH_LANG_NAMES[_synthLang] || _synthLang}. You MUST respond entirely in ${_SYNTH_LANG_NAMES[_synthLang] || _synthLang}.`
         : '';
-      const synthesisInstructions = (hasFileContent
+      const synthesisInstructions = (isFileEdit
         ? `You are a file editing assistant. The user has asked you to modify a file. You have been given the current file content. Your job is to output the COMPLETE updated file content with ONLY the requested changes applied. Output the full file text only — no preamble, no explanation, no markdown code fences, no commentary. Preserve all existing structure, headings, and formatting. Only change what was explicitly requested.`
+        : hasFileContent
+        ? `You are a document analyst. The user has asked you to analyze, summarize, or explain the contents of one or more files. You have been given the raw file content. Your job is to provide a clear, well-structured explanation of what the file(s) contain — describe the purpose, key information, structure, and any notable details. Do NOT just repeat or list the raw content. Write in plain prose with headings where helpful. Be concise and informative.`
         : hasImageAnalysis
         ? `You are a report writer. The user has analyzed a folder of images/screenshots and wants a summary. You have been given the vision AI analysis of each image. Write a clear, structured report using ONLY the actual file names and descriptions provided — do NOT invent or guess file names, sizes, or content. Use the exact file path from each "Image analysis: <path>" heading as the file name.`
         : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual.`) + _synthLangSuffix;
@@ -1621,10 +1645,16 @@ module.exports = async function executeCommand(state) {
       : state.activeBrowserUrl || null;
 
     // ── Post-navigate scan ────────────────────────────────────────────────────
-    // After every successful navigate, scan the live page to get real elements.
-    // This fires for ALL next steps (not just highlight) so smartType, click, and
-    // any subsequent step gets accurate element context — no selector guessing.
-    if (skill === 'browser.act' && resolvedArgs.action === 'navigate' && stepResult.ok && resolvedArgs.sessionId && mcpAdapter) {
+    // After every successful navigate OR press Enter (form submit → navigation),
+    // scan the live page to get real elements for the next step.
+    const isPressEnter = skill === 'browser.act' && resolvedArgs.action === 'press' && /^(Enter|Return)$/i.test(resolvedArgs.key || resolvedArgs.text || '');
+    // Skip scan when the next plan step is already snapshot/examine/scanCurrentPage —
+    // running scanCurrentPage + snapshot concurrently on the same playwright-cli session
+    // causes a race that kills the session ("Session closed" error).
+    const nextPlanStep = skillPlan[skillCursor + 1];
+    const nextIsSnapshot = nextPlanStep?.skill === 'browser.act' &&
+      ['snapshot', 'examine', 'scanCurrentPage'].includes(nextPlanStep?.args?.action);
+    if (skill === 'browser.act' && (resolvedArgs.action === 'navigate' || isPressEnter) && stepResult.ok && resolvedArgs.sessionId && mcpAdapter && !nextIsSnapshot) {
       const navSessionId = resolvedArgs.sessionId;
       try {
         const scanRes = await mcpAdapter.callService('command', 'command.automate', {
@@ -1835,9 +1865,58 @@ module.exports = async function executeCommand(state) {
         ? [...updatedResults].reverse().find(r => r.skill === 'browser.act' && r.ok)
         : null;
       const imageAnalyzeResult = [...updatedResults].reverse().find(r => r.skill === 'image.analyze' && r.ok && r.stdout);
+      // Last waitForStableText/getPageText result — the actual page content the user asked for.
+      // waitForStableText returns `result` (string), getPageText returns `stdout`.
+      const pageTextResult = [...updatedResults].reverse().find(r =>
+        r.skill === 'browser.act' && r.ok &&
+        ['waitForStableText', 'getPageText'].includes(r.args?.action) &&
+        (r.result || r.stdout)
+      );
+      const pageTextContent = pageTextResult
+        ? (typeof pageTextResult.result === 'string' && pageTextResult.result ? pageTextResult.result : pageTextResult.stdout)
+        : null;
 
       if (imageAnalyzeResult) {
         lastStepAnswer = imageAnalyzeResult.stdout;
+      } else if (pageTextContent) {
+        // Raw innerText may have literal "\n" escape sequences (from JSON serialization) — convert to real newlines.
+        // Also collapse runs of 3+ blank lines into 2 so the output isn't excessively spaced.
+        const cleanedPageText = pageTextContent
+          .replace(/\\n/g, '\n')       // literal \n → real newline
+          .replace(/\\t/g, '\t')       // literal \t → real tab
+          .replace(/\n{3,}/g, '\n\n')  // 3+ blank lines → 2
+          .trim();
+        // Synthesize a concise answer via LLM instead of dumping raw page text.
+        // Truncate page content to ~8k chars for the LLM context window.
+        if (state.llmBackend && cleanedPageText.length > 50) {
+          try {
+            const truncatedText = cleanedPageText.slice(0, 8000);
+            const originalPrompt = state.message || '';
+            const synthesized = await state.llmBackend.generateAnswer(
+              truncatedText,
+              {
+                query: originalPrompt,
+                context: {
+                  systemInstructions: `You are a helpful assistant. The user asked: "${originalPrompt}"\n\nBelow is the raw text extracted from the browser page. Summarize what was found in a concise, human-readable response (2-5 sentences or a short bullet list). Focus on what directly answers the user's request. Do not repeat the full page text — extract the key information only.`,
+                  conversationHistory: [],
+                  intent: 'command_automate',
+                },
+                options: { maxTokens: 300, temperature: 0.3 },
+              },
+              { maxTokens: 300, temperature: 0.3 },
+              null
+            ).catch(() => null);
+            if (synthesized && synthesized.trim()) {
+              lastStepAnswer = synthesized.trim();
+            } else {
+              lastStepAnswer = cleanedPageText;
+            }
+          } catch (_) {
+            lastStepAnswer = cleanedPageText;
+          }
+        } else {
+          lastStepAnswer = cleanedPageText;
+        }
       } else if (hasBrowserSteps && lastBrowserResult?.url) {
         const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
         lastStepAnswer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;

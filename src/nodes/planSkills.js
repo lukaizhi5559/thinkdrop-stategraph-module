@@ -249,10 +249,11 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
     browserSessionNote = `\n\nACTIVE BROWSER SESSION: sessionId="${activeBrowserSessionId}" is already open.${activeUrlNote} Use this EXACT sessionId for all browser.act steps. If the task targets a DIFFERENT website than the current URL, include a browser.act navigate step first. If the task is a follow-up on the SAME site, skip navigate.`;
     if (activeBrowserPageElements?.elements?.length > 0) {
       const elList = activeBrowserPageElements.elements
-        .slice(0, 40)
-        .map(e => `  - [${e.tag}] "${e.label}"${e.href ? ` → ${e.href}` : ''}`)
+        .slice(0, 60)
+        .map(e => `  - [${e.ref || ''}] ${e.tag} "${e.label}"${e.href ? ` → ${e.href}` : ''}`)
         .join('\n');
-      browserSessionNote += `\n\nCURRENT PAGE ELEMENTS (${activeBrowserPageElements.url}):\nUse ONLY these exact labels in highlight steps — do not invent labels:\n${elList}`;
+      const hasRefs = activeBrowserPageElements.elements.some(e => e.ref);
+      browserSessionNote += `\n\nCURRENT PAGE ELEMENTS (${activeBrowserPageElements.url}):\n${hasRefs ? 'Use the [eN] ref as the selector value for click/fill/hover — do NOT use the label text as selector when a ref is provided. Skip examine steps — refs are already known.' : 'Use ONLY these exact labels as selectors — do not invent labels.'}\n${elList}`;
     }
   }
 
@@ -374,13 +375,14 @@ Task: "${userMessage}"`;
       return !completedLabels.has(e.label.toLowerCase().trim());
     });
     const elList = filteredEls
-      .slice(0, 40)
-      .map(e => `  - [${e.tag}] "${e.label}"${e.href ? ` → ${e.href}` : ''}`)
+      .slice(0, 60)
+      .map(e => `  - [${e.ref || ''}] ${e.tag} "${e.label}"${e.href ? ` → ${e.href}` : ''}`)
       .join('\n');
+    const hasRefs = filteredEls.some(e => e.ref);
     const doneNote = effectiveCompleted.length > 0
       ? `\nALREADY COMPLETED (do NOT repeat these): ${effectiveCompleted.map(s => `"${s.label}"`).join(', ')}`
       : '';
-    browserSessionNote = `\n\nACTIVE BROWSER SESSION: sessionId="${sid}" is already open at ${livePageUrl}. Use this EXACT sessionId for all browser.act steps. If this task targets the SAME site, skip navigate. If it targets a DIFFERENT site, include a navigate step first.${doneNote}\n\nCURRENT PAGE ELEMENTS (${livePageUrl}):\nUse ONLY these exact labels in highlight steps — do not invent labels:\n${elList}`;
+    browserSessionNote = `\n\nACTIVE BROWSER SESSION: sessionId="${sid}" is already open at ${livePageUrl}. Use this EXACT sessionId for all browser.act steps. If this task targets the SAME site, skip navigate. If it targets a DIFFERENT site, include a navigate step first.${doneNote}\n\nCURRENT PAGE ELEMENTS (${livePageUrl}):\n${hasRefs ? 'Use the [eN] ref as the selector value for click/fill/hover — do NOT use the label text as selector when a ref is provided. Skip examine steps — refs are already known.' : 'Use ONLY these exact labels as selectors — do not invent labels.'}\n${elList}`;
   }
 
   // ── RAG: fetch relevant skill prompt snippets from DuckDB ───────────────────
@@ -700,8 +702,27 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
         const isMultiTab = plannedSessionIds.size > 1;
 
         if (isMultiTab) {
-          // Multi-site comparison plan — leave all sessionIds and navigates intact
-          logger.debug(`[Node:PlanSkills] Multi-tab plan detected (${plannedSessionIds.size} sessions) — preserving all navigates`);
+          // Multi-site plan — LLM used separate sessionIds (= separate windows). Consolidate
+          // everything into the FIRST sessionId, converting subsequent navigate steps to tab-new.
+          const [primarySession] = [...plannedSessionIds];
+          let firstNavigateSeen = false;
+          skillPlan = skillPlan.map(step => {
+            if (step.skill !== 'browser.act') return step;
+            const action = step.args?.action;
+            // Rewrite this step to use the primary session
+            const unified = { ...step, args: { ...step.args, sessionId: primarySession } };
+            if (action === 'navigate') {
+              if (!firstNavigateSeen) {
+                // Keep the first navigate as-is (just unify the sessionId)
+                firstNavigateSeen = true;
+                return unified;
+              }
+              // Subsequent navigates from other sessions → convert to tab-new
+              return { ...unified, args: { ...unified.args, action: 'tab-new', url: step.args.url } };
+            }
+            return unified;
+          });
+          logger.debug(`[Node:PlanSkills] Multi-tab plan consolidated: ${plannedSessionIds.size} sessions → 1 session "${primarySession}" (subsequent navigates → tab-new)`);
         } else {
           // Check if the navigate step goes to the same domain as the active session
           const navigateStep = skillPlan.find(s => s.skill === 'browser.act' && s.args?.action === 'navigate');
@@ -747,26 +768,14 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
             });
             logger.debug(`[Node:PlanSkills] Eval retry ${state.evaluationRetryCount} — keeping navigate despite same domain`);
           } else if (navigateStep) {
-            // Different domain — derive session ID from target hostname, NOT the old session.
-            // Using the old session ID (e.g. "chatgpt") for biblegateway steps is misleading
-            // in the UI and can confuse snapshot cache lookups.
-            let targetSessionId;
-            try {
-              const targetHost = new URL(navigateStep.args.url).hostname.replace(/^www\./, '');
-              // Use first segment of hostname as session name (e.g. "biblegateway" from "biblegateway.com")
-              targetSessionId = targetHost.split('.')[0];
-            } catch (_) {
-              targetSessionId = effectiveSessionId;
-            }
-            // Only override steps that have no sessionId or still carry the old one
+            // Different domain — reuse the SAME active session so the URL loads in the existing
+            // window instead of spawning a new Chrome window. Site-named sessions ("youtube",
+            // "amazon") each cold-start a new window which clutters the desktop.
             skillPlan = skillPlan.map(step => {
               if (step.skill !== 'browser.act') return step;
-              const sid = step.args?.sessionId;
-              // If the LLM already chose a distinct session, respect it
-              if (sid && sid !== effectiveSessionId) return step;
-              return { ...step, args: { ...step.args, sessionId: targetSessionId } };
+              return { ...step, args: { ...step.args, sessionId: effectiveSessionId } };
             });
-            logger.debug(`[Node:PlanSkills] Different domain — reassigned session "${effectiveSessionId}" → "${targetSessionId}" for new navigate`);
+            logger.debug(`[Node:PlanSkills] Different domain — reusing active session "${effectiveSessionId}" (navigate in same window)`);
           } else {
             // No navigate — keep active session
             skillPlan = skillPlan.map(step => {
@@ -803,16 +812,39 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
             }
           } catch (_) {}
         }
-        // Fallback: derive from navigate URL hostname
+        // Fallback: always use the canonical "browser" session — never derive from hostname.
+        // Hostname-derived sessions (youtube, wikipedia, amazon) each cold-start a new Chrome window.
+        // A single "browser" session reuses the existing window for all sites.
         if (!derivedSession) {
-          try { derivedSession = new URL(navigateStep.args.url).hostname; } catch (_) {}
-          if (derivedSession) logger.info(`[Node:PlanSkills] Stamped missing sessionIds with "${derivedSession}" (derived from navigate URL)`);
+          derivedSession = 'browser';
+          logger.info(`[Node:PlanSkills] Stamped missing sessionIds with "browser" (canonical session — avoids new window per site)`);
         }
         if (derivedSession) {
           skillPlan = skillPlan.map(step => {
             if (step.skill !== 'browser.act' || step.args?.sessionId) return step;
             return { ...step, args: { ...step.args, sessionId: derivedSession } };
           });
+        }
+      }
+    }
+
+    // ── Final session normalization ──────────────────────────────────────────
+    // The LLM sometimes explicitly generates site-named sessionIds like "youtube", "amazon", etc.
+    // These cold-start a new Chrome window per site. When it's a single-session plan (all steps
+    // share one sessionId) and that sessionId is not "browser", rewrite it to "browser" so
+    // all navigation stays in the same window regardless of whether a prior active session exists.
+    if (Array.isArray(skillPlan)) {
+      const browserStepsForNorm = skillPlan.filter(s => s.skill === 'browser.act');
+      if (browserStepsForNorm.length > 0) {
+        const sessionIdsUsed = new Set(browserStepsForNorm.map(s => s.args?.sessionId).filter(Boolean));
+        const isSingleSession = sessionIdsUsed.size === 1;
+        const [onlySession] = [...sessionIdsUsed];
+        if (isSingleSession && onlySession && onlySession !== 'browser') {
+          skillPlan = skillPlan.map(step => {
+            if (step.skill !== 'browser.act') return step;
+            return { ...step, args: { ...step.args, sessionId: 'browser' } };
+          });
+          logger.info(`[Node:PlanSkills] Normalized sessionId "${onlySession}" → "browser" (canonical single-session)`);
         }
       }
     }
