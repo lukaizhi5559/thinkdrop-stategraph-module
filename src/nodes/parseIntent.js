@@ -291,7 +291,7 @@ module.exports = async function parseIntent(state) {
 
   // System-info override — "what's today's date", "what time is it", "what's my battery", etc.
   // These are trivially answerable by shell.run — must go to command_automate, not general_query.
-  const sysInfoPattern = /\b(what('s| is)( the)?|tell me( the)?|show me( the)?|get( the)?)\s+(today'?s?|current|the)\s+(date|time|day|battery|wifi|disk|ip address|timezone|hostname|username)\b|\b(what('s| is)( today'?s?| the current| the)?)\s+(date|time|day)\b|\btoday'?s?\s+date\b|\bwhat day is (today|it)\b|\bwhat time is it\b/i;
+  const sysInfoPattern = /\b(what('s| is)( the)?|tell me( the)?|show me( the)?|get( the)?)\s+(today'?s?|current|the)\s+(date|time|day|battery|wifi|disk|ip address|timezone|hostname|username)\b|\b(what('s| is)( today'?s?| the current| the)?)\s+(date|time|day)\b|\btoday'?s?\s+date\b|\bwhat day is (today|it)\b|\bwhat time is it\b|\btell me (what time|the time|the date|the day|today'?s date)\b|\b(do you know|can you tell me) what time\b|\bwhat'?s the time\b/i;
   if (sysInfoPattern.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] System-info override → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.98, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'system-info-override', processingTimeMs: 0 } };
