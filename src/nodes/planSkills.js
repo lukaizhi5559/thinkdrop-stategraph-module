@@ -136,6 +136,49 @@ module.exports = async function planSkills(state) {
     if (fs.existsSync(state.creatorSkillPath)) {
       logger.info(`[Node:PlanSkills] Creator skill ready — bypassing LLM plan, running "${state.creatorSkillName}" directly`);
       const secretKeys = Array.isArray(state.creatorSkillSecrets) ? state.creatorSkillSecrets : [];
+
+      // ── Credential gate: collect missing secrets before running ─────────────
+      // If the skill requires API credentials that are not yet in keytar, prompt
+      // for them now. This prevents the skill from auto-executing with missing creds.
+      const gatherCredentialCallback = state.gatherCredentialCallback || null;
+      const keytarCheckCallback      = state.keytarCheckCallback      || null;
+      if (secretKeys.length > 0 && gatherCredentialCallback) {
+        const skillName = state.creatorSkillName;
+        for (const secretKey of secretKeys) {
+          // Check if this secret already exists in keytar
+          let alreadyStored = false;
+          if (keytarCheckCallback) {
+            try {
+              const checkResult = await keytarCheckCallback(secretKey);
+              alreadyStored = checkResult?.found === true;
+            } catch (_) {}
+          }
+          if (!alreadyStored) {
+            logger.info(`[Node:PlanSkills] Skill "${skillName}" needs credential "${secretKey}" — prompting user before execution`);
+            // Emit gather_credential so the UI shows the masked input card
+            if (progressCallback) progressCallback({
+              type: 'gather_credential',
+              credentialKey: secretKey,
+              question: `Enter your ${secretKey} for the "${skillName}" skill`,
+              hint: `This will be stored securely in your keychain`,
+              helpUrl: null,
+            });
+            try {
+              const credResult = await gatherCredentialCallback(secretKey);
+              if (credResult?.stored) {
+                logger.info(`[Node:PlanSkills] Credential "${secretKey}" stored for "${skillName}"`);
+                if (progressCallback) progressCallback({ type: 'gather_credential_stored', credentialKey: secretKey });
+              } else {
+                logger.warn(`[Node:PlanSkills] Credential "${secretKey}" was not stored (user skipped or timed out)`);
+              }
+            } catch (credErr) {
+              logger.warn(`[Node:PlanSkills] Credential prompt for "${secretKey}" failed/skipped: ${credErr?.message}`);
+            }
+          }
+        }
+      }
+      // ── End credential gate ──────────────────────────────────────────────────
+
       const skillPlan = [{
         skill: 'external.skill',
         args:  { name: state.creatorSkillName, secretKeys },
@@ -853,6 +896,92 @@ User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRul
     skillPlan.forEach((s, i) =>
       logger.debug(`  Step ${i + 1}: ${s.skill} — ${s.description || JSON.stringify(s.args)}`)
     );
+
+    // ── Scout intercept: replace needs_skill with a provider-select card ────────
+    // If the LLM returned needs_skill, check the CLI/API registries before falling
+    // through to recoverSkill → ASK_USER. If we find a match, emit scout_match and
+    // pause so the user picks a provider in the Results Window. After they pick,
+    // main.js resumes with cliMatch/apiMatch set → creatorPlanning fast-path runs.
+    const needsSkillStep = skillPlan.find(s => s.skill === 'needs_skill');
+    if (needsSkillStep) {
+      const path = require('path');
+      const capability = needsSkillStep.args?.capability || needsSkillStep.args?.name || '';
+      const suggestion  = needsSkillStep.args?.suggestion || '';
+      const searchMsg   = [userMessage, capability, suggestion].join(' ').toLowerCase();
+
+      // Walk up from __dirname to find the command-service src directory
+      function findRegistryDir() {
+        let dir = __dirname;
+        for (let i = 0; i < 8; i++) {
+          const candidate = path.join(dir, 'mcp-services', 'command-service', 'src');
+          if (fs.existsSync(path.join(candidate, 'cli-registry.json'))) return candidate;
+          dir = path.dirname(dir);
+        }
+        return null;
+      }
+
+      const regDir = findRegistryDir();
+      if (regDir) {
+        let cliRegistry = {}, apiRegistry = {};
+        try { cliRegistry = JSON.parse(fs.readFileSync(path.join(regDir, 'cli-registry.json'), 'utf8')); } catch (_) {}
+        try { apiRegistry = JSON.parse(fs.readFileSync(path.join(regDir, 'api-registry.json'), 'utf8')); } catch (_) {}
+
+        // Find all matching capabilities across both registries
+        function findMatches(registry, regType) {
+          const matches = [];
+          for (const [cap, entry] of Object.entries(registry)) {
+            const kws = entry.keywords || [];
+            if (kws.some(kw => searchMsg.includes(kw.toLowerCase()))) {
+              const providers = entry.providers || {};
+              for (const [providerName, config] of Object.entries(providers)) {
+                matches.push({ capability: cap, provider: providerName, config, type: regType, defaultProvider: entry.defaultProvider });
+              }
+            }
+          }
+          return matches;
+        }
+
+        const cliMatches = findMatches(cliRegistry, 'cli');
+        const apiMatches = findMatches(apiRegistry, 'api');
+        const allMatches = [...cliMatches, ...apiMatches];
+
+        if (allMatches.length > 0) {
+          logger.info(`[Node:PlanSkills] Scout intercept: ${allMatches.length} provider(s) found for "${capability || userMessage}" — emitting scout_match`);
+
+          if (progressCallback) progressCallback({
+            type: 'plan_ready',
+            steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })),
+            intent: state.intent?.type || 'command_automate',
+          });
+          if (progressCallback) progressCallback({
+            type: 'scout_match',
+            capability: capability || userMessage,
+            suggestion,
+            matches: allMatches,
+          });
+
+          // Pause state — main.js will resume with scout:select IPC carrying chosen match
+          return {
+            ...state,
+            skillPlan,
+            skillCursor: 0,
+            scoutPending: true,
+            scoutCapability: capability || userMessage,
+            scoutMatches: allMatches,
+            recoveryAction: 'scout_select',
+            pendingQuestion: {
+              question: `I found ${allMatches.length} tool${allMatches.length > 1 ? 's' : ''} that can handle "${capability || userMessage}". Which would you like to use?`,
+              options: allMatches.map(m => `${m.provider} (${m.type})`),
+              context: { scoutMatches: allMatches, capability: capability || userMessage },
+              _isScoutSelect: true,
+            },
+            commandExecuted: false,
+          };
+        }
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────────
+
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })), intent: state.intent?.type || 'command_automate' });
 
     // ── RAG learn: if no snippet matched, extract a reusable pattern and save it ─

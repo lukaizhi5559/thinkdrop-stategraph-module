@@ -37,6 +37,234 @@ const path = require('path');
 const MAX_ROUNDS = 8;
 const GATHER_TIMEOUT_MS = 10 * 60 * 1000; // 10 min per answer
 
+// ── CLI Scout & API Scout ─────────────────────────────────────────────────────
+// Loaded lazily so gatherContext still works if command-service registries are absent.
+
+function loadRegistry(filename) {
+  // Walk up from __dirname to find the project root containing mcp-services.
+  // Works from both stategraph-module/src/nodes/ and node_modules/@thinkdrop/stategraph/src/nodes/
+  const candidates = [];
+  let dir = __dirname;
+  for (let i = 0; i < 8; i++) {
+    candidates.push(path.join(dir, 'mcp-services', 'command-service', 'src', filename));
+    dir = path.dirname(dir);
+  }
+  // Also check ~/.thinkdrop as a fallback for user-installed registries
+  candidates.push(path.join(require('os').homedir(), '.thinkdrop', filename));
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch (_) {}
+  }
+  return null;
+}
+
+/**
+ * Scout a registry (CLI or API) for a match against confirmed services and the full message.
+ * Returns the first matching capability entry + the winning provider config,
+ * or null if nothing matches.
+ *
+ * @param {object} registry   parsed cli-registry.json or api-registry.json
+ * @param {string[]} services confirmed service names from gatheredContext
+ * @param {string} message    original user message (for keyword fallback)
+ * @returns {{ capability: string, provider: string, config: object } | null}
+ */
+
+/**
+ * Like scoutRegistry but ONLY matches explicit provider keys — no keyword/defaultProvider fallback.
+ * Used to check if a user-chosen service (e.g. 'clicksend') exists as a provider in ANY capability
+ * before falling back to keyword matching which might return a different defaultProvider.
+ */
+function scoutRegistryExplicitOnly(registry, services) {
+  if (!registry || !services || services.length === 0) return null;
+  const servicesLower = services.map(s => s.toLowerCase());
+  for (const [capability, entry] of Object.entries(registry)) {
+    const providers = entry.providers || {};
+    for (const svc of servicesLower) {
+      if (providers[svc]) {
+        return { capability, provider: svc, config: providers[svc] };
+      }
+      const matchedKey = Object.keys(providers).find(k => svc.includes(k) || k.includes(svc));
+      if (matchedKey) {
+        return { capability, provider: matchedKey, config: providers[matchedKey] };
+      }
+    }
+  }
+  return null;
+}
+
+function scoutRegistry(registry, services, message) {
+  if (!registry) return null;
+  const msgLower = (message || '').toLowerCase();
+  const servicesLower = (services || []).map(s => s.toLowerCase());
+
+  for (const [capability, entry] of Object.entries(registry)) {
+    const keywords = entry.keywords || [];
+    const providers = entry.providers || {};
+
+    // 1. Check if any confirmed service name matches a provider key
+    for (const svc of servicesLower) {
+      if (providers[svc]) {
+        return { capability, provider: svc, config: providers[svc] };
+      }
+      // Partial match: provider key is substring of service or vice versa
+      const matchedKey = Object.keys(providers).find(k => svc.includes(k) || k.includes(svc));
+      if (matchedKey) {
+        return { capability, provider: matchedKey, config: providers[matchedKey] };
+      }
+    }
+
+    // 2. Keyword match against original message — use defaultProvider
+    const kwMatch = keywords.some(kw => msgLower.includes(kw.toLowerCase()));
+    if (kwMatch) {
+      const defProvider = entry.defaultProvider;
+      if (defProvider && providers[defProvider]) {
+        return { capability, provider: defProvider, config: providers[defProvider] };
+      }
+      // First available provider
+      const firstKey = Object.keys(providers)[0];
+      if (firstKey) return { capability, provider: firstKey, config: providers[firstKey] };
+    }
+  }
+  return null;
+}
+
+/**
+ * Find the skill-scout.cjs path by walking up from __dirname.
+ * Returns null if not found (dynamic discovery will be skipped gracefully).
+ */
+function findSkillScout() {
+  let dir = __dirname;
+  for (let i = 0; i < 8; i++) {
+    const candidate = path.join(dir, 'mcp-services', 'command-service', 'src', 'skill-scout.cjs');
+    if (fs.existsSync(candidate)) return candidate;
+    dir = path.dirname(dir);
+  }
+  return null;
+}
+
+/**
+ * Run CLI + API scouts and return { cliMatch, apiMatch } (either can be null).
+ * Step 1: static registry lookup (fast, no I/O beyond file reads).
+ * Step 2: if no match, dynamic discovery via skill-scout.cjs (npm/brew search + LLM).
+ *
+ * @param {string[]} services  confirmed service names (e.g. ['clicksend'])
+ * @param {string}   message   original user message for keyword fallback
+ * @param {object}   logger    logger instance
+ * @returns {Promise<{ cliMatch: object|null, apiMatch: object|null }>}
+ */
+async function runScouts(services, message, logger) {
+  const cliRegistry = loadRegistry('cli-registry.json');
+  const apiRegistry = loadRegistry('api-registry.json');
+
+  // ── Step 1: static registry ────────────────────────────────────────────────
+  // Priority order:
+  //   1a. Explicit provider key match in CLI registry (e.g. services=['twilio'] → cli sms/twilio)
+  //   1b. Explicit provider key match in API registry (e.g. services=['clicksend'] → api sms/clicksend)
+  //   1c. Keyword+defaultProvider fallback in CLI registry
+  //   1d. Keyword+defaultProvider fallback in API registry
+  // This ensures a user-chosen provider (e.g. 'clicksend') wins even when the
+  // CLI registry has a different defaultProvider ('twilio') for the same capability.
+  const cliExplicit = scoutRegistryExplicitOnly(cliRegistry, services);
+  const apiExplicit = cliExplicit ? null : scoutRegistryExplicitOnly(apiRegistry, services);
+  const explicitMatch = cliExplicit || apiExplicit;
+
+  const cliMatch = explicitMatch
+    ? (cliExplicit || null)
+    : scoutRegistry(cliRegistry, services, message);
+  const apiMatch = explicitMatch
+    ? (apiExplicit || null)
+    : (cliMatch ? null : scoutRegistry(apiRegistry, services, message));
+
+  if (cliMatch || apiMatch) {
+    // ── Step 1b: validate the static match is real before trusting it ────────
+    // Runs npm info / brew info / which to confirm the package/tool exists.
+    // If the tool is already installed, also fetches --help for richer context.
+    // CLI→API fallback: if cliMatch fails validation, check apiRegistry for the
+    // same provider before falling through to dynamic discovery.
+    const scoutPath = findSkillScout();
+    if (scoutPath) {
+      try {
+        const scout = require(scoutPath);
+        if (scout.validateRegistryEntry) {
+          const match = cliMatch || apiMatch;
+          const type  = cliMatch ? 'cli' : 'api';
+          const validation = await scout.validateRegistryEntry(type, match.config);
+          if (!validation.valid) {
+            logger.warn(`[Node:GatherContext] Static registry entry invalid (${match.provider}): ${validation.reason}`);
+
+            // ── CLI→API static fallback ────────────────────────────────────
+            // If the failing match was CLI, check if there's an API entry for
+            // the same provider/capability before giving up to dynamic discovery.
+            if (cliMatch) {
+              const apiRegistry = loadRegistry('api-registry.json');
+              const apiFallback = scoutRegistryExplicitOnly(apiRegistry, services)
+                || scoutRegistry(apiRegistry, services, message);
+              if (apiFallback) {
+                const apiFallbackValidation = await scout.validateRegistryEntry('api', apiFallback.config);
+                if (apiFallbackValidation.valid) {
+                  logger.info(`[Node:GatherContext] CLI→API fallback: ${cliMatch.provider} CLI invalid → using API entry (${apiFallback.provider})`);
+                  return { cliMatch: null, apiMatch: apiFallback };
+                }
+              }
+            }
+            logger.warn(`[Node:GatherContext] No valid fallback found — falling through to dynamic discovery`);
+            // Invalidate and fall through to Step 2
+          } else {
+            logger.info(`[Node:GatherContext] Static registry entry verified (${match.provider}): ${validation.reason}`);
+            if (validation.helpText) {
+              match.config = { ...match.config, helpText: validation.helpText };
+            }
+            return { cliMatch, apiMatch };
+          }
+        } else {
+          return { cliMatch, apiMatch };
+        }
+      } catch (e) {
+        logger.warn(`[Node:GatherContext] Registry validation threw: ${e.message} — using static entry anyway`);
+        return { cliMatch, apiMatch };
+      }
+    } else {
+      return { cliMatch, apiMatch };
+    }
+  }
+
+  // ── Step 2: dynamic discovery fallback ────────────────────────────────────
+  // Only runs when the static registry has no match (or match failed validation).
+  // Tries brew search, npm search, PATH check, and LLM validation to find a
+  // suitable tool. Results are cached back to the registry for future runs.
+  const scoutPath = findSkillScout();
+  if (!scoutPath) {
+    logger.debug('[Node:GatherContext] skill-scout.cjs not found — skipping dynamic discovery');
+    return { cliMatch: null, apiMatch: null };
+  }
+
+  // Derive best service name to search: prefer explicit service answers, fall back to message
+  const primaryService = (services && services.length > 0)
+    ? services[0].toLowerCase().trim()
+    : null;
+
+  if (!primaryService) {
+    return { cliMatch: null, apiMatch: null };
+  }
+
+  // Infer capability from the primary service name (best effort)
+  const capability = primaryService;
+
+  logger.info(`[Node:GatherContext] Static registry miss — running dynamic discovery for "${primaryService}"`);
+
+  try {
+    const scout = require(scoutPath);
+    const { cliMatch: dynCli, apiMatch: dynApi } = await scout.discover(primaryService, capability);
+    if (dynCli) logger.info(`[Node:GatherContext] Dynamic CLI discovery found: ${dynCli.provider} for "${primaryService}"`);
+    if (dynApi) logger.info(`[Node:GatherContext] Dynamic API discovery found: ${dynApi.provider} for "${primaryService}"`);
+    return { cliMatch: dynCli || null, apiMatch: dynApi || null };
+  } catch (scoutErr) {
+    logger.warn(`[Node:GatherContext] Dynamic discovery threw: ${scoutErr.message}`);
+    return { cliMatch: null, apiMatch: null };
+  }
+}
+
 function loadPrompt(filename) {
   try {
     return fs.readFileSync(path.join(__dirname, '../prompts', filename), 'utf8').trim();
@@ -124,6 +352,30 @@ Key rules:
 Respond with ONLY valid JSON, no explanation, no markdown:
 {"type":"EXECUTE"} or {"type":"BUILD"}`;
 
+  // ── Explicit skill-build intent: user literally asks to create a skill ─────────
+  // These phrases mean the user wants to BUILD a new persistent skill, regardless
+  // of whether there are schedule or credential signals in the message.
+  // Short-circuit to BUILD immediately — no LLM classifier needed.
+  const SKILL_BUILD_INTENT_SIGNALS = [
+    /\bi\s+need\s+a\s+skill\b/i,
+    /\bbuild\s+(me\s+)?a\s+skill\b/i,
+    /\bcreate\s+(me\s+)?a\s+skill\b/i,
+    /\bmake\s+(me\s+)?a\s+skill\b/i,
+    /\bset\s+up\s+a\s+skill\b/i,
+    /\bwrite\s+(me\s+)?a\s+skill\b/i,
+    /\bbuild\s+(me\s+)?a\s+new\s+skill\b/i,
+    /\bcreate\s+(me\s+)?a\s+new\s+skill\b/i,
+    /\bi\s+want\s+a\s+skill\b/i,
+    /\bi\s+need\s+a\s+(new\s+)?skill\s+that\b/i,
+    /\b(build|create|make|write)\s+(a\s+)?skill\s+that\b/i,
+    /\b(build|create|make|write)\s+(a\s+)?skill\s+(for|to)\b/i,
+  ];
+
+  if (SKILL_BUILD_INTENT_SIGNALS.some(r => r.test(userMessage))) {
+    logger.info(`[Node:GatherContext] Explicit skill-build intent detected — forcing BUILD mode for: "${userMessage.slice(0, 80)}"`);
+    state = { ...state, forceSkillBuild: true }; // fall through to gather loop below
+  }
+
   // ── Hard validation gate: BUILD requires BOTH scheduling AND credential signals ─
   // The LLM classifier is unreliable — it sometimes hallucinates BUILD for plain
   // one-shot tasks. We validate any BUILD response against concrete textual signals
@@ -151,27 +403,152 @@ Respond with ONLY valid JSON, no explanation, no markdown:
   }
 
   let taskType = 'EXECUTE'; // strong default — only flip to BUILD if validated
-  try {
-    const classifyRaw = await llmBackend.generateAnswer(CLASSIFIER_SYS, `Task: "${userMessage}"`, { temperature: 0 });
-    const classifyJson = parseJson(classifyRaw);
-    if (classifyJson?.type === 'BUILD') {
-      // Validate: only accept BUILD if the message has explicit schedule + credential signals
-      if (isBuildCandidate(userMessage)) {
-        taskType = 'BUILD';
-        logger.info(`[Node:GatherContext] Task classifier → BUILD (validated) for: "${userMessage.slice(0, 80)}"`);
+
+  // forceSkillBuild is set by the router when matchedSkillName was a stub (no index.cjs).
+  // The user is explicitly invoking a skill that needs to be built — skip the classifier.
+  if (state.forceSkillBuild) {
+    taskType = 'BUILD';
+    logger.info(`[Node:GatherContext] forceSkillBuild=true (stub skill "${state.stubSkillName || 'unknown'}") — forcing BUILD mode, skipping classifier`);
+  } else {
+    try {
+      const classifyRaw = await llmBackend.generateAnswer(CLASSIFIER_SYS, `Task: "${userMessage}"`, { temperature: 0 });
+      const classifyJson = parseJson(classifyRaw);
+      if (classifyJson?.type === 'BUILD') {
+        // Validate: only accept BUILD if the message has explicit schedule + credential signals
+        if (isBuildCandidate(userMessage)) {
+          taskType = 'BUILD';
+          logger.info(`[Node:GatherContext] Task classifier → BUILD (validated) for: "${userMessage.slice(0, 80)}"`);
+        } else {
+          logger.info(`[Node:GatherContext] Task classifier said BUILD but no schedule+credential signals found — overriding to EXECUTE for: "${userMessage.slice(0, 80)}"`);
+        }
       } else {
-        logger.info(`[Node:GatherContext] Task classifier said BUILD but no schedule+credential signals found — overriding to EXECUTE for: "${userMessage.slice(0, 80)}"`);
+        logger.info(`[Node:GatherContext] Task classifier → EXECUTE for: "${userMessage.slice(0, 80)}"`);
       }
-    } else {
-      logger.info(`[Node:GatherContext] Task classifier → EXECUTE for: "${userMessage.slice(0, 80)}"`);
+    } catch (e) {
+      logger.warn(`[Node:GatherContext] Classifier failed (${e.message}) — defaulting to EXECUTE`);
     }
-  } catch (e) {
-    logger.warn(`[Node:GatherContext] Classifier failed (${e.message}) — defaulting to EXECUTE`);
   }
 
+  // ── Locate skill-builder.cjs (used by scout gate + upfront credential check) ──
+  let builderPath = null;
+  {
+    let _bDir = __dirname;
+    for (let _i = 0; _i < 10; _i++) {
+      const _c = path.join(_bDir, 'mcp-services', 'command-service', 'src', 'skill-builder.cjs');
+      if (fs.existsSync(_c)) { builderPath = _c; break; }
+      _bDir = path.dirname(_bDir);
+    }
+    if (!builderPath) {
+      const _s = path.join(__dirname, '..', '..', '..', 'mcp-services', 'command-service', 'src', 'skill-builder.cjs');
+      if (fs.existsSync(_s)) builderPath = _s;
+    }
+  }
+
+  // ── scoutProviderPreselect: provider chosen before Q&A loop (if multiple exist) ─
+  let scoutProviderPreselect = null;
+
   if (taskType === 'EXECUTE') {
-    logger.info('[Node:GatherContext] One-shot task — skipping gather, proceeding to plan');
-    return { ...state, gatherContextSkipped: true };
+    // ── Scout gate: check if message matches a known capability (SMS, email, etc.)
+    // If it does, this needs credentials + a persistent skill → upgrade to BUILD.
+    // Then run skill-builder web-search discovery to find ALL provider options
+    // before asking the user to pick — never auto-select from a static registry.
+    const cliReg = loadRegistry('cli-registry.json');
+    const apiReg = loadRegistry('api-registry.json');
+    const quickCli = scoutRegistry(cliReg, [], userMessage);
+    const quickApi = quickCli ? null : scoutRegistry(apiReg, [], userMessage);
+
+    if (quickCli || quickApi) {
+      const match = quickCli || quickApi;
+      taskType = 'BUILD';
+      logger.info(`[Node:GatherContext] Scout gate: EXECUTE → BUILD for capability "${match.capability}"`);
+
+      // ── Step 1: Prereq check via skill-builder ────────────────────────────
+      emit('gather_start', { message: 'Checking prerequisites (node, npm, brew)…' });
+
+      let prereqsOk = true;
+      if (builderPath) {
+        try {
+          const { checkPrereqs } = require(builderPath);
+          const prereqs = checkPrereqs();
+          logger.info(`[Node:GatherContext] Prereqs: node=${prereqs.node} npm=${prereqs.npm} brew=${prereqs.brew}`);
+          if (!prereqs.node || !prereqs.npm) {
+            prereqsOk = false;
+            logger.error('[Node:GatherContext] node or npm missing — cannot build skill');
+          }
+        } catch (e) {
+          logger.warn(`[Node:GatherContext] Prereq check failed: ${e.message}`);
+        }
+      }
+
+      if (!prereqsOk) {
+        emit('gather_complete', { message: 'Cannot build skill: node.js or npm is not installed.' });
+        return { ...state, gatherContextSkipped: true };
+      }
+
+      // ── Step 2: Web-search for ALL providers for this capability ─────────
+      emit('gather_start', { message: `Searching for the best ${match.capability} providers…` });
+
+      // Start from static registry providers as baseline
+      const cliCapEntry = cliReg?.[match.capability];
+      const apiCapEntry = apiReg?.[match.capability];
+      const staticProviders = [
+        ...Object.keys(cliCapEntry?.providers || {}),
+        ...Object.keys(apiCapEntry?.providers || {}),
+      ];
+      let allProviderNames = [...new Set(staticProviders)];
+
+      // Run discoverProviders web-search to find ALL options
+      if (builderPath) {
+        try {
+          const { discoverProviders } = require(builderPath);
+          const discovered = await Promise.race([
+            discoverProviders(match.capability, userMessage),
+            new Promise(res => setTimeout(() => res([]), 20000)),
+          ]);
+          for (const p of (discovered || [])) {
+            if (p.name && !allProviderNames.includes(p.name)) {
+              allProviderNames.push(p.name);
+            }
+          }
+          logger.info(`[Node:GatherContext] Provider list after web discovery: ${allProviderNames.join(', ')}`);
+        } catch (e) {
+          logger.warn(`[Node:GatherContext] discoverProviders failed: ${e.message} — using static list`);
+        }
+      }
+
+      // Also detect any provider explicitly named in user message
+      const msgLower = userMessage.toLowerCase();
+      const providerPattern = /\b([a-z][a-z0-9]{2,}(?:send|sms|mail|message|text|bird|bip|go))\b/gi;
+      let pm;
+      while ((pm = providerPattern.exec(userMessage)) !== null) {
+        const named = pm[1].toLowerCase();
+        if (!allProviderNames.includes(named)) {
+          allProviderNames.push(named);
+          logger.info(`[Node:GatherContext] Added explicitly-named provider "${named}" from message`);
+        }
+      }
+
+      // If user explicitly mentions a known provider name anywhere in message, pre-select it
+      const explicitMatch = allProviderNames.find(p => msgLower.includes(p) && p.length > 3);
+      const defaultProvider = explicitMatch
+        || cliCapEntry?.defaultProvider
+        || apiCapEntry?.defaultProvider
+        || allProviderNames[0];
+
+      // ALWAYS ask the user — never auto-select, even if only 1 option
+      scoutProviderPreselect = {
+        capability: match.capability,
+        providers: allProviderNames,
+        defaultProvider,
+        registryType: (quickCli ? 'cli' : 'api'),
+        autoSelected: false,
+      };
+
+      logger.info(`[Node:GatherContext] Provider choice: [${allProviderNames.join(', ')}] default="${defaultProvider}"`);
+    } else {
+      logger.info('[Node:GatherContext] One-shot task — skipping gather, proceeding to plan');
+      return { ...state, gatherContextSkipped: true };
+    }
   }
 
   // ── BUILD safety check: guard against duplicate skill creation ───────────────
@@ -239,7 +616,150 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
   let links = [];
   let round = 0;
 
-  emit('gather_start', { message: 'Gathering requirements before building…' });
+  // gather_start already emitted by scout gate for BUILD tasks; emit here only for BUILD tasks
+  // that came directly (forceSkillBuild) without going through the scout gate's emit calls.
+  if (taskType === 'BUILD' && !scoutProviderPreselect) {
+    emit('gather_start', { message: 'Gathering requirements before building…' });
+  }
+
+  // ── Provider choice: ask upfront if multiple CLI/API providers are available ──
+  // scoutProviderPreselect is set by the Scout gate above when it upgrades EXECUTE→BUILD.
+  // If there are multiple providers, ask the user to pick before entering the Q&A loop.
+  // The chosen provider is pre-seeded into resolvedFacts so the LLM never re-asks.
+  if (scoutProviderPreselect && !scoutProviderPreselect.autoSelected) {
+    const { capability, providers, defaultProvider } = scoutProviderPreselect;
+    logger.info(`[Node:GatherContext] Provider choice: ${providers.length} options for "${capability}" — asking user`);
+    emit('gather_question', {
+      id: `service_${capability}`,
+      question: `Which provider would you like to use for ${capability}?`,
+      hint: `Recommended: ${defaultProvider}`,
+      inputType: 'choice',
+      options: providers,
+      links: [],
+    });
+    if (gatherAnswerCallback) {
+      try {
+        const chosen = await Promise.race([
+          gatherAnswerCallback(),
+          new Promise(res => setTimeout(() => res(defaultProvider), GATHER_TIMEOUT_MS)),
+        ]);
+        const chosenProvider = (chosen || defaultProvider).toString().trim().toLowerCase();
+        const validProvider = providers.find(p => p.toLowerCase() === chosenProvider) || defaultProvider;
+        resolvedFacts[`service_${capability}`] = validProvider;
+        resolvedFacts['service_provider'] = validProvider;
+        emit('gather_answer_received', { id: `service_${capability}`, answer: validProvider });
+        logger.info(`[Node:GatherContext] Provider chosen: "${validProvider}" for "${capability}"`);
+      } catch (_) {
+        resolvedFacts[`service_${capability}`] = defaultProvider;
+        resolvedFacts['service_provider'] = defaultProvider;
+        logger.info(`[Node:GatherContext] Provider choice timed out — defaulting to "${defaultProvider}"`);
+      }
+    } else {
+      resolvedFacts[`service_${capability}`] = defaultProvider;
+      resolvedFacts['service_provider'] = defaultProvider;
+    }
+  } else if (scoutProviderPreselect?.autoSelected) {
+    // Single provider — pre-seed silently so LLM extractor doesn't ask about it
+    resolvedFacts[`service_${scoutProviderPreselect.capability}`] = scoutProviderPreselect.defaultProvider;
+    resolvedFacts['service_provider'] = scoutProviderPreselect.defaultProvider;
+    logger.info(`[Node:GatherContext] Provider auto-selected: "${scoutProviderPreselect.defaultProvider}" for "${scoutProviderPreselect.capability}"`);
+  }
+  // ── End provider choice ──────────────────────────────────────────────────────
+
+  // ── Upfront credential check: ask for provider authEnv keys before LLM loop ──
+  // Once the provider is known, look up its required credentials.
+  // For static registry providers: use the registry config directly.
+  // For live-discovery providers: call buildSkill() now to get full config,
+  // then cache it in resolvedFacts['builtSkill'] so creatorPlanning doesn't re-discover.
+  {
+    const chosenProvider = resolvedFacts['service_provider'] || resolvedFacts[`service_${scoutProviderPreselect?.capability}`];
+    if (chosenProvider && scoutProviderPreselect) {
+      const { capability } = scoutProviderPreselect;
+      const cliReg  = loadRegistry('cli-registry.json');
+      const apiReg  = loadRegistry('api-registry.json');
+      let providerConfig =
+        cliReg?.[capability]?.providers?.[chosenProvider] ||
+        apiReg?.[capability]?.providers?.[chosenProvider] || null;
+
+      // ── Live-discovery: provider not in static registry → run buildSkill now ──
+      if (!providerConfig && builderPath) {
+        try {
+          emit('gather_start', { message: `Researching ${chosenProvider} ${capability} API…` });
+          const { buildSkill } = require(builderPath);
+          const builtSkill = await Promise.race([
+            buildSkill(chosenProvider, capability, userMessage, (evtType, payload) => emit(evtType, payload)),
+            new Promise(res => setTimeout(() => res(null), 30000)),
+          ]);
+          if (builtSkill) {
+            providerConfig = builtSkill.config;
+            resolvedFacts['builtSkill'] = builtSkill;
+            logger.info(`[Node:GatherContext] Live buildSkill for "${chosenProvider}": type=${builtSkill.type} authEnv=${(builtSkill.config?.authEnv || []).join(',')}`);
+          } else {
+            logger.warn(`[Node:GatherContext] buildSkill returned null for "${chosenProvider}" — credentials unknown`);
+          }
+        } catch (e) {
+          logger.warn(`[Node:GatherContext] Live buildSkill failed: ${e.message}`);
+        }
+      }
+
+      const authEnvKeys = providerConfig?.authEnv || [];
+
+      if (authEnvKeys.length > 0) {
+        logger.info(`[Node:GatherContext] Upfront credential check for ${chosenProvider}: ${authEnvKeys.join(', ')}`);
+
+        for (const key of authEnvKeys) {
+          if (knownSecrets.includes(key)) continue;
+
+          // Check keytar
+          let alreadyStored = false;
+          if (keytarCheckCallback) {
+            try {
+              const check = await keytarCheckCallback(key);
+              alreadyStored = check?.found === true;
+            } catch (_) {}
+          }
+
+          if (alreadyStored) {
+            knownSecrets.push(key);
+            resolvedAnswers[key] = '[stored in keytar]';
+            logger.info(`[Node:GatherContext] Upfront cred: ${key} already in keytar — skipping`);
+          } else {
+            // Ask user to provide it now
+            emit('gather_credential', {
+              credentialKey: key,
+              question: `Please enter your ${key} for ${chosenProvider}`,
+              hint: `Required to use the ${chosenProvider} ${capability} API`,
+              helpUrl: providerConfig?.links?.[0]?.url || null,
+            });
+            if (gatherCredentialCallback) {
+              try {
+                const result = await Promise.race([
+                  gatherCredentialCallback(key),
+                  new Promise(res => setTimeout(() => res(null), GATHER_TIMEOUT_MS)),
+                ]);
+                if (result?.stored) {
+                  knownSecrets.push(key);
+                  resolvedAnswers[key] = '[stored in keytar]';
+                  emit('gather_credential_stored', { credentialKey: key });
+                  logger.info(`[Node:GatherContext] Upfront cred: ${key} stored`);
+                }
+              } catch (e) {
+                logger.warn(`[Node:GatherContext] Upfront credential capture failed for ${key}: ${e.message}`);
+              }
+            }
+          }
+        }
+
+        // Pre-seed resolved facts so LLM Q&A loop never re-asks about credentials
+        for (const key of authEnvKeys) {
+          if (knownSecrets.includes(key) && !resolvedAnswers[key]) {
+            resolvedAnswers[key] = '[stored in keytar]';
+          }
+        }
+      }
+    }
+  }
+  // ── End upfront credential check ─────────────────────────────────────────────
 
   while (round < MAX_ROUNDS) {
     round++;
@@ -316,20 +836,16 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
       links = [...links, ...analysis.links];
     }
 
-    // ── If complete — no unknowns remain ──────────────────────────────────────
-    if (analysis.complete) {
-      logger.info('[Node:GatherContext] All context gathered — proceeding to build');
-      emit('gather_complete', { message: 'All requirements gathered. Starting build…' });
-      break;
-    }
-
     // ── Process credential checks via keytar ──────────────────────────────────
+    // IMPORTANT: credentials are processed BEFORE the complete check so that
+    // a complete:true response doesn't skip credential collection entirely.
     const confirmedServices = new Set(
       Object.entries(allResolvedAfterExtract)
         .filter(([k]) => k.startsWith('service_'))
         .map(([, v]) => (v || '').toLowerCase().trim())
         .filter(Boolean)
     );
+    logger.debug(`[Node:GatherContext] confirmedServices: [${[...confirmedServices].join(', ')}]`);
 
     const credentialsToAsk = [];
     for (const cred of (analysis.credentials || [])) {
@@ -444,7 +960,11 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
       return true;
     });
 
-    if (unresolvedUnknowns.length === 0 && credentialsToAsk.filter(c => c.required).length === 0) {
+    // ── Complete check: exit only after credentials and unknowns are both settled ──
+    // analysis.complete from the LLM is advisory — we also check ourselves whether
+    // any required items remain (the LLM may wrongly set complete:true before creds).
+    const hasUnresolvedCreds = credentialsToAsk.filter(c => c.required).length > 0;
+    if (unresolvedUnknowns.length === 0 && !hasUnresolvedCreds) {
       emit('gather_complete', { message: 'All requirements gathered. Starting build…' });
       break;
     }
@@ -521,6 +1041,45 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
     .map(([, v]) => v)
     .filter(Boolean);
 
+  // ── CLI Scout + API Scout ────────────────────────────────────────────────────
+  // Match confirmed services (and message keywords) against registries.
+  // CLI takes priority; API Scout only runs if no CLI match found.
+  //
+  // IMPORTANT: If the user explicitly chose a provider and buildSkill already ran
+  // for that provider (builtSkill cached in resolvedFacts), skip runScouts entirely.
+  // Running runScouts would let a keyword-based registry match (e.g. Twilio on PATH)
+  // override the user's explicit choice.
+  const chosenProvider = allFinal['service_provider'] || null;
+  const cachedBuiltSkill = resolvedFacts['builtSkill'] || null;
+
+  let cliMatch = null;
+  let apiMatch = null;
+
+  if (cachedBuiltSkill) {
+    // User picked a live-discovery provider — use the cached buildSkill result directly
+    if (cachedBuiltSkill.type === 'cli') {
+      cliMatch = cachedBuiltSkill;
+      logger.info(`[Node:GatherContext] Using cached builtSkill (CLI) for "${cachedBuiltSkill.provider}" — skipping runScouts`);
+    } else {
+      apiMatch = cachedBuiltSkill;
+      logger.info(`[Node:GatherContext] Using cached builtSkill (API) for "${cachedBuiltSkill.provider}" — skipping runScouts`);
+    }
+  } else {
+    const scoutServices = chosenProvider
+      ? [chosenProvider, ...services.filter(s => s !== chosenProvider)]
+      : services;
+    const scoutResult = await runScouts(scoutServices, userMessage, logger);
+    cliMatch = scoutResult.cliMatch;
+    apiMatch = scoutResult.apiMatch;
+    if (cliMatch) {
+      logger.info(`[Node:GatherContext] CLI Scout matched: capability="${cliMatch.capability}" provider="${cliMatch.provider}" tool="${cliMatch.config?.tool}"`);
+    } else if (apiMatch) {
+      logger.info(`[Node:GatherContext] API Scout matched: capability="${apiMatch.capability}" provider="${apiMatch.provider}" npm="${apiMatch.config?.npm}"`);
+    } else {
+      logger.info('[Node:GatherContext] No CLI/API Scout match — will use code-gen path');
+    }
+  }
+
   const gatheredContext = {
     services,
     timezone: allFinal.schedule_tz || systemTz,
@@ -529,6 +1088,11 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
     resolvedAnswers,
     knownSecrets,
     links: [...new Map(links.map(l => [l.url, l])).values()],
+    cliMatch:  cliMatch  || null,
+    apiMatch:  apiMatch  || null,
+    // Top-level convenience fields for creatorPlanning → skill-builder
+    service_provider:   allFinal['service_provider']   || chosenProvider || null,
+    service_capability: allFinal['service_capability'] || scoutProviderPreselect?.capability || null,
   };
 
   logger.info('[Node:GatherContext] Context gathered', {
@@ -536,6 +1100,8 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
     timezone: gatheredContext.timezone,
     knownSecrets: knownSecrets.length,
     resolvedAnswers: Object.keys(resolvedAnswers).length,
+    cliMatch:  cliMatch  ? `${cliMatch.capability}/${cliMatch.provider}`  : null,
+    apiMatch:  apiMatch  ? `${apiMatch.capability}/${apiMatch.provider}`  : null,
   });
 
   return { ...state, gatheredContext };

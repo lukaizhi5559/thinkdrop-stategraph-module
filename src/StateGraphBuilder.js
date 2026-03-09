@@ -211,9 +211,25 @@ class StateGraphBuilder {
         if (intentType === 'command_automate') {
           // Skill already installed (parseSkill matched) — skip gatherContext + creatorPlanning,
           // go straight to planSkills which will emit external.skill as the only step.
+          // BUT: if the skill is a stub (no index.cjs on disk), we must go through gatherContext
+          // first so credentials/service info are collected before the skill build kicks off.
           if (state.matchedSkillName) {
-            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${state.matchedSkillName}" — skipping to planSkills`);
-            return 'planSkills';
+            const _fs = require('fs');
+            const _os = require('os');
+            const _path = require('path');
+            const _dotName = state.matchedSkillName;
+            const _skillExec = _path.join(_os.homedir(), '.thinkdrop', 'skills', _dotName, 'index.cjs');
+            if (_fs.existsSync(_skillExec)) {
+              logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" has index.cjs — skipping to planSkills`);
+              return 'planSkills';
+            }
+            // Stub-only: clear matchedSkillName so gatherContext + creatorPlanning can run
+            // and collect credentials before building the skill for real.
+            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub (no index.cjs) — routing to gatherContext`);
+            state.matchedSkillName = null;
+            state.forceSkillBuild = true;  // skip EXECUTE/BUILD classifier in gatherContext
+            state.stubSkillName = _dotName; // gatherContext can use this for focused questioning
+            // fall through to gatherContext below
           }
           logger.debug('[StateGraph:Router] enrichIntent: command_automate, no skill match — gatherContext');
           return 'gatherContext';

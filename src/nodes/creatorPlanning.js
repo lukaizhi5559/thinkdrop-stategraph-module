@@ -72,20 +72,229 @@ module.exports = async function creatorPlanning(state) {
     if (progressCallback) progressCallback({ type, ...extra });
   }
 
-  // ── Queue tab: enqueue item + broadcast phase transitions ───────────────────
-  // The queueManager lives in main.js — we drive it via a dedicated IPC bridge
-  // injected as state.queueBridge, or fall back to fire-and-forget HTTP.
-  const queueBridge = state.queueBridge || null;
-  let queueItemId = null;
+  // ── CLI Scout / API Scout fast-path ─────────────────────────────────────────
+  // If gatherContext identified a known CLI or SDK for this task, skip the full
+  // creator.agent → reviewer → skillCreator code-gen pipeline entirely.
+  // Instead, write skill.md + cli.json (or api.json) to disk and return.
+  const gatheredContext = state.gatheredContext || null;
+  let cliMatch  = gatheredContext?.cliMatch  || null;
+  let apiMatch  = gatheredContext?.apiMatch  || null;
+  let scoutMatch = cliMatch || apiMatch;
 
-  function queuePhase(status, extra) {
-    if (queueBridge?.setPhase) {
-      queueBridge.setPhase(queueItemId, status, extra);
+  // ── Live discovery fallback via skill-builder ────────────────────────────
+  // If gatherContext already ran buildSkill for a live-discovery provider, use
+  // the cached result. Otherwise run buildSkill now (provider named but no registry match).
+  if (!scoutMatch && gatheredContext?.resolvedFacts?.builtSkill) {
+    const built = gatheredContext.resolvedFacts.builtSkill;
+    if (built.type === 'cli') { cliMatch = built; } else { apiMatch = built; }
+    scoutMatch = built;
+    logger.info(`[Node:CreatorPlanning] Using cached builtSkill from gatherContext for "${built.provider}" (${built.type.toUpperCase()})`);
+  }
+
+  if (!scoutMatch && gatheredContext?.service_provider) {
+    const provider   = gatheredContext.service_provider;
+    const capability = gatheredContext.service_capability || gatheredContext[`service_${provider}`] || provider;
+    logger.info(`[Node:CreatorPlanning] No static registry match — running live skill-builder for "${provider}" (${capability})`);
+    emit('planning', { message: `Searching for "${provider}" CLI / API tools…` });
+    try {
+      // Walk up to find skill-builder.cjs next to skill-scout.cjs
+      let builderPath = null;
+      let _dir = __dirname;
+      for (let _i = 0; _i < 10; _i++) {
+        const _c = path.join(_dir, 'mcp-services', 'command-service', 'src', 'skill-builder.cjs');
+        if (fs.existsSync(_c)) { builderPath = _c; break; }
+        _dir = path.dirname(_dir);
+      }
+      // Also check sibling directory (when running from stategraph-module directly)
+      if (!builderPath) {
+        const _sibling = path.join(__dirname, '..', '..', '..', 'mcp-services', 'command-service', 'src', 'skill-builder.cjs');
+        if (fs.existsSync(_sibling)) builderPath = _sibling;
+      }
+      if (builderPath) {
+        const { buildSkill } = require(builderPath);
+        const built = await buildSkill(provider, capability, userMessage, (evtType, payload) => emit(evtType, payload));
+        if (built) {
+          if (built.type === 'cli') {
+            cliMatch = built;
+          } else {
+            apiMatch = built;
+          }
+          scoutMatch = built;
+          logger.info(`[Node:CreatorPlanning] Live skill-builder found ${built.type.toUpperCase()} match for "${provider}"`);
+        } else {
+          logger.info(`[Node:CreatorPlanning] Live skill-builder found nothing for "${provider}" — falling through to code-gen`);
+        }
+      } else {
+        logger.warn('[Node:CreatorPlanning] skill-builder.cjs not found — falling through to code-gen');
+      }
+    } catch (builderErr) {
+      logger.warn(`[Node:CreatorPlanning] Live skill-builder failed: ${builderErr.message} — falling through to code-gen`);
     }
   }
 
-  if (queueBridge?.enqueue) {
-    queueItemId = queueBridge.enqueue(userMessage);
+  if (scoutMatch) {
+    const isCliMatch = !!cliMatch;
+    const matchType  = isCliMatch ? 'CLI' : 'API';
+    const provider   = scoutMatch.provider;
+    const capability = scoutMatch.capability;
+    const config     = scoutMatch.config;
+
+    logger.info(`[Node:CreatorPlanning] ${matchType} Scout fast-path — skipping code-gen`, { capability, provider });
+    emit('planning', { message: `Found ${matchType} tool for "${capability}" (${provider}) — setting up skill…` });
+
+    // Derive dot-notation skill name from capability + provider
+    const rawName = `${capability}.${provider}`.toLowerCase().replace(/[^a-z0-9.]/g, '.');
+    const skillName = rawName.replace(/\.{2,}/g, '.').replace(/^\.|\.$/g, '');
+    const skillDir  = path.join(os.homedir(), '.thinkdrop', 'skills', skillName);
+
+    try {
+      fs.mkdirSync(skillDir, { recursive: true });
+
+      // Write skill.md
+      const secretsList = (config.authEnv || []).map(k => `  - ${k}`).join('\n');
+      // Only use schedule from context if it looks like a real time/cron — never let
+      // prior session history bleed in. On-demand tasks (no schedule in prompt) → 'on_demand'.
+      const rawSchedule = gatheredContext?.schedule || null;
+      const scheduleVal = (rawSchedule && rawSchedule !== 'on_demand' && /^[0-9]|daily|weekly|hourly|cron/i.test(rawSchedule))
+        ? rawSchedule
+        : 'on_demand';
+      const skillMd = [
+        '---',
+        `name: ${skillName}`,
+        `type: ${isCliMatch ? 'cli' : 'api'}`,
+        `${isCliMatch ? `cli_tool: ${config.tool}` : (config.npm ? `npm: ${config.npm}` : `transport: native_https`)}`,
+        `capability: ${capability}`,
+        `provider: ${provider}`,
+        `schedule: ${scheduleVal}`,
+        `secrets:`,
+        secretsList || '  []',
+        '---',
+        `## ${skillName}`,
+        '',
+        `Handles "${capability}" via ${isCliMatch ? `the \`${config.tool}\` CLI tool` : (config.npm ? `the \`${config.npm}\` npm SDK` : `native HTTPS (no npm package needed)`)}.`,
+        '',
+        isCliMatch
+          ? `Install: \`${config.installCmd}\``
+          : (config.npm ? `Install: \`npm install ${config.npm}\`` : `Install: none (uses Node.js built-in https)`),
+        '',
+        '### Required credentials',
+        ...(config.authEnv || []).map(k => `- \`${k}\``),
+        '',
+        '### Usage',
+        isCliMatch && config.helpCmd
+          ? `Get full CLI help: \`${config.helpCmd}\``
+          : !isCliMatch && config.npm
+          ? `Docs: \`npm info ${config.npm}\``
+          : config.baseUrl
+          ? `Base URL: \`${config.baseUrl}\``
+          : '',
+        ...(config.exampleCmds?.length
+          ? ['', '**Example commands:**', ...config.exampleCmds.map(c => `\`\`\`\n${c}\n\`\`\``)]
+          : config.exampleSnippet
+          ? ['', '**Example request:**', '```js', config.exampleSnippet, '```']
+          : []),
+        '',
+        '### Links',
+        ...(config.links?.length
+          ? (config.links || []).map(l => `- [${l.label}](${l.url})`)
+          : ['_(No links available)_']),
+      ].filter(l => l !== undefined).join('\n');
+
+      fs.writeFileSync(path.join(skillDir, 'skill.md'), skillMd, 'utf8');
+
+      // Write cli.json or api.json
+      const descriptorFile = isCliMatch ? 'cli.json' : 'api.json';
+      fs.writeFileSync(
+        path.join(skillDir, descriptorFile),
+        JSON.stringify(config, null, 2),
+        'utf8',
+      );
+
+      // ── CLI→API fallback: also write api.json if an API entry exists ─────────
+      // This allows executeCommand to retry via skill-api-runner if the CLI
+      // binary is unavailable after install (e.g. TS-only SDK, missing binary).
+      if (isCliMatch) {
+        try {
+          // Walk up from __dirname to find api-registry.json (works from both
+          // stategraph-module/src/nodes/ and node_modules/@thinkdrop/stategraph/src/nodes/)
+          let apiRegFile = null;
+          let _searchDir = __dirname;
+          for (let _i = 0; _i < 10; _i++) {
+            const _candidate = path.join(_searchDir, 'mcp-services', 'command-service', 'src', 'api-registry.json');
+            if (fs.existsSync(_candidate)) { apiRegFile = _candidate; break; }
+            _searchDir = path.dirname(_searchDir);
+          }
+          if (apiRegFile) {
+            const apiReg = JSON.parse(fs.readFileSync(apiRegFile, 'utf8'));
+            // Check if this capability+provider has an API entry
+            const apiCapEntry = apiReg[capability];
+            const apiProviderConfig = apiCapEntry?.providers?.[provider]
+              || apiCapEntry?.providers?.[apiCapEntry?.defaultProvider];
+            if (apiProviderConfig) {
+              const apiFallbackPath = path.join(skillDir, 'api.json');
+              if (!fs.existsSync(apiFallbackPath)) {
+                fs.writeFileSync(apiFallbackPath, JSON.stringify(apiProviderConfig, null, 2), 'utf8');
+                logger.info(`[Node:CreatorPlanning] Wrote api.json fallback for CLI skill "${skillName}" (${provider})`);
+              }
+            }
+          }
+        } catch (_apiFallbackErr) { /* non-fatal */ }
+      }
+
+      logger.info(`[Node:CreatorPlanning] ${matchType} skill written`, { skillName, skillDir });
+      emit('planning', { message: `Skill "${skillName}" configured — ready to run.` });
+
+      // Register in user-memory MCP so planSkills can find it
+      const secretKeys = config.authEnv || [];
+      try {
+        const http = require('http');
+        const body = JSON.stringify({
+          name: skillName,
+          type: isCliMatch ? 'cli' : 'api',
+          path: skillDir,
+          secrets: secretKeys,
+          description: `${capability} via ${provider} (${matchType} Scout)`,
+        });
+        await new Promise((resolve) => {
+          const req = http.request(
+            { hostname: '127.0.0.1', port: 3001, path: '/skill.install', method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+            (res) => { res.resume(); resolve(); },
+          );
+          req.on('error', () => resolve());
+          req.setTimeout(5000, () => { req.destroy(); resolve(); });
+          req.write(body); req.end();
+        });
+      } catch (_) { /* non-fatal */ }
+
+      // Set queueBridge phase
+      const queueBridge = state.queueBridge || null;
+      if (queueBridge?.setPhase) queueBridge.setPhase(null, 'done', { skillName, skillSecrets: secretKeys });
+
+      return {
+        ...state,
+        creatorSkillName:    skillName,
+        creatorSkillPath:    path.join(skillDir, isCliMatch ? 'cli.json' : 'api.json'),
+        creatorSkillSecrets: secretKeys,
+        creatorSkipCodeGen:  true,
+        creatorMatchType:    matchType.toLowerCase(),
+      };
+
+    } catch (scoutErr) {
+      logger.warn(`[Node:CreatorPlanning] ${matchType} Scout fast-path failed — falling through to code-gen`, { error: scoutErr.message });
+      // Fall through to normal code-gen pipeline below
+    }
+  }
+
+  // ── Queue tab: phase transitions via queueBridge ──────────────────────────
+  // The promptQueue item already exists (created when stategraph:process fired).
+  // We only call setPhase here — never enqueue — so there is exactly one Queue item.
+  const queueBridge = state.queueBridge || null;
+
+  function queuePhase(status, extra) {
+    if (queueBridge?.setPhase) {
+      queueBridge.setPhase(null, status, extra);
+    }
   }
 
   // ── Acquire pipeline lock ─────────────────────────────────────────────────
@@ -166,8 +375,13 @@ module.exports = async function creatorPlanning(state) {
     let roundsUsed = 0;
     let prevBlockerFingerprint = null;
     let stallCount = 0;
-    const STALL_LIMIT = 2; // 2 rounds with similar blockers = stalled, give up
-    const LATE_ROUND_ESCAPE = 6; // after this many rounds, apply tiered escape logic
+    const STALL_LIMIT = 2;  // 2 rounds with similar blockers = stalled, give up
+    const LATE_ROUND_ESCAPE = 3; // after this many rounds, apply tiered escape logic
+    // Score threshold: reviewer now knows it's a prototype — scores are more generous.
+    // Accept pass-with-warnings at lower thresholds than before.
+    const PROTO_ONLY_SCORE_MIN  = 40; // prototype-only blockers: accept if score >= this
+    const ARCH_BLOCKER_SCORE_MIN = 55; // arch/security blockers: higher bar required
+    const HIGH_SCORE_AUTO_PASS   = 70; // any score >= this → auto pass-with-warnings regardless
 
     // Prototype-only blocker keywords — lenient, these are expected prototype limitations.
     // Architecture/plan/agents blockers are STRICT — no escape allowed for those.
@@ -229,28 +443,43 @@ module.exports = async function creatorPlanning(state) {
       const currentBlockers = (reviewData?.blockers || []).concat(reviewData?.warnings || []);
       if (currentBlockers.length === 0) break;
 
-      // Late-round escape hatch (tiered):
-      // - Prototype-only blockers (retry logic, error handling, mock code, etc.):
-      //   escape at round>=LATE_ROUND_ESCAPE with score>=50 — prototypes are expected to be imperfect
-      // - Architecture/plan/agents blockers: still require score>=60 (no compromise on spec quality)
-      // - Ceiling hit (round === SAFETY_CEILING): force accept regardless — runtime recovery handles the rest
+      // ── Escape hatch logic (tiered) ─────────────────────────────────────────
+      // The reviewer now knows it's reviewing a prototype scaffold, so scores are
+      // more generous and blockers should be genuinely architectural. Exit early.
+      const score    = reviewData?.overallScore || 0;
+      const blockers = reviewData?.blockers || [];
+
+      // 1. Ceiling: always accept at safety ceiling
       if (round === SAFETY_CEILING) {
         verdict = 'pass-with-warnings';
-        logger.info('[Node:CreatorPlanning] ceiling hit at round ' + round + ' — accepting as pass-with-warnings (runtime recovery handles remaining issues)');
+        logger.info('[Node:CreatorPlanning] ceiling hit at round ' + round + ' — accepting as pass-with-warnings');
         break;
       }
+
+      // 2. High-score auto-pass: reviewer gave >=70 — prototype is solid enough
+      if (score >= HIGH_SCORE_AUTO_PASS) {
+        verdict = 'pass-with-warnings';
+        logger.info('[Node:CreatorPlanning] high-score auto-pass (score ' + score + ' >= ' + HIGH_SCORE_AUTO_PASS + ') at round ' + round);
+        break;
+      }
+
+      // 3. Late-round tiered escape (fires at round >= LATE_ROUND_ESCAPE = 3)
       if (round >= LATE_ROUND_ESCAPE) {
-        const score = reviewData?.overallScore || 0;
-        const blockers = reviewData?.blockers || [];
         const allPrototypeOnly = blockers.length > 0 && blockers.every(isPrototypeOnlyBlocker);
-        if (allPrototypeOnly && score >= 50) {
+        if (allPrototypeOnly && score >= PROTO_ONLY_SCORE_MIN) {
           verdict = 'pass-with-warnings';
-          logger.info('[Node:CreatorPlanning] late-round escape (prototype-only blockers, score ' + score + ') after ' + round + ' rounds — accepting as pass-with-warnings');
+          logger.info('[Node:CreatorPlanning] late-round escape (prototype-only blockers, score ' + score + ') after ' + round + ' rounds');
           break;
         }
-        if (!allPrototypeOnly && score >= 60) {
+        if (!allPrototypeOnly && score >= ARCH_BLOCKER_SCORE_MIN) {
           verdict = 'pass-with-warnings';
-          logger.info('[Node:CreatorPlanning] late-round escape (arch blocker, score ' + score + ' >= 60) after ' + round + ' rounds — accepting as pass-with-warnings');
+          logger.info('[Node:CreatorPlanning] late-round escape (arch blocker, score ' + score + ' >= ' + ARCH_BLOCKER_SCORE_MIN + ') after ' + round + ' rounds');
+          break;
+        }
+        // No blockers at all in late round — treat as pass
+        if (blockers.length === 0) {
+          verdict = 'pass-with-warnings';
+          logger.info('[Node:CreatorPlanning] late-round escape (no blockers) at round ' + round);
           break;
         }
       }

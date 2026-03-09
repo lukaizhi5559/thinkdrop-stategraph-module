@@ -16,14 +16,14 @@ Your job: identify what is GENUINELY MISSING to build and run this automation �
 
 ## What to look for (only if genuinely missing)
 
-- **SMS/messaging service** — if the user said "text me" or "SMS" but named no provider, ask which service (Twilio, ClickSend, TextBelt, etc.)
+- **SMS/messaging service** — if the user said "text me" or "SMS" but named no provider, ask which service. The provider list is populated by live discovery — do NOT hardcode names.
 - **Credentials** — API keys, Account SIDs, Auth Tokens, phone numbers, OAuth secrets. List each as a separate credential entry.
 - **Target identifiers** — recipient phone number, email address filter, Slack channel, repo name — only if not stated
 - **Config preferences** — how many emails to summarize? subject filter? format? — only if relevant to the task and not inferable
 
 ## Credential gating rule
 
-CRITICAL: Only list credentials for services that are already confirmed in resolvedFacts. If `service_sms` is not yet resolved, do NOT list Twilio/ClickSend credentials — those come after the user names their SMS service.
+CRITICAL: Only list credentials for services that are already confirmed in resolvedFacts. If `service_sms` is not yet resolved, do NOT list any SMS provider credentials — those come after the user names their SMS service.
 
 ## Output format
 
@@ -36,28 +36,23 @@ Return ONLY valid JSON. No markdown fences. No explanation outside the JSON.
     {
       "id": "service_sms",
       "question": "Which SMS service do you use to send text messages?",
-      "hint": "Common options: Twilio, ClickSend, TextBelt — or let me know if you use something else.",
+      "hint": "Provider options are surfaced by live discovery. State your preference or pick from the list shown.",
       "type": "choice",
-      "options": ["Twilio", "ClickSend", "TextBelt", "Other"],
+      "options": [],
       "required": true
     }
   ],
   "credentials": [
     {
       "id": "recipient_phone",
-      "question": "What phone number should receive the daily SMS summary?",
+      "question": "What phone number should receive the SMS?",
       "hint": "Include country code, e.g. +1 555 123 4567",
       "credentialKey": "RECIPIENT_PHONE_NUMBER",
       "required": true,
       "storedInKeytar": false
     }
   ],
-  "links": [
-    {
-      "label": "Get your Twilio credentials",
-      "url": "https://console.twilio.com"
-    }
-  ]
+  "links": []
 }
 ```
 

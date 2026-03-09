@@ -30,7 +30,7 @@ Only add something to `unknowns` if it is genuinely missing or ambiguous from th
 
 ## What to look for
 
-**Services / integrations** — Which SMS provider? (Twilio, TextBase, ClickSend, MessageBird, etc.) Which email provider? Which calendar? The user may have said "text me" without naming a provider. But if they named one (Gmail, Twilio, etc.), extract it — don't ask.
+**Services / integrations** — Which SMS provider? Which email provider? Which calendar? The user may have said "text me" without naming a provider. But if they named one, extract it — don't ask.
 
 **Credentials** — Every API key, Account SID, Auth Token, phone number, webhook URL, or OAuth secret required. Do NOT assume the user has any credential unless they stated it explicitly.
 
@@ -60,9 +60,9 @@ Return ONLY a valid JSON object. No markdown fences. No explanation text outside
     {
       "id": "service_sms",
       "question": "Which SMS service do you use to send text messages?",
-      "hint": "Common options: Twilio, TextBase, ClickSend, MessageBird — or let me know if you use something else.",
+      "hint": "The available options will be shown based on live discovery — or let me know if you have a preference.",
       "type": "choice",
-      "options": ["Twilio", "TextBase", "ClickSend", "MessageBird", "Other"],
+      "options": ["<dynamically populated by skill-builder>"],  
       "required": true
     },
     {
@@ -76,19 +76,19 @@ Return ONLY a valid JSON object. No markdown fences. No explanation text outside
   ],
   "credentials": [
     {
-      "id": "twilio_account_sid",
-      "question": "What is your Twilio Account SID?",
-      "hint": "Find it at console.twilio.com → Account Info. Starts with AC...",
-      "credentialKey": "TWILIO_ACCOUNT_SID",
-      "helpUrl": "https://console.twilio.com",
+      "id": "provider_api_key",
+      "question": "What is your <Provider> API key?",
+      "hint": "Find it in your <Provider> dashboard under API credentials.",
+      "credentialKey": "PROVIDER_API_KEY",
+      "helpUrl": "https://dashboard.provider.com",
       "required": true,
       "storedInKeytar": false
     }
   ],
   "links": [
     {
-      "label": "Get your Twilio credentials",
-      "url": "https://console.twilio.com"
+      "label": "Get your <Provider> credentials",
+      "url": "https://dashboard.provider.com"
     }
   ]
 }

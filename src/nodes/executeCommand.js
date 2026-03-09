@@ -386,19 +386,6 @@ module.exports = async function executeCommand(state) {
     };
   }
 
-  // ── needs_skill pseudo-skill — route to creatorPlanning ──────────────────
-  // needs_skill is no longer used — all new automation goes through creatorPlanning.
-  // If it appears (old plan), treat as a failed step so recoverSkill handles it.
-  if (skill === 'needs_skill') {
-    logger.warn(`[Node:ExecuteCommand] needs_skill step encountered — routing to recoverSkill`);
-    return {
-      ...state,
-      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_skill', args, description, ok: false, error: 'needs_skill is no longer supported — all automation goes through creatorPlanning' }],
-      skillCursor: skillCursor + 1,
-      failedStep: { step: skillCursor + 1, skill: 'needs_skill', error: 'needs_skill unsupported' },
-    };
-  }
-
   // ── api_suggest pseudo-skill ─────────────────────────────────────────────
   // Pauses the plan and surfaces an API-first offer to the user.
   // The LLM uses this when a task is better served by an app's API (e.g. Slack,
@@ -879,10 +866,46 @@ module.exports = async function executeCommand(state) {
 
     try {
       const fs = require('fs');
-      if (!fs.existsSync(skillPath)) {
-        throw new Error(`Skill contract file not found: ${skillPath}`);
+      const path = require('path');
+      const os = require('os');
+
+      // Resolve contractMd: prefer inline arg, then file on disk, then auto-scaffold
+      let contractMd = args.contractMd || null;
+      if (!contractMd) {
+        if (skillPath && fs.existsSync(skillPath)) {
+          contractMd = fs.readFileSync(skillPath, 'utf8');
+        } else {
+          // Auto-scaffold a minimal skill contract from the skill name
+          // Derive skill name from path (e.g. ~/.thinkdrop/skills/send.text/skill.md → send.text)
+          // or from args.name / args.skillName
+          const inferredName = args.name || args.skillName ||
+            (skillPath ? path.basename(path.dirname(skillPath)) : null) ||
+            'unknown.skill';
+          logger.info(`[Node:ExecuteCommand] skill.install: no file at ${skillPath || '(none)'} — auto-scaffolding contract for "${inferredName}"`);
+          const scaffoldDir = path.join(os.homedir(), '.thinkdrop', 'skills', inferredName);
+          const scaffoldFile = path.join(scaffoldDir, 'skill.md');
+          contractMd = [
+            '---',
+            `name: ${inferredName}`,
+            `description: ${args.description || inferredName + ' skill (auto-scaffolded)'}`,
+            `exec_path: ~/.thinkdrop/skills/${inferredName}/index.cjs`,
+            'exec_type: node',
+            'version: 1.0.0',
+            `trigger: ${inferredName}`,
+            'schedule: on_demand',
+            'secrets: ',
+            '---',
+            '',
+            `# ${inferredName}`,
+            '',
+            args.description || `Auto-scaffolded skill. Replace this with the real implementation.`,
+          ].join('\n');
+          // Persist scaffold so future skill.install calls can load it
+          fs.mkdirSync(scaffoldDir, { recursive: true });
+          fs.writeFileSync(scaffoldFile, contractMd, 'utf8');
+          logger.info(`[Node:ExecuteCommand] skill.install: scaffold written to ${scaffoldFile}`);
+        }
       }
-      const contractMd = fs.readFileSync(skillPath, 'utf8');
 
       const installRes = await mcpAdapter.callService('user-memory', 'skill.install', { contractMd }, { timeoutMs: 10000 });
       const raw = installRes?.data || installRes;
@@ -1509,6 +1532,137 @@ module.exports = async function executeCommand(state) {
 
     const updatedResults = [...skillResults, stepResult];
 
+    // ── CLI / API Scout execution ────────────────────────────────────────────
+    // If this step is external.skill AND the skill dir has cli.json or api.json
+    // (written by creatorPlanning Scout fast-path), route to the universal runners
+    // instead of doing code-gen or failing. This runs on success AND failure so
+    // CLI/API skills don't need an index.cjs at all.
+    if (skill === 'external.skill') {
+      const SKILLS_DIR = require('path').join(require('os').homedir(), '.thinkdrop', 'skills');
+      const stepSkillName = resolvedArgs.name || args.name;
+      if (stepSkillName) {
+        const skillDir    = require('path').join(SKILLS_DIR, stepSkillName);
+        const cliJsonPath = require('path').join(skillDir, 'cli.json');
+        const apiJsonPath = require('path').join(skillDir, 'api.json');
+        const hasCli = require('fs').existsSync(cliJsonPath);
+        const hasApi = !hasCli && require('fs').existsSync(apiJsonPath);
+
+        if (hasCli || hasApi) {
+          const runnerType = hasCli ? 'CLI' : 'API';
+          const logger = state.logger || console;
+          logger.info(`[Node:ExecuteCommand] ${runnerType} Scout skill detected — routing to runner`, { skillName: stepSkillName });
+
+          if (progressCallback) progressCallback({
+            type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length,
+            skill: hasCli ? 'skill-cli-runner' : 'skill-api-runner',
+            description: `Running "${stepSkillName}" via ${runnerType} runner…`,
+          });
+
+          try {
+            // Resolve runner path — walk up from __dirname to find command-service/src.
+            // Works from both stategraph-module/src/nodes/ and node_modules/@thinkdrop/stategraph/src/nodes/
+            function findCommandServiceSrc() {
+              const _path = require('path');
+              const _fs   = require('fs');
+              let dir = __dirname;
+              for (let i = 0; i < 8; i++) {
+                const candidate = _path.join(dir, 'mcp-services', 'command-service', 'src');
+                if (_fs.existsSync(candidate)) return candidate;
+                dir = _path.dirname(dir);
+              }
+              return null;
+            }
+            const cmdSvcSrc = findCommandServiceSrc();
+            const runnerFile = hasCli ? 'skill-cli-runner.cjs' : 'skill-api-runner.cjs';
+            const runnerPath = cmdSvcSrc
+              ? require('path').join(cmdSvcSrc, runnerFile)
+              : require('path').join(__dirname, '../../../../mcp-services/command-service/src', runnerFile);
+
+            const runner = require(runnerPath);
+            const runArgs = { ...(resolvedArgs || {}), ...(args || {}) };
+            delete runArgs.name; delete runArgs.secretKeys;
+
+            let runResult = await runner.run(stepSkillName, runArgs, {
+              dryRun: runArgs.dryRun === true,
+            });
+
+            // ── CLI→API runtime fallback ─────────────────────────────────────
+            // If the CLI runner reports the binary is unavailable after install,
+            // check if an api.json exists for the same skill and retry via the
+            // API runner — no user interaction needed.
+            let effectiveRunnerType = runnerType;
+            if (!runResult.ok && runResult.cliNotAvailable && hasCli) {
+              const _logger = state.logger || console;
+              const apiFallbackPath = require('path').join(skillDir, 'api.json');
+              if (require('fs').existsSync(apiFallbackPath)) {
+                _logger.info(`[Node:ExecuteCommand] CLI→API fallback: "${runResult.error}" — retrying via API runner`, { skillName: stepSkillName });
+                if (progressCallback) progressCallback({
+                  type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length,
+                  skill: 'skill-api-runner',
+                  description: `CLI unavailable — retrying "${stepSkillName}" via API runner…`,
+                });
+                const apiRunnerPath = cmdSvcSrc
+                  ? require('path').join(cmdSvcSrc, 'skill-api-runner.cjs')
+                  : require('path').join(__dirname, '../../../../mcp-services/command-service/src/skill-api-runner.cjs');
+                try {
+                  const apiRunner = require(apiRunnerPath);
+                  runResult = await apiRunner.run(stepSkillName, runArgs, { dryRun: runArgs.dryRun === true });
+                  effectiveRunnerType = 'API';
+                } catch (apiFallbackErr) {
+                  _logger.warn(`[Node:ExecuteCommand] API fallback runner threw: ${apiFallbackErr.message}`);
+                }
+              }
+            }
+
+            const scoutStepResult = {
+              skill,
+              args: resolvedArgs,
+              ok: runResult.ok,
+              result: runResult.result || runResult.output || null,
+              error: runResult.error || null,
+              runnerType: effectiveRunnerType,
+            };
+
+            if (progressCallback) progressCallback({
+              type: runResult.ok ? 'step_done' : 'step_error',
+              stepIndex: skillCursor,
+              totalSteps: skillPlan.length,
+              skill: `skill-${effectiveRunnerType.toLowerCase()}-runner`,
+              result: scoutStepResult,
+            });
+
+            const scoutResults = [...skillResults, scoutStepResult];
+
+            if (!runResult.ok && !optional) {
+              return {
+                ...state,
+                skillResults: scoutResults,
+                failedStep: { step: skillCursor, skill, args: resolvedArgs, error: runResult.error, runnerType: effectiveRunnerType },
+                skillCursor,
+                skillPlan,
+              };
+            }
+
+            if (skillCursor + 1 >= skillPlan.length) {
+              return {
+                ...state,
+                skillResults: scoutResults,
+                skillCursor: skillCursor + 1,
+                commandExecuted: true,
+                answer: runResult.result || `${runnerType} skill "${stepSkillName}" completed.`,
+              };
+            }
+            return { ...state, skillResults: scoutResults, skillCursor: skillCursor + 1, skillPlan };
+
+          } catch (runnerErr) {
+            const logger = state.logger || console;
+            logger.warn(`[Node:ExecuteCommand] ${runnerType} runner threw — falling through to code-gen`, { error: runnerErr.message });
+            // Fall through to normal missing-skill handling below
+          }
+        }
+      }
+    }
+
     if (!stepResult.ok && !optional) {
       // ── Missing external skill — trigger build pipeline ─────────────────────
       // When external.skill fails because the skill file doesn't exist, don't
@@ -1549,6 +1703,92 @@ module.exports = async function executeCommand(state) {
         } catch (regenErr) {
           logger.warn(`[Node:ExecuteCommand] skillCreator re-gen threw: ${regenErr.message}`);
         }
+      }
+
+      // ── No creatorProjectId — skill was installed as a stub but never built ──
+      // Kick off creator.agent create_project → skillCreator generate_skill to
+      // actually build the index.cjs file, install deps, and register the skill.
+      // After a successful build, retry the external.skill step (once only).
+      if (isMissingSkill && !state.creatorProjectId && !state.skillCreatorBuildAttempted && mcpAdapter) {
+        const missingSkillName = resolvedArgs.name || args.name;
+        // Build a focused skill description from the step args — NOT the full user task message.
+        // The full message (e.g. "research photosynthesis and text me") describes the overall task,
+        // not what the missing skill should do. Use the step args to describe the skill's purpose.
+        const stepArgsDesc = Object.entries(resolvedArgs.args || resolvedArgs || {})
+          .filter(([k]) => k !== 'name')
+          .map(([k, v]) => `${k}: ${typeof v === 'string' ? v.slice(0, 120) : JSON.stringify(v).slice(0, 120)}`)
+          .join(', ');
+        const skillPrompt = `Create a ThinkDrop skill named "${missingSkillName}" that: ${stepArgsDesc || `implements the ${missingSkillName} capability`}. The skill should be a standalone Node.js CommonJS module that accepts runtime args and uses REST APIs or npm packages to accomplish its task. It must NOT use any relative require() paths or command-service internal files.`;
+        logger.info(`[Node:ExecuteCommand] Skill "${missingSkillName}" has no index.cjs — kicking off creator.agent + skillCreator build pipeline`);
+        logger.debug(`[Node:ExecuteCommand] creator.agent prompt: ${skillPrompt.slice(0, 200)}`);
+
+        if (progressCallback) progressCallback({
+          type: 'skill_build_phase',
+          phase: 'planning',
+          skillName: missingSkillName,
+          round: 1,
+        });
+
+        try {
+          // Step 1: creator.agent create_project — BDD, plan.md, agents.md
+          logger.info(`[Node:ExecuteCommand] creator.agent create_project for "${missingSkillName}"`);
+          if (progressCallback) progressCallback({
+            type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length,
+            skill: 'creator.agent', description: `Planning skill "${missingSkillName}"…`,
+          });
+
+          const createRes = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'creator.agent',
+            args: { action: 'create_project', prompt: skillPrompt, name: missingSkillName },
+          }, { timeoutMs: 360000 }).catch(e => ({ ok: false, error: e.message }));
+          const created = createRes?.data || createRes;
+
+          if (!created?.ok || !created?.id) {
+            logger.warn(`[Node:ExecuteCommand] creator.agent create_project failed: ${created?.error}`);
+            // Fall through to recoverSkill
+          } else {
+            // Step 2: skillCreator generate_skill — generates index.cjs, installs deps
+            logger.info(`[Node:ExecuteCommand] skillCreator generate_skill for project "${created.id}"`);
+            if (progressCallback) progressCallback({
+              type: 'skill_build_phase',
+              phase: 'generating',
+              skillName: missingSkillName,
+              round: 1,
+            });
+
+            const genRes = await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'skillCreator.skill',
+              args: { action: 'generate_skill', projectId: created.id, projectDir: created.dir },
+            }, { timeoutMs: 360000 }).catch(e => ({ ok: false, error: e.message }));
+            const generated = genRes?.data || genRes;
+
+            if (generated?.ok && generated?.skillPath) {
+              logger.info(`[Node:ExecuteCommand] Skill "${missingSkillName}" built at ${generated.skillPath} — retrying external.skill step`);
+              if (progressCallback) progressCallback({
+                type: 'skill_build_phase',
+                phase: 'complete',
+                skillName: generated.skillName || missingSkillName,
+                round: 1,
+              });
+              // Retry the failed external.skill step (cursor stays, remove failed result)
+              return {
+                ...state,
+                creatorProjectId: created.id,
+                creatorSkillName: generated.skillName || missingSkillName,
+                creatorSkillPath: generated.skillPath,
+                skillCreatorBuildAttempted: true,
+                skillPlan,
+                skillCursor,
+                skillResults: updatedResults.slice(0, -1), // remove the failed step so it retries
+                failedStep: null,
+              };
+            }
+            logger.warn(`[Node:ExecuteCommand] skillCreator generate_skill failed: ${generated?.error}`);
+          }
+        } catch (buildErr) {
+          logger.warn(`[Node:ExecuteCommand] creator.agent/skillCreator build threw: ${buildErr.message}`);
+        }
+        // Build failed — fall through to recoverSkill
       }
 
       // Step failed and is not optional — hand off to recoverSkill
