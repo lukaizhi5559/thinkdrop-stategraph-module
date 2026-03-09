@@ -1709,7 +1709,19 @@ module.exports = async function executeCommand(state) {
       // Kick off creator.agent create_project → skillCreator generate_skill to
       // actually build the index.cjs file, install deps, and register the skill.
       // After a successful build, retry the external.skill step (once only).
-      if (isMissingSkill && !state.creatorProjectId && !state.skillCreatorBuildAttempted && mcpAdapter) {
+      //
+      // GUARD: Do NOT build on-demand if the skill name looks like a capability
+      // that gatherContext+creatorPlanning owns (sms, email, payment, etc.).
+      // Those need provider-specific context the gatherContext pipeline collects.
+      // Building here would produce generic/wrong code (e.g. hardcoded Twilio).
+      const _missingName = (resolvedArgs.name || args.name || '').toLowerCase();
+      const _capabilityPrefixes = ['sms', 'email', 'send', 'message', 'text', 'payment', 'storage', 'notify', 'call', 'voice', 'mail', 'push'];
+      const _isCapabilitySkill = _capabilityPrefixes.some(p => _missingName.startsWith(p + '.') || _missingName === p || _missingName.startsWith(p + '_'));
+      if (isMissingSkill && _isCapabilitySkill) {
+        logger.warn(`[Node:ExecuteCommand] Blocking on-demand build for capability skill "${_missingName}" — must go through gatherContext discovery pipeline`);
+        // Fall through to recoverSkill with a clear error
+      }
+      if (isMissingSkill && !_isCapabilitySkill && !state.creatorProjectId && !state.skillCreatorBuildAttempted && mcpAdapter) {
         const missingSkillName = resolvedArgs.name || args.name;
         // Build a focused skill description from the step args — NOT the full user task message.
         // The full message (e.g. "research photosynthesis and text me") describes the overall task,

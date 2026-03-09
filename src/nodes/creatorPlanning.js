@@ -244,28 +244,61 @@ module.exports = async function creatorPlanning(state) {
       logger.info(`[Node:CreatorPlanning] ${matchType} skill written`, { skillName, skillDir });
       emit('planning', { message: `Skill "${skillName}" configured — ready to run.` });
 
-      // Register in user-memory MCP so planSkills can find it
+      // Register in user-memory DB via skill.upsert so parseSkill can find it next run
       const secretKeys = config.authEnv || [];
       try {
         const http = require('http');
-        const body = JSON.stringify({
-          name: skillName,
-          type: isCliMatch ? 'cli' : 'api',
-          path: skillDir,
-          secrets: secretKeys,
-          description: `${capability} via ${provider} (${matchType} Scout)`,
+        // execPath: prefer index.cjs if it exists, else the descriptor json
+        const indexPath = path.join(skillDir, 'index.cjs');
+        const execPath  = fs.existsSync(indexPath)
+          ? indexPath
+          : path.join(skillDir, isCliMatch ? 'cli.json' : 'api.json');
+        // Read skill.md so contractMd is stored in DB — main.js parses secrets from it
+        const skillMdPath = path.join(skillDir, 'skill.md');
+        const contractMd = fs.existsSync(skillMdPath) ? fs.readFileSync(skillMdPath, 'utf8') : '';
+        const upsertPayload = JSON.stringify({
+          version:   'mcp.v1',
+          service:   'user-memory',
+          action:    'skill.upsert',
+          requestId: `creatorPlanning-${Date.now()}`,
+          payload: {
+            name:        skillName,
+            description: `${capability} via ${provider} — ${isCliMatch ? 'CLI' : 'API'} skill`,
+            execPath,
+            execType:    'node',
+            enabled:     true,
+            contractMd,
+          },
         });
+        const _memApiKey = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
         await new Promise((resolve) => {
           const req = http.request(
-            { hostname: '127.0.0.1', port: 3001, path: '/skill.install', method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
-            (res) => { res.resume(); resolve(); },
+            { hostname: '127.0.0.1', port: 3001, path: '/skill.upsert', method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(upsertPayload),
+                ...(_memApiKey ? { 'Authorization': `Bearer ${_memApiKey}` } : {}),
+              } },
+            (res) => {
+              let raw = '';
+              res.on('data', c => raw += c);
+              res.on('end', () => {
+                if (res.statusCode === 200 || res.statusCode === 201) {
+                  logger.info(`[Node:CreatorPlanning] Registered skill "${skillName}" in DB (execPath: ${execPath})`);
+                } else {
+                  logger.warn(`[Node:CreatorPlanning] skill.upsert failed: ${res.statusCode} ${raw.slice(0,200)}`);
+                }
+                resolve();
+              });
+            },
           );
-          req.on('error', () => resolve());
+          req.on('error', (e) => { logger.warn(`[Node:CreatorPlanning] skill.upsert failed: ${e.message}`); resolve(); });
           req.setTimeout(5000, () => { req.destroy(); resolve(); });
-          req.write(body); req.end();
+          req.write(upsertPayload); req.end();
         });
-      } catch (_) { /* non-fatal */ }
+      } catch (regErr) {
+        logger.warn(`[Node:CreatorPlanning] Skill registration error: ${regErr.message}`);
+      }
 
       // Set queueBridge phase
       const queueBridge = state.queueBridge || null;

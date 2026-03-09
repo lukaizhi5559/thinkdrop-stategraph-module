@@ -218,14 +218,17 @@ class StateGraphBuilder {
             const _os = require('os');
             const _path = require('path');
             const _dotName = state.matchedSkillName;
-            const _skillExec = _path.join(_os.homedir(), '.thinkdrop', 'skills', _dotName, 'index.cjs');
-            if (_fs.existsSync(_skillExec)) {
-              logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" has index.cjs — skipping to planSkills`);
+            const _skillDir = _path.join(_os.homedir(), '.thinkdrop', 'skills', _dotName);
+            const _skillExec = _path.join(_skillDir, 'index.cjs');
+            const _apiJson   = _path.join(_skillDir, 'api.json');
+            const _cliJson   = _path.join(_skillDir, 'cli.json');
+            if (_fs.existsSync(_skillExec) || _fs.existsSync(_apiJson) || _fs.existsSync(_cliJson)) {
+              logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is installed — skipping to planSkills`);
               return 'planSkills';
             }
             // Stub-only: clear matchedSkillName so gatherContext + creatorPlanning can run
             // and collect credentials before building the skill for real.
-            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub (no index.cjs) — routing to gatherContext`);
+            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub (no index.cjs/api.json/cli.json) — routing to gatherContext`);
             state.matchedSkillName = null;
             state.forceSkillBuild = true;  // skip EXECUTE/BUILD classifier in gatherContext
             state.stubSkillName = _dotName; // gatherContext can use this for focused questioning

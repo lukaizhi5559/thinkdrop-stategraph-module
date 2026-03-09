@@ -793,12 +793,17 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
 
     const extracted = parseJson(extractRaw);
     if (extracted?.resolvedFacts) {
+      // Schedule keywords — only honour schedule extraction if the current prompt
+      // actually mentions scheduling. Otherwise Phase 1 hallucinates them from
+      // conversation history (e.g. a previous "every day at 9pm" bleeds in).
+      const promptMentionsSchedule = /\b(every|daily|weekly|hourly|at \d|schedule|cron|remind|morning|evening|tonight|tomorrow|each day|each week)\b/i.test(userMessage);
       for (const [k, v] of Object.entries(extracted.resolvedFacts)) {
         // Never overwrite keys the user has explicitly answered
-        if (!resolvedAnswers[k] && v) {
-          resolvedFacts[k] = v;
-          logger.info(`[Node:GatherContext] Phase 1 extracted: ${k} = ${v}`);
-        }
+        if (resolvedAnswers[k] || !v) continue;
+        // Drop schedule fields if prompt has no scheduling intent
+        if (!promptMentionsSchedule && (k === 'schedule_time' || k === 'schedule_frequency' || k === 'schedule_tz')) continue;
+        resolvedFacts[k] = v;
+        logger.info(`[Node:GatherContext] Phase 1 extracted: ${k} = ${v}`);
       }
     }
 
@@ -1093,6 +1098,19 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
     // Top-level convenience fields for creatorPlanning → skill-builder
     service_provider:   allFinal['service_provider']   || chosenProvider || null,
     service_capability: allFinal['service_capability'] || scoutProviderPreselect?.capability || null,
+    // True when the scout gate upgraded EXECUTE→BUILD — user said "I need to send texts"
+    // (setup intent), not "send a text to X right now". planSkills stops after skill setup.
+    // If the message has a specific recipient/target (phone number, email, content to send),
+    // it's a combined "set up and run now" request — don't stop after setup.
+    buildOnly: (() => {
+      if (taskType !== 'BUILD') return false;
+      const _hasPhoneNumber  = /\b\d{10,}\b/.test(userMessage);
+      const _hasEmailTarget  = /\bto\s+[\w._%+-]+@[\w.-]+\.[a-z]{2,}/i.test(userMessage);
+      const _hasSayContent   = /\bsay(ing)?\s+["']?.{3,}/i.test(userMessage);
+      const _hasAndSend      = /\band\s+(send|text|email|notify|tell|say)/i.test(userMessage);
+      const _isImmediateRun  = _hasPhoneNumber || _hasEmailTarget || _hasSayContent || _hasAndSend;
+      return !_isImmediateRun;
+    })(),
   };
 
   logger.info('[Node:GatherContext] Context gathered', {

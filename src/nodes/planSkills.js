@@ -134,7 +134,8 @@ module.exports = async function planSkills(state) {
   if (state.creatorSkillName && state.creatorSkillPath) {
     const fs = require('fs');
     if (fs.existsSync(state.creatorSkillPath)) {
-      logger.info(`[Node:PlanSkills] Creator skill ready — bypassing LLM plan, running "${state.creatorSkillName}" directly`);
+      const buildOnly = state.gatheredContext?.buildOnly === true;
+      logger.info(`[Node:PlanSkills] Creator skill ready — ${buildOnly ? 'build-only setup, not auto-executing' : `running "${state.creatorSkillName}" directly`}`);
       const secretKeys = Array.isArray(state.creatorSkillSecrets) ? state.creatorSkillSecrets : [];
 
       // ── Credential gate: collect missing secrets before running ─────────────
@@ -178,6 +179,23 @@ module.exports = async function planSkills(state) {
         }
       }
       // ── End credential gate ──────────────────────────────────────────────────
+
+      // Build-only: user set up the skill (e.g. "I need to send text messages from here")
+      // but didn't ask to run it right now. Tell them it's ready and stop.
+      if (buildOnly) {
+        const readyMsg = `Skill "${state.creatorSkillName}" is set up and ready. Just say something like "send a text to [number] saying [message]" to use it.`;
+        logger.info(`[Node:PlanSkills] Build-only — skill ready, not executing: "${state.creatorSkillName}"`);
+        if (progressCallback) progressCallback({ type: 'skill_setup_complete', skillName: state.creatorSkillName, message: readyMsg });
+        return {
+          ...state,
+          skillPlan: [],
+          skillCursor: 0,
+          commandExecuted: true,
+          answer: readyMsg,
+          recoveryContext: null,
+          planError: null,
+        };
+      }
 
       const skillPlan = [{
         skill: 'external.skill',

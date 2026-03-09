@@ -99,6 +99,24 @@ module.exports = async function parseSkill(state) {
     }
   }
 
+  // ── Strategy 2.5: capability-keyword match ───────────────────────────────────
+  // Catches "send me a text", "send an email", etc. when an installed skill covers
+  // that capability — prevents parseIntent from misclassifying as memory_store.
+  const CAPABILITY_PATTERNS = [
+    { keywords: /\b(send|text|sms|message)\b.*\b(text|sms|message)\b|\bsend\b.*\b\d{10}\b|\btext (me|him|her|them|us)\b/i, capability: 'sms' },
+    { keywords: /\b(send|compose|write)\b.*\b(email|mail)\b/i,                                                                 capability: 'email' },
+  ];
+  for (const pattern of CAPABILITY_PATTERNS) {
+    if (pattern.keywords.test(classifyMessage)) {
+      // Find an installed skill whose name contains the capability
+      const capSkill = installedSkills.find(s => s.name.toLowerCase().includes(pattern.capability));
+      if (capSkill) {
+        logger.info(`[Node:ParseSkill] Capability-keyword match: "${classifyMessage.substring(0,60)}" → skill "${capSkill.name}"`);
+        return _matchedState(state, capSkill.name);
+      }
+    }
+  }
+
   // ── Strategy 3: LLM semantic match ──────────────────────────────────────────
   // Only fires when both string strategies miss AND we have an LLM backend.
   // Builds a compact skill menu (name + description) and asks the LLM for a
