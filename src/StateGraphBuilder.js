@@ -226,16 +226,14 @@ class StateGraphBuilder {
               logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is installed — skipping to planSkills`);
               return 'planSkills';
             }
-            // Stub-only: clear matchedSkillName so gatherContext + creatorPlanning can run
-            // and collect credentials before building the skill for real.
-            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub (no index.cjs/api.json/cli.json) — routing to gatherContext`);
+            // Stub-only: no index.cjs on disk — fall through to planSkills which handles it
+            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub — routing to planSkills`);
             state.matchedSkillName = null;
-            state.forceSkillBuild = true;  // skip EXECUTE/BUILD classifier in gatherContext
-            state.stubSkillName = _dotName; // gatherContext can use this for focused questioning
-            // fall through to gatherContext below
+            // fall through below
           }
-          logger.debug('[StateGraph:Router] enrichIntent: command_automate, no skill match — gatherContext');
-          return 'gatherContext';
+          // gatherContext + creatorPlanning both bypassed — route direct to planSkills
+          logger.debug('[StateGraph:Router] enrichIntent: command_automate — planSkills (creator pipeline bypassed)');
+          return 'planSkills';
         }
 
         // All other intents: route the same as parseIntent used to
@@ -263,23 +261,19 @@ class StateGraphBuilder {
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',
       
-      // gatherContext → planSkills (EXECUTE one-shot) or creatorPlanning (BUILD new skill)
-      gatherContext: (state) => {
-        if (state.gatherContextSkipped) {
-          logger.debug('[StateGraph:Router] gatherContext skipped (EXECUTE task) — routing direct to planSkills');
-          return 'planSkills';
-        }
-        return 'creatorPlanning';
-      },
-
+      // gatherContext bypassed — kept for future re-enable
+      // gatherContext: () => 'creatorPlanning',
       // creatorPlanning → planSkills (pass/warnings) or logConversation (reviewer fail)
-      creatorPlanning: (state) => {
-        if (state.planError) {
-          logger.debug(`[StateGraph:Router] creatorPlanning reviewer blocked: ${state.planError}`);
-          return 'logConversation';
-        }
-        return 'planSkills';
-      },
+      // creatorPlanning: (state) => {
+      //   if (state.planError) {
+      //     logger.debug(`[StateGraph:Router] creatorPlanning reviewer blocked: ${state.planError}`);
+      //     return 'logConversation';
+      //   }
+      //   return 'planSkills';
+      // },
+      // gatherContext + creatorPlanning both bypassed — kept for future re-enable
+      gatherContext: () => 'planSkills',
+      creatorPlanning: () => 'planSkills',
 
       // planSkills → executeCommand (plan ready) or logConversation (plan error)
       planSkills: (state) => {

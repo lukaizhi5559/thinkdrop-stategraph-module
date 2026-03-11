@@ -547,10 +547,42 @@ Task: "${userMessage}"`;
       const isRaw = isRes?.data || isRes;
       const isNames = Array.isArray(isRaw?.results) ? isRaw.results : [];
       if (isNames.length > 0) {
-        const lines = isNames.map(s => `  - name: ${s.name} — ${s.description || 'no description'}`).join('\n');
-        installedSkillsNote = `\n\nINSTALLED SKILLS (MUST use external.skill for these — NEVER use needs_skill):\n${lines}\n  Usage: { "skill": "external.skill", "args": { "name": "<skill-name>", ...skillArgs } }`;
+        const isMdSkill = s => s.execType === 'shell' || (s.execPath || '').endsWith('.md');
+        const nodeSkills  = isNames.filter(s => !isMdSkill(s));
+        const shellSkills = isNames.filter(s =>  isMdSkill(s));
+        const noteParts = [];
+        if (nodeSkills.length > 0) {
+          const lines = nodeSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
+          noteParts.push(`INSTALLED SKILLS (use external.skill ONLY when the skill's purpose DIRECTLY matches the task — do NOT use as a fallback for vaguely related tasks):\n${lines}\n  Usage: { "skill": "external.skill", "args": { "name": "<skill-name>", ...args } }\n  RULE: If the task cannot be fulfilled by one of these skills exactly, use shell.run or needs_skill instead. Never pick an installed skill just because it seems related.`);
+        }
+        if (shellSkills.length > 0) {
+          const lines = shellSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
+          noteParts.push(`SHELL-PLAN SKILLS (contract_md defines steps — generate shell.run steps directly, do NOT use external.skill):\n${lines}\n  RULE: Only use these when the task directly matches the skill's stated purpose.`);
+        }
+        if (noteParts.length > 0) installedSkillsNote = '\n\n' + noteParts.join('\n\n');
       }
     } catch (_) { /* non-fatal */ }
+  }
+
+  // ── Skill contract injection ─────────────────────────────────────────────────
+  // When parseSkill matched an installed skill, fetch its full contract_md from DB
+  // and inject it as planning context. This replaces the old creatorPlanning code-gen
+  // pipeline: skill.md IS the plan — shell.run/curl steps are derived from it directly.
+  let skillContractNote = '';
+  if (state.matchedSkillName && mcpAdapter) {
+    try {
+      const scRes = await mcpAdapter.callService('user-memory', 'skill.get', {
+        name: state.matchedSkillName
+      }, { timeoutMs: 3000 }).catch(() => null);
+      const scData = scRes?.data || scRes;
+      const contractMd = scData?.contractMd || scData?.contract_md || '';
+      if (contractMd && contractMd.trim()) {
+        skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — IMPORTANT: this is a shell-plan skill. You MUST generate individual shell.run steps from the Plan section below. Do NOT use external.skill for this — it cannot be executed directly.\n\n${contractMd.slice(0, 3000)}`;
+        logger.info(`[Node:PlanSkills] Injected contract_md for matched skill "${state.matchedSkillName}" (${contractMd.length} chars)`);
+      }
+    } catch (scErr) {
+      logger.warn(`[Node:PlanSkills] Could not fetch contract_md for "${state.matchedSkillName}": ${scErr.message}`);
+    }
   }
 
   // ── Agent registry: inject healthy agent descriptors into planning context ──
@@ -599,7 +631,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${installedSkillsNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
+User request: "${userMessage}"${skillContractNote}${installedSkillsNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   const payload = {
     query: planningQuery,

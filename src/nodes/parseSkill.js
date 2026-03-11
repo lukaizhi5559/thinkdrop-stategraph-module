@@ -102,12 +102,20 @@ module.exports = async function parseSkill(state) {
   // ── Strategy 2.5: capability-keyword match ───────────────────────────────────
   // Catches "send me a text", "send an email", etc. when an installed skill covers
   // that capability — prevents parseIntent from misclassifying as memory_store.
+  // Guard: only match if (a) a phone/email address is present, OR (b) the prompt
+  // is short (≤120 chars) and SMS/email is clearly the primary intent.
+  // Long multi-step prompts with "send a text" as a trailing clause must NOT match
+  // here — they need the full planning pipeline.
+  const hasPhoneNumber = /\b\d{10,11}\b|\+1\d{10}/.test(classifyMessage);
+  const isShortPrompt  = classifyMessage.trim().length <= 120;
   const CAPABILITY_PATTERNS = [
-    { keywords: /\b(send|text|sms|message)\b.*\b(text|sms|message)\b|\bsend\b.*\b\d{10}\b|\btext (me|him|her|them|us)\b/i, capability: 'sms' },
-    { keywords: /\b(send|compose|write)\b.*\b(email|mail)\b/i,                                                                 capability: 'email' },
+    { keywords: /\b(send|text|sms|message)\b.*\b(text|sms|message)\b|\bsend\b.*\b\d{10}\b|\btext (me|him|her|them|us)\b/i, capability: 'sms',   requiresPhoneOrShort: true },
+    { keywords: /\b(send|compose|write)\b.*\b(email|mail)\b/i,                                                                capability: 'email', requiresPhoneOrShort: false },
   ];
   for (const pattern of CAPABILITY_PATTERNS) {
     if (pattern.keywords.test(classifyMessage)) {
+      // For SMS: only match if there's a phone number OR it's a short focused prompt
+      if (pattern.requiresPhoneOrShort && !hasPhoneNumber && !isShortPrompt) continue;
       // Find an installed skill whose name contains the capability
       const capSkill = installedSkills.find(s => s.name.toLowerCase().includes(pattern.capability));
       if (capSkill) {
@@ -142,7 +150,11 @@ module.exports = async function parseSkill(state) {
 
   try {
     const raw = await Promise.race([
-      llmBackend.generateAnswer(SEMANTIC_SYSTEM_PROMPT, semanticPrompt, { temperature: 0 }),
+      llmBackend.generateAnswer(semanticPrompt, {
+        systemInstructions: SEMANTIC_SYSTEM_PROMPT,
+        conversationHistory: [],
+        intent: 'command_automate'
+      }, { maxTokens: 60, temperature: 0, fastMode: true }),
       new Promise((_, reject) => setTimeout(() => reject(new Error('semantic timeout')), 5000)),
     ]);
 

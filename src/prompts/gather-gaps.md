@@ -14,29 +14,41 @@ Your job: identify what is GENUINELY MISSING to build and run this automation �
 - **`service_email`** — NEVER ask which email service if already in resolvedFacts
 - **Any fact visible in the "Already resolved" section below**
 
-## What to look for (only if genuinely missing)
+## What to look for (only if genuinely missing AND directly required by the user's stated action)
 
-- **SMS/messaging service** — if the user said "text me" or "SMS" but named no provider, ask which service. The provider list is populated by live discovery — do NOT hardcode names.
-- **Credentials** — API keys, Account SIDs, Auth Tokens, phone numbers, OAuth secrets. List each as a separate credential entry.
-- **Target identifiers** — recipient phone number, email address filter, Slack channel, repo name — only if not stated
-- **Config preferences** — how many emails to summarize? subject filter? format? — only if relevant to the task and not inferable
+Only ask for things the user's **action** requires. If the user says "review this PR", the only service involved is GitHub — do NOT ask for SMS credentials, phone numbers, email providers, or anything else that appears in the PR code but is not part of what the user asked you to do.
 
-## Credential gating rule
+- **Service the user is invoking** — if the user said "text me" or "send email" but named no provider, ask which service. Only if the delivery mechanism is part of the user's stated intent.
+- **Credentials** — only for services the user is actively using to complete their task. API keys, tokens, phone numbers only for confirmed, user-invoked services.
+- **Target identifiers** — only if directly required (e.g. a recipient number when user said "text me", an email address when user said "email me")
+- **Config preferences** — only if relevant to the task the user described
 
-CRITICAL: Only list credentials for services that are already confirmed in resolvedFacts. If `service_sms` is not yet resolved, do NOT list any SMS provider credentials — those come after the user names their SMS service.
+## Credential gating rule — INTENT-BASED
+
+CRITICAL: Only list credentials for services that:
+1. Are confirmed in `resolvedFacts`, AND
+2. Are directly required by what the user said they want to DO
+
+If a service appears in a URL, code, document, or PR being processed — but the user did NOT say they want to use that service — do NOT list credentials for it. The user asked you to act on content, not to integrate with every technology mentioned in that content.
 
 ## Output format
 
 Return ONLY valid JSON. No markdown fences. No explanation outside the JSON.
 
+For a read/review/analyze task (e.g. GitHub PR review) with no missing info:
+```
+{"complete": true, "unknowns": [], "credentials": [], "links": []}
+```
+
+For a task with genuinely missing information:
 ```
 {
   "complete": false,
   "unknowns": [
     {
       "id": "service_sms",
-      "question": "Which SMS service do you use to send text messages?",
-      "hint": "Provider options are surfaced by live discovery. State your preference or pick from the list shown.",
+      "question": "Which SMS service do you want to use?",
+      "hint": "e.g. Twilio, Vonage",
       "type": "choice",
       "options": [],
       "required": true
@@ -44,10 +56,10 @@ Return ONLY valid JSON. No markdown fences. No explanation outside the JSON.
   ],
   "credentials": [
     {
-      "id": "recipient_phone",
-      "question": "What phone number should receive the SMS?",
-      "hint": "Include country code, e.g. +1 555 123 4567",
-      "credentialKey": "RECIPIENT_PHONE_NUMBER",
+      "id": "twilio_sid",
+      "question": "What is your Twilio Account SID?",
+      "hint": "Find it at console.twilio.com",
+      "credentialKey": "TWILIO_ACCOUNT_SID",
       "required": true,
       "storedInKeytar": false
     }

@@ -1535,9 +1535,9 @@ module.exports = async function executeCommand(state) {
     // ── CLI / API Scout execution ────────────────────────────────────────────
     // If this step is external.skill AND the skill dir has cli.json or api.json
     // (written by creatorPlanning Scout fast-path), route to the universal runners
-    // instead of doing code-gen or failing. This runs on success AND failure so
-    // CLI/API skills don't need an index.cjs at all.
-    if (skill === 'external.skill') {
+    // instead of doing code-gen or failing. Only fires when the MCP call FAILED
+    // (external.skill.cjs now handles api.json/cli.json routing internally).
+    if (skill === 'external.skill' && !stepResult.ok) {
       const SKILLS_DIR = require('path').join(require('os').homedir(), '.thinkdrop', 'skills');
       const stepSkillName = resolvedArgs.name || args.name;
       if (stepSkillName) {

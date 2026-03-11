@@ -17,6 +17,21 @@ Before listing anything as an unknown, carefully read the user's message and ext
 
 Only add something to `unknowns` if it is genuinely missing or ambiguous from the user's message.
 
+## CRITICAL: Only extract services the user needs to INVOKE
+
+Only extract services/credentials that the user must **actively use** to complete their stated task. NEVER extract services that merely appear in:
+- URLs being acted on (e.g. a GitHub PR URL does NOT mean the user needs Gmail or SMS)
+- Code being reviewed, read, or analyzed
+- PR descriptions, commit messages, or documentation content
+- Repository names or file contents
+
+**Examples:**
+- "Review this PR: https://github.com/org/repo/pull/1" → only needs `github` (via `gh` CLI or GitHub API). ZERO unknowns for SMS, email, phone number, or any other service visible in the PR code.
+- "Summarize this GitHub issue" → only needs `github`. No SMS, no email.
+- "Check my AWS costs and email me" → needs BOTH `aws` AND `email` because the user explicitly said to email them.
+
+If the task is purely a **read/review/analyze** GitHub operation, `complete: true` with only github-related facts — no SMS provider, no phone number, no email credentials.
+
 ## ABSOLUTE PROHIBITIONS — never add these as unknowns
 
 - **`task_description`** — NEVER ask the user to describe or repeat their task. The user's request IS the task description. It is always complete as given.
@@ -48,6 +63,12 @@ If the user answered "Other" to a service/provider choice question, you MUST fol
 
 Return ONLY a valid JSON object. No markdown fences. No explanation text outside the JSON.
 
+Example — "Review this PR: https://github.com/org/repo/pull/1" (read-only, nothing missing):
+```
+{"complete": true, "resolvedFacts": {"service_provider": "github"}, "unknowns": [], "credentials": [], "links": []}
+```
+
+Example — task with missing SMS provider and credentials:
 ```
 {
   "complete": false,
@@ -59,36 +80,28 @@ Return ONLY a valid JSON object. No markdown fences. No explanation text outside
   "unknowns": [
     {
       "id": "service_sms",
-      "question": "Which SMS service do you use to send text messages?",
-      "hint": "The available options will be shown based on live discovery — or let me know if you have a preference.",
+      "question": "Which SMS service do you want to use?",
+      "hint": "e.g. Twilio, Vonage",
       "type": "choice",
-      "options": ["<dynamically populated by skill-builder>"],  
-      "required": true
-    },
-    {
-      "id": "recipient_phone",
-      "question": "What phone number should receive the daily SMS summary?",
-      "hint": "Include country code, e.g. +1 555 123 4567",
-      "type": "credential",
-      "credentialKey": "RECIPIENT_PHONE_NUMBER",
+      "options": [],
       "required": true
     }
   ],
   "credentials": [
     {
-      "id": "provider_api_key",
-      "question": "What is your <Provider> API key?",
-      "hint": "Find it in your <Provider> dashboard under API credentials.",
-      "credentialKey": "PROVIDER_API_KEY",
-      "helpUrl": "https://dashboard.provider.com",
+      "id": "twilio_sid",
+      "question": "What is your Twilio Account SID?",
+      "hint": "Find it at console.twilio.com",
+      "credentialKey": "TWILIO_ACCOUNT_SID",
+      "helpUrl": "https://console.twilio.com",
       "required": true,
       "storedInKeytar": false
     }
   ],
   "links": [
     {
-      "label": "Get your <Provider> credentials",
-      "url": "https://dashboard.provider.com"
+      "label": "Twilio Console",
+      "url": "https://console.twilio.com"
     }
   ]
 }
@@ -105,7 +118,7 @@ Return ONLY a valid JSON object. No markdown fences. No explanation text outside
 ## Rules
 
 - **Extract first, ask second.** Always populate `resolvedFacts` from the user's message before deciding what to ask. If the user said Gmail, schedule_time ~21:00, platform macOS — those are resolved facts, not unknowns.
-- If the prompt has ZERO unknowns (e.g. "open Finder" or a task that needs no credentials), set `complete: true` and return empty `unknowns` and `credentials` arrays immediately.
+- If the prompt has ZERO unknowns (e.g. "open Finder", "review this GitHub PR", or a task that needs no credentials beyond what is already known), set `complete: true` and return empty `unknowns` and `credentials` arrays immediately.
 - Ask about one cluster at a time in the conversation (service choice → then credentials for that service → then config details). Do NOT front-load all questions in the first turn.
 - Never ask about something already stated in the user's message or in `resolvedFacts`.
 - Never assume a specific SMS or email provider unless the user explicitly named one (but DO extract when they name one).

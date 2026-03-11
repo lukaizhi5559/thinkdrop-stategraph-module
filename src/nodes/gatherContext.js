@@ -284,9 +284,17 @@ function parseJson(raw) {
   }
 }
 
+// Providers that authenticate via OAuth rather than raw API keys.
+// When these are the chosen provider, emit gather_oauth instead of gather_credential.
+const OAUTH_PROVIDERS = new Set(['github', 'google', 'microsoft', 'facebook', 'twitter',
+  'linkedin', 'slack', 'notion', 'spotify', 'dropbox', 'discord', 'zoom', 'atlassian',
+  'salesforce', 'hubspot', 'outlook']);
+
+
 module.exports = async function gatherContext(state) {
   const { intent, message, resolvedMessage, llmBackend, progressCallback,
-    gatherAnswerCallback, gatherCredentialCallback, keytarCheckCallback } = state;
+    gatherAnswerCallback, gatherCredentialCallback, keytarCheckCallback,
+    gatherOAuthCallback } = state;
 
   const logger = state.logger || console;
 
@@ -458,6 +466,32 @@ Respond with ONLY valid JSON, no explanation, no markdown:
     const quickApi = quickCli ? null : scoutRegistry(apiReg, [], userMessage);
 
     if (quickCli || quickApi) {
+      // ── Early dedup guard: if an installed skill already covers this capability,
+      // skip BUILD entirely — don't ask questions, don't discover providers.
+      // This must run BEFORE any emit() calls so no UI cards are shown.
+      try {
+        const _mcpAdapter = state.mcpAdapter;
+        if (_mcpAdapter) {
+          const _res = await _mcpAdapter.callService('user-memory', 'skill.listNames', {}, { timeoutMs: 3000 });
+          const _data = _res?.data || _res;
+          const _installed = (_data?.results || []).filter(s => s.description || s.summary);
+          if (_installed.length > 0) {
+            const _match = (quickCli || quickApi);
+            const _capabilityKeywords = [_match.capability, _match.provider].filter(Boolean).map(s => s.toLowerCase());
+            const _coveringSkill = _installed.find(s => {
+              const nm = (s.name || '').toLowerCase();
+              const ds = (s.description || s.summary || '').toLowerCase();
+              return _capabilityKeywords.some(kw => nm.includes(kw) || ds.includes(kw));
+            });
+            if (_coveringSkill) {
+              logger.info(`[Node:GatherContext] Scout gate blocked — "${_coveringSkill.name}" already covers capability "${_match.capability}". Forcing EXECUTE.`);
+              return { ...state, gatherContextSkipped: true };
+            }
+          }
+        }
+      } catch (_earlyDedupErr) {
+        logger.warn(`[Node:GatherContext] Early dedup check failed (${_earlyDedupErr.message}) — proceeding`);
+      }
       const match = quickCli || quickApi;
       taskType = 'BUILD';
       logger.info(`[Node:GatherContext] Scout gate: EXECUTE → BUILD for capability "${match.capability}"`);
@@ -485,10 +519,7 @@ Respond with ONLY valid JSON, no explanation, no markdown:
         return { ...state, gatherContextSkipped: true };
       }
 
-      // ── Step 2: Web-search for ALL providers for this capability ─────────
-      emit('gather_start', { message: `Searching for the best ${match.capability} providers…` });
-
-      // Start from static registry providers as baseline
+      // ── Step 2: Build provider list (static first, web only if no static match) ──
       const cliCapEntry = cliReg?.[match.capability];
       const apiCapEntry = apiReg?.[match.capability];
       const staticProviders = [
@@ -497,8 +528,10 @@ Respond with ONLY valid JSON, no explanation, no markdown:
       ];
       let allProviderNames = [...new Set(staticProviders)];
 
-      // Run discoverProviders web-search to find ALL options
-      if (builderPath) {
+      // Only run web discovery if the static registry has NO providers for this capability.
+      // Static entries (e.g. gh for github) are curated and should win without a web search.
+      if (allProviderNames.length === 0 && builderPath) {
+        emit('gather_start', { message: `Searching for the best ${match.capability} providers…` });
         try {
           const { discoverProviders } = require(builderPath);
           const discovered = await Promise.race([
@@ -506,45 +539,36 @@ Respond with ONLY valid JSON, no explanation, no markdown:
             new Promise(res => setTimeout(() => res([]), 20000)),
           ]);
           for (const p of (discovered || [])) {
-            if (p.name && !allProviderNames.includes(p.name)) {
-              allProviderNames.push(p.name);
-            }
+            if (p.name && !allProviderNames.includes(p.name)) allProviderNames.push(p.name);
           }
           logger.info(`[Node:GatherContext] Provider list after web discovery: ${allProviderNames.join(', ')}`);
         } catch (e) {
           logger.warn(`[Node:GatherContext] discoverProviders failed: ${e.message} — using static list`);
         }
+      } else if (allProviderNames.length > 0) {
+        logger.info(`[Node:GatherContext] Using static providers: [${allProviderNames.join(', ')}] — skipping web discovery`);
       }
 
-      // Also detect any provider explicitly named in user message
+      // If user explicitly names a provider in the message, pre-select it
       const msgLower = userMessage.toLowerCase();
-      const providerPattern = /\b([a-z][a-z0-9]{2,}(?:send|sms|mail|message|text|bird|bip|go))\b/gi;
-      let pm;
-      while ((pm = providerPattern.exec(userMessage)) !== null) {
-        const named = pm[1].toLowerCase();
-        if (!allProviderNames.includes(named)) {
-          allProviderNames.push(named);
-          logger.info(`[Node:GatherContext] Added explicitly-named provider "${named}" from message`);
-        }
-      }
-
-      // If user explicitly mentions a known provider name anywhere in message, pre-select it
       const explicitMatch = allProviderNames.find(p => msgLower.includes(p) && p.length > 3);
       const defaultProvider = explicitMatch
         || cliCapEntry?.defaultProvider
         || apiCapEntry?.defaultProvider
         || allProviderNames[0];
 
-      // ALWAYS ask the user — never auto-select, even if only 1 option
+      // Auto-select when only one provider exists — no need to ask the user
+      const autoSelected = allProviderNames.length === 1 || !!explicitMatch;
+
       scoutProviderPreselect = {
         capability: match.capability,
         providers: allProviderNames,
         defaultProvider,
         registryType: (quickCli ? 'cli' : 'api'),
-        autoSelected: false,
+        autoSelected,
       };
 
-      logger.info(`[Node:GatherContext] Provider choice: [${allProviderNames.join(', ')}] default="${defaultProvider}"`);
+      logger.info(`[Node:GatherContext] Provider choice: [${allProviderNames.join(', ')}] default="${defaultProvider}" autoSelected=${autoSelected}`);
     } else {
       logger.info('[Node:GatherContext] One-shot task — skipping gather, proceeding to plan');
       return { ...state, gatherContextSkipped: true };
@@ -704,7 +728,51 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
 
       const authEnvKeys = providerConfig?.authEnv || [];
 
-      if (authEnvKeys.length > 0) {
+      // ── OAuth provider: use gather_oauth instead of raw credential prompts ────
+      // If the chosen provider authenticates via OAuth (GitHub, Microsoft, Google, etc.),
+      // emit a gather_oauth event so the UI shows a Connect button in the Queue tab.
+      // The OAuth token lands in keytar under oauth:<provider>:<skillName> automatically.
+      if (OAUTH_PROVIDERS.has(chosenProvider)) {
+        const oauthTokenKey = `oauth:${chosenProvider}:${state.creatorSkillName || chosenProvider}`;
+        let alreadyConnected = false;
+        if (keytarCheckCallback) {
+          try {
+            const check = await keytarCheckCallback(oauthTokenKey);
+            alreadyConnected = check?.found === true;
+          } catch (_) {}
+        }
+        if (alreadyConnected) {
+          knownSecrets.push(oauthTokenKey);
+          resolvedAnswers['oauth_token'] = '[connected via OAuth]';
+          logger.info(`[Node:GatherContext] ${chosenProvider} OAuth already connected — skipping`);
+        } else {
+          logger.info(`[Node:GatherContext] Prompting OAuth connect for provider: ${chosenProvider}`);
+          emit('gather_oauth', {
+            provider: chosenProvider,
+            tokenKey: oauthTokenKey,
+            scopes: providerConfig?.scopes || '',
+            skillName: state.creatorSkillName || chosenProvider,
+          });
+          if (gatherOAuthCallback) {
+            try {
+              const result = await Promise.race([
+                gatherOAuthCallback(chosenProvider, oauthTokenKey),
+                new Promise(res => setTimeout(() => res(null), GATHER_TIMEOUT_MS)),
+              ]);
+              if (result?.connected) {
+                knownSecrets.push(oauthTokenKey);
+                resolvedAnswers['oauth_token'] = '[connected via OAuth]';
+                emit('gather_oauth_connected', { provider: chosenProvider, tokenKey: oauthTokenKey });
+                logger.info(`[Node:GatherContext] ${chosenProvider} OAuth connected successfully`);
+              } else {
+                logger.warn(`[Node:GatherContext] ${chosenProvider} OAuth connect timed out or was skipped`);
+              }
+            } catch (e) {
+              logger.warn(`[Node:GatherContext] OAuth callback threw: ${e.message}`);
+            }
+          }
+        }
+      } else if (authEnvKeys.length > 0) {
         logger.info(`[Node:GatherContext] Upfront credential check for ${chosenProvider}: ${authEnvKeys.join(', ')}`);
 
         for (const key of authEnvKeys) {
@@ -756,7 +824,7 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
             resolvedAnswers[key] = '[stored in keytar]';
           }
         }
-      }
+      } // end non-OAuth credential block
     }
   }
   // ── End upfront credential check ─────────────────────────────────────────────
@@ -797,11 +865,27 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
       // actually mentions scheduling. Otherwise Phase 1 hallucinates them from
       // conversation history (e.g. a previous "every day at 9pm" bleeds in).
       const promptMentionsSchedule = /\b(every|daily|weekly|hourly|at \d|schedule|cron|remind|morning|evening|tonight|tomorrow|each day|each week)\b/i.test(userMessage);
+      // When the scout gate already determined a capability, any service_* extraction
+      // that names a DIFFERENT capability is a hallucination (e.g. LLM sees "twilio"
+      // in repo code and emits service_sms=twilio even though task is github PR review).
+      // Drop it here so it never pollutes resolvedFacts or scoutServices.
+      const gateCapabilityForExtract = scoutProviderPreselect?.capability?.toLowerCase() || null;
+
       for (const [k, v] of Object.entries(extracted.resolvedFacts)) {
         // Never overwrite keys the user has explicitly answered
         if (resolvedAnswers[k] || !v) continue;
         // Drop schedule fields if prompt has no scheduling intent
         if (!promptMentionsSchedule && (k === 'schedule_time' || k === 'schedule_frequency' || k === 'schedule_tz')) continue;
+        // Drop service_* facts that contradict the scout gate's capability.
+        // e.g. gate=github → drop service_sms=twilio, service_email=gmail, etc.
+        if (gateCapabilityForExtract && k.startsWith('service_') && k !== 'service_provider' && k !== 'service_capability') {
+          const extractedVal = (v || '').toLowerCase();
+          // Allow only if the extracted value aligns with the gate capability
+          if (!extractedVal.includes(gateCapabilityForExtract) && !gateCapabilityForExtract.includes(extractedVal)) {
+            logger.info(`[Node:GatherContext] Dropping "${k}=${v}" — scout gate capability is "${gateCapabilityForExtract}"`);
+            continue;
+          }
+        }
         resolvedFacts[k] = v;
         logger.info(`[Node:GatherContext] Phase 1 extracted: ${k} = ${v}`);
       }
@@ -853,10 +937,25 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
     logger.debug(`[Node:GatherContext] confirmedServices: [${[...confirmedServices].join(', ')}]`);
 
     const credentialsToAsk = [];
+    // Capability set by the scout gate — only ask for credentials relevant to it.
+    const gateCapForCreds = scoutProviderPreselect?.capability?.toLowerCase() || null;
+
     for (const cred of (analysis.credentials || [])) {
       if (!cred.credentialKey || knownSecrets.includes(cred.credentialKey)) continue;
 
-      // Gate credentials behind confirmed service — don't ask for Twilio creds if user hasn't picked Twilio yet
+      // If the scout gate established a specific capability (e.g. 'github'), drop any
+      // credential whose key name doesn't relate to that capability.
+      // This prevents RECIPIENT_PHONE_NUMBER / TWILIO_* stored from old runs from
+      // surfacing even via the "found in keychain — use those?" path.
+      if (gateCapForCreds) {
+        const keyLower = (cred.credentialKey || '').toLowerCase();
+        if (!keyLower.includes(gateCapForCreds)) {
+          logger.info(`[Node:GatherContext] Dropping credential "${cred.credentialKey}" — unrelated to gate capability "${gateCapForCreds}"`);
+          continue;
+        }
+      }
+
+      // Legacy service gate — don't ask for Twilio creds if user hasn't confirmed Twilio
       const keyLower = (cred.credentialKey || '').toLowerCase();
       const knownServiceNames = ['twilio', 'sendgrid', 'mailgun', 'clicksend', 'textbelt',
         'messagebird', 'textbase', 'vonage', 'bandwidth', 'plivo'];
@@ -932,6 +1031,13 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
           logger.warn(`[Node:GatherContext] Credential capture failed for ${cred.credentialKey}: ${e.message}`);
         }
       }
+    }
+
+    // ── If no gatherAnswerCallback and there are still unknowns, exit the loop ──
+    // Prevents infinite 8-round cycling when the callback is not wired (e.g. recovery path).
+    if (!gatherAnswerCallback && unresolvedUnknowns.length > 0) {
+      logger.warn(`[Node:GatherContext] No gatherAnswerCallback and ${unresolvedUnknowns.length} unresolved unknowns — breaking loop`);
+      break;
     }
 
     // ── Ask non-credential unknowns ───────────────────────────────────────────
@@ -1070,9 +1176,19 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
       logger.info(`[Node:GatherContext] Using cached builtSkill (API) for "${cachedBuiltSkill.provider}" — skipping runScouts`);
     }
   } else {
-    const scoutServices = chosenProvider
-      ? [chosenProvider, ...services.filter(s => s !== chosenProvider)]
-      : services;
+    // CRITICAL: if the scout gate established a specific capability (e.g. 'github'),
+    // only search for the chosen provider within that capability.
+    // Never let other service_* extractions from resolvedFacts (e.g. 'twilio' extracted
+    // from PR code) leak into scoutServices and hijack the match.
+    const gateCapability = scoutProviderPreselect?.capability || null;
+    const scoutServices = gateCapability
+      ? (chosenProvider ? [chosenProvider] : services.filter(s =>
+          s === gateCapability || s === chosenProvider
+        ))
+      : (chosenProvider
+          ? [chosenProvider, ...services.filter(s => s !== chosenProvider)]
+          : services);
+    logger.info(`[Node:GatherContext] runScouts with: [${scoutServices.join(', ')}] (gateCapability=${gateCapability})`);
     const scoutResult = await runScouts(scoutServices, userMessage, logger);
     cliMatch = scoutResult.cliMatch;
     apiMatch = scoutResult.apiMatch;

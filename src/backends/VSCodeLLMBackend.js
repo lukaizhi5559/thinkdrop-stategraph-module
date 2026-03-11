@@ -106,10 +106,18 @@ class VSCodeLLMBackend extends LLMBackend {
     let streamStarted = false;
 
     await new Promise((resolve, reject) => {
-      const responseTimeout = setTimeout(() => {
+      let activeTimeout = setTimeout(() => {
         ws.terminate();
         reject(new Error('[VSCodeLLMBackend] Response timeout'));
       }, this.responseTimeoutMs);
+
+      const resetTimeout = () => {
+        clearTimeout(activeTimeout);
+        activeTimeout = setTimeout(() => {
+          ws.terminate();
+          reject(new Error('[VSCodeLLMBackend] Response timeout'));
+        }, this.responseTimeoutMs);
+      };
 
       ws.on('message', (data) => {
         try {
@@ -117,7 +125,11 @@ class VSCodeLLMBackend extends LLMBackend {
 
           if (msg.type === 'llm_stream_start') {
             streamStarted = true;
-            clearTimeout(responseTimeout);
+            clearTimeout(activeTimeout);
+
+          } else if (msg.type === 'llm_stream_fallback') {
+            // Preferred provider failed — fallback in progress, keep connection alive
+            resetTimeout();
 
           } else if (msg.type === 'llm_stream_chunk') {
             const chunk = msg.payload?.chunk || msg.payload?.text || '';
@@ -127,12 +139,18 @@ class VSCodeLLMBackend extends LLMBackend {
             }
 
           } else if (msg.type === 'llm_stream_end') {
-            clearTimeout(responseTimeout);
+            clearTimeout(activeTimeout);
             ws.close();
             resolve();
 
+          } else if (msg.type === 'llm_error') {
+            // Terminal error — all providers exhausted
+            clearTimeout(activeTimeout);
+            ws.close();
+            reject(new Error(msg.payload?.message || 'WebSocket LLM error'));
           } else if (msg.type === 'error') {
-            clearTimeout(responseTimeout);
+            // Legacy/non-streaming error — treat as terminal
+            clearTimeout(activeTimeout);
             ws.close();
             reject(new Error(msg.payload?.message || 'WebSocket LLM error'));
           }
@@ -142,12 +160,12 @@ class VSCodeLLMBackend extends LLMBackend {
       });
 
       ws.on('error', (err) => {
-        clearTimeout(responseTimeout);
+        clearTimeout(activeTimeout);
         reject(err);
       });
 
       ws.on('close', () => {
-        clearTimeout(responseTimeout);
+        clearTimeout(activeTimeout);
         if (!streamStarted) {
           reject(new Error('[VSCodeLLMBackend] Connection closed before stream started'));
         } else {
