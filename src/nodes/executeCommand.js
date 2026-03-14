@@ -61,6 +61,214 @@ function getScheduler() {
   return _scheduler;
 }
 
+/**
+ * Inline skill.md repair agent.
+ * Validates a skill contract string and repairs it using the LLM if issues are found.
+ * Runs synchronously in the synthesize write path — prevents skill.install rejection
+ * without needing a full recoverSkill → evaluateSkills → replan loop.
+ *
+ * Checks performed (in order, fast static checks first):
+ *   1. Outer markdown fence wrapping  — strip ``` yaml/markdown/``` wrapper
+ *   2. YAML frontmatter present        — must start with '---'
+ *   3. Required fields present         — name, description, secrets, schedule
+ *   4. Frontmatter closed properly     — second '---' exists
+ *   5. ## Plan section present         — skill executor needs it
+ *
+ * Phase 1: Deterministic static fixes (no LLM).
+ * Phase 2: LLM-driven quality review with context (crawled docs, user message, known patterns).
+ *
+ * Returns the (possibly repaired) skill.md string.
+ */
+async function _repairSkillMd(content, llmBackend, logger, filePath, context = {}) {
+  const _path = require('path');
+  const dirName = filePath ? _path.basename(_path.dirname(filePath)) : null;
+
+  // ── _applyStaticFixes: deterministic fixes that must ALWAYS be applied ───────
+  // Called both before Phase 2 (Phase 1) AND after Phase 2 LLM output to ensure
+  // name/schedule/exec_path are correct regardless of what the LLM generates.
+  function _applyStaticFixes(str) {
+    // Strip outer fence
+    str = str.replace(/^```[a-zA-Z]*\r?\n([\s\S]*)\n```\s*$/, '$1').trim();
+    const fm = str.match(/^---\s*\n([\s\S]*?)\n---/);
+    if (!fm) return str; // no frontmatter — can't fix deterministically without LLM
+    let fmBody = fm[1];
+    let changed = false;
+
+    // Fix name: if the value has spaces or uppercase it is a human-readable title
+    // (e.g. "ClickSend SMS API") — always replace with the directory name.
+    // Simple space/uppercase check avoids false-negatives from strict dot-notation regex.
+    const nameMatch = fmBody.match(/^name:\s*["']?(.+?)["']?\s*$/m);
+    if (nameMatch) {
+      const cur = nameMatch[1].trim();
+      const isTitle = /\s/.test(cur) || /[A-Z]/.test(cur);
+      if (isTitle && dirName) {
+        logger.info(`[skill.md repair] Static fix: name "${cur}" → "${dirName}"`);
+        fmBody = fmBody.replace(/^(name:\s*)["']?.*?["']?\s*$/m, `$1${dirName}`);
+        changed = true;
+      }
+    } else if (dirName) {
+      // name field missing entirely — inject it
+      fmBody = `name: ${dirName}\n` + fmBody;
+      changed = true;
+    }
+
+    // Fix schedule: false / "false" → null
+    if (/^schedule:\s*(false|"false")\s*$/m.test(fmBody)) {
+      fmBody = fmBody.replace(/^schedule:\s*(false|"false")\s*$/m, 'schedule: null');
+      changed = true;
+    }
+
+    // Inject exec_path / exec_type if missing
+    if (!/^exec_path\s*:/m.test(fmBody) && dirName) {
+      fmBody += `\nexec_path: ~/.thinkdrop/skills/${dirName}/skill.md`;
+      changed = true;
+    }
+    if (!/^exec_type\s*:/m.test(fmBody)) {
+      fmBody += `\nexec_type: node`;
+      changed = true;
+    }
+
+    if (changed) str = `---\n${fmBody.trim()}\n---` + str.slice(fm[0].length);
+    return str;
+  }
+
+  let s = content.trim();
+  s = s.replace(/^```[a-zA-Z]*\r?\n([\s\S]*)\n```\s*$/, '$1').trim();
+
+  // ── Phase 1: Apply deterministic fixes ──────────────────────────────────────
+  s = _applyStaticFixes(s);
+
+  // ── Phase 2: LLM-driven quality review ──────────────────────────────────────
+  const issues = [];
+  if (!s.startsWith('---')) issues.push('Missing YAML frontmatter opening (file must start with ---)');
+  if (s.startsWith('---')) {
+    const fmEnd = s.indexOf('\n---', 3);
+    if (fmEnd === -1) {
+      issues.push('Frontmatter block is not closed (missing second ---)');
+    } else {
+      const fm = s.slice(0, fmEnd);
+      if (!/^name:/m.test(fm))        issues.push('Frontmatter missing required field: name');
+      if (!/^description:/m.test(fm)) issues.push('Frontmatter missing required field: description');
+      if (!/^secrets:/m.test(fm))     issues.push('Frontmatter missing required field: secrets');
+      if (!/^schedule:/m.test(fm))    issues.push('Frontmatter missing required field: schedule');
+
+      // Empty secrets when context suggests auth is needed
+      const secretsMatch = fm.match(/^secrets:\s*\[\s*\]\s*$/m);
+      if (secretsMatch && (context.crawledDocs || context.userMessage)) {
+        issues.push('Secrets list is empty but this service requires authentication credentials (API key, username, etc.)');
+      }
+    }
+  }
+
+  if (!/^##\s+Plan/m.test(s)) issues.push('Missing ## Plan section (required for execution)');
+  if (!/curl\s+/i.test(s) && !/shell\.run\s+bash/i.test(s)) {
+    issues.push('Missing actionable command example (curl or shell.run bash) in ## Commands or ## Plan');
+  }
+  if (!/security\s+find-generic-password\s+-s\s+thinkdrop/i.test(s)) {
+    issues.push('Auth section missing correct keytar retrieval format: security find-generic-password -s thinkdrop -a "skill:<name>:<KEY>" -w');
+  }
+
+  if (issues.length === 0) return s;
+
+  logger.info(`[skill.md repair] Found ${issues.length} quality issue(s): ${issues.join('; ')}`);
+
+  const KNOWN_API_PATTERNS = {
+    'clicksend': { secrets: ['CLICKSEND_USERNAME', 'CLICKSEND_API_KEY'], auth: 'Basic auth (-u username:api_key)' },
+    'twilio':    { secrets: ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'], auth: 'Basic auth (-u account_sid:auth_token)' },
+    'mailgun':   { secrets: ['MAILGUN_API_KEY', 'MAILGUN_DOMAIN'], auth: 'Basic auth (-u api:key)' },
+    'pushover':  { secrets: ['PUSHOVER_USER_KEY', 'PUSHOVER_APP_TOKEN'], auth: 'POST params' },
+    'sendgrid':  { secrets: ['SENDGRID_API_KEY'], auth: 'Bearer token' },
+    'vonage':    { secrets: ['VONAGE_API_KEY', 'VONAGE_API_SECRET'], auth: 'POST params' }
+  };
+
+  const service = dirName ? dirName.split('.')[0] : 'unknown';
+  const pattern = KNOWN_API_PATTERNS[service] || null;
+
+  const repairPrompt = `You are a skill contract repair agent. The following skill.md file has issues that will prevent it from being installed or used. Fix ALL listed issues and output the complete corrected skill.md.
+
+CONTEXT:
+- Skill Name (MUST be used verbatim as the name: field value): ${dirName || 'unknown'}
+- User Request: ${context.userMessage || 'unknown'}
+${pattern ? `- Known API Pattern for "${service}": Secrets=[${pattern.secrets.join(', ')}], Auth=${pattern.auth}` : ''}
+${context.crawledDocs ? `- Crawled API Docs:\n${context.crawledDocs.slice(0, 2000)}` : ''}
+
+ISSUES TO FIX:
+${issues.map((iss, i) => `${i + 1}. ${iss}`).join('\n')}
+
+RULES:
+- CRITICAL: The frontmatter \`name:\` field MUST be exactly "${dirName || 'skill.name'}" — not a human-readable title.
+- The file MUST start with a YAML frontmatter block (---).
+- Required frontmatter fields: name, description, secrets (array of credential key names), schedule (null).
+- \`## Auth\` section must show: security find-generic-password -s thinkdrop -a "skill:${dirName || '<name>'}:<KEY>" -w 2>/dev/null
+- \`## Commands\` section must contain a REAL curl example using creds retrieved from keychain.
+- \`## Plan\` section must list actionable steps: (1) shell.run bash to get secrets, (2) shell.run bash with curl, (3) synthesize to confirm.
+- Do NOT wrap output in markdown code fences. Output ONLY the raw corrected skill.md content.
+
+BROKEN CONTENT:
+${s}`;
+
+  try {
+    const repaired = await llmBackend.generateAnswer(repairPrompt, {
+      query: repairPrompt,
+      context: { systemInstructions: `You are a skill contract repair agent. The skill name MUST be exactly "${dirName || 'skill.name'}" in the frontmatter. Output ONLY the corrected skill.md — no fences, no explanation.`, conversationHistory: [], intent: 'repair_skill' },
+      options: { maxTokens: 2000, temperature: 0.1, fastMode: false }
+    }, { maxTokens: 2000, temperature: 0.1, fastMode: false }, null).catch(() => null);
+
+    if (repaired && repaired.trim().length > 100) {
+      let cleaned = repaired.trim();
+
+      // Step 1: strip if entire string is wrapped in a single fence
+      cleaned = cleaned.replace(/^```[a-zA-Z]*\r?\n([\s\S]*)\n```\s*$/, '$1').trim();
+
+      // Step 2: LLM prefixed with prose then a fence — extract content from first code block
+      // that begins with --- (e.g. "Here is the corrected file:\n```yaml\n---\n...\n```")
+      if (!cleaned.startsWith('---')) {
+        const innerFence = cleaned.match(/```[a-zA-Z]*\r?\n(---[\s\S]*?)\n```/);
+        if (innerFence) cleaned = innerFence[1].trim();
+      }
+
+      // Step 3: strip any remaining leading prose before the first --- delimiter
+      if (!cleaned.startsWith('---')) {
+        const fmIdx = cleaned.search(/^---$/m);
+        if (fmIdx > 0) cleaned = cleaned.slice(fmIdx).trim();
+      }
+
+      // Step 4: apply deterministic fixes (name, schedule, exec_path, exec_type)
+      cleaned = _applyStaticFixes(cleaned);
+
+      // Step 5: if the LLM STILL didn't produce a frontmatter block, build one from context.
+      // The body content (markdown sections) is still useful — just prepend correct frontmatter.
+      if (!cleaned.startsWith('---')) {
+        logger.warn(`[skill.md repair] Phase 2: LLM output lacks frontmatter — injecting from context`);
+        const svc = dirName ? dirName.split('.')[0] : 'unknown';
+        const pat = KNOWN_API_PATTERNS[svc];
+        const secretsList = pat ? `[${pat.secrets.map(k => `'${k}'`).join(', ')}]` : '[]';
+        // Try to pull a short description from the first non-heading sentence in the body
+        const descMatch = cleaned.match(/^(?:#+\s+.+\n+)*([A-Z][^.\n]{10,100}\.)/m);
+        const autoDesc = descMatch ? descMatch[1].trim() : `${svc} skill — send messages via API`;
+        const injectedFm = `---\nname: ${dirName || 'skill.name'}\ndescription: ${autoDesc}\nsecrets: ${secretsList}\nschedule: null\nexec_path: ~/.thinkdrop/skills/${dirName}/skill.md\nexec_type: node\n---\n\n`;
+        cleaned = injectedFm + cleaned;
+      }
+
+      logger.info(`[skill.md repair] Phase 2: Repaired successfully (${cleaned.length} chars, has_frontmatter=${cleaned.startsWith('---')})`);
+      return cleaned;
+    }
+  } catch (repairErr) {
+    logger.warn(`[skill.md repair] Phase 2: LLM repair failed: ${repairErr.message}`);
+  }
+
+  // Phase 2 did not return usable content — apply the same frontmatter injection to Phase 1 result
+  if (!s.startsWith('---') && dirName) {
+    logger.warn(`[skill.md repair] Phase 1 fallback: injecting minimal frontmatter for ${dirName}`);
+    const svc = dirName.split('.')[0];
+    const pat = { 'clicksend': ['CLICKSEND_USERNAME', 'CLICKSEND_API_KEY'], 'twilio': ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'], 'mailgun': ['MAILGUN_API_KEY', 'MAILGUN_DOMAIN'], 'sendgrid': ['SENDGRID_API_KEY'], 'vonage': ['VONAGE_API_KEY', 'VONAGE_API_SECRET'] }[svc];
+    const secretsList = pat ? `[${pat.map(k => `'${k}'`).join(', ')}]` : '[]';
+    const fallbackFm = `---\nname: ${dirName}\ndescription: ${svc} skill\nsecrets: ${secretsList}\nschedule: null\nexec_path: ~/.thinkdrop/skills/${dirName}/skill.md\nexec_type: node\n---\n\n`;
+    s = fallbackFm + s;
+  }
+  return s;
+}
+
 function loadSmartFillPrompt() {
   const promptPath = path.join(__dirname, '../prompts/smart-fill.md');
   try {
@@ -874,10 +1082,60 @@ module.exports = async function executeCommand(state) {
       if (!contractMd) {
         if (skillPath && fs.existsSync(skillPath)) {
           contractMd = fs.readFileSync(skillPath, 'utf8');
+          // Inject exec_path and exec_type if missing — the skill.install MCP requires them
+          // but the LLM-synthesized skill.md often omits them.
+          const fmMatch = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
+          if (fmMatch) {
+            let fmBody = fmMatch[1];
+            const skillDir = path.dirname(skillPath);
+            const inferName = path.basename(skillDir);
+            // Extract body once from original contractMd so all reconstructions use the
+            // correct offset regardless of how fmBody length changes.
+            const bodyAfterFm = contractMd.slice(fmMatch[0].length);
+            // Fix name: field — if the value has spaces or uppercase it's a human-readable
+            // title (e.g. "ClickSend SMS API"). Replace with the directory-derived name.
+            const nameMatch = fmBody.match(/^name:\s*["']?(.+?)["']?\s*$/m);
+            if (nameMatch) {
+              const curName = nameMatch[1].trim();
+              const isTitle = /\s/.test(curName) || /[A-Z]/.test(curName);
+              if (isTitle && inferName) {
+                logger.info(`[Node:ExecuteCommand] skill.install: fixing invalid name "${curName}" → "${inferName}"`);
+                fmBody = fmBody.replace(/^(name:\s*)["']?.*?["']?\s*$/m, `$1${inferName}`);
+              }
+            }
+            if (!/^exec_path\s*:/m.test(fmBody)) {
+              fmBody += `\nexec_path: ~/.thinkdrop/skills/${inferName}/skill.md`;
+              logger.debug(`[Node:ExecuteCommand] skill.install: injected exec_path for ${inferName}`);
+            }
+            if (!/^exec_type\s*:/m.test(fmBody)) {
+              fmBody += `\nexec_type: node`;
+              logger.debug(`[Node:ExecuteCommand] skill.install: injected exec_type for ${inferName}`);
+            }
+            contractMd = `---\n${fmBody}\n---` + bodyAfterFm;
+            // Write corrected contract back to disk so the file matches what we register
+            try { fs.writeFileSync(skillPath, contractMd, 'utf8'); } catch (_) {}
+          }
         } else {
-          // Auto-scaffold a minimal skill contract from the skill name
-          // Derive skill name from path (e.g. ~/.thinkdrop/skills/send.text/skill.md → send.text)
-          // or from args.name / args.skillName
+          // No file on disk — check if a prior synthesize step should have created it.
+          // Only auto-scaffold if a prior synthesize step with saveToFile ran in this plan
+          // (on-demand build flow). Otherwise fail so recoverSkill can replan with the
+          // full bootstrap (web.crawl → synthesize → skill.install).
+          const hadPriorSynthesize = skillResults.some(r =>
+            r.skill === 'synthesize' && r.ok && r.args?.saveToFile
+          );
+          if (!hadPriorSynthesize) {
+            const errMsg = `Skill contract not found at ${skillPath}. The bootstrap plan must include web.crawl + synthesize steps before skill.install to create the skill.md file.`;
+            logger.warn(`[Node:ExecuteCommand] skill.install: ${errMsg}`);
+            if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: 'Install failed', error: errMsg });
+            return {
+              ...state,
+              skillResults: [...skillResults, { step: skillCursor + 1, skill: 'skill.install', args, description, ok: false, error: errMsg }],
+              skillCursor: skillCursor + 1,
+              failedStep: { skill: 'skill.install', error: errMsg, stepIndex: skillCursor },
+            };
+          }
+
+          // Prior synthesize ran but file is missing — auto-scaffold as fallback
           const inferredName = args.name || args.skillName ||
             (skillPath ? path.basename(path.dirname(skillPath)) : null) ||
             'unknown.skill';
@@ -1025,6 +1283,12 @@ module.exports = async function executeCommand(state) {
       .filter(r => r.skill === 'shell.run' && r.ok && r.stdout && r.stdout.trim().length > 0)
       .map(r => `=== Shell output (${r.description || r.args?.cmd || 'shell.run'}) ===\n${r.stdout}`);
 
+    // Include web.crawl results — the crawled page content is essential for
+    // synthesize steps that generate skill.md from API documentation
+    const webCrawlResults = skillResults
+      .filter(r => r.skill === 'web.crawl' && r.ok && r.stdout && r.stdout.trim().length > 0)
+      .map(r => `=== Crawled page (${r.url || r.args?.url || 'web.crawl'}) ===\n${r.stdout}`);
+
     // Include file.bridge read results — extract blocks array and format as readable text
     const fileBridgeResults = skillResults
       .filter(r => r.skill === 'file.bridge' && r.ok && r.args?.action === 'read')
@@ -1067,6 +1331,7 @@ module.exports = async function executeCommand(state) {
     const allContextParts = [
       ...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`),
       ...shellStdoutResults,
+      ...webCrawlResults,
       ...fileBridgeResults,
       ...fsReadResults,
       ...imageAnalyzeResults,
@@ -1234,7 +1499,27 @@ module.exports = async function executeCommand(state) {
         }
         // Strip internal === Shell output (...) === markers that executeCommand injects for LLM context
         // but must never appear in saved files (e.g. skill.md contracts, text files, etc.)
-        const cleanedAnswer = synthesisAnswer.replace(/^=== Shell output \(.*?\) ===\s*/gm, '').trim();
+        let cleanedAnswer = synthesisAnswer.replace(/^=== Shell output \(.*?\) ===\s*/gm, '').trim();
+        // Strip outer markdown fences — LLM often wraps skill.md in ```yaml/```markdown/``` blocks.
+        // skill.install rejects any file that doesn't start with '---' (YAML frontmatter).
+        // IMPORTANT: match only the OUTERMOST wrapping fence, not inner ```bash blocks inside ## Commands.
+        // Strategy: if the entire string starts with ``` and ends with ```, strip only those two lines.
+        cleanedAnswer = cleanedAnswer.replace(/^```[a-zA-Z]*\r?\n([\s\S]*)\n```\s*$/, '$1').trim();
+
+        // ── Inline skill.md repair agent ─────────────────────────────────────
+        // If the target file is a skill contract (skill.md), validate and repair
+        // it before writing to disk. This prevents skill.install SKILL_INSTALL_FAILED
+        // without needing a full recoverSkill → evaluateSkills → replan loop.
+        // Checks: frontmatter exists, required fields present, no wrapping fences remain.
+        if (synthesisFilePath.endsWith('skill.md') && llmBackend) {
+          const repairContext = {
+            skillName: path.basename(path.dirname(synthesisFilePath)),
+            crawledDocs: webCrawlResults.join('\n\n'),
+            userMessage: state.message || state.originalMessage || '',
+          };
+          cleanedAnswer = await _repairSkillMd(cleanedAnswer, llmBackend, logger, synthesisFilePath, repairContext);
+        }
+
         fs.writeFileSync(synthesisFilePath, cleanedAnswer, 'utf8');
         logger.debug(`[Node:ExecuteCommand] synthesize: saved to ${synthesisFilePath}`);
       } catch (writeErr) {
@@ -1319,6 +1604,121 @@ module.exports = async function executeCommand(state) {
     };
   }
 
+  // Fix apostrophes in single-quoted bash variable assignments.
+  // LLMs consistently generate broken quoting like: MSG='what's up'
+  // which ends the single-quoted string at the apostrophe (exit code 2).
+  // Fix: find MSG/BODY/TEXT-like var assignments, extract raw text, re-wrap
+  // in double quotes. Simple string scan — no fragile regex.
+  if (skill === 'shell.run' && resolvedArgs.cmd === 'bash' && Array.isArray(resolvedArgs.argv)) {
+    const _MSG_VAR_NAMES = ['MSG', 'MESSAGE', 'BODY', 'TEXT', 'CONTENT', 'SUBJECT'];
+    const _fixedArgv = resolvedArgs.argv.map(a => {
+      if (typeof a !== 'string') return a;
+      let result = a;
+      for (const vn of _MSG_VAR_NAMES) {
+        // Find VAR= (case insensitive) followed by a quote
+        const patterns = [`${vn}='`, `${vn}="`, `${vn.toLowerCase()}='`, `${vn.toLowerCase()}="`];
+        for (const pat of patterns) {
+          const idx = result.indexOf(pat);
+          if (idx === -1) continue;
+          const afterEq = idx + vn.length + 1; // position of the opening quote char
+          const openQuote = result[afterEq];
+          if (openQuote === '"') continue; // already double-quoted — leave alone
+          // Single-quoted assignment: find the text between = and the next '; '
+          // The '; ' delimiter separates the assignment from the next command (curl, etc.)
+          const searchFrom = afterEq + 1; // skip the opening '
+          const semiIdx = result.indexOf('; ', searchFrom);
+          if (semiIdx === -1) continue;
+          // Extract raw value between the opening quote and '; '
+          let rawVal = result.substring(searchFrom, semiIdx);
+          // Strip trailing quote if present
+          if (rawVal.endsWith("'")) rawVal = rawVal.slice(0, -1);
+          // Clean up all LLM quoting artifacts to get the actual user text
+          rawVal = rawVal
+            .replace(/'"'"'/g, "'")    // '"'"' → '
+            .replace(/"'"'/g, "'")     // "'"' → '
+            .replace(/'"'/g, "'")      // '"' → '
+            .replace(/\\'/g, "'")      // \' → '
+            .replace(/\\\\/g, '\\');   // \\\\ → \\
+          // Rebuild with double quotes (apostrophes are safe inside double quotes)
+          const varPart = result.substring(idx, idx + vn.length);
+          result = result.substring(0, idx) + `${varPart}="${rawVal}"` + result.substring(semiIdx);
+          break; // only fix first match per var name
+        }
+      }
+      return result;
+    });
+    if (JSON.stringify(_fixedArgv) !== JSON.stringify(resolvedArgs.argv)) {
+      logger.info('[Node:ExecuteCommand] shell.run: fixed message var quoting (apostrophe fix)');
+    }
+    resolvedArgs = { ...resolvedArgs, argv: _fixedArgv };
+  }
+
+  // Normalize bare phone numbers to E.164 (+<cc>XXXXXXXXXX) in shell.run scripts.
+  // Users rarely add country codes. We detect the country from the macOS system locale
+  // and prepend the correct dialing code. Only fires for "to" fields in SMS payloads
+  // where the number has no + prefix already.
+  if (skill === 'shell.run' && Array.isArray(resolvedArgs.argv)) {
+    // Country code lookup from ISO 3166-1 alpha-2 → ITU-T E.164 dialing prefix.
+    // Only includes countries where the national number length is unambiguous enough
+    // to avoid false positives. Covers ~95% of global SMS traffic.
+    const _COUNTRY_DIAL_CODES = {
+      US: '1', CA: '1', GB: '44', AU: '61', NZ: '64', IE: '353',
+      DE: '49', FR: '33', ES: '34', IT: '39', NL: '31', BE: '32', AT: '43', CH: '41',
+      PT: '351', SE: '46', NO: '47', DK: '45', FI: '358', PL: '48',
+      JP: '81', KR: '82', CN: '86', TW: '886', HK: '852', SG: '65',
+      IN: '91', PH: '63', TH: '66', MY: '60', ID: '62', VN: '84',
+      BR: '55', MX: '52', AR: '54', CO: '57', CL: '56',
+      ZA: '27', NG: '234', KE: '254', EG: '20',
+      IL: '972', AE: '971', SA: '966', TR: '90', RU: '7',
+    };
+    // National number lengths per country (min digits a local number can be).
+    // Used to avoid matching short strings that aren't phone numbers.
+    const _NATIONAL_MIN_DIGITS = {
+      US: 10, CA: 10, GB: 10, AU: 9, NZ: 8, IE: 9,
+      DE: 10, FR: 9, ES: 9, IT: 9, NL: 9, BE: 9, AT: 10, CH: 9,
+      PT: 9, SE: 9, NO: 8, DK: 8, FI: 9, PL: 9,
+      JP: 10, KR: 10, CN: 11, TW: 9, HK: 8, SG: 8,
+      IN: 10, PH: 10, TH: 9, MY: 9, ID: 10, VN: 9,
+      BR: 10, MX: 10, AR: 10, CO: 10, CL: 9,
+      ZA: 9, NG: 10, KE: 9, EG: 10,
+      IL: 9, AE: 9, SA: 9, TR: 10, RU: 10,
+    };
+
+    let _detectedCountry = null;
+    try {
+      // Intl.DateTimeFormat().resolvedOptions().locale gives e.g. 'en-US', 'zh-CN', 'fr-FR'
+      const locale = Intl.DateTimeFormat().resolvedOptions().locale || '';
+      const parts = locale.split('-');
+      _detectedCountry = (parts[parts.length - 1] || '').toUpperCase();
+      // Validate it's a real 2-letter country code in our table
+      if (!_COUNTRY_DIAL_CODES[_detectedCountry]) _detectedCountry = null;
+    } catch (_) {}
+
+    if (_detectedCountry) {
+      const _cc = _COUNTRY_DIAL_CODES[_detectedCountry];
+      const _minDigits = _NATIONAL_MIN_DIGITS[_detectedCountry] || 8;
+      // Build regex: match bare digits (min length) without a + prefix, inside "to" fields
+      // Anchored to "to" key in JSON to avoid mangling non-phone numbers
+      const _digitPattern = `(\\d{${_minDigits},15})`;
+      const _toE164 = (str) => str
+        // JSON-escaped variant: \"to\":\"123456789\"
+        .replace(new RegExp(`\\\\"to\\\\":\\\\"${_digitPattern}\\\\"`, 'g'), (_m, n) =>
+          n.startsWith(_cc) ? _m : `\\"to\\":\\"+${_cc}${n}\\"`)
+        // Unescaped double-quote: "to":"123456789"
+        .replace(new RegExp(`"to":"${_digitPattern}"`, 'g'), (_m, n) =>
+          n.startsWith(_cc) ? _m : `"to":"+${_cc}${n}"`)
+        // Single-quote: 'to':'123456789'
+        .replace(new RegExp(`'to':'${_digitPattern}'`, 'g'), (_m, n) =>
+          n.startsWith(_cc) ? _m : `'to':'+${_cc}${n}'`);
+
+      const _normalizedArgv = resolvedArgs.argv.map(a => typeof a === 'string' ? _toE164(a) : a);
+      if (JSON.stringify(_normalizedArgv) !== JSON.stringify(resolvedArgs.argv)) {
+        logger.info(`[Node:ExecuteCommand] shell.run: normalized phone number to E.164 (+${_cc}, country=${_detectedCountry})`);
+      }
+      resolvedArgs = { ...resolvedArgs, argv: _normalizedArgv };
+    }
+  }
+
   // ── Session inheritance: browser.act steps with no sessionId inherit from last navigate ──
   // Without this, actions like waitForStableText/getPageText with no sessionId open a new
   // blank tab instead of targeting the page that was just navigated to.
@@ -1362,6 +1762,10 @@ module.exports = async function executeCommand(state) {
       const p = (args.prompt || '').slice(0, 40);
       return p ? `synthesize — ${p}…` : 'synthesize';
     }
+    if (sk === 'web.crawl') {
+      const u = (args.url || '').replace(/^https?:\/\//, '').slice(0, 50);
+      return u ? `Crawling ${u}…` : 'web.crawl';
+    }
     if (externalSkillName) return `external.skill — ${externalSkillName}`;
     return sk;
   }
@@ -1389,6 +1793,10 @@ module.exports = async function executeCommand(state) {
   // polls up to 45s, and any LLM-supplied timeoutMs:5000 would kill these before they finish.
   if (skill === 'browser.act') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 30000);
+  }
+  // web.crawl launches playwright-cli, navigates, waits for JS render — needs at least 45s.
+  if (skill === 'web.crawl') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 45000);
   }
 
   try {
@@ -1498,6 +1906,43 @@ module.exports = async function executeCommand(state) {
     if (isSearchCmd && noOutput && (stepResult.ok || stepResult.exitCode === 1)) {
       stepResult.ok = false;
       stepResult.error = `search_no_results: search returned no results for the given query`;
+    }
+
+    // ── shell.run curl: detect HTTP API error responses ──────────────────────
+    // curl returns exit code 0 even on HTTP 4xx/5xx errors. Check stdout for
+    // common API error patterns so we don't report false success to the user.
+    if (skill === 'shell.run' && stepResult.ok && stepResult.stdout) {
+      const out = stepResult.stdout.trim();
+      const isCurlStep = (args.cmd === 'curl') ||
+        (args.cmd === 'bash' && Array.isArray(args.argv) && args.argv.some(a => typeof a === 'string' && a.includes('curl ')));
+      if (isCurlStep) {
+        // Match JSON error responses: {"http_code":401,...}, {"error":...}, {"response_code":"UNAUTHORIZED",...}
+        const httpCodeMatch = out.match(/"http_code"\s*:\s*(\d+)/);
+        const httpCode = httpCodeMatch ? parseInt(httpCodeMatch[1], 10) : 0;
+        const hasErrorField = /"error"\s*:/i.test(out) || /"response_code"\s*:\s*"(?!SUCCESS)/i.test(out);
+        const hasAuthError = /UNAUTHORIZED|FORBIDDEN|invalid.{0,20}(key|token|credential|auth)/i.test(out);
+
+        if ((httpCode >= 400) || (hasErrorField && hasAuthError)) {
+          const briefError = out.length > 200 ? out.slice(0, 200) + '...' : out;
+          stepResult.ok = false;
+          stepResult.error = `API error (HTTP ${httpCode || '4xx'}): ${briefError}`;
+          logger.warn(`[Node:ExecuteCommand] shell.run curl returned API error: ${briefError}`);
+        }
+      }
+    }
+
+    // ── shell.run credential guard: bash scripts that check creds and echo a guard message ──
+    // When bash does `if [ -n "$VAR" ]; then curl ...; else echo 'Missing credentials'; fi`
+    // and $VAR is empty, exit code is 0 but the curl never ran. Detect this pattern and
+    // treat it as a credential failure so recoverSkill can surface the right message.
+    if (skill === 'shell.run' && stepResult.ok && stepResult.stdout) {
+      const _out = stepResult.stdout.trim();
+      const _isMissingCred = /^(missing credentials?|no credentials?|credentials? not found|credentials? (are )?missing|credentials? empty|please (set|add|enter|provide) (your )?(credentials?|api key|username|password))/i.test(_out);
+      if (_isMissingCred) {
+        stepResult.ok = false;
+        stepResult.error = `Missing credentials: ${_out} — please enter your API credentials in the Skills tab`;
+        logger.warn(`[Node:ExecuteCommand] shell.run credential guard fired: ${_out}`);
+      }
     }
 
     // ── browser.act examine: NEEDS_USER / authRequired → fail fast with user message ──
@@ -1716,12 +2161,18 @@ module.exports = async function executeCommand(state) {
       // Building here would produce generic/wrong code (e.g. hardcoded Twilio).
       const _missingName = (resolvedArgs.name || args.name || '').toLowerCase();
       const _capabilityPrefixes = ['sms', 'email', 'send', 'message', 'text', 'payment', 'storage', 'notify', 'call', 'voice', 'mail', 'push'];
-      const _isCapabilitySkill = _capabilityPrefixes.some(p => _missingName.startsWith(p + '.') || _missingName === p || _missingName.startsWith(p + '_'));
-      if (isMissingSkill && _isCapabilitySkill) {
-        logger.warn(`[Node:ExecuteCommand] Blocking on-demand build for capability skill "${_missingName}" — must go through gatherContext discovery pipeline`);
+      const _nameSegments = _missingName.split('.');
+      const _isCapabilitySkill = _capabilityPrefixes.some(p =>
+        _nameSegments.includes(p) || _missingName.startsWith(p + '.') || _missingName === p || _missingName.startsWith(p + '_')
+      );
+      // Also block creator.agent when user explicitly asked to install/create a skill — bootstrap flow should handle it
+      const _userMsg = (state.message || state.resolvedMessage || '').toLowerCase();
+      const _isInstallRequest = /\b(install|create|add|build|need|want)\b.*\bskill\b/i.test(_userMsg);
+      if (isMissingSkill && (_isCapabilitySkill || _isInstallRequest)) {
+        logger.warn(`[Node:ExecuteCommand] Blocking on-demand build for "${_missingName}" — ${_isInstallRequest ? 'install request → bootstrap flow' : 'capability skill → gatherContext pipeline'}`);
         // Fall through to recoverSkill with a clear error
       }
-      if (isMissingSkill && !_isCapabilitySkill && !state.creatorProjectId && !state.skillCreatorBuildAttempted && mcpAdapter) {
+      if (isMissingSkill && !_isCapabilitySkill && !_isInstallRequest && !state.creatorProjectId && !state.skillCreatorBuildAttempted && mcpAdapter) {
         const missingSkillName = resolvedArgs.name || args.name;
         // Build a focused skill description from the step args — NOT the full user task message.
         // The full message (e.g. "research photosynthesis and text me") describes the overall task,
@@ -1822,6 +2273,14 @@ module.exports = async function executeCommand(state) {
     if (stepResult.ok || optional) {
       if (skill === 'image.analyze') {
         logger.info(`[Node:ExecuteCommand] image.analyze step_done stdout length: ${stepResult.stdout?.length ?? 'null'}, preview: ${String(stepResult.stdout || '').slice(0, 80)}`);
+      }
+      // web.crawl: synthesize a human-readable stdout from title + content length
+      if (skill === 'web.crawl' && raw.ok) {
+        const crawlTitle = raw.title ? `"${raw.title}"` : resolvedArgs.url || '';
+        const crawlChars = raw.contentLength ? ` — ${raw.contentLength.toLocaleString()} chars` : '';
+        const crawlTrunc = raw.truncated ? ' (truncated)' : '';
+        stepResult.stdout = `Crawled ${crawlTitle}${crawlChars}${crawlTrunc}\n\n${raw.content || ''}`;
+        logger.info(`[Node:ExecuteCommand] web.crawl done: ${crawlTitle}${crawlChars}${crawlTrunc}`);
       }
       const resolvedSkillName = skill === 'external.skill'
         ? (stepResult.skillName || resolvedArgs.name || 'external.skill')

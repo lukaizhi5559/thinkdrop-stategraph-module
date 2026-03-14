@@ -89,6 +89,7 @@ api_suggest: use as FIRST step when task is RECURRING or programmatic AND the se
 guide.step: use for ANY task where the user must act manually step by step (government sites, DMV, forms, license renewal, API token setup, CAPTCHAs, login walls). MANDATORY pattern: browser.act navigate URL (sessionId) → browser.act highlight (label, instruction, sessionId) → guide.step (instruction, sessionId) → repeat highlight+guide.step for each step. Playwright opens a VISIBLE Chrome Testing window. highlight injects glow + speech bubble; guide.step polls window.__tdGuideTriggered and auto-advances when user clicks highlighted element. sessionId is REQUIRED in guide.step.
 Policy: no sudo/su/passwd. argv is string[] — no shell interpolation.
 Output ONLY a valid JSON array. No explanation, no markdown fences.
+For synthesize steps: keep prompt strings UNDER 200 chars. If the prompt needs to be longer, write "{{EXPAND:<brief intent>}}" (e.g. "{{EXPAND:write skill.md for github from crawled docs}}") and the system will expand it in a follow-up call.
 If the request cannot be safely automated, output: { "error": "explain why it cannot be done" }`;
 
 module.exports = async function planSkills(state) {
@@ -106,7 +107,9 @@ module.exports = async function planSkills(state) {
     activeBrowserSessionId = null,
     activeBrowserPageElements = null,
     completedGuideSteps = [],
-    profileContext = null
+    profileContext = null,
+    domainTags = null,
+    chosenService = null
   } = state;
 
   const logger = state.logger || console;
@@ -585,6 +588,70 @@ Task: "${userMessage}"`;
     }
   }
 
+  // ── CLI pre-flight check: detect required CLIs, check brew/curl + install/auth status ──
+  // Calls cli.agent preflight_check BEFORE the LLM prompt is built so the LLM gets
+  // accurate tool availability context and can plan the right install/auth steps upfront.
+  // Only fires when there are no active skillResults (fresh plan, not a recovery replan).
+  // Kept fast via a tight 5s timeout — never blocks planning if cli.agent is unavailable.
+  let cliPreflightNote = '';
+  const isRecoveryReplan = !!recoveryContext;
+  if (mcpAdapter && !isRecoveryReplan) {
+    try {
+      const pfRes = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'cli.agent',
+        args: { action: 'preflight_check', task: userMessage },
+      }, { timeoutMs: 5000 }).catch(() => null);
+
+      const pf = pfRes?.data || pfRes;
+
+      if (pf?.ok) {
+        const lines = [];
+
+        // Bootstrap tools
+        if (!pf.brew?.installed) {
+          lines.push('brew: NOT INSTALLED — install first: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"');
+        } else {
+          lines.push('brew: installed ✓');
+        }
+        if (!pf.curl?.installed) {
+          lines.push('curl: NOT INSTALLED — cannot use curl-based API calls until installed');
+        } else {
+          lines.push('curl: installed ✓');
+        }
+
+        // Per-CLI status
+        if (Array.isArray(pf.detectedClis) && pf.detectedClis.length > 0) {
+          for (const c of pf.detectedClis) {
+            if (!c.cli) {
+              if (c.isOAuth)  lines.push(`${c.service}: OAuth-based service — no CLI, browser or API flow required`);
+              else if (c.isApiKey) lines.push(`${c.service}: API key required (${c.apiKeyEnvVar || 'check service settings'}) — use shell.run curl with the key`);
+              continue;
+            }
+            if (!c.installed) {
+              const installCmd = c.installMethod === 'npm'
+                ? `npm install -g ${c.installPkg}`
+                : `brew install ${c.installPkg || c.cli}`;
+              lines.push(`${c.cli} (${c.service}): NOT INSTALLED — MUST install before use: ${installCmd}`);
+            } else if (c.authStatus === 'not_authenticated') {
+              lines.push(`${c.cli} (${c.service}): installed v${c.version} — NOT AUTHENTICATED. Run \`${c.cli} auth login\` or equivalent before use.`);
+            } else if (c.authStatus === 'authenticated') {
+              lines.push(`${c.cli} (${c.service}): installed v${c.version} — authenticated ✓ — use directly, skip auth setup steps`);
+            } else {
+              lines.push(`${c.cli} (${c.service}): installed v${c.version} — auth status unknown`);
+            }
+          }
+        }
+
+        if (lines.length > 0) {
+          cliPreflightNote = `\n\nCLI PRE-FLIGHT STATUS (verified at plan time — use this to decide whether to add install/auth steps):\n${lines.map(l => `- ${l}`).join('\n')}`;
+          logger.info(`[Node:PlanSkills] CLI pre-flight: ${pf.detectedClis?.length || 0} CLI(s) checked`);
+        }
+      }
+    } catch (pfErr) {
+      logger.warn(`[Node:PlanSkills] CLI pre-flight check failed (non-fatal): ${pfErr.message}`);
+    }
+  }
+
   // ── Agent registry: inject healthy agent descriptors into planning context ──
   // Query the agent registry (cli.agent + browser.agent) for all healthy agents.
   // Their descriptors tell the LLM which services have resolved auth, CLI tools,
@@ -628,10 +695,100 @@ Task: "${userMessage}"`;
     ? ragSnippetsBlock + SKILL_SYSTEM_PROMPT
     : SKILL_SYSTEM_PROMPT;
 
+  // ── Domain context note from enrichIntent keyword extraction ──────────────
+  // enrichIntent runs DOMAIN_TAXONOMY against the raw message and outputs
+  // tags + preferred services + skill hints. Inject this so the LLM knows
+  // exactly what service to bootstrap even when the user message is ambiguous
+  // (e.g. "text these to me" → tags: sms, services: twilio, skillHint: twilio.sms).
+  // Known docs URLs — loaded from api_rules DB (rule_type='endpoint').
+  // Seeded by database.js seedApiRules() on first boot — no hardcoded map here.
+  // Any new service can be added via api_rule.upsert without a code deploy.
+  // For unknown services, planSkills instructs the LLM to web-search for docs.
+  let KNOWN_DOCS_URLS = {};
+  try {
+    const endpointRules = await mcpAdapter.callService('user-memory', 'api_rule.list', {
+      ruleType: 'endpoint',
+      limit: 200,
+    });
+    const endpointResults = endpointRules?.results || endpointRules?.data?.results || [];
+    for (const rule of endpointResults) {
+      if (rule.service && rule.rule_text) {
+        // rule_text stores the docs URL for endpoint rules
+        KNOWN_DOCS_URLS[rule.service.toLowerCase()] = rule.rule_text;
+      }
+    }
+    if (endpointResults.length > 0) {
+      logger.debug(`[Node:PlanSkills] Loaded ${endpointResults.length} endpoint docs URLs from api_rules DB`);
+    }
+  } catch (_e) {
+    logger.debug('[Node:PlanSkills] api_rule.list(endpoint) unavailable (non-fatal)');
+  }
+
+  let domainContextNote = '';
+  if (domainTags && (domainTags.tags?.length > 0 || domainTags.skillHints?.length > 0)) {
+    const parts = [];
+    if (domainTags.tags?.length > 0) parts.push(`Domain: ${domainTags.tags.join(', ')}`);
+
+    // If user already chose a specific service, lock it in — single target, not a list
+    if (chosenService) {
+      const svcLower = chosenService.toLowerCase();
+      const docsUrl = KNOWN_DOCS_URLS[svcLower];
+      // Reuse a previously derived skill name (from a prior plan/replan) so duplicate
+      // skills never get created under different names for the same task.
+      // Only derive a new name if one has never been set for this task.
+      let skillName = state.pendingSkillName || null;
+      if (!skillName) {
+        // Derive skill name from: service + what the user actually asked to do.
+        // Extract the core action from the user message or skill hints.
+        // Format: <service>.<capability>.<action> — e.g. clicksend.sms.send
+        const msgLower = (state.message || state.resolvedMessage || '').toLowerCase();
+        const hints = (domainTags?.skillHints || []).map(h => h.toLowerCase());
+        // If skillHints already provide a dotted name that belongs to this service, use it.
+        // MUST start with svcLower — reject unrelated hints like 'twitter.post' when service='clicksend'.
+        const dottedHint = hints.find(h => h.includes('.') && h.startsWith(svcLower));
+        if (dottedHint) {
+          skillName = dottedHint;
+        } else {
+          // Build from the first skill hint or first domain tag + a verb from the user message.
+          // Use only simple (non-dotted) hints — dotted hints like 'twitter.post' are cross-service
+          // noise that must not bleed into the capability token.
+          const _NOISE_TAGS = new Set(['social-media', 'smart-home', 'billing', 'scheduling', 'vehicle']);
+          const simpleHints = hints.filter(h => !h.includes('.') && !_NOISE_TAGS.has(h));
+          const capability = simpleHints[0]
+            || (domainTags?.tags || []).find(t => !_NOISE_TAGS.has(t))?.toLowerCase().replace(/[^a-z0-9]/g, '')
+            || 'api';
+          // Extract verb: match common action words near the start of the message
+          const verbMatch = msgLower.match(/\b(send|check|get|create|list|delete|update|monitor|watch|read|write|track|schedule|cancel|search|play|control|open|close|turn|set|move|find|book|order|pay|call|text|email|push|notify|forward|upload|download|sync|backup|export|import|analyze|convert|translate|generate|summarize|record|stream)\b/);
+          const action = verbMatch ? verbMatch[1] : 'send';
+          skillName = `${svcLower}.${capability}.${action}`;
+        }
+      }
+      parts.push(`Chosen service: ${chosenService} (user selected)`);
+      if (docsUrl) {
+        parts.push(`API docs URL: ${docsUrl}`);
+      } else {
+        parts.push(`API docs URL: unknown — you must discover it`);
+      }
+      parts.push(`Skill name to create: ${skillName}`);
+      const crawlInstruction = docsUrl
+        ? `web.crawl("${docsUrl}")`
+        : `web.crawl("https://www.google.com/search?q=${encodeURIComponent(chosenService + ' API documentation send notification')}") to discover the real docs URL, then web.crawl that URL`;
+      domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Use the skill.bootstrap pattern — ${crawlInstruction} → synthesize skill.md as "${skillName}" → skill.install.\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials. Credentials are handled automatically via keychain.\n- FORBIDDEN: Do NOT use api_suggest — the service is already chosen.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
+      logger.info(`[Node:PlanSkills] Domain context (chosen service): ${chosenService} → ${skillName}`);
+      // Store the locked skill name back on state so subsequent replans reuse the exact same name
+      state = { ...state, pendingSkillName: skillName };
+    } else {
+      if (domainTags.services?.length > 0) parts.push(`Target services (in priority order): ${domainTags.services.join(', ')}`);
+      if (domainTags.skillHints?.length > 0) parts.push(`Suggested skill name: ${domainTags.skillHints[0]}`);
+      domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Because this is a messaging/API task with a known target service, you MUST use the skill.bootstrap pattern (web.crawl docs → synthesize skill.md → skill.install).\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials like <TWILIO_ACCOUNT_SID> or <API_KEY>. Credentials are handled automatically via keychain — never hardcode them.\n- FORBIDDEN: Do NOT use api_suggest — the service is already identified above.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
+      logger.info(`[Node:PlanSkills] Domain context injected: ${domainTags.tags?.join(', ')} → ${domainTags.skillHints?.[0]}`);
+    }
+  }
+
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${skillContractNote}${installedSkillsNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
+User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   const payload = {
     query: planningQuery,
@@ -643,7 +800,7 @@ User request: "${userMessage}"${skillContractNote}${installedSkillsNote}${agentC
       intent: 'command_automate'
     },
     options: {
-      maxTokens: 1200,
+      maxTokens: 2400,
       temperature: 0.1,
       fastMode: false
     }
@@ -685,6 +842,69 @@ User request: "${userMessage}"${skillContractNote}${installedSkillsNote}${agentC
     if (!Array.isArray(skillPlan) && skillPlan && typeof skillPlan === 'object' && skillPlan.skill) {
       logger.debug(`[Node:PlanSkills] LLM returned single-step object — wrapping in array`);
       skillPlan = [skillPlan];
+    }
+
+    // ── Phase 2: Segment expansion ─────────────────────────────────────────
+    // Scan for {{EXPAND:<intent>}} placeholders in synthesize prompt strings.
+    // Each placeholder gets its own focused LLM call to generate the full prompt,
+    // so the plan skeleton stays small and never truncates.
+    if (Array.isArray(skillPlan)) {
+      const EXPAND_RE = /^\{\{EXPAND:(.+)\}\}$/;
+      for (let i = 0; i < skillPlan.length; i++) {
+        const step = skillPlan[i];
+        if (step.skill !== 'synthesize' || !step.args?.prompt) continue;
+        const match = step.args.prompt.match(EXPAND_RE);
+        if (!match) continue;
+
+        const expandIntent = match[1].trim();
+        logger.debug(`[Node:PlanSkills] Phase 2 expand: step ${i + 1} — "${expandIntent}"`);
+
+        // Build context from the plan: what comes before and after this step
+        const priorSteps = skillPlan.slice(0, i).map((s, j) =>
+          `Step ${j + 1}: ${s.skill}${s.args?.url ? ` (${s.args.url})` : ''}${s.description ? ` — ${s.description}` : ''}`
+        ).join('\n');
+        const saveToFile = step.args.saveToFile || '';
+
+        const expandQuery = `Write a detailed synthesize prompt for this task.
+
+Context — this is step ${i + 1} in a plan:
+${priorSteps}
+
+Intent for this step: ${expandIntent}
+${saveToFile ? `Output will be saved to: ${saveToFile}` : ''}
+User request: "${userMessage}"
+
+Write ONLY the prompt text (no JSON, no fences). The prompt should tell the LLM exactly what to produce.
+If writing a skill.md: start with --- frontmatter (name, description, secrets, schedule:null, tags, version), then sections for What this skill does, Auth, Commands (real curl from docs), Plan (numbered steps). Do NOT wrap in fences.
+CRITICAL rules for skill.md:
+- secrets: list ALL auth credentials (username, API key, account SID, auth token). NOT runtime args (phone, message).
+- schedule: must be null (not false, not "false").
+- Keytar retrieval: security find-generic-password -s thinkdrop -a "skill:<skillName>:<SECRET_KEY>" -w 2>/dev/null. NEVER use -s <service-name>. Always -s thinkdrop -a "skill:<name>:<key>".
+- Commands curl: use keytar retrieval for credentials, real endpoint/headers from docs.`;
+
+        try {
+          const expandedPrompt = await backend.generateAnswer(expandQuery, {
+            query: expandQuery,
+            context: { systemInstructions: 'You write precise LLM prompts. Output only the prompt text, nothing else.', conversationHistory: [], intent: 'command_automate' },
+            options: { maxTokens: 800, temperature: 0.1, fastMode: true }
+          }, { maxTokens: 800, temperature: 0.1, fastMode: true }, null);
+
+          if (expandedPrompt && expandedPrompt.trim().length > 20) {
+            // Strip any markdown fences the LLM might wrap around the prompt
+            const cleaned = expandedPrompt.trim()
+              .replace(/^```[a-zA-Z]*\r?\n/, '').replace(/\n```\s*$/, '').trim();
+            skillPlan[i].args.prompt = cleaned;
+            logger.info(`[Node:PlanSkills] Phase 2 expanded step ${i + 1}: ${cleaned.length} chars`);
+          } else {
+            // Fallback: use the intent as a short prompt
+            skillPlan[i].args.prompt = expandIntent;
+            logger.warn(`[Node:PlanSkills] Phase 2 expand failed for step ${i + 1} — using intent as fallback`);
+          }
+        } catch (expandErr) {
+          skillPlan[i].args.prompt = expandIntent;
+          logger.warn(`[Node:PlanSkills] Phase 2 expand error for step ${i + 1}: ${expandErr.message} — using intent as fallback`);
+        }
+      }
     }
 
     // Check if LLM returned a clarifying question instead of a plan
@@ -1079,7 +1299,9 @@ Output ONLY the pattern text. No markdown, no explanation.`;
       skillPlan,
       skillCursor: 0,          // Always reset cursor on a fresh/re-plan
       recoveryContext: null,   // Clear recovery context after re-plan
-      planError: null
+      planError: null,
+      // Persist the locked skill name so replans use the same name (prevents duplicate skills)
+      pendingSkillName: state.pendingSkillName || null
     };
 
   } catch (error) {
@@ -1146,6 +1368,46 @@ function parsePlan(raw, logger) {
     return JSON.parse(jsonStr);
   } catch (e) {
     logger.warn('[Node:PlanSkills] JSON parse failed:', e.message);
+
+    // ── Truncation recovery ──────────────────────────────────────────────
+    // When maxTokens cuts the LLM output mid-JSON, the string is truncated
+    // inside a synthesize prompt or similar long value. Attempt to close
+    // open strings/objects/arrays and salvage the completed steps.
+    if (open === '[' && /unterminated string/i.test(e.message)) {
+      logger.debug('[Node:PlanSkills] Attempting truncation recovery...');
+      // Strategy: find the last complete object in the array (last "},")
+      // and close the array after it.
+      const lastCompleteObj = jsonStr.lastIndexOf('},');
+      if (lastCompleteObj > 0) {
+        const recovered = jsonStr.substring(0, lastCompleteObj + 1) + ']';
+        try {
+          const plan = JSON.parse(recovered);
+          if (Array.isArray(plan) && plan.length > 0) {
+            logger.info(`[Node:PlanSkills] Truncation recovery: salvaged ${plan.length} complete step(s) from truncated output`);
+            return plan;
+          }
+        } catch (_) { /* recovery failed, fall through */ }
+      }
+      // Strategy 2: close the current string + all open brackets
+      let repaired = jsonStr;
+      if (inString) repaired += '"';
+      // Close remaining depth
+      for (let d = depth; d > 0; d--) {
+        // Heuristic: alternate } and ] based on depth (innermost is likely an object)
+        repaired += d === depth ? '}' : (d % 2 === 0 ? ']' : '}');
+      }
+      repaired += ']';
+      try {
+        const plan = JSON.parse(repaired);
+        if (Array.isArray(plan) && plan.length > 0) {
+          logger.info(`[Node:PlanSkills] Truncation recovery (bracket-close): salvaged ${plan.length} step(s)`);
+          return plan;
+        }
+      } catch (_) { /* recovery failed */ }
+
+      logger.debug('[Node:PlanSkills] Truncation recovery failed — returning null');
+    }
+
     return null;
   }
 }

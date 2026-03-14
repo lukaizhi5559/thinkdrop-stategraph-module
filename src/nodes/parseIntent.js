@@ -31,6 +31,26 @@ module.exports = async function parseIntent(state) {
   // ── Hard overrides — run BEFORE carriedIntent and BEFORE phi4 ML ──────────
   // These must never be bypassed by resolveReferences carryover.
 
+  // Messaging verb override — HIGHEST PRIORITY: must beat carriedIntent + intent_override.search.
+  // "text this to me", "send that info to me", "email me the results", "text me this info"
+  // "text this info", "send that", "email these results" (bare messaging verbs)
+  // These are ALWAYS command_automate (trigger SMS/email/skill), never screen_intelligence.
+  // Destination fragment: "to me", "to my me" (typo), "to my phone/cell/number/email/inbox"
+  const TO_ME_DEST = /to\s+(my\s+)?(me|phone|cell\s*phone?|number|email|inbox)\b/i;
+  const MESSAGING_VERB_OVERRIDE =
+    // "text this to me", "send that info to me", "text these to my me"
+    new RegExp(`^(text|send|email|message|forward)\\s+(this|it|that|these|those)(\\s+\\w+)?\\s+${TO_ME_DEST.source}`, 'i')
+    // "text the info to me", "send the results to my phone"
+    || new RegExp(`^(text|send|email|message|forward)\\s+the\\s+\\w[\\w\\s]{0,30}\\s+${TO_ME_DEST.source}`, 'i')
+    // verb + me + object: "text me this", "send me the results", "email me it"
+    || /^(text|send|email|message|forward)\s+me\s+(this|it|that|these|the\s+\w+)/i
+    // bare messaging verb + demonstrative: "text this info", "send that", "email these results"
+    || /^(text|send|email|message|forward)\s+(this|it|that|these|those|the)\s+/i;
+  if (MESSAGING_VERB_OVERRIDE.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Messaging verb override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'messaging-verb-override', processingTimeMs: 0 } };
+  }
+
   // Filesystem / folder action override:
   // "I need you to scan the folder X", "scan the folder X", "read the files in X",
   // "analyze the screenshots in X", "list files in X", "show me the files on my desktop"

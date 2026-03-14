@@ -282,6 +282,23 @@ module.exports = async function answer(state) {
       streamCallback(finalAnswer);
     }
 
+    // ── Emit search sources so ResultsWindow can render the favicon pill ─────
+    // Uses the \x00SOURCES\x00 sentinel (same channel as \x00REPLACE\x00).
+    // Only fires when the answer was grounded in web search results.
+    if (typeof streamCallback === 'function' && contextDocs.length > 0) {
+      const sources = contextDocs
+        .filter(d => d.url && d.url.startsWith('http'))
+        .slice(0, 10)
+        .map(d => {
+          let hostname = '';
+          try { hostname = new URL(d.url).hostname.replace(/^www\./, ''); } catch (_) {}
+          return { url: d.url, title: d.text?.split('\n')[0]?.trim() || hostname, hostname };
+        });
+      if (sources.length > 0) {
+        streamCallback('\x00SOURCES\x00' + JSON.stringify(sources));
+      }
+    }
+
     // ── Guide offer extraction ────────────────────────────────────────────────
     // The LLM may append a guide offer question to its answer (per answer.md rules).
     // Detect it, strip it from the displayed text, and surface it as a pendingQuestion

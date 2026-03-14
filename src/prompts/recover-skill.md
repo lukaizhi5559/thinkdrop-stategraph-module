@@ -29,6 +29,7 @@ osascript exit code 1 with `* seconds` in date arithmetic → AUTO_PATCH: `* sec
 osascript exit code 1 with `delay N` before a Reminders/Calendar command → AUTO_PATCH: remove the `delay` entirely and set `due date:(current date) + N` instead. `delay` blocks the process and causes timeouts.
 osascript exit code 1 with a `date "..."` literal → AUTO_PATCH: ensure date format is `"MM/DD/YYYY HH:MM:SS AM/PM"` e.g. `date "02/25/2026 09:00:00 AM"`. Formats like `"February 25, 2026"` or `"2026-02-25"` are locale-dependent and fail.
 osascript/Reminders fails repeatedly after AUTO_PATCH attempts → REPLAN: switch to a cross-platform notification tool using `needs_install` + a background shell command. See the cross-platform fallback section in plan-skills.md.
+shell.run exit code 1 with placeholder credentials (error contains `<TWILIO_`, `<API_KEY`, `<YOUR_`, `401`, `403`, `Authentication`, `Unauthorized`, `curl: (6)`, or similar auth/credential failures) → REPLAN with suggestion: "Use skill.bootstrap pattern: web.crawl the API docs URL, synthesize a skill.md with keychain credential references (not hardcoded values), skill.install to register, then external.skill to execute. Do NOT use shell.run with placeholder or hardcoded credentials."
 
 ## Output Format
 

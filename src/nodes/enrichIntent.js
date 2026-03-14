@@ -33,6 +33,32 @@
  *   state.conversationHistory              — to detect prior enrichment questions
  */
 
+/**
+ * Extract domain tags from a user message via the phi4-service /domain.extract endpoint.
+ * Uses zero-shot NLI classification (@xenova/transformers) + compromise NLP fallback.
+ * Returns { tags: string[], services: string[], skillHints: string[] } or null on failure.
+ *
+ * @param {string} message
+ * @param {object} mcpAdapter  — state.mcpAdapter, used to call phi4.domain.extract
+ * @param {object} logger
+ */
+async function extractDomainTags(message, mcpAdapter, logger) {
+  try {
+    const response = await mcpAdapter.callService('phi4', 'domain.extract', { message });
+    const data = response?.data || response;
+    if (data && data.tags && data.tags.length > 0) {
+      return {
+        tags: data.tags,
+        services: data.services || [],
+        skillHints: data.skillHints || [],
+      };
+    }
+  } catch (err) {
+    logger.warn(`[Node:EnrichIntent] domain.extract MCP call failed: ${err.message}`);
+  }
+  return null;
+}
+
 // ── Correction patterns ────────────────────────────────────────────────────
 const CORRECTION_PATTERNS = [
   /^(no[,.]?\s+|nope[,.]?\s+|wrong[,.]?\s+|not right[,.]?\s+|that'?s? (wrong|incorrect|not right)[,.]?\s*)/i,
@@ -66,9 +92,9 @@ const GAP_DETECTORS = [
   },
   {
     field: 'my_phone',
-    pattern: /\b(my phone number|my number|my cell)\b/i,
+    pattern: /\b(my phone number|my number|my cell|text me|sms me|send me a (text|sms|message))\b/i,
     searchQuery: 'my phone number',
-    question: 'What is your phone number (including country code)?',
+    question: 'What is your phone number?',
     storeTemplate: (v) => `My phone number is ${v}`,
     memoryType: 'personal_profile',
   },
@@ -98,8 +124,10 @@ const GAP_DETECTORS = [
   },
   {
     field: 'skill_install_path',
-    // Only fire if no skill name (dot-notation) or path is already present in the message
-    pattern: /^(?!.*\b[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+\b)(?!.*(?:\/|~\/|\.thinkdrop)).*\b(install|add|register|load)\s+(a\s+)?(skill|external skill|custom skill)\b/i,
+    // Only fire if no skill name (dot-notation) or path is already present in the message.
+    // Also skip if the message contains creation verbs (need/want/create/make/build) —
+    // those mean "build a new skill via bootstrap", not "install existing skill from path".
+    pattern: /^(?!.*\b(need|want|create|make|build)\b)(?!.*\b[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+\b)(?!.*(?:\/|~\/|\.thinkdrop)).*\b(install|add|register|load)\s+(a\s+)?(skill|external skill|custom skill)\b/i,
     searchQuery: null,
     question: 'What is the path to the skill contract file? (e.g. ~/.thinkdrop/skills/my.skill/skill.md)',
     storeTemplate: null,
@@ -195,6 +223,7 @@ const _ENRICH_LANG_NAMES = { zh: 'Chinese (Mandarin)', ja: 'Japanese', ko: 'Kore
 
 module.exports = async function enrichIntent(state) {
   const { mcpAdapter, message, resolvedMessage, intent, context, conversationHistory = [] } = state;
+  const llmBackend = state.llmBackend || null;
   const logger = state.logger || console;
 
   const userId = context?.userId || 'local_user';
@@ -368,7 +397,7 @@ module.exports = async function enrichIntent(state) {
     const entityGaps = await Promise.all(unresolvedEntities.map(async ref => ({
       field: `entity:${ref.entityType}:${ref.label}`,
       ref,
-      question: await buildEntityQuestion(ref, commandMessage, mcpAdapter, logger, _langInstruction),
+      question: await buildEntityQuestion(ref, commandMessage, llmBackend, logger, _langInstruction),
     })));
 
     const fieldList = entityGaps.map(g => g.field).join(',');
@@ -386,6 +415,279 @@ module.exports = async function enrichIntent(state) {
     };
   }
 
+  // ─── STEP 3b: Domain keyword extraction ─────────────────────────────────
+  // Run domain.extract only when there is a genuine outbound-delivery ambiguity:
+  // "text this to me" → which SMS provider? (twilio vs clicksend vs sinch)
+  //
+  // The service picker UI should ONLY appear for known outbound messaging/notification
+  // providers. phi4 regularly hallucinates unrelated services (discord, postgres,
+  // homekit, salesforce) for tasks unrelated to service selection.
+  //
+  // SEED set — well-known providers. Extended at runtime by:
+  //   (a) services the user has previously chosen (from phrase_preference table)
+  //   (b) services the user mentions EXPLICITLY by name in this message
+  // This means ThinkDrop can learn any new provider the user teaches it.
+  const MESSAGING_PROVIDERS_SEED = new Set([
+    'twilio', 'clicksend', 'sinch', 'vonage', 'messagebird', 'plivo',
+    'sendgrid', 'mailgun', 'ses', 'postmark', 'sparkpost', 'mailchimp',
+    'pushover', 'pushbullet', 'onesignal', 'firebase', 'apns',
+    'slack', 'discord', 'telegram', 'whatsapp',
+    'zapier', 'make', 'n8n', 'ifttt',
+  ]);
+
+  // Extend with any services the user has previously taught us via phrase_preference
+  let MESSAGING_PROVIDERS = new Set(MESSAGING_PROVIDERS_SEED);
+  try {
+    const learnedList = await mcpAdapter.callService('user-memory', 'phrase_preference.list', {});
+    const learnedResults = learnedList?.results || learnedList?.data?.results || [];
+    for (const pref of learnedResults) {
+      if (pref.service) MESSAGING_PROVIDERS.add(pref.service.toLowerCase());
+    }
+    if (learnedResults.length > 0) {
+      logger.debug(`[Node:EnrichIntent] Extended MESSAGING_PROVIDERS with ${learnedResults.length} learned service(s)`);
+    }
+  } catch (_e) {
+    // Non-fatal — fall back to seed set only
+  }
+
+  // Run domain.extract, then validate the result is actually relevant to this message.
+  // phi4 (3B local model) hallucinates messaging/API services for unrelated tasks like
+  // browser navigation. Instead of hardcoding patterns to skip, we ask the LLM backend
+  // (the capable model) to confirm whether the returned tags genuinely apply.
+  // This is self-healing: no list to maintain, any false-positive gets discarded.
+  let domainTags = state.matchedSkillName
+    ? null
+    : await extractDomainTags(commandMessage, mcpAdapter, logger);
+
+  if (domainTags && domainTags.services?.length > 0 && llmBackend) {
+    try {
+      const _validationPrompt = `A task classification model returned these service tags for a user message. Answer YES if the tags genuinely apply (the task requires contacting or using these services), or NO if they are false positives (the task is unrelated — e.g. browser navigation, file operation, search).
+
+User message: "${commandMessage}"
+Returned tags: ${domainTags.tags.join(', ')}
+Returned services: ${domainTags.services.join(', ')}
+
+Answer with exactly one word: YES or NO.`;
+      const _validationAnswer = await llmBackend.generateAnswer(_validationPrompt, {
+        query: _validationPrompt,
+        context: { systemInstructions: 'You are a classification validator. Answer only YES or NO.', conversationHistory: [], intent: 'validate_tags' },
+        options: { maxTokens: 5, temperature: 0.0, fastMode: true }
+      }, { maxTokens: 5, temperature: 0.0, fastMode: true }, null).catch(() => 'YES');
+      if (_validationAnswer && _validationAnswer.trim().toUpperCase().startsWith('NO')) {
+        logger.info(`[Node:EnrichIntent] domain.extract tags discarded (LLM validation: false positive) — tags: [${domainTags.tags.join(', ')}]`);
+        domainTags = null;
+      }
+    } catch (_ve) {
+      // Non-fatal — keep domainTags as-is if validation fails
+    }
+  }
+
+  // Filter phi4 results to real messaging providers (seed + learned)
+  // ALSO: if the user explicitly named a service in the message, include it
+  // even if phi4 didn't return it — this covers unknown providers the user mentions.
+  const _phi4Services = domainTags
+    ? domainTags.services.filter(s => MESSAGING_PROVIDERS.has(s.toLowerCase()))
+    : [];
+
+  // Extract any service explicitly named in the message (e.g. "via Pushbullet", "using Gotify")
+  // This allows ThinkDrop to work with ANY provider the user mentions by name,
+  // not just the ones phi4 knows about.
+  const _explicitMention = commandMessage.match(
+    /\b(?:via|using|with|through|on|by)\s+([A-Za-z][A-Za-z0-9._-]{2,30})\b/i
+  );
+  const _explicitService = _explicitMention ? _explicitMention[1].toLowerCase() : null;
+  // Only add explicit service if it looks like a delivery channel:
+  // - not a common English word
+  // - phi4 also returned at least one real messaging service (guards against
+  //   "on sale", "on Yahoo", "by me" being treated as provider names when
+  //   the message has no messaging intent at all)
+  const _COMMON_WORDS = new Set(['email', 'text', 'message', 'phone', 'web', 'browser', 'app', 'the', 'my', 'your', 'me', 'sale', 'it']);
+  const _explicitValid = _explicitService
+    && !_COMMON_WORDS.has(_explicitService)
+    && _phi4Services.length > 0; // only valid when phi4 already confirmed messaging intent
+  const _messagingServices = [...new Set([
+    ..._phi4Services,
+    ...(_explicitValid ? [_explicitService] : []),
+  ])];
+
+  if (domainTags) {
+    logger.info(`[Node:EnrichIntent] Domain tags: [${domainTags.tags.join(', ')}] → phi4 services: [${_phi4Services.join(', ')}] → explicit: [${_explicitService || 'none'}] → final: [${_messagingServices.join(', ')}]`);
+  }
+
+  // ─── STEP 3c: Service choice — learning loop ─────────────────────────────
+  // 1. If user already chose a service this session, reuse it.
+  // 2. Check phrase_preference memory — did the user EVER tell us which service
+  //    they prefer for phrasing like this? (semantic similarity match)
+  //    If yes → auto-select silently, never ask again.
+  // 3. If 1 real messaging provider → auto-select.
+  // 4. If 2+ real messaging providers AND no learned preference → ask the user,
+  //    then STORE their answer so we never ask again for similar phrases.
+  // 5. If 0 real messaging providers → skip service selection entirely.
+  let chosenService = state.chosenService || null;
+  const progressCallback = state.progressCallback || null;
+  const gatherAnswerCallback = state.gatherAnswerCallback || null;
+
+  const SERVICE_DISPLAY_NAMES = {
+    twilio: 'Twilio', clicksend: 'ClickSend', sinch: 'Sinch', vonage: 'Vonage',
+    mailgun: 'Mailgun', sendgrid: 'SendGrid', pushover: 'Pushover', slack: 'Slack',
+    discord: 'Discord', telegram: 'Telegram', zapier: 'Zapier', onesignal: 'OneSignal',
+    messagebird: 'MessageBird', plivo: 'Plivo', make: 'Make', n8n: 'n8n', ifttt: 'IFTTT',
+  };
+
+  if (!chosenService && _messagingServices.length > 0) {
+    // Step 1: Check learned phrase preferences before asking anything
+    let learnedPref = null;
+    try {
+      const prefResult = await mcpAdapter.callService('user-memory', 'phrase_preference.search', {
+        phrase: commandMessage,
+      });
+      learnedPref = prefResult?.match || null;
+    } catch (_e) {
+      logger.debug('[Node:EnrichIntent] phrase_preference.search unavailable (non-fatal)');
+    }
+
+    if (learnedPref?.service) {
+      chosenService = learnedPref.service;
+      logger.info(`[Node:EnrichIntent] Learned preference hit — auto-selected: "${chosenService}" (sim=${learnedPref.similarity?.toFixed(3)})`);
+    } else if (_messagingServices.length === 1) {
+      // Single provider — auto-select, no question needed
+      chosenService = _messagingServices[0];
+      logger.info(`[Node:EnrichIntent] Single messaging provider auto-selected: "${chosenService}"`);
+    } else if (_messagingServices.length > 1 && gatherAnswerCallback) {
+      // Multiple providers — ask once, then remember forever
+      const serviceOptions = _messagingServices.map(s =>
+        SERVICE_DISPLAY_NAMES[s.toLowerCase()] || (s.charAt(0).toUpperCase() + s.slice(1))
+      );
+
+      logger.info(`[Node:EnrichIntent] Multiple messaging providers, no learned preference — asking: ${serviceOptions.join(', ')}`);
+
+      if (progressCallback) {
+        progressCallback({
+          type: 'gather_question',
+          id: 'service_choice',
+          question: `How would you like me to reach you for this?`,
+          hint: `I found ${serviceOptions.length} options. Pick one and I'll remember it for next time.`,
+          inputType: 'choice',
+          options: serviceOptions,
+          links: [],
+        });
+      }
+
+      let answer = await gatherAnswerCallback();
+
+      // ── "I don't know" path ─────────────────────────────────────────────────────
+      // If user says they don't know, query api_rules in the DB for services
+      // that have known endpoints matching the task domain. The DB is the
+      // authoritative service catalog — no LLM call needed here.
+      // phi4/Ollama is a 3B local model and cannot reliably suggest services.
+      const _dontKnowPhrases = /\b(don'?t know|not sure|no idea|unsure|idk|help|suggest|recommend|what.?s best|you choose|you pick)\b/i;
+      if (answer && _dontKnowPhrases.test(answer)) {
+        logger.info('[Node:EnrichIntent] User unsure — querying api_rules DB for service suggestions');
+
+        let suggestedServices = [];
+        try {
+          // Fetch all services that have endpoint rules (i.e. known, actionable APIs)
+          const rulesRes = await mcpAdapter.callService('user-memory', 'api_rule.list', {
+            ruleType: 'endpoint',
+            limit: 50,
+          });
+          const allEndpointServices = (rulesRes?.results || rulesRes?.data?.results || [])
+            .map(r => r.service)
+            .filter((s, i, a) => s && a.indexOf(s) === i); // unique
+
+          // Score by overlap with domain tags from this message
+          const domainTagsLower = (domainTags?.tags || []).map(t => t.toLowerCase());
+          const domainTagsSet = new Set(domainTagsLower);
+
+          // Prefer services whose name or rules relate to the current domain tags
+          // (e.g. tags=[sms,notify] → twilio, clicksend rank high)
+          const scored = allEndpointServices.map(s => {
+            const sl = s.toLowerCase();
+            const inTags = domainTagsSet.has(sl) ? 3 : 0;
+            const tagOverlap = domainTagsLower.filter(t => sl.includes(t) || t.includes(sl)).length;
+            return { s, score: inTags + tagOverlap };
+          });
+          scored.sort((a, b) => b.score - a.score);
+
+          // Return top 5 — if none scored, just return first 5 alphabetically
+          suggestedServices = scored.slice(0, 5).map(x => x.s);
+          if (suggestedServices.length === 0) suggestedServices = allEndpointServices.slice(0, 5);
+        } catch (_e) {
+          logger.debug('[Node:EnrichIntent] api_rule.list failed (non-fatal)');
+        }
+
+        // Fallback: if DB has no endpoint rules yet, fall back to MESSAGING_PROVIDERS seed
+        if (suggestedServices.length === 0) {
+          suggestedServices = [...MESSAGING_PROVIDERS].slice(0, 5);
+        }
+
+        if (suggestedServices.length > 0) {
+          const suggestOptions = suggestedServices.map(s =>
+            SERVICE_DISPLAY_NAMES[s] || (s.charAt(0).toUpperCase() + s.slice(1))
+          );
+
+          logger.info(`[Node:EnrichIntent] DB suggested services: ${suggestOptions.join(', ')}`);
+
+          if (progressCallback) {
+            progressCallback({
+              type: 'gather_question',
+              id: 'service_choice_suggested',
+              question: `Here are some options that could handle this. Which would you prefer?`,
+              hint: `These are services I know how to integrate. Pick one and I'll set it up automatically.`,
+              inputType: 'choice',
+              options: suggestOptions,
+              links: [],
+            });
+          }
+          answer = await gatherAnswerCallback();
+          // Merge suggested services into the candidate pool for resolution below
+          for (const s of suggestedServices) {
+            if (!_messagingServices.includes(s)) _messagingServices.push(s);
+          }
+        }
+      }
+      // ── End "I don't know" path ─────────────────────────────────────────────
+
+      if (answer) {
+        const picked = answer.trim().toLowerCase();
+        chosenService = _messagingServices.find(s =>
+          s.toLowerCase() === picked ||
+          s.toLowerCase() === picked.replace(/\s+/g, '') ||
+          picked.includes(s.toLowerCase())
+        ) || picked; // if still no match, trust the user's literal answer as the service name
+        logger.info(`[Node:EnrichIntent] User chose: "${answer}" → resolved: "${chosenService}"`);
+
+        // Store the learned preference — next time this phrase won't ask again.
+        // Delivery defaults to 'webhook' for unknown services — planSkills crawls
+        // the docs to figure out the actual integration pattern. No category
+        // hardcoding — services can be anything (SMS, IoT, car, desktop, etc.)
+        let _deliveryForStore = 'webhook';
+        try {
+          const _existingPref = await mcpAdapter.callService('user-memory', 'phrase_preference.list', { service: chosenService });
+          const _existingResults = _existingPref?.results || _existingPref?.data?.results || [];
+          if (_existingResults.length > 0 && _existingResults[0].delivery) {
+            _deliveryForStore = _existingResults[0].delivery;
+          }
+        } catch (_e) { /* non-fatal */ }
+        try {
+          await mcpAdapter.callService('user-memory', 'phrase_preference.upsert', {
+            examplePhrase: commandMessage,
+            delivery: _deliveryForStore,
+            service: chosenService,
+            source: 'user_answer',
+          });
+          logger.info(`[Node:EnrichIntent] Stored phrase preference: "${commandMessage.slice(0, 60)}" → ${chosenService} (${_deliveryForStore})`);
+        } catch (_e) {
+          logger.debug('[Node:EnrichIntent] phrase_preference.upsert unavailable (non-fatal)');
+        }
+      } else {
+        // Timeout/no answer — default to first option
+        chosenService = _messagingServices[0];
+        logger.info(`[Node:EnrichIntent] Service choice timed out — defaulting to: "${chosenService}"`);
+      }
+    }
+  }
+
   // ─── STEP 4: Scalar profile gap detection ────────────────────────────────
   // Covers: user's own name, phone, email, address, skill ops
   // SKIP when message was auto-translated: translation artifacts (e.g. "near my house"
@@ -394,7 +696,7 @@ module.exports = async function enrichIntent(state) {
   const triggered = _wasTranslated ? [] : GAP_DETECTORS.filter(d => d.pattern.test(commandMessage));
   if (triggered.length === 0 && entityRefs.length === 0) {
     logger.debug('[Node:EnrichIntent] No gaps detected — passthrough');
-    return state;
+    return { ...state, domainTags: domainTags || state.domainTags, chosenService: chosenService || state.chosenService };
   }
 
   const resolvedFacts = [];
@@ -402,7 +704,7 @@ module.exports = async function enrichIntent(state) {
 
   await Promise.all(triggered.map(async (detector) => {
     if (!detector.storeTemplate) {
-      const q = await translateQuestion(detector.question, _langInstruction, mcpAdapter, logger);
+      const q = await translateQuestion(detector.question, _langInstruction, llmBackend, logger);
       unresolvedGaps.push({ field: detector.field, question: q });
       return;
     }
@@ -423,12 +725,12 @@ module.exports = async function enrichIntent(state) {
         resolvedFacts.push({ field: detector.field, value, rawText: hit.text });
         logger.info(`[Node:EnrichIntent] Resolved ${detector.field}: "${value}"`);
       } else {
-        const q = await translateQuestion(detector.question, _langInstruction, mcpAdapter, logger);
+        const q = await translateQuestion(detector.question, _langInstruction, llmBackend, logger);
         unresolvedGaps.push({ field: detector.field, question: q });
       }
     } catch (err) {
       logger.warn(`[Node:EnrichIntent] Gap lookup failed for ${detector.field}: ${err.message}`);
-      const q = await translateQuestion(detector.question, _langInstruction, mcpAdapter, logger);
+      const q = await translateQuestion(detector.question, _langInstruction, llmBackend, logger);
       unresolvedGaps.push({ field: detector.field, question: q });
     }
   }));
@@ -466,6 +768,8 @@ module.exports = async function enrichIntent(state) {
       ...state,
       resolvedMessage: enrichedMessage !== commandMessage ? enrichedMessage : (resolvedMessage || message),
       profileContext,
+      domainTags: domainTags || state.domainTags,
+      chosenService: chosenService || state.chosenService,
       enrichmentNeeded: deduped,
       answer: questionText,
       enrichmentPendingMessage: commandMessage,
@@ -476,6 +780,8 @@ module.exports = async function enrichIntent(state) {
     ...state,
     resolvedMessage: enrichedMessage !== commandMessage ? enrichedMessage : (resolvedMessage || message),
     profileContext,
+    domainTags: domainTags || state.domainTags,
+    chosenService: chosenService || state.chosenService,
     enrichmentNeeded: [],
   };
 };
@@ -845,15 +1151,15 @@ const extractScalarValue = extractScalarFromAnswer;
  * Translate a hardcoded English question into the user's language via phi4.
  * Falls back to the original English if LLM is unavailable or langInstruction is empty.
  */
-async function translateQuestion(englishQuestion, langInstruction, mcpAdapter, logger) {
-  if (!langInstruction || !mcpAdapter) return englishQuestion;
+async function translateQuestion(englishQuestion, langInstruction, llmBackend, logger) {
+  if (!langInstruction || !llmBackend) return englishQuestion;
   try {
     const prompt = `Translate this question into the target language specified below. Output only the translated question, nothing else.\n\nQuestion: "${englishQuestion}"${langInstruction}`;
-    const res = await mcpAdapter.callService('phi4', 'general.answer', {
-      message: prompt,
-      stream: false,
-    }, { timeoutMs: 4000 }).catch(() => null);
-    const text = res?.data?.answer || res?.answer || '';
+    const text = await llmBackend.generateAnswer(prompt, {
+      query: prompt,
+      context: {},
+      options: { maxTokens: 200, temperature: 0.1 },
+    }, { maxTokens: 200, temperature: 0.1 }, null).catch(() => '');
     if (text && text.trim().length > 3) return text.trim().replace(/^["']|["']$/g, '');
   } catch (err) {
     logger?.debug(`[EnrichIntent] translateQuestion failed: ${err.message}`);
@@ -865,13 +1171,13 @@ async function translateQuestion(englishQuestion, langInstruction, mcpAdapter, l
  * Build the question to ask when an entity is unknown.
  * Adapts per entity type and the action being requested.
  */
-async function buildEntityQuestion(ref, commandMessage, mcpAdapter, logger, langInstruction = '') {
+async function buildEntityQuestion(ref, commandMessage, llmBackend, logger, langInstruction = '') {
   const { label, entityType } = ref;
 
   // Fallback template if LLM is unavailable
   const fallback = `What is your ${label}? I need that to complete this request.`;
 
-  if (!mcpAdapter) return fallback;
+  if (!llmBackend) return fallback;
 
   try {
     const prompt = [
@@ -882,12 +1188,12 @@ async function buildEntityQuestion(ref, commandMessage, mcpAdapter, logger, lang
       langInstruction,
     ].filter(Boolean).join('\n');
 
-    const res = await mcpAdapter.callService('phi4', 'general.answer', {
-      message: prompt,
-      stream: false,
-    }, { timeoutMs: 4000 }).catch(() => null);
+    const text = await llmBackend.generateAnswer(prompt, {
+      query: prompt,
+      context: {},
+      options: { maxTokens: 200, temperature: 0.3 },
+    }, { maxTokens: 200, temperature: 0.3 }, null).catch(() => '');
 
-    const text = res?.data?.answer || res?.answer || '';
     if (text && text.trim().length > 5) {
       return text.trim().replace(/^["']|["']$/g, '');
     }

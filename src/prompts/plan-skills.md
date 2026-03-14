@@ -3,7 +3,7 @@ guide.step|args:{instruction:string,sessionId:string,timeoutMs?:number}|pauses_p
 schedule|args:{time?:string,delayMs?:number,label?:string}|waits_until_clock_time_or_delay_then_continues_plan
 list_skills|args:{}|returns_full_skill_registry_including_installed_user_skills
 skill.install|args:{skillPath:string}|reads_skill_contract_md_at_path_and_registers_it_in_the_skill_registry.__ALWAYS_use_this_to_install_a_skill__never_shell.run.__skillPath_must_be_absolute_eg_/Users/lukaizhi/.thinkdrop/skills/send.text/skill.md
-needs_skill|args:{capability:string,suggestion:string}|tells_user_ThinkDrop_cannot_do_this_natively_and_scaffolds_a_starter_skill_contract
+needs_skill|args:{capability:string,suggestion:string}|ONLY_for_recurring_background_daemons_that_cannot_be_done_via_one-off_API_call.__For_one-off_REST_API_tasks_use_skill.bootstrap_pattern_instead
 external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user_installed_external_skill_by_name
 
 ## Template variables
@@ -30,6 +30,22 @@ TOKEN=$(security find-internet-password -s github.com -w 2>/dev/null | head -1)
 ```
 
 **GitHub — NEVER attach binary files to PRs via API.** GitHub REST API does not support file uploads to PRs. Instead: read the file content with `shell.run`, then post it as a PR comment using `POST /repos/OWNER/REPO/issues/NUMBER/comments`.
+
+**shell.run JSON body quoting — CRITICAL when user message text may contain apostrophes:**
+
+Always assign user-provided text to a shell variable, then expand it inside a double-quoted `-d "..."` string. Never put user text directly inside single-quoted JSON.
+
+```bash
+# CORRECT — works even when body contains apostrophes like "what's up"
+MSG='what'"'"'s up'; curl -X POST https://api.example.com/send -u "$U:$K" -H 'Content-Type: application/json' -d "{\"messages\":[{\"body\":\"$MSG\"}]}"
+```
+
+Or use printf to build the JSON:
+```bash
+JSON=$(printf '{"messages":[{"body":"%s"}]}' "what's up"); curl ... -d "$JSON"
+```
+
+**NEVER** use: `-d '{"body":"what'"'"'s up"}'` — any apostrophe inside single-quoted bash string causes syntax error (exit code 2).
 
 **Get repo owner/name from git remote (when not provided by user):**
 ```bash
@@ -196,6 +212,9 @@ Rules:
 - Playing audio/video (use `browser.act → click` on the play/listen button)
 - Submitting a form you can fill automatically
 - Any action where `browser.act` can do it directly
+- **Setting up API credentials, API keys, or account registration** — use `skill.bootstrap` (keychain + gatherContext handles credentials automatically, no manual steps)
+- **"Sign up for X", "log in to X", "copy your API key from X dashboard"** — these are credential setup steps, never guide.step
+- **Testing a curl command in the terminal** — execute it directly via `shell.run`
 
 **PREFERRED automation pattern for button clicks:**
 ```json
@@ -212,6 +231,8 @@ When `guide.step` IS appropriate:
 ## api_suggest — when to use
 
 Use as the FIRST step when the task is recurring, scheduled, or would be fragile via UI automation. Almost all major platforms have REST APIs (Slack, GitHub, Jira, Gmail, Notion, Linear, Stripe, etc.). Do NOT use for one-off tasks — just do the action directly.
+
+**IMPORTANT: If a `DOMAIN CONTEXT` block is present in this prompt (injected above), do NOT use `api_suggest`. Use `skill.bootstrap` instead — the target service is already known. `api_suggest` is only for ambiguous cases where you cannot determine the service.**
 
 ## file.bridge — key action rules
 
@@ -245,6 +266,164 @@ When `matchedSkillName` is set in context, use `external.skill` as the ONLY step
 ```
 
 The skill contract's "What this skill does" section describes inputs — extract them from the user message.
+
+## skill.bootstrap — build a skill on the fly from API docs
+
+**Use this pattern when:**
+- The user asks to DO something with a service that has no installed skill yet (one-off or recurring)
+- The service has a REST API (ClickSend, Twilio, Mailgun, Pushover, Stripe, etc.)
+- You need to learn how the API works before you can call it
+
+**Do NOT use `needs_skill` for one-off API tasks. Build the skill yourself using this pattern.**
+**NEVER use `guide.step` to set up API credentials — credentials are handled via keychain + gatherContext automatically.**
+
+### Decision tree — CLI first, API second
+
+```
+Does the service have a CLI (gh, twilio, stripe, fly, wrangler, heroku, etc.)?
+  YES →
+    1. shell.run: check if CLI is installed (which <cli> || command -v <cli>)
+    2. If NOT installed: shell.run brew install <cli>   (or pip/npm/cargo if appropriate)
+    3. shell.run: authenticate if needed (e.g. twilio login, gh auth login)
+    4. shell.run: execute the task directly with the CLI
+    5. (optional) synthesize skill.md backed by CLI commands + skill.install for reuse
+  NO (REST API only) →
+    1. web.crawl API docs URL
+    2. synthesize skill.md with curl commands + saveToFile
+    3. skill.install to register
+    4. external.skill to execute
+```
+
+**Prefer CLI over curl when available** — CLIs handle auth, retries, and output formatting better than raw curl.
+
+### Full self-bootstrap loop (REST API path)
+
+1. **web.crawl** — fetch and extract the API docs (auth method, endpoint, curl example)
+2. **synthesize** — write a complete `skill.md` contract from the crawled docs, saved directly to disk
+3. **skill.install** — register the skill in the skill registry (status: `missing_secrets` until creds entered)
+4. **synthesize** — tell the user to open the Skills tab and enter their credentials to activate the skill
+
+### Full self-bootstrap loop (CLI path)
+
+1. **shell.run** — check if CLI is installed: `which <cli> 2>/dev/null || echo NOT_FOUND`
+2. **shell.run** — if NOT_FOUND: install via brew/pip/npm/cargo
+3. **shell.run** — run the CLI command to complete the task
+4. **(optional)** synthesize a `skill.md` backed by CLI commands + `skill.install` so the skill is reusable next time
+
+### web.crawl — fetches URL and returns readable text (JS-rendered, Playwright-backed)
+
+```json
+{ "skill": "web.crawl", "args": { "url": "<docs-url>", "maxChars": 12000 } }
+```
+
+- Uses playwright-cli under the hood — fully renders JavaScript-heavy pages (Twilio, Stripe, GitHub Docs, etc.)
+- Returns: `{ ok, url, title, content, contentLength, truncated, elapsedMs }`
+- The `content` field contains the full extracted readable text — pass it directly to the next `synthesize` step
+- **Always use `web.crawl` instead of `shell.run` + curl for fetching API documentation**
+
+### synthesize skill.md from crawled docs
+
+The `synthesize` prompt must instruct the LLM to output a complete `skill.md` in this exact format:
+
+```markdown
+---
+name: <service.action>
+description: <one sentence — what the skill does>
+secrets: [<ALL_AUTH_CREDENTIALS>]
+schedule: null
+tags: [<service>, sms, api]
+version: 1.0.0
+---
+
+## What this skill does
+
+<description>
+
+## Auth
+
+Secrets are stored in macOS keytar under service "thinkdrop".
+Retrieval: `security find-generic-password -s thinkdrop -a "skill:<service.action>:<SECRET_KEY>" -w 2>/dev/null`
+
+## Commands
+
+### Send (curl example extracted from docs — use REAL endpoint/headers from docs)
+\`\`\`bash
+SECRET=$(security find-generic-password -s thinkdrop -a "skill:<service.action>:<SECRET_KEY>" -w 2>/dev/null)
+curl -s -X POST <endpoint> \
+  -u "$USERNAME:$SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"to":"<TO>","source":"sdk","body":"<MESSAGE>"}]}'
+\`\`\`
+
+## Plan (for planSkills LLM — this is what gets executed)
+
+1. \`shell.run bash\` — retrieve ALL secrets from keytar: \`security find-generic-password -s thinkdrop -a "skill:<name>:<KEY>" -w 2>/dev/null\`
+2. \`shell.run bash\` — call the API with curl using retrieved creds + user-provided args (phone, message, etc.)
+3. \`synthesize\` — confirm success or surface the error message
+```
+
+### Generic example — any REST API service
+
+Replace `<service>`, `<action>`, `<docs-url>`, and arg names with the actual service details.
+
+```json
+[
+  {
+    "skill": "web.crawl",
+    "args": { "url": "<docs-url>", "maxChars": 12000 },
+    "description": "Crawl <service> API docs"
+  },
+  {
+    "skill": "synthesize",
+    "args": {
+      "prompt": "{{EXPAND:write skill.md for <service>.<action> from crawled API docs. secrets=ALL auth creds (username+API key+SID). schedule=null. Keytar retrieval: security find-generic-password -s thinkdrop -a 'skill:<name>:<KEY>' -w}}",
+      "saveToFile": "/Users/lukaizhi/.thinkdrop/skills/<service>.<action>/skill.md"
+    },
+    "description": "Write <service>.<action>/skill.md from docs"
+  },
+  {
+    "skill": "skill.install",
+    "args": { "skillPath": "/Users/lukaizhi/.thinkdrop/skills/<service>.<action>/skill.md" },
+    "description": "Install <service>.<action> skill"
+  },
+  {
+    "skill": "synthesize",
+    "args": {
+      "prompt": "Skill '<service>.<action>' installed. Tell user to open Skills tab, find it, enter API key(s), then retry the command."
+    },
+    "description": "Tell user to enter credentials in Skills tab"
+  }
+]
+```
+
+### Rules for skill.bootstrap
+
+- **CRITICAL: Keep `synthesize` prompt strings SHORT (under 300 chars).** Long prompts cause JSON truncation. Use concise instructions — the LLM will expand them. Never inline the full skill.md format spec in the prompt string.
+- **ALWAYS crawl the docs first** — never write a skill.md from memory alone, API endpoints change
+- **`synthesize` with `saveToFile`** writes the file directly — no separate `shell.run tee` needed
+- The `saveToFile` path must use the full expanded `/Users/<username>/.thinkdrop/skills/<name>/skill.md` — no `~`
+- `skill.install` with `skillPath` reads the file from disk and registers it — no curl to localhost needed
+- After install, call `external.skill` immediately in the same plan to complete the original task
+- Pass any user-provided values (phone number, recipient, message, etc.) directly as args to `external.skill`
+- **Credentials are NEVER collected via `guide.step`** — the skill reads from keychain at runtime. If missing, the Skills tab shows a yellow badge so the user can enter them directly.
+- **After `skill.install`, always end with a `synthesize` step** directing the user to the Skills tab to enter credentials — do NOT call `external.skill` immediately (it will fail with no creds).
+- **NEVER plan `guide.step` steps for: signing up, logging in, copying API keys, saving credentials, or testing curl in a terminal.** These break the autonomous flow.
+- **Keytar storage format**: secrets are stored under macOS Keychain service `thinkdrop`, account `skill:<skillName>:<secretKey>`. To retrieve at runtime: `security find-generic-password -s thinkdrop -a "skill:<skillName>:<KEY>" -w 2>/dev/null`. NEVER use `-s <service-name>` — always use `-s thinkdrop -a "skill:..."`. 
+- **`schedule` must be `null`** (not `false`, not `"false"`). `false` triggers scheduler warnings.
+- **secrets list must include ALL authentication credentials** (username, API key, account SID, auth token, etc.). Runtime arguments like phone number or message body are NOT secrets — they are passed by the user at invocation time.
+- **When generating shell.run curl steps** from a contract, substitute the user's actual values (message text, etc.) into the curl command. For phone number: if the user didn't provide one, ASK via a synthesize step — never use +1234567890 as a placeholder.
+
+### Known API doc URLs and auth patterns (use these — don't web search if service matches)
+
+| Service | Docs URL | Auth | Required secrets |
+|---------|----------|------|-----------------|
+| ClickSend SMS | `https://developers.clicksend.com/docs/rest/v3/#send-sms` | HTTP Basic (`-u username:api_key`) | CLICKSEND_USERNAME, CLICKSEND_API_KEY |
+| Twilio SMS | `https://www.twilio.com/docs/sms/api/message-resource#create-a-message-resource` | HTTP Basic (`-u account_sid:auth_token`) | TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN |
+| Mailgun email | `https://documentation.mailgun.com/en/latest/api-sending.html` | HTTP Basic (`-u api:key`) | MAILGUN_API_KEY, MAILGUN_DOMAIN |
+| Pushover push | `https://pushover.net/api` | POST body params | PUSHOVER_USER_KEY, PUSHOVER_APP_TOKEN |
+| Slack webhook | `https://api.slack.com/messaging/webhooks` | URL contains token | SLACK_WEBHOOK_URL |
+| SendGrid email | `https://docs.sendgrid.com/api-reference/mail-send/mail-send` | Bearer token | SENDGRID_API_KEY |
+| Vonage SMS | `https://developer.vonage.com/api/sms` | POST body params | VONAGE_API_KEY, VONAGE_API_SECRET |
 
 ## needs_skill — capability gap
 

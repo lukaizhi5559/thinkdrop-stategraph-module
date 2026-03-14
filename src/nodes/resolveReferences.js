@@ -368,6 +368,14 @@ module.exports = async function resolveReferences(state) {
         logger.debug('[Node:ResolveReferences] Rejecting low-confidence simple_fallback resolution, using original');
         resolvedMessage = message;
       }
+      // Reject if message starts with a communication/action verb — 'this/it' in these
+      // messages refers to prior context (e.g. search results), not a proper noun.
+      // e.g. "text this to me" → DO NOT resolve 'this' to 'Eats' or any prior noun.
+      const COMM_ACTION_START = /^(text|send|email|call|message|share|forward|post|tweet|dm|ping|notify|alert|remind|tell)/i;
+      if (COMM_ACTION_START.test(message.trim())) {
+        logger.debug('[Node:ResolveReferences] Rejecting simple_fallback on communication-action message, using original');
+        resolvedMessage = message;
+      }
       // Also reject if any replacement modifies an adjective/determiner before a path/location noun
       // e.g. "that folder" → "Assistant folder" corrupts the folder name the user intended
       const PATH_NOUN = /\b(folder|directory|file|path|dir|desktop|document|screenshot|image|photo)\b/i;

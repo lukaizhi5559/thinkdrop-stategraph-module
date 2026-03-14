@@ -220,9 +220,10 @@ class StateGraphBuilder {
             const _dotName = state.matchedSkillName;
             const _skillDir = _path.join(_os.homedir(), '.thinkdrop', 'skills', _dotName);
             const _skillExec = _path.join(_skillDir, 'index.cjs');
+            const _skillMd   = _path.join(_skillDir, 'skill.md');
             const _apiJson   = _path.join(_skillDir, 'api.json');
             const _cliJson   = _path.join(_skillDir, 'cli.json');
-            if (_fs.existsSync(_skillExec) || _fs.existsSync(_apiJson) || _fs.existsSync(_cliJson)) {
+            if (_fs.existsSync(_skillExec) || _fs.existsSync(_skillMd) || _fs.existsSync(_apiJson) || _fs.existsSync(_cliJson)) {
               logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is installed — skipping to planSkills`);
               return 'planSkills';
             }
