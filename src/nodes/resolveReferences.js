@@ -68,13 +68,13 @@ const STANDALONE_INTENT_WORDS = /\b(search|look up|google|wikipedia|define|expla
 
 // Memory-recall question patterns — these should NEVER carry command_automate forward.
 // e.g. "how have I", "list the email", "did I email", "what emails did I", "who did I"
-const MEMORY_RECALL_QUESTION = /^(how (have|many|much|often)\b|did i\b|what (emails?|messages?|texts?|did i|have i)\b|who did i\b|list (the |all |my )?(emails?|messages?|texts?|addresses?|contacts?|history|activity|sms|chats?)\b|show (me )?(the |my )?(emails?|messages?|texts?|history|activity|list of emails?|list of messages?)\b|what.*(i (sent|emailed|texted|wrote|did))\b)/i;
+const MEMORY_RECALL_QUESTION = /^(how (have|many|much|often)\b|did i\b|what (emails?|messages?|texts?|did i|have i)\b|who did i\b|list (the |those |all |my )?(emails?|messages?|texts?|addresses?|contacts?|history|activity|sms|chats?|entries|items|times|dates|records)\b|show (me )?(the |my )?(emails?|messages?|texts?|history|activity|list of emails?|list of messages?|entries|items|times|dates)\b|what.*(i (sent|emailed|texted|wrote|did))\b)/i;
 
 // Time words that indicate a temporal reference
 const TEMPORAL_WORDS = /\b(today|yesterday|now|this morning|this afternoon|this evening|this week|last week|last night|last month|earlier|recently|at noon|at midnight|around \d|at \d)\b/i;
 
 // Deictic pronouns referring to prior retrieved content
-const DEICTIC_MEMORY_REFS = /\b(these|those|them|the ones|the files|the apps|the sites|the messages|the results)\b/i;
+const DEICTIC_MEMORY_REFS = /\b(these|those|them|the ones|the files|the apps|the sites|the messages|the results|the entries|the items|the records|the data|the list)\b/i;
 
 // Activity verbs that pair with deictic refs to signal memory follow-up
 const ACTIVITY_VERBS = /\b(doing|working|using|looking|opening|open|running|editing|writing|reading|viewing|accessing|with|for|about|saved|created|deleted|moved|closed|have|had|were|was)\b/i;
@@ -212,7 +212,13 @@ function detectIntentCarryover(message, conversationHistory) {
     return { carriedIntent: 'command_automate', resolvedMessage: message };
   }
 
-  if (!isContinuation && !isTemporalElliptical && !isDeiticMemoryFollowup) return null;
+  // Signal 5: REFINEMENT — correction or addendum to a prior answer.
+  // "dates as well not just times", "also include X", "not just X", "include dates too"
+  // These are always follow-ups to the prior intent — the user is refining the output format.
+  const REFINEMENT_MARKERS = /\b(as well|not just|also include|include .* too|instead of|rather than|add .* too|plus |and also|but also|in addition)\b/i;
+  const isRefinement = REFINEMENT_MARKERS.test(msg) && wordCount <= 12 && !hasStandaloneIntent;
+
+  if (!isContinuation && !isTemporalElliptical && !isDeiticMemoryFollowup && !isRefinement) return null;
 
   // ── Determine prior intent from conversation history ──────────────────────
   // Read the last 5 user messages, most recent first, and infer intent from content

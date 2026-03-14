@@ -468,131 +468,76 @@ module.exports = async function executeCommand(state) {
     };
   }
 
-  // ── schedule pseudo-skill ────────────────────────────────────────────────
-  // Defers the remaining plan steps until a specific clock time or after a
-  // delay. Shows a live countdown in the UI via 'schedule_tick' progress events.
-  // Args: { time?: string (e.g. "8:00 PM"), delayMs?: number, label?: string }
+  // ── schedule pseudo-skill (NON-BLOCKING) ─────────────────────────────────
+  // Registers a one-shot reminder with command-service /reminder.register,
+  // then returns immediately. No blocking setTimeout countdown.
   if (skill === 'schedule') {
     const { time, delayMs: rawDelayMs, label = 'Waiting...' } = args;
-
-    // Resolve target time → ms from now
     let waitMs = 0;
     if (rawDelayMs && typeof rawDelayMs === 'number' && rawDelayMs > 0) {
       waitMs = rawDelayMs;
     } else if (time && typeof time === 'string') {
-      // Parse "8:00 PM", "20:00", "9:30 AM", "21:00" etc.
       const now = new Date();
-      const timeStr = time.trim().toUpperCase();
-      const match12 = timeStr.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/);
-      const match24 = timeStr.match(/^(\d{1,2}):(\d{2})$/);
-      let targetDate = null;
-      if (match12) {
-        let hours = parseInt(match12[1], 10);
-        const mins = parseInt(match12[2] || '0', 10);
-        const meridiem = match12[3];
-        if (meridiem === 'PM' && hours < 12) hours += 12;
-        if (meridiem === 'AM' && hours === 12) hours = 0;
-        targetDate = new Date(now);
-        targetDate.setHours(hours, mins, 0, 0);
-      } else if (match24) {
-        const hours = parseInt(match24[1], 10);
-        const mins = parseInt(match24[2], 10);
-        targetDate = new Date(now);
-        targetDate.setHours(hours, mins, 0, 0);
+      const ts = time.trim().toUpperCase();
+      const m12 = ts.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/);
+      const m24 = ts.match(/^(\d{1,2}):(\d{2})$/);
+      let td = null;
+      if (m12) {
+        let h = parseInt(m12[1], 10); const mn = parseInt(m12[2] || '0', 10);
+        if (m12[3] === 'PM' && h < 12) h += 12;
+        if (m12[3] === 'AM' && h === 12) h = 0;
+        td = new Date(now); td.setHours(h, mn, 0, 0);
+      } else if (m24) {
+        td = new Date(now); td.setHours(parseInt(m24[1], 10), parseInt(m24[2], 10), 0, 0);
       }
-      if (targetDate) {
-        // If target time already passed today, schedule for tomorrow
-        if (targetDate <= now) targetDate.setDate(targetDate.getDate() + 1);
-        waitMs = targetDate.getTime() - now.getTime();
-      }
+      if (td) { if (td <= now) td.setDate(td.getDate() + 1); waitMs = td.getTime() - now.getTime(); }
     }
-
     if (waitMs <= 0) {
-      // Already past target time or no valid time given — skip immediately
-      logger.info(`[Node:ExecuteCommand] schedule: no valid future time — skipping`);
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: description || 'Schedule: skipped (time already passed)', stdout: 'Skipped' });
-      return {
-        ...state,
-        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: 'Skipped — time already passed' }],
-        skillCursor: skillCursor + 1,
-        commandExecuted: false
-      };
+      logger.info('[Node:ExecuteCommand] schedule: no valid future time — skipping');
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: 'Schedule: skipped', stdout: 'Skipped' });
+      return { ...state, skillResults: [...skillResults, { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: 'Skipped — time already passed' }], skillCursor: skillCursor + 1, commandExecuted: false };
     }
-
     const targetIso = new Date(Date.now() + waitMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    logger.info(`[Node:ExecuteCommand] schedule: waiting ${Math.round(waitMs / 1000)}s until ${targetIso} — "${label}"`);
-
-    // Register a persistent launchd task so macOS launches ThinkDrop at the
-    // target time even if the user closes the app before the countdown ends.
-    const scheduleId = `sched_${Date.now()}`;
-    const remainingSteps = skillPlan.slice(skillCursor + 1); // steps after this schedule step
-    try {
-      getScheduler().registerSchedule({
-        id: scheduleId,
-        targetMs: Date.now() + waitMs,
-        label,
-        prompt: state.message || '',
-        skillPlan: remainingSteps,
-      });
-    } catch (schedErr) {
-      logger.warn(`[Node:ExecuteCommand] schedule: launchd registration failed (non-fatal): ${schedErr.message}`);
+    const reminderId = `reminder_${Date.now()}`;
+    // Determine trigger intent: only command_automate if remaining steps include
+    // real action skills (shell.run, browser.act, web.crawl, etc.) — NOT just synthesize.
+    // A synthesize step after schedule is just the notification message, not a real command.
+    const remainingSteps = skillPlan.slice(skillCursor + 1);
+    const ACTION_SKILLS = ['shell.run', 'browser.act', 'web.crawl', 'skill.install', 'external.skill'];
+    const hasActionSteps = remainingSteps.some(s => ACTION_SKILLS.includes(s.skill));
+    const triggerIntent = hasActionSteps ? 'command_automate' : 'notify';
+    // For notify: use the synthesize prompt, or generate a friendly message from the label.
+    // For command_automate: use the original user message to re-run the full pipeline.
+    const synthStep = remainingSteps.find(s => s.skill === 'synthesize');
+    let notifyMessage = synthStep?.args?.prompt || '';
+    if (!notifyMessage) {
+      // Generate a friendly notification from the label: "Remind to check the oven" → "It's time to check the oven!"
+      const cleanLabel = (label || '').replace(/^remind(er)?(\s+to)?\s*/i, '').replace(/^check\s+/i, 'check ');
+      notifyMessage = cleanLabel ? `⏰ Reminder: It's time to ${cleanLabel}!` : `⏰ ${label}`;
     }
-
-    if (progressCallback) progressCallback({
-      type: 'schedule_start',
-      stepIndex: skillCursor,
-      totalSteps: skillPlan.length,
-      skill: 'schedule',
-      description: description || label,
-      waitMs,
-      targetTime: targetIso,
-      label
-    });
-
-    // Live countdown — tick every second
-    await new Promise((resolve) => {
-      let remaining = waitMs;
-      const TICK = 1000;
-      const interval = setInterval(() => {
-        remaining -= TICK;
-        if (remaining <= 0) {
-          clearInterval(interval);
-          resolve(undefined);
-          return;
-        }
-        const secsLeft = Math.ceil(remaining / 1000);
-        const minsLeft = Math.floor(secsLeft / 60);
-        const secs = secsLeft % 60;
-        const countdownLabel = minsLeft > 0
-          ? `${minsLeft}m ${secs}s until ${targetIso}`
-          : `${secs}s until ${targetIso}`;
-        if (progressCallback) progressCallback({
-          type: 'schedule_tick',
-          stepIndex: skillCursor,
-          totalSteps: skillPlan.length,
-          skill: 'schedule',
-          description: `${label} — ${countdownLabel}`,
-          remainingMs: remaining,
-          targetTime: targetIso,
-          label
-        });
-      }, TICK);
-      // Also schedule the final resolve at exactly waitMs
-      setTimeout(() => { clearInterval(interval); resolve(undefined); }, waitMs);
-    });
-
-    logger.info(`[Node:ExecuteCommand] schedule: wait complete — continuing plan`);
-    // App stayed open — clear the launchd plist so macOS doesn't relaunch later
-    try { getScheduler().clearPendingSchedule(scheduleId); } catch (_) {}
-    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: description || `Scheduled wait complete — running now`, stdout: `Waited until ${targetIso}` });
-
+    const triggerPrompt = triggerIntent === 'command_automate' ? (state.message || label) : notifyMessage;
+    // POST to command-service /reminder.register (non-blocking)
+    const cmdPort = 3007;
+    try {
+      const http = require('http');
+      const payload = JSON.stringify({ id: reminderId, delayMs: waitMs, label, triggerIntent, triggerPrompt });
+      const req = http.request({ hostname: '127.0.0.1', port: cmdPort, path: '/reminder.register', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }, timeout: 5000 });
+      req.on('error', (e) => logger.warn(`[Node:ExecuteCommand] schedule: reminder register failed: ${e.message}`));
+      req.write(payload);
+      req.end();
+    } catch (e) { logger.warn(`[Node:ExecuteCommand] schedule: reminder register error: ${e.message}`); }
+    logger.info(`[Node:ExecuteCommand] schedule: registered reminder "${label}" → fires at ${targetIso} (intent=${triggerIntent})`);
+    if (progressCallback) progressCallback({ type: 'schedule_registered', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: `⏰ Reminder set — ${label} at ${targetIso}`, targetTime: targetIso, label, reminderId });
+    // Return immediately — skip all remaining steps (they'll run when the reminder fires)
     return {
       ...state,
-      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: `Waited until ${targetIso}` }],
-      skillCursor: skillCursor + 1,
-      commandExecuted: false
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: `Reminder set for ${targetIso} — "${label}"` }],
+      skillCursor: skillPlan.length, // skip to end — remaining steps fire on reminder
+      commandExecuted: true,
+      answer: `⏰ Reminder set: "${label}" at ${targetIso}`,
     };
   }
+
 
   // ── api_suggest pseudo-skill ─────────────────────────────────────────────
   // Pauses the plan and surfaces an API-first offer to the user.

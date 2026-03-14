@@ -51,6 +51,18 @@ module.exports = async function parseIntent(state) {
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'messaging-verb-override', processingTimeMs: 0 } };
   }
 
+  // General knowledge override:
+  // "how do I pronounce X", "what's the spanish word for X", "translate X to Y",
+  // "what does X mean", "define X", "how do you say X in Y"
+  // These are factual knowledge questions, never memory_store.
+  // Also catches typos like "I do I pronounce" (missing 'how').
+  if (/\b(pronounce|pronunciation|translate|translation|say .* in|word for|definition of|define|meaning of|spell|conjugat|declens)\b/i.test(classifyMessage) ||
+      /\b(how (do|would|can|should) (i|you|we))\b.{0,40}\b(pronounce|say|translate|spell)\b/i.test(classifyMessage) ||
+      /\b(i do i|how do i)\b.{0,40}\b(pronounce|say|translate|spell)\b/i.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Knowledge/language override → general_knowledge: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'general_knowledge', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'knowledge-language-override', processingTimeMs: 0 } };
+  }
+
   // Reminder / timer / alarm / schedule override:
   // "remind me in 5 minutes to check the oven", "set a timer for 10 minutes",
   // "wake me up at 7am", "alert me in 30 seconds", "in 5 min remind me to X"
