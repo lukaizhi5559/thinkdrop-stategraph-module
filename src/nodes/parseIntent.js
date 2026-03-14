@@ -51,6 +51,17 @@ module.exports = async function parseIntent(state) {
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'messaging-verb-override', processingTimeMs: 0 } };
   }
 
+  // Reminder / timer / alarm / schedule override:
+  // "remind me in 5 minutes to check the oven", "set a timer for 10 minutes",
+  // "wake me up at 7am", "alert me in 30 seconds", "in 5 min remind me to X"
+  // These are always command_automate (schedule pseudo-skill), never memory_store.
+  if (/\b(remind|reminder|timer|alarm|alert|wake|notify)\b.*\b(in\s+\d+\s+(min|minute|sec|second|hour|hr)|at\s+\d{1,2}[:.]\d{2}|at\s+\d{1,2}\s*(am|pm))\b/i.test(classifyMessage) ||
+      /\b(in\s+\d+\s+(min|minute|sec|second|hour|hr))\b.*\b(remind|alert|notify|tell|wake)\b/i.test(classifyMessage) ||
+      /\b(set\s+a?\s*(timer|alarm|reminder))\b/i.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Reminder/schedule override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'reminder-schedule-override', processingTimeMs: 0 } };
+  }
+
   // Filesystem / folder action override:
   // "I need you to scan the folder X", "scan the folder X", "read the files in X",
   // "analyze the screenshots in X", "list files in X", "show me the files on my desktop"

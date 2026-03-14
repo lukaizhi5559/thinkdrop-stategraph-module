@@ -109,7 +109,7 @@ module.exports = async function parseSkill(state) {
   const hasPhoneNumber = /\b\d{10,11}\b|\+1\d{10}/.test(classifyMessage);
   const isShortPrompt  = classifyMessage.trim().length <= 120;
   const CAPABILITY_PATTERNS = [
-    { keywords: /\b(send|text|sms|message)\b.*\b(text|sms|message)\b|\bsend\b.*\b\d{10}\b|\btext (me|him|her|them|us)\b/i, capability: 'sms',   requiresPhoneOrShort: true },
+    { keywords: /\b(send|text|sms|message)\b.*\b(text|sms|message)\b|\bsend\b.*\b\d{10}\b|\btext (me|him|her|them|us)\b|\btext (this|that|it) to (me|him|her|them|us|\d{7,})\b/i, capability: 'sms',   requiresPhoneOrShort: true },
     { keywords: /\b(send|compose|write)\b.*\b(email|mail)\b/i,                                                                capability: 'email', requiresPhoneOrShort: false },
   ];
   for (const pattern of CAPABILITY_PATTERNS) {

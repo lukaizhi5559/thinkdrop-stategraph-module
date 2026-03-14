@@ -331,9 +331,13 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
   // Inject resolved personal profile facts (phone numbers, names, addresses) from enrichIntent
   let profileContextNote = '';
   if (profileContext?.facts?.length > 0) {
-    const factLines = profileContext.facts.map(f => `- ${f.field}: ${f.value}`).join('\n');
-    profileContextNote = `\n\nUSER PROFILE FACTS (use these exact values — do NOT substitute placeholders):\n${factLines}`;
-    logger.debug(`[Node:PlanSkills] Injecting ${profileContext.facts.length} profile fact(s) into planning query`);
+    const factLines = profileContext.facts.map(f => {
+      if (f.field === 'my_phone') return `- User's phone number: ${f.value} — use this as the "to" number for ANY SMS/text step. NEVER use a placeholder like +1234567890.`;
+      if (f.field === 'my_email') return `- User's email: ${f.value} — use this as the recipient for any email step.`;
+      return `- ${f.field}: ${f.value}`;
+    }).join('\n');
+    profileContextNote = `\n\n⚠️ USER PROFILE — MANDATORY (never substitute placeholders):\n${factLines}`;
+    logger.info(`[Node:PlanSkills] Injecting ${profileContext.facts.length} profile fact(s) into planning query`);
   }
 
   // ── Two-phase guide planning: scan first, plan with real elements ───────────
@@ -580,7 +584,7 @@ Task: "${userMessage}"`;
       const scData = scRes?.data || scRes;
       const contractMd = scData?.contractMd || scData?.contract_md || '';
       if (contractMd && contractMd.trim()) {
-        skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — IMPORTANT: this is a shell-plan skill. You MUST generate individual shell.run steps from the Plan section below. Do NOT use external.skill for this — it cannot be executed directly.\n\n${contractMd.slice(0, 3000)}`;
+        skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands or ## Plan section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step. It is NOT a dispatchable skill.\n3. FORBIDDEN: Do NOT use external.skill for this.\n4. The ONLY way to execute this skill is via shell.run with the curl command shown in the contract.\n\n${contractMd.slice(0, 3000)}`;
         logger.info(`[Node:PlanSkills] Injected contract_md for matched skill "${state.matchedSkillName}" (${contractMd.length} chars)`);
       }
     } catch (scErr) {

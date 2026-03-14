@@ -1653,6 +1653,54 @@ module.exports = async function executeCommand(state) {
     resolvedArgs = { ...resolvedArgs, argv: _fixedArgv };
   }
 
+  // Fix multi-line file content in curl JSON bodies.
+  // LLMs generate: MSG=$(cat file.txt); curl ... -d '{"body":"'$MSG'"}'
+  // Multi-line content with newlines, quotes, markdown breaks the JSON (exit code 3).
+  // Fix: rewrite to use jq for proper JSON construction when MSG is loaded from cat/file.
+  if (skill === 'shell.run' && resolvedArgs.cmd === 'bash' && Array.isArray(resolvedArgs.argv)) {
+    const _fixedArgv = resolvedArgs.argv.map(a => {
+      if (typeof a !== 'string') return a;
+      // Detect pattern: VAR=$(cat 'path') or VAR=$(cat "path") or VAR=$(cat path)
+      const catMatch = a.match(/\b(MSG|MESSAGE|BODY|TEXT|CONTENT)=\$\(cat\s+['"]?([^'")\s]+)['"]?\)/i);
+      if (!catMatch) return a;
+      // Check if curl uses this variable in a JSON body
+      const varName = catMatch[1];
+      const filePath = catMatch[2];
+      const hasCurl = a.includes('curl ') && (a.includes(`$${varName}`) || a.includes(`\${${varName}}`));
+      if (!hasCurl) return a;
+
+      // Extract the curl command portion to find the JSON template and phone/to field
+      const toMatch = a.match(/["\\']+to["\\']+\s*:\s*["\\']+([^"'\\\s}]+)["\\']+/);
+      let toNumber = toMatch ? toMatch[1] : '';
+      // Apply E.164 normalization inline — detect country from locale and prepend dial code
+      if (toNumber && !toNumber.startsWith('+')) {
+        try {
+          const _locale = Intl.DateTimeFormat().resolvedOptions().locale || '';
+          const _cc2 = (_locale.split('-').pop() || '').toUpperCase();
+          const _dialCodes = { US:'1',CA:'1',GB:'44',AU:'61',DE:'49',FR:'33',JP:'81',CN:'86',IN:'91',BR:'55',MX:'52' };
+          const _dc = _dialCodes[_cc2];
+          if (_dc) { toNumber = `+${_dc}${toNumber}`; }
+        } catch (_) {}
+      }
+
+      // Rewrite: read file → truncate to SMS limit → use jq to build valid JSON → curl
+      // ClickSend SMS body limit is 918 chars (6 SMS segments). Truncate to be safe.
+      const rewritten = [
+        `${varName}=$(cat '${filePath}' | head -c 900)`,
+        `USERNAME=$(security find-generic-password -s thinkdrop -a "skill:clicksend.send.sms:CLICKSEND_USERNAME" -w 2>/dev/null)`,
+        `API_KEY=$(security find-generic-password -s thinkdrop -a "skill:clicksend.send.sms:CLICKSEND_API_KEY" -w 2>/dev/null)`,
+        toNumber
+          ? `JSON=$(jq -n --arg body "$${varName}" --arg to "${toNumber}" '{"messages":[{"source":"sdk","body":$body,"to":$to}]}')`
+          : `JSON=$(jq -n --arg body "$${varName}" '{"messages":[{"source":"sdk","body":$body}]}')`,
+        `curl -s -X POST https://rest.clicksend.com/v3/sms/send -u "$USERNAME:$API_KEY" -H "Content-Type: application/json" -d "$JSON"`,
+      ].join('; ');
+
+      logger.info(`[Node:ExecuteCommand] shell.run: rewrote cat+curl to jq JSON construction for file: ${filePath}`);
+      return rewritten;
+    });
+    resolvedArgs = { ...resolvedArgs, argv: _fixedArgv };
+  }
+
   // Normalize bare phone numbers to E.164 (+<cc>XXXXXXXXXX) in shell.run scripts.
   // Users rarely add country codes. We detect the country from the macOS system locale
   // and prepend the correct dialing code. Only fires for "to" fields in SMS payloads

@@ -104,6 +104,14 @@ click/fill/hover automatically take a fresh snapshot and resolve the `selector` 
 - When no refs are provided (fresh navigate with no pre-scan): pass the **visible label or aria-name** as `selector` (e.g. `"Sign in"`, `"Email"`, `"Search"`)
 - For typing into a search box without a known label: use `fill` with `selector` set to the placeholder text or visible label
 
+**CRITICAL — AI chatbot URLs (use these exact URLs, NOT the wrong ones):**
+| Name | Correct URL | WRONG URL (do NOT use) |
+|------|-------------|----------------------|
+| Google Gemini | `https://gemini.google.com` | `gemini.com` (crypto exchange) |
+| ChatGPT | `https://chat.openai.com` | `openai.com` (corporate site) |
+| Perplexity | `https://www.perplexity.ai` | `perplexity.com` |
+| Claude | `https://claude.ai` | `anthropic.com` |
+
 **CRITICAL — AI chatbots use contenteditable divs, not `<input>` fields.**
 `fill` will fail with "Element is not an input/textarea" on most AI chat UIs.
 Use `fill` as normal; the skill handles the fallback. Do NOT add a separate `click` step before `fill`.
