@@ -72,9 +72,12 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 
 ## Critical skill selection rules
 
+- **Closing a file on macOS** — use `osascript -e 'tell application "AppName" to close (every document whose name is "filename")'`. NEVER use `lsof | kill`, `kill -9`, or `xargs kill` — those kill the whole app or random processes. To find which app has the file open: `mdls -name kMDItemLastUsedApp "/path/to/file"`. For .txt files the app is usually "TextEdit". For PDFs use "Preview". Always close the document, not the application (unless the user explicitly says "quit TextEdit").
 - **Opening apps** — always `shell.run open -a AppName`, never `ui.findAndClick`
 - **Reading/writing files** — always `shell.run bash -c`, never open a GUI app
 - **Editing an existing file** — read it first, then synthesize, then write
+- **Finding a file by name then reading/analyzing it** — always 3 steps: (1) `shell.run bash -c "mdfind -name 'SOME FILE'"` to locate it, (2) `shell.run bash -c "cat /found/path"` to read it, (3) `synthesize` to answer. Never stop at just `find` — always follow through with read + synthesize when the user wants to know what's in the file.
+- **`synthesize` with `saveToFile` — ONLY when user explicitly asks to save/write/create a file.** If the task is just reading, analyzing, or summarizing an existing file, the `synthesize` step MUST NOT include `saveToFile`. Never auto-generate a new file just to hold the analysis — stream it as the answer instead.
 - **`ui.moveMouse`** — last resort only, when `ui.axClick` and keyboard shortcuts both failed
 - **`image.analyze`** — for local image files only (tagged file path). Never use for live screenshots.
 - **`screen.capture`** — takes a live screenshot + OCR and returns visible text as `stdout`. Use this when the user asks to "save what's on screen", "extract what you see", or "read the current screen". Chain with `synthesize(saveToFile)` to write to a file.

@@ -1014,6 +1014,26 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
       });
       // Increment retry count for timeout retries; reset for other patches
       const nextRetryCount = decision._isTimeoutRetry ? stepRetryCount + 1 : 0;
+
+      // ── Self-heal write-back ──────────────────────────────────────────────
+      // Persist this patch as a skill_prompt rule so planSkills injects it
+      // next time a similar task is planned — closing the learn loop.
+      // Only write back meaningful notes (skip generic timeout retries).
+      if (state.mcpAdapter && decision.note && !decision._isTimeoutRetry) {
+        const failedSkill = failedStep.skill || 'shell.run';
+        const originalRequest = state.resolvedMessage || state.message || '';
+        const ruleText = `When planning ${failedSkill} steps for tasks like "${originalRequest.slice(0, 80)}": ${decision.note}. Patched args: ${JSON.stringify(decision.patchedArgs).slice(0, 200)}`;
+        state.mcpAdapter.callService('user-memory', 'skill_prompt.upsert', {
+          tags: [failedSkill, 'auto_patch', 'self_heal'],
+          content: ruleText
+        }, { timeoutMs: 3000 }).then(() => {
+          logger.info(`[Node:RecoverSkill] Self-heal: wrote AUTO_PATCH rule to skill_prompt DB`);
+        }).catch(err => {
+          logger.debug(`[Node:RecoverSkill] Self-heal write-back failed (non-fatal): ${err.message}`);
+        });
+      }
+      // ── End self-heal write-back ──────────────────────────────────────────
+
       return {
         ...state,
         recoveryAction: 'auto_patch',

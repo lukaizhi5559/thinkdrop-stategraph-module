@@ -286,6 +286,7 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
   // Build conversation history context so LLM can resolve cross-turn references
   // e.g. "that file", "add more to it" when the file path was mentioned in a prior turn
   let conversationNote = '';
+  let priorSynthesizedContent = '';
   if (conversationHistory && conversationHistory.length > 0) {
     const recentTurns = conversationHistory.slice(-6); // last 3 exchanges
     const turnLines = recentTurns
@@ -302,6 +303,45 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
     if (turnLines.length > 0) {
       conversationNote = `\n\nRECENT CONVERSATION (use this to resolve references like "that file", "it", "the result"):\n${turnLines.join('\n')}`;
     }
+
+    // Extract the last synthesized answer from conversation history so that
+    // follow-up messaging tasks ("text this to me", "email this info") use the
+    // actual prior content as the message body — not a placeholder.
+    const lastAssistantMsg = recentTurns.slice().reverse().find(m => m.role === 'assistant');
+    if (lastAssistantMsg?.content) {
+      const stepOutputsIdx = lastAssistantMsg.content.indexOf('Step outputs:');
+      if (stepOutputsIdx !== -1) {
+        priorSynthesizedContent = lastAssistantMsg.content.slice(stepOutputsIdx + 'Step outputs:'.length).trim().slice(0, 2000);
+      }
+    }
+  }
+
+  // ── Messaging body injection ─────────────────────────────────────────────────
+  // When the user says "text this info to me", "email this to my phone", etc.,
+  // the LLM has no idea what "this info" is unless we explicitly provide it.
+  // Inject the prior synthesized content as the EXACT message body to send.
+  let messagingBodyNote = '';
+  const isMessagingTask = /^(text|send|email|message|forward|share|ping|tell|notify)/i.test(userMessage.trim()) ||
+    /\b(text|sms|send.*message|email.*me|message.*me)\b/i.test(userMessage);
+  if (isMessagingTask && priorSynthesizedContent) {
+    messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${priorSynthesizedContent}\n---\nIMPORTANT: Use this full text as the MSG/body variable in your shell.run command. Do NOT use "Here is the information you requested." or any other placeholder.`;
+    logger.info('[Node:PlanSkills] Injected prior synthesized content as messaging body');
+  }
+
+  // ── Close/quit file context injection ────────────────────────────────────────
+  // When the user says "close it", "close this", "close the file", etc., use the
+  // lastOpenedFilePath tracked explicitly by executeCommand (set when `open` succeeds).
+  // This is authoritative — no pattern matching or extension guessing.
+  let closeFileContextNote = '';
+  const isCloseVerbTask = /^(close|quit|exit|hide|minimize|stop)\b/i.test(userMessage.trim());
+  const lastOpenedFilePath = state.lastOpenedFilePath || null;
+  if (isCloseVerbTask && lastOpenedFilePath) {
+    const _closePath = require('path');
+    const openedFileName = _closePath.basename(lastOpenedFilePath);
+    const openedExt = _closePath.extname(lastOpenedFilePath).toLowerCase();
+    const openedStem = _closePath.basename(openedFileName, openedExt);
+    closeFileContextNote = `\n\n⚠️ CLOSE TARGET — CRITICAL:\nThe user recently opened "${openedFileName}" (${lastOpenedFilePath}). "${userMessage}" means close that file.\nUse osascript to close it by document name in the app that owns it (use \`mdls -name kMDItemLastUsedApp "${lastOpenedFilePath}"\` to find the app if unknown, or infer from extension).\nDo NOT close Terminal, Warp, browser, or any other unrelated app. Target only the file "${openedStem}".`;
+    logger.info(`[Node:PlanSkills] Injected close-file context from state: "${lastOpenedFilePath}"`);
   }
 
   // If there's an active browser session from a prior task, tell the LLM to reuse it
@@ -792,7 +832,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
+User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   const payload = {
     query: planningQuery,
@@ -883,6 +923,8 @@ If writing a skill.md: start with --- frontmatter (name, description, secrets, s
 CRITICAL rules for skill.md:
 - secrets: list ALL auth credentials (username, API key, account SID, auth token). NOT runtime args (phone, message).
 - schedule: must be null (not false, not "false").
+- oauth: if the provider uses OAuth (google, github, microsoft, slack, spotify, dropbox, discord, zoom, atlassian, notion, linkedin, salesforce, hubspot), add "oauth: <provider>" frontmatter field. This lets ThinkDrop auto-supply tokens from the user's global Connections tab.
+- oauth_scopes: add "oauth_scopes: <provider>=<scope1> <scope2>" if specific scopes are needed (e.g. google=https://www.googleapis.com/auth/calendar for gcal skills).
 - Keytar retrieval: security find-generic-password -s thinkdrop -a "skill:<skillName>:<SECRET_KEY>" -w 2>/dev/null. NEVER use -s <service-name>. Always -s thinkdrop -a "skill:<name>:<key>".
 - Commands curl: use keytar retrieval for credentials, real endpoint/headers from docs.`;
 

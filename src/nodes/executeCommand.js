@@ -1328,23 +1328,9 @@ module.exports = async function executeCommand(state) {
       logger.debug(`[Node:ExecuteCommand] synthesize: expanded ~ in saveToFile: ${synthesisFilePath}`);
     }
 
-    // If saveToFile is still relative/missing but a prior shell.run step output a single absolute path,
-    // use that path's directory (handles single-pipeline find+read where stdout = file content, not path)
-    if (!synthesisFilePath || (!synthesisFilePath.startsWith('/') && !synthesisFilePath.startsWith(os.homedir()))) {
-      const pathMod = require('path');
-      // Look for a pure-find step whose stdout is a single absolute file path
-      const purePathStep = skillResults.find(r =>
-        r.skill === 'shell.run' && r.ok && r.stdout &&
-        /^\/[^\n]+\.[a-zA-Z0-9]+$/.test(r.stdout.trim())
-      );
-      if (purePathStep) {
-        const foundPath = purePathStep.stdout.trim();
-        const dir = pathMod.dirname(foundPath);
-        const base = pathMod.basename(foundPath, pathMod.extname(foundPath));
-        synthesisFilePath = pathMod.join(dir, base + '.txt');
-        logger.debug(`[Node:ExecuteCommand] synthesize: saveToFile from pure-find step stdout: ${synthesisFilePath}`);
-      }
-    }
+    // NOTE: Do NOT auto-assign synthesisFilePath from a prior find/mdfind step stdout.
+    // That would silently overwrite the found file with synthesis output (e.g. overwriting cheese.txt
+    // with an analysis summary). saveToFile must always be explicitly set in the synthesize step args.
 
     // Run LLM inline
     const llmBackend = state.llmBackend;
@@ -1596,6 +1582,22 @@ module.exports = async function executeCommand(state) {
       logger.info('[Node:ExecuteCommand] shell.run: fixed message var quoting (apostrophe fix)');
     }
     resolvedArgs = { ...resolvedArgs, argv: _fixedArgv };
+  }
+
+  // Fix osascript -e quoting: LLMs wrap the AppleScript body in extra single quotes.
+  // e.g. argv: ["-e", "'tell application \"TextEdit\" to close...'"] → strip outer quotes.
+  // osascript -e receives the quotes as literal characters → syntax error (exit code 1).
+  if (skill === 'shell.run' && resolvedArgs.cmd === 'osascript' && Array.isArray(resolvedArgs.argv)) {
+    const _fixedOsaArgv = resolvedArgs.argv.map((a, idx, arr) => {
+      if (typeof a !== 'string') return a;
+      if (arr[idx - 1] === '-e' && a.startsWith("'") && a.endsWith("'")) {
+        const stripped = a.slice(1, -1);
+        logger.info('[Node:ExecuteCommand] osascript: stripped extra single quotes from -e script');
+        return stripped;
+      }
+      return a;
+    });
+    resolvedArgs = { ...resolvedArgs, argv: _fixedOsaArgv };
   }
 
   // Fix multi-line file content in curl JSON bodies.
@@ -1914,8 +1916,13 @@ module.exports = async function executeCommand(state) {
         const httpCode = httpCodeMatch ? parseInt(httpCodeMatch[1], 10) : 0;
         const hasErrorField = /"error"\s*:/i.test(out) || /"response_code"\s*:\s*"(?!SUCCESS)/i.test(out);
         const hasAuthError = /UNAUTHORIZED|FORBIDDEN|invalid.{0,20}(key|token|credential|auth)/i.test(out);
+        // Google-style: {"error":{"code":403,...}} — JSON body with numeric HTTP status code >= 400
+        const jsonErrorCodeMatch = out.match(/"code"\s*:\s*(\d{3})/);
+        const jsonErrorCode = jsonErrorCodeMatch ? parseInt(jsonErrorCodeMatch[1], 10) : 0;
+        // Google-style status strings: PERMISSION_DENIED, NOT_FOUND, SERVICE_DISABLED, UNAUTHENTICATED, etc.
+        const hasApiStatusError = /"status"\s*:\s*"(PERMISSION_DENIED|NOT_FOUND|SERVICE_DISABLED|UNAUTHENTICATED|RESOURCE_EXHAUSTED|FAILED_PRECONDITION|INVALID_ARGUMENT|UNAVAILABLE)"/i.test(out);
 
-        if ((httpCode >= 400) || (hasErrorField && hasAuthError)) {
+        if ((httpCode >= 400) || (hasErrorField && hasAuthError) || (hasErrorField && jsonErrorCode >= 400) || hasApiStatusError) {
           const briefError = out.length > 200 ? out.slice(0, 200) + '...' : out;
           stepResult.ok = false;
           stepResult.error = `API error (HTTP ${httpCode || '4xx'}): ${briefError}`;
@@ -2245,6 +2252,57 @@ module.exports = async function executeCommand(state) {
           logger.warn(`[Node:ExecuteCommand] creator.agent/skillCreator build threw: ${buildErr.message}`);
         }
         // Build failed — fall through to recoverSkill
+      }
+
+      // ── Pre-recoverSkill: open <file> with wrong extension → glob for real file ──
+      // When `open <path>` or `open -a <App> <path>` fails with exit code 1, the most
+      // common cause is a wrong extension guess (e.g. prompts.txt vs prompts.rtf).
+      // Before escalating to recoverSkill (which asks the user), glob-search the
+      // directory for any file whose stem matches. If found, auto-patch and retry.
+      if (skill === 'shell.run' && (stepResult.exitCode === 1 || stepResult.exitCode === 3)) {
+        const _argv = resolvedArgs?.argv || [];
+        const _script = (resolvedArgs?.cmd === 'bash' && Array.isArray(_argv))
+          ? (_argv.find(a => typeof a === 'string' && a !== '-c') || '')
+          : _argv.join(' ');
+        // Extract file path from: open '/path/to/file' or open -a App '/path/to/file'
+        const _openPathMatch = _script.match(/\bopen\b(?:\s+-a\s+\S+)?\s+['"]?([^\s'"]+)['"']?\s*$/);
+        if (_openPathMatch) {
+          const _failedPath = _openPathMatch[1];
+          const _pathModule = require('path');
+          const _fsModule = require('fs');
+          const _dir = _pathModule.dirname(_failedPath);
+          const _stem = _pathModule.basename(_failedPath, _pathModule.extname(_failedPath));
+          try {
+            const _entries = _fsModule.readdirSync(_dir);
+            const _match = _entries.find(e => {
+              const eStem = _pathModule.basename(e, _pathModule.extname(e));
+              return eStem.toLowerCase() === _stem.toLowerCase() && e !== _pathModule.basename(_failedPath);
+            });
+            if (_match) {
+              const _fixedPath = _pathModule.join(_dir, _match);
+              logger.info(`[Node:ExecuteCommand] open file: auto-patching extension "${_failedPath}" → "${_fixedPath}"`);
+              // Rebuild the argv with corrected path
+              const _fixedArgv = _argv.map(a => {
+                if (typeof a !== 'string') return a;
+                return a.split(_failedPath).join(_fixedPath);
+              });
+              const _patchedPlan = skillPlan.map((s, i) =>
+                i === skillCursor ? { ...s, args: { ...s.args, argv: _fixedArgv } } : s
+              );
+              // Remove the failed result so it retries cleanly
+              return {
+                ...state,
+                skillPlan: _patchedPlan,
+                skillResults: updatedResults.slice(0, -1),
+                skillCursor,
+                failedStep: null,
+                commandExecuted: false,
+              };
+            }
+          } catch (_e) {
+            // readdirSync failed (dir doesn't exist, permissions) — fall through to recoverSkill
+          }
+        }
       }
 
       // Step failed and is not optional — hand off to recoverSkill
@@ -2624,10 +2682,61 @@ module.exports = async function executeCommand(state) {
       } else if (hasBrowserSteps && lastBrowserResult?.url) {
         const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
         lastStepAnswer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
-      } else if (failedCount === 0) {
-        lastStepAnswer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
       } else {
-        lastStepAnswer = `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`;
+        // ── shell.run readable output: use stdout directly as the answer ─────────
+        // When the last step is shell.run and stdout looks like human-readable content
+        // (file listing, command output, status check, etc.) rather than a raw JSON
+        // API response, stream it directly instead of the generic completion message.
+        // Exclusions:
+        //   - stdout is a JSON object/array (API response — fire-and-forget, not for display)
+        //   - stdout > 4000 chars (should have had a synthesize step; truncate + summarize)
+        //   - failedCount > 0 (partial failure message is more useful)
+        const lastShellResult = failedCount === 0
+          ? [...updatedResults].reverse().find(r => r.skill === 'shell.run' && r.ok && r.stdout?.trim())
+          : null;
+        if (lastShellResult) {
+          const out = lastShellResult.stdout.trim();
+          const looksLikeJson = /^\s*[\[{]/.test(out);
+          const looksLikeHttpCode = /"http_code"\s*:\s*\d+/.test(out);
+          const isReadable = !looksLikeJson && !looksLikeHttpCode && out.length > 0;
+          if (isReadable) {
+            // Short output (≤4000 chars): show directly
+            // Long output: LLM-synthesize a concise summary
+            if (out.length <= 4000) {
+              lastStepAnswer = out;
+            } else if (state.llmBackend) {
+              try {
+                const originalPrompt = state.message || '';
+                const summarized = await state.llmBackend.generateAnswer(
+                  out.slice(0, 8000),
+                  {
+                    query: originalPrompt,
+                    context: {
+                      systemInstructions: `You are a helpful assistant. The user asked: "${originalPrompt}"\n\nBelow is the terminal output. Summarize the key information concisely. Do not repeat everything verbatim.`,
+                      conversationHistory: [],
+                      intent: 'command_automate',
+                    },
+                    options: { maxTokens: 400, temperature: 0.2 },
+                  },
+                  { maxTokens: 400, temperature: 0.2 },
+                  null
+                ).catch(() => null);
+                lastStepAnswer = (summarized && summarized.trim()) ? summarized.trim() : out.slice(0, 4000);
+              } catch (_) {
+                lastStepAnswer = out.slice(0, 4000);
+              }
+            } else {
+              lastStepAnswer = out.slice(0, 4000);
+            }
+          }
+        }
+        if (!lastStepAnswer) {
+          if (failedCount === 0) {
+            lastStepAnswer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
+          } else {
+            lastStepAnswer = `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`;
+          }
+        }
       }
 
       logger.info(`[Node:ExecuteCommand] last-step all_done: savedFilePaths=${JSON.stringify(finalSavedPaths)}`);
@@ -2656,6 +2765,22 @@ module.exports = async function executeCommand(state) {
       }
     }
 
+    // ── Track last opened file path for close-verb context in planSkills ────────
+    // When `open <file>` succeeds, store the real path in state so "close it/this/the file"
+    // has an authoritative target — no pattern matching or extension guessing needed.
+    let lastOpenedFilePath = state.lastOpenedFilePath || null;
+    if (skill === 'shell.run' && stepResult.ok) {
+      const _trackArgv = resolvedArgs?.argv || [];
+      const _trackScript = (resolvedArgs?.cmd === 'bash' && Array.isArray(_trackArgv))
+        ? (_trackArgv.find(a => typeof a === 'string' && a !== '-c') || '')
+        : _trackArgv.join(' ');
+      const _openMatch = _trackScript.match(/\bopen\b(?:\s+-a\s+\S+)?\s+['"]?([^\s'"]+\.[a-zA-Z0-9]+)['"]?\s*$/);
+      if (_openMatch) {
+        lastOpenedFilePath = _openMatch[1];
+        logger.info(`[Node:ExecuteCommand] Tracked lastOpenedFilePath: "${lastOpenedFilePath}"`);
+      }
+    }
+
     // Step succeeded (or was optional) — advance cursor
     return {
       ...state,
@@ -2665,6 +2790,7 @@ module.exports = async function executeCommand(state) {
       failedStep: null,
       activeBrowserSessionId,
       activeBrowserUrl,
+      lastOpenedFilePath,
       commandExecuted: isLastStep,
       answer: lastStepAnswer  // set so voice service _stategraphLaneResponse gets it for TTS
     };
@@ -2676,6 +2802,52 @@ module.exports = async function executeCommand(state) {
       args.argv.some(a => typeof a === 'string' && SEARCH_CMDS_CATCH.some(sc => a.includes(sc)));
     const isSearchExit1 = (SEARCH_CMDS_CATCH.includes(args.cmd) || isBashSearchCatch) &&
       error.message && error.message.includes('code 1');
+
+    // ── Catch path: open <file> wrong extension → glob for real file ──────────
+    // command.automate throws 'Process exited with code 1' when `open <file>` can't
+    // find the file. The patch block in the normal path is bypassed when an exception
+    // is thrown. Intercept here: glob for the stem name in the same dir and retry.
+    if (skill === 'shell.run' && !isSearchExit1 && error.message && error.message.includes('code 1')) {
+      const _catchArgv = (args?.argv) || [];
+      const _catchScript = (args?.cmd === 'bash' && Array.isArray(_catchArgv))
+        ? (_catchArgv.find(a => typeof a === 'string' && a !== '-c') || '')
+        : _catchArgv.join(' ');
+      const _catchOpenMatch = _catchScript.match(/\bopen\b(?:\s+-a\s+\S+)?\s+['"]?([^\s'"]+)['"']?\s*$/);
+      if (_catchOpenMatch) {
+        const _catchFailedPath = _catchOpenMatch[1];
+        const _catchPathMod = require('path');
+        const _catchFsMod = require('fs');
+        const _catchDir = _catchPathMod.dirname(_catchFailedPath);
+        const _catchStem = _catchPathMod.basename(_catchFailedPath, _catchPathMod.extname(_catchFailedPath));
+        try {
+          const _catchEntries = _catchFsMod.readdirSync(_catchDir);
+          const _catchMatch = _catchEntries.find(e => {
+            const eStem = _catchPathMod.basename(e, _catchPathMod.extname(e));
+            return eStem.toLowerCase() === _catchStem.toLowerCase() && e !== _catchPathMod.basename(_catchFailedPath);
+          });
+          if (_catchMatch) {
+            const _catchFixedPath = _catchPathMod.join(_catchDir, _catchMatch);
+            logger.info(`[Node:ExecuteCommand] catch: open file auto-patching "${_catchFailedPath}" → "${_catchFixedPath}"`);
+            const _catchFixedArgv = _catchArgv.map(a =>
+              typeof a === 'string' ? a.split(_catchFailedPath).join(_catchFixedPath) : a
+            );
+            const _catchPatchedPlan = skillPlan.map((s, i) =>
+              i === skillCursor ? { ...s, args: { ...s.args, argv: _catchFixedArgv } } : s
+            );
+            return {
+              ...state,
+              skillPlan: _catchPatchedPlan,
+              skillResults,  // don't append failed result
+              skillCursor,
+              failedStep: null,
+              commandExecuted: false,
+            };
+          }
+        } catch (_ce) {
+          // readdirSync failed — fall through to normal error handling
+        }
+      }
+    }
 
     const stepResult = {
       step: skillCursor + 1,

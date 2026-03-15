@@ -78,7 +78,7 @@ module.exports = async function parseIntent(state) {
   // "I need you to scan the folder X", "scan the folder X", "read the files in X",
   // "analyze the screenshots in X", "list files in X", "show me the files on my desktop"
   // These are always command_automate (fs.read / image.analyze), never memory_retrieve.
-  if (/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|open|explore)\b.{0,60}\b(folder|directory|dir|path|file|files|screenshot|screenshots|image|images|photo|photos|desktop|downloads|documents|home directory|~\/)\b/i.test(classifyMessage) ||
+  if (/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|open|explore|find|locate|search for|get)\b.{0,60}\b(folder|directory|dir|path|file|files|screenshot|screenshots|image|images|photo|photos|desktop|downloads|documents|home directory|~\/)\b/i.test(classifyMessage) ||
       /\bI need you to\b.{0,80}\b(folder|directory|file|files|screenshot|desktop)\b/i.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Filesystem action override → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'filesystem-action-override', processingTimeMs: 0 } };
@@ -805,7 +805,7 @@ function fallbackIntentClassification(state) {
   
   // Web search patterns - more specific to avoid false positives
   if (msg.match(/(weather|news|current|latest|search for|look up|google)/i) ||
-      (msg.match(/find/i) && !msg.match(/(button|click|press|select|field|menu)/i))) {
+      (msg.match(/find/i) && !msg.match(/(button|click|press|select|field|menu)/i) && !msg.match(/\b(file|folder|directory|document|the file|the folder)\b/i))) {
     return {
       ...state,
       intent: { type: 'web_search', confidence: 0.8, entities: [] },
@@ -813,11 +813,12 @@ function fallbackIntentClassification(state) {
     };
   }
   
-  // Command execution patterns (simple, single-step)
+  // Command execution patterns — always use command_automate so planSkills generates the right steps.
+  // command_execute routes directly to executeCommand with no plan (0ms, does nothing).
   if (msg.match(/^(open|close|launch|quit|start|stop|run|execute)\s+[a-z]/i)) {
     return {
       ...state,
-      intent: { type: 'command_execute', confidence: 0.85, entities: [] },
+      intent: { type: 'command_automate', confidence: 0.85, entities: [] },
       metadata: { parser: 'fallback', processingTimeMs: 0 }
     };
   }

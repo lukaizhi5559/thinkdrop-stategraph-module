@@ -32,6 +32,7 @@
 const path = require('path');
 const os   = require('os');
 const fs   = require('fs');
+const { isOAuthProvider, getOAuthScopes } = require('./oauthProviders');
 
 // ── Module-level mutex ────────────────────────────────────────────────────────
 // Only one creator pipeline runs at a time. Concurrent command_automate prompts
@@ -152,6 +153,7 @@ module.exports = async function creatorPlanning(state) {
       const scheduleVal = (rawSchedule && rawSchedule !== 'on_demand' && /^[0-9]|daily|weekly|hourly|cron/i.test(rawSchedule))
         ? rawSchedule
         : 'on_demand';
+
       const skillMd = [
         '---',
         `name: ${skillName}`,
@@ -159,6 +161,8 @@ module.exports = async function creatorPlanning(state) {
         `${isCliMatch ? `cli_tool: ${config.tool}` : (config.npm ? `npm: ${config.npm}` : `transport: native_https`)}`,
         `capability: ${capability}`,
         `provider: ${provider}`,
+        isOAuthProvider(provider) ? `oauth: ${provider}` : null,
+        isOAuthProvider(provider) ? `oauth_scopes: ${provider}=${getOAuthScopes(provider) || config.scopes || ''}` : null,
         `schedule: ${scheduleVal}`,
         `secrets:`,
         secretsList || '  []',
@@ -192,7 +196,7 @@ module.exports = async function creatorPlanning(state) {
         ...(config.links?.length
           ? (config.links || []).map(l => `- [${l.label}](${l.url})`)
           : ['_(No links available)_']),
-      ].filter(l => l !== undefined).join('\n');
+      ].filter(l => l !== undefined && l !== null).join('\n');
 
       fs.writeFileSync(path.join(skillDir, 'skill.md'), skillMd, 'utf8');
 

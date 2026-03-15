@@ -100,15 +100,25 @@ module.exports = async function logConversation(state) {
     const skillResults = state.skillResults || [];
     let richAssistantText = answer;
     if (intent?.type === 'command_automate' && skillResults.length > 0) {
+      // For the final synthesize step: use the generated answer text (not raw stdout)
+      // so that follow-up prompts like "text this to me" get the full formatted content.
+      const synthAnswer = state.answer && typeof state.answer === 'string' && state.answer.trim().length > 50
+        ? state.answer.trim()
+        : null;
       const keyOutputs = skillResults
         .filter(r => r.ok && r.stdout && r.stdout.trim().length > 0)
-        .map(r => {
+        .map((r, idx, arr) => {
           const label = r.description || r.skill;
+          // Last synthesize step: store the LLM-generated answer (formatted, readable)
+          // instead of raw stdout — follow-ups can use this as message body directly.
+          if (r.skill === 'synthesize' && idx === arr.length - 1 && synthAnswer) {
+            return `[${label}]:\n${synthAnswer.slice(0, 2000)}`;
+          }
           // For fs.read: include full tree output (filenames are critical for follow-ups)
-          // For others: truncate to 300 chars
+          // For others: truncate to 500 chars
           const out = r.skill === 'fs.read'
             ? r.stdout.trim()
-            : r.stdout.trim().slice(0, 300);
+            : r.stdout.trim().slice(0, 500);
           return `[${label}]:\n${out}`;
         });
       if (keyOutputs.length > 0) {

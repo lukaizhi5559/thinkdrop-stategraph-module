@@ -285,10 +285,8 @@ function parseJson(raw) {
 }
 
 // Providers that authenticate via OAuth rather than raw API keys.
-// When these are the chosen provider, emit gather_oauth instead of gather_credential.
-const OAUTH_PROVIDERS = new Set(['github', 'google', 'microsoft', 'facebook', 'twitter',
-  'linkedin', 'slack', 'notion', 'spotify', 'dropbox', 'discord', 'zoom', 'atlassian',
-  'salesforce', 'hubspot', 'outlook']);
+// Loaded from shared constants — single source of truth for all nodes.
+const { OAUTH_PROVIDERS } = require('./oauthProviders');
 
 
 module.exports = async function gatherContext(state) {
@@ -734,11 +732,21 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
       // The OAuth token lands in keytar under oauth:<provider>:<skillName> automatically.
       if (OAUTH_PROVIDERS.has(chosenProvider)) {
         const oauthTokenKey = `oauth:${chosenProvider}:${state.creatorSkillName || chosenProvider}`;
+        const globalTokenKey = `oauth:${chosenProvider}`;
         let alreadyConnected = false;
+        let usedGlobalKey = globalTokenKey;
         if (keytarCheckCallback) {
           try {
-            const check = await keytarCheckCallback(oauthTokenKey);
-            alreadyConnected = check?.found === true;
+            // Check global Connections-tab token first (oauth:<provider>)
+            const globalCheck = await keytarCheckCallback(globalTokenKey);
+            if (globalCheck?.found === true) {
+              alreadyConnected = true;
+            } else {
+              // Fall back to per-skill token
+              const check = await keytarCheckCallback(oauthTokenKey);
+              alreadyConnected = check?.found === true;
+              usedGlobalKey = oauthTokenKey;
+            }
           } catch (_) {}
         }
         if (alreadyConnected) {

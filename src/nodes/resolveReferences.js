@@ -261,10 +261,48 @@ function detectIntentCarryover(message, conversationHistory) {
 
 /**
  * Layer 2: Does this message contain pronouns that need Python coreference?
- * Only call the service when there's an actual pronoun to resolve.
+ *
+ * Only call the service when:
+ *  1. The message contains a pronoun, AND
+ *  2. The pronoun's referent is NOT already named in the same message.
+ *
+ * If the message names a concrete noun (file, app, person name, path) alongside
+ * the pronoun, the pronoun refers to that noun — no external resolution needed.
+ * Calling the coreference service in these cases causes it to latch onto the
+ * previous conversation role ("Assistant") instead of the in-message noun.
+ *
+ * Examples that should SKIP coreference:
+ *   "find the file cheese and tell me what it's about"  — "it" = cheese (named)
+ *   "open notes.txt and read it"                        — "it" = notes.txt (named)
+ *   "find cheese and analyze it"                        — "it" = cheese (named)
+ *
+ * Examples that should RUN coreference:
+ *   "can you explain it more"                           — no referent in message
+ *   "what did he say"                                   — no referent in message
+ *   "tell me more about that"                           — no referent in message
  */
 function needsPronounResolution(message) {
-  return /\b(he|she|it|they|him|her|his|their|them|its|this|that|these|those)\b/i.test(message);
+  if (!/\b(he|she|it|they|him|her|his|their|them|its|this|that|these|those)\b/i.test(message)) {
+    return false;
+  }
+
+  // If the message already names a concrete noun that the pronoun can refer to,
+  // skip the coreference service — the LLM planner will handle it in context.
+  const hasConcreteReferent =
+    // Named file or path (word.ext or bare noun near "file"/"folder"/"document")
+    /\b\w+\.\w{1,6}\b/.test(message) ||
+    /\b(file|folder|directory|document|doc|app|application|program|window|tab|page|script|command)\s+\w/i.test(message) ||
+    // Verb followed by a concrete noun (≥4 chars) that is NOT a generic filler/adverb.
+    // Generic words like 'again', 'more', 'that', 'this', 'now', 'back', 'here', 'away'
+    // are NOT referents — they're modifiers. Require at least one non-generic noun.
+    (/\b(find|open|read|close|analyze|summarize|scan|check|run|execute|launch|locate|search for)\b.{0,60}\b[a-z]{4,}\b/i.test(message) &&
+     !/^(close|open|read|find|run|launch|execute|check|scan)\s+(it|this|that|them|again|more|now|back|here|up|down|away|there)\s*$/i.test(message.trim()));
+
+  if (hasConcreteReferent) {
+    return false;
+  }
+
+  return true;
 }
 
 module.exports = async function resolveReferences(state) {
@@ -397,6 +435,70 @@ module.exports = async function resolveReferences(state) {
       if (corruptsPathContext) {
         logger.debug('[Node:ResolveReferences] Rejecting simple_fallback that corrupts path/folder context, using original');
         resolvedMessage = message;
+      }
+    }
+
+    // ── Cross-method guards (apply regardless of coreferee/simple_fallback) ─────
+    if (replacements.length > 0 && resolvedMessage !== message) {
+      // Guard A: close/quit/kill + pronoun resolved to anything other than last opened file.
+      // Priority 1: use authoritative lastOpenedFilePath from state (set by executeCommand).
+      // Priority 2: fall back to scanning conversation history for open <file> pattern.
+      const CLOSE_VERB_START = /^(close|quit|kill|exit|stop|hide|minimize|terminate)\b/i;
+      if (CLOSE_VERB_START.test(message.trim())) {
+        const stateLastOpened = state.lastOpenedFilePath || null;
+        if (stateLastOpened) {
+          // Authoritative: state has the real path, reject any resolution not pointing to it
+          const openedStem = require('path').basename(stateLastOpened, require('path').extname(stateLastOpened)).toLowerCase();
+          const resolvedToOpenedFile = replacements.some(r =>
+            String(r.resolved || '').toLowerCase().includes(openedStem)
+          );
+          if (!resolvedToOpenedFile) {
+            logger.debug(`[Node:ResolveReferences] Rejecting ${method} close-verb resolution (state has lastOpenedFilePath="${stateLastOpened}")`);
+            resolvedMessage = message;
+          }
+        } else {
+          // Fallback: scan conversation history for open <file> pattern
+          const openedFilePattern = /open\s+['"]?([^\s'"]+\.[a-zA-Z0-9]+)['"]?/i;
+          const lastOpenMsg = conversationHistory.slice().reverse().find(
+            m => m.role === 'user' && openedFilePattern.test(m.content || '')
+          );
+          if (lastOpenMsg) {
+            const openedMatch = (lastOpenMsg.content || '').match(openedFilePattern);
+            const openedFile = openedMatch ? openedMatch[1] : null;
+            if (openedFile) {
+              const resolvedToOpenedFile = replacements.some(r =>
+                String(r.resolved || '').toLowerCase().includes(
+                  openedFile.toLowerCase().replace(/\.[^.]+$/, '')
+                )
+              );
+              if (!resolvedToOpenedFile) {
+                logger.debug(`[Node:ResolveReferences] Rejecting ${method} close-verb resolution — artifact, not opened file "${openedFile}"`);
+                resolvedMessage = message;
+              }
+            }
+          }
+        }
+      }
+
+      // Guard B: 'it/its/it's/this/that' resolves to a proper noun or bare capitalised word
+      // with confidence < 0.90 — these are NER false positives or listing noise.
+      // e.g. "did you find it" → "did you find Assistant" (proper noun substitution, wrong)
+      // e.g. "what it's about" → "what Assistant's about" (possessive form, also wrong)
+      // e.g. "close it" → "close Screenshot" (ls listing noise, wrong)
+      if (resolvedMessage !== message) {
+        const pronounReplacement = replacements.find(r =>
+          /^(it|its|it's|this|that)$/i.test(String(r.original || '').trim())
+        );
+        if (pronounReplacement) {
+          // Strip possessive 's from resolved value before checking (e.g. "Assistant's" → "Assistant")
+          const resolved = String(pronounReplacement.resolved || '').trim().replace(/'s$/, '');
+          // A bare capitalised word with no dot = likely a proper noun substitution or listing artifact
+          const isProperNounSub = !resolved.includes('.') && /^[A-Z][a-zA-Z]+$/.test(resolved);
+          if (isProperNounSub && (pronounReplacement.confidence || 0) < 0.90) {
+            logger.debug(`[Node:ResolveReferences] Rejecting ${method} pronoun→proper-noun "${resolved}" (conf ${pronounReplacement.confidence})`);
+            resolvedMessage = message;
+          }
+        }
       }
     }
 
