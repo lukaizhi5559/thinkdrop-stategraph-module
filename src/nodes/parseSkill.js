@@ -30,9 +30,12 @@ const SEMANTIC_SYSTEM_PROMPT = `You are a skill-matching assistant. Given a user
 Rules:
 - Only match if the skill's purpose CLEARLY covers the user's request — same service, same action type.
 - Do NOT match on loose similarity (e.g. "weather" skill does not match "check my email").
-- If the user is asking to BUILD or CREATE something new, return null — do not match an existing skill.
+- IMPORTANT: Even if the user says "I need to create" or "I want to build" a skill, if an existing installed skill ALREADY covers the described capability, return that skill name. The user may not know it exists.
 - Return ONLY the exact skill name string (e.g. "gmail.daily.summary") or the word null.
 - No explanation, no punctuation, no quotes around the name.`;
+
+// Patterns that indicate the user wants to CREATE a skill (phrasing, not intent)
+const WANTS_TO_CREATE_RE = /\b(create|build|make|write|add|install|set up|setup)\b.{0,40}\b(skill|ability|feature|capability|automation|tool)\b|\bneed (a |to )?(create|build|make|have)\b|\bdon't have\b|\bdoesn'?t exist\b/i;
 
 module.exports = async function parseSkill(state) {
   const { mcpAdapter, message, resolvedMessage, llmBackend } = state;
@@ -125,6 +128,45 @@ module.exports = async function parseSkill(state) {
     }
   }
 
+  // ── Strategy 2.7: description-keyword overlap match ─────────────────────────
+  // Deterministic fallback before the LLM: extract meaningful capability words
+  // from the user message and check if any installed skill's description contains
+  // a critical mass of them. This catches "scroll / type / shortcut / app control"
+  // requests matching browser.act without relying on the LLM.
+  const userWantsToCreate = WANTS_TO_CREATE_RE.test(classifyMessage);
+  {
+    // Capability keyword groups — each group is a set of synonyms for one concept.
+    // A skill description must contain at least MIN_GROUPS_MATCHED groups to match.
+    const CAPABILITY_GROUPS = [
+      { words: ['scroll', 'scrolling', 'scroll up', 'scroll down', 'scrolls'] },
+      { words: ['type', 'typing', 'type text', 'type chars', 'keypress', 'keyboard', 'keystroke'] },
+      { words: ['shortcut', 'shortcuts', 'hotkey', 'key combination', 'ctrl+', 'cmd+', 'command+'] },
+      { words: ['click', 'clicking', 'mouse click', 'right-click', 'double-click'] },
+      { words: ['app control', 'control app', 'interact with app', 'application control', 'desktop automation', 'ui automation', 'automate app'] },
+      { words: ['playwright', 'nut-js', 'nut.js', 'robotjs', 'pyautogui', 'xdotool'] },
+      { words: ['window', 'windows', 'active window', 'foreground app', 'current app'] },
+    ];
+    const MIN_GROUPS_MATCHED = 2; // user message must hit ≥2 groups to qualify
+
+    const msgWords = msgLower;
+
+    // How many capability groups does the user message touch?
+    const userGroupHits = CAPABILITY_GROUPS.filter(g => g.words.some(w => msgWords.includes(w))).length;
+
+    if (userGroupHits >= MIN_GROUPS_MATCHED) {
+      // Now check installed skills — find one whose description also hits ≥2 of the same groups
+      for (const skill of installedSkills) {
+        const descLower = (skill.description || skill.summary || '').toLowerCase();
+        if (!descLower) continue;
+        const descGroupHits = CAPABILITY_GROUPS.filter(g => g.words.some(w => descLower.includes(w))).length;
+        if (descGroupHits >= MIN_GROUPS_MATCHED) {
+          logger.info(`[Node:ParseSkill] Description-keyword match (${userGroupHits}/${descGroupHits} groups): "${classifyMessage.substring(0, 60)}" → skill "${skill.name}"${userWantsToCreate ? ' (userWantsToCreate)' : ''}`);
+          return _matchedState(state, skill.name, userWantsToCreate);
+        }
+      }
+    }
+  }
+
   // ── Strategy 3: LLM semantic match ──────────────────────────────────────────
   // Only fires when both string strategies miss AND we have an LLM backend.
   // Builds a compact skill menu (name + description) and asks the LLM for a
@@ -164,8 +206,8 @@ module.exports = async function parseSkill(state) {
       // Verify the returned name is actually an installed skill (LLM can hallucinate)
       const confirmed = installedSkills.find(s => s.name.toLowerCase() === candidate);
       if (confirmed) {
-        logger.info(`[Node:ParseSkill] Semantic match: "${classifyMessage.substring(0, 60)}" → skill "${confirmed.name}"`);
-        return _matchedState(state, confirmed.name);
+        logger.info(`[Node:ParseSkill] Semantic match: "${classifyMessage.substring(0, 60)}" → skill "${confirmed.name}"${userWantsToCreate ? ' (userWantsToCreate)' : ''}`);
+        return _matchedState(state, confirmed.name, userWantsToCreate);
       } else {
         logger.debug(`[Node:ParseSkill] Semantic LLM returned unknown skill "${candidate}" — ignoring`);
       }
@@ -180,10 +222,11 @@ module.exports = async function parseSkill(state) {
   return state;
 };
 
-function _matchedState(state, skillName) {
+function _matchedState(state, skillName, userWantsToCreate = false) {
   return {
     ...state,
     matchedSkillName: skillName,
+    matchedSkillUserWantsToCreate: userWantsToCreate,
     intent: {
       type: 'command_automate',
       confidence: 1.0,

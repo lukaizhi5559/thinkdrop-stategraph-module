@@ -1793,6 +1793,223 @@ module.exports = async function executeCommand(state) {
   if (skill === 'web.crawl') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 45000);
   }
+  // project_build can take several minutes (npm install + vite build + Playwright tests × 5 retries)
+  if (skill === 'project_build') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 600000); // 10 min max
+  }
+  // project_launch: start server + open browser — give it 30s
+  if (skill === 'project_launch') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 30000);
+  }
+
+  // ── project_build: route to project.builder MCP skill ──────────────────────
+  if (skill === 'project_build') {
+    if (progressCallback) progressCallback({
+      type: 'project_build_start',
+      capability: resolvedArgs.capability || resolvedArgs.description || '',
+      projectName: resolvedArgs.projectName || '',
+    });
+
+    try {
+      const buildResult = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'project.builder',
+        args: {
+          capability:   resolvedArgs.capability || resolvedArgs.description || '',
+          description:  resolvedArgs.description || state.resolvedMessage || state.message || '',
+          projectName:  resolvedArgs.projectName || null,
+        },
+      }, { timeoutMs: stepTimeoutMs });
+
+      const raw = buildResult?.data || buildResult || {};
+      const ok  = raw.ok === true || raw.success === true;
+
+      if (ok) {
+        // Emit file-creation events (Windsurf-style visibility) for key source files
+        if (progressCallback && raw.projectDir) {
+          try {
+            const fsSync = require('fs');
+            const pathSync = require('path');
+            const SHOW_FILES = [
+              'package.json', 'vite.config.js', 'tailwind.config.js',
+              path.join('server', 'index.js'), path.join('server', 'app.js'),
+              path.join('client', 'App.jsx'), path.join('client', 'main.jsx'),
+              path.join('public', 'index.html'),
+            ];
+            for (const rel of SHOW_FILES) {
+              const abs = pathSync.join(raw.projectDir, rel);
+              if (fsSync.existsSync(abs)) {
+                progressCallback({ type: 'project_file_created', file: rel, projectDir: raw.projectDir });
+              }
+            }
+          } catch (_) {}
+        }
+        if (progressCallback) progressCallback({ type: 'project_build_pass', projectName: raw.projectName, projectDir: raw.projectDir, iterations: raw.iterations });
+        const stepResult = {
+          step: skillCursor + 1, skill, args: resolvedArgs, description,
+          ok: true,
+          output:     raw.output || `Project "${raw.projectName}" built successfully.`,
+          projectName: raw.projectName,
+          projectDir:  raw.projectDir,
+          port:        raw.port,
+          iterations:  raw.iterations,
+          stdout:      raw.output || '',
+        };
+        const updatedResults = [...skillResults, stepResult];
+        const nextCursor = skillCursor + 1;
+        if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription, stdout: stepResult.stdout });
+        if (nextCursor >= skillPlan.length) {
+          const answer = `Project "${raw.projectName}" has been built and registered. You can now use it as a skill.`;
+          return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: true, answer, failedStep: null };
+        }
+        return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+      } else {
+        const errMsg = raw.error || 'project.builder returned failure';
+        if (progressCallback) progressCallback({ type: 'project_build_fail', error: errMsg });
+        const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+        if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
+        return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+      }
+    } catch (buildErr) {
+      const errMsg = buildErr.message || 'project.builder threw an error';
+      if (progressCallback) progressCallback({ type: 'project_build_fail', error: errMsg });
+      const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
+      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+    }
+  }
+
+  // ── project_launch: route to project.launcher MCP skill ────────────────────
+  if (skill === 'project_launch') {
+    try {
+      const launchResult = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'project.launcher',
+        args: {
+          projectName: resolvedArgs.projectName || resolvedArgs.name || '',
+          port:        resolvedArgs.port || null,
+        },
+      }, { timeoutMs: stepTimeoutMs });
+
+      const raw = launchResult?.data || launchResult || {};
+      const ok  = raw.ok === true || raw.success === true;
+
+      if (ok) {
+        const stepResult = {
+          step: skillCursor + 1, skill, args: resolvedArgs, description,
+          ok: true,
+          output: raw.output || `Project "${raw.projectName}" is running at ${raw.url}.`,
+          projectName: raw.projectName,
+          projectDir:  raw.projectDir,
+          port:        raw.port,
+          url:         raw.url,
+          stdout:      raw.output || '',
+        };
+        const updatedResults = [...skillResults, stepResult];
+        const nextCursor = skillCursor + 1;
+        if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription, stdout: stepResult.stdout });
+        if (nextCursor >= skillPlan.length) {
+          const answer = raw.output || `"${raw.projectName}" is running at ${raw.url} and has been opened in your browser.`;
+          return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: true, answer, failedStep: null };
+        }
+        return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+      } else {
+        const errMsg = raw.error || 'project.launcher returned failure';
+        const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+        if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
+        return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+      }
+    } catch (launchErr) {
+      const errMsg = launchErr.message || 'project.launcher threw an error';
+      const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
+      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+    }
+  }
+
+  // ── project_edit: route to project.editor MCP skill ────────────────────────
+  if (skill === 'project_edit') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 120000); // 2 min for LLM + rebuild
+    try {
+      const editResult = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'project.editor',
+        args: {
+          projectName: resolvedArgs.projectName || resolvedArgs.name || '',
+          prompt:      resolvedArgs.prompt || resolvedArgs.editPrompt || '',
+          port:        resolvedArgs.port || null,
+        },
+      }, { timeoutMs: stepTimeoutMs });
+
+      const raw = editResult?.data || editResult || {};
+      const ok  = raw.ok === true || raw.success === true;
+
+      if (ok) {
+        const stepResult = {
+          step: skillCursor + 1, skill, args: resolvedArgs, description,
+          ok: true,
+          output: raw.output || `Updated ${(raw.changedFiles || []).join(' and ')}.`,
+          changedFiles: raw.changedFiles,
+          stdout: raw.output || '',
+        };
+        const updatedResults = [...skillResults, stepResult];
+        const nextCursor = skillCursor + 1;
+        if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription, stdout: stepResult.stdout });
+        if (nextCursor >= skillPlan.length) {
+          return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: true, answer: raw.output, failedStep: null };
+        }
+        return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+      } else {
+        const errMsg = raw.error || 'project.editor returned failure';
+        const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+        if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
+        return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+      }
+    } catch (editErr) {
+      const errMsg = editErr.message || 'project.editor threw an error';
+      const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
+      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+    }
+  }
+
+  // ── project_stop: route to project.stopper MCP skill ───────────────────────
+  if (skill === 'project_stop') {
+    try {
+      const stopResult = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'project.stopper',
+        args: {
+          projectName: resolvedArgs.projectName || resolvedArgs.name || '',
+          port:        resolvedArgs.port || null,
+        },
+      }, { timeoutMs: 10000 });
+
+      const raw = stopResult?.data || stopResult || {};
+      const ok  = raw.ok === true || raw.success === true;
+      const stepResult = {
+        step: skillCursor + 1, skill, args: resolvedArgs, description,
+        ok,
+        output: raw.output || (ok ? 'Stopped.' : raw.error),
+        stdout: raw.output || '',
+        error: ok ? undefined : raw.error,
+      };
+      const updatedResults = [...skillResults, stepResult];
+      const nextCursor = skillCursor + 1;
+      if (ok) {
+        if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription, stdout: stepResult.stdout });
+        if (nextCursor >= skillPlan.length) {
+          return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: true, answer: raw.output, failedStep: null };
+        }
+        return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+      } else {
+        if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: raw.error });
+        return { ...state, skillResults: updatedResults, skillCursor, failedStep: stepResult, commandExecuted: false };
+      }
+    } catch (stopErr) {
+      const errMsg = stopErr.message || 'project.stopper threw an error';
+      const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
+      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
 
   try {
     const result = await mcpAdapter.callService('command', 'command.automate', {

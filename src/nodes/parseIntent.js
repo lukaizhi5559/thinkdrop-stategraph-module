@@ -7,8 +7,72 @@
  * - Without MCP: Uses rule-based fallback classification
  */
 
+/**
+ * Classify project intent using LLM for context-aware routing.
+ * Returns: { intent: 'launch'|'stop'|'edit'|'none', project: string|null, confidence: number }
+ */
+async function classifyProjectIntent(userMessage, builtProjects, conversationHistory, llmBackend, logger) {
+  if (!llmBackend || builtProjects.length === 0 || !userMessage) {
+    return { intent: 'none', project: null, confidence: 0 };
+  }
+
+  const recentContext = conversationHistory.length > 0
+    ? conversationHistory.slice(-4).map(m => {
+        const role = m.role === 'assistant' ? 'AI' : 'User';
+        const text = (m.content || m.text || '').slice(0, 150);
+        return `${role}: ${text}`;
+      }).join('\n')
+    : '';
+
+  const prompt = `You are a project intent classifier for ThinkDrop AI.
+
+Built projects: ${builtProjects.join(', ')}
+
+${recentContext ? `Recent conversation:\n${recentContext}\n\n` : ''}Current user message: "${userMessage}"
+
+Classify the intent:
+- **launch**: User wants to open/start/run a project (e.g., "open tic tac toe", "launch the game")
+- **stop**: User wants to close/stop/kill a project (e.g., "close the game", "stop tic tac toe")
+- **edit**: User wants to modify/fix/update a project (e.g., "fix the black tiles", "make Xs red", "add a score counter", "make the Xs show")
+- **none**: Not project-related or ambiguous
+
+CRITICAL: "show" in context of making something visible is EDIT, not LAUNCH.
+Example: "make the Xs and Os show" → edit (fixing visibility)
+Example: "show me the game" → launch (opening it)
+
+Output JSON only:
+{
+  "intent": "launch" | "stop" | "edit" | "none",
+  "project": "<project-name>" | null,
+  "confidence": 0.0-1.0,
+  "reason": "<1 sentence explanation>"
+}`;
+
+  try {
+    const response = await llmBackend.generateAnswer(prompt, {
+      temperature: 0.1,
+      maxTokens: 100,
+      systemInstructions: 'You are a JSON-only classifier. Output valid JSON with no markdown fences.'
+    });
+
+    const text = response.trim().replace(/^```json\s*/, '').replace(/\s*```$/, '');
+    const result = JSON.parse(text);
+    
+    logger.info(`[Node:ParseIntent] LLM project intent: ${result.intent} (${result.confidence}) → ${result.project || 'null'} | reason: ${result.reason}`);
+    
+    return {
+      intent: result.intent || 'none',
+      project: result.project || null,
+      confidence: result.confidence || 0
+    };
+  } catch (err) {
+    logger.warn(`[Node:ParseIntent] LLM intent classification failed: ${err.message}`);
+    return { intent: 'none', project: null, confidence: 0 };
+  }
+}
+
 module.exports = async function parseIntent(state) {
-  const { mcpAdapter, message, resolvedMessage, carriedIntent, context } = state;
+  const { mcpAdapter, message, resolvedMessage, carriedIntent, context, llmBackend, conversationHistory } = state;
   const logger = state.logger || console;
 
   // ── skill_build fast-path: never re-classify skill build requests ──────────
@@ -24,12 +88,77 @@ module.exports = async function parseIntent(state) {
   let classifyMessage = resolvedMessage || message;
 
   logger.debug('[Node:ParseIntent] Parsing intent...');
+  
+  // ── Project intercept (HIGHEST PRIORITY) ──────────────────────────────────
+  // Check for project-related intents (launch/stop/edit) BEFORE all other classification.
+  // This ensures project commands bypass normal intent classification entirely.
+  {
+    const fs = require('fs');
+    const _os = require('os');
+    const _path = require('path');
+    const projectsBase = _path.join(_os.homedir(), '.thinkdrop', 'projects');
+    let builtProjects = [];
+    try { 
+      builtProjects = fs.readdirSync(projectsBase).filter(d => {
+        try { return fs.statSync(_path.join(projectsBase, d)).isDirectory(); } catch (_) { return false; }
+      }); 
+    } catch (_) {}
+
+    if (builtProjects.length > 0 && classifyMessage && llmBackend) {
+      const classification = await classifyProjectIntent(classifyMessage, builtProjects, conversationHistory || [], llmBackend, logger);
+      
+      if (classification.confidence >= 0.6 && classification.project) {
+        const { intent: projectIntent, project } = classification;
+        
+        if (projectIntent === 'launch') {
+          logger.info(`[Node:ParseIntent] Project launch intercept: "${classifyMessage}" → project_launch("${project}")`);
+          return { 
+            ...state, 
+            intent: { type: 'command_automate', confidence: 1 },
+            projectSkillPlan: [{ skill: 'project_launch', description: `Launch "${project}"`, args: { projectName: project } }]
+          };
+        }
+        
+        if (projectIntent === 'stop') {
+          logger.info(`[Node:ParseIntent] Project stop intercept: "${classifyMessage}" → project_stop("${project}")`);
+          return { 
+            ...state, 
+            intent: { type: 'command_automate', confidence: 1 },
+            projectSkillPlan: [{ skill: 'project_stop', description: `Stop "${project}"`, args: { projectName: project } }]
+          };
+        }
+        
+        if (projectIntent === 'edit') {
+          logger.info(`[Node:ParseIntent] Project edit intercept: "${classifyMessage}" → project_edit("${project}")`);
+          return { 
+            ...state, 
+            intent: { type: 'command_automate', confidence: 1 },
+            projectSkillPlan: [{ skill: 'project_edit', description: `Edit "${project}": ${classifyMessage}`, args: { projectName: project, prompt: classifyMessage } }]
+          };
+        }
+      }
+    }
+  }
+
+  logger.debug('[Node:ParseIntent] Parsing intent...');
   if (resolvedMessage && resolvedMessage !== message) {
     logger.debug(`[Node:ParseIntent] Using resolved message: "${resolvedMessage}"`);
   }
 
   // ── Hard overrides — run BEFORE carriedIntent and BEFORE phi4 ML ──────────
   // These must never be bypassed by resolveReferences carryover.
+
+  // App control mode override — must beat carriedIntent entirely.
+  // "turn on control mode", "control Slack", "exit control mode", etc.
+  // These are NEVER command_automate / memory_retrieve — they are app_control_start.
+  // carriedIntent from a prior command_automate run would completely suppress DistilBERT
+  // for these phrases, so we intercept them here unconditionally.
+  const APP_CONTROL_ENTER_RE = /\b(turn\s+on|enable|activate|enter|start|switch\s+to|app\s+control|control\s+mode\s+on)\b.{0,20}\bcontrol\s*(mode)?\b|\bcontrol\s+(slack|word|chrome|figma|vscode|vs\s*code|notion|this\s+app|the\s+app|current\s+app)\b|\b(control\s+mode|app\s+control)\b/i;
+  const APP_CONTROL_EXIT_RE = /\b(exit|stop|quit|turn\s+off|disable|deactivate|leave|end|release)\b.{0,20}\bcontrol(\s+mode)?\b|\bcontrol\s+mode\s+(off|done)\b/i;
+  if (APP_CONTROL_ENTER_RE.test(classifyMessage) || APP_CONTROL_EXIT_RE.test(classifyMessage)) {
+    logger.info(`[Node:ParseIntent] App control override → app_control_start: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'app_control_start', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'app-control-override', processingTimeMs: 0 } };
+  }
 
   // Messaging verb override — HIGHEST PRIORITY: must beat carriedIntent + intent_override.search.
   // "text this to me", "send that info to me", "email me the results", "text me this info"
@@ -49,6 +178,16 @@ module.exports = async function parseIntent(state) {
   if (MESSAGING_VERB_OVERRIDE.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Messaging verb override → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'messaging-verb-override', processingTimeMs: 0 } };
+  }
+
+  // Build/create/make app override — ALWAYS command_automate, never web_search.
+  // "build a tic tac toe game", "create a todo app", "make me a calculator",
+  // "build a script that X", "create a tool to X", "make a dashboard for X"
+  // DistilBERT scores these ~0.39 for both web_search and command_automate — must hard-pin.
+  if (/^(build|create|make|generate|write|code|develop|implement)\b.{0,60}\b(app|application|game|tool|script|widget|dashboard|cli|bot|program|site|website|webapp|web app|extension|plugin|utility|calculator|tracker|manager|timer|reminder|scheduler)\b/i.test(classifyMessage) ||
+      /^(build|create|make|generate)\s+(me\s+)?(a|an|the)\s+/i.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Build/create override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'build-create-override', processingTimeMs: 0 } };
   }
 
   // General knowledge override:

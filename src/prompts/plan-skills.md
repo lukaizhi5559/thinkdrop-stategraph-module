@@ -3,7 +3,8 @@ guide.step|args:{instruction:string,sessionId:string,timeoutMs?:number}|pauses_p
 schedule|args:{time?:string,delayMs?:number,label?:string}|waits_until_clock_time_or_delay_then_continues_plan
 list_skills|args:{}|returns_full_skill_registry_including_installed_user_skills
 skill.install|args:{skillPath:string}|reads_skill_contract_md_at_path_and_registers_it_in_the_skill_registry.__ALWAYS_use_this_to_install_a_skill__never_shell.run.__skillPath_must_be_absolute_eg_/Users/lukaizhi/.thinkdrop/skills/send.text/skill.md
-needs_skill|args:{capability:string,suggestion:string}|ONLY_for_recurring_background_daemons_that_cannot_be_done_via_one-off_API_call.__For_one-off_REST_API_tasks_use_skill.bootstrap_pattern_instead
+project.launcher|args:{projectName:string,port?:number}|Starts_a_previously_built_ThinkDrop_project_and_opens_it_in_the_browser.__Use_when_the_user_says_"open_the_game",_"start_the_app",_"run_the_project",_"launch_X",_"open_X_app"_and_X_refers_to_a_built_project_in_~/.thinkdrop/projects/.__projectName_is_the_slug_or_plain_name_e.g._"tic_tac_toe"_or_"build-a-tic-tac-toe-game".__NEVER_use_shell.run_open_-a_for_these_—_projects_are_Node.js_servers_not_macOS_apps.
+needs_skill|args:{capability:string,suggestion:string}|Use_for_TWO_cases:_(1)_recurring_background_daemons_that_cannot_be_done_via_one-off_API_call,_(2)_desktop_UI_automation_/_app_control_tasks_(scroll,_type,_shortcuts,_interact_with_native_apps)_that_require_a_full_project_—_NOT_a_skill.md.__For_one-off_REST_API_tasks_use_skill.bootstrap_pattern_instead.__RULE:_if_the_user_asks_to_"create_a_skill"_or_"build_a_tool"_for_controlling_apps_(keyboard,_mouse,_scroll,_shortcuts,_window_control),_output_needs_skill_with_the_described_capability.
 external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user_installed_external_skill_by_name
 
 ## Template variables

@@ -79,6 +79,7 @@ module.exports = async function recoverSkill(state) {
     skillResults = [],
     stepRetryCount = 0,
     replanCount = 0,
+    patchHistory = [],
     message,
     resolvedMessage,
     context
@@ -334,6 +335,10 @@ module.exports = async function recoverSkill(state) {
     }
   }
 
+  const patchHistorySection = patchHistory.length
+    ? `\nPrevious recovery attempts (already tried — DO NOT repeat these):\n${patchHistory.map((p, i) => `  ${i + 1}. ${p}`).join('\n')}\n`
+    : '';
+
   const recoveryQuery = `Original user request: "${resolvedMessage || message}"
 
 Failed step:
@@ -343,7 +348,7 @@ Failed step:
   Error: ${failedStep.error}
   Exit code: ${failedStep.exitCode ?? 'N/A'}
   Stderr: ${failedStep.stderr || '(none)'}
-${skillContextSection}
+${skillContextSection}${patchHistorySection}
 Completed steps so far:
 ${completedSteps}
 
@@ -1014,7 +1019,14 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
       });
       // Increment retry count for timeout retries; reset for other patches
       const nextRetryCount = decision._isTimeoutRetry ? stepRetryCount + 1 : 0;
+      // Accumulate patch history so next recovery sees what was already tried
+      const updatedPatchHistory = [
+        ...(state.patchHistory || []),
+        decision.note ? `AUTO_PATCH: ${decision.note} (patchedArgs: ${JSON.stringify(decision.patchedArgs)})` : `AUTO_PATCH: ${JSON.stringify(decision.patchedArgs)}`
+      ].slice(-8); // keep last 8 attempts
 
+      // ── Patch history forwarded on state ──────────────────────────────────
+      // updatedPatchHistory is set above and written to state below.
       // ── Self-heal write-back ──────────────────────────────────────────────
       // Persist this patch as a skill_prompt rule so planSkills injects it
       // next time a similar task is planned — closing the learn loop.
@@ -1025,7 +1037,7 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
         const ruleText = `When planning ${failedSkill} steps for tasks like "${originalRequest.slice(0, 80)}": ${decision.note}. Patched args: ${JSON.stringify(decision.patchedArgs).slice(0, 200)}`;
         state.mcpAdapter.callService('user-memory', 'skill_prompt.upsert', {
           tags: [failedSkill, 'auto_patch', 'self_heal'],
-          content: ruleText
+          promptText: ruleText
         }, { timeoutMs: 3000 }).then(() => {
           logger.info(`[Node:RecoverSkill] Self-heal: wrote AUTO_PATCH rule to skill_prompt DB`);
         }).catch(err => {
@@ -1041,7 +1053,8 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
         skillCursor: cursor,   // retry same step with patched args
         failedStep: null,
         stepRetryCount: nextRetryCount,
-        recoveryNote: decision.note
+        recoveryNote: decision.note,
+        patchHistory: updatedPatchHistory,
       };
     }
 

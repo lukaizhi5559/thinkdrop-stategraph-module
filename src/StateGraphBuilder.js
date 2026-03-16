@@ -27,6 +27,7 @@ const enrichIntentNode = require('./nodes/enrichIntent');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
 const creatorPlanningNode = require('./nodes/creatorPlanning');
 const gatherContextNode = require('./nodes/gatherContext');
+const appControlNode = require('./nodes/appControl');
 
 class StateGraphBuilder {
   /**
@@ -178,6 +179,7 @@ class StateGraphBuilder {
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
       synthesize: (state) => synthesizeNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
+      appControl: (state) => appControlNode({ ...state, logger }),
       logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
     };
     
@@ -249,6 +251,9 @@ class StateGraphBuilder {
         }
         if (intentType === 'screen_intelligence') {
           return 'screenIntelligence';
+        }
+        if (intentType === 'app_control_start') {
+          return 'appControl';
         }
         if (intentType === 'web_search' || intentType === 'question' || intentType === 'general_knowledge') {
           return 'webSearch';
@@ -352,6 +357,9 @@ class StateGraphBuilder {
       // Web search path
       webSearch: 'retrieveMemory',
       
+      // App control mode — routes to logConversation to persist state + show answer
+      appControl: 'logConversation',
+
       // Standard path: all roads lead to logConversation before end
       retrieveMemory: 'answer',
       answer: 'logConversation',

@@ -84,7 +84,7 @@ ui.findAndClick does NOT exist — never use it.
 ui.axClick ONLY works for true native macOS apps (TextEdit, Calendar, Finder, Mail, Safari). It does NOT work for Electron apps (Slack, Discord, VS Code, Cursor, Figma) — use keyboard shortcuts instead.
 For Slack: always use osascript activate + {CMD+K} + type + {DOWN}{ENTER}. Never use ui.axClick for Slack.
 For dropdown/switcher results after typing: use {DOWN} then {ENTER}, never any click skill.
-After switching Slack workspace with {ENTER}, always add ui.waitFor + osascript activate before the next {CMD+K}.
+After switch                                                                                          ing Slack workspace with {ENTER}, always add ui.waitFor + osascript activate before the next {CMD+K}.
 api_suggest: use as FIRST step when task is RECURRING or programmatic AND the service has an API. Almost all SaaS/cloud services have APIs (Slack, Gmail, Discord, Notion, GitHub, Twilio, n8n, Stripe, Zapier, OpenAI, etc.). Do NOT use for one-off tasks.
 guide.step: use for ANY task where the user must act manually step by step (government sites, DMV, forms, license renewal, API token setup, CAPTCHAs, login walls). MANDATORY pattern: browser.act navigate URL (sessionId) → browser.act highlight (label, instruction, sessionId) → guide.step (instruction, sessionId) → repeat highlight+guide.step for each step. Playwright opens a VISIBLE Chrome Testing window. highlight injects glow + speech bubble; guide.step polls window.__tdGuideTriggered and auto-advances when user clicks highlighted element. sessionId is REQUIRED in guide.step.
 Policy: no sudo/su/passwd. argv is string[] — no shell interpolation.
@@ -114,6 +114,28 @@ module.exports = async function planSkills(state) {
 
   const logger = state.logger || console;
   const progressCallback = state.progressCallback || null;
+  const userMessage = resolvedMessage || message;
+
+  // ── Project skill plan passthrough ────────────────────────────────────────
+  // If parseIntent already classified this as a project command and set projectSkillPlan,
+  // use it directly and skip all LLM planning.
+  if (state.projectSkillPlan && Array.isArray(state.projectSkillPlan) && state.projectSkillPlan.length > 0) {
+    logger.info(`[Node:PlanSkills] Using project skill plan from parseIntent: ${state.projectSkillPlan[0].skill}`);
+    if (progressCallback) {
+      progressCallback({ 
+        type: 'plan_ready', 
+        steps: state.projectSkillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })), 
+        intent: 'command_automate' 
+      });
+    }
+    return { 
+      ...state, 
+      skillPlan: state.projectSkillPlan, 
+      skillCursor: 0, 
+      planError: null, 
+      recoveryContext: null 
+    };
+  }
 
   if (intent?.type !== 'command_automate') {
     return state;
@@ -225,7 +247,6 @@ module.exports = async function planSkills(state) {
     };
   }
 
-  const userMessage = resolvedMessage || message;
   const os = process.platform;
 
   // ── Creator planning context (injected by creatorPlanning node) ────────────
@@ -611,6 +632,34 @@ Task: "${userMessage}"`;
     } catch (_) { /* non-fatal */ }
   }
 
+  // ── "You already have this" short-circuit ────────────────────────────────────
+  // parseSkill matched an existing skill BUT the user asked to CREATE/BUILD it.
+  // Don't rebuild — surface a friendly "you already have X" response immediately.
+  if (state.matchedSkillName && state.matchedSkillUserWantsToCreate) {
+    const existingName = state.matchedSkillName;
+    logger.info(`[Node:PlanSkills] matchedSkillUserWantsToCreate=true — short-circuit for "${existingName}"`);
+    const alreadyHavePlan = [{
+      skill: 'synthesize',
+      description: `You already have ${existingName}`,
+      args: {
+        prompt: `The user asked to create a skill for app control / automation but they already have an installed skill called "${existingName}" that covers exactly this capability. Tell them they already have it, briefly describe what it can do (scroll, type, use shortcuts, interact with any app), and give 2-3 example prompts they can use right now. Be concise and helpful.`,
+        savedFilePath: null,
+      },
+    }];
+    if (progressCallback) progressCallback({
+      type: 'plan_ready',
+      steps: alreadyHavePlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })),
+      intent: 'command_automate',
+    });
+    return {
+      ...state,
+      skillPlan: alreadyHavePlan,
+      skillCursor: 0,
+      planError: null,
+      recoveryContext: null,
+    };
+  }
+
   // ── Skill contract injection ─────────────────────────────────────────────────
   // When parseSkill matched an installed skill, fetch its full contract_md from DB
   // and inject it as planning context. This replaces the old creatorPlanning code-gen
@@ -824,8 +873,21 @@ Task: "${userMessage}"`;
     } else {
       if (domainTags.services?.length > 0) parts.push(`Target services (in priority order): ${domainTags.services.join(', ')}`);
       if (domainTags.skillHints?.length > 0) parts.push(`Suggested skill name: ${domainTags.skillHints[0]}`);
-      domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Because this is a messaging/API task with a known target service, you MUST use the skill.bootstrap pattern (web.crawl docs → synthesize skill.md → skill.install).\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials like <TWILIO_ACCOUNT_SID> or <API_KEY>. Credentials are handled automatically via keychain — never hardcode them.\n- FORBIDDEN: Do NOT use api_suggest — the service is already identified above.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
-      logger.info(`[Node:PlanSkills] Domain context injected: ${domainTags.tags?.join(', ')} → ${domainTags.skillHints?.[0]}`);
+
+      // Built-in skills (browser.act, shell.run, ui.*, etc.) don't need the skill.bootstrap
+      // pipeline — they are already available. Only force skillCreator for external API services.
+      const BUILTIN_SKILLS = new Set(['browser.act', 'shell.run', 'ui.axClick', 'ui.typeText', 'ui.click', 'ui.moveMouse', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'web.crawl', 'screen.capture']);
+      const firstHint = (domainTags.skillHints?.[0] || '').toLowerCase();
+      const isBuiltin = BUILTIN_SKILLS.has(firstHint) || [...BUILTIN_SKILLS].some(b => firstHint.startsWith(b));
+
+      if (isBuiltin) {
+        // Built-in skill — just inject domain context as info, don't force skillCreator
+        domainContextNote = `\n\n⚠️ DOMAIN CONTEXT:\n${parts.map(p => `- ${p}`).join('\n')}\n- This capability is provided by the built-in "${firstHint}" skill — do NOT use skill.bootstrap pattern.\n- If the user is asking to CREATE or BUILD a new skill/tool for this capability, output: [{"skill":"needs_skill","args":{"capability":"<describe what they want>","suggestion":"${firstHint}"}}]\n- OUTPUT: A valid JSON array only.`;
+        logger.info(`[Node:PlanSkills] Domain context injected (builtin): ${domainTags.tags?.join(', ')} → ${firstHint}`);
+      } else {
+        domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Because this is a messaging/API task with a known target service, you MUST use the skill.bootstrap pattern (web.crawl docs → synthesize skill.md → skill.install).\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials like <TWILIO_ACCOUNT_SID> or <API_KEY>. Credentials are handled automatically via keychain — never hardcode them.\n- FORBIDDEN: Do NOT use api_suggest — the service is already identified above.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
+        logger.info(`[Node:PlanSkills] Domain context injected: ${domainTags.tags?.join(', ')} → ${domainTags.skillHints?.[0]}`);
+      }
     }
   }
 
@@ -1223,7 +1285,7 @@ CRITICAL rules for skill.md:
       const path = require('path');
       const capability = needsSkillStep.args?.capability || needsSkillStep.args?.name || '';
       const suggestion  = needsSkillStep.args?.suggestion || '';
-      const searchMsg   = [userMessage, capability, suggestion].join(' ').toLowerCase();
+      const searchMsg   = [userMessage, capability].join(' ').toLowerCase();
 
       // Walk up from __dirname to find the command-service src directory
       function findRegistryDir() {
@@ -1242,12 +1304,45 @@ CRITICAL rules for skill.md:
         try { cliRegistry = JSON.parse(fs.readFileSync(path.join(regDir, 'cli-registry.json'), 'utf8')); } catch (_) {}
         try { apiRegistry = JSON.parse(fs.readFileSync(path.join(regDir, 'api-registry.json'), 'utf8')); } catch (_) {}
 
+        // Skip registry matching entirely when the LLM suggestion is a built-in skill
+        // (browser.act, shell.run, ui.*, etc.) — those don't have CLI/API providers and
+        // any keyword match would be spurious (e.g. 'slack' as an example word in the message).
+        const BUILTIN_SUGGESTIONS = new Set(['browser.act', 'shell.run', 'ui.axclick', 'ui.typetext', 'ui.click', 'ui.movemouse', 'ui.waitfor', 'ui.screen.verify']);
+        const suggestionIsBuiltin = BUILTIN_SUGGESTIONS.has((suggestion || '').toLowerCase());
+
+        // Generic English words that appear in registry keywords but are too ambiguous
+        // to use as scout triggers on their own (e.g. "todo" in "create a todo app",
+        // "task" in "build a task manager", "mail" in "send mail", "merge" in "merge data").
+        // These keywords only count as a match when accompanied by a service-specific term
+        // in the same registry entry — so we skip them as standalone triggers.
+        const GENERIC_KW_BLOCKLIST = new Set([
+          'todo', 'task', 'to-do list', 'mail', 'merge', 'branch', 'commit',
+          'issue', 'repo', 'repository', 'messaging', 'email', 'payment',
+          'billing', 'checkout', 'invoice', 'subscription',
+        ]);
+
         // Find all matching capabilities across both registries
+        // Uses whole-word boundary matching to avoid false positives (e.g. 'slack' as an example).
         function findMatches(registry, regType) {
+          if (suggestionIsBuiltin) return [];
           const matches = [];
           for (const [cap, entry] of Object.entries(registry)) {
             const kws = entry.keywords || [];
-            if (kws.some(kw => searchMsg.includes(kw.toLowerCase()))) {
+            const hasMatch = kws.some(kw => {
+              const kwLower = kw.toLowerCase();
+              // Skip generic words — they must not be the sole reason for a match
+              if (GENERIC_KW_BLOCKLIST.has(kwLower)) return false;
+              const idx = searchMsg.indexOf(kwLower);
+              if (idx === -1) return false;
+              // Whole-word boundary check
+              const before = idx === 0 ? '' : searchMsg[idx - 1];
+              const after = searchMsg[idx + kwLower.length] || '';
+              const atEnd = idx + kwLower.length === searchMsg.length;
+              const wordBefore = idx === 0 || /[\s,.(\["']/.test(before);
+              const wordAfter  = atEnd || /[\s,.)\]"']/.test(after);
+              return wordBefore && wordAfter;
+            });
+            if (hasMatch) {
               const providers = entry.providers || {};
               for (const [providerName, config] of Object.entries(providers)) {
                 matches.push({ capability: cap, provider: providerName, config, type: regType, defaultProvider: entry.defaultProvider });
@@ -1294,7 +1389,103 @@ CRITICAL rules for skill.md:
             commandExecuted: false,
           };
         }
+
       }
+
+      // ── Dynamic discovery via skill-scout (LLM + web-search driven) ──────────
+      // Static keywords didn't match — try live discovery before falling back to
+      // project_build. skill-scout.discover() does: npm search → brew search →
+      // LLM validates best candidate → writes result back to registry for caching.
+      if (regDir && !suggestionIsBuiltin) {
+        try {
+          const scoutPath = path.join(regDir, 'skill-scout.cjs');
+          if (fs.existsSync(scoutPath)) {
+            // Extract the service name: strip filler words to get the key noun
+            // e.g. "send a slack message" → "slack", "stripe payment" → "stripe",
+            //      "tic tac toe game" → "tic" (length <4 → skipped → project_build)
+            const FILLER_WORDS = new Set([
+              'a','an','the','send','get','fetch','create','build','make','add','post',
+              'use','using','via','with','from','to','for','of','on','in','at','by',
+              'my','me','this','that','some','new','about','through','into','can',
+              'message','messages','email','emails','sms','text','notification','notifications',
+            ]);
+            const capWords = (capability || userMessage).toLowerCase().split(/\s+/).map(w => w.replace(/[^a-z0-9\-]/g, '')).filter(w => w.length >= 2 && !FILLER_WORDS.has(w));
+            const serviceName = capWords[0] || '';
+            if (serviceName.length >= 3) {
+              logger.info(`[Node:PlanSkills] Scout intercept: static miss — trying dynamic discovery for "${serviceName}"`);
+              const { discover } = require(scoutPath);
+              const { cliMatch, apiMatch } = await discover(serviceName, capability || userMessage);
+              const dynamicMatch = cliMatch || apiMatch;
+              if (dynamicMatch) {
+                logger.info(`[Node:PlanSkills] Scout intercept: dynamic discovery found "${dynamicMatch.provider}" (${dynamicMatch.type}) for "${serviceName}"`);
+                const dynamicMatches = [dynamicMatch];
+                if (progressCallback) progressCallback({
+                  type: 'plan_ready',
+                  steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })),
+                  intent: state.intent?.type || 'command_automate',
+                });
+                if (progressCallback) progressCallback({
+                  type: 'scout_match',
+                  capability: capability || userMessage,
+                  suggestion,
+                  matches: dynamicMatches,
+                });
+                return {
+                  ...state,
+                  skillPlan,
+                  skillCursor: 0,
+                  scoutPending: true,
+                  scoutCapability: capability || userMessage,
+                  scoutMatches: dynamicMatches,
+                  recoveryAction: 'scout_select',
+                  pendingQuestion: {
+                    question: `I found a tool that can handle "${capability || userMessage}". Would you like to use it?`,
+                    options: dynamicMatches.map(m => `${m.provider} (${m.type})`),
+                    context: { scoutMatches: dynamicMatches, capability: capability || userMessage },
+                    _isScoutSelect: true,
+                  },
+                  commandExecuted: false,
+                };
+              }
+              logger.info(`[Node:PlanSkills] Scout intercept: dynamic discovery found nothing for "${serviceName}" — routing to project_build`);
+            }
+          }
+        } catch (scoutErr) {
+          logger.warn(`[Node:PlanSkills] skill-scout dynamic discovery error (non-fatal): ${scoutErr.message}`);
+        }
+      }
+
+      // ── No CLI/API match (static or dynamic) — route to project builder ──────
+      // This capability requires a full app (not a CLI command or REST API call).
+      // Build a self-contained Vite+React+Express project via project.builder.
+      logger.info(`[Node:PlanSkills] Scout intercept: no CLI/API match for "${capability || userMessage}" — routing to project_build`);
+      const projectBuildPlan = [{
+        skill: 'project_build',
+        description: `Building project for: ${capability || userMessage}`,
+        args: {
+          capability: capability || userMessage,
+          description: userMessage,
+          suggestion,
+        },
+      }];
+      if (progressCallback) progressCallback({
+        type: 'plan_ready',
+        steps: projectBuildPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })),
+        intent: state.intent?.type || 'command_automate',
+      });
+      if (progressCallback) progressCallback({
+        type: 'project_build_start',
+        capability: capability || userMessage,
+        message: 'No CLI or API available — building a custom app for this capability.',
+      });
+      return {
+        ...state,
+        skillPlan: projectBuildPlan,
+        skillCursor: 0,
+        planError: null,
+        recoveryContext: null,
+        pendingSkillName: state.pendingSkillName || null,
+      };
     }
     // ─────────────────────────────────────────────────────────────────────────────
 
