@@ -216,6 +216,64 @@ module.exports = async function answer(state) {
 
   // Language detection and injection already handled above (langOverridePrefix at top of systemInstructions).
 
+  // ─── Personality overlay injection ──────────────────────────────────────────
+  // Fetches the live THINKDROP LIVE STATE block (mood + traits) from personality-service.
+  // Appended BEFORE screen context so the LLM sees personality state at all times.
+  // Falls back gracefully if personality-service is down — no breakage.
+  try {
+    const http = require('http');
+    const personalityOverlay = await new Promise((resolve) => {
+      const body = JSON.stringify({ version: 'mcp.v1', service: 'personality-service', action: 'personality.overlay', payload: {}, requestId: 'ans_' + Date.now() });
+      const req = http.request({
+        hostname: '127.0.0.1',
+        port: parseInt(process.env.PERSONALITY_SERVICE_PORT || '3008', 10),
+        path: '/personality.overlay',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        timeout: 2000,
+      }, (res) => {
+        let raw = '';
+        res.on('data', c => { raw += c; });
+        res.on('end', () => { try { const p = JSON.parse(raw); resolve(p && p.data && p.data.overlay ? p.data.overlay : ''); } catch (_) { resolve(''); } });
+      });
+      req.on('error', () => resolve(''));
+      req.on('timeout', () => { req.destroy(); resolve(''); });
+      req.write(body);
+      req.end();
+    });
+    if (personalityOverlay) {
+      systemInstructions += `\n\n${personalityOverlay}`;
+    }
+  } catch (_personalityErr) {}
+
+  // ─── Text-signal mood event emission (fire-and-forget) ──────────────────────
+  // Analyzes the user's text for emotional cues and fires a mood event so that
+  // text-path interactions shape ThinkDrop's emotional state just like voice does.
+  try {
+    const textSignalPath = path.join(__dirname, '../../../mcp-services/personality-service/src/text-signal.cjs');
+    const textSignal = require(textSignalPath);
+    const textEvt = textSignal.analyze(queryMessage, conversationHistory);
+    if (textEvt && textEvt.event_type) {
+      const http2 = require('http');
+      const evtBody = JSON.stringify({
+        version: 'mcp.v1', service: 'personality-service', action: 'personality.event',
+        payload: { event_type: textEvt.event_type, source: 'text', reason: textEvt.reason },
+        requestId: 'ans_evt_' + Date.now(),
+      });
+      const evtReq = http2.request({
+        hostname: '127.0.0.1',
+        port: parseInt(process.env.PERSONALITY_SERVICE_PORT || '3008', 10),
+        path: '/personality.event', method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(evtBody) },
+        timeout: 3000,
+      }, () => {});
+      evtReq.on('error', () => {});
+      evtReq.on('timeout', () => { evtReq.destroy(); });
+      evtReq.write(evtBody);
+      evtReq.end();
+    }
+  } catch (_textSignalErr) {}
+
   // Inject screen context into system instructions (not into the user query)
   if (state.context && typeof state.context === 'string') {
     const truncated = state.context.length > 6000
