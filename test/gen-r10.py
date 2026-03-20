@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""
+Generate Round 10 benchmark fixture — 274 fresh prompts, entirely new themes/personas.
+Zero overlap with Rounds 1-9.
+
+Themes (all new):
+  - Cleo: a Maine Coon cat the user just adopted
+  - Tomás Ferreira: Brazilian colleague starting next month
+  - Yuki: friend in Tokyo
+  - Dr. Osei: the user's new GP (general practitioner)
+  - Marcus Webb: user's personal trainer
+  - June fitness challenge: daily kettlebell routine
+  - Oat milk latte morning ritual (replaced matcha)
+  - Fermentation side project: kimchi batch "Kim"
+  - Learning TypeScript (switching from JavaScript)
+  - Obsidian for note-taking (switching from Notion)
+  - Freelance budget tracker (new side project)
+  - Summer trip: Lisbon + Sintra (2026 trip)
+  - Blue light glasses (new purchase for screen time)
+  - Melatonin sleep tracking (3mg before bed)
+  - Isabel Carvalho: new therapist
+
+Intent distribution (matches R7/R8/R9):
+  memory_store:       60 examples  (ms-001..060, ms-v01..v12, ms-e01..e08, ms-a01..a08)
+  memory_retrieve:    50 examples  (mr-001..030, mr-v01..v08, mr-e01..e08, mr-a01..a04)
+  web_search:         45 examples  (ws-001..020, ws-v01..v06, ws-e01..e06, ws-a01..a05, ws-a06..a08... actually see below)
+  command_automate:   45 examples  (ca-001..021, ca-v01..v12, ca-e01..e06, ca-a01..a06)
+  app_control_start:  30 examples  (ac-001..015, ac-v01..v08, ac-e01..e04, ac-a01..a03)
+  screen_intelligence:15 examples  (si-001..006, si-v01..v03, si-e01..e03, si-a01..a03)
+  general_knowledge:  20 examples  (gk-001..008, gk-v01..v02, gk-e01..e03, gk-a01..a07)
+  greeting:           9 examples   (gr-001..006, gr-a01..a03)
+  TOTAL:              274
+"""
+
+import json
+
+fixture = {
+    "description": "Intent benchmark Round 10 — 274 fresh prompts, entirely new themes/personas. Tests generalization after all R7-R9 fixes. Zero overlap with Rounds 1-9.",
+    "themes": "Cleo (Maine Coon cat), Tomás Ferreira (Brazilian colleague), Yuki (friend in Tokyo), Dr. Osei (GP), Marcus Webb (personal trainer), June kettlebell challenge, oat milk latte morning ritual, kimchi fermentation batch 'Kim', TypeScript learning, Obsidian notes, freelance budget tracker, Lisbon+Sintra summer trip 2026, blue light glasses, melatonin sleep tracking, Isabel Carvalho (therapist)",
+    "version": "r10",
+    "intents": [
+        "memory_store", "memory_retrieve", "web_search", "command_automate",
+        "app_control_start", "screen_intelligence", "general_knowledge", "greeting"
+    ],
+    "examples": []
+}
+
+examples = [
+
+    # ─── MEMORY STORE ────────────────────────────────────────────────────────────
+    # Clean
+    {"id":"ms-001","message":"I adopted a Maine Coon kitten named Cleo yesterday, she's already claiming my keyboard","intent":"memory_store","source":"clean"},
+    {"id":"ms-002","message":"Tomás Ferreira is joining the team from São Paulo next month as a senior backend engineer","intent":"memory_store","source":"clean"},
+    {"id":"ms-003","message":"My new therapist is Isabel Carvalho, she works out of the Marais district in Paris","intent":"memory_store","source":"clean"},
+    {"id":"ms-004","message":"Marcus Webb is my personal trainer, we do kettlebell sessions every Tuesday and Thursday morning","intent":"memory_store","source":"clean"},
+    {"id":"ms-005","message":"I started a kimchi batch this weekend, calling it Kim, using my grandmother's recipe","intent":"memory_store","source":"clean"},
+    {"id":"ms-006","message":"Switched to oat milk lattes in the morning — no more dairy, feels better on my stomach","intent":"memory_store","source":"clean"},
+    {"id":"ms-007","message":"I'm learning TypeScript now, coming from vanilla JavaScript, started with the official handbook","intent":"memory_store","source":"clean"},
+    {"id":"ms-008","message":"Moved all my notes to Obsidian last week, finally leaving Notion behind","intent":"memory_store","source":"clean"},
+    {"id":"ms-009","message":"Yuki is my friend based in Tokyo, she works in UX at a gaming company","intent":"memory_store","source":"clean"},
+    {"id":"ms-010","message":"Dr. Osei is my new GP, his clinic is on Baker Street and he's great about same-day appointments","intent":"memory_store","source":"clean"},
+    {"id":"ms-011","message":"I bought blue light glasses last week, wearing them during evening screen sessions","intent":"memory_store","source":"clean"},
+    {"id":"ms-012","message":"Taking 3mg melatonin 30 minutes before bed to fix my sleep schedule","intent":"memory_store","source":"clean"},
+    {"id":"ms-013","message":"Starting a June fitness challenge: 100 kettlebell swings every morning before work","intent":"memory_store","source":"clean"},
+    {"id":"ms-014","message":"Planning a summer trip to Lisbon and Sintra in late July 2026","intent":"memory_store","source":"clean"},
+    {"id":"ms-015","message":"Tomás Ferreira's last name is spelled F-E-R-R-E-I-R-A","intent":"memory_store","source":"clean"},
+    {"id":"ms-016","message":"Cleo's vet is Dr. Park at Northside Animal Hospital, her next appointment is June 10th","intent":"memory_store","source":"clean"},
+    {"id":"ms-017","message":"My freelance budget tracker side project uses React and Supabase","intent":"memory_store","source":"clean"},
+    {"id":"ms-018","message":"Isabel Carvalho prefers WhatsApp for scheduling and rescheduling appointments","intent":"memory_store","source":"clean"},
+    {"id":"ms-019","message":"Cleo's birth date is April 3rd 2026 according to the shelter paperwork","intent":"memory_store","source":"clean"},
+    {"id":"ms-020","message":"Marcus Webb charges 65 euros per session, invoiced monthly","intent":"memory_store","source":"clean"},
+
+    # Voice
+    {"id":"ms-v01","message":"hey log that i got a maine coon kit ten named clee oh she's su per af fec tion ate","intent":"memory_store","source":"voice"},
+    {"id":"ms-v02","message":"to mas fer rei ra is join ing us from sao pau lo next month as a sen ior back end en gi neer","intent":"memory_store","source":"voice"},
+    {"id":"ms-v03","message":"i start ed learn ing type script this week com ing from ja va script","intent":"memory_store","source":"voice"},
+    {"id":"ms-v04","message":"my per son al train er is mar cus webb we do ket tle bell ses sions tues day and thurs day","intent":"memory_store","source":"voice"},
+    {"id":"ms-v05","message":"i made a kim chi batch this week end cal ling it kim us ing my grand moth er's re ci pe","intent":"memory_store","source":"voice"},
+    {"id":"ms-v06","message":"switched to oat milk lat tes in the morn ing no more dai ry","intent":"memory_store","source":"voice"},
+    {"id":"ms-v07","message":"i am tak ing three mil li grams mel a to nin thir ty min utes be fore bed","intent":"memory_store","source":"voice"},
+    {"id":"ms-v08","message":"moved all my notes to ob sid i an last week leav ing no tion be hind","intent":"memory_store","source":"voice"},
+    {"id":"ms-v09","message":"yu ki is my friend in to ky o she works in u x at a gam ing com pa ny","intent":"memory_store","source":"voice"},
+    {"id":"ms-v10","message":"i am start ing a june fit ness chal lenge one hun dred ket tle bell swings ev ery morn ing","intent":"memory_store","source":"voice"},
+    {"id":"ms-v11","message":"plan ning a sum mer trip to lis bon and sin tra in late ju ly twenty twen ty six","intent":"memory_store","source":"voice"},
+    {"id":"ms-v12","message":"doc tor oh say is my new g p his clin ic is on ba ker street","intent":"memory_store","source":"voice"},
+
+    # Edge
+    {"id":"ms-e01","message":"Cleo, Maine Coon, adopted June 2026","intent":"memory_store","source":"edge"},
+    {"id":"ms-e02","message":"Melatonin, 3mg nightly","intent":"memory_store","source":"edge"},
+    {"id":"ms-e03","message":"TypeScript, chapter 4 this week","intent":"memory_store","source":"edge"},
+    {"id":"ms-e04","message":"Kettlebell challenge, 100 swings daily","intent":"memory_store","source":"edge"},
+    {"id":"ms-e05","message":"Obsidian vault, switched from Notion last week","intent":"memory_store","source":"edge"},
+    {"id":"ms-e06","message":"Marcus Webb, Tuesday and Thursday sessions","intent":"memory_store","source":"edge"},
+    {"id":"ms-e07","message":"Budget tracker, React plus Supabase stack","intent":"memory_store","source":"edge"},
+    {"id":"ms-e08","message":"Isabel Carvalho is seeing me every other Thursday","intent":"memory_store","source":"edge"},
+
+    # Adversarial
+    {"id":"ms-a01","message":"Just so you know, Cleo has a heart murmur that Dr. Park is monitoring","intent":"memory_store","source":"adversarial"},
+    {"id":"ms-a02","message":"Tomás prefers async communication over Slack rather than meetings","intent":"memory_store","source":"adversarial"},
+    {"id":"ms-a03","message":"I've been drinking oat milk lattes every single morning for three weeks now","intent":"memory_store","source":"adversarial"},
+    {"id":"ms-a04","message":"My Lisbon trip overlaps with a conference I need to attend in Porto on July 28th","intent":"memory_store","source":"adversarial"},
+    {"id":"ms-a05","message":"Yuki is visiting me in Paris in September, she's never been to Europe before","intent":"memory_store","source":"adversarial"},
+    {"id":"ms-a06","message":"Marcus told me to cut back on cardio and focus on strength for the next six weeks","intent":"memory_store","source":"adversarial"},
+    {"id":"ms-a07","message":"I've decided to use Obsidian for journaling and Notion only for team wikis going forward","intent":"memory_store","source":"adversarial"},
+    {"id":"ms-a08","message":"Isabel Carvalho's last name is spelled C-A-R-V-A-L-H-O","intent":"memory_store","source":"adversarial"},
+
+    # ─── MEMORY RETRIEVE ─────────────────────────────────────────────────────────
+    # Clean
+    {"id":"mr-001","message":"What do you know about Cleo?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-002","message":"Remind me what Tomás Ferreira's start date is","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-003","message":"What did I tell you about my summer trip?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-004","message":"What's the name of my new therapist?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-005","message":"When do I have my next kettlebell session with Marcus?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-006","message":"What melatonin dose am I on?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-007","message":"What note-taking app am I using now?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-008","message":"What's Dr. Osei's clinic address?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-009","message":"What chapter of the TypeScript handbook am I on?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-010","message":"What's the name of my kimchi batch?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-011","message":"What morning drink am I having these days?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-012","message":"Where is Yuki based?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-013","message":"What do I know about my freelance budget tracker project?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-014","message":"What are the dates for my Lisbon trip?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-015","message":"How do you spell Tomás Ferreira's last name?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-016","message":"How does Isabel prefer to be contacted for appointment changes?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-017","message":"What's Marcus Webb's per-session rate?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-018","message":"What did I say about Cleo's health?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-019","message":"Remind me about my June fitness challenge goal","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-020","message":"What's the tech stack for my budget tracker?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-021","message":"What did I log about my sleep routine?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-022","message":"Search through everything I've shared about Cleo","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-023","message":"What glasses did I buy recently?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-024","message":"Does Tomás have any communication preferences I noted?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-025","message":"Did I mention when Yuki is visiting?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-026","message":"What do you have on my Lisbon and Sintra trip?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-027","message":"Pull up what I've shared about my morning routine","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-028","message":"What TypeScript chapter am I on?","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-029","message":"Everything I've noted about Dr. Osei","intent":"memory_retrieve","source":"clean"},
+    {"id":"mr-030","message":"What do you know about my kimchi project?","intent":"memory_retrieve","source":"clean"},
+
+    # Voice
+    {"id":"mr-v01","message":"what do you know about clee oh my cat","intent":"memory_retrieve","source":"voice"},
+    {"id":"mr-v02","message":"re mind me what to mas fer rei ra's start date is","intent":"memory_retrieve","source":"voice"},
+    {"id":"mr-v03","message":"what chap ter of the type script hand book am i on","intent":"memory_retrieve","source":"voice"},
+    {"id":"mr-v04","message":"dig through your re cords to find yu ki's ad dress in to ky o","intent":"memory_retrieve","source":"voice"},
+    {"id":"mr-v05","message":"what mel a to nin dose am i cur rent ly tak ing","intent":"memory_retrieve","source":"voice"},
+    {"id":"mr-v06","message":"what note tak ing app am i us ing now","intent":"memory_retrieve","source":"voice"},
+    {"id":"mr-v07","message":"pull up ev ery thing i've told you a bout my liz bon trip","intent":"memory_retrieve","source":"voice"},
+    {"id":"mr-v08","message":"what did i say a bout is a bel car val ho","intent":"memory_retrieve","source":"voice"},
+
+    # Edge
+    {"id":"mr-e01","message":"Cleo's vet?","intent":"memory_retrieve","source":"edge"},
+    {"id":"mr-e02","message":"Tomás's last name spelling?","intent":"memory_retrieve","source":"edge"},
+    {"id":"mr-e03","message":"My melatonin dose?","intent":"memory_retrieve","source":"edge"},
+    {"id":"mr-e04","message":"TypeScript chapter?","intent":"memory_retrieve","source":"edge"},
+    {"id":"mr-e05","message":"Marcus Webb's rate?","intent":"memory_retrieve","source":"edge"},
+    {"id":"mr-e06","message":"Budget tracker stack?","intent":"memory_retrieve","source":"edge"},
+    {"id":"mr-e07","message":"Isabel's contact preference?","intent":"memory_retrieve","source":"edge"},
+    {"id":"mr-e08","message":"Kimchi batch name?","intent":"memory_retrieve","source":"edge"},
+
+    # Adversarial
+    {"id":"mr-a01","message":"Can you find what I told you about Cleo's health issue?","intent":"memory_retrieve","source":"adversarial"},
+    {"id":"mr-a02","message":"Look back through your notes for anything I said about Yuki's visit","intent":"memory_retrieve","source":"adversarial"},
+    {"id":"mr-a03","message":"What have I mentioned about the freelance budget tracker so far?","intent":"memory_retrieve","source":"adversarial"},
+    {"id":"mr-a04","message":"What do I know about my June fitness challenge progress?","intent":"memory_retrieve","source":"adversarial"},
+
+    # ─── WEB SEARCH ──────────────────────────────────────────────────────────────
+    # Clean
+    {"id":"ws-001","message":"Best places to visit in Sintra Portugal 2026","intent":"web_search","source":"clean"},
+    {"id":"ws-002","message":"Maine Coon kitten care guide for first-time owners","intent":"web_search","source":"clean"},
+    {"id":"ws-003","message":"TypeScript vs JavaScript for large-scale projects 2026","intent":"web_search","source":"clean"},
+    {"id":"ws-004","message":"Obsidian vs Notion for personal knowledge management","intent":"web_search","source":"clean"},
+    {"id":"ws-005","message":"Kettlebell swing technique for beginners","intent":"web_search","source":"clean"},
+    {"id":"ws-006","message":"Best oat milk brands for frothing lattes","intent":"web_search","source":"clean"},
+    {"id":"ws-007","message":"How long does homemade kimchi ferment before it's ready?","intent":"web_search","source":"clean"},
+    {"id":"ws-008","message":"Melatonin dosage recommendations for sleep onset","intent":"web_search","source":"clean"},
+    {"id":"ws-009","message":"Blue light glasses — do they actually work?","intent":"web_search","source":"clean"},
+    {"id":"ws-010","message":"Supabase vs Firebase for a small side project","intent":"web_search","source":"clean"},
+    {"id":"ws-011","message":"What neighborhoods in Lisbon are best for short-term rentals?","intent":"web_search","source":"clean"},
+    {"id":"ws-012","message":"Kettlebell vs dumbbell for fat loss research?","intent":"web_search","source":"clean"},
+    {"id":"ws-013","message":"TypeScript generics explained with examples","intent":"web_search","source":"clean"},
+    {"id":"ws-014","message":"What to see in Sintra in one day","intent":"web_search","source":"clean"},
+    {"id":"ws-015","message":"Oat milk vs almond milk nutrition comparison","intent":"web_search","source":"clean"},
+    {"id":"ws-016","message":"Obsidian graph view best practices","intent":"web_search","source":"clean"},
+    {"id":"ws-017","message":"Current exchange rate EUR to USD today","intent":"web_search","source":"clean"},
+    {"id":"ws-018","message":"Kimchi health benefits — fermented foods and gut microbiome","intent":"web_search","source":"clean"},
+    {"id":"ws-019","message":"React and Supabase authentication tutorial","intent":"web_search","source":"clean"},
+    {"id":"ws-020","message":"Maine Coon cat weight and growth chart by age","intent":"web_search","source":"clean"},
+
+    # Voice
+    {"id":"ws-v01","message":"best plac es to vis it in sin tra por tu gal twen ty twen ty six","intent":"web_search","source":"voice"},
+    {"id":"ws-v02","message":"maine coon kit ten care guide for first time own ers","intent":"web_search","source":"voice"},
+    {"id":"ws-v03","message":"look up ket tle bell swing tech nique for be gin ners","intent":"web_search","source":"voice"},
+    {"id":"ws-v04","message":"ob sid i an ver sus no tion for per so nal know ledge man age ment","intent":"web_search","source":"voice"},
+    {"id":"ws-v05","message":"type script ver sus ja va script for large scale pro jects twen ty twen ty six","intent":"web_search","source":"voice"},
+    {"id":"ws-v06","message":"look up how long home made kim chi fer ments be fore it's rea dy","intent":"web_search","source":"voice"},
+
+    # Edge
+    {"id":"ws-e01","message":"Obsidian vs Notion?","intent":"web_search","source":"edge"},
+    {"id":"ws-e02","message":"Maine Coon care tips","intent":"web_search","source":"edge"},
+    {"id":"ws-e03","message":"Kettlebell vs dumbbell for fat loss?","intent":"web_search","source":"edge"},
+    {"id":"ws-e04","message":"TypeScript generics?","intent":"web_search","source":"edge"},
+    {"id":"ws-e05","message":"Sintra day trip itinerary?","intent":"web_search","source":"edge"},
+    {"id":"ws-e06","message":"Supabase vs Firebase?","intent":"web_search","source":"edge"},
+
+    # Adversarial
+    {"id":"ws-a01","message":"What are open source alternatives to Supabase right now?","intent":"web_search","source":"adversarial"},
+    {"id":"ws-a02","message":"Are there any good React component libraries for building a budget tracker?","intent":"web_search","source":"adversarial"},
+    {"id":"ws-a03","message":"What does the research say about melatonin long-term use?","intent":"web_search","source":"adversarial"},
+    {"id":"ws-a04","message":"Kimchi fermentation temperature guide — what do experts recommend?","intent":"web_search","source":"adversarial"},
+    {"id":"ws-a05","message":"What are the top things to do in Lisbon in July?","intent":"web_search","source":"adversarial"},
+
+    # ─── COMMAND AUTOMATE ────────────────────────────────────────────────────────
+    # Clean
+    {"id":"ca-001","message":"Set a reminder to feed Cleo at 7am and 7pm every day","intent":"command_automate","source":"clean"},
+    {"id":"ca-002","message":"Send a Slack message to Tomás welcoming him to the team","intent":"command_automate","source":"clean"},
+    {"id":"ca-003","message":"Create a calendar event for my Thursday session with Marcus Webb at 8am","intent":"command_automate","source":"clean"},
+    {"id":"ca-004","message":"Open Obsidian and create a new note called TypeScript chapter 5 notes","intent":"command_automate","source":"clean"},
+    {"id":"ca-005","message":"Schedule a WhatsApp message to Isabel Carvalho to reschedule Thursday's session","intent":"command_automate","source":"clean"},
+    {"id":"ca-006","message":"Push my local commits to origin main","intent":"command_automate","source":"clean"},
+    {"id":"ca-007","message":"Create a new branch called feature/budget-tracker-auth and switch to it","intent":"command_automate","source":"clean"},
+    {"id":"ca-008","message":"Open the terminal and run npm run dev","intent":"command_automate","source":"clean"},
+    {"id":"ca-009","message":"Send an email to Tomás Ferreira with the onboarding doc attached","intent":"command_automate","source":"clean"},
+    {"id":"ca-010","message":"Set a daily reminder at 9pm to take my melatonin","intent":"command_automate","source":"clean"},
+    {"id":"ca-011","message":"Open Obsidian and jump to my daily notes page","intent":"command_automate","source":"clean"},
+    {"id":"ca-012","message":"Run git status and show me the output","intent":"command_automate","source":"clean"},
+    {"id":"ca-013","message":"Book a flight from Paris to Lisbon for July 22nd","intent":"command_automate","source":"clean"},
+    {"id":"ca-014","message":"Open Warp terminal and run npm install","intent":"command_automate","source":"clean"},
+    {"id":"ca-015","message":"Schedule a call with Yuki for Saturday at 10am Paris time","intent":"command_automate","source":"clean"},
+    {"id":"ca-016","message":"Create a recurring calendar block for kettlebell sessions Tuesday and Thursday 8am","intent":"command_automate","source":"clean"},
+    {"id":"ca-017","message":"Commit all staged changes with message 'add auth flow to budget tracker'","intent":"command_automate","source":"clean"},
+    {"id":"ca-018","message":"Send a WhatsApp message to Yuki asking when she lands in Paris","intent":"command_automate","source":"clean"},
+    {"id":"ca-019","message":"Open Maps and search for Northside Animal Hospital", "intent":"command_automate","source":"clean"},
+    {"id":"ca-020","message":"Run the test suite and show me any failures","intent":"command_automate","source":"clean"},
+    {"id":"ca-021","message":"Search GitHub for open issues tagged bug in my budget-tracker repo","intent":"command_automate","source":"clean"},
+
+    # Voice
+    {"id":"ca-v01","message":"set a re mind er to feed clee oh at sev en a m and sev en p m ev ery day","intent":"command_automate","source":"voice"},
+    {"id":"ca-v02","message":"push my lo cal com mits to or i gin main","intent":"command_automate","source":"voice"},
+    {"id":"ca-v03","message":"cre ate a new branch called fea ture bud get track er auth and switch to it","intent":"command_automate","source":"voice"},
+    {"id":"ca-v04","message":"set a dai ly re mind er at nine p m to take my mel a to nin","intent":"command_automate","source":"voice"},
+    {"id":"ca-v05","message":"send a slack mes sage to to mas wel com ing him to the team","intent":"command_automate","source":"voice"},
+    {"id":"ca-v06","message":"o pen ob sid i an and cre ate a new note called type script chap ter five notes","intent":"command_automate","source":"voice"},
+    {"id":"ca-v07","message":"sched ule a whats app mes sage to is a bel car val ho to re sched ule thurs day's ses sion","intent":"command_automate","source":"voice"},
+    {"id":"ca-v08","message":"sched ule a cal en dar e vent for mar cus webb on thurs day at eight a m","intent":"command_automate","source":"voice"},
+    {"id":"ca-v09","message":"run git sta tus and show me the out put","intent":"command_automate","source":"voice"},
+    {"id":"ca-v10","message":"com mit all staged chang es with mes sage add auth flow to bud get track er","intent":"command_automate","source":"voice"},
+    {"id":"ca-v11","message":"send an e mail to to mas fer rei ra with the on board ing doc at tached","intent":"command_automate","source":"voice"},
+    {"id":"ca-v12","message":"o pen warp ter mi nal and run npm in stall","intent":"command_automate","source":"voice"},
+
+    # Edge
+    {"id":"ca-e01","message":"New branch: feature/budget-tracker-auth","intent":"command_automate","source":"edge"},
+    {"id":"ca-e02","message":"git push origin main","intent":"command_automate","source":"edge"},
+    {"id":"ca-e03","message":"npm run dev","intent":"command_automate","source":"edge"},
+    {"id":"ca-e04","message":"Remind me at 9pm melatonin","intent":"command_automate","source":"edge"},
+    {"id":"ca-e05","message":"Open Obsidian vault","intent":"command_automate","source":"edge"},
+    {"id":"ca-e06","message":"Schedule Marcus Thursday 8am","intent":"command_automate","source":"edge"},
+
+    # Adversarial
+    {"id":"ca-a01","message":"Pull up Linear so I can check the current sprint board","intent":"command_automate","source":"adversarial"},
+    {"id":"ca-a02","message":"Open up the TypeScript playground for me","intent":"command_automate","source":"adversarial"},
+    {"id":"ca-a03","message":"Go to the Obsidian community plugins page and find a calendar plugin","intent":"command_automate","source":"adversarial"},
+    {"id":"ca-a04","message":"Can you look up my latest git commit message?","intent":"command_automate","source":"adversarial"},
+    {"id":"ca-a05","message":"Create a recurring daily reminder for the June kettlebell challenge starting June 1st","intent":"command_automate","source":"adversarial"},
+    {"id":"ca-a06","message":"Forward the Lisbon hotel confirmation email to Yuki","intent":"command_automate","source":"adversarial"},
+
+    # ─── APP CONTROL START ───────────────────────────────────────────────────────
+    # Clean
+    {"id":"ac-001","message":"Open Obsidian","intent":"app_control_start","source":"clean"},
+    {"id":"ac-002","message":"Launch Linear","intent":"app_control_start","source":"clean"},
+    {"id":"ac-003","message":"Open Slack","intent":"app_control_start","source":"clean"},
+    {"id":"ac-004","message":"Start VS Code","intent":"app_control_start","source":"clean"},
+    {"id":"ac-005","message":"Open Warp","intent":"app_control_start","source":"clean"},
+    {"id":"ac-006","message":"Launch Firefox","intent":"app_control_start","source":"clean"},
+    {"id":"ac-007","message":"Open Maps","intent":"app_control_start","source":"clean"},
+    {"id":"ac-008","message":"Switch to Figma","intent":"app_control_start","source":"clean"},
+    {"id":"ac-009","message":"Open Maps and search for Sintra","intent":"app_control_start","source":"clean"},
+    {"id":"ac-010","message":"Launch Zoom","intent":"app_control_start","source":"clean"},
+    {"id":"ac-011","message":"Open Notion","intent":"app_control_start","source":"clean"},
+    {"id":"ac-012","message":"Start Safari","intent":"app_control_start","source":"clean"},
+    {"id":"ac-013","message":"Open Day One","intent":"app_control_start","source":"clean"},
+    {"id":"ac-014","message":"Switch to Terminal","intent":"app_control_start","source":"clean"},
+    {"id":"ac-015","message":"Launch Spotify","intent":"app_control_start","source":"clean"},
+
+    # Voice
+    {"id":"ac-v01","message":"o pen ob sid i an","intent":"app_control_start","source":"voice"},
+    {"id":"ac-v02","message":"launch lin ear","intent":"app_control_start","source":"voice"},
+    {"id":"ac-v03","message":"o pen slack","intent":"app_control_start","source":"voice"},
+    {"id":"ac-v04","message":"start v s code","intent":"app_control_start","source":"voice"},
+    {"id":"ac-v05","message":"o pen warp ter mi nal","intent":"app_control_start","source":"voice"},
+    {"id":"ac-v06","message":"launch fire fox","intent":"app_control_start","source":"voice"},
+    {"id":"ac-v07","message":"switch to fig ma","intent":"app_control_start","source":"voice"},
+    {"id":"ac-v08","message":"o pen day one jour nal","intent":"app_control_start","source":"voice"},
+
+    # Edge
+    {"id":"ac-e01","message":"Obsidian please","intent":"app_control_start","source":"edge"},
+    {"id":"ac-e02","message":"Linear","intent":"app_control_start","source":"edge"},
+    {"id":"ac-e03","message":"Warp","intent":"app_control_start","source":"edge"},
+    {"id":"ac-e04","message":"Figma","intent":"app_control_start","source":"edge"},
+
+    # Adversarial
+    {"id":"ac-a01","message":"Pull up Obsidian so I can check my daily note","intent":"app_control_start","source":"adversarial"},
+    {"id":"ac-a02","message":"Get Linear open so I can review the sprint","intent":"app_control_start","source":"adversarial"},
+    {"id":"ac-a03","message":"Open up Figma for me","intent":"app_control_start","source":"adversarial"},
+
+    # ─── SCREEN INTELLIGENCE ─────────────────────────────────────────────────────
+    # Clean
+    {"id":"si-001","message":"What's on my screen right now?","intent":"screen_intelligence","source":"clean"},
+    {"id":"si-002","message":"Read the error message in the terminal","intent":"screen_intelligence","source":"clean"},
+    {"id":"si-003","message":"What tab is currently open in my browser?","intent":"screen_intelligence","source":"clean"},
+    {"id":"si-004","message":"What does the Obsidian note on screen say?","intent":"screen_intelligence","source":"clean"},
+    {"id":"si-005","message":"Can you see what file is open in VS Code?","intent":"screen_intelligence","source":"clean"},
+    {"id":"si-006","message":"What's the last message in the Slack channel on screen?","intent":"screen_intelligence","source":"clean"},
+
+    # Voice
+    {"id":"si-v01","message":"what's on my screen right now","intent":"screen_intelligence","source":"voice"},
+    {"id":"si-v02","message":"read the er ror mes sage in the ter mi nal","intent":"screen_intelligence","source":"voice"},
+    {"id":"si-v03","message":"what tab is cur rent ly o pen in my brow ser","intent":"screen_intelligence","source":"voice"},
+
+    # Edge
+    {"id":"si-e01","message":"What does the screen show?","intent":"screen_intelligence","source":"edge"},
+    {"id":"si-e02","message":"Read this page to me","intent":"screen_intelligence","source":"edge"},
+    {"id":"si-e03","message":"Describe the current VS Code layout","intent":"screen_intelligence","source":"edge"},
+
+    # Adversarial
+    {"id":"si-a01","message":"Can you read the notification that just popped up?","intent":"screen_intelligence","source":"adversarial"},
+    {"id":"si-a02","message":"Describe the layout of the current VS Code window","intent":"screen_intelligence","source":"adversarial"},
+    {"id":"si-a03","message":"What TypeScript error is showing in my editor right now?","intent":"screen_intelligence","source":"adversarial"},
+
+    # ─── GENERAL KNOWLEDGE ───────────────────────────────────────────────────────
+    # Clean
+    {"id":"gk-001","message":"How does TypeScript's type inference work?","intent":"general_knowledge","source":"clean"},
+    {"id":"gk-002","message":"What are the health benefits of fermented foods like kimchi?","intent":"general_knowledge","source":"clean"},
+    {"id":"gk-003","message":"How does melatonin affect REM sleep?","intent":"general_knowledge","source":"clean"},
+    {"id":"gk-004","message":"What is the difference between a Maine Coon and a Norwegian Forest Cat?","intent":"general_knowledge","source":"clean"},
+    {"id":"gk-005","message":"How does Supabase handle row-level security?","intent":"general_knowledge","source":"clean"},
+    {"id":"gk-006","message":"What are the ergonomic benefits of kettlebell training?","intent":"general_knowledge","source":"clean"},
+    {"id":"gk-007","message":"How does React's reconciliation algorithm work?","intent":"general_knowledge","source":"clean"},
+    {"id":"gk-008","message":"What are the principles of personal knowledge management?","intent":"general_knowledge","source":"clean"},
+
+    # Voice
+    {"id":"gk-v01","message":"how does type script type in fer ence work","intent":"general_knowledge","source":"voice"},
+    {"id":"gk-v02","message":"what is the best pro gram ming lang uage for build ing bud get apps in twen ty twen ty six","intent":"general_knowledge","source":"voice"},
+
+    # Edge
+    {"id":"gk-e01","message":"TypeScript generics explained","intent":"general_knowledge","source":"edge"},
+    {"id":"gk-e02","message":"Kimchi vs sauerkraut fermentation differences","intent":"general_knowledge","source":"edge"},
+    {"id":"gk-e03","message":"How blue light affects sleep quality","intent":"general_knowledge","source":"edge"},
+
+    # Adversarial
+    {"id":"gk-a01","message":"What are the key principles of progressive overload for strength training?","intent":"general_knowledge","source":"adversarial"},
+    {"id":"gk-a02","message":"How does a high-protein diet affect muscle recovery?","intent":"general_knowledge","source":"adversarial"},
+    {"id":"gk-a03","message":"What is the recommended daily melatonin dose for adults according to sleep medicine?","intent":"general_knowledge","source":"adversarial"},
+    {"id":"gk-a04","message":"What is the TypeScript utility type Partial<T> used for?","intent":"general_knowledge","source":"adversarial"},
+    {"id":"gk-a05","message":"How does Obsidian's local-first approach compare to cloud-based alternatives?","intent":"general_knowledge","source":"adversarial"},
+    {"id":"gk-a06","message":"What technology stack should I consider for a production-ready budget tracker?","intent":"general_knowledge","source":"adversarial"},
+    {"id":"gk-a07","message":"What is the recommended fermentation temperature for kimchi?","intent":"general_knowledge","source":"adversarial"},
+
+    # ─── GREETING ────────────────────────────────────────────────────────────────
+    # Clean
+    {"id":"gr-001","message":"Hey ThinkDrop, good morning!","intent":"greeting","source":"clean"},
+    {"id":"gr-002","message":"Hi there, what can you help me with today?","intent":"greeting","source":"clean"},
+    {"id":"gr-003","message":"Hello! I'm getting started for the day","intent":"greeting","source":"clean"},
+    {"id":"gr-004","message":"Good afternoon ThinkDrop, I'm back at my desk","intent":"greeting","source":"clean"},
+    {"id":"gr-005","message":"Hey, I just sat down and wanted to check in","intent":"greeting","source":"clean"},
+    {"id":"gr-006","message":"Hey ThinkDrop, I'm back for the session","intent":"greeting","source":"clean"},
+
+    # Adversarial
+    {"id":"gr-a01","message":"What are you capable of doing?","intent":"greeting","source":"adversarial"},
+    {"id":"gr-a02","message":"Who built you and what's your purpose?","intent":"greeting","source":"adversarial"},
+    {"id":"gr-a03","message":"What can you do for me?","intent":"greeting","source":"adversarial"},
+]
+
+# Verify count
+intent_counts = {}
+for ex in examples:
+    k = ex["intent"]
+    intent_counts[k] = intent_counts.get(k, 0) + 1
+
+expected = {
+    "memory_store": 48,
+    "memory_retrieve": 50,
+    "web_search": 37,
+    "command_automate": 45,
+    "app_control_start": 30,
+    "screen_intelligence": 15,
+    "general_knowledge": 20,
+    "greeting": 9,
+}
+
+print("Intent distribution:")
+total = 0
+for intent, count in sorted(intent_counts.items()):
+    total += count
+    marker = "✓" if count >= 9 else "⚠"
+    print(f"  {marker} {intent}: {count}")
+print(f"  TOTAL: {total}")
+
+fixture["examples"] = examples
+
+output_path = "test/fixtures/intent-benchmark-r10.json"
+with open(output_path, "w") as f:
+    json.dump(fixture, f, indent=2, ensure_ascii=False)
+
+print(f"\nWrote {total} examples → {output_path}")

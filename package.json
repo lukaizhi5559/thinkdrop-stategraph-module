@@ -7,7 +7,12 @@
   "scripts": {
     "test": "node test/intent-classifier.test.js",
     "test:unit": "node test/unit.test.js",
-    "test:full": "node test/full-stategraph.test.js"
+    "test:full": "node test/full-stategraph.test.js",
+    "bench": "node test/intent-bench.js",
+    "bench:offline": "node test/intent-bench.js --offline",
+    "bench:failures": "node test/intent-bench.js --failures",
+    "bench:gen": "node test/gen-bench-data.js",
+    "bench:both": "node test/intent-bench.js --dataset=both"
   },
   "keywords": [
     "workflow",

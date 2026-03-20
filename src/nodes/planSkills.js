@@ -1298,17 +1298,18 @@ CRITICAL rules for skill.md:
         return null;
       }
 
+      // Skip registry matching entirely when the LLM suggestion is a built-in skill
+      // (browser.act, shell.run, ui.*, etc.) — those don't have CLI/API providers and
+      // any keyword match would be spurious (e.g. 'slack' as an example word in the message).
+      // Declared here (outside if(regDir)) so it's also accessible in the dynamic-discovery block below.
+      const BUILTIN_SUGGESTIONS = new Set(['browser.act', 'shell.run', 'ui.axclick', 'ui.typetext', 'ui.click', 'ui.movemouse', 'ui.waitfor', 'ui.screen.verify']);
+      const suggestionIsBuiltin = BUILTIN_SUGGESTIONS.has((suggestion || '').toLowerCase());
+
       const regDir = findRegistryDir();
       if (regDir) {
         let cliRegistry = {}, apiRegistry = {};
         try { cliRegistry = JSON.parse(fs.readFileSync(path.join(regDir, 'cli-registry.json'), 'utf8')); } catch (_) {}
         try { apiRegistry = JSON.parse(fs.readFileSync(path.join(regDir, 'api-registry.json'), 'utf8')); } catch (_) {}
-
-        // Skip registry matching entirely when the LLM suggestion is a built-in skill
-        // (browser.act, shell.run, ui.*, etc.) — those don't have CLI/API providers and
-        // any keyword match would be spurious (e.g. 'slack' as an example word in the message).
-        const BUILTIN_SUGGESTIONS = new Set(['browser.act', 'shell.run', 'ui.axclick', 'ui.typetext', 'ui.click', 'ui.movemouse', 'ui.waitfor', 'ui.screen.verify']);
-        const suggestionIsBuiltin = BUILTIN_SUGGESTIONS.has((suggestion || '').toLowerCase());
 
         // Generic English words that appear in registry keywords but are too ambiguous
         // to use as scout triggers on their own (e.g. "todo" in "create a todo app",

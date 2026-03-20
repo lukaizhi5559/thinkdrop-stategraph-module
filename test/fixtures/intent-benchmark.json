@@ -1,0 +1,1718 @@
+{
+  "version": "1.0",
+  "description": "Intent benchmark dataset for ThinkDrop StateGraph — covers all 8 intents with clean, voice/ASR, edge-case, and adversarial examples",
+  "intents": [
+    "memory_store",
+    "memory_retrieve",
+    "web_search",
+    "command_automate",
+    "screen_intelligence",
+    "general_knowledge",
+    "greeting",
+    "app_control_start"
+  ],
+  "sources": {
+    "clean": "Well-formed, canonical inputs",
+    "voice": "Voice/ASR noise — typos, garbling, filler words, mishearing",
+    "edge": "Short, context-dependent, or structurally ambiguous",
+    "adversarial": "Looks like intent X but is actually intent Y"
+  },
+  "examples": [
+    {
+      "id": "ms-001",
+      "message": "I started cycling to work, my route is 8 miles along the Oak Street path",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-002",
+      "message": "Piano lessons are every Wednesday at 6pm, my teacher is Ms. Yuen",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-003",
+      "message": "Client Kenji Watanabe is a SaaS founder, our quarterly review is in May",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-004",
+      "message": "Save this: I went fully vegan starting January of this year",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-005",
+      "message": "My dog Biscuit's vet is Dr. Petrov, annual shots are due in September",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-006",
+      "message": "I'm learning Mandarin with the HelloHao app, thirty minutes each morning",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-007",
+      "message": "Note I'm targeting a 10:30pm bedtime every night going forward",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-008",
+      "message": "My freelance hourly rate is one hundred twenty dollars",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-009",
+      "message": "Store this: my emergency fund goal is fifteen thousand dollars",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-010",
+      "message": "Remember my sister Sofia's wedding is June 22nd, ceremony at St. Marks",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-011",
+      "message": "Record that I'm switching from coffee to matcha as of this month",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-012",
+      "message": "Note my security clearance renewal is due in Q4 this year",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-013",
+      "message": "My developer certificate expires in November, keep that on record",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-014",
+      "message": "I left off at Podcast Syntax episode 600 midway through, remember that",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-015",
+      "message": "My gym locker combination is four four two seven",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-016",
+      "message": "My therapist is Dr. Ling, sessions every Thursday at noon",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-017",
+      "message": "Started reading Deep Work last Tuesday, currently on page forty two",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-018",
+      "message": "My standing desk preferred height is forty two inches",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-019",
+      "message": "Log my weekly grocery budget target as one hundred eighty dollars",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-020",
+      "message": "My renter's insurance policy number is HM-983201",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-021",
+      "message": "Note that I started physical therapy for my knee, sessions every Monday and Friday",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-022",
+      "message": "My marathon training plan kicks off the first week of April",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-023",
+      "message": "Save this: I stopped intermittent fasting last week after three months",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-024",
+      "message": "Dad's retirement party is on April 12th, venue is the Harbor Grill",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-025",
+      "message": "Remember my new neighborhood parking permit number is ZX-4492",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-v01",
+      "message": "log I went vegan in jan you ary of this year",
+      "intent": "memory_store",
+      "source": "voice",
+      "notes": "January garbled"
+    },
+    {
+      "id": "ms-v02",
+      "message": "my therapist is doc ling every thursday at noon",
+      "intent": "memory_store",
+      "source": "voice",
+      "notes": "Dr. Ling phonetic"
+    },
+    {
+      "id": "ms-v03",
+      "message": "save um my freelance rate is one twenty an hour",
+      "intent": "memory_store",
+      "source": "voice",
+      "notes": "filler um"
+    },
+    {
+      "id": "ms-v04",
+      "message": "note to self my gym locker combo is four four two seven",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v05",
+      "message": "hey my marathon train ing kicks off first week of april",
+      "intent": "memory_store",
+      "source": "voice",
+      "notes": "training garbled"
+    },
+    {
+      "id": "ms-v06",
+      "message": "my dog biscuits vet is doctor petrov shots in september",
+      "intent": "memory_store",
+      "source": "voice",
+      "notes": "possessive dropped"
+    },
+    {
+      "id": "ms-v07",
+      "message": "log I'm learning man darin every day for thirty minutes",
+      "intent": "memory_store",
+      "source": "voice",
+      "notes": "Mandarin garbled"
+    },
+    {
+      "id": "ms-v08",
+      "message": "remember sofia's wedding is june twenty second at some church",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v09",
+      "message": "my piano class is every wednesday at uh six pm",
+      "intent": "memory_store",
+      "source": "voice",
+      "notes": "filler uh"
+    },
+    {
+      "id": "ms-v10",
+      "message": "save my emergency fund goal is fifteen k",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-e01",
+      "message": "I have a product strategy meeting with Kenji next Tuesday",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e02",
+      "message": "Follow-up with Dr. Petrov is in three weeks",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e03",
+      "message": "Write down everything I just told you",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e04",
+      "message": "Keep a note of all that",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e05",
+      "message": "Record the last thing I said",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e06",
+      "message": "Tuck that away somewhere",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e07",
+      "message": "I want to hold onto that information",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e08",
+      "message": "I'm Miguel",
+      "intent": "memory_store",
+      "source": "edge",
+      "notes": "Very short name declaration"
+    },
+    {
+      "id": "ms-e09",
+      "message": "Nadia Chen is my tax accountant",
+      "intent": "memory_store",
+      "source": "edge",
+      "notes": "Inverted form"
+    },
+    {
+      "id": "ms-e10",
+      "message": "Actually nope my matcha brand is Jade Leaf not Ippodo",
+      "intent": "memory_store",
+      "source": "edge",
+      "notes": "Correction with filler"
+    },
+    {
+      "id": "ms-a01",
+      "message": "I've had lower back pain every single day this week",
+      "intent": "memory_store",
+      "source": "adversarial",
+      "notes": "Health fact declaration not retrieve"
+    },
+    {
+      "id": "ms-a02",
+      "message": "Log this: the Kubernetes cluster crashed at 3am on the staging branch",
+      "intent": "memory_store",
+      "source": "adversarial",
+      "notes": "Technical content still a store request"
+    },
+    {
+      "id": "ms-a03",
+      "message": "I need to remember how I configured the CI pipeline in GitHub Actions",
+      "intent": "memory_store",
+      "source": "adversarial",
+      "notes": "Looks like retrieve intent but is a store instruction"
+    },
+    {
+      "id": "ms-a04",
+      "message": "Bookmark this job listing on LinkedIn for later review",
+      "intent": "memory_store",
+      "source": "adversarial",
+      "notes": "Looks like browse navigation but is storage"
+    },
+    {
+      "id": "ms-a05",
+      "message": "Note I'm upping my daily water intake to three liters starting today",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-001",
+      "message": "When is my next piano lesson?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-002",
+      "message": "What's my cycling route to work?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-003",
+      "message": "What do I know about client Kenji Watanabe?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-004",
+      "message": "Am I vegan now? Did I log that?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-005",
+      "message": "When are Biscuit's vet shots due?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-006",
+      "message": "What Mandarin app have I been using?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-007",
+      "message": "What time am I supposed to be in bed by?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-008",
+      "message": "What's my current freelance hourly rate?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-009",
+      "message": "What's my emergency fund savings goal?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-010",
+      "message": "When is my sister Sofia's wedding?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-011",
+      "message": "What podcast episode did I stop at?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-012",
+      "message": "What's my gym locker combination?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-013",
+      "message": "When is my next therapy appointment?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-014",
+      "message": "How far into Deep Work have I read?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-015",
+      "message": "What is my standing desk height setting?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-016",
+      "message": "What's my weekly grocery budget?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-017",
+      "message": "What's my renter's insurance policy number?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-018",
+      "message": "When do I have physical therapy sessions?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-019",
+      "message": "What does my marathon training schedule look like?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-020",
+      "message": "When is Dad's retirement party and where is it?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-021",
+      "message": "What medications have I logged as current?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-022",
+      "message": "What health information have you stored about me this week?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-023",
+      "message": "Who is my current therapist?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-024",
+      "message": "What's the parking permit number for my new neighborhood?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-025",
+      "message": "What personal finance goals have I stored?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-026",
+      "message": "Have I saved anything about my diet changes this year?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-027",
+      "message": "Tell me everything you know about client Kenji's business",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-028",
+      "message": "Show me all my upcoming personal events stored in memory",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-029",
+      "message": "What did I save about my standing desk preferences?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-030",
+      "message": "Did I note anything about my new bedtime routine?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-v01",
+      "message": "do you have anything on my piano schedule",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v02",
+      "message": "hey think drop pull up my freelance rate",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v03",
+      "message": "what meds do I have logged as current",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v04",
+      "message": "show me my recent notes and whatever I saved this week",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v05",
+      "message": "go through my logs to find when sofia's wedding is",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v06",
+      "message": "what did I save about biscuits vet appointments",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v07",
+      "message": "remind me when my next therapy session is",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v08",
+      "message": "whats my locker code again",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v09",
+      "message": "anything on my calendar coming up soon",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v10",
+      "message": "fetch everything you know about my training plan",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-e01",
+      "message": "list the times I've looked up home gym equipment",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e02",
+      "message": "give me the times I checked on my knee recovery progress",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e03",
+      "message": "how many matcha-related logs have I made this month",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e04",
+      "message": "how would you describe me based on what I've shared with you",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e05",
+      "message": "what does my recent diet history look like",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e06",
+      "message": "based on everything I've told you what are my health trends",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e07",
+      "message": "what was I focused on two Thursdays ago",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e08",
+      "message": "give me a brief overview of myself based on your stored data",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e09",
+      "message": "what was the very first thing you ever stored about me",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e10",
+      "message": "what have I told you about my sleep habits",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e11",
+      "message": "everything I've entered about fitness so far this year",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e12",
+      "message": "search my notes for anything about the marathon training",
+      "intent": "memory_retrieve",
+      "source": "edge",
+      "notes": "Has search but is a personal memory query"
+    },
+    {
+      "id": "mr-e13",
+      "message": "look through my records for anything about my renter's insurance",
+      "intent": "memory_retrieve",
+      "source": "edge",
+      "notes": "Has look through but is memory"
+    },
+    {
+      "id": "mr-e14",
+      "message": "look up what I have stored about my Mandarin study progress",
+      "intent": "memory_retrieve",
+      "source": "edge",
+      "notes": "Has look up could look like web_search"
+    },
+    {
+      "id": "mr-e15",
+      "message": "what do I have coming up in my schedule this weekend",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-a01",
+      "message": "dig through your memory for my security clearance renewal date",
+      "intent": "memory_retrieve",
+      "source": "adversarial",
+      "notes": "Has dig through but is a memory query"
+    },
+    {
+      "id": "mr-a02",
+      "message": "find my saved renter's insurance details",
+      "intent": "memory_retrieve",
+      "source": "adversarial",
+      "notes": "Has find but is memory not web"
+    },
+    {
+      "id": "mr-a03",
+      "message": "what podcasts have I been listening to lately",
+      "intent": "memory_retrieve",
+      "source": "adversarial",
+      "notes": "Personal listen history memory not web_search"
+    },
+    {
+      "id": "mr-a04",
+      "message": "which personal goals have I completed most recently",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a05",
+      "message": "do you know when I normally wrap up work in the evening",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-001",
+      "message": "Will it rain in Seattle this weekend?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-002",
+      "message": "What are the latest federal interest rate changes?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-003",
+      "message": "When does IKEA open on Sunday?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-004",
+      "message": "What is the population of Australia?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-005",
+      "message": "Best craft cocktail bars in New Orleans",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-006",
+      "message": "Live JPY to USD exchange rate",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-007",
+      "message": "What time is it right now in Auckland?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-008",
+      "message": "Direct flights from Boston to Lisbon in April",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-009",
+      "message": "What's new in the latest iOS 19 beta update?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-010",
+      "message": "Find me gluten-free pasta alternatives available right now",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-011",
+      "message": "What does the Google Pixel 9 Pro cost right now?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-012",
+      "message": "Surface Pro vs Dell XPS comparison 2026",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-013",
+      "message": "What live events are happening in Portland this weekend?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-014",
+      "message": "NBA championship betting odds this season",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-015",
+      "message": "Find a great sushi omakase restaurant in Los Angeles",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-v01",
+      "message": "what's the whether in seattle for this weekend",
+      "intent": "web_search",
+      "source": "voice",
+      "notes": "weather misheard as whether"
+    },
+    {
+      "id": "ws-v02",
+      "message": "search something about the federal interest rate news",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v03",
+      "message": "find me a good sushi spot near me",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v04",
+      "message": "how much does the pixel nine pro cost right now",
+      "intent": "web_search",
+      "source": "voice",
+      "notes": "Pixel 9 spoken as nine"
+    },
+    {
+      "id": "ws-v05",
+      "message": "hey look up best craft cocktail bars in new orleans",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-e01",
+      "message": "air quality index in LA today",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e02",
+      "message": "basketball scores tonight",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e03",
+      "message": "weekend forecast",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e04",
+      "message": "top-rated wireless earbuds under 150",
+      "intent": "web_search",
+      "source": "edge",
+      "notes": "Product search not browser navigation"
+    },
+    {
+      "id": "ws-a01",
+      "message": "look up the current humidity levels in Miami",
+      "intent": "web_search",
+      "source": "adversarial",
+      "notes": "look up also used for memory_retrieve but this is live weather"
+    },
+    {
+      "id": "ws-a02",
+      "message": "find recent research published on sleep deprivation effects",
+      "intent": "web_search",
+      "source": "adversarial",
+      "notes": "Current publications needs web not general_knowledge"
+    },
+    {
+      "id": "ws-a03",
+      "message": "search for anti-inflammatory meal prep ideas",
+      "intent": "web_search",
+      "source": "adversarial",
+      "notes": "Diet keyword appears in stored memory but this is a web search"
+    },
+    {
+      "id": "ca-001",
+      "message": "Post a LinkedIn announcement about our new product feature",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-002",
+      "message": "Create a tar.gz archive of my project directory and copy to the Desktop",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-003",
+      "message": "Set a recurring weekly team retrospective for Fridays at 4pm",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-004",
+      "message": "Set an alarm for Monday at 7:30am",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-005",
+      "message": "What is my GPU temperature right now?",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-006",
+      "message": "Archive the old Inbox folder and save it to the local drive",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-007",
+      "message": "Open Notion and jump to my daily notes page",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-008",
+      "message": "Scaffold a new FastAPI project with Docker support",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-009",
+      "message": "Kill the Node process and restart it fresh",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-010",
+      "message": "Set a 50-minute deep work focus timer",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-011",
+      "message": "Open Spotify and play my Deep Focus playlist",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-012",
+      "message": "Run npm install and then start the dev server",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-013",
+      "message": "Check if Python 3.13 is available as an update",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-014",
+      "message": "Message Alex the standup summary from today via Slack",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-015",
+      "message": "Rename all PDFs in this folder with today's date as prefix",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-016",
+      "message": "List all running Docker containers",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-017",
+      "message": "Move all video files from Downloads to the external drive",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-018",
+      "message": "What is my current disk read/write speed?",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-019",
+      "message": "Navigate to linear.app and open my active sprint board",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-020",
+      "message": "Initialize a new Git repository in this folder",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-021",
+      "message": "Generate a new GPG key for my work email",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-022",
+      "message": "Block off Thursday afternoon on my calendar as focus time",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-023",
+      "message": "Delete all files in the temp folder that are older than 30 days",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-024",
+      "message": "Convert all PNGs in this directory to WebP format",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-025",
+      "message": "Open iTerm and run the full integration test suite",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-v01",
+      "message": "post a linked in announcement about our new feature",
+      "intent": "command_automate",
+      "source": "voice",
+      "notes": "LinkedIn garbled"
+    },
+    {
+      "id": "ca-v02",
+      "message": "open no shun and jump to my daily notes",
+      "intent": "command_automate",
+      "source": "voice",
+      "notes": "Notion garbled"
+    },
+    {
+      "id": "ca-v03",
+      "message": "set a fifty minute deep work timer",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v04",
+      "message": "ping alex with today's stand up notes uh via slack",
+      "intent": "command_automate",
+      "source": "voice",
+      "notes": "filler uh"
+    },
+    {
+      "id": "ca-v05",
+      "message": "what's my g p u temperature right now",
+      "intent": "command_automate",
+      "source": "voice",
+      "notes": "GPU spelled out"
+    },
+    {
+      "id": "ca-v06",
+      "message": "kill the node process and re start it",
+      "intent": "command_automate",
+      "source": "voice",
+      "notes": "restart split"
+    },
+    {
+      "id": "ca-v07",
+      "message": "navigate to linear dot app and open my sprint",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v08",
+      "message": "run npm in stall and start the dev server",
+      "intent": "command_automate",
+      "source": "voice",
+      "notes": "install garbled"
+    },
+    {
+      "id": "ca-v09",
+      "message": "I need you to close this terminal and open a fresh one",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v10",
+      "message": "scaffold me a new fast API project",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-e01",
+      "message": "Ping me at 6pm today",
+      "intent": "command_automate",
+      "source": "edge",
+      "notes": "Short automation request"
+    },
+    {
+      "id": "ca-e02",
+      "message": "Spin it up",
+      "intent": "command_automate",
+      "source": "edge",
+      "notes": "Requires prior context"
+    },
+    {
+      "id": "ca-e03",
+      "message": "Ship it",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e04",
+      "message": "Send Jamie the notes from our last call",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e05",
+      "message": "Hold this slot on my calendar",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e06",
+      "message": "How much swap memory do I have left?",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e07",
+      "message": "Wake me up at quarter past six tomorrow",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-a01",
+      "message": "Stream Dune Part Two on Apple TV this evening",
+      "intent": "command_automate",
+      "source": "adversarial",
+      "notes": "Media navigation not web_search"
+    },
+    {
+      "id": "ca-a02",
+      "message": "Open up a Python cheat sheet for me",
+      "intent": "command_automate",
+      "source": "adversarial",
+      "notes": "Could look like web_search is navigation"
+    },
+    {
+      "id": "ca-a03",
+      "message": "Take me to my Linear board",
+      "intent": "command_automate",
+      "source": "adversarial",
+      "notes": "Navigate command not web_search"
+    },
+    {
+      "id": "ca-a04",
+      "message": "Go to shopify.com and check my active orders",
+      "intent": "command_automate",
+      "source": "adversarial",
+      "notes": "Has go to navigation not web_search"
+    },
+    {
+      "id": "si-001",
+      "message": "What browser window is currently active on my screen?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-002",
+      "message": "Summarize the file I currently have open in VS Code",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-003",
+      "message": "Are there any status bar alerts visible right now?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-004",
+      "message": "Tell me what settings panel is currently showing on screen",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-005",
+      "message": "Read the toast notification at the bottom of the screen",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-006",
+      "message": "What function am I currently editing in my code editor?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-007",
+      "message": "What does the dialog box currently say?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-008",
+      "message": "Describe the analytics dashboard I have open right now",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-009",
+      "message": "What Slack message thread is currently visible on screen?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-010",
+      "message": "What's showing in the terminal window right now?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-011",
+      "message": "Read everything currently visible on this screen to me",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-012",
+      "message": "What system notification just appeared on my display?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-013",
+      "message": "Is there any highlighted text visible on screen right now?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-014",
+      "message": "Summarize the Jira ticket that is currently open in front of me",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-015",
+      "message": "What does the current warning prompt say?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-v01",
+      "message": "hey what is showing on my monitor right now",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v02",
+      "message": "describe what's visible on this screen for me",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v03",
+      "message": "read that error message aloud for me please",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v04",
+      "message": "what's open in my editor right now",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v05",
+      "message": "give me a summary of the page I'm currently looking at",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-e01",
+      "message": "What's that say?",
+      "intent": "screen_intelligence",
+      "source": "edge",
+      "notes": "Very short needs visible screen context"
+    },
+    {
+      "id": "si-e02",
+      "message": "Read this to me",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e03",
+      "message": "What am I looking at?",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e04",
+      "message": "What's that error?",
+      "intent": "screen_intelligence",
+      "source": "edge",
+      "notes": "Error on screen needs screen context"
+    },
+    {
+      "id": "si-a01",
+      "message": "What is currently on my screen?",
+      "intent": "screen_intelligence",
+      "source": "adversarial",
+      "notes": "Could be memory_retrieve but screen_intelligence is correct"
+    },
+    {
+      "id": "si-a02",
+      "message": "What is the terminal window currently outputting?",
+      "intent": "screen_intelligence",
+      "source": "adversarial",
+      "notes": "Read screen not memory_retrieve"
+    },
+    {
+      "id": "gk-001",
+      "message": "How does mRNA vaccine technology work?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-002",
+      "message": "What was the Marshall Plan?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-003",
+      "message": "Can you explain recursion in programming?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-004",
+      "message": "Why does the sky turn red at sunset?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-005",
+      "message": "What does the word petrichor mean?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-006",
+      "message": "How do you say good morning in Swahili?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-007",
+      "message": "What does ROI stand for?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-008",
+      "message": "What is Planck's constant?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-009",
+      "message": "How do linked lists work in data structures?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-010",
+      "message": "What are the common symptoms of vitamin D deficiency?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-011",
+      "message": "What is the difference between REST and GraphQL?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-012",
+      "message": "How does end-to-end encryption work?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-013",
+      "message": "What is survivorship bias?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-014",
+      "message": "Explain what containerization means in DevOps",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-015",
+      "message": "What is monetary policy in economics?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-016",
+      "message": "What is the difference between ACID and BASE in databases?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-017",
+      "message": "What is the most effective way to improve memory retention?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-018",
+      "message": "At what temperature does helium become a superfluid?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-019",
+      "message": "Who wrote Crime and Punishment?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-020",
+      "message": "What is the difference between a mutex and a semaphore?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-v01",
+      "message": "how does um mRNA vaccine tech actually work",
+      "intent": "general_knowledge",
+      "source": "voice",
+      "notes": "filler um"
+    },
+    {
+      "id": "gk-v02",
+      "message": "what is uh the difference between REST and GraphQL",
+      "intent": "general_knowledge",
+      "source": "voice",
+      "notes": "filler uh"
+    },
+    {
+      "id": "gk-v03",
+      "message": "explain recursion in program ing for me",
+      "intent": "general_knowledge",
+      "source": "voice",
+      "notes": "programming garbled"
+    },
+    {
+      "id": "gk-v04",
+      "message": "what is the difference between acid and base databases",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v05",
+      "message": "who wrote crime and punishment",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-e01",
+      "message": "What is the Byzantine Generals problem in distributed systems?",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e02",
+      "message": "Tell me more",
+      "intent": "general_knowledge",
+      "source": "edge",
+      "notes": "Ambiguous continuation general knowledge context"
+    },
+    {
+      "id": "gk-e03",
+      "message": "How exactly does that work?",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e04",
+      "message": "Can you recommend a good book on behavioral economics?",
+      "intent": "general_knowledge",
+      "source": "edge",
+      "notes": "Recommendation knowledge not memory-based"
+    },
+    {
+      "id": "gk-e05",
+      "message": "Which is faster for random access: an array or a linked list?",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-a01",
+      "message": "Is it theoretically possible for a human to run 50 miles in a day?",
+      "intent": "general_knowledge",
+      "source": "adversarial",
+      "notes": "Physical knowledge not live web data"
+    },
+    {
+      "id": "gk-a02",
+      "message": "What is the best general framework for making decisions under uncertainty?",
+      "intent": "general_knowledge",
+      "source": "adversarial",
+      "notes": "General knowledge not memory_retrieve"
+    },
+    {
+      "id": "gk-a03",
+      "message": "Can you walk me through how JavaScript promises work?",
+      "intent": "general_knowledge",
+      "source": "adversarial",
+      "notes": "Tech explanation not web_search"
+    },
+    {
+      "id": "gk-a04",
+      "message": "What year did I start at my current company?",
+      "intent": "memory_retrieve",
+      "source": "adversarial",
+      "notes": "ACTUALLY memory_retrieve personal fact not general knowledge"
+    },
+    {
+      "id": "gk-a05",
+      "message": "What is my nightly sleep target?",
+      "intent": "memory_retrieve",
+      "source": "adversarial",
+      "notes": "ACTUALLY memory_retrieve stored personal preference"
+    },
+    {
+      "id": "gr-001",
+      "message": "Good morning!",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-002",
+      "message": "Hello",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-003",
+      "message": "Howdy",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-004",
+      "message": "Hey, how are you?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-005",
+      "message": "Good evening",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-006",
+      "message": "Hello ThinkDrop, I'm back for the day",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-007",
+      "message": "Hope you're ready for today",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-008",
+      "message": "Hey hey, what's going on?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-009",
+      "message": "Good night",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-010",
+      "message": "Rise and shine",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-v01",
+      "message": "hey think drop I'm back for the day",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v02",
+      "message": "good morning how you doing today",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v03",
+      "message": "yo what up",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v04",
+      "message": "heyyy good to see ya",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v05",
+      "message": "sup",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "acs-001",
+      "message": "Take over Notion",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-002",
+      "message": "Start controlling Chrome",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-003",
+      "message": "App control mode on",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-004",
+      "message": "Exit control mode",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-005",
+      "message": "Control Slack",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-006",
+      "message": "Hand me control of this app",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-007",
+      "message": "Stop the control session",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-008",
+      "message": "Activate control mode now",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-009",
+      "message": "Seize control of Terminal",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-010",
+      "message": "Let me take charge of Excel",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "acs-v01",
+      "message": "take over notion for me",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "acs-v02",
+      "message": "exit control mode please",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "acs-v03",
+      "message": "start controlling chrome",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "acs-v04",
+      "message": "I want you to take over this app right now",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "acs-v05",
+      "message": "stop controlling this right now",
+      "intent": "app_control_start",
+      "source": "voice"
+    }
+  ]
+}

@@ -400,11 +400,21 @@ module.exports = async function retrieveMemory(state) {
   try {
     let dateRange = parseDateRange(resolvedMessage || message);
 
-    // If no dateRange and this is a short continuation (≤4 words like "anything else", "what else",
-    // "more", "go on"), inherit the dateRange from the most recent prior user message that had one.
-    // This makes follow-ups stay in the same temporal context as the prior query.
+    // If no dateRange and this is a short continuation, inherit the dateRange from the
+    // most recent prior user message that had one. This keeps follow-ups in the same
+    // temporal context (e.g. "can you give me times" after "yesterday what did I do").
+    //
+    // Guards — do NOT inherit for:
+    //   1. Profile/personality queries: "what's my name", "what type of person am I"
+    //      These should search all history, not be limited to a prior time window.
+    //   2. All-time / earliest-memory queries: "what's the first memory you have of me"
+    //   3. Messages longer than 12 words — they carry enough context for their own parse.
+    const PROFILE_QUERY_PATTERN = /^(what'?s|what is|who is|who'?s|where is)\s+(my|i am|am i)\b|^what (type|kind|sort) of (person|man|woman|human|individual)/i;
+    const ALL_TIME_QUERY_PATTERN = /\b(first|earliest|ever|all time|oldest|very first|all history)\b/i;
     const msgWords = (resolvedMessage || message).trim().split(/\s+/).filter(Boolean).length;
-    if (!dateRange && msgWords <= 8 && context?.sessionId) {
+    if (!dateRange && msgWords <= 12 && context?.sessionId &&
+        !PROFILE_QUERY_PATTERN.test(resolvedMessage || message) &&
+        !ALL_TIME_QUERY_PATTERN.test(resolvedMessage || message)) {
       try {
         const histResult = await mcpAdapter.callService('conversation', 'message.list', {
           sessionId: context.sessionId,

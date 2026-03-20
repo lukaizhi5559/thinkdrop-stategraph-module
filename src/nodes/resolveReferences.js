@@ -81,8 +81,9 @@ const ACTIVITY_VERBS = /\b(doing|working|using|looking|opening|open|running|edit
 
 // Heuristics to classify prior user message intent from its content
 const PRIOR_SCREEN_SIGNALS = /\b(screen|what do you see|what.*(on|in).*screen|what.*(visible|showing|displayed)|describe.*screen|analyze.*screen|look at.*screen)\b/i;
-const PRIOR_MEMORY_SIGNALS = /\b(was i|did i|have i|what did i|what apps|what sites|what files|history|activity|working on|looking at|mentioned|files|yesterday|last week|last night|last month|earlier today|this morning|what were (we|you)|what did (we|you)|list.*i|show.*i (did|used|worked|opened))\b/i;
-const PRIOR_COMMAND_SIGNALS = /\b(open|run|execute|create|make|delete|move|copy|click|press|type|scroll|launch|install|download|send|email|comment|add comment|post comment|review|attach|upload|push|pull request|pr|commit|merge|deploy|build|compile|test|lint|format|fix|patch|update|edit|write|generate|publish|release|tag|branch|checkout|clone|fork|star|watch|issue|ticket|task|assign|close|reopen|approve|reject|request changes)\b/i;
+const PRIOR_MEMORY_SIGNALS = /\b(was i|did i|have i|what did i|what apps|what sites|what files|history|activity|working on|looking at|mentioned|files|yesterday|last week|last night|last month|earlier today|this morning|what were (we|you)|what did (we|you)|list.*i|show.*i (did|used|worked|opened)|memories|memory|records|recall|my records|looking at my)\b/i;
+const PRIOR_COMMAND_SIGNALS = /\b(open|run|execute|create|make|delete|move|copy|click|press|type|scroll|launch|install|download|send|email|comment|add comment|post comment|review|attach|upload|push|pull request|pr|commit|merge|deploy|build|compile|test|lint|format|fix|patch|update|edit|write|generate|publish|release|tag|branch|checkout|clone|fork|star|issue|ticket|task|assign|close|reopen|approve|reject|request changes)\b/i;
+// NOTE: 'watch' intentionally excluded — it false-positives on media/movie phrasing (e.g. "watch die hard")
 // Browser automation signals — navigation to a specific site/app
 const PRIOR_BROWSER_SIGNALS = /\b(go to|goto|navigate to|open|launch|search.*on|ask.*on|type.*into|search.*in|search.*using|search.*via|search.*at)\b/i;
 

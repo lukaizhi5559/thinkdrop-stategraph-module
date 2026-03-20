@@ -1,0 +1,1679 @@
+{
+  "version": "1.0",
+  "round": 9,
+  "description": "Intent benchmark Round 9 — 274 fresh prompts, entirely new themes/personas. Tests generalization after all R7/R8 fixes. Zero overlap with Rounds 1-8.",
+  "intents": [
+    "memory_store",
+    "memory_retrieve",
+    "web_search",
+    "command_automate",
+    "screen_intelligence",
+    "general_knowledge",
+    "greeting",
+    "app_control_start"
+  ],
+  "sources": {
+    "clean": "Well-formed, canonical inputs",
+    "voice": "Voice/ASR noise — typos, garbling, filler words, mishearing",
+    "edge": "Short, context-dependent, or structurally ambiguous",
+    "adversarial": "Looks like intent X but is actually intent Y"
+  },
+  "themes": "Mochi (pet rabbit), Rafael Okonkwo (data engineer), Nina (friend/Prague), Dr. Singh (therapist), Priya (yoga instructor), September half marathon/Portugal, matcha morning routine, sourdough starter Bubbles, ADHD meds tracking, Figma to Penpot migration, Ghostwriter subscription, Uplift standing desk, Rust programming, Anki flashcards, Sam Torres (mechanic), Day One journaling",
+  "distribution": {
+    "memory_store": 50,
+    "memory_retrieve": 62,
+    "web_search": 27,
+    "command_automate": 46,
+    "screen_intelligence": 26,
+    "general_knowledge": 33,
+    "greeting": 15,
+    "app_control_start": 15,
+    "total": 274
+  },
+  "examples": [
+    {
+      "id": "ms-001",
+      "message": "I adopted a rabbit named Mochi last weekend, she's a Holland Lop and super friendly",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-002",
+      "message": "Rafael Okonkwo is joining our team as the new data engineer, he starts Monday",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-003",
+      "message": "My friend Nina just moved to Prague for a two-year expat assignment",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-004",
+      "message": "I started seeing Dr. Singh for therapy, sessions are every other Tuesday at 5pm",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-005",
+      "message": "Priya is my new yoga instructor at the studio on Oak Street, classes are Wednesday and Saturday",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-006",
+      "message": "I signed up for the September half marathon in Portugal, it's a 13.1 mile coastal route",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-007",
+      "message": "I have a matcha latte every morning now instead of coffee, switched two weeks ago",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-008",
+      "message": "My sourdough starter is named Bubbles, I've been feeding it every 12 hours",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-009",
+      "message": "I started taking Adderall 10mg for ADHD, prescribed by Dr. Singh last week",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-010",
+      "message": "Our design team is migrating from Figma to Penpot starting next sprint",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-011",
+      "message": "I subscribed to Ghostwriter for AI writing assistance, annual plan",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-012",
+      "message": "I'm flying to Lisbon in September for my Portugal trip, staying 10 days",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-013",
+      "message": "I got a new standing desk from Uplift, set it to 42 inches for standing height",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-014",
+      "message": "I'm learning Rust this quarter, working through the official Rust book chapter by chapter",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-015",
+      "message": "Rafael Okonkwo's last name is spelled O-K-O-N-K-W-O",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-016",
+      "message": "Sam Torres is my mechanic at the garage on 3rd Ave, reliable and fair on pricing",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-017",
+      "message": "I got Mochi from a Holland Lop breeder about 20 minutes outside the city",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-018",
+      "message": "I'm using Anki for memorizing Rust syntax and vocabulary, 20 cards per day",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-019",
+      "message": "My training plan for the half marathon is 4 runs per week, 16-week program",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-020",
+      "message": "I'm journaling every evening now using Day One, started this Monday",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-v01",
+      "message": "hey log that i got a rab bit named mo chi she is a hol land lop",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v02",
+      "message": "i signed up for the sep tem ber half mar a thon in por tu gal",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v03",
+      "message": "im learn ing rust this quar ter work ing through the of fi cial book",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v04",
+      "message": "ra fa el o kon kwo is my new da ta en gi neer start ing mon day",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v05",
+      "message": "i got mo chi from a hol land lop breed er out side the ci ty",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v06",
+      "message": "my sour dough start er is named bub bles i feed it ev ery twelve hours",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v07",
+      "message": "im do ing mat cha ev ery morn ing in stead of cof fee now",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v08",
+      "message": "pen pot in stead of fig ma now we're mi grat ing the whole team",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v09",
+      "message": "sam tor res is my go to per son for car re pairs and main te nance",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v10",
+      "message": "i start ed tak ing add er all ten mil li grams for A D H D last week",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-e01",
+      "message": "New rabbit: Mochi",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e02",
+      "message": "September Portugal trip, 10 days in Lisbon",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e03",
+      "message": "Penpot instead of Figma now",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e04",
+      "message": "401k, maxing contributions starting this month",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e05",
+      "message": "Rust programming, chapter 4 this week",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e06",
+      "message": "Matcha instead of coffee now",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e07",
+      "message": "Standing desk, 42 inches for standing",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e08",
+      "message": "Anki, 20 cards per day goal",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e09",
+      "message": "New data engineer: Rafael Okonkwo",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e10",
+      "message": "Backdoor Roth IRA, conversion this quarter",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-a01",
+      "message": "Log that Mochi had her first vet checkup today with Dr. Patel, all clear",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a02",
+      "message": "Remember that Nina's time zone in Prague is 6 hours ahead of me",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a03",
+      "message": "Note that Dr. Singh requires 24-hour notice to cancel sessions",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a04",
+      "message": "Keep in mind that Rafael needs access to the Snowflake data warehouse on day one",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a05",
+      "message": "I want to remember that the Portugal half marathon starts at 7am local time",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a06",
+      "message": "Save that Bubbles smells a bit sour right now, probably needs a discard",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a07",
+      "message": "Hey log that I just picked up my standing desk from the freight depot today",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a08",
+      "message": "Record that Sam Torres quoted me $340 for the full brake job",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a09",
+      "message": "Ghostwriter is my go-to tool for first drafts and blog posts now",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a10",
+      "message": "Don't let me forget that Priya does private yoga sessions for an extra fee on request",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-001",
+      "message": "What breed is Mochi?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-002",
+      "message": "Who is the new data engineer on our team?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-003",
+      "message": "What city did Nina move to?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-004",
+      "message": "When are my therapy sessions with Dr. Singh?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-005",
+      "message": "Where is the yoga studio Priya teaches at?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-006",
+      "message": "What half marathon am I signed up for?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-007",
+      "message": "What's my sourdough starter's name?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-008",
+      "message": "Do I have any notes on my ADHD medication?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-009",
+      "message": "What design tool is my team switching to?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-010",
+      "message": "Where am I going in September?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-011",
+      "message": "What height did I set my standing desk to?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-012",
+      "message": "What programming language am I learning this quarter?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-013",
+      "message": "How do I spell Rafael's last name?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-014",
+      "message": "Who's my mechanic?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-015",
+      "message": "What AI writing tool did I subscribe to?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-016",
+      "message": "Remind me about my Portugal trip details",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-017",
+      "message": "How many Anki cards am I doing per day?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-018",
+      "message": "What's my half marathon training schedule?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-019",
+      "message": "Remind me about Bubbles's feeding schedule",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-020",
+      "message": "What's the dose for my ADHD medication?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-021",
+      "message": "Who do I contact for data pipeline issues at work?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-022",
+      "message": "Who should I ask about our Penpot migration timeline?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-023",
+      "message": "Dig through your notes to find Nina's Prague address",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-024",
+      "message": "What do I know about my standing desk model?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-025",
+      "message": "Search through what I've shared about Mochi's health",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-026",
+      "message": "What day of the week is yoga with Priya?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-027",
+      "message": "How long is my Portugal trip?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-028",
+      "message": "What chapter of the Rust book am I on?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-029",
+      "message": "Remind me what I said about Sam Torres's pricing",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-030",
+      "message": "When did I start seeing Dr. Singh?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-031",
+      "message": "What journal app am I using now?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-032",
+      "message": "What did I say my daily matcha routine is?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-v01",
+      "message": "what breed is mo chi",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v02",
+      "message": "who is the new da ta en gi neer start ing mon day",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v03",
+      "message": "who do i ask for da ta pipe line is sues at work",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v04",
+      "message": "dig through your re cords to find ni na's a ddress in prague",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v05",
+      "message": "re mind me a bout my por tu gal trip de tails",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v06",
+      "message": "what pro gram ming lan guage am i learn ing this quar ter",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v07",
+      "message": "what is my sour dough start er named",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v08",
+      "message": "re mind me a bout bub bles feed ing sched ule",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v09",
+      "message": "who should i ask a bout the pen pot mi gra tion time line",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v10",
+      "message": "what height did I set my stand ing desk to",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-e01",
+      "message": "Mochi's breed?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e02",
+      "message": "Rafael's last name spelling?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e03",
+      "message": "My September trip destination?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e04",
+      "message": "Standing desk height?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e05",
+      "message": "Bubbles schedule?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e06",
+      "message": "Priya's class days?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e07",
+      "message": "Any notes on my ADHD meds?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e08",
+      "message": "What Rust chapter am I on?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-a01",
+      "message": "Search your memory for my half marathon training mileage this week",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a02",
+      "message": "Dig through your notes to find what I said about the Ghostwriter plan I picked",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a03",
+      "message": "Look back through what I've told you about Dr. Singh's cancellation policy",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a04",
+      "message": "Can you find what I told you about Mochi's first vet visit?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a05",
+      "message": "What did I say about Rafael's first day access requirements?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a06",
+      "message": "Is there anything in my notes about Sam Torres's quote for the brakes?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a07",
+      "message": "Tell me everything stored about my Anki deck progress",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a08",
+      "message": "Remind me about my 401k contribution plan this month",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a09",
+      "message": "Search your records for anything about Priya's private session rates",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a10",
+      "message": "Pull up what I said about the Uplift standing desk I ordered",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a11",
+      "message": "Look through your records for what I stored about Ghostwriter pricing",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a12",
+      "message": "What do you have stored about Bubbles's feeding routine?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-001",
+      "message": "Best half marathon training plans for first-timers in 2026",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-002",
+      "message": "Penpot vs Figma feature comparison 2026",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-003",
+      "message": "Ghostwriter AI writing tool pricing and review",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-004",
+      "message": "Best Anki decks for learning Rust programming",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-005",
+      "message": "Current ADHD medication options besides Adderall in 2026",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-006",
+      "message": "Uplift standing desk reviews and assembly tips",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-007",
+      "message": "September half marathons in Portugal or Spain 2026",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-008",
+      "message": "Holland Lop rabbit diet and care guide",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-009",
+      "message": "Current Rust programming language adoption trends 2026",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-010",
+      "message": "Sourdough starter hydration ratio — what do experts recommend?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-011",
+      "message": "Current 401k contribution limits for 2026",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-012",
+      "message": "Matcha latte vs coffee for ADHD focus — any research?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-v01",
+      "message": "search best half mar a thon train ing plans for first tim ers",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v02",
+      "message": "pen pot ver sus fig ma which is bet ter in twen ty twen ty six",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v03",
+      "message": "look up hol land lop rab bit care guide for new own ers",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-e01",
+      "message": "Penpot vs Figma?",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e02",
+      "message": "Current 401k limits 2026",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e03",
+      "message": "Holland Lop rabbit care tips",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-a01",
+      "message": "What are the current ADHD medication shortage updates in the US?",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a02",
+      "message": "Latest news on Lisbon travel advisories for September 2026",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a03",
+      "message": "Are there open source alternatives to Ghostwriter right now?",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a04",
+      "message": "Find the current Uplift desk sale page",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a05",
+      "message": "Look up Priya's yoga studio on Oak Street Yelp reviews",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a06",
+      "message": "Search for recent Rust vs Go benchmark comparisons",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a07",
+      "message": "Find race results for the Lisbon half marathon 2025",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a08",
+      "message": "What is the current resting heart rate zone 2 heart rate for a 32 year old?",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a09",
+      "message": "Search for sourdough hydration calculator tools online",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-001",
+      "message": "Commit all staged changes with message add sourdough tracking module",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-002",
+      "message": "Create a new folder called Portugal Trip on my Desktop",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-003",
+      "message": "Send a Slack message to Rafael Okonkwo welcoming him to the team",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-004",
+      "message": "Push my local commits to origin main",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-005",
+      "message": "Set a daily reminder at 7am to feed Bubbles",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-006",
+      "message": "Create a new branch called feature/rust-parser and switch to it",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-007",
+      "message": "Find all FIXME comments in the Rust source files",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-008",
+      "message": "Schedule a calendar event for Dr. Singh therapy at 5pm every other Tuesday",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-009",
+      "message": "Ping Rafael Okonkwo",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-010",
+      "message": "Run the test suite for the data pipeline with verbose output",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-011",
+      "message": "Move all JPEG files from Downloads to the Portugal Trip folder",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-012",
+      "message": "Kill the background process running on port 8080",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-013",
+      "message": "Add Nina's Prague timezone to my world clock",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-014",
+      "message": "Write a script to auto-archive Anki cards older than 90 days",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-015",
+      "message": "Rename all files in the halfmarathon folder to use ISO date prefix",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-016",
+      "message": "Search through the current repository for all TODO comments and list filenames",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-017",
+      "message": "Create a cron job to sync my Day One journal backup every night",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-018",
+      "message": "Send an email to Sam Torres to confirm the brake job appointment",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-v01",
+      "message": "com mit all staged chang es with mes sage add sour dough track ing mod ule",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v02",
+      "message": "push my loc al com mits to or i gin main right now",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v03",
+      "message": "cre ate a new branch called fea ture rust par ser and switch to it",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v04",
+      "message": "set a dai ly re mind er at sev en a m to feed bub bles",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v05",
+      "message": "ping ra fa el o kon kwo",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v06",
+      "message": "find all fix me com ments in the rust source files",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v07",
+      "message": "git com mit mes sage ref ac tor da ta pipe line in gest ion",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v08",
+      "message": "sched ule a cal en dar e vent for doc tor singh at five p m ev ery oth er tues day",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-e01",
+      "message": "Commit staged, message: refactor ingest",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e02",
+      "message": "Push to origin main",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e03",
+      "message": "New branch: feature/rust-parser",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e04",
+      "message": "Kill port 8080",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e05",
+      "message": "Ping 10.0.0.42",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-a01",
+      "message": "Set up a scheduled Slack message to Rafael every Monday with the weekly data quality report",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a02",
+      "message": "Create a recurring calendar task to review Mochi's vet records every 6 months",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a03",
+      "message": "Write a shell script to back up my Anki collection to Dropbox daily",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a04",
+      "message": "Automate a 7am weekday alarm for my half marathon training runs",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a05",
+      "message": "Build a script to export all my Day One entries to markdown files",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a06",
+      "message": "Find all HACK annotations in the codebase and export to a text file",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a07",
+      "message": "Stash current changes, pull latest from main, then pop the stash",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a08",
+      "message": "Run cargo test with verbose flag and save output to test.log",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a09",
+      "message": "Set up port forwarding so 8080 maps to 3000 locally",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a10",
+      "message": "Create a GitHub Actions workflow to run the test suite on every push",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a11",
+      "message": "Write a Python script to convert all my Anki exports to CSV format",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a12",
+      "message": "Set a recurring Zoom meeting every other Tuesday at 5pm for therapy",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a13",
+      "message": "Schedule a weekly reminder to log my half marathon mileage on Saturdays",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a14",
+      "message": "Create a launchd plist to run the data sync script every 6 hours on macOS",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a15",
+      "message": "Run the formatter on all Rust files in the src directory",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-001",
+      "message": "What does the screen say?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-002",
+      "message": "Read the error message on screen please",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-003",
+      "message": "What's the current window showing?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-004",
+      "message": "Summarize the text visible on my screen right now",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-005",
+      "message": "OCR the content of this document on screen",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-006",
+      "message": "Which app is currently focused on my display?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-007",
+      "message": "What is the warning message shown in the dialog?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-008",
+      "message": "Read the status bar text at the bottom of the screen",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-009",
+      "message": "Tell me what the notification in the top right says",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-010",
+      "message": "What values are in the table visible on screen?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-v01",
+      "message": "what does the screen say right now",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v02",
+      "message": "read the er ror mes sage on my screen for me please",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v03",
+      "message": "what app is cur rent ly fo cused on my dis play",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v04",
+      "message": "o c r the con tent of this doc u ment on screen",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-e01",
+      "message": "What's on screen?",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e02",
+      "message": "Read that for me",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e03",
+      "message": "OCR this",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e04",
+      "message": "Current window content?",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-a01",
+      "message": "Extract the form field labels from what's shown on my screen",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a02",
+      "message": "Describe the layout of the current VS Code window",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a03",
+      "message": "What does the terminal output on my screen currently show?",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a04",
+      "message": "Read the cargo build error shown in my terminal right now",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a05",
+      "message": "Scan the numbers in the spreadsheet visible on screen",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a06",
+      "message": "What does the prescription label on screen say?",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a07",
+      "message": "What text does the modal dialog show right now?",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a08",
+      "message": "Read the commit message shown in the diff view on screen",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-001",
+      "message": "How does the Rust borrow checker prevent memory leaks?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-002",
+      "message": "What is the difference between ADHD inattentive and hyperactive types?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-003",
+      "message": "How does sourdough fermentation work with wild yeast?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-004",
+      "message": "What is the Portuguese language family and where is it spoken?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-005",
+      "message": "Explain the difference between L-theanine in matcha versus caffeine in coffee",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-006",
+      "message": "What language is best for building data pipelines in 2026?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-007",
+      "message": "How does spaced repetition work in Anki?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-008",
+      "message": "What is a Holland Lop rabbit's average lifespan?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-009",
+      "message": "What sports psychology techniques help with race day anxiety?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-010",
+      "message": "Which framework is most recommended for Rust web backends today?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-011",
+      "message": "How does cognitive behavioral therapy differ from traditional talk therapy?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-012",
+      "message": "What are the ergonomic benefits of alternating between sitting and standing at a desk?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-013",
+      "message": "What programming language is mostly used for data engineering right now?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-014",
+      "message": "What is the difference between Scrum and Kanban for software teams?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-015",
+      "message": "Explain ownership and lifetimes in Rust",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-v01",
+      "message": "how does the rust bor row check er pre vent mem o ry leaks",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v02",
+      "message": "what is the best lang uage for da ta pipe lines in twen ty twen ty six",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v03",
+      "message": "ex plain how spaced re pe ti tion works in an ki",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-e01",
+      "message": "Rust borrow checker explained",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e02",
+      "message": "Matcha vs coffee for focus",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e03",
+      "message": "How sourdough fermentation works",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-a01",
+      "message": "What does clinical research say about Adderall effectiveness in adults?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a02",
+      "message": "How do rabbit digestive systems differ from cats and dogs?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a03",
+      "message": "Explain the physiological effects of cold exposure on athletic recovery",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a04",
+      "message": "What are the key principles of minimalist running form for endurance athletes?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a05",
+      "message": "How does a high-deductible health plan pair with an HSA tax-wise?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a06",
+      "message": "What technology stack should I learn for backend data engineering in 2026?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a07",
+      "message": "What is the recommended daily carb limit for strict ketosis?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a08",
+      "message": "How does the Anki SM-2 algorithm calculate review intervals?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a09",
+      "message": "What are the main differences between async Rust with Tokio versus threads?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a10",
+      "message": "What does jogging zone 2 heart rate mean physiologically?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a11",
+      "message": "How does the Czech language compare to Slovak — are they mutually intelligible?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a12",
+      "message": "What is the difference between a flat and a hilly half marathon course for pacing?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gr-001",
+      "message": "Hello!",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-002",
+      "message": "Good afternoon, how's it going?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-003",
+      "message": "Hey, what's up?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-004",
+      "message": "What are you capable of doing?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-005",
+      "message": "What are you exactly?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-006",
+      "message": "What do people call you?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-007",
+      "message": "Who built you?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-008",
+      "message": "Good night",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-009",
+      "message": "What is your name?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-010",
+      "message": "Are you an AI assistant?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-v01",
+      "message": "hey good af ter noon how are you do ing to day",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v02",
+      "message": "what is your name think drop as sis tant",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-e01",
+      "message": "Morning!",
+      "intent": "greeting",
+      "source": "edge"
+    },
+    {
+      "id": "gr-a01",
+      "message": "What kind of assistant are you anyway?",
+      "intent": "greeting",
+      "source": "adversarial"
+    },
+    {
+      "id": "gr-a02",
+      "message": "Hey there, tell me a little about yourself",
+      "intent": "greeting",
+      "source": "adversarial"
+    },
+    {
+      "id": "ac-001",
+      "message": "Open Day One",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-002",
+      "message": "Launch Penpot",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-003",
+      "message": "Open Anki",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-004",
+      "message": "Switch to Ghostwriter",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-005",
+      "message": "Open Slack",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-006",
+      "message": "Launch Linear",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-007",
+      "message": "Open Warp terminal",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-008",
+      "message": "Start Zoom for Rafael's onboarding call",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-009",
+      "message": "Open Maps and search for Sam Torres Auto",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-v01",
+      "message": "o pen day one jour nal app",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v02",
+      "message": "launch pen pot for de sign work",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-e01",
+      "message": "Day One please",
+      "intent": "app_control_start",
+      "source": "edge"
+    },
+    {
+      "id": "ac-e02",
+      "message": "Anki",
+      "intent": "app_control_start",
+      "source": "edge"
+    },
+    {
+      "id": "ac-a01",
+      "message": "Pull up Ghostwriter so I can draft the Portugal itinerary",
+      "intent": "app_control_start",
+      "source": "adversarial"
+    },
+    {
+      "id": "ac-a02",
+      "message": "Get Linear open so I can check the sprint board",
+      "intent": "app_control_start",
+      "source": "adversarial"
+    }
+  ]
+}

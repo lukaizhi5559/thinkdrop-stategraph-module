@@ -1,0 +1,1541 @@
+{
+  "description": "Intent benchmark Round 11 — 254 fresh prompts, entirely new themes/personas. Tests generalization post-fine-tuned model. Zero overlap with Rounds 1-10.",
+  "themes": "Nadia (Beirut data scientist colleague), Priya Nair (yoga instructor), Chef Benito (Italian cooking class), Dr. Liang (dermatologist), Ziggy (rescue greyhound), cold brew coffee ritual, sourdough starter Hugo, Rust learning, Roam Research notes, marathon training (Berlin 2026), kitchen tile renovation, Marrakech+Atlas Mountains trip, standing desk converter, vitamin D+magnesium, Sione Tuilagi (physio)",
+  "version": "r11",
+  "intents": [
+    "memory_store",
+    "memory_retrieve",
+    "web_search",
+    "command_automate",
+    "app_control_start",
+    "screen_intelligence",
+    "general_knowledge",
+    "greeting"
+  ],
+  "examples": [
+    {
+      "id": "ms-001",
+      "message": "Nadia starts next Monday as our new data scientist, she's relocating from Beirut",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-002",
+      "message": "Adopted a rescue greyhound named Ziggy this weekend, he's three years old",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-003",
+      "message": "My new yoga instructor is Priya Nair, classes every Wednesday evening at 7pm",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-004",
+      "message": "Started a sourdough starter yesterday, naming him Hugo, fed with whole wheat flour",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-005",
+      "message": "Enrolled in Chef Benito's Italian cooking class, every other Saturday morning",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-006",
+      "message": "Switched to cold brew concentrate in the mornings, one part coffee two parts oat milk",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-007",
+      "message": "I'm learning Rust now, coming from TypeScript, started with the Rust Book chapter 1",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-008",
+      "message": "Set up Roam Research to try alongside Obsidian for daily notes",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-009",
+      "message": "Sione Tuilagi is my physio for marathon training, sessions every second Friday",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-010",
+      "message": "Booked Berlin Marathon for September 2026, it's my first marathon",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-011",
+      "message": "Nadia's background is in NLP and recommender systems from her time at a Beirut fintech",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-012",
+      "message": "Dr. Liang is my new dermatologist, appointment was at the clinic on Rue du Temple",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-013",
+      "message": "Kitchen tile project starts next week — going with zellige terracotta tiles",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-014",
+      "message": "Taking vitamin D 2000 IU and magnesium glycinate 400mg before bed each night",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-015",
+      "message": "Planning a Morocco trip for October — Marrakech for five days then Atlas Mountains",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-016",
+      "message": "Got a standing desk converter installed Tuesday, adjusts between sitting and standing",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-017",
+      "message": "Hugo the sourdough starter is on day three, already bubbling nicely",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-018",
+      "message": "Priya's class moved to Thursday evenings starting next week",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-019",
+      "message": "Ziggy is crate trained but still anxious around other dogs on walks",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-020",
+      "message": "Sione said my glute activation is weak and gave me resistance band exercises",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-021",
+      "message": "Chef Benito showed us how to make fresh tagliatelle by hand today",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-022",
+      "message": "Dr. Liang prescribed tretinoin 0.025% for my skin, use every other night",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-023",
+      "message": "Nadia prefers Slack over email for async communication, heads up for the team",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-024",
+      "message": "My Berlin marathon training plan is 18 weeks, peaking at 80km per week",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-025",
+      "message": "I bought a cold brew tower for the kitchen, makes 1.5 litres overnight",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-v01",
+      "message": "note that ziggy had his first vet check today and everything looks good",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v02",
+      "message": "remember priya said to keep my hips square during warrior two",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v03",
+      "message": "log that i did a twenty kilometer long run this morning for marathon training",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v04",
+      "message": "save that hugo the starter smells tangy and passed the float test today",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v05",
+      "message": "remember nadia uses python and spark for her data pipelines",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v06",
+      "message": "note that the kitchen tiles are being delivered thursday morning",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v07",
+      "message": "log that i stood at my desk for four hours today and my back feels better",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v08",
+      "message": "save that doctor liang said to use spf 50 every morning even indoors",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v09",
+      "message": "remember that sione wants me to stretch my hip flexors for ten minutes after each run",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v10",
+      "message": "note that chef benito's next class is focaccia and we need to bring our own olive oil",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v11",
+      "message": "log that ziggy ate his full meal this evening which is a first",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v12",
+      "message": "save that i booked the riad in marrakech for october fourteenth to nineteenth",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-e01",
+      "message": "Rust ownership clicked today — borrowed references finally make sense",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e02",
+      "message": "Hugo collapsed after the float test, my starter might be dead — logging this",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e03",
+      "message": "Ziggy destroyed my standing desk mat this morning",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e04",
+      "message": "Priya cancelled Wednesday — rescheduled to a Saturday morning session",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e05",
+      "message": "Nadia and I are going to pair on the recommender model next sprint",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e06",
+      "message": "The zellige tiles arrived cracked — contractor says we need to reorder",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e07",
+      "message": "First 10K time trial done: 51 minutes flat, Sione says there's room to improve",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e08",
+      "message": "Dr. Liang said the tretinoin is working, upgrade to 0.05% in six weeks",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-a01",
+      "message": "I've been taking vitamin D for two weeks now and my energy feels different",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a02",
+      "message": "Nadia mentioned she speaks Arabic, French, and English fluently",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a03",
+      "message": "My marathon pace target is 5:45 per kilometre according to Sione's plan",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-001",
+      "message": "What did I say about Nadia's background?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-002",
+      "message": "When is my next physiotherapy session with Sione?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-003",
+      "message": "What time are Priya's yoga classes?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-004",
+      "message": "What did Dr. Liang prescribe for my skin?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-005",
+      "message": "What's my marathon training peak weekly mileage?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-006",
+      "message": "What did I name my sourdough starter?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-007",
+      "message": "What tiles did I pick for the kitchen renovation?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-008",
+      "message": "What are the dates I booked for the Morocco trip?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-009",
+      "message": "What supplement dose of magnesium am I taking?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-010",
+      "message": "What did Chef Benito teach in the last cooking class?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-011",
+      "message": "What exercises did Sione give me for glute activation?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-012",
+      "message": "What have I saved about Ziggy?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-013",
+      "message": "What did I log about Hugo the starter?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-014",
+      "message": "Where does Priya hold her yoga classes?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-015",
+      "message": "What's Chef Benito's next class about?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-016",
+      "message": "What did Dr. Liang say about sunscreen?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-017",
+      "message": "What's my 10K time trial result?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-018",
+      "message": "When does the Berlin marathon take place?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "mr-019",
+      "message": "What tools does Nadia use for her data pipelines?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-020",
+      "message": "How many litres does my cold brew tower make?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-021",
+      "message": "What did Sione say about stretching after runs?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-022",
+      "message": "When is the kitchen tile delivery?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-023",
+      "message": "What's Ziggy's breed?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-024",
+      "message": "What did I note about Nadia's communication preferences?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-025",
+      "message": "Where is the riad I booked in Marrakech?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-026",
+      "message": "What chapter am I on in the Rust Book?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-027",
+      "message": "What's my marathon pace target?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-028",
+      "message": "What have I written about the kitchen renovation?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-029",
+      "message": "What did I save about my standing desk?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-030",
+      "message": "What frequency is tretinoin for my skin?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-v01",
+      "message": "what did i log about ziggy this week",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v02",
+      "message": "what have i saved about my marathon training plan",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v03",
+      "message": "what do i know about nadia from my notes",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v04",
+      "message": "what did i say about hugo the sourdough starter",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v05",
+      "message": "find what i told you about sione's exercises",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v06",
+      "message": "remind me what priya said about warrior two",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v07",
+      "message": "what did i save about the marrakech trip",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v08",
+      "message": "search through my notes about the kitchen tiles",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-e01",
+      "message": "How am I spelling Nadia's surname?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e02",
+      "message": "What side notes have I made about Ziggy's behaviour?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e03",
+      "message": "What's the name of Dr. Liang's clinic?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e04",
+      "message": "Did I log anything about Hugo failing the float test?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e05",
+      "message": "What am I currently on in the Rust Book?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e06",
+      "message": "What did I save about the standing desk mat?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e07",
+      "message": "What's the cold brew ratio I'm using?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e08",
+      "message": "What was Nadia's old company before joining us?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-a01",
+      "message": "How do you spell Priya Nair's last name?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a02",
+      "message": "What am I currently learning in Rust?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a03",
+      "message": "What's my current vitamin D dosage according to my notes?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a04",
+      "message": "What personal data do you have about my marathon training?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-001",
+      "message": "Best cold brew coffee ratio for concentrate",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-002",
+      "message": "Rescue greyhound first week tips",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-003",
+      "message": "Rust ownership and borrowing explained",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-004",
+      "message": "Atlas Mountains trekking routes difficulty",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-005",
+      "message": "Zellige tile installation guide for kitchen backsplash",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-006",
+      "message": "Berlin Marathon 2026 registration deadline",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-007",
+      "message": "Sourdough starter troubleshooting not rising",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-008",
+      "message": "Tretinoin purging phase how long to expect",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-009",
+      "message": "Magnesium glycinate vs magnesium citrate sleep",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-010",
+      "message": "Roam Research vs Obsidian 2026 comparison",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-011",
+      "message": "Marathon training plan for sub-4-hour first timer",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-012",
+      "message": "Marrakech medina best riads to stay",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-013",
+      "message": "Greyhound anxiety around other dogs tips",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-014",
+      "message": "Fresh tagliatelle recipe without pasta machine",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-015",
+      "message": "Rust Book chapter 4 exercises online",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-016",
+      "message": "Standing desk health benefits research",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-017",
+      "message": "Vitamin D deficiency symptoms adults",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-018",
+      "message": "Beirut data science tech scene overview",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-019",
+      "message": "Yoga poses for marathon runner hip flexors",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-020",
+      "message": "Italian cooking class beginner curriculum",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-v01",
+      "message": "look up greyhound adoption care routine",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v02",
+      "message": "search for cold brew tower reviews",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v03",
+      "message": "find marathon nutrition plan for long runs",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v04",
+      "message": "search for zellige tile suppliers in paris",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v05",
+      "message": "look up sourdough hydration percentage for beginners",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v06",
+      "message": "find best running shoes for marathon training 2026",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-e01",
+      "message": "Marrakech day trip itinerary from the city",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e02",
+      "message": "Glute activation technique for beginners",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e03",
+      "message": "What technology stack should I consider for a production-ready NLP pipeline?",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e04",
+      "message": "Cold brew vs iced coffee caffeine content",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e05",
+      "message": "Riad in Marrakech with Atlas view booking",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-e06",
+      "message": "Rust async programming beginner guide",
+      "intent": "web_search",
+      "source": "edge"
+    },
+    {
+      "id": "ws-a01",
+      "message": "Greyhound breed lifespan and common health issues",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a02",
+      "message": "Is sourdough bread healthier than regular bread?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a03",
+      "message": "How far in advance should I book a Marrakech riad?",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a04",
+      "message": "Tretinoin retinol same thing or different?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a05",
+      "message": "Does standing all day hurt your back more than sitting?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-001",
+      "message": "Set a recurring alarm every weekday at 6:30am for my morning run",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-002",
+      "message": "Schedule a weekly reminder on Friday afternoon to feed Hugo the starter",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-003",
+      "message": "Create a calendar event for Chef Benito's next cooking class Saturday 10am",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-004",
+      "message": "Send Nadia an onboarding prep email with the team handbook link",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-005",
+      "message": "Set a reminder for my physio appointment with Sione next Friday at 2pm",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-006",
+      "message": "Book a 30-minute slot with Dr. Liang for my follow-up in six weeks",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-007",
+      "message": "Add a task to the kitchen renovation project to reorder the zellige tiles",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-008",
+      "message": "Set up a weekly Sunday long run calendar block for marathon training",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-009",
+      "message": "Create a Slack message to the team introducing Nadia on her first day",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-010",
+      "message": "Remind me to take my vitamin D and magnesium every night at 9pm",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-011",
+      "message": "Schedule a pair programming session with Nadia for next Tuesday afternoon",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-012",
+      "message": "Add a task to check if Ziggy's vaccination records arrived from the shelter",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-013",
+      "message": "Set a timer for 24 hours to check on Hugo the sourdough starter",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-014",
+      "message": "Create a packing list for the Morocco trip in October",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-015",
+      "message": "Schedule Ziggy's vet follow-up appointment for two weeks from now",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-016",
+      "message": "Email Chef Benito to confirm I'm coming to the focaccia class",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-017",
+      "message": "Set a daily standing desk reminder to switch positions every 45 minutes",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-018",
+      "message": "Create a Rust learning milestone in my task manager — finish chapters 1-4 by end of month",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-019",
+      "message": "Book a flight from Paris to Marrakech for October 14th",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-020",
+      "message": "Add a grocery reminder for sourdough whole wheat flour and rye",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-021",
+      "message": "Set up a biweekly sync with Nadia on the recommender model progress",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-v01",
+      "message": "schedule a reminder to walk ziggy at seven pm tonight",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v02",
+      "message": "set an alarm for five forty five tomorrow morning for my interval run",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v03",
+      "message": "remind me to ping nadia about the spark job before her first standup",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v04",
+      "message": "create a calendar event for priya's thursday yoga class starting next week",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v05",
+      "message": "set a reminder friday noon to check on hugo",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v06",
+      "message": "remind me to apply tretinoin tonight before bed",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v07",
+      "message": "schedule a tile contractor visit for monday morning",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v08",
+      "message": "set a reminder two weeks before the berlin marathon to do a final long run",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v09",
+      "message": "add a task to buy ziggy a new mat to replace the one he destroyed",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v10",
+      "message": "schedule a weekly meal prep reminder every sunday at four pm",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v11",
+      "message": "remind me to confirm the riad booking in marrakech next week",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v12",
+      "message": "send sione my last three run logs before our next session",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-e01",
+      "message": "Pull up my calendar so I can add Nadia's onboarding block",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e02",
+      "message": "Open up the Notion template for trip planning for my Morocco trip",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e03",
+      "message": "Book a vet appointment for Ziggy so I can get his annual vaccinations done",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e04",
+      "message": "Set a recurring reminder to log my Rust study notes every Sunday evening",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e05",
+      "message": "Create a marathon week-by-week training schedule in my task manager",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e06",
+      "message": "Plan out my Morocco itinerary for October and add it to my calendar",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-a01",
+      "message": "Pull up Linear so I can track the data pipeline sprint with Nadia",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a02",
+      "message": "Open up the Rust playground for me",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a03",
+      "message": "Book a running shoe fitting appointment at a local running store",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a04",
+      "message": "Reserve a table at an Italian restaurant for after Chef Benito's class",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a05",
+      "message": "Schedule my next sourdough bake for the weekend after Hugo passes the float test",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a06",
+      "message": "Add a Rust learning check-in to the team wiki every two weeks",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ac-001",
+      "message": "Open Roam Research",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-002",
+      "message": "Launch Obsidian",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-003",
+      "message": "Start Slack",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-004",
+      "message": "Open VS Code",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-005",
+      "message": "Launch Spotify for my morning run playlist",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-006",
+      "message": "Open Terminal",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-007",
+      "message": "Start Zoom for my call with Nadia",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-008",
+      "message": "Open Safari",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-009",
+      "message": "Launch Arc browser",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-010",
+      "message": "Open Figma",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-011",
+      "message": "Start DataGrip",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-012",
+      "message": "Open PyCharm",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-013",
+      "message": "Launch Bear notes app",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-014",
+      "message": "Open Linear",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-015",
+      "message": "Start iTerm",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-v01",
+      "message": "open up roam research for me",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v02",
+      "message": "launch vs code please",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v03",
+      "message": "start slack so i can message nadia",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v04",
+      "message": "open safari for me",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v05",
+      "message": "open up obsidian",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v06",
+      "message": "launch spotify",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v07",
+      "message": "start up terminal",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v08",
+      "message": "open zoom for my physio call with sione",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-e01",
+      "message": "Open Roam Research and create a new daily note",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ac-e02",
+      "message": "Launch VS Code and open the Rust project",
+      "intent": "app_control_start",
+      "source": "edge"
+    },
+    {
+      "id": "ac-e03",
+      "message": "Start Slack and go to the data-science channel",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ac-e04",
+      "message": "Open iTerm and navigate to my marathon training scripts folder",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ac-a01",
+      "message": "Can you open Roam for me please",
+      "intent": "app_control_start",
+      "source": "adversarial"
+    },
+    {
+      "id": "ac-a02",
+      "message": "Get Obsidian up on screen",
+      "intent": "app_control_start",
+      "source": "adversarial"
+    },
+    {
+      "id": "ac-a03",
+      "message": "Fire up DataGrip so I can query the recommender DB",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-001",
+      "message": "What's on my screen right now?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-002",
+      "message": "Can you read the error in my terminal?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-003",
+      "message": "What file is currently open in VS Code?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-004",
+      "message": "What's the last message in my Slack window?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-005",
+      "message": "Read what's written in this document for me",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-006",
+      "message": "What does the current terminal output say?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-v01",
+      "message": "tell me what you see on my screen",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v02",
+      "message": "read out the compiler error on screen",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v03",
+      "message": "describe what's open in my browser right now",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-e01",
+      "message": "Describe the layout of the current VS Code window",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e02",
+      "message": "What Rust error is showing in the active editor?",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e03",
+      "message": "Describe the structure of the interface I'm looking at",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-a01",
+      "message": "Can you see the form I have open?",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a02",
+      "message": "What tab is active in my browser?",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-a03",
+      "message": "Read the notification that just popped up",
+      "intent": "screen_intelligence",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-001",
+      "message": "What causes sourdough starter to collapse after rising?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-002",
+      "message": "How does tretinoin work at the cellular level?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-003",
+      "message": "What is the recommended weekly mileage increase for marathon training?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-004",
+      "message": "How does Rust's ownership model prevent memory leaks?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-005",
+      "message": "What are the benefits of magnesium glycinate over other forms?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-006",
+      "message": "How does cold brew extraction differ from hot espresso?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-007",
+      "message": "What is the traditional process for making zellige tiles?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-008",
+      "message": "How does glute activation help prevent running injuries?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-v01",
+      "message": "explain how sourdough fermentation works",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v02",
+      "message": "what does rust ownership mean in simple terms",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-e01",
+      "message": "Cold brew vs hot coffee fermentation differences",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e02",
+      "message": "Zellige vs encaustic tile production methods",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e03",
+      "message": "What is the recommended acclimatisation period for Atlas Mountains altitude?",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-a01",
+      "message": "Is sourdough fermentation aerobic or anaerobic?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a02",
+      "message": "What are the benefits of standing desks vs sitting all day?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a03",
+      "message": "What technology stack should I consider for a production-ready data pipeline?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a04",
+      "message": "How does vitamin D synthesis work in the body?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a05",
+      "message": "What are the long-term effects of tretinoin on skin collagen?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a06",
+      "message": "Rust vs Go — which is better for systems programming?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a07",
+      "message": "How does the greyhound's physiology differ from other dog breeds?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gr-001",
+      "message": "Hey, good morning!",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-002",
+      "message": "Hi there",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-003",
+      "message": "Hello",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-004",
+      "message": "Good evening",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-005",
+      "message": "Hey Thinkdrop",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-006",
+      "message": "Morning!",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-a01",
+      "message": "Hey, quick question about Ziggy",
+      "intent": "greeting",
+      "source": "adversarial"
+    },
+    {
+      "id": "gr-a02",
+      "message": "Hi, can you help me with my Rust code?",
+      "intent": "greeting",
+      "source": "adversarial"
+    },
+    {
+      "id": "gr-a03",
+      "message": "Hello, I need to check something about Nadia's onboarding",
+      "intent": "greeting",
+      "source": "adversarial"
+    }
+  ]
+}
