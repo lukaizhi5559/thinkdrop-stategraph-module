@@ -1096,182 +1096,212 @@
     {
       "id": "ac-001",
       "message": "Open Obsidian",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-002",
       "message": "Launch Linear",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-003",
       "message": "Open Slack",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-004",
       "message": "Start VS Code",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-005",
       "message": "Open Warp",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-006",
       "message": "Launch Firefox",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-007",
       "message": "Open Maps",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-008",
       "message": "Switch to Figma",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-009",
       "message": "Open Maps and search for Sintra",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-010",
       "message": "Launch Zoom",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-011",
       "message": "Open Notion",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-012",
       "message": "Start Safari",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-013",
       "message": "Open Day One",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-014",
       "message": "Switch to Terminal",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-015",
       "message": "Launch Spotify",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v01",
       "message": "o pen ob sid i an",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v02",
       "message": "launch lin ear",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v03",
       "message": "o pen slack",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v04",
       "message": "start v s code",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v05",
       "message": "o pen warp ter mi nal",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v06",
       "message": "launch fire fox",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v07",
       "message": "switch to fig ma",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v08",
       "message": "o pen day one jour nal",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-e01",
       "message": "Obsidian please",
-      "intent": "app_control_start",
-      "source": "edge"
+      "intent": "command_automate",
+      "source": "edge",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-e02",
       "message": "Linear",
-      "intent": "app_control_start",
-      "source": "edge"
+      "intent": "command_automate",
+      "source": "edge",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-e03",
       "message": "Warp",
-      "intent": "app_control_start",
-      "source": "edge"
+      "intent": "command_automate",
+      "source": "edge",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-e04",
       "message": "Figma",
-      "intent": "app_control_start",
-      "source": "edge"
+      "intent": "command_automate",
+      "source": "edge",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-a01",
       "message": "Pull up Obsidian so I can check my daily note",
-      "intent": "app_control_start",
-      "source": "adversarial"
+      "intent": "command_automate",
+      "source": "adversarial",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-a02",
       "message": "Get Linear open so I can review the sprint",
-      "intent": "app_control_start",
-      "source": "adversarial"
+      "intent": "command_automate",
+      "source": "adversarial",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-a03",
       "message": "Open up Figma for me",
-      "intent": "app_control_start",
-      "source": "adversarial"
+      "intent": "command_automate",
+      "source": "adversarial",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "si-001",

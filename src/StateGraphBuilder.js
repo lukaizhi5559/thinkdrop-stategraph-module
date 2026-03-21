@@ -28,6 +28,7 @@ const evaluateSkillsNode = require('./nodes/evaluateSkills');
 const creatorPlanningNode = require('./nodes/creatorPlanning');
 const gatherContextNode = require('./nodes/gatherContext');
 const appControlNode = require('./nodes/appControl');
+const parseProjectNode = require('./nodes/parseProject');
 
 class StateGraphBuilder {
   /**
@@ -180,6 +181,7 @@ class StateGraphBuilder {
       synthesize: (state) => synthesizeNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
       appControl: (state) => appControlNode({ ...state, logger }),
+      parseProject: (state) => parseProjectNode({ ...state, logger, llmBackend }),
       logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
     };
     
@@ -253,7 +255,7 @@ class StateGraphBuilder {
           return 'screenIntelligence';
         }
         if (intentType === 'app_control_start') {
-          return 'appControl';
+          return 'parseProject';
         }
         if (intentType === 'web_search' || intentType === 'question' || intentType === 'general_knowledge') {
           return 'webSearch';
@@ -357,6 +359,16 @@ class StateGraphBuilder {
       // Web search path
       webSearch: 'retrieveMemory',
       
+      // parseProject: matched → command_automate → planSkills; no match → appControl
+      parseProject: (state) => {
+        if (state.projectSkillPlan && state.projectSkillPlan.length > 0) {
+          logger.debug(`[StateGraph:Router] parseProject matched — routing to planSkills`);
+          return 'planSkills';
+        }
+        logger.debug('[StateGraph:Router] parseProject no match — routing to appControl');
+        return 'appControl';
+      },
+
       // App control mode — routes to logConversation to persist state + show answer
       appControl: 'logConversation',
 

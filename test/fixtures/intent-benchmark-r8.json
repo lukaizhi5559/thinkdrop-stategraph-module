@@ -31,286 +31,1650 @@
     "total": 274
   },
   "examples": [
-    { "id": "ms-001", "message": "I adopted a rescue dog named Aria, she's a golden mix and came from the city shelter", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-002", "message": "Carlos Mendes joined our team as the new design lead this week", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-003", "message": "My sister Zoe got married last Saturday, her husband's name is Patrick Ngai", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-004", "message": "Madison Park is our new project manager, she came from the Seattle office", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-005", "message": "I registered for the November bouldering competition at the Red River Gorge", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-006", "message": "I got Aria from a rescue organization last Friday, she's about two years old", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-007", "message": "My new espresso machine is named Bruce, it's a Breville Barista Express", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-008", "message": "Arc instead of Chrome now, I switched last week and won't go back", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-009", "message": "Carlos Mendes's last name is spelled M-E-N-D-E-S not Mendez", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-010", "message": "I'm learning Korean using Pimsleur, just started lesson five this morning", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-011", "message": "I leased a Tesla Model Y last Tuesday, it's midnight silver and fully loaded", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-012", "message": "I've been doing cold plunges every morning this week, two minutes at 50 degrees", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-013", "message": "Dr. Reyes is my new GP, her clinic is on Maple Street near the park", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-014", "message": "I started a keto diet two weeks ago, net carbs under 25 grams per day", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-015", "message": "I signed up for the watercolor painting workshop that starts next Saturday", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-016", "message": "Aria had her first vet visit with Dr. Pham today, she's fully vaccinated now", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-017", "message": "My HSA contribution limit this year is $4,150 as a single filer", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-018", "message": "I opened a new Obsidian vault for work notes, called it Second Brain v2", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-019", "message": "Warp instead of iTerm now, using it for the AI command lookup feature", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-020", "message": "November relocation, east village neighborhood near the climbing gym", "intent": "memory_store", "source": "clean" },
-    { "id": "ms-v01", "message": "hey log that i registered for the november bouldering competition at red river gorge", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v02", "message": "i got ar i a from a res cue shel ter last fri day she's a gold en mix", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v03", "message": "i'm learn ing kor e an us ing pim sleur just start ed les son five this morn ing", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v04", "message": "arc in stead of chrome now switched last week and i love it", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v05", "message": "i'm do ing cold plung es ev ery morn ing two min utes at fif ty de grees", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v06", "message": "my sister zoe got married last saturday, her husband is patrick ngai", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v07", "message": "i start ed a ke to di et two weeks a go net carbs un der twen ty five grams", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v08", "message": "i leased a tesla model y last tuesday, it is midnight silver metallic", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v09", "message": "hey log that aria had her first vet visit today and she is now fully vaccinated", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v10", "message": "hey log that I just registered for the rock climbing competition in November", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v11", "message": "log that carlos mendes is my new design lead and started this week", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v12", "message": "i've been do ing cold plung es ev ery morn ing this week two min at fif ty", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v13", "message": "im climb ing for a boul der ing comp in nov em ber start ed train ing this week", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v14", "message": "my new doc tor is doc tor ray ez her clinic is on ma ple street", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-v15", "message": "i sign ed up for a wa ter col or work shop start ing next sat ur day", "intent": "memory_store", "source": "voice" },
-    { "id": "ms-e01", "message": "New climbing shoes: Scarpa Instinct VSR", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e02", "message": "Warp instead of iTerm now", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e03", "message": "November move, east village", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e04", "message": "HSA, max contribution this year", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e05", "message": "New espresso machine: Breville Barista Express", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e06", "message": "Keto protocol, strict daily tracking", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e07", "message": "New rescue dog: Aria", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e08", "message": "Obsidian instead of Notion now", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e09", "message": "I'm learning Korean using the Pimsleur method", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-e10", "message": "Madison Park is my new PM", "intent": "memory_store", "source": "edge" },
-    { "id": "ms-a01", "message": "I officially joined the climbing gym on Park Street, signed up for the membership last week", "intent": "memory_store", "source": "adversarial" },
-    { "id": "ms-a02", "message": "I started adding cold plunges to my morning routine this week, two minutes at fifty degrees", "intent": "memory_store", "source": "adversarial" },
-    { "id": "ms-a03", "message": "Aria is definitely the most affectionate dog I've ever had", "intent": "memory_store", "source": "adversarial" },
-    { "id": "ms-a04", "message": "Oliver cut my hair last Saturday, he does a great fade", "intent": "memory_store", "source": "adversarial" },
-    { "id": "ms-a05", "message": "Carlos's design instincts are really sharp, he joined us from Figma", "intent": "memory_store", "source": "adversarial" },
-
-    { "id": "mr-001", "message": "What kind of dog is Aria?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-002", "message": "What's Carlos's last name again?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-003", "message": "Who is Madison Park?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-004", "message": "When is the November bouldering competition?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-005", "message": "What watercolor class did I sign up for?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-006", "message": "What's the name of my new espresso machine?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-007", "message": "Who do I go to for design feedback on the team?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-008", "message": "Dig through your records to find Carlos's phone number", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-009", "message": "What car did I lease last week?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-010", "message": "Remind me about my HSA contribution limit", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-011", "message": "Any notes I have on my keto diet?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-012", "message": "What note-taking app am I using for work now?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-013", "message": "Where is Dr. Reyes's clinic?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-014", "message": "When did Aria have her first vet visit?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-015", "message": "What browser am I using now?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-016", "message": "Has my sister Zoe gotten married yet?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-017", "message": "What language am I currently learning?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-018", "message": "Do you have any notes on my cold plunge routine?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-019", "message": "What was Madison Park's previous office?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-020", "message": "Who do I contact for dev infrastructure issues on my team?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-021", "message": "Who should I ask about watercolor technique?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-022", "message": "Anything stored about my Tesla lease terms?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-023", "message": "Search through your records to find my espresso machine warranty info", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-024", "message": "What do you have on Aria's health records?", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-025", "message": "Look back through what I've saved about my diet goals", "intent": "memory_retrieve", "source": "clean" },
-    { "id": "mr-v01", "message": "what kind of dog is ar i a", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v02", "message": "who do i ask for de sign ques tions at work", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v03", "message": "dig through your re cords to find car los's num ber", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v04", "message": "what car did I lease last week think drop", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v05", "message": "re mind me a bout my H S A con tri bu tion lim it", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v06", "message": "any notes on my keto diet plan", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v07", "message": "what note tak ing app am i us ing for work now", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v08", "message": "when did ar i a have her first vet vis it", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v09", "message": "what brows er am i us ing now think drop", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v10", "message": "what language am I currently learning these days", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v11", "message": "who is mad i son park to me", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v12", "message": "do you have an y no tes on my cold plung e rou tine", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v13", "message": "search through your memory to find my espresso machine warranty info", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v14", "message": "an y thing sto red a bout my tes la lease terms", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-v15", "message": "look back through what I've saved a bout my di et goals", "intent": "memory_retrieve", "source": "voice" },
-    { "id": "mr-e01", "message": "Aria info?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e02", "message": "What do I know about Carlos Mendes?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e03", "message": "What browser am I currently using?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e04", "message": "HSA limit?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e05", "message": "Any notes on my keto diet plan?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e06", "message": "Who is Madison Park to me?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e07", "message": "What watercolor class did I sign up for?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e08", "message": "Who handles design?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e09", "message": "What are the details of my November bouldering competition?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e10", "message": "Tesla lease terms?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e11", "message": "Dr. Reyes's address?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-e12", "message": "What Korean learning app am I currently using?", "intent": "memory_retrieve", "source": "edge" },
-    { "id": "mr-a01", "message": "Do you remember what kind of rescue dog Aria is?", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a02", "message": "Dig through your memory to find when I scheduled the watercolor class", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a03", "message": "Was it Carlos Mendes or Carlos Rivera who became my new design lead?", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a04", "message": "Can you remind me what Aria's breed mix is?", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a05", "message": "Look back through your records to find Madison Park's previous role", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a06", "message": "What time did I say Dr. Reyes's appointment was?", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a07", "message": "Search your memory for what I said about my keto carb limit", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a08", "message": "Who on my team first told me about the Pimsleur Korean app?", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a09", "message": "What temperature did I set for my cold plunge sessions?", "intent": "memory_retrieve", "source": "adversarial" },
-    { "id": "mr-a10", "message": "Did I store anything about my HSA provider?", "intent": "memory_retrieve", "source": "adversarial" },
-
-    { "id": "ws-001", "message": "Best rock climbing gyms in Seattle for beginners", "intent": "web_search", "source": "clean" },
-    { "id": "ws-002", "message": "Current Tesla Model Y lease deals in California this month", "intent": "web_search", "source": "clean" },
-    { "id": "ws-003", "message": "What's the current crypto fear and greed index?", "intent": "web_search", "source": "clean" },
-    { "id": "ws-004", "message": "Pimsleur Korean review 2026 — is it still worth it?", "intent": "web_search", "source": "clean" },
-    { "id": "ws-005", "message": "Best watercolor paper for beginners right now", "intent": "web_search", "source": "clean" },
-    { "id": "ws-006", "message": "Arc browser vs Chrome performance benchmarks 2026", "intent": "web_search", "source": "clean" },
-    { "id": "ws-007", "message": "Keto diet side effects and how long does keto flu last", "intent": "web_search", "source": "clean" },
-    { "id": "ws-008", "message": "What time does REI close today in Denver?", "intent": "web_search", "source": "clean" },
-    { "id": "ws-009", "message": "Ethereum price right now", "intent": "web_search", "source": "clean" },
-    { "id": "ws-010", "message": "Who won the Red River Gorge bouldering competition this year?", "intent": "web_search", "source": "clean" },
-    { "id": "ws-011", "message": "HSA contribution limit for 2026 IRS", "intent": "web_search", "source": "clean" },
-    { "id": "ws-012", "message": "Best espresso beans for a Breville Barista Express", "intent": "web_search", "source": "clean" },
-    { "id": "ws-013", "message": "Cold plunge benefits science-backed research 2025", "intent": "web_search", "source": "clean" },
-    { "id": "ws-014", "message": "What events are happening in Nashville this weekend?", "intent": "web_search", "source": "clean" },
-    { "id": "ws-015", "message": "Latest Arc browser update features", "intent": "web_search", "source": "clean" },
-    { "id": "ws-v01", "message": "eth e re um price right now", "intent": "web_search", "source": "voice" },
-    { "id": "ws-v02", "message": "best rock climb ing gyms in seat tle for be gin ners", "intent": "web_search", "source": "voice" },
-    { "id": "ws-v03", "message": "search for ke to flu side ef fects and how long does it last for most peo ple", "intent": "web_search", "source": "voice" },
-    { "id": "ws-v04", "message": "search for tes la mod el Y lease deals in cal i for nia this month", "intent": "web_search", "source": "voice" },
-    { "id": "ws-v05", "message": "search for arc brows er ver sus chrome per form ance bench marks 2026", "intent": "web_search", "source": "voice" },
-    { "id": "ws-v06", "message": "IRS HSA contribution limit for tax year 2026 current amount", "intent": "web_search", "source": "voice" },
-    { "id": "ws-v07", "message": "best wa ter col or pa per for be gin ners right now", "intent": "web_search", "source": "voice" },
-    { "id": "ws-a01", "message": "How much does a Breville Barista Express cost in 2026 compared to last year?", "intent": "web_search", "source": "adversarial" },
-    { "id": "ws-a02", "message": "What are the top bouldering problems at Red River Gorge right now?", "intent": "web_search", "source": "adversarial" },
-    { "id": "ws-a03", "message": "Is there a discount on Pimsleur Korean right now?", "intent": "web_search", "source": "adversarial" },
-    { "id": "ws-a04", "message": "What Tesla Model Y color is most popular according to recent surveys?", "intent": "web_search", "source": "adversarial" },
-    { "id": "ws-a05", "message": "Find cold plunge spa retreats near Portland Washington available this weekend", "intent": "web_search", "source": "adversarial" },
-
-    { "id": "ca-001", "message": "Open Arc browser and navigate to github.com", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-002", "message": "Search for all FIXME comments in the current project directory", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-003", "message": "Ping Carlos Mendes", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-004", "message": "Commit all staged changes with message refactor auth module", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-005", "message": "Pull the latest changes from origin main and rebase", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-006", "message": "Create a new branch called feature/cold-plunge-tracker", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-007", "message": "Push all commits to origin main", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-008", "message": "Search for all deprecated API calls in the repository", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-009", "message": "Remind me in 20 minutes to drink water", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-010", "message": "Set a timer for 2 minutes for my cold plunge", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-011", "message": "Find all TODO comments in the codebase and list them", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-012", "message": "Send Madison Park an email about the sprint review", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-013", "message": "Ping 10.0.0.5 to check connectivity", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-014", "message": "Open Warp terminal and run npm install", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-015", "message": "Go to Linear and create a new ticket for the keto macro tracker feature", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-016", "message": "Navigate to Obsidian and open my Second Brain v2 vault", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-017", "message": "Check if port 5432 is in use", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-018", "message": "Create a folder called climbing-logs on my Desktop", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-019", "message": "List all PDF files in my Documents folder", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-020", "message": "Text this to my phone number", "intent": "command_automate", "source": "clean" },
-    { "id": "ca-v01", "message": "com mit all staged files with mes sage re fac tor au tho ri za tion mod ule", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v02", "message": "pull the lat est chang es from or i gin main and re base", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v03", "message": "push all com mits to or i gin main", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v04", "message": "search for all fix me com ments in the cur rent pro ject dir ec to ry", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v05", "message": "ping car los men dez to check in", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v06", "message": "set a timer for two minutes for my cold plunge", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v07", "message": "remind me in twenty minutes to drink water", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v08", "message": "o pen arc brows er and nav i gate to git hub dot com", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v09", "message": "create a new branch called feature slash korean tracker", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v10", "message": "search for all TODO markers in the current project directory", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v11", "message": "send madison park an email about the sprint review", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v12", "message": "list all P D F files in my doc u ments fold er", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v13", "message": "o pen warp ter mi nal and run npm in stall", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v14", "message": "ping ten dot ze ro dot ze ro dot five to check con nec tiv i ty", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-v15", "message": "text this to my phone num ber", "intent": "command_automate", "source": "voice" },
-    { "id": "ca-e01", "message": "Search for XXXX_PLACEHOLDER in the repo", "intent": "command_automate", "source": "edge" },
-    { "id": "ca-e02", "message": "Commit and push everything", "intent": "command_automate", "source": "edge" },
-    { "id": "ca-e03", "message": "Ping Madison", "intent": "command_automate", "source": "edge" },
-    { "id": "ca-e04", "message": "Timer for the cold plunge, 2 minutes", "intent": "command_automate", "source": "edge" },
-    { "id": "ca-e05", "message": "Open Obsidian vault", "intent": "command_automate", "source": "edge" },
-    { "id": "ca-e06", "message": "Find DEPRECATED comments in the codebase", "intent": "command_automate", "source": "edge" },
-    { "id": "ca-a01", "message": "I need to push the keto tracker feature to production today", "intent": "command_automate", "source": "adversarial" },
-    { "id": "ca-a02", "message": "Can you run the test suite and report back any failures?", "intent": "command_automate", "source": "adversarial" },
-    { "id": "ca-a03", "message": "Schedule a meeting with Madison Park for Friday at 2pm", "intent": "command_automate", "source": "adversarial" },
-    { "id": "ca-a04", "message": "Scan the current repository for any security vulnerabilities", "intent": "command_automate", "source": "adversarial" },
-    { "id": "ca-a05", "message": "Merge the feature branch into develop after reviewing the diff", "intent": "command_automate", "source": "adversarial" },
-
-    { "id": "si-001", "message": "What does the error in my terminal say right now?", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-002", "message": "Summarize what's currently visible in my VS Code editor", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-003", "message": "What branch name is shown in my Warp terminal status bar?", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-004", "message": "Read the popup message that just appeared on screen", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-005", "message": "What does the VS Code problems panel show right now?", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-006", "message": "Tell me all the text visible in my Arc browser tab right now", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-007", "message": "What's the current file I have open in Warp?", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-008", "message": "Which Obsidian note do I currently have open?", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-009", "message": "Describe what my desktop looks like right now", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-010", "message": "What apps are running on my screen right now?", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-011", "message": "Read the Linear ticket that's currently open on my screen", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-012", "message": "What notifications are showing in my menu bar right now?", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-013", "message": "Summarize the Obsidian vault file I currently have open", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-014", "message": "Tell me what error message is displayed in the current terminal window", "intent": "screen_intelligence", "source": "clean" },
-    { "id": "si-v01", "message": "what does the er ror in my ter mi nal say right now", "intent": "screen_intelligence", "source": "voice" },
-    { "id": "si-v02", "message": "what branch name is shown in my warp sta tus bar", "intent": "screen_intelligence", "source": "voice" },
-    { "id": "si-v03", "message": "read the pop up mes sage that just ap peared on screen", "intent": "screen_intelligence", "source": "voice" },
-    { "id": "si-v04", "message": "what apps are run ning on my screen right now", "intent": "screen_intelligence", "source": "voice" },
-    { "id": "si-v05", "message": "which obsidian note do I currently have open", "intent": "screen_intelligence", "source": "voice" },
-    { "id": "si-v06", "message": "describe what my desktop looks like right now", "intent": "screen_intelligence", "source": "voice" },
-    { "id": "si-v07", "message": "which ob sid i an note do I cur rent ly have o pen on screen right now", "intent": "screen_intelligence", "source": "voice" },
-    { "id": "si-e01", "message": "What's on screen?", "intent": "screen_intelligence", "source": "edge" },
-    { "id": "si-e02", "message": "What does this popup say?", "intent": "screen_intelligence", "source": "edge" },
-    { "id": "si-e03", "message": "Current error in terminal?", "intent": "screen_intelligence", "source": "edge" },
-    { "id": "si-e04", "message": "What's in my VS Code sidebar right now?", "intent": "screen_intelligence", "source": "edge" },
-    { "id": "si-e05", "message": "Tell me what's shown in the Warp terminal buffer right now", "intent": "screen_intelligence", "source": "edge" },
-
-    { "id": "gk-001", "message": "What is the difference between bouldering and top rope climbing?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-002", "message": "How does cold water immersion affect the nervous system?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-003", "message": "What framework is best for serverless functions in Node.js?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-004", "message": "What is the ketogenic diet and how does ketosis work?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-005", "message": "Explain how CQRS architecture works in software design", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-006", "message": "What is the difference between a lease and a loan for a car?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-007", "message": "How does HEVC compression compare to H.264?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-008", "message": "What is a Health Savings Account and how does it work?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-009", "message": "Explain the difference between espresso and drip coffee extraction", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-010", "message": "What is the Wim Hof method?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-011", "message": "How does a relational database differ from a document store?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-012", "message": "Explain event-driven architecture simply", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-013", "message": "What is the tonality system in Korean (hangeul)?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-014", "message": "How does dollar cost averaging reduce investment risk?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-015", "message": "What is the difference between V-grade and font-grade bouldering scales?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-016", "message": "Explain what HSA triple tax advantage means", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-017", "message": "What is osmosis in biology?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-018", "message": "What programming language is best for machine learning in 2026?", "intent": "general_knowledge", "source": "clean" },
-    { "id": "gk-v01", "message": "what is the dif fer ence be tween boul der ing and top rope climb ing", "intent": "general_knowledge", "source": "voice" },
-    { "id": "gk-v02", "message": "explain how cold water immersion affects the nervous system", "intent": "general_knowledge", "source": "voice" },
-    { "id": "gk-v03", "message": "what frame work is best for serv er less func tions in node j s", "intent": "general_knowledge", "source": "voice" },
-    { "id": "gk-v04", "message": "ex plain the ke to gen ic di et and how ke to sis works in the bod y", "intent": "general_knowledge", "source": "voice" },
-    { "id": "gk-v05", "message": "ex plain the dif fer ence be tween ex pres so and drip cof fee ex trac tion", "intent": "general_knowledge", "source": "voice" },
-    { "id": "gk-v06", "message": "ex plain what an H S A is and how the tri ple tax ad van tage works", "intent": "general_knowledge", "source": "voice" },
-    { "id": "gk-v07", "message": "how does dol lar cost av er ag ing re duce in vest ment risk", "intent": "general_knowledge", "source": "voice" },
-    { "id": "gk-v08", "message": "which programming language is best for machine learning in 2026", "intent": "general_knowledge", "source": "voice" },
-    { "id": "gk-e01", "message": "Cold plunge benefits?", "intent": "general_knowledge", "source": "edge" },
-    { "id": "gk-e02", "message": "Best serverless language?", "intent": "general_knowledge", "source": "edge" },
-    { "id": "gk-e03", "message": "HSA triple tax advantage explained", "intent": "general_knowledge", "source": "edge" },
-    { "id": "gk-e04", "message": "What's the difference between keto and low-carb diets?", "intent": "general_knowledge", "source": "edge" },
-    { "id": "gk-a01", "message": "Explain what technology makes Arc browser architecturally different from Chrome", "intent": "general_knowledge", "source": "adversarial" },
-    { "id": "gk-a02", "message": "Is Obsidian better than Notion for long-term knowledge management?", "intent": "general_knowledge", "source": "adversarial" },
-    { "id": "gk-a03", "message": "What database structure is best for storing user preferences in 2026?", "intent": "general_knowledge", "source": "adversarial" },
-
-    { "id": "gr-001", "message": "Hey ThinkDrop, good morning!", "intent": "greeting", "source": "clean" },
-    { "id": "gr-002", "message": "What are you called?", "intent": "greeting", "source": "clean" },
-    { "id": "gr-003", "message": "Hi, I'm back after the weekend", "intent": "greeting", "source": "clean" },
-    { "id": "gr-004", "message": "What name do you go by?", "intent": "greeting", "source": "clean" },
-    { "id": "gr-005", "message": "Hey, what's up!", "intent": "greeting", "source": "clean" },
-    { "id": "gr-006", "message": "Are you an AI assistant?", "intent": "greeting", "source": "clean" },
-    { "id": "gr-007", "message": "Thanks, that's exactly what I needed!", "intent": "greeting", "source": "clean" },
-    { "id": "gr-008", "message": "Good evening, ready to get started", "intent": "greeting", "source": "clean" },
-    { "id": "gr-v01", "message": "hey think drop good morn ing", "intent": "greeting", "source": "voice" },
-    { "id": "gr-v02", "message": "what are you called think drop", "intent": "greeting", "source": "voice" },
-    { "id": "gr-v03", "message": "hey what's up", "intent": "greeting", "source": "voice" },
-    { "id": "gr-v04", "message": "thanks that's ex act ly what I need ed", "intent": "greeting", "source": "voice" },
-    { "id": "gr-v05", "message": "good eve ning read y to get start ed", "intent": "greeting", "source": "voice" },
-    { "id": "gr-e01", "message": "Morning!", "intent": "greeting", "source": "edge" },
-    { "id": "gr-e02", "message": "Your name?", "intent": "greeting", "source": "edge" },
-
-    { "id": "ac-001", "message": "Turn on control mode for Arc browser", "intent": "app_control_start", "source": "clean" },
-    { "id": "ac-002", "message": "Enter control mode for Obsidian", "intent": "app_control_start", "source": "clean" },
-    { "id": "ac-003", "message": "Activate control mode for Linear", "intent": "app_control_start", "source": "clean" },
-    { "id": "ac-004", "message": "Take control of Warp terminal for me", "intent": "app_control_start", "source": "clean" },
-    { "id": "ac-005", "message": "Control Arc browser", "intent": "app_control_start", "source": "clean" },
-    { "id": "ac-006", "message": "Exit control mode", "intent": "app_control_start", "source": "clean" },
-    { "id": "ac-007", "message": "Start controlling Obsidian and open my daily note", "intent": "app_control_start", "source": "clean" },
-    { "id": "ac-v01", "message": "turn on con trol mode for arc brows er", "intent": "app_control_start", "source": "voice" },
-    { "id": "ac-v02", "message": "en ter con trol mode for ob sid i an", "intent": "app_control_start", "source": "voice" },
-    { "id": "ac-v03", "message": "take con trol of warp ter mi nal for me", "intent": "app_control_start", "source": "voice" },
-    { "id": "ac-v04", "message": "ac ti vate con trol mode for lin e ar", "intent": "app_control_start", "source": "voice" },
-    { "id": "ac-v05", "message": "ex it con trol mode", "intent": "app_control_start", "source": "voice" },
-    { "id": "ac-e01", "message": "Control mode on for Arc", "intent": "app_control_start", "source": "edge" },
-    { "id": "ac-e02", "message": "Take over Warp", "intent": "app_control_start", "source": "edge" },
-    { "id": "ac-e03", "message": "Control Linear for me", "intent": "app_control_start", "source": "edge" }
+    {
+      "id": "ms-001",
+      "message": "I adopted a rescue dog named Aria, she's a golden mix and came from the city shelter",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-002",
+      "message": "Carlos Mendes joined our team as the new design lead this week",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-003",
+      "message": "My sister Zoe got married last Saturday, her husband's name is Patrick Ngai",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-004",
+      "message": "Madison Park is our new project manager, she came from the Seattle office",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-005",
+      "message": "I registered for the November bouldering competition at the Red River Gorge",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-006",
+      "message": "I got Aria from a rescue organization last Friday, she's about two years old",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-007",
+      "message": "My new espresso machine is named Bruce, it's a Breville Barista Express",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-008",
+      "message": "Arc instead of Chrome now, I switched last week and won't go back",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-009",
+      "message": "Carlos Mendes's last name is spelled M-E-N-D-E-S not Mendez",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-010",
+      "message": "I'm learning Korean using Pimsleur, just started lesson five this morning",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-011",
+      "message": "I leased a Tesla Model Y last Tuesday, it's midnight silver and fully loaded",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-012",
+      "message": "I've been doing cold plunges every morning this week, two minutes at 50 degrees",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-013",
+      "message": "Dr. Reyes is my new GP, her clinic is on Maple Street near the park",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-014",
+      "message": "I started a keto diet two weeks ago, net carbs under 25 grams per day",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-015",
+      "message": "I signed up for the watercolor painting workshop that starts next Saturday",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-016",
+      "message": "Aria had her first vet visit with Dr. Pham today, she's fully vaccinated now",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-017",
+      "message": "My HSA contribution limit this year is $4,150 as a single filer",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-018",
+      "message": "I opened a new Obsidian vault for work notes, called it Second Brain v2",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-019",
+      "message": "Warp instead of iTerm now, using it for the AI command lookup feature",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-020",
+      "message": "November relocation, east village neighborhood near the climbing gym",
+      "intent": "memory_store",
+      "source": "clean"
+    },
+    {
+      "id": "ms-v01",
+      "message": "hey log that i registered for the november bouldering competition at red river gorge",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v02",
+      "message": "i got ar i a from a res cue shel ter last fri day she's a gold en mix",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v03",
+      "message": "i'm learn ing kor e an us ing pim sleur just start ed les son five this morn ing",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v04",
+      "message": "arc in stead of chrome now switched last week and i love it",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v05",
+      "message": "i'm do ing cold plung es ev ery morn ing two min utes at fif ty de grees",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v06",
+      "message": "my sister zoe got married last saturday, her husband is patrick ngai",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v07",
+      "message": "i start ed a ke to di et two weeks a go net carbs un der twen ty five grams",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v08",
+      "message": "i leased a tesla model y last tuesday, it is midnight silver metallic",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v09",
+      "message": "hey log that aria had her first vet visit today and she is now fully vaccinated",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v10",
+      "message": "hey log that I just registered for the rock climbing competition in November",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v11",
+      "message": "log that carlos mendes is my new design lead and started this week",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v12",
+      "message": "i've been do ing cold plung es ev ery morn ing this week two min at fif ty",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v13",
+      "message": "im climb ing for a boul der ing comp in nov em ber start ed train ing this week",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v14",
+      "message": "my new doc tor is doc tor ray ez her clinic is on ma ple street",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-v15",
+      "message": "i sign ed up for a wa ter col or work shop start ing next sat ur day",
+      "intent": "memory_store",
+      "source": "voice"
+    },
+    {
+      "id": "ms-e01",
+      "message": "New climbing shoes: Scarpa Instinct VSR",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e02",
+      "message": "Warp instead of iTerm now",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e03",
+      "message": "November move, east village",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e04",
+      "message": "HSA, max contribution this year",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e05",
+      "message": "New espresso machine: Breville Barista Express",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e06",
+      "message": "Keto protocol, strict daily tracking",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e07",
+      "message": "New rescue dog: Aria",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e08",
+      "message": "Obsidian instead of Notion now",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e09",
+      "message": "I'm learning Korean using the Pimsleur method",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-e10",
+      "message": "Madison Park is my new PM",
+      "intent": "memory_store",
+      "source": "edge"
+    },
+    {
+      "id": "ms-a01",
+      "message": "I officially joined the climbing gym on Park Street, signed up for the membership last week",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a02",
+      "message": "I started adding cold plunges to my morning routine this week, two minutes at fifty degrees",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a03",
+      "message": "Aria is definitely the most affectionate dog I've ever had",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a04",
+      "message": "Oliver cut my hair last Saturday, he does a great fade",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "ms-a05",
+      "message": "Carlos's design instincts are really sharp, he joined us from Figma",
+      "intent": "memory_store",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-001",
+      "message": "What kind of dog is Aria?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-002",
+      "message": "What's Carlos's last name again?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-003",
+      "message": "Who is Madison Park?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-004",
+      "message": "When is the November bouldering competition?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-005",
+      "message": "What watercolor class did I sign up for?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-006",
+      "message": "What's the name of my new espresso machine?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-007",
+      "message": "Who do I go to for design feedback on the team?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-008",
+      "message": "Dig through your records to find Carlos's phone number",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-009",
+      "message": "What car did I lease last week?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-010",
+      "message": "Remind me about my HSA contribution limit",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-011",
+      "message": "Any notes I have on my keto diet?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-012",
+      "message": "What note-taking app am I using for work now?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-013",
+      "message": "Where is Dr. Reyes's clinic?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-014",
+      "message": "When did Aria have her first vet visit?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-015",
+      "message": "What browser am I using now?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-016",
+      "message": "Has my sister Zoe gotten married yet?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-017",
+      "message": "What language am I currently learning?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-018",
+      "message": "Do you have any notes on my cold plunge routine?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-019",
+      "message": "What was Madison Park's previous office?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-020",
+      "message": "Who do I contact for dev infrastructure issues on my team?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-021",
+      "message": "Who should I ask about watercolor technique?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-022",
+      "message": "Anything stored about my Tesla lease terms?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-023",
+      "message": "Search through your records to find my espresso machine warranty info",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-024",
+      "message": "What do you have on Aria's health records?",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-025",
+      "message": "Look back through what I've saved about my diet goals",
+      "intent": "memory_retrieve",
+      "source": "clean"
+    },
+    {
+      "id": "mr-v01",
+      "message": "what kind of dog is ar i a",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v02",
+      "message": "who do i ask for de sign ques tions at work",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v03",
+      "message": "dig through your re cords to find car los's num ber",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v04",
+      "message": "what car did I lease last week think drop",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v05",
+      "message": "re mind me a bout my H S A con tri bu tion lim it",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v06",
+      "message": "any notes on my keto diet plan",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v07",
+      "message": "what note tak ing app am i us ing for work now",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v08",
+      "message": "when did ar i a have her first vet vis it",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v09",
+      "message": "what brows er am i us ing now think drop",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v10",
+      "message": "what language am I currently learning these days",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v11",
+      "message": "who is mad i son park to me",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v12",
+      "message": "do you have an y no tes on my cold plung e rou tine",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v13",
+      "message": "search through your memory to find my espresso machine warranty info",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v14",
+      "message": "an y thing sto red a bout my tes la lease terms",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-v15",
+      "message": "look back through what I've saved a bout my di et goals",
+      "intent": "memory_retrieve",
+      "source": "voice"
+    },
+    {
+      "id": "mr-e01",
+      "message": "Aria info?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e02",
+      "message": "What do I know about Carlos Mendes?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e03",
+      "message": "What browser am I currently using?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e04",
+      "message": "HSA limit?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e05",
+      "message": "Any notes on my keto diet plan?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e06",
+      "message": "Who is Madison Park to me?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e07",
+      "message": "What watercolor class did I sign up for?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e08",
+      "message": "Who handles design?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e09",
+      "message": "What are the details of my November bouldering competition?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e10",
+      "message": "Tesla lease terms?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e11",
+      "message": "Dr. Reyes's address?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-e12",
+      "message": "What Korean learning app am I currently using?",
+      "intent": "memory_retrieve",
+      "source": "edge"
+    },
+    {
+      "id": "mr-a01",
+      "message": "Do you remember what kind of rescue dog Aria is?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a02",
+      "message": "Dig through your memory to find when I scheduled the watercolor class",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a03",
+      "message": "Was it Carlos Mendes or Carlos Rivera who became my new design lead?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a04",
+      "message": "Can you remind me what Aria's breed mix is?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a05",
+      "message": "Look back through your records to find Madison Park's previous role",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a06",
+      "message": "What time did I say Dr. Reyes's appointment was?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a07",
+      "message": "Search your memory for what I said about my keto carb limit",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a08",
+      "message": "Who on my team first told me about the Pimsleur Korean app?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a09",
+      "message": "What temperature did I set for my cold plunge sessions?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "mr-a10",
+      "message": "Did I store anything about my HSA provider?",
+      "intent": "memory_retrieve",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-001",
+      "message": "Best rock climbing gyms in Seattle for beginners",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-002",
+      "message": "Current Tesla Model Y lease deals in California this month",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-003",
+      "message": "What's the current crypto fear and greed index?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-004",
+      "message": "Pimsleur Korean review 2026 — is it still worth it?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-005",
+      "message": "Best watercolor paper for beginners right now",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-006",
+      "message": "Arc browser vs Chrome performance benchmarks 2026",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-007",
+      "message": "Keto diet side effects and how long does keto flu last",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-008",
+      "message": "What time does REI close today in Denver?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-009",
+      "message": "Ethereum price right now",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-010",
+      "message": "Who won the Red River Gorge bouldering competition this year?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-011",
+      "message": "HSA contribution limit for 2026 IRS",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-012",
+      "message": "Best espresso beans for a Breville Barista Express",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-013",
+      "message": "Cold plunge benefits science-backed research 2025",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-014",
+      "message": "What events are happening in Nashville this weekend?",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-015",
+      "message": "Latest Arc browser update features",
+      "intent": "web_search",
+      "source": "clean"
+    },
+    {
+      "id": "ws-v01",
+      "message": "eth e re um price right now",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v02",
+      "message": "best rock climb ing gyms in seat tle for be gin ners",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v03",
+      "message": "search for ke to flu side ef fects and how long does it last for most peo ple",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v04",
+      "message": "search for tes la mod el Y lease deals in cal i for nia this month",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v05",
+      "message": "search for arc brows er ver sus chrome per form ance bench marks 2026",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v06",
+      "message": "IRS HSA contribution limit for tax year 2026 current amount",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-v07",
+      "message": "best wa ter col or pa per for be gin ners right now",
+      "intent": "web_search",
+      "source": "voice"
+    },
+    {
+      "id": "ws-a01",
+      "message": "How much does a Breville Barista Express cost in 2026 compared to last year?",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a02",
+      "message": "What are the top bouldering problems at Red River Gorge right now?",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a03",
+      "message": "Is there a discount on Pimsleur Korean right now?",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a04",
+      "message": "What Tesla Model Y color is most popular according to recent surveys?",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ws-a05",
+      "message": "Find cold plunge spa retreats near Portland Washington available this weekend",
+      "intent": "web_search",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-001",
+      "message": "Open Arc browser and navigate to github.com",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-002",
+      "message": "Search for all FIXME comments in the current project directory",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-003",
+      "message": "Ping Carlos Mendes",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-004",
+      "message": "Commit all staged changes with message refactor auth module",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-005",
+      "message": "Pull the latest changes from origin main and rebase",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-006",
+      "message": "Create a new branch called feature/cold-plunge-tracker",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-007",
+      "message": "Push all commits to origin main",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-008",
+      "message": "Search for all deprecated API calls in the repository",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-009",
+      "message": "Remind me in 20 minutes to drink water",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-010",
+      "message": "Set a timer for 2 minutes for my cold plunge",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-011",
+      "message": "Find all TODO comments in the codebase and list them",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-012",
+      "message": "Send Madison Park an email about the sprint review",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-013",
+      "message": "Ping 10.0.0.5 to check connectivity",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-014",
+      "message": "Open Warp terminal and run npm install",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-015",
+      "message": "Go to Linear and create a new ticket for the keto macro tracker feature",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-016",
+      "message": "Navigate to Obsidian and open my Second Brain v2 vault",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-017",
+      "message": "Check if port 5432 is in use",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-018",
+      "message": "Create a folder called climbing-logs on my Desktop",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-019",
+      "message": "List all PDF files in my Documents folder",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-020",
+      "message": "Text this to my phone number",
+      "intent": "command_automate",
+      "source": "clean"
+    },
+    {
+      "id": "ca-v01",
+      "message": "com mit all staged files with mes sage re fac tor au tho ri za tion mod ule",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v02",
+      "message": "pull the lat est chang es from or i gin main and re base",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v03",
+      "message": "push all com mits to or i gin main",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v04",
+      "message": "search for all fix me com ments in the cur rent pro ject dir ec to ry",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v05",
+      "message": "ping car los men dez to check in",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v06",
+      "message": "set a timer for two minutes for my cold plunge",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v07",
+      "message": "remind me in twenty minutes to drink water",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v08",
+      "message": "o pen arc brows er and nav i gate to git hub dot com",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v09",
+      "message": "create a new branch called feature slash korean tracker",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v10",
+      "message": "search for all TODO markers in the current project directory",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v11",
+      "message": "send madison park an email about the sprint review",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v12",
+      "message": "list all P D F files in my doc u ments fold er",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v13",
+      "message": "o pen warp ter mi nal and run npm in stall",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v14",
+      "message": "ping ten dot ze ro dot ze ro dot five to check con nec tiv i ty",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-v15",
+      "message": "text this to my phone num ber",
+      "intent": "command_automate",
+      "source": "voice"
+    },
+    {
+      "id": "ca-e01",
+      "message": "Search for XXXX_PLACEHOLDER in the repo",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e02",
+      "message": "Commit and push everything",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e03",
+      "message": "Ping Madison",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e04",
+      "message": "Timer for the cold plunge, 2 minutes",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e05",
+      "message": "Open Obsidian vault",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-e06",
+      "message": "Find DEPRECATED comments in the codebase",
+      "intent": "command_automate",
+      "source": "edge"
+    },
+    {
+      "id": "ca-a01",
+      "message": "I need to push the keto tracker feature to production today",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a02",
+      "message": "Can you run the test suite and report back any failures?",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a03",
+      "message": "Schedule a meeting with Madison Park for Friday at 2pm",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a04",
+      "message": "Scan the current repository for any security vulnerabilities",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "ca-a05",
+      "message": "Merge the feature branch into develop after reviewing the diff",
+      "intent": "command_automate",
+      "source": "adversarial"
+    },
+    {
+      "id": "si-001",
+      "message": "What does the error in my terminal say right now?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-002",
+      "message": "Summarize what's currently visible in my VS Code editor",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-003",
+      "message": "What branch name is shown in my Warp terminal status bar?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-004",
+      "message": "Read the popup message that just appeared on screen",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-005",
+      "message": "What does the VS Code problems panel show right now?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-006",
+      "message": "Tell me all the text visible in my Arc browser tab right now",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-007",
+      "message": "What's the current file I have open in Warp?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-008",
+      "message": "Which Obsidian note do I currently have open?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-009",
+      "message": "Describe what my desktop looks like right now",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-010",
+      "message": "What apps are running on my screen right now?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-011",
+      "message": "Read the Linear ticket that's currently open on my screen",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-012",
+      "message": "What notifications are showing in my menu bar right now?",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-013",
+      "message": "Summarize the Obsidian vault file I currently have open",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-014",
+      "message": "Tell me what error message is displayed in the current terminal window",
+      "intent": "screen_intelligence",
+      "source": "clean"
+    },
+    {
+      "id": "si-v01",
+      "message": "what does the er ror in my ter mi nal say right now",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v02",
+      "message": "what branch name is shown in my warp sta tus bar",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v03",
+      "message": "read the pop up mes sage that just ap peared on screen",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v04",
+      "message": "what apps are run ning on my screen right now",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v05",
+      "message": "which obsidian note do I currently have open",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v06",
+      "message": "describe what my desktop looks like right now",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-v07",
+      "message": "which ob sid i an note do I cur rent ly have o pen on screen right now",
+      "intent": "screen_intelligence",
+      "source": "voice"
+    },
+    {
+      "id": "si-e01",
+      "message": "What's on screen?",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e02",
+      "message": "What does this popup say?",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e03",
+      "message": "Current error in terminal?",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e04",
+      "message": "What's in my VS Code sidebar right now?",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "si-e05",
+      "message": "Tell me what's shown in the Warp terminal buffer right now",
+      "intent": "screen_intelligence",
+      "source": "edge"
+    },
+    {
+      "id": "gk-001",
+      "message": "What is the difference between bouldering and top rope climbing?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-002",
+      "message": "How does cold water immersion affect the nervous system?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-003",
+      "message": "What framework is best for serverless functions in Node.js?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-004",
+      "message": "What is the ketogenic diet and how does ketosis work?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-005",
+      "message": "Explain how CQRS architecture works in software design",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-006",
+      "message": "What is the difference between a lease and a loan for a car?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-007",
+      "message": "How does HEVC compression compare to H.264?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-008",
+      "message": "What is a Health Savings Account and how does it work?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-009",
+      "message": "Explain the difference between espresso and drip coffee extraction",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-010",
+      "message": "What is the Wim Hof method?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-011",
+      "message": "How does a relational database differ from a document store?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-012",
+      "message": "Explain event-driven architecture simply",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-013",
+      "message": "What is the tonality system in Korean (hangeul)?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-014",
+      "message": "How does dollar cost averaging reduce investment risk?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-015",
+      "message": "What is the difference between V-grade and font-grade bouldering scales?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-016",
+      "message": "Explain what HSA triple tax advantage means",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-017",
+      "message": "What is osmosis in biology?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-018",
+      "message": "What programming language is best for machine learning in 2026?",
+      "intent": "general_knowledge",
+      "source": "clean"
+    },
+    {
+      "id": "gk-v01",
+      "message": "what is the dif fer ence be tween boul der ing and top rope climb ing",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v02",
+      "message": "explain how cold water immersion affects the nervous system",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v03",
+      "message": "what frame work is best for serv er less func tions in node j s",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v04",
+      "message": "ex plain the ke to gen ic di et and how ke to sis works in the bod y",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v05",
+      "message": "ex plain the dif fer ence be tween ex pres so and drip cof fee ex trac tion",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v06",
+      "message": "ex plain what an H S A is and how the tri ple tax ad van tage works",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v07",
+      "message": "how does dol lar cost av er ag ing re duce in vest ment risk",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-v08",
+      "message": "which programming language is best for machine learning in 2026",
+      "intent": "general_knowledge",
+      "source": "voice"
+    },
+    {
+      "id": "gk-e01",
+      "message": "Cold plunge benefits?",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e02",
+      "message": "Best serverless language?",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e03",
+      "message": "HSA triple tax advantage explained",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-e04",
+      "message": "What's the difference between keto and low-carb diets?",
+      "intent": "general_knowledge",
+      "source": "edge"
+    },
+    {
+      "id": "gk-a01",
+      "message": "Explain what technology makes Arc browser architecturally different from Chrome",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a02",
+      "message": "Is Obsidian better than Notion for long-term knowledge management?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gk-a03",
+      "message": "What database structure is best for storing user preferences in 2026?",
+      "intent": "general_knowledge",
+      "source": "adversarial"
+    },
+    {
+      "id": "gr-001",
+      "message": "Hey ThinkDrop, good morning!",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-002",
+      "message": "What are you called?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-003",
+      "message": "Hi, I'm back after the weekend",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-004",
+      "message": "What name do you go by?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-005",
+      "message": "Hey, what's up!",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-006",
+      "message": "Are you an AI assistant?",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-007",
+      "message": "Thanks, that's exactly what I needed!",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-008",
+      "message": "Good evening, ready to get started",
+      "intent": "greeting",
+      "source": "clean"
+    },
+    {
+      "id": "gr-v01",
+      "message": "hey think drop good morn ing",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v02",
+      "message": "what are you called think drop",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v03",
+      "message": "hey what's up",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v04",
+      "message": "thanks that's ex act ly what I need ed",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-v05",
+      "message": "good eve ning read y to get start ed",
+      "intent": "greeting",
+      "source": "voice"
+    },
+    {
+      "id": "gr-e01",
+      "message": "Morning!",
+      "intent": "greeting",
+      "source": "edge"
+    },
+    {
+      "id": "gr-e02",
+      "message": "Your name?",
+      "intent": "greeting",
+      "source": "edge"
+    },
+    {
+      "id": "ac-001",
+      "message": "Turn on control mode for Arc browser",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-002",
+      "message": "Enter control mode for Obsidian",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-003",
+      "message": "Activate control mode for Linear",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-004",
+      "message": "Take control of Warp terminal for me",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-005",
+      "message": "Control Arc browser",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-006",
+      "message": "Exit control mode",
+      "intent": "app_control_start",
+      "source": "clean"
+    },
+    {
+      "id": "ac-007",
+      "message": "Start controlling Obsidian and open my daily note",
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
+    },
+    {
+      "id": "ac-v01",
+      "message": "turn on con trol mode for arc brows er",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v02",
+      "message": "en ter con trol mode for ob sid i an",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v03",
+      "message": "take con trol of warp ter mi nal for me",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v04",
+      "message": "ac ti vate con trol mode for lin e ar",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-v05",
+      "message": "ex it con trol mode",
+      "intent": "app_control_start",
+      "source": "voice"
+    },
+    {
+      "id": "ac-e01",
+      "message": "Control mode on for Arc",
+      "intent": "app_control_start",
+      "source": "edge"
+    },
+    {
+      "id": "ac-e02",
+      "message": "Take over Warp",
+      "intent": "app_control_start",
+      "source": "edge"
+    },
+    {
+      "id": "ac-e03",
+      "message": "Control Linear for me",
+      "intent": "app_control_start",
+      "source": "edge"
+    }
   ]
 }

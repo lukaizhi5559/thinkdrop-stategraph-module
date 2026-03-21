@@ -148,6 +148,12 @@ function detectIntentCarryover(message, conversationHistory) {
   const CAPABILITY_QUESTION = /\b(do you have (a skill|the ability|a way|a tool) to\b|can you (use|run|execute|do) .{0,40}\b(skill|command|shell|terminal|browser)\b|is there a skill (to|that|for)\b)/i;
   if (FILESYSTEM_ACTION.test(msg) || CAPABILITY_QUESTION.test(msg)) return null;
 
+  // Screen-intelligence queries NEVER carry prior intent — they're always new requests.
+  // "What's on my screen right now?" contains "now" (temporal word) which would incorrectly
+  // trigger isTemporalElliptical carryover.  Guard = any direct screen-read phrasing.
+  const SCREEN_QUERY_DIRECT = /\b(on\s+(my\s+)?(the\s+)?screen|my\s+screen|my\s+(display|monitor)|on\s+screen|what'?s?\s+on\s+my|what\s+is\s+on\s+my)\b/i;
+  if (SCREEN_QUERY_DIRECT.test(msg)) return null;
+
   const words = msg.split(/\s+/).filter(Boolean);
   const wordCount = words.length;
   const hasStandaloneIntent = STANDALONE_INTENT_WORDS.test(msg);
@@ -185,8 +191,11 @@ function detectIntentCarryover(message, conversationHistory) {
   // Signal 1: CONTINUATION — very short message (≤4 words), no standalone intent
   // Covers: "anything else", "what else", "more", "go on", "continue", "and?", "ok so?"
   // Excludes clear subject+verb sentences: "I like these", "these are interesting"
+  // Excludes greetings — these are never follow-ups to a prior command_automate
   const CLEAR_SUBJECT_VERB = /^(i |they |he |she |it |we |these |those |that |this )\w/i;
-  const isContinuation = wordCount <= 4 && !hasStandaloneIntent && !CLEAR_SUBJECT_VERB.test(msg);
+  const GREETING_RE = /^(hey|hi|hello|howdy|hiya|yo|sup|what'?s\s+up|whats\s+up|good\s+(morning|afternoon|evening|day|night)|greetings|salutations|morning|evening|afternoon|heya|helo)\b/i;
+  const isGreeting = GREETING_RE.test(msg);
+  const isContinuation = wordCount <= 4 && !hasStandaloneIntent && !CLEAR_SUBJECT_VERB.test(msg) && !isGreeting;
 
   // Signal 2: TEMPORAL ELLIPTICAL — has time word, no standalone intent, short or elliptical prefix
   // EXCEPTION: system-info queries like "what's today's date", "what time is it" must NEVER

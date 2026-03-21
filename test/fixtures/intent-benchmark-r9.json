@@ -1588,92 +1588,107 @@
     {
       "id": "ac-001",
       "message": "Open Day One",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-002",
       "message": "Launch Penpot",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-003",
       "message": "Open Anki",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-004",
       "message": "Switch to Ghostwriter",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-005",
       "message": "Open Slack",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-006",
       "message": "Launch Linear",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-007",
       "message": "Open Warp terminal",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-008",
       "message": "Start Zoom for Rafael's onboarding call",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-009",
       "message": "Open Maps and search for Sam Torres Auto",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v01",
       "message": "o pen day one jour nal app",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v02",
       "message": "launch pen pot for de sign work",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-e01",
       "message": "Day One please",
-      "intent": "app_control_start",
-      "source": "edge"
+      "intent": "command_automate",
+      "source": "edge",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-e02",
       "message": "Anki",
-      "intent": "app_control_start",
-      "source": "edge"
+      "intent": "command_automate",
+      "source": "edge",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-a01",
       "message": "Pull up Ghostwriter so I can draft the Portugal itinerary",
-      "intent": "app_control_start",
-      "source": "adversarial"
+      "intent": "command_automate",
+      "source": "adversarial",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-a02",
       "message": "Get Linear open so I can check the sprint board",
-      "intent": "app_control_start",
-      "source": "adversarial"
+      "intent": "command_automate",
+      "source": "adversarial",
+      "note": "open-app → command_automate (shell.run open -a)"
     }
   ]
 }

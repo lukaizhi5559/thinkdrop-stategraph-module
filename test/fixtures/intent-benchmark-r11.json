@@ -1096,140 +1096,163 @@
     {
       "id": "ac-001",
       "message": "Open Roam Research",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-002",
       "message": "Launch Obsidian",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-003",
       "message": "Start Slack",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-004",
       "message": "Open VS Code",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-005",
       "message": "Launch Spotify for my morning run playlist",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-006",
       "message": "Open Terminal",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-007",
       "message": "Start Zoom for my call with Nadia",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-008",
       "message": "Open Safari",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-009",
       "message": "Launch Arc browser",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-010",
       "message": "Open Figma",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-011",
       "message": "Start DataGrip",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-012",
       "message": "Open PyCharm",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-013",
       "message": "Launch Bear notes app",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-014",
       "message": "Open Linear",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-015",
       "message": "Start iTerm",
-      "intent": "app_control_start",
-      "source": "clean"
+      "intent": "command_automate",
+      "source": "clean",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v01",
       "message": "open up roam research for me",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v02",
       "message": "launch vs code please",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v03",
       "message": "start slack so i can message nadia",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v04",
       "message": "open safari for me",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v05",
       "message": "open up obsidian",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v06",
       "message": "launch spotify",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v07",
       "message": "start up terminal",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-v08",
       "message": "open zoom for my physio call with sione",
-      "intent": "app_control_start",
-      "source": "voice"
+      "intent": "command_automate",
+      "source": "voice",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-e01",
@@ -1240,8 +1263,9 @@
     {
       "id": "ac-e02",
       "message": "Launch VS Code and open the Rust project",
-      "intent": "app_control_start",
-      "source": "edge"
+      "intent": "command_automate",
+      "source": "edge",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-e03",
@@ -1258,14 +1282,16 @@
     {
       "id": "ac-a01",
       "message": "Can you open Roam for me please",
-      "intent": "app_control_start",
-      "source": "adversarial"
+      "intent": "command_automate",
+      "source": "adversarial",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-a02",
       "message": "Get Obsidian up on screen",
-      "intent": "app_control_start",
-      "source": "adversarial"
+      "intent": "command_automate",
+      "source": "adversarial",
+      "note": "open-app → command_automate (shell.run open -a)"
     },
     {
       "id": "ac-a03",
