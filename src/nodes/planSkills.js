@@ -21,6 +21,7 @@
  */
 
 const fs = require('fs');
+const { buildReminderSkill } = require('../utils/buildReminderSkill');
 
 /**
  * Build a human-readable description for a plan step.
@@ -817,6 +818,24 @@ Task: "${userMessage}"`;
     logger.debug('[Node:PlanSkills] api_rule.list(endpoint) unavailable (non-fatal)');
   }
 
+  // ── Pre-LLM guard: strip erroneous messaging domain context for local recurring reminders ──
+  // phi4 can hallucinate "discord"/"telegram"/"slack" as domain services for requests like
+  // "Schedule my cold plunge every morning at 6am" — a local macOS alarm that needs NO API.
+  // If enrichIntent leaked a chosenService or domainTags from a phi4 false-positive, clear
+  // them before the domain context note is built, so the LLM sees a clean message and
+  // respects the launchd/node-cron pattern in plan-skills.md.
+  {
+    const _PRE_LLM_RECURRING_RE = /\b(every\s+(morning|day|night|evening|week|month|hour|\d)|daily|weekly|monthly|each\s+(morning|day|night|evening|week)|remind\s+me\s+(daily|every)|recurring|repeat(ing)?|on\s+a\s+(daily|weekly|\w+)\s+schedule|alarm)\b/i;
+    const _PRE_LLM_EXPLICIT_SVC_RE = /\b(discord|telegram|slack|twilio|clicksend|sendgrid|mailgun|pushover|pushbullet|onesignal|whatsapp)\b/i;
+    if (_PRE_LLM_RECURRING_RE.test(userMessage) && !_PRE_LLM_EXPLICIT_SVC_RE.test(userMessage)) {
+      if (chosenService || domainTags) {
+        logger.info(`[Node:PlanSkills] Local recurring reminder pre-LLM guard: cleared chosenService="${chosenService}" and domainTags for: "${userMessage.substring(0, 60)}"`);
+        chosenService = null;
+        domainTags = null;
+      }
+    }
+  }
+
   let domainContextNote = '';
   if (domainTags && (domainTags.tags?.length > 0 || domainTags.skillHints?.length > 0)) {
     const parts = [];
@@ -888,6 +907,36 @@ Task: "${userMessage}"`;
         domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Because this is a messaging/API task with a known target service, you MUST use the skill.bootstrap pattern (web.crawl docs → synthesize skill.md → skill.install).\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials like <TWILIO_ACCOUNT_SID> or <API_KEY>. Credentials are handled automatically via keychain — never hardcode them.\n- FORBIDDEN: Do NOT use api_suggest — the service is already identified above.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
         logger.info(`[Node:PlanSkills] Domain context injected: ${domainTags.tags?.join(', ')} → ${domainTags.skillHints?.[0]}`);
       }
+    }
+  }
+
+  // ── Pre-LLM recurring reminder intercept ─────────────────────────────────────
+  // Delegate to buildReminderSkill — a pure, independently-tested helper that
+  // detects local macOS reminders/schedules and builds a deterministic notify/bridge
+  // skill plan without touching the LLM.
+  // SKIP if the prompt came from the Bridge Listener — that source already has
+  // a real action to execute and should never be re-intercepted as a new reminder.
+  {
+    const _isBridgeListenerSource = state.context?.source === 'bridge_listener' || state.context?.source === 'bridge_startup';
+    if (_isBridgeListenerSource) {
+      logger.info(`[Node:PlanSkills] Bridge source detected (${state.context?.source}) — skipping reminder intercept`);
+    }
+    const _reminderResult = _isBridgeListenerSource ? null : buildReminderSkill(userMessage, homeDir);
+    if (_reminderResult && _reminderResult.fires) {
+      logger.info(`[Node:PlanSkills] Pre-LLM recurring reminder intercept [${_reminderResult.tier}]: "${_reminderResult.skillName}" cron="${_reminderResult.cronExpr}"`);
+      if (progressCallback) progressCallback({
+        type: 'plan_ready',
+        steps: _reminderResult.skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })),
+        intent: state.intent?.type || 'command_automate',
+      });
+      return {
+        ...state,
+        skillPlan: _reminderResult.skillPlan,
+        skillCursor: 0,
+        planError: null,
+        recoveryContext: null,
+        pendingSkillName: _reminderResult.skillName,
+      };
     }
   }
 
@@ -1143,7 +1192,7 @@ CRITICAL rules for skill.md:
             }
             return unified;
           });
-          logger.debug(`[Node:PlanSkills] Multi-tab plan consolidated: ${plannedSessionIds.size} sessions → 1 session "${primarySession}" (subsequent navigates → tab-new)`);
+          logger.debug(`[Node:PlanSkills] Multi-tab plan cold: ${plannedSessionIds.size} sessions → 1 session "${primarySession}" (subsequent navigates → tab-new)`);
         } else {
           // Check if the navigate step goes to the same domain as the active session
           const navigateStep = skillPlan.find(s => s.skill === 'browser.act' && s.args?.action === 'navigate');
@@ -1453,6 +1502,176 @@ CRITICAL rules for skill.md:
           }
         } catch (scoutErr) {
           logger.warn(`[Node:PlanSkills] skill-scout dynamic discovery error (non-fatal): ${scoutErr.message}`);
+        }
+      }
+
+      // ── Local recurring reminder shortcut (node-cron via SkillScheduler) ──────
+      // If the LLM returned needs_skill for a local macOS reminder (no external API),
+      // create a minimal notification skill with a cron schedule in its frontmatter
+      // and install it. The SkillScheduler daemon (already running in command-service)
+      // reads the schedule field and registers a node-cron job automatically.
+      //
+      // Architecture: skill.md (schedule: "0 6 * * *") + index.cjs (osascript notify)
+      //               → skill.install → curl /skill.schedule/sync → SkillScheduler picks up
+      {
+        const capLow = (capability || userMessage).toLowerCase();
+        const sugLow = (suggestion || '').toLowerCase();
+        const msgLow = userMessage.toLowerCase();
+        const EXTERNAL_SVC = ['gmail', 'twilio', 'sms', 'text message', 'clicksend', 'vonage', 'slack', 'discord', 'telegram', 'whatsapp', 'sendgrid', 'mailgun', 'email service'];
+        const isExternalSvc = EXTERNAL_SVC.some(s => sugLow.includes(s) || capLow.includes(s));
+        const LOCAL_REMINDER_KWS = ['remind', 'reminder', 'alarm', 'cold plunge', 'plunge', 'workout', 'exercise', 'meditation', 'wake up', 'stand up', 'break', 'hydrat', 'drink water', 'stretch'];
+        const SCHEDULE_KWS = ['every morning', 'every day', 'every night', 'daily', 'weekly', 'at 6', 'at 7', 'at 8', 'at 9', 'at 10', 'at 11', 'at 12', 'am', 'pm'];
+        // Bridge action keywords: tasks requiring AI reasoning at fire time (access current state/data).
+        // "remind me to X" stays notify even if X contains these words — explicit "remind" overrides.
+        const BRIDGE_ACTION_KWS = ['update', 'review', 'check', 'go through', 'organize', 'summarize', 'draft', 'process', 'clean up', 'analyze', 'categorize', 'compile', 'go over', 'look at', 'write up'];
+        const hasExplicitRemind = /\b(remind\s+me|reminder|set\s+(a|an)\s+(reminder|alarm))\b/i.test(userMessage);
+        const hasReminderKw = LOCAL_REMINDER_KWS.some(k => capLow.includes(k) || msgLow.includes(k));
+        const hasScheduleKw = SCHEDULE_KWS.some(k => capLow.includes(k) || msgLow.includes(k));
+        const hasBridgeKw   = !hasExplicitRemind && BRIDGE_ACTION_KWS.some(k => capLow.includes(k) || msgLow.includes(k));
+
+        // ── Tier classification ────────────────────────────────────────────────
+        // notify: pure nudge — user does the action, ThinkDrop just beeps
+        // bridge: ThinkDrop executes an agentic task at fire time (needs fresh context)
+        // script: deterministic code that can be fully pre-written (handled elsewhere)
+        const reminderTier = hasBridgeKw ? 'bridge' : 'notify';
+
+        if (!isExternalSvc && (hasReminderKw || hasScheduleKw || hasBridgeKw)) {
+          // ── Parse time ──────────────────────────────────────────────────────
+          const fullText = `${userMessage} ${capability || ''}`;
+          const timeMatch = fullText.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b/i)
+                         || fullText.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\b/i);
+          let hour = 6; let minute = 0;
+          if (timeMatch) {
+            hour = parseInt(timeMatch[1], 10);
+            minute = parseInt(timeMatch[2] || '0', 10);
+            const period = (timeMatch[3] || '').toLowerCase();
+            if (period === 'pm' && hour < 12) hour += 12;
+            if (period === 'am' && hour === 12) hour = 0;
+          }
+          const minuteStr = minute.toString().padStart(2, '0');
+
+          // ── Build skill name + label ────────────────────────────────────────
+          const STOP_WORDS = new Set(['my','a','an','the','at','every','morning','evening','daily','to','for','of','on','in','sessions','session','schedule','me','i','set','give','put','remind','reminder','alarm','weekly','nightly','each','tonight','night']);
+          const labelWords = (capability || userMessage).toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(w => w.length > 1 && !STOP_WORDS.has(w) && !/^\d/.test(w)).slice(0, 3);
+          const label = labelWords.length > 0 ? labelWords.join('.') : 'daily';
+          const skillName = `reminder.${label}`;
+          const skillDir = `$HOME/.thinkdrop/skills/${skillName}`;
+
+          // ── cron expression: "minute hour * * *" (daily) ───────────────────
+          const cronExpr = `${minute} ${hour} * * *`;
+
+          // ── Human-readable title & notification message ─────────────────────
+          const notifTitle = `ThinkDrop Reminder`;
+          const notifMsg   = (capability || userMessage).split(' ').slice(0, 8).join(' ');
+
+          // ── Build skill.md based on tier ────────────────────────────────────
+          let skillMd, setupScript, reminderPlan;
+
+          if (reminderTier === 'notify') {
+            // ── NOTIFY tier: SkillScheduler fires osascript directly, no index.cjs ──
+            skillMd = [
+              `---`,
+              `name: ${skillName}`,
+              `schedule: "${cronExpr}"`,
+              `type: notify`,
+              `title: ${notifTitle}`,
+              `message: ${notifMsg}`,
+              `description: Daily reminder — ${notifMsg}`,
+              `---`,
+              ``,
+              `## Plan`,
+              `Fire a macOS notification every day at ${hour}:${minuteStr}.`,
+            ].join('\n');
+
+            setupScript = [
+              `mkdir -p "${skillDir}"`,
+              `cat > "${skillDir}/skill.md" << 'SKILL_EOF'`,
+              skillMd,
+              `SKILL_EOF`,
+              `echo "✅ Reminder skill (notify) written: ${skillName}"`,
+            ].join('\n');
+
+            reminderPlan = [
+              {
+                skill: 'shell.run',
+                description: `Write notify skill.md for "${label}" (fires osascript at ${hour}:${minuteStr} daily)`,
+                args: { cmd: 'bash', argv: ['-c', setupScript] },
+              },
+              {
+                skill: 'skill.install',
+                description: `Register ${skillName} so SkillScheduler picks up the cron`,
+                args: { skillPath: `${homeDir}/.thinkdrop/skills/${skillName}/skill.md` },
+              },
+              {
+                skill: 'shell.run',
+                description: `Sync SkillScheduler to activate the cron immediately`,
+                args: { cmd: 'bash', argv: ['-c', `curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo "✅ node-cron activated: ${skillName} at ${hour}:${minuteStr} daily"`] },
+              },
+            ];
+
+            logger.info(`[Node:PlanSkills] Local reminder intercept [notify]: "${label}" cron="${cronExpr}"`);
+
+          } else {
+            // ── BRIDGE tier: SkillScheduler writes WS:INSTRUCTION → Electron executes ──
+            // Full user message becomes the instruction so the AI has complete context at fire time.
+            const bridgeInstruction = userMessage;
+
+            skillMd = [
+              `---`,
+              `name: ${skillName}`,
+              `schedule: "${cronExpr}"`,
+              `type: bridge`,
+              `title: ${label}`,
+              `instruction: ${bridgeInstruction}`,
+              `description: Scheduled task — ${notifMsg}`,
+              `---`,
+              ``,
+              `## Plan`,
+              `At fire time, ThinkDrop executes: "${bridgeInstruction}"`,
+            ].join('\n');
+
+            setupScript = [
+              `mkdir -p "${skillDir}"`,
+              `cat > "${skillDir}/skill.md" << 'SKILL_EOF'`,
+              skillMd,
+              `SKILL_EOF`,
+              `echo "✅ Bridge skill written: ${skillName}"`,
+            ].join('\n');
+
+            reminderPlan = [
+              {
+                skill: 'shell.run',
+                description: `Write bridge skill.md for "${label}" (AI task at ${hour}:${minuteStr} daily)`,
+                args: { cmd: 'bash', argv: ['-c', setupScript] },
+              },
+              {
+                skill: 'skill.install',
+                description: `Register ${skillName} so SkillScheduler picks up the cron`,
+                args: { skillPath: `${homeDir}/.thinkdrop/skills/${skillName}/skill.md` },
+              },
+              {
+                skill: 'shell.run',
+                description: `Sync SkillScheduler to activate the cron immediately`,
+                args: { cmd: 'bash', argv: ['-c', `curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo "✅ node-cron activated: ${skillName} at ${hour}:${minuteStr} daily"`] },
+              },
+            ];
+
+            logger.info(`[Node:PlanSkills] Local reminder intercept [bridge]: "${label}" cron="${cronExpr}"`);
+          }
+
+          if (progressCallback) progressCallback({
+            type: 'plan_ready',
+            steps: reminderPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })),
+            intent: state.intent?.type || 'command_automate',
+          });
+          return {
+            ...state,
+            skillPlan: reminderPlan,
+            skillCursor: 0,
+            planError: null,
+            recoveryContext: null,
+            pendingSkillName: skillName,
+          };
         }
       }
 

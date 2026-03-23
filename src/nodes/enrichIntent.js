@@ -482,6 +482,21 @@ Answer with exactly one word: YES or NO.`;
     }
   }
 
+  // ── Local recurring reminder guard ────────────────────────────────────────
+  // "Schedule my cold plunge every morning at 6am" requires a macOS launchd
+  // alarm — there is NO external messaging/notification API involved.
+  // phi4 frequently hallucinates "discord", "telegram", "slack" etc. as domain
+  // services for recurring local-reminder requests. If the message clearly
+  // describes a recurring local reminder AND does NOT explicitly name an
+  // external delivery channel, discard domainTags entirely so planSkills
+  // receives a clean slate and can use the launchd/node-cron pattern.
+  const _LOCAL_RECURRING_RE = /\b(every\s+(morning|day|night|evening|week|month|hour|\d)|daily|weekly|monthly|each\s+(morning|day|night|evening|week)|remind\s+me\s+(daily|every)|recurring|repeat(ing)?|on\s+a\s+(daily|weekly|\w+)\s+schedule|alarm)\b/i;
+  const _EXPLICIT_EXTERNAL_SVC_RE = /\b(discord|telegram|slack|twilio|clicksend|sendgrid|mailgun|pushover|pushbullet|onesignal|whatsapp|sms\s+me|text\s+me)\b/i;
+  if (_LOCAL_RECURRING_RE.test(commandMessage) && !_EXPLICIT_EXTERNAL_SVC_RE.test(commandMessage)) {
+    logger.info(`[Node:EnrichIntent] Local recurring reminder guard — clearing domain tags for: "${commandMessage.substring(0, 60)}"`);
+    domainTags = null;
+  }
+
   // Filter phi4 results to real messaging providers (seed + learned)
   // ALSO: if the user explicitly named a service in the message, include it
   // even if phi4 didn't return it — this covers unknown providers the user mentions.

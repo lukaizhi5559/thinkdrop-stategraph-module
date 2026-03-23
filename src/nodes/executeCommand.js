@@ -499,28 +499,36 @@ module.exports = async function executeCommand(state) {
     }
     const targetIso = new Date(Date.now() + waitMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const reminderId = `reminder_${Date.now()}`;
-    // Determine trigger intent: only command_automate if remaining steps include
-    // real action skills (shell.run, browser.act, web.crawl, etc.) — NOT just synthesize.
-    // A synthesize step after schedule is just the notification message, not a real command.
+    // Determine pending steps to execute when reminder fires.
+    // Notification-only steps (osascript/display notification) are excluded because main.js
+    // already shows a dialog + Electron Notification on every reminder fire.
+    // Real action steps (browser.act, non-notification shell.run, etc.) are serialized and
+    // executed directly via command-service when the reminder fires — no stategraph re-run.
+    // Re-running the original prompt causes an infinite loop for time-delay reminders.
     const remainingSteps = skillPlan.slice(skillCursor + 1);
-    const ACTION_SKILLS = ['shell.run', 'browser.act', 'web.crawl', 'skill.install', 'external.skill'];
-    const hasActionSteps = remainingSteps.some(s => ACTION_SKILLS.includes(s.skill));
-    const triggerIntent = hasActionSteps ? 'command_automate' : 'notify';
-    // For notify: use the synthesize prompt, or generate a friendly message from the label.
-    // For command_automate: use the original user message to re-run the full pipeline.
+    const isNotificationStep = (s) => s.skill === 'synthesize' ||
+      (s.skill === 'shell.run' && (
+        s.args?.cmd === 'osascript' ||
+        (s.args?.cmd === 'bash' && String(s.args?.argv || '').includes('osascript')) ||
+        String(s.args?.argv || '').includes('display notification')
+      ));
+    const pendingRealSteps = remainingSteps.filter(s => !isNotificationStep(s));
+    const triggerIntent = pendingRealSteps.length > 0 ? 'execute_steps' : 'notify';
+    // Always use a clean human-readable message for the dialog/notification shown on fire.
+    // Never use state.message (the raw user prompt) — that causes infinite loops when re-run.
     const synthStep = remainingSteps.find(s => s.skill === 'synthesize');
     let notifyMessage = synthStep?.args?.prompt || '';
     if (!notifyMessage) {
-      // Generate a friendly notification from the label: "Remind to check the oven" → "It's time to check the oven!"
       const cleanLabel = (label || '').replace(/^remind(er)?(\s+to)?\s*/i, '').replace(/^check\s+/i, 'check ');
-      notifyMessage = cleanLabel ? `⏰ Reminder: It's time to ${cleanLabel}!` : `⏰ ${label}`;
+      notifyMessage = cleanLabel ? `It's time to ${cleanLabel}!` : label;
     }
-    const triggerPrompt = triggerIntent === 'command_automate' ? (state.message || label) : notifyMessage;
+    const triggerPrompt = notifyMessage;
+    const pendingSteps = pendingRealSteps.length > 0 ? JSON.stringify(pendingRealSteps) : null;
     // POST to command-service /reminder.register (non-blocking)
     const cmdPort = 3007;
     try {
       const http = require('http');
-      const payload = JSON.stringify({ id: reminderId, delayMs: waitMs, label, triggerIntent, triggerPrompt });
+      const payload = JSON.stringify({ id: reminderId, delayMs: waitMs, label, triggerIntent, triggerPrompt, pendingSteps });
       const req = http.request({ hostname: '127.0.0.1', port: cmdPort, path: '/reminder.register', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }, timeout: 5000 });
       req.on('error', (e) => logger.warn(`[Node:ExecuteCommand] schedule: reminder register failed: ${e.message}`));
       req.write(payload);
@@ -572,6 +580,31 @@ module.exports = async function executeCommand(state) {
       skillCursor: skillCursor + 1,
       commandExecuted: false,
       pendingQuestion: { question, options },
+      failedStep: null
+    };
+  }
+
+  // ── needs_skill safety net ───────────────────────────────────────────────
+  // If needs_skill bypasses the scout intercept (e.g. during a recovery replan),
+  // it would normally hit the MCP dispatcher with no handler and fail silently.
+  // Surface a clear ask_user card instead.
+  if (skill === 'needs_skill') {
+    const { capability = 'an unknown capability', suggestion = '' } = args;
+    const message = `🔧 ThinkDrop needs a custom skill to: **${capability}**${suggestion ? `\n\nSuggested services: ${suggestion}` : ''}\n\nWould you like to build this skill now?`;
+    logger.info(`[Node:ExecuteCommand] needs_skill: surfacing capability gap for "${capability}"`);
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_skill', description: description || `Skill needed: ${capability}`, stdout: message });
+    return {
+      ...state,
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'needs_skill', args, description, ok: true, stdout: message }],
+      skillCursor: skillCursor + 1,
+      commandExecuted: false,
+      pendingQuestion: {
+        question: message,
+        options: [
+          `Yes, build the skill for: ${capability}`,
+          `No thanks, skip this`
+        ]
+      },
       failedStep: null
     };
   }
@@ -1003,7 +1036,11 @@ module.exports = async function executeCommand(state) {
     if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: description || 'Installing skill...' });
 
     const rawPath = args.skillPath || args.path || args.contractPath || '';
-    const skillPath = rawPath.replace(/~/g, require('os').homedir());
+    const _homedir = require('os').homedir();
+    const skillPath = rawPath
+      .replace(/~/g, _homedir)
+      .replace(/\$HOME\b/g, _homedir)
+      .replace(/\$USERPROFILE\b/g, _homedir);
 
     if (!skillPath) {
       const errMsg = 'skill.install requires a skillPath argument (absolute path to the skill.md file)';
@@ -1110,6 +1147,106 @@ module.exports = async function executeCommand(state) {
         }
       }
 
+      // ── Pre-flight: validate + auto-patch skill.md before the HTTP call ─────
+      // Mirrors skillRegistry.validateContract so errors are caught locally, with
+      // clear fixes applied inline, rather than returned as an opaque HTTP 400.
+      const REQUIRED_FM_FIELDS = ['name', 'description', 'exec_path', 'exec_type'];
+      const VALID_EXEC_TYPES = new Set(['node', 'shell']);
+      const SKILL_NAME_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
+      {
+        const fmPreflight = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
+        if (fmPreflight) {
+          let fm = fmPreflight[1];
+          const bodyAfterFm = contractMd.slice(fmPreflight[0].length);
+          let patched = false;
+
+          // 1. Missing description — derive from message or name
+          if (!/^description\s*:/m.test(fm)) {
+            const nameM = fm.match(/^name:\s*(.+)$/m);
+            const derivedName = (nameM ? nameM[1].trim() : 'skill').replace(/\./g, ' ');
+            fm += `\ndescription: ${derivedName} (auto-generated)`;
+            patched = true;
+            logger.info(`[Node:ExecuteCommand] skill.install pre-flight: injected missing description`);
+          }
+
+          // 2. exec_type missing or invalid
+          const execTypeM = fm.match(/^exec_type\s*:\s*(.+)$/m);
+          if (!execTypeM) {
+            fm += `\nexec_type: shell`;
+            patched = true;
+            logger.info(`[Node:ExecuteCommand] skill.install pre-flight: injected missing exec_type`);
+          } else if (!VALID_EXEC_TYPES.has(execTypeM[1].trim())) {
+            fm = fm.replace(/^exec_type\s*:.+$/m, `exec_type: shell`);
+            patched = true;
+            logger.info(`[Node:ExecuteCommand] skill.install pre-flight: fixed invalid exec_type "${execTypeM[1].trim()}" → shell`);
+          }
+
+          // 3. exec_path missing — derive from skillPath
+          if (!/^exec_path\s*:/m.test(fm)) {
+            const inferredDirName = skillPath ? path.basename(path.dirname(skillPath)) : null;
+            if (inferredDirName) {
+              fm += `\nexec_path: ~/.thinkdrop/skills/${inferredDirName}/skill.md`;
+              patched = true;
+              logger.info(`[Node:ExecuteCommand] skill.install pre-flight: injected missing exec_path for ${inferredDirName}`);
+            }
+          }
+
+          // 4. Invalid skill name — fix hyphens, uppercase, digit-start segments
+          const nameLineM = fm.match(/^name:\s*(.+)$/m);
+          if (nameLineM) {
+            const rawName = nameLineM[1].trim();
+            if (!SKILL_NAME_RE.test(rawName)) {
+              const fixed = rawName
+                .toLowerCase()
+                .replace(/[^a-z0-9.]/g, '.')
+                .replace(/\.+/g, '.')
+                .replace(/^\.|\.$/, '')
+                .split('.')
+                .filter(seg => seg.length > 0 && !/^\d/.test(seg))
+                .join('.');
+              const validFixed = SKILL_NAME_RE.test(fixed) ? fixed : null;
+              if (validFixed) {
+                fm = fm.replace(/^name:\s*.+$/m, `name: ${validFixed}`);
+                patched = true;
+                logger.info(`[Node:ExecuteCommand] skill.install pre-flight: fixed invalid name "${rawName}" → "${validFixed}"`);
+              } else {
+                const preflightErr = `skill.md has invalid name "${rawName}" and could not be auto-fixed. Must match /^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$/`;
+                logger.warn(`[Node:ExecuteCommand] skill.install pre-flight: ${preflightErr}`);
+                if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: 'Pre-flight failed', error: preflightErr });
+                return {
+                  ...state,
+                  skillResults: [...skillResults, { step: skillCursor + 1, skill: 'skill.install', args, description, ok: false, error: preflightErr }],
+                  skillCursor: skillCursor + 1,
+                  failedStep: { skill: 'skill.install', step: skillCursor + 1, error: preflightErr, args, stderr: preflightErr },
+                };
+              }
+            }
+          }
+
+          // 5. Any remaining missing required fields (catch-all after patches above)
+          const stillMissing = REQUIRED_FM_FIELDS.filter(f => !new RegExp(`^${f}\\s*:`, 'm').test(fm));
+          if (stillMissing.length > 0) {
+            const preflightErr = `skill.md is missing required field(s): ${stillMissing.join(', ')}. Cannot install.`;
+            logger.warn(`[Node:ExecuteCommand] skill.install pre-flight: ${preflightErr}`);
+            if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: 'Pre-flight failed', error: preflightErr });
+            return {
+              ...state,
+              skillResults: [...skillResults, { step: skillCursor + 1, skill: 'skill.install', args, description, ok: false, error: preflightErr }],
+              skillCursor: skillCursor + 1,
+              failedStep: { skill: 'skill.install', step: skillCursor + 1, error: preflightErr, args, stderr: preflightErr },
+            };
+          }
+
+          if (patched) {
+            contractMd = `---\n${fm}\n---` + bodyAfterFm;
+            // Write patched contract back to disk so it matches what we register
+            try { if (skillPath && fs.existsSync(path.dirname(skillPath))) fs.writeFileSync(skillPath, contractMd, 'utf8'); } catch (_) {}
+            logger.info(`[Node:ExecuteCommand] skill.install pre-flight: patched contract written`);
+          }
+        }
+      }
+      // ── End pre-flight ────────────────────────────────────────────────────────
+
       const installRes = await mcpAdapter.callService('user-memory', 'skill.install', { contractMd }, { timeoutMs: 10000 });
       const raw = installRes?.data || installRes;
       const skillName = raw?.name || rawPath.split('/').slice(-2, -1)[0] || 'skill';
@@ -1150,6 +1287,7 @@ module.exports = async function executeCommand(state) {
       { name: 'shell.run',         desc: 'Run shell commands, scripts, and CLI tools' },
       { name: 'browser.act',       desc: 'Control a browser: navigate, click, type, scan, scrape, screenshot. Actions: navigate, smartClick, smartType, getPageText, scanCurrentPage, screenshot, ...' },
       { name: 'image.analyze',     desc: 'Analyze a screenshot or image file with vision AI' },
+      { name: 'screen.capture',    desc: 'Take a live screenshot + OCR — returns visible screen text. Use when user asks to save what\'s on screen or read current screen.' },
       { name: 'ui.axClick',        desc: 'Click UI elements via macOS Accessibility (no browser needed)' },
       { name: 'ui.findAndClick',   desc: 'Find and click a UI element by label or description' },
       { name: 'ui.typeText',       desc: 'Type text into the focused UI element' },
@@ -2908,11 +3046,12 @@ module.exports = async function executeCommand(state) {
         //   - stdout is a JSON object/array (API response — fire-and-forget, not for display)
         //   - stdout > 4000 chars (should have had a synthesize step; truncate + summarize)
         //   - failedCount > 0 (partial failure message is more useful)
+        // Also consider stderr — e.g. brew writes progress/warnings to stderr, not stdout.
         const lastShellResult = failedCount === 0
-          ? [...updatedResults].reverse().find(r => r.skill === 'shell.run' && r.ok && r.stdout?.trim())
+          ? [...updatedResults].reverse().find(r => r.skill === 'shell.run' && r.ok && (r.stdout?.trim() || r.stderr?.trim()))
           : null;
         if (lastShellResult) {
-          const out = lastShellResult.stdout.trim();
+          const out = (lastShellResult.stdout?.trim() || lastShellResult.stderr?.trim() || '');
           const looksLikeJson = /^\s*[\[{]/.test(out);
           const looksLikeHttpCode = /"http_code"\s*:\s*\d+/.test(out);
           const isReadable = !looksLikeJson && !looksLikeHttpCode && out.length > 0;
@@ -2949,7 +3088,19 @@ module.exports = async function executeCommand(state) {
         }
         if (!lastStepAnswer) {
           if (failedCount === 0) {
-            lastStepAnswer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
+            // Use step descriptions for a more informative completion message
+            // rather than the generic "All N steps completed successfully."
+            // Silent commands (e.g. `open -a Spotify`) produce no stdout but the
+            // plan description ("Open Spotify application") is always available.
+            const effectivePlan = patchedSkillPlan || skillPlan;
+            const descriptions = effectivePlan.map(s => s.description).filter(Boolean);
+            if (descriptions.length === 1) {
+              lastStepAnswer = `Done! ${descriptions[0]}`;
+            } else if (descriptions.length > 1) {
+              lastStepAnswer = descriptions.map(d => `✓ ${d}`).join('\n');
+            } else {
+              lastStepAnswer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
+            }
           } else {
             lastStepAnswer = `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`;
           }

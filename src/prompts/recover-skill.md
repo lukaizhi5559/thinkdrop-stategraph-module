@@ -31,6 +31,55 @@ osascript exit code 1 with a `date "..."` literal → AUTO_PATCH: ensure date fo
 osascript/Reminders fails repeatedly after AUTO_PATCH attempts → REPLAN: switch to a cross-platform notification tool using `needs_install` + a background shell command. See the cross-platform fallback section in plan-skills.md.
 shell.run exit code 1 with placeholder credentials (error contains `<TWILIO_`, `<API_KEY`, `<YOUR_`, `401`, `403`, `Authentication`, `Unauthorized`, `curl: (6)`, or similar auth/credential failures) → REPLAN with suggestion: "Use skill.bootstrap pattern: web.crawl the API docs URL, synthesize a skill.md with keychain credential references (not hardcoded values), skill.install to register, then external.skill to execute. Do NOT use shell.run with placeholder or hardcoded credentials."
 
+## Python fallback patterns (bash → Python pivot)
+
+When a `shell.run bash -c` step fails on a **file edit, JSON mutation, or data transformation**, pivot to Python instead of retrying bash. Python avoids shell quoting issues, handles Unicode/encoding correctly, and provides structured error handling.
+
+**Trigger conditions — REPLAN with Python when:**
+- `sed` / `awk` exits code 1 or 2 on a file that exists (quoting issue or multi-line pattern failure)
+- `bash -c` script exits code 2 (shell syntax/quoting error, especially when content contains apostrophes or special chars)
+- Any bash file write op (`echo >`, `tee`, `cat >`) exits non-zero on an existing writable path
+- `jq` exits non-zero (JSON parse error or missing key)
+- Task involves nested conditional logic, multiple file mutations, or CSV/JSON/Excel output
+
+**Python REPLAN pattern — temp script (preferred for anything > 3 lines):**
+```
+REPLAN: Write a Python script to /tmp/thinkdrop_task.py using synthesize(saveToFile), then run via shell.run bash -c "python3 /tmp/thinkdrop_task.py"
+```
+
+**Python REPLAN pattern — inline one-liner (≤3 lines of logic):**
+```
+REPLAN: shell.run bash -c "python3 -c \"import pathlib; p=pathlib.Path('/path/to/file'); p.write_text(p.read_text().replace('old', 'new'))\""
+```
+
+**Python package installs — ALWAYS audit before installing:**
+Before any `pip3 install PACKAGE`, prepend a security scan:
+```bash
+bash -c "pip3 install pip-audit --quiet --user 2>/dev/null; pip-audit 2>/dev/null | grep -i PACKAGE | grep -i vuln && echo 'BLOCKED: vulnerability found' || pip3 install PACKAGE --quiet --user"
+```
+**NEVER install packages with known CVEs cited in pip-audit output.** Use ASK_USER with the vulnerability details and offer a safe alternative instead.
+
+**Python stdlib — always prefer for file/data tasks (no install needed):**
+- File read/write/patch — `pathlib.Path.read_text()` / `.write_text()`
+- JSON mutation — `import json; d=json.loads(p.read_text()); d['key']='val'; p.write_text(json.dumps(d, indent=2))`
+- Regex replace — `import re; re.sub(pattern, replacement, text)`
+- Directory walk — `import os; list(os.walk(path))`
+- CSV read/write — `import csv`
+
+**High-value packages (safe, widely audited — install freely after pip-audit):**
+
+| Package | Use case |
+|---------|----------|
+| `openpyxl` | Create/edit Excel .xlsx with formatting, formulas |
+| `pandas` | Data wrangling, CSV→Excel, groupby, pivot tables |
+| `Pillow` | Image resize, crop, convert, watermark, batch ops |
+| `pdfplumber` | Extract tables and text from PDFs |
+| `beautifulsoup4` | Parse scraped HTML cleanly |
+| `google-api-python-client` + `google-auth-oauthlib` | Gmail/Calendar/Drive REST API (no browser needed) |
+| `anthropic` / `openai` | Direct LLM API calls from inside a task script |
+| `requests` | HTTP calls with session/retry/auth handling |
+| `python-docx` | Create/edit Word .docx files |
+
 ## Output Format
 
 Output ONLY valid JSON. No explanation, no markdown fences, no preamble. One of:

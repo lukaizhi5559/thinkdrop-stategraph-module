@@ -1,0 +1,5585 @@
+[
+  {
+    "id": "rs-001",
+    "message": "Schedule my cold plunge sessions every morning at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-002",
+    "message": "Remind me to take my vitamins every day at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-003",
+    "message": "Set a daily reminder for my morning workout at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-004",
+    "message": "Remind me to meditate every morning at 6:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-005",
+    "message": "Set a reminder to drink water every day at 9am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-006",
+    "message": "Remind me to stretch every morning at 7:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-007",
+    "message": "Set an alarm for my yoga practice every day at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-008",
+    "message": "Give me a daily reminder to journal at 9pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-009",
+    "message": "Remind me to take my medication every morning at 8:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-010",
+    "message": "Set a reminder to go for a run at 6am daily",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-011",
+    "message": "Remind me to do my breathing exercises every morning at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-012",
+    "message": "Set a daily alarm for my cold shower at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-013",
+    "message": "Remind me to practice Spanish every evening at 8pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-014",
+    "message": "Set a reminder for my daily standup at 9am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-015",
+    "message": "Give me a reminder to read for 30 minutes every night at 9pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-016",
+    "message": "Remind me to water my plants every morning at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-017",
+    "message": "Set a daily reminder at 7pm to prep meals for tomorrow",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-018",
+    "message": "Remind me every day at noon to get up and walk around",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-019",
+    "message": "Set a reminder to call mom every Sunday at 2pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "cronMinute": 0,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-020",
+    "message": "Remind me to take my supplements daily at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-021",
+    "message": "Set an alarm every morning at 5:45am to wake up",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 45,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-022",
+    "message": "Remind me to do my evening walk at 6pm daily",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-023",
+    "message": "Give me a daily reminder at 10am to check in with my team",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-024",
+    "message": "Set a reminder to practice piano every day at 7pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-025",
+    "message": "Remind me to do my ice bath sessions every morning at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-026",
+    "message": "Set a daily alarm at 8am to take my medication",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-027",
+    "message": "Remind me to do my gratitude journal every evening at 9pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-028",
+    "message": "Set a morning routine reminder at 5:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-029",
+    "message": "Remind me to feed the dog every morning at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-030",
+    "message": "Give me a daily reminder to do 10 minutes of mindfulness at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-031",
+    "message": "Remind me about my gym session every weekday at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-032",
+    "message": "Set a reminder every Friday at 5pm to wind down for the weekend",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "cronMinute": 0,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-033",
+    "message": "Remind me daily at 6am to start my cold plunge routine",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-034",
+    "message": "Schedule a daily 8am reminder to drink my protein shake",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-035",
+    "message": "Set a reminder to do pushups every morning at 6:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-036",
+    "message": "Remind me to check my posture every hour",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-037",
+    "message": "Give me a daily reminder at 7:15am for my workout",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 15,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-038",
+    "message": "Remind me every morning to do my workout before work",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-039",
+    "message": "Set a nightly reminder at 10pm to go to bed",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-040",
+    "message": "Remind me to study for 1 hour every day at 8pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-041",
+    "message": "Set a daily reminder at 12pm for my lunch break walk",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-042",
+    "message": "Remind me every Tuesday at 9am to call my therapist",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-043",
+    "message": "Give me an evening routine reminder at 9:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-044",
+    "message": "Remind me to practice coding every night at 8pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-045",
+    "message": "Set a daily reminder at 6am for my morning jog",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-046",
+    "message": "Remind me to do breathwork every morning at 5am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-047",
+    "message": "Set a daily alarm at 7am to take vitamin D",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-048",
+    "message": "Remind me every Wednesday at 6pm to do laundry",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "cronMinute": 0,
+      "dayOfWeek": 3,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-049",
+    "message": "Give me a reminder every morning at 8:45am to leave for work",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 45,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-050",
+    "message": "Set a daily reminder to do 20 minutes of yoga at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-051",
+    "message": "Schedule my cold plunge every day at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-052",
+    "message": "I want a reminder for my daily cold plunge at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-053",
+    "message": "Alert me every morning at 6am for my cold plunge",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-054",
+    "message": "I need a daily reminder at 6am to do my cold plunge",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-055",
+    "message": "Can you remind me about cold plunge every morning at 6",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-056",
+    "message": "Set up a 6am daily cold plunge reminder please",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-057",
+    "message": "Put a reminder for cold plunge at 6am every day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-058",
+    "message": "Schedule cold plunge sessions daily at 6am starting tomorrow",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-059",
+    "message": "Make me a daily 6am reminder for cold plunge going forward",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-060",
+    "message": "I want to be reminded every day at 6am to do my cold plunge sessions",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-061",
+    "message": "Remind me to take meds at 8am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-062",
+    "message": "Set a one-time alarm for 3pm tomorrow",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-063",
+    "message": "Remind me to buy milk",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-064",
+    "message": "Tell me a joke",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-065",
+    "message": "What time is it?",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-066",
+    "message": "Send a Slack message to John",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-067",
+    "message": "Email my report to the team",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-068",
+    "message": "Post a message in Discord",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-069",
+    "message": "Send a text via Twilio to +1234567890",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-070",
+    "message": "Search for the best coffee shops near me",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-071",
+    "message": "Open my calendar and add an event",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-072",
+    "message": "What's the weather like today?",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-073",
+    "message": "Create a new file called notes.txt",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-074",
+    "message": "Find all PDFs in my Downloads folder",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-075",
+    "message": "Remind me to call back John when I get home",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-076",
+    "message": "Set a timer for 25 minutes",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-077",
+    "message": "Open Spotify and play jazz",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-078",
+    "message": "Book a flight to New York",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-079",
+    "message": "Summarize this document for me",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-080",
+    "message": "Send an email via Gmail to my boss",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-081",
+    "message": "Text this info to me via SMS",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-082",
+    "message": "Post my availability on Telegram",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-083",
+    "message": "Notify me via WhatsApp when the build finishes",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-084",
+    "message": "Send a weekly digest email via SendGrid",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-085",
+    "message": "Send a Mailgun newsletter to subscribers daily",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-086",
+    "message": "Git commit and push my changes",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-087",
+    "message": "Run my test suite",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-088",
+    "message": "Install the dependencies for this project",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-089",
+    "message": "Help me debug this Python script",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-090",
+    "message": "Write a blog post about productivity",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-091",
+    "message": "Remind me to pick up dry cleaning at some point",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-092",
+    "message": "Remind me about my dentist appointment",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-093",
+    "message": "Let me know when my package arrives",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-094",
+    "message": "Alert me if the stock price drops",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-095",
+    "message": "Open Safari and go to GitHub",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-096",
+    "message": "Translate this text to Spanish",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-097",
+    "message": "Take a screenshot",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-098",
+    "message": "Resize all images in the folder",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-099",
+    "message": "Read the contents of config.json",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-100",
+    "message": "Start my local dev server",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-101",
+    "message": "Every morning at 9am review my emails and summarize the important ones",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-102",
+    "message": "Daily at 8am check my calendar and summarize today's meetings",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-103",
+    "message": "Every Monday at 9am go through my Notion tasks and organize them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-104",
+    "message": "Every Friday at 5pm review the week and draft a summary",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "cronMinute": 0,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-105",
+    "message": "Each morning at 7am analyze my GitHub notifications and triage them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-106",
+    "message": "Every day at 10am go through my Jira board and update priorities",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-107",
+    "message": "Every Sunday at 6pm prepare my weekly plan for the next week",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "cronMinute": 0,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-108",
+    "message": "Daily at 9am check my analytics dashboard and compile a report",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-109",
+    "message": "Every Wednesday at 2pm review my budget spreadsheet and summarize spending",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "cronMinute": 0,
+      "dayOfWeek": 3,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-110",
+    "message": "Each evening at 9pm go through my reading list and archive articles I've read",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-111",
+    "message": "Every morning at 8am check my Slack and summarize anything I missed overnight",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-112",
+    "message": "Daily at 7am organize my desktop files and clean up Downloads",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-113",
+    "message": "Every Thursday at 3pm analyze this week's PRs and summarize them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 15,
+      "cronMinute": 0,
+      "dayOfWeek": 4,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-114",
+    "message": "Each morning review my to-do list and prioritize tasks for the day",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-115",
+    "message": "Every day at 11am look at my open tabs and organize them by project",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 11,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-116",
+    "message": "Weekly on Monday at 9am compile a summary of last week's work",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-117",
+    "message": "Every weekday at 6pm summarize what I accomplished today",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-118",
+    "message": "Each Saturday at 10am audit my subscriptions and flag unused ones",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "cronMinute": 0,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-119",
+    "message": "Every day at 2pm check Confluence and summarize any new updates",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-120",
+    "message": "Each morning at 7am review yesterday's notes and organize them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-121",
+    "message": "Remind me to work out at 6am tomorrow",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-122",
+    "message": "Wake me up at 7am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-123",
+    "message": "Set an alarm for 6:30am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-124",
+    "message": "Remind me once to take out the trash tonight",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-125",
+    "message": "Alert me in 30 minutes",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-126",
+    "message": "Ping me when the download is done",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-127",
+    "message": "Remind me about the interview tomorrow at 2pm",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-128",
+    "message": "Set a reminder for the meeting at 3pm today",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-129",
+    "message": "Schedule my cold plunge every morning at 6:00am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-130",
+    "message": "Remind me to do cold plunge daily at 06:00",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-131",
+    "message": "Schedule cold plunge - every day at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-132",
+    "message": "Set daily cold plunge reminder for 6am!",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-133",
+    "message": "pls remind me to do cold plunge every morning 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-134",
+    "message": "cold plunge daily 6am reminder",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-135",
+    "message": "set reminder: cold plunge, 6am, every day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-136",
+    "message": "Remind me to workout every day at 12pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-137",
+    "message": "Set a daily 1pm reminder for my afternoon walk",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 13,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-138",
+    "message": "Remind me to call the dentist every Monday at 9am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-139",
+    "message": "Give me a weekly reminder on Fridays at 4pm to send my timesheet",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "cronMinute": 0,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-140",
+    "message": "Remind me every Saturday at 11am to clean the house",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 11,
+      "cronMinute": 0,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-141",
+    "message": "Set a reminder to check on my investments every Sunday at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-142",
+    "message": "Remind me to do my physical therapy exercises every day at 3pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 15,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-143",
+    "message": "Set a daily reminder at 11:30am to prepare for my afternoon meetings",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 11,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-144",
+    "message": "Remind me every Wednesday evening at 7pm for my book club",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "cronMinute": 0,
+      "dayOfWeek": 3,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-145",
+    "message": "Remind me to take a break from screen every 2 hours daily",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-146",
+    "message": "Set a morning ritual reminder at 5am every day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-147",
+    "message": "Remind me to floss every night before bed at 10:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-148",
+    "message": "Give me a daily 4pm reminder to wrap up work tasks",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-149",
+    "message": "Set an alert so I remember to practice guitar every evening at 7:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-150",
+    "message": "Remind me to log my food intake every day at 8pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-151",
+    "message": "Remind me to check my email",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-152",
+    "message": "Set an alarm for noon tomorrow",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-153",
+    "message": "Remind me about this later",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-154",
+    "message": "Notify me when this is done",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-155",
+    "message": "Remind me on my birthday",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-156",
+    "message": "Set a reminder next Tuesday",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-157",
+    "message": "Alert me at 8am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-158",
+    "message": "Alarm for 7am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-159",
+    "message": "Remind me in 2 hours",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-160",
+    "message": "Remind me to go to the gym (no time specified)",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-161",
+    "message": "Remind me to work out every day at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-162",
+    "message": "Set a daily reminder for yoga at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-163",
+    "message": "Every morning remind me to take vitamins at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-164",
+    "message": "Remind me at 9am daily to review my tasks",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-165",
+    "message": "Set a morning alarm for meditation at 5:30am every day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-166",
+    "message": "Daily workout reminder at 6am please",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-167",
+    "message": "Remind me every day at 10am to stand up from my desk",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-168",
+    "message": "Set a nightly reminder at 9pm to wind down",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-169",
+    "message": "Remind me to run every morning before breakfast at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-170",
+    "message": "Set a daily reminder at 7pm for evening journaling",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-171",
+    "message": "Remind me to drink a glass of water every morning at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-172",
+    "message": "Set a daily 8am reminder for morning stretches",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-173",
+    "message": "Remind me every Thursday at 4pm to review my weekly goals",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "cronMinute": 0,
+      "dayOfWeek": 4,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-174",
+    "message": "Give me a reminder to practice mindfulness every single day at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-175",
+    "message": "Set an alarm for my daily cold shower at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-176",
+    "message": "Remind me to do 30 minutes of reading every night at 9:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-177",
+    "message": "Set a daily reminder at 6:45am to start my morning routine",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 45,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-178",
+    "message": "Remind me every Monday morning at 9am to plan the week ahead",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-179",
+    "message": "Give me a reminder to take my evening meds every night at 9pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-180",
+    "message": "Set a daily alarm at 7:30am for my morning exercise",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-181",
+    "message": "Remind me to journal every night at 10pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-182",
+    "message": "Set a reminder to walk the dog every day at 5pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-183",
+    "message": "Remind me daily at 7am to prep my gym bag",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-184",
+    "message": "Set a weekly Sunday reminder at 7pm to meal prep",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "cronMinute": 0,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-185",
+    "message": "Remind me to take a 5-minute break every hour during work",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-186",
+    "message": "Set a daily 6am reminder for my cold plunge and breathing exercises",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-187",
+    "message": "Remind me to practice gratitude every morning when I wake up at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-188",
+    "message": "Give me a daily 2pm reminder to answer messages",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-189",
+    "message": "Set a reminder to check my weight every Tuesday morning at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-190",
+    "message": "Remind me to do back stretches every day at 3pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 15,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-191",
+    "message": "Set a 10pm nightly reminder to prep for tomorrow",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-192",
+    "message": "Remind me on Saturdays at 2pm to call my parents",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "cronMinute": 0,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-193",
+    "message": "Set a daily alarm at noon to step away from the computer",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-194",
+    "message": "Remind me every morning at 6am about my fitness goals",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-195",
+    "message": "Give me an 8pm evening reminder to take my vitamins",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-196",
+    "message": "Set a weekly Friday at 3pm reminder to do a code review",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 15,
+      "cronMinute": 0,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-197",
+    "message": "Remind me to meditate for 10 minutes every morning at 5:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-198",
+    "message": "Set a daily reminder at 1pm to eat lunch and step outside",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 13,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-199",
+    "message": "Remind me every morning to do my workout routine at 6:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-200",
+    "message": "Set a daily 9am reminder to review my top 3 priorities for the day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-201",
+    "message": "Every day at 9am summarize my overnight emails",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-202",
+    "message": "Each morning at 8am check Notion and organize my tasks",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-203",
+    "message": "Daily at 5pm compile a summary of what I did today",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-204",
+    "message": "Every Monday at 8am review last week and draft priorities",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-205",
+    "message": "Each evening at 8pm go over my to-do list and archive done items",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-206",
+    "message": "Every morning check my GitHub notifications and triage pull requests",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-207",
+    "message": "Daily at 7am analyze my sleep data and summarize it",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-208",
+    "message": "Every Friday afternoon review this week's Jira tickets",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-209",
+    "message": "Each week on Sunday prepare a briefing of the upcoming week",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-210",
+    "message": "Every morning at 6am review my fitness metrics and track progress",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-211",
+    "message": "Daily at noon check my server logs and flag any errors",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-212",
+    "message": "Every Tuesday at 10am review open support tickets and prioritize",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "cronMinute": 0,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-213",
+    "message": "Each morning compile a list of all my meetings for the day and summarize them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-214",
+    "message": "Every Thursday review changelog entries and draft release notes",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": 4,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-215",
+    "message": "Daily at 6pm archive any completed tasks in my project manager",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-216",
+    "message": "Every week summarize my reading notes and file them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-217",
+    "message": "Each Saturday morning audit my finances and categorize transactions",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-218",
+    "message": "Every day at 3pm check my analytics and update the dashboard",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 15,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-219",
+    "message": "Each morning analyze yesterday's workout metrics and update my log",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-220",
+    "message": "Every Sunday evening prepare a grocery list and organize the week",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-221",
+    "message": "Create a Python script that scrapes HackerNews",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-222",
+    "message": "Set up a cron job to backup my database",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-223",
+    "message": "Configure nginx for my website",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-224",
+    "message": "Deploy my app to AWS",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-225",
+    "message": "Set up a webhook for GitHub",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-226",
+    "message": "Schedule a job at midnight to clean temp files",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-227",
+    "message": "Run a daily report at 8am that emails my team",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-228",
+    "message": "Set up a daily digest email at 7am via Mailgun",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-229",
+    "message": "Schedule a daily Slack summary at 9am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-230",
+    "message": "Text me my daily agenda every morning via Twilio",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-231",
+    "message": "Remind me to do my morning workout every day at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-232",
+    "message": "Set a daily reminder at 7am to take my probiotics",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-233",
+    "message": "Remind me every morning at 6:15am to start my day intentionally",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 15,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-234",
+    "message": "Set a daily 5am reminder for my early morning practice",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-235",
+    "message": "Remind me to exercise every evening at 6pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-236",
+    "message": "Give me a daily 8:30am reminder to review my calendar",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-237",
+    "message": "Remind me to do my cold exposure therapy every morning at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-238",
+    "message": "Set a nightly 10pm reminder to review tomorrow's schedule",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-239",
+    "message": "Give me a morning reminder at 7am to drink my greens",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-240",
+    "message": "Remind me to do squats every day at 5pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-241",
+    "message": "Set a daily 9pm reminder to prep my gym bag for tomorrow",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-242",
+    "message": "Remind me to take magnesium every night before bed at 9:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 30,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-243",
+    "message": "Set a daily 6am reminder to review my top goal for the day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-244",
+    "message": "Remind me each morning at 7:45am before my commute to check traffic",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 45,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-245",
+    "message": "Set a weekly reminder on Mondays at 8am to review my OKRs",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-246",
+    "message": "Remind me to do my evening meditation every night at 9pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-247",
+    "message": "Set a daily reminder at 4pm to close out my work tasks",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-248",
+    "message": "Remind me to stand up and move around every day at 2pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-249",
+    "message": "Set a morning reminder on Tuesdays and Thursdays at 7am for my run",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-250",
+    "message": "Give me a daily reminder to do neck stretches every hour",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-251",
+    "message": "Check my inbox every morning at 9am and summarize unread messages",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-252",
+    "message": "Every Friday at 4:30pm archive completed Trello cards",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "cronMinute": 30,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-253",
+    "message": "Daily at 6pm triage my GitHub issues by priority",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-254",
+    "message": "Each week on Sunday analyze my screen time and compile a report",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-255",
+    "message": "Every morning at 7am review my Obsidian notes and organize them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-256",
+    "message": "Daily at 11am summarize my sales data and prepare a brief",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 11,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-257",
+    "message": "Every Tuesday at 2pm go through my LinkedIn connections and follow up",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "cronMinute": 0,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-258",
+    "message": "Each Saturday at 9am audit my weekly spending in Mint",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-259",
+    "message": "Every morning go through my Readwise highlights and review them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-260",
+    "message": "Daily at 5pm prepare tomorrow's schedule and sync my calendar",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "cronMinute": 0,
+      "dayOfWeek": null,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-261",
+    "message": "Remind me every hour to drink water throughout the day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-262",
+    "message": "Set a reminder every 2 hours to stretch during work hours",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-263",
+    "message": "Give me a daily reminder to do my morning routine",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-264",
+    "message": "Remind me to exercise daily",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-265",
+    "message": "Set a daily yoga alarm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-266",
+    "message": "Remind me every day to take vitamins",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-267",
+    "message": "I need a daily cold plunge alarm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-268",
+    "message": "Set weekly reminders for my workout",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-269",
+    "message": "Give me nightly reminders to journal",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-270",
+    "message": "Remind me about my medication every morning",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-271",
+    "message": "Remind me to do my cold plunge every morning at 6am!!!!",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-272",
+    "message": "REMIND ME TO WORKOUT AT 6AM DAILY",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-273",
+    "message": "set reminder: workout, 6am every day please thank you",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-274",
+    "message": "hey can u set a daily reminder for yoga @ 7am?",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-275",
+    "message": "morning supplement reminder 8am daily thx",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-276",
+    "message": "need daily reminder cold plunge 6",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-277",
+    "message": "Pls remind me to meditate every night before bed",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-278",
+    "message": "remindr: cold plunge, morning, 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-279",
+    "message": "Set an early morning 5am wake-up reminder daily",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-280",
+    "message": "daily 6am cold plunge REMINDER PLEASE",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-281",
+    "message": "Remind me to workout at 6am every day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-282",
+    "message": "Set reminders daily at 7am for vitamins",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-283",
+    "message": "Give daily morning yoga alerts at 6:30 each day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-284",
+    "message": "Alert me every day at 8am to meditate",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-285",
+    "message": "Set a daily run reminder for 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-286",
+    "message": "Schedule daily medication reminder 8:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-287",
+    "message": "Remind me to stretch at 7am every morning",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-288",
+    "message": "Daily gym time reminder at 6am please",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-289",
+    "message": "Set an evening journaling reminder at 9pm nightly",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-290",
+    "message": "Each morning at 7am ping me to take my vitamins",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-291",
+    "message": "Remind me to do mindfulness every morning at 6:45am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 45,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-292",
+    "message": "Setup a morning exercise notification at 6am daily",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-293",
+    "message": "Daily at 9:15am ping me to review my priorities",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 15,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-294",
+    "message": "Every evening at 7pm remind me to do relaxation exercises",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-295",
+    "message": "Set a drink-water reminder that fires every morning at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-296",
+    "message": "Morning routine alert every day at 5:45am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 45,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-297",
+    "message": "Remind me daily at 7:30am about cold plunge",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-298",
+    "message": "Set up weekly Monday 9am work review reminder",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 0,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-299",
+    "message": "Daily bed-time reminder at 10:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-300",
+    "message": "Set a nightly 11pm reminder to put my phone away",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 23,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-301",
+    "message": "Remind me about meetings",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-302",
+    "message": "Set up automated emails",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-303",
+    "message": "I want notifications for stock prices",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-304",
+    "message": "Remind me when someone messages me",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-305",
+    "message": "Set a reminder for my next dentist appointment",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-306",
+    "message": "Alert me if it rains",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-307",
+    "message": "Remind me to renew my subscription",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-308",
+    "message": "ping me when the CI build fails",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-309",
+    "message": "Remind me to reply to that email",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-310",
+    "message": "Set a reminder for my flight check-in",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-311",
+    "message": "Daily at midnight back up my files and archive logs",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 0,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-312",
+    "message": "Every Sunday at noon compile my weekly highlights",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "cronMinute": 0,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-313",
+    "message": "Each morning review my Anki deck and study 20 cards",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-314",
+    "message": "Every day at 11:59pm summarize the day and file it",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 23,
+      "cronMinute": 59,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-315",
+    "message": "Each Monday morning organize my downloads folder",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-316",
+    "message": "Weekly on Thursday review sprint velocity and summarize",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 4,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-317",
+    "message": "Every Friday compile all open PRs and write a summary",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-318",
+    "message": "Daily at 8pm process my inbox to zero",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-319",
+    "message": "Each Saturday review my Duolingo streak and update my log",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-320",
+    "message": "Every evening analyze my activity rings and summarize",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-321",
+    "message": "Remind me to workout every day at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-322",
+    "message": "Set a daily reminder to stretch at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-323",
+    "message": "Daily cold plunge reminder at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-324",
+    "message": "Remind me to hydrate every morning at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-325",
+    "message": "Set a 9am daily reminder to review my tasks",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-326",
+    "message": "Remind me every Monday at 10am for team sync",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-327",
+    "message": "Give me a daily 7pm reminder to wind down",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-328",
+    "message": "Remind me to meditate nightly at 8:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-329",
+    "message": "Set a weekday 6am alarm for morning run",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-330",
+    "message": "Each morning at 6am alert me to start cold plunge sessions",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-331",
+    "message": "Daily vitamin D reminder at 8am please",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-332",
+    "message": "Set a 10pm nightly reminder to stop using screens",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-333",
+    "message": "Remind me to drink water every morning when I wake up at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-334",
+    "message": "Give me a daily reminder for my evening yoga at 6pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-335",
+    "message": "Morning exercise reminder every day at 5:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-336",
+    "message": "Remind me about my journaling practice each night at 9pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-337",
+    "message": "Set a daily reminder at 8am for my supplements routine",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-338",
+    "message": "Remind me every Saturday morning to go for a long walk",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-339",
+    "message": "Give me a daily 3pm reminder to step away from work",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 15,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-340",
+    "message": "Set a reminder to practice coding challenges every day at 7pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-341",
+    "message": "Daily reminder to read at 9pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-342",
+    "message": "Remind me to do leg day every Tuesday at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-343",
+    "message": "Set a morning workout alert every day at 6:15am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 15,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-344",
+    "message": "Give me a bedtime reminder at 10pm every night",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-345",
+    "message": "Remind me to take fish oil every morning",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-346",
+    "message": "Set a daily meditation reminder for 5am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-347",
+    "message": "Remind me every weekday morning at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-348",
+    "message": "Give a daily reminder for afternoon workout at 4pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-349",
+    "message": "Morning cold plunge reminder 6am each day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-350",
+    "message": "Evening reminder at 8pm to track my nutrition",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-351",
+    "message": "Ping me on Pushover every morning at 6am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-352",
+    "message": "Send a OneSignal push every day at 8am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-353",
+    "message": "Set up a daily Pushbullet alert at 7am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-354",
+    "message": "Remind me via ClickSend SMS every morning",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-355",
+    "message": "Set a daily Vonage text at 9am",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-356",
+    "message": "Email a reminder to myself every day via Gmail",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-357",
+    "message": "Create a zapier workflow for daily reminders",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-358",
+    "message": "Set up n8n to send me a daily digest",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-359",
+    "message": "Automate a daily newsletter with Mailchimp",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-360",
+    "message": "Send me a morning briefing via Telegram daily",
+    "expected": {
+      "fires": false
+    }
+  },
+  {
+    "id": "rs-361",
+    "message": "Remind me to do plank every morning at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-362",
+    "message": "Daily reminder to take creatine at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-363",
+    "message": "Remind me about my morning routine every day at 5am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-364",
+    "message": "Set an afternoon workout reminder every day at 4pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-365",
+    "message": "Remind me to do jaw exercises every day at 7pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-366",
+    "message": "Give me a daily 6am alert for my fitness regimen",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-367",
+    "message": "Remind me to do my shoulder mobility routine daily at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-368",
+    "message": "Set a summer morning routine reminder at 5:30am daily",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-369",
+    "message": "Remind me every morning to be grateful at 6:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-370",
+    "message": "Daily reminder for evening walk at 6pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-371",
+    "message": "Set a daily alarm for intermittent fasting window at 12pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-372",
+    "message": "Remind me to hydrate every morning at 6:45am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 45,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-373",
+    "message": "Give me a nightly wind-down reminder at 9:45pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 45,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-374",
+    "message": "Set a daily reminder for my posture check at 2pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-375",
+    "message": "Morning sun routine reminder every day at 7:15am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 15,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-376",
+    "message": "Remind me to do evening journaling every night at 10pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 22,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-377",
+    "message": "Set a daily reminder to get outside by 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-378",
+    "message": "Remind me each morning at 6am about my wellness goals",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-379",
+    "message": "Give me a daily 11am reminder for my midday exercises",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 11,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-380",
+    "message": "Set a monthly planning reminder every Sunday at 7pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-381",
+    "message": "Remind me every evening at 8pm to do my pushups",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-382",
+    "message": "Daily 9am reminder to check my goals board",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-383",
+    "message": "Set a nightly reminder at 8:30pm to brush my teeth",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-384",
+    "message": "Give me a weekly Saturday 9am reminder for house cleaning",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-385",
+    "message": "Remind me to do deep work every morning at 9am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-386",
+    "message": "Daily reminder: read for 20 minutes at 8pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-387",
+    "message": "Set a reminder to drink green tea every morning at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-388",
+    "message": "Give me a daily workout reminder at 5:45am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 45,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-389",
+    "message": "From now on remind me to lift weights every morning at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-390",
+    "message": "Starting tomorrow remind me about my morning jog at 6am every day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-391",
+    "message": "Every day at 9am analyze my calendar and flag conflicts",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-392",
+    "message": "Each morning review my starred GitHub repos and summarize activity",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-393",
+    "message": "Daily at 3pm check Asana and update task statuses",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 15,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-394",
+    "message": "Every Sunday evening prepare my week's meal plan",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-395",
+    "message": "Each Monday triage my email backlog and sort by urgency",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-396",
+    "message": "Daily at noon compile a summary of today's news and highlights",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-397",
+    "message": "Every Thursday morning review this week's experiments and document findings",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 4,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-398",
+    "message": "Each Saturday summarize my learning from the week",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-399",
+    "message": "Every day at 7am check my habit tracker and update streaks",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-400",
+    "message": "Daily at 4pm go through open issues and assign priorities",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-401",
+    "message": "Remind me to take my morning pills at 7am every day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-402",
+    "message": "Set a daily 6am fitness reminder",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-403",
+    "message": "Give me a reminder every night at midnight to wind down",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-404",
+    "message": "Remind me to do ice bath daily at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-405",
+    "message": "Set a daily alarm for sauna session at 7pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-406",
+    "message": "Remind me every weekday at 9am to start focused work blocks",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-407",
+    "message": "Give me a daily 6:30am reminder to go for a walk",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-408",
+    "message": "Set a reminder to do 10 pull-ups every morning at 7am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-409",
+    "message": "Remind me to track calories every day after each meal at 1pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 13,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-410",
+    "message": "Daily reminder for my neck stretching exercises at 3pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 15,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-411",
+    "message": "Set an evening reminder every day at 7pm to prepare tomorrow's outfit",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-412",
+    "message": "Give me a morning hydration reminder every single day at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-413",
+    "message": "Remind me to practice the violin every Saturday at 10am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-414",
+    "message": "Set a daily 8am reminder for my morning reading practice",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-415",
+    "message": "Remind me about evening cold plunge every night at 7pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-416",
+    "message": "Give me a daily 9:30am reminder to take a mindful pause",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-417",
+    "message": "Set a daily cold plunge reminder at 6am every morning starting now",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-418",
+    "message": "Remind me to do breath training every morning at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-419",
+    "message": "Daily at 7:30am remind me to review my intentions for the day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-420",
+    "message": "Set a weekly Wednesday 5pm reminder for team retrospective",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "dayOfWeek": 3,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-421",
+    "message": "Every morning at 8am review my notes and organize them into Notion",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-422",
+    "message": "Daily at 6pm summarize my productivity metrics for the day",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-423",
+    "message": "Each Sunday prepare a detailed brief of the upcoming work week",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-424",
+    "message": "Every morning check my fitness data and compile a weekly trend",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-425",
+    "message": "Daily at 10am review my content calendar and draft tomorrow's post",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-426",
+    "message": "Each Friday afternoon archive this week's notes and summarize key points",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-427",
+    "message": "Every day at 5:30pm wrap up work tasks and process inbox",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-428",
+    "message": "Each Tuesday morning review the backlog and reprioritize items",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-429",
+    "message": "Daily at noon look through my Kindle highlights and organize them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-430",
+    "message": "Every Monday compile feedback from last week and summarize action items",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-431",
+    "message": "Remind me about my cold plunge every morning at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-432",
+    "message": "Set a daily meditation reminder at 5am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-433",
+    "message": "Give me a reminder to stretch every day at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-434",
+    "message": "Remind me to do my exercises every morning at 6:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-435",
+    "message": "Set a daily 7:45am reminder for my morning routine",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 45,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-436",
+    "message": "Remind me every night to review my wins at 9pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-437",
+    "message": "Daily reminder to foam roll at 8pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-438",
+    "message": "Remind me about my weight training session every Tuesday at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-439",
+    "message": "Set a morning notification every day at 7am to hydrate",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-440",
+    "message": "Give me a daily 4:30pm reminder to finalize my to-do list",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-441",
+    "message": "Set a reminder to practice Spanish every morning at 8am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-442",
+    "message": "Remind me to review my goals every Sunday morning at 9am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-443",
+    "message": "Give me a weekly Thursday 2pm brain health reminder",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "dayOfWeek": 4,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-444",
+    "message": "Set a daily 11:30am reminder to prepare for my afternoon",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 11,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-445",
+    "message": "Remind me to do a 10-minute walk every weekday at 2pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-446",
+    "message": "Set a 6am daily reminder to cold plunge and journal",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-447",
+    "message": "Give me a daily reminder at 6pm to wind down from work",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-448",
+    "message": "Remind me to do my leg stretches every morning at 7:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-449",
+    "message": "Set a daily alarm for my evening exercise at 6:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-450",
+    "message": "Give me a reminder every day to practice gratitude at noon",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 12,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-451",
+    "message": "Daily at 7am check my Obsidian vault and organize notes",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-452",
+    "message": "Every morning review my book notes and file summaries",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-453",
+    "message": "Each Friday compile a summary of the week's work for my manager",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-454",
+    "message": "Daily at 6pm archive and summarize completed Asana tasks",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-455",
+    "message": "Every Sunday at 8pm prepare and organize my weekly planner",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-456",
+    "message": "Each morning at 9am analyze my sleep quality data and log it",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-457",
+    "message": "Every Wednesday afternoon review meeting notes and extract action items",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 3,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-458",
+    "message": "Daily at 8pm look through my learning journal and update progress",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-459",
+    "message": "Each Monday organize my inbox and archive old threads",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-460",
+    "message": "Every day at 2pm review my kanban board and update statuses",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 14,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-461",
+    "message": "Remind me to do my morning cold plunge every day at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-462",
+    "message": "Set a daily 6am alarm for my health routine",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-463",
+    "message": "Give me a morning fitness reminder every day at 5:30am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-464",
+    "message": "Set a daily 8am reminder to take supplements",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-465",
+    "message": "Remind me to do relaxation breathing every evening at 8:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 20,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-466",
+    "message": "Daily reminder about my evening run at 5pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-467",
+    "message": "Remind me to log my meals every evening at 7pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-468",
+    "message": "Set a reminder for my weekly review every Sunday at 5pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-469",
+    "message": "Give me a daily wake alarm at 5:45am for my morning routine",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "cronMinute": 45,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-470",
+    "message": "Set a reminder to do foam rolling every night before bed at 9:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-471",
+    "message": "Remind me to do meal prep every Sunday at 4pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-472",
+    "message": "Give me a daily 7:20am reminder to leave for gym",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "cronMinute": 20,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-473",
+    "message": "Set a 9pm nightly reminder for sleep hygiene",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-474",
+    "message": "Remind me to go for a bike ride every morning at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-475",
+    "message": "Daily 10am reminder to review my learning goals",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 10,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-476",
+    "message": "Give me a reminder to do morning pages every day at 5am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-477",
+    "message": "Set a daily 8:15am reminder to plan my day",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "cronMinute": 15,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-478",
+    "message": "Remind me to practice ukulele every evening at 7pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 19,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-479",
+    "message": "Give me a weekly Monday 9am goal-setting reminder",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 9,
+      "dayOfWeek": 1,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-480",
+    "message": "Set a daily reminder at 6am to cold plunge and continue this habit",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-481",
+    "message": "Every morning at 7am go through my action items and update progress",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-482",
+    "message": "Daily at 11am compile the latest metrics and prepare a brief",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 11,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-483",
+    "message": "Each Saturday review my project backlog and reprioritize",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-484",
+    "message": "Every Friday morning summarize this week and write next week goals",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 5,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-485",
+    "message": "Daily at 5pm look at unresolved customer feedback and draft responses",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 17,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-486",
+    "message": "Every morning analyze my budget and flag overspending categories",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-487",
+    "message": "Each week on Tuesday draft a progress report for my team",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 2,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-488",
+    "message": "Daily at 4pm go through flagged messages and process them",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": 16,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-489",
+    "message": "Every Sunday prepare a structured plan for the entire coming week",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-490",
+    "message": "Each morning check my health stats and update my wellness journal",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-491",
+    "message": "Remind me to cold plunge every morning at 6am please",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-492",
+    "message": "Set a daily 7am reminder for morning stretches and meditation",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 7,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-493",
+    "message": "Give me a 6am alarm every day for my morning exercises",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-494",
+    "message": "Daily workout reminder at 6am - don't let me skip it",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-495",
+    "message": "Remind me each morning at 6am to start my cold plunge practice",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-496",
+    "message": "Set a daily 8am supplement and vitamin reminder",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 8,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-497",
+    "message": "Give a morning reminder every day for my ice bath at 6am",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-498",
+    "message": "Remind me to meditate every night at 9:30pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 21,
+      "cronMinute": 30,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-499",
+    "message": "Set a weekly review reminder every Sunday evening at 6pm",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 18,
+      "dayOfWeek": 0,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-500",
+    "message": "Give me a daily 6am cold plunge reminder to keep the habit going",
+    "expected": {
+      "fires": true,
+      "tier": "notify",
+      "skillNameValid": true,
+      "cronHour": 6,
+      "recurring": true
+    }
+  }
+]

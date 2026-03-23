@@ -269,6 +269,28 @@ module.exports = async function recoverSkill(state) {
       .map(r => `  Step ${r.step} stdout: ${String(r.stdout).trim().substring(0, 200)}`);
     if (priorShellOutputs.length) lines.push(`Prior shell.run outputs:\n${priorShellOutputs.join('\n')}`);
 
+    // Python fallback hint — injected when the failure looks like a bash file/data op
+    // that is better handled by Python (avoids quoting issues, encoding problems, sed/awk fragility).
+    // Gives the recovery LLM a concrete suggestion instead of defaulting to ASK_USER.
+    const _bashScript = (failedStep.args?.cmd === 'bash' && Array.isArray(failedStep.args?.argv))
+      ? (failedStep.args.argv.find(a => typeof a === 'string' && a !== '-c') || '')
+      : '';
+    const _isBashFileOp = _bashScript.length > 0 && (
+      /\bsed\b/.test(_bashScript) || /\bawk\b/.test(_bashScript) ||
+      /\bjq\b/.test(_bashScript)  || /echo\s+.*>/.test(_bashScript) ||
+      /\btee\b/.test(_bashScript) || /cat\s*>/.test(_bashScript)
+    );
+    const _isQuotingError = (exitCode === 2) && (failedStep.args?.cmd === 'bash');
+    if (_isBashFileOp || _isQuotingError) {
+      lines.push(
+        'PYTHON FALLBACK AVAILABLE: This failure (bash file edit / quoting error) is best resolved by switching to Python.\n' +
+        '  Inline (<3 lines): bash -c "python3 -c \'import pathlib; p=pathlib.Path(FILE); p.write_text(p.read_text().replace(OLD,NEW))\'"\n' +
+        '  Script (>3 lines): synthesize(saveToFile=/tmp/thinkdrop_task.py) then shell.run bash -c "python3 /tmp/thinkdrop_task.py"\n' +
+        '  Packages needed: pip3 install pip-audit --quiet --user; pip-audit 2>/dev/null || true; pip3 install PACKAGE --quiet --user'
+      );
+      logger.debug('[Node:RecoverSkill] Python fallback hint injected');
+    }
+
     if (lines.length) {
       skillContextSection = `\nshell.run diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
       logger.debug(`[Node:RecoverSkill] shell.run context injected (${lines.length} items)`);
@@ -304,6 +326,68 @@ module.exports = async function recoverSkill(state) {
       skillContextSection = `\nimage.analyze diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
       logger.debug(`[Node:RecoverSkill] image.analyze context injected`);
     }
+  }
+
+  // ── skill.install: read the actual skill.md so the recovery LLM can see ─────
+  // what fields are invalid or missing. Without this, the LLM only sees the HTTP
+  // 400 error string and cannot generate a correct REPLAN fix.
+  if (failedStep.skill === 'skill.install') {
+    const fsSync = require('fs');
+    const path = require('path');
+    const skillPath = failedStep.args?.skillPath
+      ? failedStep.args.skillPath.replace(/^~/, process.env.HOME || '')
+      : null;
+    const lines = [];
+
+    if (skillPath) {
+      lines.push(`skillPath: "${skillPath}"`);
+      if (fsSync.existsSync(skillPath)) {
+        try {
+          const content = fsSync.readFileSync(skillPath, 'utf8').trim();
+          const fmMatch = content.match(/^---\n([\s\S]*?)\n---/);
+          if (fmMatch) {
+            lines.push(`Current skill.md frontmatter:\n${fmMatch[1].split('\n').map(l => `    ${l}`).join('\n')}`);
+          } else {
+            lines.push(`skill.md content (first 500 chars):\n${content.substring(0, 500).split('\n').map(l => `    ${l}`).join('\n')}`);
+          }
+        } catch (readErr) {
+          lines.push(`Could not read skill.md: ${readErr.message}`);
+        }
+
+        // Validate required fields and report which are missing
+        const REQUIRED = ['name', 'description', 'exec_path', 'exec_type'];
+        const SKILL_NAME_PATTERN = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
+        try {
+          const raw = fsSync.readFileSync(skillPath, 'utf8');
+          const fmMatch2 = raw.match(/^---\n([\s\S]*?)\n---/);
+          if (fmMatch2) {
+            const fm = fmMatch2[1];
+            const missing = REQUIRED.filter(f => !new RegExp(`^${f}:`, 'm').test(fm));
+            if (missing.length) lines.push(`MISSING required fields: ${missing.join(', ')}`);
+
+            const nameMatch = fm.match(/^name:\s*(.+)$/m);
+            if (nameMatch) {
+              const skillName = nameMatch[1].trim();
+              if (!SKILL_NAME_PATTERN.test(skillName)) {
+                lines.push(`INVALID skill name "${skillName}" — must match /^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$/ (no hyphens, no digit-start segments)`);
+              }
+            }
+          }
+        } catch (_) {}
+      } else {
+        lines.push(`skill.md does NOT exist at path — shell.run write step may have failed silently`);
+      }
+    } else {
+      lines.push(`No skillPath in args — cannot diagnose`);
+    }
+
+    lines.push(`REQUIRED frontmatter fields: name, description, exec_path, exec_type`);
+    lines.push(`exec_type must be one of: node, shell`);
+    lines.push(`name must match: /^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$/ (e.g. reminder.cold.plunge)`);
+    lines.push(`exec_path must be inside ~/.thinkdrop/skills/<name>/skill.md`);
+
+    skillContextSection = `\nskill.install diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
+    logger.debug(`[Node:RecoverSkill] skill.install context injected (skillPath: ${skillPath})`);
   }
 
   // ── ui.findAndClick / ui.click / ui.typeText / ui.waitFor ────────────────

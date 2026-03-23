@@ -4,6 +4,7 @@ schedule|args:{time?:string,delayMs?:number,label?:string}|waits_until_clock_tim
 list_skills|args:{}|returns_full_skill_registry_including_installed_user_skills
 skill.install|args:{skillPath:string}|reads_skill_contract_md_at_path_and_registers_it_in_the_skill_registry.__ALWAYS_use_this_to_install_a_skill__never_shell.run.__skillPath_must_be_absolute_eg_/Users/lukaizhi/.thinkdrop/skills/send.text/skill.md
 project.launcher|args:{projectName:string,port?:number}|Starts_a_previously_built_ThinkDrop_project_and_opens_it_in_the_browser.__Use_when_the_user_says_"open_the_game",_"start_the_app",_"run_the_project",_"launch_X",_"open_X_app"_and_X_refers_to_a_built_project_in_~/.thinkdrop/projects/.__projectName_is_the_slug_or_plain_name_e.g._"tic_tac_toe"_or_"build-a-tic-tac-toe-game".__NEVER_use_shell.run_open_-a_for_these_—_projects_are_Node.js_servers_not_macOS_apps.
+project.stopper|args:{projectName:string,port?:number}|Stops_a_running_ThinkDrop_project_server_and_kills_its_Node.js_process.__Use_when_the_user_says_"close_the_app",_"stop_the_project",_"shut_it_down",_"close_it",_"kill_the_server"_and_the_user_is_referring_to_a_previously_launched_ThinkDrop_project_(built_with_project.builder).__projectName_is_the_slug_or_fuzzy_name_eg_"cold-plunge"_or_"schedule-plunge".__NEVER_use_needs_skill_or_shell.run_for_stopping_a_ThinkDrop_project.
 needs_skill|args:{capability:string,suggestion:string}|Use_for_TWO_cases:_(1)_recurring_background_daemons_that_cannot_be_done_via_one-off_API_call,_(2)_desktop_UI_automation_/_app_control_tasks_(scroll,_type,_shortcuts,_interact_with_native_apps)_that_require_a_full_project_—_NOT_a_skill.md.__For_one-off_REST_API_tasks_use_skill.bootstrap_pattern_instead.__RULE:_if_the_user_asks_to_"create_a_skill"_or_"build_a_tool"_for_controlling_apps_(keyboard,_mouse,_scroll,_shortcuts,_window_control),_output_needs_skill_with_the_described_capability.
 external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user_installed_external_skill_by_name
 
@@ -71,8 +72,65 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 
 **`synthesize` ordering rule — CRITICAL:** Place ALL `synthesize` steps AFTER all data-collection steps (browser.act, shell.run, getPageText, waitForStableText) are complete. **NEVER interleave `synthesize` between browser steps on different sites.** Wrong: [chatgpt scrape → synthesize → gmail scrape → synthesize]. Right: [chatgpt scrape → gmail scrape → synthesize all → send].
 
+## Python scripts for data and file tasks
+
+Python is the preferred tool for: file patching, JSON/CSV/Excel mutation, data analysis, complex conditional logic, and any task requiring packages. Use bash only for simple single-command system ops.
+
+### Bash vs Python decision guide
+
+| Task type | Use |
+|-----------|-----|
+| Open app, move file, list directory | `shell.run` bash |
+| Simple pipeline (`grep \| sort \| uniq`) | `shell.run` bash |
+| Edit a file in-place (replace text, add line) | `python3 -c` inline or temp script |
+| JSON key mutation / schema update | `python3 -c 'import json...'` |
+| CSV → Excel, data formatting, pivot tables | `synthesize(saveToFile)` Python script + `shell.run` |
+| Nested if/for logic, multiple file mutations | Python temp script at `/tmp/thinkdrop_task.py` |
+| Web scrape results → structured spreadsheet | `browser.act` collect → Python script → Excel |
+
+### Python temp script pattern (preferred for anything > 3 lines of logic)
+
+```json
+[
+  { "skill": "synthesize", "args": { "prompt": "Write a Python script that [TASK]. Use only stdlib unless packages are needed. Output ONLY the Python code, no markdown fences.", "saveToFile": "/tmp/thinkdrop_task.py" } },
+  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "python3 /tmp/thinkdrop_task.py"] } }
+]
+```
+
+### Python inline pattern (≤3 lines of logic)
+
+```json
+{ "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "python3 -c \"import pathlib,json; p=pathlib.Path('/path/file.json'); d=json.loads(p.read_text()); d['version']='2.0.0'; p.write_text(json.dumps(d,indent=2))\""] } }
+```
+
+### pip3 install pattern — ALWAYS audit before installing
+
+```json
+[
+  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "pip3 install pip-audit --quiet --user 2>/dev/null; pip-audit 2>/dev/null | grep -i PACKAGE | grep -i vuln && echo 'BLOCKED: vulnerability found' || pip3 install PACKAGE --quiet --user"] } },
+  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "python3 /tmp/thinkdrop_task.py"] } }
+]
+```
+
+**NEVER install a package flagged with known CVEs.** Offer the user an alternative package instead.
+
+### Data collection → Excel/CSV example (Gmail → openpyxl)
+
+```json
+[
+  { "skill": "browser.act", "args": { "action": "navigate", "url": "https://mail.google.com", "sessionId": "gmail" } },
+  { "skill": "browser.act", "args": { "action": "examine", "intent": "search gmail for covid 2020 emails", "nextActions": ["fill search", "press Enter", "waitForStableText"], "sessionId": "gmail" } },
+  { "skill": "browser.act", "args": { "action": "fill", "selector": "Search mail", "text": "covid after:2019/12/31 before:2021/01/01", "sessionId": "gmail" } },
+  { "skill": "browser.act", "args": { "action": "press", "key": "Enter", "sessionId": "gmail" } },
+  { "skill": "browser.act", "args": { "action": "waitForStableText", "timeoutMs": 15000, "sessionId": "gmail" } },
+  { "skill": "synthesize", "args": { "prompt": "From the email results above, write a Python script that installs openpyxl (after pip-audit check), then creates /tmp/gmail_covid.xlsx with columns: Date, Time, From, Subject, Description (first 200 chars of body). Output ONLY Python code.", "saveToFile": "/tmp/gmail_export.py" } },
+  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "pip3 install pip-audit --quiet --user 2>/dev/null; pip-audit 2>/dev/null | grep -i openpyxl | grep -i vuln || pip3 install openpyxl --quiet --user && python3 /tmp/gmail_export.py"] } }
+]
+```
+
 ## Critical skill selection rules
 
+- **Stopping/closing a ThinkDrop project app** — use `project.stopper` with the projectName. NEVER use `needs_skill` or `shell.run kill` for this. Example: user says "close it", "stop the app", "shut down the cold plunge project" → `project.stopper { "projectName": "schedule-daily-cold-plunge-sessions-at-6" }`. Use partial name matching — "cold plunge" matches "schedule-daily-cold-plunge-sessions-at-6".
 - **Closing a file on macOS** — use `osascript -e 'tell application "AppName" to close (every document whose name is "filename")'`. NEVER use `lsof | kill`, `kill -9`, or `xargs kill` — those kill the whole app or random processes. To find which app has the file open: `mdls -name kMDItemLastUsedApp "/path/to/file"`. For .txt files the app is usually "TextEdit". For PDFs use "Preview". Always close the document, not the application (unless the user explicitly says "quit TextEdit").
 - **Opening apps** — always `shell.run open -a AppName`, never `ui.findAndClick`
 - **Reading/writing files** — always `shell.run bash -c`, never open a GUI app
@@ -267,7 +325,7 @@ For unknown IDEs: plan a `web.search` step first to find the rules file location
 
 ## schedule — deferred execution
 
-Use as the FIRST step when user says "at 8pm", "in 30 minutes", "wait an hour then". Use `time` for clock time or `delayMs` for a duration. Do not use for recurring tasks (suggest cron/launchd via `api_suggest` instead).
+Use as the FIRST step when user says "at 8pm", "in 30 minutes", "wait an hour then". Use `time` for clock time or `delayMs` for a duration. Do not use for recurring tasks (use the node-cron skill pattern instead).
 
 ## external.skill — user-installed skills
 
@@ -437,6 +495,108 @@ Replace `<service>`, `<action>`, `<docs-url>`, and arg names with the actual ser
 | SendGrid email | `https://docs.sendgrid.com/api-reference/mail-send/mail-send` | Bearer token | SENDGRID_API_KEY |
 | Vonage SMS | `https://developer.vonage.com/api/sms` | POST body params | VONAGE_API_KEY, VONAGE_API_SECRET |
 
+## Local scheduled skills — three tiers
+
+ThinkDrop runs a SkillScheduler daemon (node-cron) inside command-service. Any installed skill with a `schedule:` field gets a registered cron job automatically. **Never use launchd, never use `needs_skill` for local scheduled work.**
+
+### Decision table
+
+| User says | Tier | `type:` field | How it fires |
+|-----------|------|---------------|--------------|
+| "Remind me to cold plunge at 6am" | **notify** | `type: notify` | SkillScheduler calls osascript directly — no index.cjs |
+| "Set a daily workout alarm at 7am" | **notify** | `type: notify` | SkillScheduler calls osascript directly |
+| "Remind me to drink water every hour" | **notify** | `type: notify` | Pure nudge — no execution |
+| "Review my expenses every Friday at 5pm" | **bridge** | `type: bridge` | SkillScheduler writes WS:INSTRUCTION → Electron AI session |
+| "Go through my Notion tasks every Monday" | **bridge** | `type: bridge` | SkillScheduler writes WS:INSTRUCTION → Electron AI session |
+| "Check if my app is running at 9am" | **bridge** | `type: bridge` | Requires screen-check execution — NOT a nudge |
+| "Every morning, look at my screen and summarize what's open" | **bridge** | `type: bridge` | Uses screen.capture + synthesize — needs AI session |
+| "Summarize my browser tabs every evening" | **bridge** | `type: bridge` | Agentic task — requires skill execution |
+| "Send me a daily SMS at 9pm" | **needs_skill** | external Twilio/ClickSend | Requires external API credentials |
+
+**"remind me to X" always → `notify`**, even if X contains action words. The word "remind" means nudge, not execution.
+
+**Action verb without "remind" → `bridge`**: update, review, check, go through, organize, summarize, draft, process, clean up, analyze, categorize, compile, go over.
+
+**Critical: screen-check tasks → always `bridge`** — any scheduled task that needs to *look at the screen*, *check app state*, *read what's visible*, or *capture/analyze a screenshot* requires an AI execution session. Never use `notify` for these — a macOS notification cannot see the screen.
+
+**Decision flowchart:**
+```
+Does the task require looking at the screen, reading data, or executing steps?
+  YES → bridge (type: bridge)
+Does the task only need to pop up a reminder message to the user?
+  YES → notify (type: notify)
+Does the task require an external API (SMS, email, OAuth service)?
+  YES → needs_skill
+```
+
+---
+
+### Tier 1 — notify (pure nudge)
+
+SkillScheduler fires osascript **directly** using `title:` and `message:` from skill.md frontmatter. **No index.cjs required.**
+
+Substitute: `NAME` = dotted skill name (e.g. `reminder.cold.plunge`), `CRON` = cron expression, `MESSAGE` = short reminder text, `TITLE` = display title.
+
+```json
+[
+  {
+    "skill": "shell.run",
+    "args": {
+      "cmd": "bash",
+      "argv": ["-c", "mkdir -p \"$HOME/.thinkdrop/skills/NAME\" && cat > \"$HOME/.thinkdrop/skills/NAME/skill.md\" << 'SKILLEOF'\n---\nname: NAME\nschedule: \"CRON\"\ntype: notify\ntitle: ThinkDrop Reminder\nmessage: MESSAGE\ndescription: Daily reminder — MESSAGE\n---\n## Plan\nFire a macOS notification on schedule.\nSKILLEOF\necho 'Notify skill written'"]
+    },
+    "description": "Write notify skill.md (no index.cjs needed)"
+  },
+  {
+    "skill": "skill.install",
+    "args": { "skillPath": "~/.thinkdrop/skills/NAME/skill.md" },
+    "description": "Register skill so SkillScheduler picks up the cron"
+  },
+  {
+    "skill": "shell.run",
+    "args": {
+      "cmd": "bash",
+      "argv": ["-c", "curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo 'node-cron activated'"]
+    },
+    "description": "Sync SkillScheduler to activate the cron immediately"
+  }
+]
+```
+
+---
+
+### Tier 2 — bridge (agentic task)
+
+SkillScheduler checks if the user is active (via `GET http://127.0.0.1:3010/activity`). If active, it defers up to 3 times at 10-min intervals with a soft notification. When idle, it appends a `WS:INSTRUCTION` block to `~/.thinkdrop/bridge.md` — Electron's bridge watcher picks this up and fires a full AI stategraph session. **No index.cjs required.** The `instruction:` field becomes the AI prompt.
+
+Substitute: `NAME` = dotted skill name, `CRON` = cron expression, `LABEL` = short label, `INSTRUCTION` = full task description (this becomes the AI prompt at fire time).
+
+```json
+[
+  {
+    "skill": "shell.run",
+    "args": {
+      "cmd": "bash",
+      "argv": ["-c", "mkdir -p \"$HOME/.thinkdrop/skills/NAME\" && cat > \"$HOME/.thinkdrop/skills/NAME/skill.md\" << 'SKILLEOF'\n---\nname: NAME\nschedule: \"CRON\"\ntype: bridge\ntitle: LABEL\ninstruction: INSTRUCTION\ndescription: Scheduled task — LABEL\n---\n## Plan\nAt fire time, ThinkDrop executes: INSTRUCTION\nSKILLEOF\necho 'Bridge skill written'"]
+    },
+    "description": "Write bridge skill.md (AI executes instruction at fire time)"
+  },
+  {
+    "skill": "skill.install",
+    "args": { "skillPath": "~/.thinkdrop/skills/NAME/skill.md" },
+    "description": "Register skill so SkillScheduler picks up the cron"
+  },
+  {
+    "skill": "shell.run",
+    "args": {
+      "cmd": "bash",
+      "argv": ["-c", "curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo 'node-cron activated'"]
+    },
+    "description": "Sync SkillScheduler to activate the cron immediately"
+  }
+]
+```
+
 ## needs_skill — capability gap
 
 **Use `needs_skill` as the FIRST AND ONLY step (no browser.act, no shell.run, no api_suggest before it) when the request requires ongoing background automation that ThinkDrop cannot do natively.**
@@ -451,13 +611,15 @@ ThinkDrop will automatically build, install, and configure the skill — includi
 | Scheduled SMS / text notifications | "send me a daily text summary at 9pm", "text me my schedule every morning" |
 | Calendar monitoring & reminders | "check my Google Calendar and remind me of events", "daily calendar briefing" |
 | Slack / Discord / messaging monitoring | "watch my Slack and summarize daily", "alert me on new Discord messages" |
-| Any recurring/scheduled background task | "every day at X", "every night", "every morning", "weekly digest" |
+| Any recurring/scheduled background task **requiring an external service** | "send me a daily text at 9pm" (Twilio), "daily calendar briefing" (Google Calendar API), "weekly Slack digest" |
 | Third-party service sync | "sync Notion", "poll Airtable", "monitor my Jira issues" |
 | OAuth-gated data access requiring a long-running daemon | Gmail API, Google Calendar API, Twilio SMS, etc. |
 
 **Why:** These tasks require a persistent background process (cron job, daemon, or webhook) with API credentials. ThinkDrop's browser.act is session-based and cannot run in the background. A custom skill (installed at `~/.thinkdrop/skills/`) is the correct mechanism. ThinkDrop's agent pipeline handles credential setup automatically.
 
-**Rule:** If the user asks to **watch / monitor / track / poll / summarize on a schedule / send daily/weekly/nightly notifications** involving any external service → emit `needs_skill` immediately. Never navigate to the service's website, never add a `shell.run` scaffold step, and never suggest an API setup as a substitute.
+**Rule:** If the user asks to **watch / monitor / track / poll / summarize on a schedule / send daily/weekly/nightly notifications** involving any external service (Gmail, Twilio, Slack, Google Calendar API, etc.) → emit `needs_skill` immediately. Never navigate to the service's website, never add a `shell.run` scaffold step, and never suggest an API setup as a substitute.
+
+**EXCEPTION — local scheduled skills:** If the user wants a local notification/alarm (`type: notify`) or a local agentic task with no external API needed (`type: bridge`), use the three-tier patterns from `## Local scheduled skills` above. Do NOT emit `needs_skill` for these.
 
 `capability` should be a concise description of what the skill will do (max 10 words). `suggestion` should name the service(s) involved.
 

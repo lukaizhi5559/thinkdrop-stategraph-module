@@ -25,14 +25,36 @@
  * Graceful degradation: if user-memory service is unavailable, passes through.
  */
 
-const SEMANTIC_SYSTEM_PROMPT = `You are a skill-matching assistant. Given a user's request and a list of installed skills (with names and descriptions), determine if any skill clearly matches what the user wants to do.
+const SEMANTIC_SYSTEM_PROMPT = `You are a strict skill-matching assistant. Given a user's request and a list of installed skills, determine if any skill EXACTLY matches what the user wants to do.
 
 Rules:
-- Only match if the skill's purpose CLEARLY covers the user's request — same service, same action type.
-- Do NOT match on loose similarity (e.g. "weather" skill does not match "check my email").
-- IMPORTANT: Even if the user says "I need to create" or "I want to build" a skill, if an existing installed skill ALREADY covers the described capability, return that skill name. The user may not know it exists.
-- Return ONLY the exact skill name string (e.g. "gmail.daily.summary") or the word null.
-- No explanation, no punctuation, no quotes around the name.`;
+- Only match if the skill's purpose DIRECTLY covers the user's request — same service, same action type, same intent.
+- Do NOT match on loose thematic similarity. Sharing a general domain does NOT qualify.
+- IMPORTANT: Even if the user says "I need to create" or "I want to build" a skill, if an existing installed skill ALREADY covers the described capability, return that skill name.
+
+## Recurring vs one-off — CRITICAL distinction:
+- A skill that creates ONE Google Calendar event (gcal.event) does NOT match requests for recurring local reminders like "every morning", "daily at 6am", "remind me every day".
+- Recurring/scheduled tasks that don't explicitly say "Google Calendar" or "add to my calendar" should NOT match calendar event creation skills.
+- Only match a calendar skill if the user explicitly mentions Google Calendar, or says "add/create a calendar event/appointment".
+
+## Matching examples:
+- "Schedule my cold plunge every morning at 6am" → null (local recurring reminder, not a calendar event)
+- "Add a dentist appointment to my Google Calendar" → gcal.event ✅
+- "Remind me daily at 7am" → null (local OS reminder, not a calendar event)
+- "Create a calendar event for the team meeting on Friday" → gcal.event ✅
+- "Send Sarah a text" → sms/clicksend skill if installed ✅
+- "Check the weather" → weather skill if installed ✅
+
+Output format — ONLY these two formats, nothing else:
+skill-name|HIGH
+null
+
+Return "null" when there is NO clear match or when confidence is not HIGH. Never return MEDIUM or LOW matches.`;
+
+// Signals that the user wants a recurring/background task (not a one-off event)
+const RECURRING_SIGNALS_RE = /\b(every\s+(morning|day|night|evening|week|month|hour|\d)|daily|weekly|monthly|alarm|each\s+(morning|day|night|evening|week)|remind\s+me\s+(daily|every)|recurring|repeat(ing)?|on\s+a\s+(daily|weekly|\w+)\s+schedule|at\s+\d{1,2}(:\d{2})?\s*(am|pm)\s+(every|daily|each))\b/i;
+// Skill name fragments that indicate a one-shot event-creation skill (not a daemon)
+const ONE_SHOT_EVENT_MARKERS = ['calendar', '.event', 'booking', 'meeting', 'webex', 'zoom.schedule'];
 
 // Patterns that indicate the user wants to CREATE a skill (phrasing, not intent)
 const WANTS_TO_CREATE_RE = /\b(create|build|make|write|add|install|set up|setup)\b.{0,40}\b(skill|ability|feature|capability|automation|tool)\b|\bneed (a |to )?(create|build|make|have)\b|\bdon't have\b|\bdoesn'?t exist\b/i;
@@ -112,7 +134,7 @@ module.exports = async function parseSkill(state) {
   const hasPhoneNumber = /\b\d{10,11}\b|\+1\d{10}/.test(classifyMessage);
   const isShortPrompt  = classifyMessage.trim().length <= 120;
   const CAPABILITY_PATTERNS = [
-    { keywords: /\b(send|text|sms|message)\b.*\b(text|sms|message)\b|\bsend\b.*\b\d{10}\b|\btext (me|him|her|them|us)\b|\btext (this|that|it) to (me|him|her|them|us|\d{7,})\b/i, capability: 'sms',   requiresPhoneOrShort: true },
+    { keywords: /\b(send|text|sms|message)\b.*\b(text|sms|message)\b|\b(send|text)\b.*\b\d{10,11}\b|\btext (me|him|her|them|us)\b|\btext (this|that|it) to (me|him|her|them|us|\d{7,})\b/i, capability: 'sms',   requiresPhoneOrShort: true },
     { keywords: /\b(send|compose|write)\b.*\b(email|mail)\b/i,                                                                capability: 'email', requiresPhoneOrShort: false },
   ];
   for (const pattern of CAPABILITY_PATTERNS) {
@@ -139,12 +161,14 @@ module.exports = async function parseSkill(state) {
     // A skill description must contain at least MIN_GROUPS_MATCHED groups to match.
     const CAPABILITY_GROUPS = [
       { words: ['scroll', 'scrolling', 'scroll up', 'scroll down', 'scrolls'] },
-      { words: ['type', 'typing', 'type text', 'type chars', 'keypress', 'keyboard', 'keystroke'] },
-      { words: ['shortcut', 'shortcuts', 'hotkey', 'key combination', 'ctrl+', 'cmd+', 'command+'] },
-      { words: ['click', 'clicking', 'mouse click', 'right-click', 'double-click'] },
+      { words: ['type', 'typing', 'type text', 'type chars', 'keypress'] },
+      { words: ['keyboard', 'keystroke', 'shortcut', 'shortcuts', 'hotkey', 'key combination', 'ctrl+', 'cmd+', 'command+'] },
+      { words: ['click', 'clicking', 'mouse click'] },
+      { words: ['mouse', 'cursor', 'move mouse', 'drag', 'right-click', 'double-click', 'mouse button'] },
       { words: ['app control', 'control app', 'interact with app', 'application control', 'desktop automation', 'ui automation', 'automate app'] },
       { words: ['playwright', 'nut-js', 'nut.js', 'robotjs', 'pyautogui', 'xdotool'] },
-      { words: ['window', 'windows', 'active window', 'foreground app', 'current app'] },
+      { words: ['window', 'windows', 'active window', 'current app'] },
+      { words: ['foreground', 'foreground app', 'bring to front', 'bring to foreground', 'focus window', 'focus app', 'activate window'] },
     ];
     const MIN_GROUPS_MATCHED = 2; // user message must hit ≥2 groups to qualify
 
@@ -178,17 +202,39 @@ module.exports = async function parseSkill(state) {
 
   // Only attempt if at least some skills have descriptions — otherwise the LLM
   // has nothing useful to compare against.
-  const skillsWithDesc = installedSkills.filter(s => s.description || s.summary);
+  let skillsWithDesc = installedSkills.filter(s => s.description || s.summary);
   if (skillsWithDesc.length === 0) {
     logger.debug(`[Node:ParseSkill] No skill match (no descriptions for semantic match): "${classifyMessage.substring(0, 80)}"`);
     return state;
+  }
+
+  // ── Pre-LLM guard: recurring request → exclude one-shot calendar/event skills ──
+  // Prevents "cold plunge every morning" from matching gcal.event.
+  // Only filters when the message has clear recurring signals AND does NOT
+  // explicitly mention Google Calendar or "calendar event".
+  const hasRecurringSignal = RECURRING_SIGNALS_RE.test(classifyMessage);
+  const hasExplicitCalendar = /\b(google calendar|my calendar|calendar event|add to (my )?calendar|create (a |an )?event|make (a |an )?appointment)\b/i.test(classifyMessage);
+  if (hasRecurringSignal && !hasExplicitCalendar) {
+    const beforeFilter = skillsWithDesc.length;
+    skillsWithDesc = skillsWithDesc.filter(s => {
+      const nameLow = s.name.toLowerCase();
+      return !ONE_SHOT_EVENT_MARKERS.some(m => nameLow.includes(m));
+    });
+    if (skillsWithDesc.length < beforeFilter) {
+      logger.info(`[Node:ParseSkill] Pre-LLM guard: excluded ${beforeFilter - skillsWithDesc.length} one-shot event skill(s) — recurring request detected ("${classifyMessage.substring(0, 60)}")`);
+    }
+    if (skillsWithDesc.length === 0) {
+      logger.debug(`[Node:ParseSkill] Semantic skipped — all candidates excluded by recurring guard`);
+      return state;
+    }
   }
 
   const skillMenu = skillsWithDesc
     .map(s => `- ${s.name}: ${(s.description || s.summary || '').slice(0, 120)}`)
     .join('\n');
 
-  const semanticPrompt = `User request: "${classifyMessage}"\n\nInstalled skills:\n${skillMenu}\n\nDoes any skill clearly match this request? Return the exact skill name or null.`;
+  const semanticPrompt = `User request: "${classifyMessage}"\n\nInstalled skills:\n${skillMenu}\n\nDoes any skill clearly match this request? Return "skill-name|HIGH" or "null".
+Examples: "gcal.event|HIGH" or "null"`;
 
   try {
     const raw = await Promise.race([
@@ -200,11 +246,18 @@ module.exports = async function parseSkill(state) {
       new Promise((_, reject) => setTimeout(() => reject(new Error('semantic timeout')), 5000)),
     ]);
 
-    const candidate = (raw || '').trim().replace(/^["']|["']$/g, '').toLowerCase();
+    // Parse format: "skill-name|HIGH" or legacy plain "skill-name" or "null"
+    const rawTrimmed = (raw || '').trim().replace(/^["`']|["`']$/g, '');
+    // Split on pipe — if HIGH confidence declared, take it; otherwise plain name treated as HIGH (backwards compat)
+    const [candidatePart, confidencePart] = rawTrimmed.split('|').map(p => p.trim().toLowerCase());
+    const candidate = candidatePart;
+    const confidence = confidencePart || 'high'; // legacy responses without pipe treated as HIGH
 
-    if (candidate && candidate !== 'null' && candidate !== 'none' && candidate !== '') {
-      // Verify the returned name is actually an installed skill (LLM can hallucinate)
-      const confirmed = installedSkills.find(s => s.name.toLowerCase() === candidate);
+    if (confidence !== 'high') {
+      logger.debug(`[Node:ParseSkill] Semantic LLM returned confidence "${confidence}" — skipping (only HIGH accepted)`);
+    } else if (candidate && candidate !== 'null' && candidate !== 'none' && candidate !== '') {
+      // Verify the returned name is actually an ALLOWED candidate (not filtered out by recurring guard)
+      const confirmed = skillsWithDesc.find(s => s.name.toLowerCase() === candidate);
       if (confirmed) {
         logger.info(`[Node:ParseSkill] Semantic match: "${classifyMessage.substring(0, 60)}" → skill "${confirmed.name}"${userWantsToCreate ? ' (userWantsToCreate)' : ''}`);
         return _matchedState(state, confirmed.name, userWantsToCreate);
