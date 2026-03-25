@@ -83,16 +83,22 @@ function isLoopDetected(newGoal, stack, currentGoalLabel) {
  *   { subPlanStack, skillPlan, skillCursor, currentGoalLabel }
  *   or { planError } when spawn is blocked (depth / loop).
  *
- * Design note: cursor points to the FAILED step (not cursor+1) so that
- * after the sub-plan completes and the stack is popped, executeCommand
- * retries the original failed step with refreshed state (e.g. new session).
+ * onComplete behaviour (stored on the parent stack entry):
+ *   'retry' (default) — after the sub-plan completes, resume at the FAILED
+ *                        step so it can be retried with freshly resolved state
+ *                        (e.g. login sub-plan: retry the authenticated request).
+ *   'skip'            — the sub-plan resolved the issue in isolation; advance
+ *                        the cursor PAST the failed step on resume. Use this
+ *                        when the failed step itself was the wrong command
+ *                        (e.g. interactive CLI auth that should not be re-run).
  *
  * @param {object} state        Current LangGraph state
  * @param {Array}  subSteps     Steps for the new sub-plan
  * @param {string} goalLabel    Human-readable label for the sub-plan goal
+ * @param {object} [opts]       Options: { onComplete: 'retry'|'skip' }
  * @returns {object}
  */
-function spawnSubPlan(state, subSteps, goalLabel) {
+function spawnSubPlan(state, subSteps, goalLabel, opts = {}) {
   const stack = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
 
   if (stack.length >= MAX_DEPTH) {
@@ -117,9 +123,10 @@ function spawnSubPlan(state, subSteps, goalLabel) {
   const parentEntry = {
     planId,
     skillPlan:    state.skillPlan   || [],
-    skillCursor:  state.skillCursor ?? 0,   // keep at failed step for retry
+    skillCursor:  state.skillCursor ?? 0,   // cursor at failed step
     goalLabel:    state.currentGoalLabel || 'root',
     depth:        stack.length,
+    onComplete:   opts.onComplete || 'retry',  // 'retry' | 'skip'
   };
 
   // Persist parent snapshot to disk (best-effort)
@@ -146,6 +153,10 @@ function spawnSubPlan(state, subSteps, goalLabel) {
  * Returns a partial state object ({ subPlanStack, skillPlan, skillCursor,
  * currentGoalLabel }) or {} when there is no parent to return to.
  *
+ * Cursor behaviour on resume:
+ *   parent.onComplete === 'retry' (default) → cursor stays at failed step (retry it)
+ *   parent.onComplete === 'skip'            → cursor advances past failed step
+ *
  * @param {object} state  Current LangGraph state
  * @returns {object}
  */
@@ -161,10 +172,16 @@ function completeSubPlan(state) {
     if (fs.existsSync(fp)) fs.unlinkSync(fp);
   } catch (_) {}
 
+  // 'skip': sub-plan resolved the issue in isolation — step should NOT be re-run.
+  // 'retry' (default): sub-plan cleared a blocking prerequisite — retry the step.
+  const resumeCursor = (parent.onComplete === 'skip')
+    ? parent.skillCursor + 1
+    : parent.skillCursor;
+
   return {
     subPlanStack:     stack,
     skillPlan:        parent.skillPlan,
-    skillCursor:      parent.skillCursor,  // retry failed step
+    skillCursor:      resumeCursor,
     currentGoalLabel: parent.goalLabel,
   };
 }

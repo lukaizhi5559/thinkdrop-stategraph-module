@@ -168,29 +168,6 @@ module.exports = async function parseIntent(state) {
     return { ...state, intent: { type: 'set_constraint', confidence: 0.98, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'set-constraint-override', processingTimeMs: 0 } };
   }
 
-  // Make-a-note / log-activity / add-to-memory overrides — must run BEFORE build-create-override.
-  // "make a note of this" / "take a note" → memory_store (not build/create command_automate).
-  // "log that I ran 3 miles" / "log my workout" → memory_store.
-  // "add this to memory: ..." / "from now on assume I prefer X" → memory_store.
-  if (/^(make|take)\s+a\s+note\b/i.test(classifyMessage) ||
-      /^(jot|write)\s+(this|that|it|these)\s+(down|up|here|in)\b/i.test(classifyMessage) ||
-      /^jot\s+down\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Make-a-note override → memory_store: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_store', confidence: 0.97, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'make-note-override', processingTimeMs: 0 } };
-  }
-  if (/^(hey\s+)?log\s+(that\s+)?i\b/i.test(classifyMessage) ||
-      /^(hey\s+)?log\s+(my\s+)?(workout|run|miles|calories|weight|sleep|mood|meal|food|exercise|steps)\b/i.test(classifyMessage) ||
-      /^(hey\s+)?log\s+(workout|run|today|this)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Log-activity override → memory_store: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_store', confidence: 0.97, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'log-activity-override', processingTimeMs: 0 } };
-  }
-  if (/\badd\s+(this|that|it|the following)\s+to\s+(my\s+)?memory\b/i.test(classifyMessage) ||
-      /\b(from now on|from here on|going forward|starting (now|today))\b.{0,80}\b(assume|know|remember|treat|consider|use|prefer|note|want|i\s+want)\b/i.test(classifyMessage) ||
-      /\b(from now on|from here on|going forward)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Add-to-memory override → memory_store: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_store', confidence: 0.97, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'add-to-memory-override', processingTimeMs: 0 } };
-  }
-
   // Build/create/make app override — ALWAYS command_automate, never web_search.
   // "build a tic tac toe game", "create a todo app", "make me a calculator",
   // "build a script that X", "create a tool to X", "make a dashboard for X"
@@ -202,23 +179,6 @@ module.exports = async function parseIntent(state) {
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'build-create-override', processingTimeMs: 0 } };
   }
 
-  // General knowledge override:
-  // "how do I pronounce X", "what's the spanish word for X", "translate X to Y",
-  // "what does X mean", "define X", "how do you say X in Y"
-  // These are factual knowledge questions, never memory_store.
-  // Also catches typos like "I do I pronounce" (missing 'how').
-  if ((/\b(pronounce|pronunciation|translate|translation|word for|definition of|define|meaning of|spell|conjugat|declens)\b/i.test(classifyMessage) ||
-      /\bsay\s+.{0,30}\s+in\s+(english|spanish|french|german|mandarin|chinese|japanese|korean|arabic|portuguese|italian|russian|hindi|swahili|latin|greek|hebrew|dutch|polish|turkish)\b/i.test(classifyMessage) ||
-      /\b(how (do|would|can|should) (i|you|we))\b.{0,40}\b(pronounce|say|translate|spell)\b/i.test(classifyMessage) ||
-      /\b(i do i|how do i)\b.{0,40}\b(pronounce|say|translate|spell)\b/i.test(classifyMessage)) &&
-     !/\bdid\s+i\s+(say|tell|mention)\b/i.test(classifyMessage) &&
-     !/^who\s+(do|should|can|would)\s+i\s+(ask|contact|go\s+to|talk\s+to|reach\s+out\s+to|email)\b/i.test(classifyMessage.trim()) &&
-     // Exclude "How do I spell [Person]'s last/first/full name?" — that's a personal contact memory query
-     !/\bspell\b.{0,40}\b(last\s+name|first\s+name|full\s+name|surname)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Knowledge/language override → general_knowledge: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'general_knowledge', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'knowledge-language-override', processingTimeMs: 0 } };
-  }
-
   // "Remind me about [X]" / "Remind me about my X" → fetch stored info → memory_retrieve.
   // Also catches voice-split "re mind me a bout [topic]".
   // EXCLUDED: "remind me in 5 min" / "remind me at 7am" (those are schedule reminders → command_automate).
@@ -226,128 +186,6 @@ module.exports = async function parseIntent(state) {
       !/\b(in\s+\d+|at\s+\d{1,2}|tomorrow|tonight|later|soon|this\s+(morning|evening|afternoon)|before\s+I|after\s+I|when\s+I)\b/i.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Remind-me-about-my override → memory_retrieve: "${classifyMessage}"`);
     return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'remind-me-about-my-override', processingTimeMs: 0 } };
-  }
-
-  // "Is there anything in my notes about X?" / "Tell me everything stored about X" → memory_retrieve.
-  // "Pull up what I said/told you about X" → memory_retrieve.
-  if (/\b(is\s+there|are\s+there)\s+(anything|something|anything\s+else)?\s*(in\s+(my\s+)?(notes?|records?|memory|data|logs?)\s+(about|on|for|regarding)|about)\s+\w/i.test(classifyMessage) ||
-      /\btell\s+me\s+everything\s+(stored|saved|noted|logged|in\s+my\s+(notes?|memory|records?))(\s+about)?\b/i.test(classifyMessage) ||
-      /\bpull\s+up\s+what\s+i\s+(said|told|mentioned|shared|gave|asked|recorded|noted)\b/i.test(classifyMessage) ||
-      /\blook\s+(back\s+)?(through|over)\s+what\s+i'?ve\s+(told|said|mentioned|shared|given)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Notes-about override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'notes-about-override', processingTimeMs: 0 } };
-  }
-
-  // "Who is the [role] on our team?" / "How many [personal metric] am I doing?" → memory_retrieve.
-  if (/^(who|what|how\s+many|how\s+much|how\s+often|how\s+long)\s+(is|are|was|were|do)?\s*(the|a|an|my|our)?\s*(new\s+)?(data\s+engineer|engineer|developer|designer|pm|manager|lead|doctor|therapist|vet|mechanic|trainer|coach|instructor|accountant)\b/i.test(classifyMessage.trim()) ||
-      /^(who|what)\s+is\s+the\s+new\b/i.test(classifyMessage.trim())) {
-    logger.debug(`[Node:ParseIntent] Who-is-new-role override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'who-is-new-role-override', processingTimeMs: 0 } };
-  }
-
-  // "Look back through what I've saved about X" → memory_retrieve.
-  if (/\blook\s+back\s+through\s+what\s+i'?ve\s+(saved|stored|noted|logged)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Look-back-saved override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'look-back-saved-override', processingTimeMs: 0 } };
-  }
-
-  // "Any notes on my X?" / "Any info on my Y?" → memory_retrieve.
-  if (/^(any\s+)?(notes?|info|record|stored|details?)\s+(on|about|for|regarding)\s+my\s+\b/i.test(classifyMessage.trim())) {
-    logger.debug(`[Node:ParseIntent] Any-notes-on-my override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'any-notes-on-my-override', processingTimeMs: 0 } };
-  }
-
-  // "Remind me what I said/told you about X" → memory_retrieve.
-  // "What chapter am I on?" / "How many X am I doing per day?" → memory_retrieve.
-  // "What do I know about my X?" → memory_retrieve.
-  if (/^(hey\s+)?remind\s+me\s+what\s+i\s+(said|told|mentioned|shared)\b/i.test(classifyMessage.trim()) ||
-      /\bwhat\s+(chapter|level|stage|step|page|section)\s+(am\s+i\s+on|do\s+i\s+(have|know)|have\s+i)\b/i.test(classifyMessage) ||
-      /\bhow\s+many\s+\w[\w\s]{0,30}\s+am\s+i\s+(doing|using|taking|eating|drinking|completing|making)\b/i.test(classifyMessage) ||
-      /\bwhat\s+do\s+i\s+know\s+about\s+my\b/i.test(classifyMessage) ||
-      /^(my\s+\w[\w\s']{1,30}?)\s*(destination|plan|schedule|session|height|weight|model|brand|name|price|goal|rate)\s*\?/i.test(classifyMessage.trim())) {
-    logger.debug(`[Node:ParseIntent] Personal-memory retrieval override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'personal-memory-retrieval-override', processingTimeMs: 0 } };
-  }
-
-  // "Who is the new data engineer on our team?" / "who is the new da ta en gi neer" → memory_retrieve.
-  if (/^who\s+is\s+\b/i.test(classifyMessage.trim()) && /\b(new|our|my|the)\s+\w[\w\s-]{0,30}\s*(starting|on\s+our|on\s+the|at\s+work|today|monday|tuesday|wednesday|thursday|friday)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Who-is-starting override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'who-is-starting-override', processingTimeMs: 0 } };
-  }
-
-  // "What's [person]'s last name?" / "How do I spell [Name]'s last name?" → memory_retrieve.
-  if (/\b(how\s+do\s+i\s+spell|what'?s|what\s+is)\b.{0,30}\b\w+\s*'?s?\s+(last\s+name|first\s+name|full\s+name|surname)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Name-spelling-retrieve override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'name-spelling-retrieve-override', processingTimeMs: 0 } };
-  }
-
-  // "What's my standing desk height?" / "What's my Rust chapter?" (short telegraphic retrieval)
-  if (/^(what'?s|what is|whats)\s+my\s+\w[\w\s']{0,25}\s*(height|model|price|goal|chapter|level|dosage|dose|address|number|name)\s*\??\s*$/i.test(classifyMessage.trim())) {
-    logger.debug(`[Node:ParseIntent] What-is-my-X override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'what-is-my-x-override', processingTimeMs: 0 } };
-  }
-
-  // "My X?" (bare possessive question fragment) → memory_retrieve.
-  // "My September trip destination?" / "Standing desk height?" → memory_retrieve.
-  // EXCLUDED: factual/general queries like "What's the current federal funds rate?"
-  if (/^my\s+\w[\w\s']{0,40}\?$/i.test(classifyMessage.trim()) ||
-      (/\b(destination|height|model|chapter|goal|price|dose|dosage|address|rate|schedule|status)\s*\?$/i.test(classifyMessage) &&
-       classifyMessage.trim().length <= 40 &&
-       // Must NOT be a general factual context ("current rate", "federal funds rate", "national average", etc.)
-       !/\b(current|federal|national|global|official|standard|average|latest|today'?s|market)\b/i.test(classifyMessage))) {
-    logger.debug(`[Node:ParseIntent] Short-fragment retrieval override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.92, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'short-fragment-retrieval-override', processingTimeMs: 0 } };
-  }
-
-  // "What's [person]'s last name?" / "How do I spell [Name]'s last name?" → memory_retrieve.
-  if (/^(what'?s|what is|whats)\s+(the\s+)?\w+\s*'?s?\s+(last\s+name|first\s+name|full\s+name|surname)\s*\??/i.test(classifyMessage.trim())) {
-    logger.debug(`[Node:ParseIntent] Whose-name override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'whose-name-override', processingTimeMs: 0 } };
-  }
-
-  // "What's the name/brand/model of my X?" → memory_retrieve (querying stored item info).
-  if (/\bwhat'?s\s+(the\s+)?(name|brand|model|make)\s+of\s+my\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] What-name-of-my override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'what-name-of-my-override', processingTimeMs: 0 } };
-  }
-
-  // "What language/app am I currently learning/using?" → personal memory, not general knowledge.
-  // Extended to also match compound descriptors: "What Korean learning app am I currently using?"
-  if (/\b(what|which)\s+(language|app|tool|method|technique|course)\s+(am\s+i|are\s+you)\s+(currently\s+)?(using|learning|studying|practicing)\b/i.test(classifyMessage) ||
-      /\bwhat\s+am\s+i\s+(currently\s+)?(learning|using|studying|practicing)\b/i.test(classifyMessage) ||
-      /\b(what|which)\s+\w[\w\s-]{0,30}\s+(am\s+i|are\s+you)\s+(currently\s+)?(using|running|learning|studying)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Am-I-currently-learning override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'am-i-currently-learning-override', processingTimeMs: 0 } };
-  }
-
-  // "What was [person]'s previous office/job/role?" → personal contact memory, not history → memory_retrieve.
-  // Runs BEFORE historical-event-override to intercept personal contact queries.
-  if (/\bwhat\s+was\s+\w+(?:\s+\w+){0,2}'?s?\s+(previous|former|last|old)\s+(office|job|role|company|team|position|title|department|location)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Personal-career-history override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'personal-career-history-override', processingTimeMs: 0 } };
-  }
-
-  // "What was [person]'s previous office/job/role?" → personal contact memory, not history → memory_retrieve.
-  // Runs BEFORE historical-event-override to intercept personal contact queries.
-  if (/\bwhat\s+was\s+\w+(?:\s+\w+){0,2}'?s?\s+(previous|former|last|old)\s+(office|job|role|company|team|position|title|department|location)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Personal-career-history override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'personal-career-history-override', processingTimeMs: 0 } };
-  }
-
-  // "What are the details of my [event/plan]?" → memory_retrieve.
-  // "Who [on my team/at work] [told/recommended/showed] me about X?" → memory_retrieve.
-  if (/\bwhat\s+are\s+the\s+details\s+of\s+my\b/i.test(classifyMessage) ||
-      /^who\s+(on\s+my\s+(team|project|team\s+first)|at\s+work|in\s+my\s+(company|org|office))\s+(told|recommended|mentioned|shared|introduced|showed)\s+me\b/i.test(classifyMessage.trim())) {
-    logger.debug(`[Node:ParseIntent] Personal-details-or-team-told override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'personal-details-override', processingTimeMs: 0 } };
-  }
-
-  // "remind me when my next appointment is" → memory_retrieve (asking what time something is stored).
-  // This fires BEFORE the reminder-schedule-override so a time-spec-less "remind me when" doesn't
-  // accidentally become command_automate.
-  if (/\bremind\s+me\s+when\b.{0,60}\b(is|was|will\s+be|happens?|occurs?)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Remind-me-when override → memory_retrieve: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'memory_retrieve', confidence: 0.95, entities: [], requiresMemoryAccess: true }, metadata: { parser: 'remind-me-when-override', processingTimeMs: 0 } };
   }
 
   // Reminder / timer / alarm / schedule override:
@@ -490,6 +328,19 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   if (MY_SKILLS_PATTERN.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] my-skills override → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'skill.list' }], requiresMemoryAccess: false }, metadata: { parser: 'my-skills-override', processingTimeMs: 0 } };
+  }
+
+  // "Search for X on Google/Bing/..." → command_automate (browser automation), NOT web_search.
+  // The phrase "on <search engine>" means the user wants the search performed IN the browser UI,
+  // not via ThinkDrop's internal web.search MCP. DistilBERT scores this as web_search at 0.92
+  // because it trained on "search for X" patterns without the browser-destination signal.
+  // Must run BEFORE the DistilBERT early exit.
+  const SEARCH_ENGINE_NAMES = /\b(google|bing|duckduckgo|yahoo|brave|ecosia|startpage|youtube|amazon|reddit|twitter|x\.com|github|stackoverflow|stack overflow|yelp|linkedin|instagram|facebook|pinterest|etsy|ebay|walmart|tripadvisor|zillow|redfin)\b/i;
+  if (/\b(search|look|find|look\s+up|search\s+for)\b/i.test(classifyMessage) &&
+      /\bon\s+/i.test(classifyMessage) &&
+      SEARCH_ENGINE_NAMES.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Search-on-engine override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'search-on-engine-override', processingTimeMs: 0 } };
   }
 
   // Knowledge-question override — BEFORE phi4 and carriedIntent.
@@ -716,6 +567,61 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
     } catch (e) {
       logger.debug(`[Node:ParseIntent] intent_override.search skipped: ${e.message}`);
     }
+  }
+
+  // ── DistilBERT early classification ──────────────────────────────────────
+  // All structural/meta guards above (app-launch, app-control, messaging verbs,
+  // lift/set_constraint, skill invocations, carriedIntent, DuckDB self-corrections)
+  // must always run unconditionally — they are correct by definition.
+  //
+  // Everything BELOW this point is a language-pattern safety net that was written
+  // to compensate for the old cosine-similarity parser's mistakes. DistilBERT
+  // (fine-tuned on 6,250 labelled examples) handles these patterns directly.
+  //
+  // Strategy: call the model here. If it is highly confident (>= MODEL_CONF_THRESHOLD)
+  // return immediately and skip all the language-pattern guards below. If it is
+  // uncertain the guards below run as a safety net — preserving existing behaviour.
+  // Over time, as DistilBERT is retrained on edge cases collected via intent_override,
+  // fewer and fewer prompts will need the safety net.
+  const MODEL_CONF_THRESHOLD = 0.75;
+  let earlyModelResult = null;
+  if (mcpAdapter) {
+    try {
+      const _earlyCall = await mcpAdapter.callService('phi4', 'intent.parse', {
+        message: classifyMessage,
+        context: { sessionId: context?.sessionId, userId: context?.userId }
+      });
+      earlyModelResult = _earlyCall?.data || _earlyCall;
+    } catch (e) {
+      logger.debug(`[Node:ParseIntent] Early DistilBERT call skipped: ${e.message}`);
+    }
+  }
+
+  if (earlyModelResult && (earlyModelResult.confidence ?? 0) >= MODEL_CONF_THRESHOLD) {
+    const _eIntent = earlyModelResult.intent || 'general_query';
+    const _eConf   = earlyModelResult.confidence;
+    logger.debug(`[Node:ParseIntent] DistilBERT early → ${_eIntent} (${_eConf.toFixed(2)}): "${classifyMessage}"`);
+    // Signal 1: record low-confidence candidates for self-repair review
+    if (_eConf < 0.55) {
+      mcpAdapter?.callService('user-memory', 'intent_override.upsert', {
+        examplePrompt: classifyMessage, correctIntent: _eIntent, wrongIntent: null, source: 'low_confidence_candidate'
+      }).catch(() => {});
+    }
+    return {
+      ...state,
+      intent: {
+        type: _eIntent,
+        confidence: _eConf,
+        entities: earlyModelResult.entities || [],
+        requiresMemoryAccess: earlyModelResult.requiresMemoryAccess || false
+      },
+      metadata: { parser: 'distilbert-early', processingTimeMs: earlyModelResult.metadata?.processingTimeMs || 0 }
+    };
+  }
+
+  // DistilBERT was uncertain or unavailable — language-pattern safety nets follow.
+  if (earlyModelResult) {
+    logger.debug(`[Node:ParseIntent] DistilBERT uncertain (${earlyModelResult.confidence?.toFixed(2)}) — pattern guards active`);
   }
 
   // Past-tense action report override — must run BEFORE browser automation override.
@@ -2133,14 +2039,15 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   }
 
   try {
-    // Try to use phi4 service for ML-based classification
-    const result = await mcpAdapter.callService('phi4', 'intent.parse', {
-      message: classifyMessage,
-      context: {
-        sessionId: context?.sessionId,
-        userId: context?.userId
-      }
-    });
+    // Reuse the early DistilBERT result when available (model was called earlier
+    // but was uncertain; all pattern guards fired without a match — use model's
+    // best guess). Only call the service again if the early call was never attempted.
+    const result = earlyModelResult
+      ? { data: earlyModelResult }
+      : await mcpAdapter.callService('phi4', 'intent.parse', {
+          message: classifyMessage,
+          context: { sessionId: context?.sessionId, userId: context?.userId }
+        });
 
     // MCP protocol wraps response in 'data' field
     const intentData = result.data || result;

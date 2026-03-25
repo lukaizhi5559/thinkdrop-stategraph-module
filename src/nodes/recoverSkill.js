@@ -1020,6 +1020,74 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
 
   // Timeout — smart recovery based on what timed out
   if (combinedError.includes('timed out') || combinedError.includes('timeout')) {
+
+    // ── Interactive / stdin-blocking CLI commands ─────────────────────────────
+    // These commands block indefinitely waiting for stdin — no timeout increase
+    // will fix them. We SPAWN_SUBPLAN with onComplete:'skip' so that:
+    //   1. The sub-plan handles auth in total isolation (checks status + auths
+    //      non-interactively via $TOKEN env var, or no-ops if already logged in).
+    //   2. On sub-plan completion, the cursor advances PAST the bad step (skip),
+    //      so the interactive command is never re-run.
+    //   3. Already-completed steps (install, etc.) stay in skillResults — no
+    //      expensive replan from scratch.
+    if (skill === 'shell.run') {
+      const bashScript = (args.cmd === 'bash' && Array.isArray(args.argv))
+        ? (args.argv.find(a => typeof a === 'string' && a !== '-c') || '')
+        : '';
+      const fullCmd = `${args.cmd || ''} ${(args.argv || []).join(' ')} ${bashScript}`.toLowerCase();
+
+      // Detect interactive CLI auth run WITHOUT a piped token
+      const isInteractiveCli = /\b(gh auth login|stripe login|heroku login|fly auth login|vercel login|netlify login|wrangler login|supabase login)\b/.test(fullCmd)
+        && !fullCmd.includes('echo') && !fullCmd.includes('printf')
+        && !fullCmd.includes(' | ') && !fullCmd.includes("'|'");
+
+      if (isInteractiveCli) {
+        const cliMatch = fullCmd.match(/\b(gh|stripe|heroku|fly|vercel|netlify|wrangler|supabase)\b/);
+        const cliName = cliMatch ? cliMatch[1] : 'cli';
+        const TOKEN_MAP = { gh: 'GITHUB_TOKEN', stripe: 'STRIPE_API_KEY', heroku: 'HEROKU_API_KEY', vercel: 'VERCEL_TOKEN', fly: 'FLY_API_TOKEN' };
+        const tokenEnvVar = TOKEN_MAP[cliName] || 'TOKEN';
+
+        // Self-contained auth sub-plan:
+        //   Step A — check status (no-op if already logged in)
+        //   Step B — non-interactive auth via env token if available, else report
+        //            what the parent plan should do (browser.act fallback)
+        const authCheckScript = `${cliName} auth status 2>&1 | head -5`;
+        const authLoginScript = [
+          `if ${cliName} auth status 2>&1 | grep -q "Logged in"; then`,
+          `  echo "ALREADY_AUTHENTICATED"`,
+          `elif [ -n "$${tokenEnvVar}" ]; then`,
+          `  echo "$${tokenEnvVar}" | ${cliName} auth login --with-token && echo "AUTH_SUCCESS"`,
+          `else`,
+          `  echo "NO_TOKEN_AVAILABLE"`,
+          `fi`,
+        ].join(' ');
+
+        logger.info(`[Node:RecoverSkill] Fast-path: interactive stdin-blocking auth (${cliName}) → SPAWN_SUBPLAN onComplete:skip`);
+        return {
+          action: 'SPAWN_SUBPLAN',
+          goalLabel: `cli-auth:${cliName}`,
+          onComplete: 'skip',   // advance past the bad interactive-auth step on resume
+          subPlanSteps: [
+            {
+              skill: 'shell.run',
+              args: { cmd: 'bash', argv: ['-c', authCheckScript], timeoutMs: 10000 },
+              description: `Check ${cliName} authentication status`,
+            },
+            {
+              skill: 'shell.run',
+              args: { cmd: 'bash', argv: ['-c', authLoginScript], timeoutMs: 30000 },
+              description: `Authenticate ${cliName} non-interactively (via $${tokenEnvVar} or skip if already logged in)`,
+              optional: true,   // if this fails, continue — main task will surface the real error
+            },
+          ],
+          // Fallback if sub-plan depth cap blocks spawn: REPLAN with constraint
+          fallbackAction: 'REPLAN',
+          fallbackConstraint: `NEVER run "${cliName} auth login" without piping a token — it reads from stdin and hangs. Check "${cliName} auth status 2>&1" first; if not authenticated and $${tokenEnvVar} is set, use "echo \\"$${tokenEnvVar}\\" | ${cliName} auth login --with-token". If no token: use browser.act to do the task on the website instead.`,
+          fallbackSuggestion: `${cliName} auth login hangs on stdin. Sub-plan spawn was blocked — replan with non-interactive auth.`,
+        };
+      }
+    }
+
     // find timeout → REPLAN to use mdfind (macOS Spotlight) — instant, no directory scan
     if (skill === 'shell.run' && args.cmd === 'find' && stepRetryCount === 0) {
       const nameArg = args.argv?.find((a, i) => args.argv[i - 1] === '-name') || '';
@@ -1201,41 +1269,71 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
       const { spawnSubPlan }      = require('../utils/subPlanEngine');
       const { buildLoginSubPlan } = require('../utils/buildLoginSubPlan');
 
-      // Build the login sub-plan steps
-      const loginSteps = buildLoginSubPlan({
-        loginUrl:    decision.loginUrl    || (failedStep?.args?.url) || '',
-        service:     decision.service     || null,
-        credentials: decision.credentials || {},
-        hasSession:  !!decision.hasSession,
-        sessionId:   state.activeBrowserSessionId || null,
-        loginError:  failedStep?.error    || '',
-      });
+      // Two sub-plan types:
+      // 1. CLI auth sub-plan: decision.subPlanSteps provided directly (deterministic)
+      // 2. Browser login sub-plan: built via buildLoginSubPlan (legacy)
+      let subSteps;
+      if (Array.isArray(decision.subPlanSteps) && decision.subPlanSteps.length > 0) {
+        // CLI / generic sub-plan — steps provided directly
+        subSteps = decision.subPlanSteps;
+        logger.debug(`[Node:RecoverSkill] SPAWN_SUBPLAN: using ${subSteps.length} provided steps for "${decision.goalLabel}"`);
+      } else {
+        // Browser login sub-plan — build from service/URL
+        subSteps = buildLoginSubPlan({
+          loginUrl:    decision.loginUrl    || (failedStep?.args?.url) || '',
+          service:     decision.service     || null,
+          credentials: decision.credentials || {},
+          hasSession:  !!decision.hasSession,
+          sessionId:   state.activeBrowserSessionId || null,
+          loginError:  failedStep?.error    || '',
+        });
+      }
 
       // Try to spawn; honours depth cap and loop guard
-      const spawnResult = spawnSubPlan(state, loginSteps, decision.goalLabel || `login:${decision.service || 'unknown'}`);
+      const spawnResult = spawnSubPlan(state, subSteps, decision.goalLabel || `login:${decision.service || 'unknown'}`, {
+        onComplete: decision.onComplete || 'retry',
+      });
 
       if (spawnResult.planError) {
-        // Blocked — fall back to ASK_USER
+        // Sub-plan blocked (depth cap or loop guard) — fall back to fallbackAction or ASK_USER
         logger.warn(`[Node:RecoverSkill] SPAWN_SUBPLAN blocked: ${spawnResult.planError}`);
+        if (decision.fallbackAction === 'REPLAN' && decision.fallbackConstraint) {
+          logger.info(`[Node:RecoverSkill] SPAWN_SUBPLAN fallback: REPLAN with constraint for "${decision.goalLabel}"`);
+          return {
+            ...state,
+            recoveryAction:  'replan',
+            recoveryContext: {
+              failedSkill:    failedStep.skill,
+              failedStep:     failedStep.step,
+              failureReason:  failedStep.error || 'unknown',
+              suggestion:     decision.fallbackSuggestion || decision.fallbackConstraint,
+              constraint:     decision.fallbackConstraint,
+            },
+            commandExecuted: false,
+            stepRetryCount:  0,
+            replanCount:     replanCount + 1,
+            failedStep:      null,
+          };
+        }
         return {
           ...state,
           recoveryAction: 'ask_user',
           pendingQuestion: {
-            question: `Cannot auto-login for "${decision.service || 'this service'}": ${spawnResult.planError}. Please log in manually and try again.`,
+            question: `Cannot auto-handle "${decision.goalLabel}": ${spawnResult.planError}. Please complete the step manually and try again.`,
             options:  [],
             context:  failedStep,
           },
           commandExecuted: false,
           stepRetryCount:  0,
           failedStep:      null,
-          answer: `Login sub-plan blocked: ${spawnResult.planError}`,
+          answer: `Sub-plan blocked: ${spawnResult.planError}`,
         };
       }
 
-      logger.info(`[Node:RecoverSkill] SPAWN_SUBPLAN spawned ${loginSteps.length} login steps for "${decision.service || 'unknown'}"`);
+      logger.info(`[Node:RecoverSkill] SPAWN_SUBPLAN spawned ${subSteps.length} steps for "${decision.goalLabel || decision.service || 'unknown'}"`);
       return {
         ...state,
-        ...spawnResult,          // subPlanStack, skillPlan (login steps), skillCursor=0, currentGoalLabel
+        ...spawnResult,          // subPlanStack, skillPlan (sub steps), skillCursor=0, currentGoalLabel
         recoveryAction:  'auto_patch',
         commandExecuted: false,
         stepRetryCount:  0,

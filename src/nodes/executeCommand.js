@@ -3031,9 +3031,9 @@ module.exports = async function executeCommand(state) {
             const synthesized = await state.llmBackend.generateAnswer(
               truncatedText,
               {
-                query: originalPrompt,
+                query: `Summarize the browser page content that was retrieved for: "${originalPrompt}"`,
                 context: {
-                  systemInstructions: `You are a helpful assistant. The user asked: "${originalPrompt}"\n\nBelow is the raw text extracted from the browser page. Summarize what was found in a concise, human-readable response (2-5 sentences or a short bullet list). Focus on what directly answers the user's request. Do not repeat the full page text — extract the key information only.`,
+                  systemInstructions: `You are a helpful assistant. A browser automation task has already been completed — the browser navigated to a website and extracted the page text shown below. Your job is ONLY to summarize that extracted content in response to the user's original request: "${originalPrompt}". IMPORTANT: Do NOT say you cannot access the internet, perform searches, or retrieve real-time data — the browser task is already done and the results are in the text below. Provide a concise summary (2–5 sentences or a short bullet list) focusing on what directly answers the user's request. Do not repeat the full page text verbatim.`,
                   conversationHistory: [],
                   intent: 'command_automate',
                 },

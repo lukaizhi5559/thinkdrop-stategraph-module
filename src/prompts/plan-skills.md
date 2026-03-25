@@ -31,6 +31,18 @@ external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user
 TOKEN=$(security find-internet-password -s github.com -w 2>/dev/null | head -1)
 ```
 
+**GitHub CLI — NEVER use `gh repo view ... && echo 'Done' || gh repo <action>` as a conditional.**
+`gh repo view` always exits 0 (it's a read command), so `&&` always fires and `||` never runs.
+Instead, extract the boolean field with `--json FIELD -q .FIELD` and test it explicitly:
+
+```bash
+# CORRECT — star a repo only if not already starred
+STARRED=$(gh repo view OWNER/REPO --json viewerHasStarred -q .viewerHasStarred 2>/dev/null)
+if [ "$STARRED" = "true" ]; then echo "Already starred OWNER/REPO"; else gh repo star OWNER/REPO && echo "Starred OWNER/REPO successfully"; fi
+```
+
+Same pattern for watch/unwatch (`viewerSubscription`), follow/unfollow, etc. — always extract the field, test the value, then act.
+
 **GitHub — NEVER attach binary files to PRs via API.** GitHub REST API does not support file uploads to PRs. Instead: read the file content with `shell.run`, then post it as a PR comment using `POST /repos/OWNER/REPO/issues/NUMBER/comments`.
 
 **shell.run JSON body quoting — CRITICAL when user message text may contain apostrophes:**
@@ -354,8 +366,19 @@ Does the service have a CLI (gh, twilio, stripe, fly, wrangler, heroku, etc.)?
   YES →
     1. shell.run: check if CLI is installed (which <cli> || command -v <cli>)
     2. If NOT installed: shell.run brew install <cli>   (or pip/npm/cargo if appropriate)
-    3. shell.run: authenticate if needed (e.g. twilio login, gh auth login)
+    3. shell.run: check auth status FIRST before trying to authenticate
+       - For gh (GitHub CLI): `gh auth status 2>&1`
+         - If output contains "Logged in" → SKIP auth, go straight to step 4
+         - If NOT logged in AND GITHUB_TOKEN env var exists:
+           `echo "$GITHUB_TOKEN" | gh auth login --with-token`
+         - If NOT logged in AND no GITHUB_TOKEN: use browser.act to do the task via the website instead — do NOT run `gh auth login` interactively, it will hang waiting for stdin
+       - For other CLIs: check their equivalent auth-status command first
     4. shell.run: execute the task directly with the CLI
+       - **Conditional idempotent actions (star, watch, follow, etc.):** NEVER use `gh repo view ... && echo 'done' || gh repo <action>` — `gh repo view` always exits 0, so the `||` branch never runs. Use `--json FIELD -q .FIELD` to extract the boolean, then test it:
+         ```bash
+         STARRED=$(gh repo view OWNER/REPO --json viewerHasStarred -q .viewerHasStarred 2>/dev/null)
+         if [ "$STARRED" = "true" ]; then echo "Already starred"; else gh repo star OWNER/REPO && echo "Starred!"; fi
+         ```
     5. (optional) synthesize skill.md backed by CLI commands + skill.install for reuse
   NO (REST API only) →
     1. web.crawl API docs URL
@@ -377,8 +400,10 @@ Does the service have a CLI (gh, twilio, stripe, fly, wrangler, heroku, etc.)?
 
 1. **shell.run** — check if CLI is installed: `which <cli> 2>/dev/null || echo NOT_FOUND`
 2. **shell.run** — if NOT_FOUND: install via brew/pip/npm/cargo
-3. **shell.run** — run the CLI command to complete the task
-4. **(optional)** synthesize a `skill.md` backed by CLI commands + `skill.install` so the skill is reusable next time
+3. **shell.run** — check auth status (e.g. `gh auth status 2>&1`). If not authenticated:
+   - For `gh`: only auth if `$GITHUB_TOKEN` is set — `echo "$GITHUB_TOKEN" | gh auth login --with-token`. NEVER run `gh auth login` without piping a token — it will hang waiting for terminal input.
+   - If no credentials are available, switch to browser.act to accomplish the task via the website.
+4. **shell.run** — run the CLI command to complete the task
 
 ### web.crawl — fetches URL and returns readable text (JS-rendered, Playwright-backed)
 

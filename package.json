@@ -7,6 +7,7 @@
   "scripts": {
     "test": "node test/intent-classifier.test.js",
     "test:unit": "node test/unit.test.js",
+    "test:parse-intent": "node test/parse-intent.test.js",
     "test:parse-skill": "node test/parse-skill.test.js",
     "test:full": "node test/full-stategraph.test.js",
     "bench": "node test/intent-bench.js",
