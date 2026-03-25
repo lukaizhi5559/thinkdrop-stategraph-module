@@ -124,6 +124,48 @@ function parsePersonalFact(text) {
   return null;
 }
 
+// ── Sensitive-value detection ────────────────────────────────────────────────
+// If a user tells us a password / token / API key, we intercept BEFORE the
+// value ever reaches the DuckDB memory table.  The raw value goes straight to
+// the OS keychain via profile.store_secret; only a KEYTAR:<KEY> pointer is
+// stored in the memory table.
+
+const SENSITIVE_LABEL_RE = /\b(password|passwd|passphrase|secret|token|api[\s_.\-]?key|access[\s_.\-]?key|private[\s_.\-]?key|auth[\s_.\-]?token|bearer|\bpin\b|passw)\b/i;
+
+const _SERVICE_PATTERNS = [
+  ['gmail',      /gmail|google\s?mail/i],
+  ['google',     /google(?!\s?mail)/i],
+  ['github',     /github/i],
+  ['twitter',    /twitter|\.x\.com/i],
+  ['slack',      /slack/i],
+  ['discord',    /discord/i],
+  ['notion',     /notion/i],
+  ['microsoft',  /microsoft|outlook|office\s?365/i],
+  ['apple',      /apple(?:id)?|icloud/i],
+  ['spotify',    /spotify/i],
+  ['instagram',  /instagram/i],
+  ['linkedin',   /linkedin/i],
+  ['shopify',    /shopify/i],
+  ['facebook',   /facebook/i],
+];
+
+function _inferServiceFromLabel(label) {
+  for (const [svc, re] of _SERVICE_PATTERNS) {
+    if (re.test(label)) return svc;
+  }
+  return 'unknown';
+}
+
+function _detectKeyType(label) {
+  if (/password|passwd|passphrase/i.test(label)) return 'PASSWORD';
+  if (/\btoken|bearer/i.test(label))             return 'TOKEN';
+  if (/api[\s_.\-]?key/i.test(label))            return 'API_KEY';
+  if (/access[\s_.\-]?key/i.test(label))         return 'ACCESS_KEY';
+  if (/secret/i.test(label))                      return 'SECRET';
+  if (/\bpin\b/i.test(label))                     return 'PIN';
+  return 'CREDENTIAL';
+}
+
 // ── Main node ────────────────────────────────────────────────────────────────
 
 module.exports = async function storeMemory(state) {
@@ -149,6 +191,59 @@ module.exports = async function storeMemory(state) {
       const parsed = parsePersonalFact(text);
       if (parsed) {
         logger.info(`[Node:StoreMemory] Personal-fact declaration — field: ${parsed.field}, value: "${parsed.value}", type: ${parsed.memType}`);
+
+        // ── Security guard: route credentials to OS keychain ─────────────────
+        // Never let a raw password / token / API key touch the memory table.
+        if (SENSITIVE_LABEL_RE.test(parsed.label) && parsed.value && parsed.value.length > 2) {
+          const service   = _inferServiceFromLabel(parsed.label);
+          const keyType   = _detectKeyType(parsed.label);
+          // For unknown services derive prefix from the field name, but strip any
+          // trailing credential-type word so we don't get NETFLIX_PASSWORD_PASSWORD.
+          // e.g. field='netflix_password' → strip '_password' → 'NETFLIX'
+          const _rawField    = (parsed.field || 'unknown');
+          const _strippedField = _rawField
+            .replace(/_?(password|passwd|passphrase|token|secret|api_key|access_key|private_key|credential|pin)$/i, '')
+            .replace(/[^A-Z0-9]/gi, '_')
+            .toUpperCase()
+            .replace(/_+$/, '') || 'UNKNOWN';
+          const prefix    = service !== 'unknown'
+            ? service.toUpperCase()
+            : _strippedField;
+          const keytarKey = `${prefix}_${keyType}`;
+
+          try {
+            await mcpAdapter.callService('user-memory', 'profile.store_secret', {
+              keytarKey,
+              value:   parsed.value,
+              service: service !== 'unknown' ? service : null,
+              label:   parsed.label,
+            }, { timeoutMs: 5000 });
+          } catch (secureErr) {
+            logger.warn(`[Node:StoreMemory] Keychain store failed for "${keytarKey}": ${secureErr.message}`);
+          }
+
+          // Store a sanitised KEYTAR ref in memory — raw value is NEVER written here
+          await mcpAdapter.callService('user-memory', 'memory.store', {
+            text: `My ${parsed.label} is KEYTAR:${keytarKey}`,
+            type: 'personal_profile',
+            userId,
+            entities: [],
+            metadata: {
+              source: 'fact_declaration',
+              field:  parsed.field,
+              sensitive: true,
+              sessionId: context?.sessionId,
+              timestamp: new Date().toISOString(),
+            },
+          }, { timeoutMs: 8000 });
+
+          logger.info(`[Node:StoreMemory] Credential intercepted → keychain key "${keytarKey}"`);
+          return {
+            ...state,
+            memoryStored: true,
+            answer: `Got it — I've stored your ${parsed.label} securely in your system keychain. It will never be written to disk as plain text.`,
+          };
+        }
 
         const entities = parsed.entityType
           ? [{ type: parsed.label, value: parsed.value, entity_type: parsed.entityType }]
@@ -180,12 +275,21 @@ module.exports = async function storeMemory(state) {
     }
 
     // ── General memory store path ────────────────────────────────────────────
+    // Light-touch inline scan: catch "my X password is Y" patterns that slip
+    // through without factDeclaration=true.
+    const _inlineCred = text.match(
+      /\b(password|token|api[\s_-]?key|secret)\s+(?:is|:)\s+([^\s]{4,})/i
+    );
+    const safeText = _inlineCred
+      ? text.replace(_inlineCred[2], '[REDACTED – stored in keychain]')
+      : text;
+
     const entities = intent?.entities || [];
     const tags = ['user_memory', intent?.type || 'unknown'];
     entities.forEach(e => { if (e.type) tags.push(e.type); });
 
     const result = await mcpAdapter.callService('user-memory', 'memory.store', {
-      text,
+      text: safeText,
       type: 'user_memory',
       userId,
       tags,

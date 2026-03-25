@@ -28,6 +28,8 @@ const evaluateSkillsNode = require('./nodes/evaluateSkills');
 const creatorPlanningNode = require('./nodes/creatorPlanning');
 const gatherContextNode = require('./nodes/gatherContext');
 const appControlNode = require('./nodes/appControl');
+const storeConstraintNode = require('./nodes/storeConstraint');
+const liftConstraintNode  = require('./nodes/liftConstraint');
 const parseProjectNode = require('./nodes/parseProject');
 
 class StateGraphBuilder {
@@ -170,6 +172,8 @@ class StateGraphBuilder {
       enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
+      storeConstraint: (state) => storeConstraintNode({ ...state, logger, mcpAdapter }),
+      liftConstraint:  (state) => liftConstraintNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
       gatherContext: (state) => gatherContextNode({ ...state, logger, mcpAdapter, llmBackend }),
       creatorPlanning: (state) => creatorPlanningNode({ ...state, logger, mcpAdapter }),
@@ -242,6 +246,12 @@ class StateGraphBuilder {
         }
 
         // All other intents: route the same as parseIntent used to
+        if (intentType === 'set_constraint') {
+          return 'storeConstraint';
+        }
+        if (intentType === 'lift_constraint') {
+          return 'liftConstraint';
+        }
         if (intentType === 'memory_store') {
           return 'storeMemory';
         }
@@ -268,6 +278,10 @@ class StateGraphBuilder {
 
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',
+      // Constraint store path: storeConstraint → logConversation → end
+      storeConstraint: 'logConversation',
+      // Constraint lift path: liftConstraint → logConversation → end
+      liftConstraint: 'logConversation',
       
       // gatherContext bypassed — kept for future re-enable
       // gatherContext: () => 'creatorPlanning',

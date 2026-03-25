@@ -274,6 +274,17 @@ module.exports = async function answer(state) {
     }
   } catch (_textSignalErr) {}
 
+  // ─── Surface system events (skill deletions, capability changes) ────────────
+  // System messages (role:'system') are extracted from the history, injected into
+  // systemInstructions as highest-priority facts, and excluded from the regular
+  // conversation turns passed to phi4 (prevents them appearing as 'User:...' lines).
+  const systemEvents = conversationHistory.filter(m => m.role === 'system');
+  if (systemEvents.length > 0) {
+    const eventLines = systemEvents.slice(-5).map(m => `  • ${(m.content || '').trim()}`);
+    systemInstructions += `\n\n⚠️ SYSTEM EVENTS (treat as current facts — highest priority):\n${eventLines.join('\n')}`;
+  }
+  const filteredConversationHistory = conversationHistory.filter(m => m.role !== 'system');
+
   // Inject screen context into system instructions (not into the user query)
   if (state.context && typeof state.context === 'string') {
     const truncated = state.context.length > 6000
@@ -301,7 +312,7 @@ module.exports = async function answer(state) {
       ? `Interpret this command output:\n\n${String(commandOutput).substring(0, 5000)}`
       : finalQuery,
     context: {
-      conversationHistory: isCommandWithOutput ? [] : conversationHistory,
+      conversationHistory: isCommandWithOutput ? [] : filteredConversationHistory,
       sessionFacts: isCommandWithOutput ? [] : sessionFacts,
       sessionEntities: isCommandWithOutput ? [] : sessionEntities,
       memories: isCommandWithOutput ? [] : filteredMemories,

@@ -516,9 +516,11 @@ module.exports = async function retrieveMemory(state) {
         })();
 
     // Process conversation history (sort chronologically)
+    // Preserve role:'system' for system-injected messages (e.g. skill deletions)
+    // so downstream nodes (answer, planSkills) can surface them at highest priority.
     const conversationHistory = primaryMessages
       .map(msg => ({
-        role: msg.sender === 'user' ? 'user' : 'assistant',
+        role: msg.sender === 'user' ? 'user' : (msg.sender === 'system' ? 'system' : 'assistant'),
         content: msg.text,
         timestamp: msg.timestamp
       }))

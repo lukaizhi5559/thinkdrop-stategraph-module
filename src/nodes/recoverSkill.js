@@ -724,11 +724,15 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
         pageContext.includes('sign up') || pageContext.includes('register');
 
       if (isLoginPage) {
-        logger.debug(`[Node:RecoverSkill] Fast-path: page text indicates login/marketing page (${currentUrl}) → ASK_USER`);
+        logger.debug(`[Node:RecoverSkill] Fast-path: page text indicates login/auth page (${currentUrl}) → SPAWN_SUBPLAN`);
+        const { isLoginSignal } = require('../utils/buildLoginSubPlan');
         return {
-          action: 'ASK_USER',
-          question: `The browser landed on a login or sign-up page instead of the app. Please log in to "${currentUrl}" in the browser, then reply "continue" to resume.`,
-          options: ['I am now logged in — continue', 'Abort the task']
+          action: 'SPAWN_SUBPLAN',
+          goalLabel: `login:${currentUrl || 'unknown'}`,
+          loginUrl:   currentUrl,
+          service:    null,  // inferService() picks up from URL inside buildLoginSubPlan
+          credentials: {},
+          hasSession: false,
         };
       }
 
@@ -1189,6 +1193,53 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
         answer: decision.options?.length
           ? `${decision.question}\n\n${optionsList}`
           : decision.question
+      };
+    }
+
+    case 'SPAWN_SUBPLAN': {
+      logger.debug(`[Node:RecoverSkill] SPAWN_SUBPLAN: goal="${decision.goalLabel}" service="${decision.service || 'unknown'}"`);
+      const { spawnSubPlan }      = require('../utils/subPlanEngine');
+      const { buildLoginSubPlan } = require('../utils/buildLoginSubPlan');
+
+      // Build the login sub-plan steps
+      const loginSteps = buildLoginSubPlan({
+        loginUrl:    decision.loginUrl    || (failedStep?.args?.url) || '',
+        service:     decision.service     || null,
+        credentials: decision.credentials || {},
+        hasSession:  !!decision.hasSession,
+        sessionId:   state.activeBrowserSessionId || null,
+        loginError:  failedStep?.error    || '',
+      });
+
+      // Try to spawn; honours depth cap and loop guard
+      const spawnResult = spawnSubPlan(state, loginSteps, decision.goalLabel || `login:${decision.service || 'unknown'}`);
+
+      if (spawnResult.planError) {
+        // Blocked — fall back to ASK_USER
+        logger.warn(`[Node:RecoverSkill] SPAWN_SUBPLAN blocked: ${spawnResult.planError}`);
+        return {
+          ...state,
+          recoveryAction: 'ask_user',
+          pendingQuestion: {
+            question: `Cannot auto-login for "${decision.service || 'this service'}": ${spawnResult.planError}. Please log in manually and try again.`,
+            options:  [],
+            context:  failedStep,
+          },
+          commandExecuted: false,
+          stepRetryCount:  0,
+          failedStep:      null,
+          answer: `Login sub-plan blocked: ${spawnResult.planError}`,
+        };
+      }
+
+      logger.info(`[Node:RecoverSkill] SPAWN_SUBPLAN spawned ${loginSteps.length} login steps for "${decision.service || 'unknown'}"`);
+      return {
+        ...state,
+        ...spawnResult,          // subPlanStack, skillPlan (login steps), skillCursor=0, currentGoalLabel
+        recoveryAction:  'auto_patch',
+        commandExecuted: false,
+        stepRetryCount:  0,
+        failedStep:      null,
       };
     }
 

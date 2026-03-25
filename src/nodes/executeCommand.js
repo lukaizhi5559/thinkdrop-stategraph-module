@@ -437,6 +437,25 @@ module.exports = async function executeCommand(state) {
     };
   }
 
+  // ── Sub-plan completion check ─────────────────────────────────────────────
+  // Before treating all steps as done (commandExecuted: true), check whether
+  // we are running inside a sub-plan (subPlanStack is non-empty).  If so, pop
+  // back to the parent plan so execution resumes at the step that originally
+  // failed (e.g. the authenticated request that triggered the login sub-plan).
+  const subPlanStack = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
+  if (subPlanStack.length > 0) {
+    const { completeSubPlan } = require('../utils/subPlanEngine');
+    const resumed = completeSubPlan(state);
+    logger.info(`[Node:ExecuteCommand] Sub-plan complete — resuming parent plan at cursor ${resumed.skillCursor}`);
+    return {
+      ...state,
+      ...resumed,           // subPlanStack (popped), skillPlan (parent), skillCursor (failed step)
+      commandExecuted: false,
+      failedStep:      null,
+      activeBrowserSessionId,
+    };
+  }
+
   const step = skillPlan[skillCursor];
   const { skill, args = {}, optional = false, description } = step;
 

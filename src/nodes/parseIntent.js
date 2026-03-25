@@ -130,6 +130,44 @@ module.exports = async function parseIntent(state) {
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'messaging-verb-override', processingTimeMs: 0 } };
   }
 
+  // Lift/remove constraint overrides — must run BEFORE set_constraint to avoid
+  // "allow me to X again" or "remove the rule" firing the add-constraint path.
+  // "remove the rule about X", "lift the constraint on X", "allow me to delete again",
+  // "forget the rule", "I changed my mind about the rule", "undo the block on X"
+  if (
+    /\b(lift|remove|delete|cancel|undo|clear|disable|drop)\s+(the\s+)?(constraint|rule|block|restriction|ban)\b/i.test(classifyMessage) ||
+    /\b(forget|ignore|discard)\s+(the\s+)?(rule|constraint|block|restriction)\b/i.test(classifyMessage) ||
+    /\bi\s+changed\s+my\s+mind\s+(about\s+(the\s+)?(rule|constraint|block)|and\s+want\s+to\s+allow)\b/i.test(classifyMessage) ||
+    (
+      // "allow/let me to DELETE/VISIT/... again" — the action verb + "again" signals constraint reversal
+      // Guard: must NOT be preceded by "don't/never/not" (that would be adding a constraint)
+      /\b(allow|let)\s+me\s+(to\s+)?(delete|remove|access|visit|browse|open|navigate|go\s+to|install|download|send|email|push|deploy|run|execute|move|copy)\b.{0,40}\bagain\b/i.test(classifyMessage) &&
+      !/\b(don'?t|do\s*not|donot|never|not)\b.{0,30}\b(allow|let)\s+me\b/i.test(classifyMessage)
+    ) ||
+    /\b(i\s+want\s+to\s+be\s+able\s+to)\b.{0,40}\bagain\b/i.test(classifyMessage) ||
+    /\b(stop|no\s+longer)\s+(blocking|restricting)\b/i.test(classifyMessage)
+  ) {
+    logger.debug(`[Node:ParseIntent] Lift-constraint override → lift_constraint: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'lift_constraint', confidence: 0.98, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'lift-constraint-override', processingTimeMs: 0 } };
+  }
+
+  // Set-constraint overrides — "never let me...", "don't let me...", "prevent me from...", etc.
+  // These must route to set_constraint so the rule is stored in user_constraints, NOT executed.
+  if (
+    /^(never|don'?t|do\s+not|please\s+(don'?t|never|do\s+not))\s+(let\s+me|allow\s+(me\s+to|me)|let\s+me)\s+/i.test(classifyMessage) ||
+    /^(prevent|stop)\s+me\s+from\s+/i.test(classifyMessage) ||
+    /^(always\s+)?block\s+(me\s+from|any\s+attempt\s+to)\s+/i.test(classifyMessage) ||
+    /^make\s+sure\s+(i|you)\s+(never|don'?t|do\s+not)\s+/i.test(classifyMessage) ||
+    /^(refuse|deny|disallow|forbid)\s+(any\s+)?(request\s+to|me\s+(from\s+|to\s+))\s*/i.test(classifyMessage) ||
+    /\b(never\s+let\s+me|don'?t\s+let\s+me|prevent\s+me\s+from|stop\s+me\s+from|block\s+me\s+from)\b/i.test(classifyMessage) ||
+    // "do not/don't/donot allow me to go/visit/access/browse/open X" — block-site type constraints
+    /\b(don'?t|do\s*not|donot|never|not)\s+(allow|let)\s+me\s+(to\s+)?(go\s+to|goto|visit|access|browse|open|navigate)\b/i.test(classifyMessage) ||
+    /\b(block|prevent|stop)\s+me\s+(from\s+)?(going|visiting|accessing|browsing|opening|navigating)\b/i.test(classifyMessage)
+  ) {
+    logger.debug(`[Node:ParseIntent] Set-constraint override → set_constraint: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'set_constraint', confidence: 0.98, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'set-constraint-override', processingTimeMs: 0 } };
+  }
+
   // Make-a-note / log-activity / add-to-memory overrides — must run BEFORE build-create-override.
   // "make a note of this" / "take a note" → memory_store (not build/create command_automate).
   // "log that I ran 3 miles" / "log my workout" → memory_store.
@@ -972,7 +1010,9 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   // EXCLUDED: "Search for all TODO comments in the current repository" — that's command_automate (code search).
   if (/^search\s+(for|the\s+web\s+for|google\s+for|online\s+for)\b/i.test(classifyMessage) &&
       !/\b(my|your|our|saved|stored|notes?|records?|memories|appointments?|history|logs?)\b/i.test(classifyMessage.slice(0, 60)) &&
-      !/\b(repository|repo|codebase|source\s+code|current\s+(repo|project|directory|folder)|TODO|FIXME|HACK|files?|commits?|branches?)\b/i.test(classifyMessage)) {
+      !/\b(repository|repo|codebase|source\s+code|current\s+(repo|project|directory|folder)|TODO|FIXME|HACK|files?|commits?|branches?)\b/i.test(classifyMessage) &&
+      // "Search for X *on Google/Bing/etc.*" means open actual browser — not API web search
+      !/\bon\s+(google|bing|duckduckgo|yahoo|brave|ecosia|startpage)\b/i.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Direct search override → web_search: "${classifyMessage}"`);
     return { ...state, intent: { type: 'web_search', confidence: 0.96, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'direct-search-override', processingTimeMs: 0 } };
   }
@@ -2109,6 +2149,20 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
     const finalConfidence = intentData.confidence || 0.5;
     
     logger.debug(`[Node:ParseIntent] Classified as: ${finalIntent} (confidence: ${finalConfidence.toFixed(2)})`);
+
+    // Low-confidence signal: phi4 was uncertain — record as self-repair candidate.
+    // The stored entry marks this prompt for future human or automated review.
+    // wrongIntent is null because we don't yet know what was wrong; source flags it as a candidate.
+    const INTENT_SIGNAL_THRESHOLD = 0.55;
+    if (finalConfidence < INTENT_SIGNAL_THRESHOLD) {
+      mcpAdapter.callService('user-memory', 'intent_override.upsert', {
+        examplePrompt: classifyMessage,
+        correctIntent: finalIntent,
+        wrongIntent: null,
+        source: 'low_confidence_candidate'
+      }).catch(() => {}); // fire-and-forget — never block intent resolution on this write
+      logger.debug(`[Node:ParseIntent] Low-confidence signal recorded: "${classifyMessage.slice(0, 60)}" → ${finalIntent} (${finalConfidence.toFixed(2)})`);
+    }
 
     // Post-phi4 correction: low-confidence memory_store with retrieval verbs → memory_retrieve.
     // phi4 sometimes misclassifies "give the date of that day", "tell me what X was" as memory_store.

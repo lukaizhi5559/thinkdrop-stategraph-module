@@ -21,6 +21,7 @@
  */
 
 const fs = require('fs');
+const { jsonrepair } = require('jsonrepair');
 const { buildReminderSkill } = require('../utils/buildReminderSkill');
 
 /**
@@ -234,6 +235,75 @@ module.exports = async function planSkills(state) {
     logger.warn(`[Node:PlanSkills] Creator skill file missing at "${state.creatorSkillPath}" — falling through to LLM plan with name constraint`);
   }
 
+  // ── Constraint gate ─────────────────────────────────────────────────────────
+  // Before invoking the LLM, check stored user_constraints against the raw
+  // message.  Use mcpAdapter (handles auth + MCP envelope) not raw HTTP.
+  // No verb-to-pattern mapping needed here — that's the constraint service's job.
+  try {
+    // Derive minimal action pattern hints from the message verb so pattern-based
+    // matching works alongside text-keyword matching in the constraint service.
+    const _actionHints = (() => {
+      const v = (userMessage || '').toLowerCase();
+      if (/\bdelete\b|\btrashe?s?\b|\brm\b|\bunlink\b|\berase\b|\bwipe\b/.test(v)) return ['delete.*', 'shell.fs.*', 'shell.run.*'];
+      if (/\bsend\b|\bpost\b|\bpublish\b|\bshare\b|\bupload\b/.test(v))           return ['send.*', 'post.*', 'share.*', 'publish.*'];
+      if (/\binstall\b|\bsetup\b|\bexecute\b|\brun\b|\blaunch\b/.test(v))         return ['shell.run.*', 'install.*'];
+      return [];
+    })();
+
+    // Try to extract an explicit PIN from the message (for PIN-protected constraints).
+    // Only matches deliberate "secret/pin/password/code ABC123" patterns — not random words.
+    const _pinAttempt = (() => {
+      const m = (userMessage || '').match(/\b(?:secret|pin|password|code)\s*[:\s]+([A-Z0-9]{3,20})\b/i);
+      return m ? m[1].toUpperCase() : null;
+    })();
+
+    const _constraintCheck = await mcpAdapter.callService(
+      'user-memory',
+      'constraint.check',
+      { message: userMessage, actionPatterns: _actionHints, pinAttempt: _pinAttempt },
+      { timeoutMs: 2000 }
+    ).catch(() => null);
+
+    const _hardBlocks = _constraintCheck?.data?.hardBlocks || [];
+    const _pinProtectedBlocks = _constraintCheck?.data?.pinProtectedBlocks || [];
+    if (_hardBlocks.length > 0) {
+      logger.info(`[Node:PlanSkills] Hard constraint blocked: ${_hardBlocks[0]}`);
+
+      // Signal 3 — constraint gate mismatch: the message was classified as command_automate
+      // but a stored constraint blocked it, meaning it should have been set_constraint.
+      // Write a correction so intent_override.search catches this phrasing next time,
+      // before phi4 ever runs. Fire-and-forget — never block the deny response on this write.
+      if (state.intent?.type === 'command_automate' && mcpAdapter) {
+        mcpAdapter.callService('user-memory', 'intent_override.upsert', {
+          examplePrompt: userMessage,
+          correctIntent: 'set_constraint',
+          wrongIntent: 'command_automate',
+          source: 'constraint_gate_mismatch'
+        }).catch(() => {});
+        logger.debug(`[Node:PlanSkills] Signal 3: constraint-gate mismatch recorded for "${userMessage?.slice(0, 60)}"`);
+      }
+
+      // Build deny prompt — if the block is PIN-protected, give the user a hint
+      const _isPinProtectedDeny = _pinProtectedBlocks.includes(_hardBlocks[0]);
+      const _pinHint = _isPinProtectedDeny
+        ? `\n\nThis rule is PIN-protected. If you know the secret, include it in your message (e.g. say your original request followed by "secret ABC123") to proceed.`
+        : '';
+
+      const _denyStep = {
+        skill: 'synthesize',
+        args: {
+          prompt: `The user asked: "${userMessage}"\n\nThis was blocked by their configured rule: "${_hardBlocks[0]}"${_pinHint}\n\nRespond naturally: explain the action is blocked by their own safety rule. Keep it brief.`,
+        },
+        description: 'Explain constraint block',
+      };
+      if (progressCallback) progressCallback({ type: 'plan_ready', steps: [{ index: 0, skill: 'synthesize', description: _denyStep.description, args: _denyStep.args }] });
+      return { ...state, skillPlan: [_denyStep], skillCursor: 0, recoveryContext: null, planError: null };
+    }
+  } catch (_constraintGateErr) {
+    logger.warn('[Node:PlanSkills] Constraint gate error:', _constraintGateErr?.message);
+  }
+  // ── End constraint gate ──────────────────────────────────────────────────────
+
   logger.debug('[Node:PlanSkills] Planning skill steps...');
   if (progressCallback) progressCallback({ type: 'planning', message: 'Generating skill plan...' });
 
@@ -311,8 +381,22 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
   let priorSynthesizedContent = '';
   if (conversationHistory && conversationHistory.length > 0) {
     const recentTurns = conversationHistory.slice(-6); // last 3 exchanges
+
+    // System event messages (skill deletions, capability changes) are surfaced
+    // separately and given highest priority — the LLM must treat these as facts,
+    // not as prior chat context.  Pull them from the full history (not just recent).
+    const systemEvents = conversationHistory
+      .filter(m => m.role === 'system' || m.sender === 'system')
+      .slice(-5); // last 5 system events
+
+    let systemNote = '';
+    if (systemEvents.length > 0) {
+      const eventLines = systemEvents.map(m => `  • ${(m.content || m.text || '').trim()}`);
+      systemNote = `\n\n⚠️ SYSTEM EVENTS (treat as current facts — highest priority):\n${eventLines.join('\n')}`;
+    }
+
     const turnLines = recentTurns
-      .filter(m => m.content && m.content.trim())
+      .filter(m => (m.role !== 'system' && m.sender !== 'system') && m.content && m.content.trim())
       .map(m => {
         const role = m.role === 'user' ? 'User' : 'Assistant';
         const content = m.content.trim();
@@ -322,8 +406,8 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
         const limit = (m.role === 'assistant' && content.includes('Step outputs:')) ? 2000 : 300;
         return `${role}: ${content.substring(0, limit)}`;
       });
-    if (turnLines.length > 0) {
-      conversationNote = `\n\nRECENT CONVERSATION (use this to resolve references like "that file", "it", "the result"):\n${turnLines.join('\n')}`;
+    if (turnLines.length > 0 || systemNote) {
+      conversationNote = `${systemNote}\n\nRECENT CONVERSATION (use this to resolve references like "that file", "it", "the result"):\n${turnLines.join('\n')}`;
     }
 
     // Extract the last synthesized answer from conversation history so that
@@ -400,6 +484,52 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
     }).join('\n');
     profileContextNote = `\n\n⚠️ USER PROFILE — MANDATORY (never substitute placeholders):\n${factLines}`;
     logger.info(`[Node:PlanSkills] Injecting ${profileContext.facts.length} profile fact(s) into planning query`);
+  }
+
+  // ── Credential intelligence pre-scan ────────────────────────────────────────
+  // Detect referenced services in the user message, check credential store for
+  // KEYTAR refs and user constraints (hard/soft).  Runs with a 1.5 s timeout so
+  // it never blocks planning.  Raw secrets are NEVER fetched here.
+  let credentialContextNote = '';
+  try {
+    const { gatherCredentialIntelligence } = require('../utils/credentialIntelligence');
+    const credCtx = await Promise.race([
+      gatherCredentialIntelligence(userMessage, { mcpAdapter }),
+      new Promise(r => setTimeout(() => r(null), 1500)),
+    ]);
+
+    if (credCtx?.detectedServices?.length > 0) {
+      const lines = [];
+
+      if (credCtx.availableCredentials.length > 0) {
+        lines.push('Available credentials (use KEYTAR refs, never hardcode secrets):');
+        for (const c of credCtx.availableCredentials) {
+          lines.push(`  - ${c.key}: ${c.valueRef}${c.label ? ` (${c.label})` : ''}`);
+        }
+      }
+
+      const missingServices = credCtx.detectedServices.filter(
+        s => !credCtx.availableCredentials.some(c => c.service === s)
+      );
+      if (missingServices.length > 0) {
+        lines.push(`Missing credentials for: ${missingServices.join(', ')} — use a needs_skill or ask_user step to obtain them before proceeding.`);
+      }
+
+      if (credCtx.hardConstraints.length > 0) {
+        lines.push('\n⛔ HARD CONSTRAINTS — MUST NOT violate under any circumstances:');
+        credCtx.hardConstraints.forEach(c => lines.push(`  - ${c}`));
+      }
+
+      if (credCtx.softConstraints.length > 0) {
+        lines.push('\n⚠️  SOFT CONSTRAINTS — warn user and confirm before proceeding:');
+        credCtx.softConstraints.forEach(c => lines.push(`  - ${c}`));
+      }
+
+      credentialContextNote = `\n\n[CREDENTIAL CONTEXT]\n${lines.join('\n')}`;
+      logger.info(`[Node:PlanSkills] Injected credential context for: ${credCtx.detectedServices.join(', ')}`);
+    }
+  } catch (_credErr) {
+    logger.debug('[Node:PlanSkills] Credential intelligence skipped:', _credErr?.message);
   }
 
   // ── Two-phase guide planning: scan first, plan with real elements ───────────
@@ -943,7 +1073,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
+User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   const payload = {
     query: planningQuery,
@@ -980,7 +1110,15 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
     if (!skillPlan) {
       logger.warn('[Node:PlanSkills] Parse failed — retrying once...');
       if (progressCallback) progressCallback({ type: 'planning', message: 'Retrying plan generation...' });
-      rawPlan = await backend.generateAnswer(planningQuery, payload, payload.options, null);
+      // On retry: enforce JSON-only output by prepending a strict instruction
+      const retryPayload = {
+        ...payload,
+        messages: [
+          ...(payload.messages || []),
+          { role: 'user', content: 'IMPORTANT: Output ONLY a valid JSON array. No explanation, no prose, no markdown fences, no comments.' },
+        ],
+      };
+      rawPlan = await backend.generateAnswer(planningQuery, retryPayload, payload.options, null);
       logger.debug(`[Node:PlanSkills] Retry output: ${rawPlan.substring(0, 300)}...`);
       skillPlan = parsePlan(rawPlan, logger);
     }
@@ -1772,9 +1910,10 @@ Output ONLY the pattern text. No markdown, no explanation.`;
 };
 
 /**
- * Extract and parse a JSON array from LLM output.
- * LLMs sometimes wrap JSON in markdown fences or append trailing explanation text.
- * This parser finds the outermost [ ] or { } and extracts only that balanced block.
+ * Extract and parse a JSON array/object from LLM output.
+ * Uses jsonrepair to handle the full spectrum of LLM JSON pathologies:
+ * control characters, bad escapes, trailing commas, missing quotes,
+ * truncated output, markdown fences, smart quotes, JS comments, etc.
  */
 function parsePlan(raw, logger) {
   if (!raw || typeof raw !== 'string') return null;
@@ -1782,89 +1921,31 @@ function parsePlan(raw, logger) {
   let text = raw.trim();
 
   // Strip markdown code fences if present (```json ... ``` or ``` ... ```)
-  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```[\s\S]*$/, '').trim();
+  const _fenceMatch = text.match(/```(?:json|javascript|js)?\s*\n?([\s\S]*?)\s*```/);
+  if (_fenceMatch) {
+    text = _fenceMatch[1].trim();
+  } else {
+    text = text.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  }
 
-  // Find first [ or { — prefer [ (array) over { (object) when both present
+  // Narrow to the first JSON array or object to drop any prose prefix/suffix
   const arrayStart = text.indexOf('[');
   const objectStart = text.indexOf('{');
-
-  let open, close;
   if (arrayStart !== -1 && (objectStart === -1 || arrayStart < objectStart)) {
-    open = '['; close = ']';
     text = text.substring(arrayStart);
   } else if (objectStart !== -1) {
-    open = '{'; close = '}';
     text = text.substring(objectStart);
   } else {
     logger.warn('[Node:PlanSkills] JSON parse failed: no [ or { found in output');
     return null;
   }
 
-  // Walk the string to find the matching closing bracket (handles nested objects/arrays)
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  let endIdx = -1;
-
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (escape) { escape = false; continue; }
-    if (ch === '\\' && inString) { escape = true; continue; }
-    if (ch === '"') { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === open) depth++;
-    else if (ch === close) {
-      depth--;
-      if (depth === 0) { endIdx = i; break; }
-    }
-  }
-
-  const jsonStr = endIdx !== -1 ? text.substring(0, endIdx + 1) : text;
-
   try {
-    return JSON.parse(jsonStr);
+    // jsonrepair handles control chars, bad escapes, trailing commas, truncation,
+    // smart-quotes, missing brackets, JS comments — anything the LLM throws.
+    return JSON.parse(jsonrepair(text));
   } catch (e) {
     logger.warn('[Node:PlanSkills] JSON parse failed:', e.message);
-
-    // ── Truncation recovery ──────────────────────────────────────────────
-    // When maxTokens cuts the LLM output mid-JSON, the string is truncated
-    // inside a synthesize prompt or similar long value. Attempt to close
-    // open strings/objects/arrays and salvage the completed steps.
-    if (open === '[' && /unterminated string/i.test(e.message)) {
-      logger.debug('[Node:PlanSkills] Attempting truncation recovery...');
-      // Strategy: find the last complete object in the array (last "},")
-      // and close the array after it.
-      const lastCompleteObj = jsonStr.lastIndexOf('},');
-      if (lastCompleteObj > 0) {
-        const recovered = jsonStr.substring(0, lastCompleteObj + 1) + ']';
-        try {
-          const plan = JSON.parse(recovered);
-          if (Array.isArray(plan) && plan.length > 0) {
-            logger.info(`[Node:PlanSkills] Truncation recovery: salvaged ${plan.length} complete step(s) from truncated output`);
-            return plan;
-          }
-        } catch (_) { /* recovery failed, fall through */ }
-      }
-      // Strategy 2: close the current string + all open brackets
-      let repaired = jsonStr;
-      if (inString) repaired += '"';
-      // Close remaining depth
-      for (let d = depth; d > 0; d--) {
-        // Heuristic: alternate } and ] based on depth (innermost is likely an object)
-        repaired += d === depth ? '}' : (d % 2 === 0 ? ']' : '}');
-      }
-      repaired += ']';
-      try {
-        const plan = JSON.parse(repaired);
-        if (Array.isArray(plan) && plan.length > 0) {
-          logger.info(`[Node:PlanSkills] Truncation recovery (bracket-close): salvaged ${plan.length} step(s)`);
-          return plan;
-        }
-      } catch (_) { /* recovery failed */ }
-
-      logger.debug('[Node:PlanSkills] Truncation recovery failed — returning null');
-    }
-
     return null;
   }
 }

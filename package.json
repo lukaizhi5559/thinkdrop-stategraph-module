@@ -24,6 +24,7 @@
   ],
   "author": "ThinkDrop AI",
   "license": "MIT",
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "jsonrepair": "^3.13.3"
+  }
 }
