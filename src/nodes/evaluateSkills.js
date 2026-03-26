@@ -78,8 +78,34 @@ module.exports = async function evaluateSkills(state) {
     const allInteractionPassed = interactionSteps.length > 0 && interactionSteps.every(r => r.ok !== false);
     const allContentOk = contentSteps.length > 0 && contentSteps.every(r => r.ok !== false);
     if (allInteractionPassed && allContentOk && evaluationRetryCount === 0) {
-      logger.info(`[Node:EvaluateSkills] Skipping post-run eval — all interaction+content steps OK (interaction task with content polling)`);
-      return { ...state, evaluationVerdict: 'PASS' };
+      // Before skipping, check whether a synthesize step produced a hollow/failure output.
+      // If synthesize says "no information available" or "sign-in page", all steps being
+      // ok:true just means playwright exited 0 — it doesn't mean the task succeeded.
+      const synthStep = skillResults.find(r => r.skill === 'synthesize' && r.ok !== false);
+      if (synthStep) {
+        const synthOut = String(synthStep.stdout || synthStep.result || '').toLowerCase();
+        const HOLLOW_SYNTH = [
+          /no information available/,
+          /sign.?in page/,
+          /login page/,
+          /not logged in/,
+          /no access to (the )?inbox/,
+          /could not (retrieve|access|find|get)/,
+          /unable to (retrieve|access|find|get)/,
+          /no (email|content|data|result).{0,40}(found|retrieved|available)/,
+          /extraction.{0,40}not possible/,
+        ];
+        if (HOLLOW_SYNTH.some(p => p.test(synthOut))) {
+          logger.info(`[Node:EvaluateSkills] Synthesize output signals task failure despite ok:true steps — forcing evaluation`);
+          // Fall through to LLM evaluation — do NOT skip
+        } else {
+          logger.info(`[Node:EvaluateSkills] Skipping post-run eval — all interaction+content steps OK (interaction task with content polling)`);
+          return { ...state, evaluationVerdict: 'PASS' };
+        }
+      } else {
+        logger.info(`[Node:EvaluateSkills] Skipping post-run eval — all interaction+content steps OK (interaction task with content polling)`);
+        return { ...state, evaluationVerdict: 'PASS' };
+      }
     }
     // Skip re-evaluation when synthesize already ran and saved output WITH real content.
     // BUT: if all browser data-collection steps returned auth walls or empty results,

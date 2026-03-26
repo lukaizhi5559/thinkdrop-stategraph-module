@@ -1,4 +1,55 @@
 /**
+ * Search for a service's canonical sign-in page URL using the web-search MCP.
+ * Returns the first result URL that looks like a login page, or null on failure.
+ * Non-fatal — any error silently falls through to knownUrl → rawLoginUrl.
+ *
+ * @param {string} service — normalized service name, e.g. 'gmail'
+ * @param {string} fallbackUrl — the app URL we already have (for context only)
+ * @param {object} mcpAdapter
+ * @param {object} logger
+ * @returns {Promise<string|null>}
+ */
+async function searchForLoginUrl(service, fallbackUrl, mcpAdapter, logger) {
+  if (!mcpAdapter || !service || service === 'unknown') return null;
+  try {
+    const query = `${service} official sign in login page site:${service}.com OR site:accounts.${service}.com`;
+    const res = await mcpAdapter.callService('web-search', 'web.search', {
+      query:      `${service} official sign in login page`,
+      maxResults: 5,
+      provider:   'auto',
+    }, { timeoutMs: 6000 });
+
+    const data    = res?.data || res;
+    const results = Array.isArray(data?.results) ? data.results : [];
+
+    // The { isLoginSignal } helper considers URL path + subdomain patterns
+    const { isLoginSignal } = require('../utils/buildLoginSubPlan');
+
+    // Accept a result if its URL looks like an auth page OR the hostname contains
+    // the service name — avoids accepting blog/article URLs about the service.
+    const serviceSlug = service.toLowerCase().replace(/[^a-z0-9]/g, '');
+    for (const r of results) {
+      const url = String(r.url || r.link || '');
+      if (!url.startsWith('http')) continue;
+      let hostname = '';
+      try { hostname = new URL(url).hostname.toLowerCase(); } catch (_) { continue; }
+      const looksLikeAuth    = isLoginSignal(url);
+      const hostnameMatches  = hostname.includes(serviceSlug) || hostname.includes('accounts') || hostname.includes('login') || hostname.includes('auth');
+      if (looksLikeAuth && hostnameMatches) {
+        logger.info(`[Node:RecoverSkill] searchForLoginUrl: found "${url}" for service="${service}" (query result)`);
+        return url;
+      }
+    }
+
+    logger.info(`[Node:RecoverSkill] searchForLoginUrl: no clean auth URL found for "${service}" in ${results.length} results — using fallback`);
+    return null;
+  } catch (err) {
+    logger.warn(`[Node:RecoverSkill] searchForLoginUrl failed (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
+/**
  * Recover Skill Node
  *
  * Called when a skill step fails during executeCommand. The LLM reasons about
@@ -93,6 +144,12 @@ module.exports = async function recoverSkill(state) {
   }
 
   logger.debug(`[Node:RecoverSkill] Recovering from: ${failedStep.skill} — ${failedStep.error}`);
+
+  // Update plan document to reflect the failed step and recovery attempt
+  try {
+    const { writePlanDoc } = require('../utils/planDocument');
+    writePlanDoc(state, 'step_failed');
+  } catch (_) {}
 
   // ── Runtime failure feedback → agent failure_log ─────────────────────────
   // When a skill that uses an agent fails, write the error back to the agent's
@@ -225,6 +282,11 @@ module.exports = async function recoverSkill(state) {
     const { execFileSync } = require('child_process');
     const lines = [];
 
+    // Auth-timeout hint (set by fast-path when curl+auth times out)
+    if (failedStep._authTimeoutHint) {
+      lines.push(`⚠️  AUTH TIMEOUT DIAGNOSIS:\n${failedStep._authTimeoutHint}`);
+    }
+
     // Stdout preview (first 600 chars — often contains the real error message)
     const stdout = (failedStep.stdout || '').trim();
     if (stdout) lines.push(`stdout (first 600 chars):\n${stdout.substring(0, 600)}`);
@@ -239,7 +301,8 @@ module.exports = async function recoverSkill(state) {
       const exitMeaning = exitCode === 1 ? 'general error' : exitCode === 2 ? 'misuse of shell command' :
         exitCode === 126 ? 'command not executable' : exitCode === 127 ? 'command not found' :
         exitCode === 130 ? 'terminated by Ctrl+C' : exitCode === 137 ? 'killed (OOM or SIGKILL)' :
-        exitCode === 139 ? 'segfault' : exitCode === 255 ? 'exit status out of range / SSH error' : '';
+        exitCode === 139 ? 'segfault' : exitCode === 255 ? 'exit status out of range / SSH error' :
+        exitCode === -1 ? 'process killed by timeout — command did not finish in time' : '';
       lines.push(`Exit code: ${exitCode}${exitMeaning ? ` (${exitMeaning})` : ''}`);
     }
 
@@ -640,6 +703,114 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     };
   }
 
+  // ── Auth wall fast-path ─────────────────────────────────────────────────
+  // executeCommand.js sets failedStep.reason = 'auth_wall' when waitForStableText
+  // (or a navigate/examine) detects that the page is a login/auth wall.
+  //
+  // Strategy:
+  //   1. Check if a saved session file exists on disk — pass hasSession:true if so
+  //      (buildLoginSubPlan will try state-load FIRST before filling credentials)
+  //   2. Derive the expected KEYTAR keys for this service (e.g. GMAIL_EMAIL, GMAIL_PASSWORD)
+  //   3. Check macOS keychain for each key — build missingCredentialKeys list
+  //   4. SPAWN_SUBPLAN with buildLoginSubPlan (passing missingCredentialKeys so it prepends
+  //      ask_user + profile.store_secret steps for any missing credentials)
+  //
+  // If all credentials are present and the session still hit an auth wall, the sub-plan
+  // will still run the full form-fill flow using KEYTAR refs (session may have expired).
+  if (failedStep.reason === 'auth_wall') {
+    const { inferService, deriveCredentialKeys } = require('../utils/buildLoginSubPlan');
+    const fs   = require('fs');
+    const path = require('path');
+    const os   = require('os');
+
+    const authService  = failedStep.service  || inferService(failedStep.loginUrl || failedStep.url || '');
+    const loginUrl     = failedStep.loginUrl || failedStep.url || '';
+    const sessionId    = failedStep.sessionId || state.activeBrowserSessionId || null;
+
+    // Check if a saved session file exists (written by the state-save step after last login).
+    // If so, pass hasSession:true so buildLoginSubPlan prepends a state-load attempt.
+    let hasSession = false;
+    if (sessionId) {
+      const sessionFile = path.join(
+        os.homedir(), '.thinkdrop', 'browser-sessions',
+        `${sessionId.replace(/[^a-zA-Z0-9-_]/g, '_')}.json`
+      );
+      try {
+        const stat = fs.statSync(sessionFile);
+        // Only treat as valid if the file is less than 7 days old (sessions expire)
+        const ageMs = Date.now() - stat.mtimeMs;
+        hasSession = ageMs < 7 * 24 * 60 * 60 * 1000;
+        if (hasSession) logger.info(`[Node:RecoverSkill] Found saved session file (${Math.round(ageMs / 60000)}m old): ${sessionFile}`);
+      } catch (_) { /* no session file */ }
+    }
+
+    // Derive the KEYTAR keys expected for this service
+    const { usernameKey, passwordKey } = deriveCredentialKeys(authService, loginUrl, {});
+
+    // Treat both keys as missing — we're here because resolveStepCredentials already
+    // returned null for this token (SERVICE_CRED_TOKEN guard fired), so the credential
+    // is definitely not available in _gatheredVars or keychain.
+    // DO NOT use the `security` CLI to probe keychain — it triggers a macOS keychain
+    // access dialog asking for the login keychain password, which is confusing to users.
+    const missingCredentialKeys = [usernameKey, passwordKey];
+
+    logger.info(`[Node:RecoverSkill] Fast-path: auth_wall on "${authService}" (session=${sessionId}, saved=${hasSession}) → SPAWN_SUBPLAN; missing keys: [${missingCredentialKeys.join(', ')}]`);
+
+    // Compute the original destination URL from the parent plan (last navigate step before cursor)
+    // so the login sub-plan can navigate back after authenticating.
+    const parentPlan   = skillPlan || [];
+    const parentCursor = cursor ?? 0;
+    let destinationUrl = '';
+    for (let i = 0; i < parentCursor; i++) {
+      const step = parentPlan[i];
+      if (step && step.args && step.args.action === 'navigate' && step.args.url) {
+        destinationUrl = step.args.url;
+      }
+    }
+    if (destinationUrl) {
+      logger.info(`[Node:RecoverSkill] destinationUrl after login: ${destinationUrl}`);
+    }
+
+    // Compute resumeCursor: skip past consecutive auth-form steps in the parent plan
+    // (fill {{service:*}}, press Enter, click submit/next/sign-in) that will be
+    // redundant after a fresh login. This prevents re-entering the auth_wall loop.
+    let resumeCursor = parentCursor;
+    const authFillPattern  = /^\{\{[a-zA-Z0-9_]+:(username|email|password|user|pass)[^}]*\}\}$/i;
+    const authSkillPattern = /^browser\.act$/;
+    while (resumeCursor < parentPlan.length) {
+      const step       = parentPlan[resumeCursor];
+      const stepSkill  = step && step.skill;
+      const stepAction = step && step.args && step.args.action;
+      const stepValue  = step && step.args && (step.args.value || step.args.text || step.args.key || '');
+      const isFillAuth = stepSkill === 'browser.act' && stepAction === 'fill' && authFillPattern.test(stepValue.trim());
+      const isPressEnter = stepSkill === 'browser.act' && stepAction === 'press' && String(stepValue).toLowerCase() === 'enter';
+      const isClickAuth  = stepSkill === 'browser.act' && stepAction === 'click' &&
+        /\b(sign.?in|login|log.?in|submit|next|continue|proceed)\b/i.test(step.args.selector || step.args.label || '');
+      if (isFillAuth || isPressEnter || isClickAuth) {
+        resumeCursor++;
+      } else {
+        break;
+      }
+    }
+    if (resumeCursor > parentCursor) {
+      logger.info(`[Node:RecoverSkill] resumeCursor: skipping ${resumeCursor - parentCursor} redundant auth steps (cursor ${parentCursor} → ${resumeCursor})`);
+    }
+
+    return {
+      action:               'SPAWN_SUBPLAN',
+      goalLabel:            `login:${authService}`,
+      loginUrl,
+      service:              authService,
+      credentials:          {},
+      missingCredentialKeys,
+      hasSession,
+      sessionId,
+      onComplete:           'retry',
+      destinationUrl,
+      resumeCursor:         resumeCursor > parentCursor ? resumeCursor : null,
+    };
+  }
+
   // browser.act failures
   if (skill === 'browser.act') {
     const action = args.action || '';
@@ -954,6 +1125,30 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     }
   }
 
+  // gh CLI "unknown command" — gh repo star, gh star, etc. don't exist in gh v2+.
+  // Detect immediately from stderr and replan to use `gh api` REST calls instead.
+  if (skill === 'shell.run' && failedStep.exitCode === 1) {
+    const combinedOut = ((failedStep.stdout || '') + ' ' + (failedStep.stderr || '')).toLowerCase();
+    const bashScript = args.cmd === 'bash' ? (Array.isArray(args.argv) ? args.argv.join(' ') : '') : '';
+    const isGhUnknownCmd = /\bgh\b/.test(bashScript) &&
+      (combinedOut.includes('unknown command') || combinedOut.includes('no such command') ||
+       combinedOut.includes('unknown subcommand') || combinedOut.includes("could not find command"));
+    if (isGhUnknownCmd) {
+      // Extract owner/repo if present for a more specific constraint
+      const repoMatch = bashScript.match(/\b([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\b/);
+      const ownerRepo = repoMatch ? repoMatch[1] : 'OWNER/REPO';
+      const isStarAction = /\b(star|unstar)\b/i.test(bashScript);
+      logger.debug(`[Node:RecoverSkill] Fast-path: gh unknown command → REPLAN with gh api`);
+      return {
+        action: 'REPLAN',
+        suggestion: isStarAction
+          ? `The gh CLI does not have a "star" subcommand in v2+. Use the REST API: \`gh api -X PUT /user/starred/${ownerRepo} --silent\` to star, or \`gh api -X DELETE /user/starred/${ownerRepo} --silent\` to unstar. Check if already starred: \`gh api /user/starred/${ownerRepo} --silent 2>/dev/null && echo starred || echo not_starred\`.`
+          : `The gh CLI command failed with "unknown command". Use \`gh api\` or the GitHub REST API via curl with \`gh auth token\` to get the token. Never use \`gh repo star\`, \`gh star\`, or other non-existent subcommands.`,
+        constraint: `NEVER use gh repo star, gh star, or gh unstar — these subcommands do not exist. Use \`gh api -X PUT /user/starred/${ownerRepo}\` for starring.`,
+      };
+    }
+  }
+
   // mkdir on root → suggest Desktop
   if (skill === 'shell.run' && args.cmd === 'mkdir') {
     if (combinedError.includes('permission denied') || combinedError.includes('read-only')) {
@@ -1099,6 +1294,31 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
       };
     }
 
+    // curl with Authorization/token header timed out → likely an empty or invalid token,
+    // NOT a real network timeout. Increasing the timeout will just hang longer for nothing.
+    // Route to the LLM with evidence so it can detect the empty-token root cause and replan.
+    if (skill === 'shell.run') {
+      const bashArgStr = args.cmd === 'bash' ? (Array.isArray(args.argv) ? args.argv.join(' ') : '') : '';
+      const isCurlWithAuth = (args.cmd === 'curl' || bashArgStr.includes('curl ')) &&
+        /Authorization|Bearer|token\s+\$|: token|: Bearer/i.test(bashArgStr || JSON.stringify(args.argv || []));
+      const isSecurityKeychain = bashArgStr.includes('security find-generic-password') ||
+        bashArgStr.includes('security find-internet-password');
+      if (isCurlWithAuth || isSecurityKeychain) {
+        logger.debug('[Node:RecoverSkill] Fast-path: curl-with-auth or keychain call timed out → route to LLM (auth issue, not timeout)');
+        // Do NOT auto-patch timeout — fall through to LLM recovery below.
+        // Add a diagnostic hint to the failedStep so the LLM has the evidence.
+        if (!failedStep._authTimeoutHint) {
+          failedStep._authTimeoutHint =
+            'IMPORTANT: This curl command timed out. The most likely cause is an EMPTY or INVALID auth token. ' +
+            'security find-generic-password returns empty string when the key does not exist, ' +
+            'and curl with an empty "Authorization: token " header hangs waiting for GitHub to respond. ' +
+            'DO NOT increase the timeout. Instead: (1) switch to `gh api` which uses its own managed token, ' +
+            'or (2) use `gh auth token` to get the token and validate it is non-empty before calling curl.';
+        }
+        return null; // fall through to LLM
+      }
+    }
+
     // Other commands: silent AUTO_PATCH with backoff (2x then 3x timeout)
     // shell.run service rejects timeoutMs > 300000 — never patch beyond that
     const MAX_TIMEOUT = 300000;
@@ -1133,7 +1353,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
 // Apply a recovery decision to state
 // ---------------------------------------------------------------------------
 
-function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, replanCount, logger) {
+async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, replanCount, logger) {
   const { failedStep } = state;
 
   switch (decision.action) {
@@ -1278,20 +1498,32 @@ function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount, repla
         subSteps = decision.subPlanSteps;
         logger.debug(`[Node:RecoverSkill] SPAWN_SUBPLAN: using ${subSteps.length} provided steps for "${decision.goalLabel}"`);
       } else {
-        // Browser login sub-plan — build from service/URL
+        // Browser login sub-plan — resolve the canonical sign-in URL via web search,
+        // then fall back to KNOWN_AUTH_URLS → rawLoginUrl.
+        const loginUrlRaw = decision.loginUrl || (failedStep?.args?.url) || '';
+        const resolvedLoginUrl = await searchForLoginUrl(
+          decision.service || 'unknown',
+          loginUrlRaw,
+          state.mcpAdapter,
+          logger,
+        );
         subSteps = buildLoginSubPlan({
-          loginUrl:    decision.loginUrl    || (failedStep?.args?.url) || '',
-          service:     decision.service     || null,
-          credentials: decision.credentials || {},
-          hasSession:  !!decision.hasSession,
-          sessionId:   state.activeBrowserSessionId || null,
-          loginError:  failedStep?.error    || '',
+          loginUrl:              loginUrlRaw,
+          service:               decision.service     || null,
+          credentials:           decision.credentials || {},
+          hasSession:            !!decision.hasSession,
+          sessionId:             decision.sessionId   || state.activeBrowserSessionId || null,
+          loginError:            failedStep?.error    || '',
+          missingCredentialKeys: Array.isArray(decision.missingCredentialKeys) ? decision.missingCredentialKeys : [],
+          resolvedLoginUrl,    // null → falls back to knownUrl → rawLoginUrl inside factory
+          destinationUrl:        decision.destinationUrl || '',
         });
       }
 
       // Try to spawn; honours depth cap and loop guard
       const spawnResult = spawnSubPlan(state, subSteps, decision.goalLabel || `login:${decision.service || 'unknown'}`, {
-        onComplete: decision.onComplete || 'retry',
+        onComplete:    decision.onComplete || 'retry',
+        resumeCursor:  decision.resumeCursor != null ? decision.resumeCursor : undefined,
       });
 
       if (spawnResult.planError) {

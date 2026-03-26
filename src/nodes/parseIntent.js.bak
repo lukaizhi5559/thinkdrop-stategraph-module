@@ -12,7 +12,7 @@
  */
 
 module.exports = async function parseIntent(state) {
-  const { mcpAdapter, message, resolvedMessage, carriedIntent, context, llmBackend, conversationHistory, activeBrowserSessionId, activeBrowserUrl } = state;
+  const { mcpAdapter, message, resolvedMessage, carriedIntent, context, llmBackend, conversationHistory } = state;
   const logger = state.logger || console;
 
   // ── skill_build fast-path: never re-classify skill build requests ──────────
@@ -205,25 +205,6 @@ module.exports = async function parseIntent(state) {
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'reminder-schedule-override', processingTimeMs: 0 } };
   }
 
-  // "I mean [action]" / "I meant [action]" clarification guard — pre-DistilBERT.
-  // User is clarifying or correcting a previous request (e.g. "I mean on the Revealing Truth
-  // channel give me a list of videos less than 5 mins"). Without this guard DistilBERT
-  // sees "I mean ... channel ... 5 mins" and classifies as memory_store.
-  if (/^\s*i\s+(mean|meant)\b/i.test(classifyMessage) &&
-    /\b(go|find|get|show|list|give|search|look|navigate|browse|open|play|watch|click|run|navigate|pull|bring|check)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] "I mean" clarification override → command_automate: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'command_automate', confidence: 0.92, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'i-mean-clarification-override', processingTimeMs: 0 } };
-  }
-
-  // Screenshot / screen-capture hard override — must run BEFORE DistilBERT early exit.
-  // DistilBERT now classifies "take a screenshot" as screen_intelligence at 0.95 confidence,
-  // which triggers early exit and bypasses the safety-net guard below. Move it here so it
-  // always fires before the early exit.
-  if (/\b(take|grab|capture|get)\s+(a\s+)?(screenshot|screen\s*shot|screen\s*grab|screen\s*capture)\b/i.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Screenshot pre-guard override → command_automate: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'command_automate', confidence: 0.97, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'screenshot-override', processingTimeMs: 0 } };
-  }
-
   // Filesystem / folder action override:
   // "I need you to scan the folder X", "scan the folder X", "read the files in X",
   // "analyze the screenshots in X", "list files in X", "show me the files on my desktop"
@@ -347,19 +328,6 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   if (MY_SKILLS_PATTERN.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] my-skills override → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [{ skill: 'skill.list' }], requiresMemoryAccess: false }, metadata: { parser: 'my-skills-override', processingTimeMs: 0 } };
-  }
-
-  // "Search for X on Google/Bing/..." → command_automate (browser automation), NOT web_search.
-  // The phrase "on <search engine>" means the user wants the search performed IN the browser UI,
-  // not via ThinkDrop's internal web.search MCP. DistilBERT scores this as web_search at 0.92
-  // because it trained on "search for X" patterns without the browser-destination signal.
-  // Must run BEFORE the DistilBERT early exit.
-  const SEARCH_ENGINE_NAMES = /\b(google|bing|duckduckgo|yahoo|brave|ecosia|startpage|youtube|amazon|reddit|twitter|x\.com|github|stackoverflow|stack overflow|yelp|linkedin|instagram|facebook|pinterest|etsy|ebay|walmart|tripadvisor|zillow|redfin)\b/i;
-  if (/\b(search|look|find|look\s+up|search\s+for)\b/i.test(classifyMessage) &&
-      /\bon\s+/i.test(classifyMessage) &&
-      SEARCH_ENGINE_NAMES.test(classifyMessage)) {
-    logger.debug(`[Node:ParseIntent] Search-on-engine override → command_automate: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'search-on-engine-override', processingTimeMs: 0 } };
   }
 
   // Knowledge-question override — BEFORE phi4 and carriedIntent.
@@ -626,25 +594,6 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
         examplePrompt: classifyMessage, correctIntent: _eIntent, wrongIntent: null, source: 'low_confidence_candidate'
       }).catch(() => {});
     }
-
-    // Browser-context override: DistilBERT says memory_store but there's an active browser
-    // session on a video/streaming platform and the message looks like a refinement/follow-up
-    // action rather than a genuine fact to store.
-    // E.g. "this revealing truth channel less then 5 mins" (0.88 memory_store) when browser
-    // is on YouTube — user is refining a previous browse request, not storing a memory.
-    if (_eIntent === 'memory_store' && _eConf < 0.92 &&
-        activeBrowserSessionId &&
-        /\b(youtube|twitch|tiktok|vimeo|netflix|instagram|channel|video)\.?(com)?/i.test(activeBrowserUrl || '') &&
-        /\b(channel|video|videos|list|less\s+than|under|min(ute)?s?|filter|shorts?|clips?)\b/i.test(classifyMessage) &&
-        !/\b(remember|note|save|store|track|don.?t forget)\b/i.test(classifyMessage)) {
-      logger.debug(`[Node:ParseIntent] Browser-context override: memory_store → command_automate (active video session, refinement pattern): "${classifyMessage}"`);
-      return {
-        ...state,
-        intent: { type: 'command_automate', confidence: 0.85, entities: [], requiresMemoryAccess: false },
-        metadata: { parser: 'browser-context-override', processingTimeMs: earlyModelResult.metadata?.processingTimeMs || 0 }
-      };
-    }
-
     return {
       ...state,
       intent: {
@@ -660,15 +609,6 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   // DistilBERT was uncertain or unavailable — language-pattern safety nets follow.
   if (earlyModelResult) {
     logger.debug(`[Node:ParseIntent] DistilBERT uncertain (${earlyModelResult.confidence?.toFixed(2)}) — pattern guards active`);
-  }
-
-  // "I need you to [action]" / "I want you to [action]" / "Can you [action]" → command_automate.
-  // NOTE: DistilBERT (retrained with R12) now handles these at 0.91-0.94 confidence → early exit.
-  // This guard only fires for unusual action verbs that fall below the 0.75 confidence threshold.
-  // Keep as a secondary safety net — not a primary classification path.
-  if (/^(i\s+(need|want|would\s+like)\s+(you\s+to|for\s+you\s+to\s*)|can\s+you\s+|please\s+)(go\s+to|goto|navigate|watch|find|search|look\s+up|browse|open|play|visit|check\s+out|pull\s+up|bring\s+up|show\s+me|get\s+me|download|install|run|execute|send|email|text|create|make|draft|compose|book|reserve|schedule|click|fill|type|start|launch|switch|jump|take\s+me)\b/i.test(classifyMessage.trim())) {
-    logger.debug(`[Node:ParseIntent] I-need-you-to-action override (safety net) → command_automate: "${classifyMessage}"`);
-    return { ...state, intent: { type: 'command_automate', confidence: 0.96, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'i-need-you-to-action-override', processingTimeMs: 0 } };
   }
 
   // Past-tense action report override — must run BEFORE browser automation override.

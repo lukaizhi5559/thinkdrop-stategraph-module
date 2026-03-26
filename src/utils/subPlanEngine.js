@@ -127,6 +127,7 @@ function spawnSubPlan(state, subSteps, goalLabel, opts = {}) {
     goalLabel:    state.currentGoalLabel || 'root',
     depth:        stack.length,
     onComplete:   opts.onComplete || 'retry',  // 'retry' | 'skip'
+    resumeCursor: opts.resumeCursor ?? null,   // explicit override for post-subplan cursor
   };
 
   // Persist parent snapshot to disk (best-effort)
@@ -172,11 +173,13 @@ function completeSubPlan(state) {
     if (fs.existsSync(fp)) fs.unlinkSync(fp);
   } catch (_) {}
 
-  // 'skip': sub-plan resolved the issue in isolation — step should NOT be re-run.
-  // 'retry' (default): sub-plan cleared a blocking prerequisite — retry the step.
-  const resumeCursor = (parent.onComplete === 'skip')
-    ? parent.skillCursor + 1
-    : parent.skillCursor;
+  // resumeCursor priority:
+  //   1. Explicit override (e.g. skip past auth-related fill/press/click steps)
+  //   2. 'skip': sub-plan resolved the issue — step should NOT be re-run
+  //   3. 'retry' (default): sub-plan cleared a blocker — retry the same step
+  const resumeCursor = parent.resumeCursor != null
+    ? parent.resumeCursor
+    : (parent.onComplete === 'skip' ? parent.skillCursor + 1 : parent.skillCursor);
 
   return {
     subPlanStack:     stack,

@@ -7,6 +7,9 @@
  * user-memory MCP service for:
  *   1. Available credential refs (KEYTAR pointers) for those services
  *   2. Constraints that may block related actions
+ *   3. CLI-managed OAuth services — identified from cli-registry.json so that
+ *      planSkills.js never injects raw KEYTAR refs for them (e.g. github→gh,
+ *      gcp→gcloud, azure→az all use OAuth tokens, not keychain secrets).
  *
  * Returns a credentialContext object that planSkills.js injects into the
  * LLM prompt.  Raw secrets are NEVER fetched here — only KEYTAR:<key> refs.
@@ -15,6 +18,41 @@
  */
 
 const http = require('http');
+const fs   = require('fs');
+const path = require('path');
+
+// ---------------------------------------------------------------------------
+// CLI registry loader — reads cli-registry.json on each call (no cache) so
+// that entries written at runtime by skill-scout.cjs are immediately visible.
+// The file is small (~10 KB) and this runs at most once per planning call.
+// ---------------------------------------------------------------------------
+function loadCliOAuthServices() {
+  const result = {};
+  try {
+    let dir = __dirname;
+    for (let i = 0; i < 8; i++) {
+      const candidate = path.join(dir, 'mcp-services', 'command-service', 'src', 'cli-registry.json');
+      if (fs.existsSync(candidate)) {
+        const registry = JSON.parse(fs.readFileSync(candidate, 'utf8'));
+        for (const [svcName, entry] of Object.entries(registry)) {
+          for (const provider of Object.values(entry.providers || {})) {
+            if (provider.authType === 'oauth' && provider.tool) {
+              result[svcName] = {
+                tool:     provider.tool,
+                tokenCmd: provider.tokenCmd || null,
+              };
+            }
+          }
+        }
+        break;
+      }
+      dir = path.dirname(dir);
+    }
+  } catch (_) {
+    // Registry unreadable — fail silently, planSkills will fall back to an empty set
+  }
+  return result;
+}
 
 const SERVICE_PATTERNS = [
   { name: 'gmail',     pattern: /\b(gmail|google\s+mail|google\s+email|my\s+email|my\s+inbox|email\s+inbox)\b/i },
@@ -170,6 +208,17 @@ async function gatherCredentialIntelligence(userMessage, opts = {}) {
     availableCredentials,
     hardConstraints,
     softConstraints,
+    // CLI-managed OAuth services detected in this message.
+    // Each entry: { service, tool, tokenCmd } where tokenCmd is the shell
+    // command to obtain a token (e.g. "gh auth token").
+    // planSkills.js uses this to filter KEYTAR injection and inject the
+    // correct tokenCmd hint instead — no hardcoded service list needed.
+    cliAuthServices: (() => {
+      const oauthMap = loadCliOAuthServices();
+      return detectedServices
+        .filter(s => oauthMap[s])
+        .map(s => ({ service: s, tool: oauthMap[s].tool, tokenCmd: oauthMap[s].tokenCmd }));
+    })(),
   };
 }
 

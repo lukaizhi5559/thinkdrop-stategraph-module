@@ -14,7 +14,20 @@ external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user
 - `{{synthesisAnswerFile}}` — temp file path containing the synthesis output
 - `{{prev_stdout}}` — stdout of the immediately preceding step
 
-## API calls vs browser.act
+**Credential template tokens — ALWAYS use these for `browser.act` fill/type steps that need a login, NEVER hardcode or guess values:**
+- `{{gmail:username}}` — Gmail / Google email address from keychain
+- `{{gmail:password}}` — Gmail / Google password from keychain
+- `{{github:username}}` — GitHub username from keychain
+- `{{github:password}}` — GitHub password from keychain
+- `{{<service>:username}}` — any service email/username (replace `<service>` with the site slug)
+- `{{<service>:password}}` — any service password
+
+**Rules for credential tokens:**
+1. NEVER use placeholder strings like `<your-email@example.com>`, `your-email@gmail.com`, `<password>`, or any angle-bracket placeholder in a `fill` / `type` / `smartType` value.
+2. ALWAYS use `{{service:username}}` and `{{service:password}}` for any fill step that needs login credentials.
+3. If the credential is not yet stored, the system will automatically pause, ask the user, and store it securely — you do NOT need to add extra steps for this.
+4. Example correct fill step: `{ "skill": "browser.act", "args": { "action": "fill", "selector": "input[type='email']", "value": "{{gmail:username}}", "sessionId": "gmail" } }`
+
 
 **Use `shell.run curl` for any service with a REST API. Use `browser.act` ONLY for unauthenticated public web browsing.**
 
@@ -26,22 +39,32 @@ external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user
 | AI chatbots (ChatGPT, Claude, Perplexity) | `browser.act` (no open API for chat UI) |
 | Any login-gated action | `shell.run curl` with token — **NEVER `browser.act`** |
 
-**Get GitHub token from macOS keychain:**
+**Get GitHub token — PREFERRED: use `gh auth token` (no keychain dialog, no empty-string risk):**
+```bash
+TOKEN=$(gh auth token 2>/dev/null)
+[ -z "$TOKEN" ] && { echo "ERROR: not authenticated — run: gh auth login"; exit 1; }
+```
+Fallback if `gh` is not installed:
 ```bash
 TOKEN=$(security find-internet-password -s github.com -w 2>/dev/null | head -1)
+[ -z "$TOKEN" ] && { echo "ERROR: no GitHub token in keychain — run: gh auth login"; exit 1; }
 ```
+NEVER use `security find-generic-password -s thinkdrop -a "skill:github.agent:GITHUB_PASSWORD"` — that key doesn't exist and macOS will show a keychain permission dialog.
+ALWAYS include the empty-check guard. An empty token causes `curl` to hang for 60s waiting for GitHub to respond.
 
 **GitHub CLI — NEVER use `gh repo view ... && echo 'Done' || gh repo <action>` as a conditional.**
 `gh repo view` always exits 0 (it's a read command), so `&&` always fires and `||` never runs.
 Instead, extract the boolean field with `--json FIELD -q .FIELD` and test it explicitly:
 
+**GitHub star/unstar — `gh repo star` does NOT exist in gh v2+. Use the REST API:**
 ```bash
-# CORRECT — star a repo only if not already starred
-STARRED=$(gh repo view OWNER/REPO --json viewerHasStarred -q .viewerHasStarred 2>/dev/null)
-if [ "$STARRED" = "true" ]; then echo "Already starred OWNER/REPO"; else gh repo star OWNER/REPO && echo "Starred OWNER/REPO successfully"; fi
+# CORRECT — star a repo only if not already starred (gh api, works in all versions)
+STARRED=$(gh api /user/starred/OWNER/REPO --silent 2>&1; echo $?)
+if [ "$STARRED" = "0" ]; then echo "Already starred OWNER/REPO"; else gh api -X PUT /user/starred/OWNER/REPO --silent && echo "Starred OWNER/REPO successfully"; fi
 ```
+NEVER use `gh repo star`, `gh star`, or `gh repo unstar` — these subcommands do not exist.
 
-Same pattern for watch/unwatch (`viewerSubscription`), follow/unfollow, etc. — always extract the field, test the value, then act.
+Same pattern for watch/unwatch — always extract the field, test the value, then act.
 
 **GitHub — NEVER attach binary files to PRs via API.** GitHub REST API does not support file uploads to PRs. Instead: read the file content with `shell.run`, then post it as a PR comment using `POST /repos/OWNER/REPO/issues/NUMBER/comments`.
 
@@ -285,8 +308,7 @@ Rules:
 
 **ONLY use `guide.step` when automation genuinely cannot complete the action:**
 - Government sites, CAPTCHAs, reCAPTCHA challenges
-- OAuth login walls (Gmail, GitHub, Notion sign-in flows)
-- Two-factor authentication prompts
+- TOTP / two-factor authentication prompts (the system will ask_user automatically)
 - Tasks that explicitly say "show me how" / "walk me through" / "guide me"
 
 **DO NOT use `guide.step` for:**
@@ -294,6 +316,7 @@ Rules:
 - Playing audio/video (use `browser.act → click` on the play/listen button)
 - Submitting a form you can fill automatically
 - Any action where `browser.act` can do it directly
+- **OAuth login walls (Gmail, GitHub, Notion, etc.)** — the system handles login automatically via sub-plans using `{{service:username}}` / `{{service:password}}` credential tokens. NEVER add guide.step for login.
 - **Setting up API credentials, API keys, or account registration** — use `skill.bootstrap` (keychain + gatherContext handles credentials automatically, no manual steps)
 - **"Sign up for X", "log in to X", "copy your API key from X dashboard"** — these are credential setup steps, never guide.step
 - **Testing a curl command in the terminal** — execute it directly via `shell.run`
@@ -374,10 +397,15 @@ Does the service have a CLI (gh, twilio, stripe, fly, wrangler, heroku, etc.)?
          - If NOT logged in AND no GITHUB_TOKEN: use browser.act to do the task via the website instead — do NOT run `gh auth login` interactively, it will hang waiting for stdin
        - For other CLIs: check their equivalent auth-status command first
     4. shell.run: execute the task directly with the CLI
-       - **Conditional idempotent actions (star, watch, follow, etc.):** NEVER use `gh repo view ... && echo 'done' || gh repo <action>` — `gh repo view` always exits 0, so the `||` branch never runs. Use `--json FIELD -q .FIELD` to extract the boolean, then test it:
+       - **Conditional idempotent actions (star, watch, follow, etc.):** NEVER use `gh repo view ... && echo 'done' || gh repo <action>` — `gh repo view` always exits 0, so the `||` branch never runs.
+         **STAR/UNSTAR — `gh repo star` DOES NOT EXIST in gh v2+. Use the REST API:**
          ```bash
-         STARRED=$(gh repo view OWNER/REPO --json viewerHasStarred -q .viewerHasStarred 2>/dev/null)
-         if [ "$STARRED" = "true" ]; then echo "Already starred"; else gh repo star OWNER/REPO && echo "Starred!"; fi
+         # Check if starred: exit 0 = already starred, exit 404/non-0 = not starred
+         if gh api /user/starred/OWNER/REPO --silent 2>/dev/null; then
+           echo "Already starred OWNER/REPO"
+         else
+           gh api -X PUT /user/starred/OWNER/REPO --silent && echo "Starred OWNER/REPO successfully"
+         fi
          ```
     5. (optional) synthesize skill.md backed by CLI commands + skill.install for reuse
   NO (REST API only) →
@@ -401,7 +429,7 @@ Does the service have a CLI (gh, twilio, stripe, fly, wrangler, heroku, etc.)?
 1. **shell.run** — check if CLI is installed: `which <cli> 2>/dev/null || echo NOT_FOUND`
 2. **shell.run** — if NOT_FOUND: install via brew/pip/npm/cargo
 3. **shell.run** — check auth status (e.g. `gh auth status 2>&1`). If not authenticated:
-   - For `gh`: only auth if `$GITHUB_TOKEN` is set — `echo "$GITHUB_TOKEN" | gh auth login --with-token`. NEVER run `gh auth login` without piping a token — it will hang waiting for terminal input.
+   - For `gh`: only auth if `$GITHUB_TOKEN` is set — `echo "$GITHUB_TOKEN" | gh auth login --with-token`. NEVER run `gh auth login` without piping a token — it will hang waiting for terminal input. Get the current token with `gh auth token` (no keychain dialog, preferred over `security find-internet-password`).
    - If no credentials are available, switch to browser.act to accomplish the task via the website.
 4. **shell.run** — run the CLI command to complete the task
 

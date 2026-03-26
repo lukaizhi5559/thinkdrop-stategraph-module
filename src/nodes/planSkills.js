@@ -156,9 +156,9 @@ module.exports = async function planSkills(state) {
   // If creatorPlanning ran successfully and skillCreator produced a .skill.cjs,
   // skip all LLM planning — the skill IS the plan. Return a single external.skill
   // step so executeCommand runs it directly with no confirm-build prompt.
-  // Allow creator fast-path even during recovery replans — creatorSkillName is the
-  // ground truth and must NOT be overridden by LLM hallucination during recovery.
-  if (state.creatorSkillName && state.creatorSkillPath) {
+  // Exception: when evaluateSkills flagged a FIX (the skill was wrong for the task),
+  // skip the fast-path so the LLM can replan with the stored fix context_rule.
+  if (state.creatorSkillName && state.creatorSkillPath && !state.evaluationFix) {
     const fs = require('fs');
     if (fs.existsSync(state.creatorSkillPath)) {
       const buildOnly = state.gatheredContext?.buildOnly === true;
@@ -501,15 +501,34 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
     if (credCtx?.detectedServices?.length > 0) {
       const lines = [];
 
-      if (credCtx.availableCredentials.length > 0) {
+      // CLI-managed OAuth services (gh, gcloud, az, etc.) must NOT use KEYTAR
+      // credential refs — they manage their own tokens internally and calling
+      // `security find-generic-password` triggers macOS keychain dialogs.
+      // `cliAuthServices` is populated dynamically from cli-registry.json by
+      // credentialIntelligence.js, so no hardcoded service list is needed here.
+      const cliAuthServices = credCtx.cliAuthServices || [];
+      const cliManagedNames = new Set(cliAuthServices.map(s => s.service));
+
+      const displayableCreds = credCtx.availableCredentials.filter(
+        c => !cliManagedNames.has(c.service)
+      );
+
+      if (displayableCreds.length > 0) {
         lines.push('Available credentials (use KEYTAR refs, never hardcode secrets):');
-        for (const c of credCtx.availableCredentials) {
+        for (const c of displayableCreds) {
           lines.push(`  - ${c.key}: ${c.valueRef}${c.label ? ` (${c.label})` : ''}`);
         }
       }
 
+      // For each CLI-managed OAuth service, inject the specific tokenCmd hint.
+      for (const { service, tool, tokenCmd } of cliAuthServices) {
+        if (tokenCmd) {
+          lines.push(`${service.charAt(0).toUpperCase() + service.slice(1)} token: use \`${tokenCmd}\` — do NOT use security find-generic-password for ${service}.`);
+        }
+      }
+
       const missingServices = credCtx.detectedServices.filter(
-        s => !credCtx.availableCredentials.some(c => c.service === s)
+        s => !cliManagedNames.has(s) && !credCtx.availableCredentials.some(c => c.service === s)
       );
       if (missingServices.length > 0) {
         lines.push(`Missing credentials for: ${missingServices.join(', ')} — use a needs_skill or ask_user step to obtain them before proceeding.`);
@@ -680,7 +699,7 @@ Task: "${userMessage}"`;
     try {
       const contextKeys = new Set();
 
-      // Extract hostnames from URLs in the message and active browser URL
+      // Extract hostnames from full URLs (https?://) in the message and active browser URL
       const urlRegex = /https?:\/\/([a-zA-Z0-9.-]+)/g;
       const searchText = `${userMessage || ''} ${state.activeBrowserUrl || ''}`;
       let m;
@@ -692,6 +711,21 @@ Task: "${userMessage}"`;
           const h = new URL(state.activeBrowserUrl).hostname.toLowerCase().replace(/^www\./, '');
           if (h) contextKeys.add(h);
         } catch (_) {}
+      }
+      // Also extract bare domain names (no protocol) from the message text
+      // e.g. "go to github.com and star" → "github.com"
+      const bareDomainRegex = /\b([a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.(?:com|io|org|net|dev|app|ai|co|gov|edu|us|me))\b/g;
+      const bareDomainText = userMessage || '';
+      let bd;
+      while ((bd = bareDomainRegex.exec(bareDomainText)) !== null) {
+        contextKeys.add(bd[1].toLowerCase());
+      }
+
+      // Include recovery context key — when replanning after a failure, the error was
+      // diagnosed against a specific contextKey (e.g. "github.com") that holds the fix rule.
+      // skillResults is cleared on replan so the URL scan above finds nothing — add it directly.
+      if (state.recoveryContext?.contextKey) {
+        contextKeys.add(String(state.recoveryContext.contextKey).toLowerCase());
       }
 
       // Add active app name for native app rules (e.g. 'slack', 'excel', 'discord')
@@ -740,15 +774,21 @@ Task: "${userMessage}"`;
 
   // Fetch installed user skills — inject into prompt so LLM uses external.skill instead of needs_skill
   let installedSkillsNote = '';
+  let installedSkillsList = []; // kept in outer scope for scout intercept dedup check below
   if (mcpAdapter) {
     try {
       const isRes = await mcpAdapter.callService('user-memory', 'skill.listNames', {}, { timeoutMs: 3000 }).catch(() => null);
       const isRaw = isRes?.data || isRes;
       const isNames = Array.isArray(isRaw?.results) ? isRaw.results : [];
+      installedSkillsList = isNames; // save for scout intercept check
       if (isNames.length > 0) {
         const isMdSkill = s => s.execType === 'shell' || (s.execPath || '').endsWith('.md');
-        const nodeSkills  = isNames.filter(s => !isMdSkill(s));
-        const shellSkills = isNames.filter(s =>  isMdSkill(s));
+        // Exclude registered projects — they should only be launchable when the user
+        // explicitly references the project name. Including them causes the LLM to
+        // shortcut to project.launcher for generic capability requests.
+        const isProject = s => s.execType === 'project' || s.projectDir || s.type === 'project';
+        const nodeSkills  = isNames.filter(s => !isMdSkill(s) && !isProject(s));
+        const shellSkills = isNames.filter(s =>  isMdSkill(s) && !isProject(s));
         const noteParts = [];
         if (nodeSkills.length > 0) {
           const lines = nodeSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
@@ -1462,6 +1502,26 @@ CRITICAL rules for skill.md:
       logger.debug(`  Step ${i + 1}: ${s.skill} — ${s.description || JSON.stringify(s.args)}`)
     );
 
+    // ── Guard: spurious project.launcher plans ────────────────────────────────
+    // The LLM may suggest project.launcher when it sees a previously-built project
+    // in conversation history, even when the user just asked for a task (not to open
+    // a specific project). Only allow project.launcher when the user explicitly
+    // references a project by name ("open project X" / "launch project X").
+    const projectLauncherStep = skillPlan.length === 1 && skillPlan[0].skill === 'project.launcher' ? skillPlan[0] : null;
+    if (projectLauncherStep) {
+      const msgLower = (userMessage || '').toLowerCase();
+      const explicitProjectRef = /\b(open|launch|start|run|show)\b.{0,30}\bproject\b/i.test(userMessage) ||
+        (projectLauncherStep.args?.projectName && msgLower.includes(projectLauncherStep.args.projectName.toLowerCase()));
+      if (!explicitProjectRef) {
+        logger.info(`[Node:PlanSkills] Guard: project.launcher suggested without explicit project reference — converting to needs_skill for scout`);
+        skillPlan = [{
+          skill: 'needs_skill',
+          args: { capability: userMessage, suggestion: null },
+          description: 'needs_skill',
+        }];
+      }
+    }
+
     // ── Scout intercept: replace needs_skill with a provider-select card ────────
     // If the LLM returned needs_skill, check the CLI/API registries before falling
     // through to recoverSkill → ASK_USER. If we find a match, emit scout_match and
@@ -1469,6 +1529,39 @@ CRITICAL rules for skill.md:
     // main.js resumes with cliMatch/apiMatch set → creatorPlanning fast-path runs.
     const needsSkillStep = skillPlan.find(s => s.skill === 'needs_skill');
     if (needsSkillStep) {
+      // forceSkillBuild: user already selected a provider from the scout card.
+      // Skip registry scout and LLM replan — directly generate an external.skill step
+      // using the chosen provider so executeCommand triggers the creator build pipeline.
+      if (state.forceSkillBuild && (state.gatheredContext?.apiMatch || state.gatheredContext?.cliMatch)) {
+        const chosenMatch = state.gatheredContext.apiMatch || state.gatheredContext.cliMatch;
+        const capability = chosenMatch.capability || needsSkillStep.args?.capability || userMessage;
+        const provider = chosenMatch.provider;
+        // Use dot notation (e.g. 'sendgrid.email') to match how skills are registered/discovered.
+        // Hyphens would generate 'sendgrid-email' which external.skill can't find after build.
+        const skillName = `${provider}.${capability.replace(/[^a-z0-9.]+/gi, '-').toLowerCase()}`.slice(0, 60);
+        logger.info(`[Node:PlanSkills] forceSkillBuild: generating external.skill plan for "${capability}" via "${provider}" (skillName: "${skillName}")`);
+        const plan = [{
+          skill: 'external.skill',
+          args: { name: skillName, capability, provider, apiMatch: state.gatheredContext.apiMatch, cliMatch: state.gatheredContext.cliMatch },
+          description: `Build skill: ${capability} using ${provider}`,
+        }];
+        return { ...state, skillPlan: plan, skillCursor: 0, scoutPending: false, forceSkillBuild: false };
+      }
+
+      // forceBrowserFallback: user already acknowledged needs_skill and said "build it".
+      // Skip registry matching (avoid re-showing the same scout card) and convert directly
+      // to browser.act so the task is attempted via the web browser instead of looping.
+      if (state.forceBrowserFallback) {
+        const capability = needsSkillStep.args?.capability || needsSkillStep.args?.name || userMessage;
+        logger.info(`[Node:PlanSkills] forceBrowserFallback: converting needs_skill → browser.act for "${capability}"`);
+        const browserPlan = [{
+          skill: 'browser.act',
+          args: { task: capability },
+          description: capability,
+        }];
+        return { ...state, skillPlan: browserPlan, skillCursor: 0, scoutPending: false, forceBrowserFallback: false };
+      }
+
       const path = require('path');
       const capability = needsSkillStep.args?.capability || needsSkillStep.args?.name || '';
       const suggestion  = needsSkillStep.args?.suggestion || '';
@@ -1491,6 +1584,21 @@ CRITICAL rules for skill.md:
       // Declared here (outside if(regDir)) so it's also accessible in the dynamic-discovery block below.
       const BUILTIN_SUGGESTIONS = new Set(['browser.act', 'shell.run', 'ui.axclick', 'ui.typetext', 'ui.click', 'ui.movemouse', 'ui.waitfor', 'ui.screen.verify']);
       const suggestionIsBuiltin = BUILTIN_SUGGESTIONS.has((suggestion || '').toLowerCase());
+
+      // Shared service-name extraction — used by both dynamic discovery and the browser.agent fallback.
+      // Strips filler/action words to isolate the key service noun (e.g. "gmail", "slack", "stripe").
+      const SCOUT_FILLER_WORDS = new Set([
+        'a','an','the','send','get','fetch','create','build','make','add','post',
+        'use','using','via','with','from','to','for','of','on','in','at','by',
+        'my','me','this','that','some','new','about','through','into','can',
+        'message','messages','email','emails','sms','text','notification','notifications',
+        'retrieve','read','open','check','access','find','list','show','view',
+        'subject','latest','unread','recent','last','first','old',
+        'tell','give','display','return','pull','load','look','search',
+        'api','service','app','tool','integration','and','the',
+      ]);
+      const extractScoutServiceName = (str) => (str || '').toLowerCase().split(/\s+/)
+        .map(w => w.replace(/[^a-z0-9\-]/g, '')).filter(w => w.length >= 3 && !SCOUT_FILLER_WORDS.has(w));
 
       const regDir = findRegistryDir();
       if (regDir) {
@@ -1545,6 +1653,28 @@ CRITICAL rules for skill.md:
         const allMatches = [...cliMatches, ...apiMatches];
 
         if (allMatches.length > 0) {
+          // ── Already-installed check ───────────────────────────────────────────
+          // If any matched provider already has an installed skill (e.g. sendgrid.email),
+          // skip the scout card entirely and use that skill directly.
+          const alreadyInstalled = installedSkillsList.find(s => {
+            const nameLower = s.name.toLowerCase();
+            return allMatches.some(m => {
+              const provLower = m.provider.toLowerCase();
+              return nameLower === provLower ||
+                     nameLower.startsWith(provLower + '.') ||
+                     nameLower.startsWith(provLower + '-');
+            });
+          });
+          if (alreadyInstalled) {
+            logger.info(`[Node:PlanSkills] Scout intercept: "${alreadyInstalled.name}" already installed — using directly, skipping scout card`);
+            const directPlan = [{
+              skill: 'external.skill',
+              args: { name: alreadyInstalled.name },
+              description: `Run installed skill: ${alreadyInstalled.name}`,
+            }];
+            return { ...state, skillPlan: directPlan, skillCursor: 0, scoutPending: false };
+          }
+
           logger.info(`[Node:PlanSkills] Scout intercept: ${allMatches.length} provider(s) found for "${capability || userMessage}" — emitting scout_match`);
 
           if (progressCallback) progressCallback({
@@ -1584,6 +1714,18 @@ CRITICAL rules for skill.md:
       // Static keywords didn't match — try live discovery before falling back to
       // project_build. skill-scout.discover() does: npm search → brew search →
       // LLM validates best candidate → writes result back to registry for caching.
+      //
+      // BROWSER-ONLY SERVICES: OAuth/web services that have no installable CLI/npm
+      // package. Dynamic discovery will always fail for these — skip it entirely
+      // and fall straight through to the browser.act navigate+snapshot+synthesize plan.
+      const BROWSER_ONLY_SERVICES = new Set([
+        'gmail','google','googlemail','slack','discord','telegram','whatsapp',
+        'notion','figma','linear','jira','confluence','airtable','hubspot','salesforce',
+        'twitter','x','facebook','instagram','linkedin','reddit','youtube',
+        'openai','chatgpt','anthropic','claude','gemini','perplexity',
+        'amazon','netflix','spotify','trello','asana','monday','clickup',
+        'dropbox','gdrive','googledrive','onedrive','icloud',
+      ]);
       if (regDir && !suggestionIsBuiltin) {
         try {
           const scoutPath = path.join(regDir, 'skill-scout.cjs');
@@ -1591,15 +1733,15 @@ CRITICAL rules for skill.md:
             // Extract the service name: strip filler words to get the key noun
             // e.g. "send a slack message" → "slack", "stripe payment" → "stripe",
             //      "tic tac toe game" → "tic" (length <4 → skipped → project_build)
-            const FILLER_WORDS = new Set([
-              'a','an','the','send','get','fetch','create','build','make','add','post',
-              'use','using','via','with','from','to','for','of','on','in','at','by',
-              'my','me','this','that','some','new','about','through','into','can',
-              'message','messages','email','emails','sms','text','notification','notifications',
-            ]);
-            const capWords = (capability || userMessage).toLowerCase().split(/\s+/).map(w => w.replace(/[^a-z0-9\-]/g, '')).filter(w => w.length >= 2 && !FILLER_WORDS.has(w));
-            const serviceName = capWords[0] || '';
+            // Priority: use the LLM suggestion first (most accurate), then fall back to capability words.
+            // (SCOUT_FILLER_WORDS and extractScoutServiceName are declared above, in outer scope)
+            const suggestionWords = extractScoutServiceName(suggestion);
+            const capabilityWords = extractScoutServiceName(capability || userMessage);
+            const serviceName = (suggestionWords[0] || capabilityWords[0] || '');
             if (serviceName.length >= 3) {
+              if (BROWSER_ONLY_SERVICES.has(serviceName)) {
+                logger.info(`[Node:PlanSkills] Scout intercept: "${serviceName}" is a browser-only service — skipping dynamic discovery, using browser.act directly`);
+              } else {
               logger.info(`[Node:PlanSkills] Scout intercept: static miss — trying dynamic discovery for "${serviceName}"`);
               const { discover } = require(scoutPath);
               const { cliMatch, apiMatch } = await discover(serviceName, capability || userMessage);
@@ -1635,7 +1777,8 @@ CRITICAL rules for skill.md:
                   commandExecuted: false,
                 };
               }
-              logger.info(`[Node:PlanSkills] Scout intercept: dynamic discovery found nothing for "${serviceName}" — routing to project_build`);
+              logger.info(`[Node:PlanSkills] Scout intercept: dynamic discovery found nothing for "${serviceName}" — falling through to browser.act`);
+              } // end !BROWSER_ONLY_SERVICES check
             }
           }
         } catch (scoutErr) {
@@ -1813,37 +1956,56 @@ CRITICAL rules for skill.md:
         }
       }
 
-      // ── No CLI/API match (static or dynamic) — route to project builder ──────
-      // This capability requires a full app (not a CLI command or REST API call).
-      // Build a self-contained Vite+React+Express project via project.builder.
-      logger.info(`[Node:PlanSkills] Scout intercept: no CLI/API match for "${capability || userMessage}" — routing to project_build`);
-      const projectBuildPlan = [{
-        skill: 'project_build',
-        description: `Building project for: ${capability || userMessage}`,
-        args: {
-          capability: capability || userMessage,
-          description: userMessage,
-          suggestion,
+      // ── No CLI/API match (static or dynamic) — re-ask the LLM with browser.act context ──
+      // The LLM returned needs_skill, but scout found no installable CLI or API.
+      // Re-invoke the LLM with an explicit note that no CLI/API exists so it plans
+      // using browser.act + playwright-cli directly, exactly like "go to ChatGPT and
+      // search for X". The LLM decides the steps — we don't hardcode them here.
+      logger.info(`[Node:PlanSkills] Scout intercept: no CLI/API match — re-planning with browser.act hint for "${capability || userMessage}"`);
+      const browserHintQuery = `TASK: Convert the following user request into a JSON skill plan.
+OS: ${os}
+Home directory: ${homeDir}
+User request: "${userMessage}"
+IMPORTANT: No CLI binary or installable npm/API package was found for this task. Do NOT output needs_skill. Use browser.act with playwright-cli to accomplish the task directly in the browser (navigate, snapshot, interact, synthesize). Plan it exactly like you would for "go to ChatGPT and search for X".${domainContextNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
+
+      const browserHintPayload = {
+        query: browserHintQuery,
+        context: {
+          systemInstructions: effectiveSystemPrompt,
+          conversationHistory: [],
+          sessionId: context?.sessionId,
+          userId: context?.userId,
+          intent: 'command_automate',
         },
-      }];
-      if (progressCallback) progressCallback({
-        type: 'plan_ready',
-        steps: projectBuildPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })),
-        intent: state.intent?.type || 'command_automate',
-      });
-      if (progressCallback) progressCallback({
-        type: 'project_build_start',
-        capability: capability || userMessage,
-        message: 'No CLI or API available — building a custom app for this capability.',
-      });
-      return {
-        ...state,
-        skillPlan: projectBuildPlan,
-        skillCursor: 0,
-        planError: null,
-        recoveryContext: null,
-        pendingSkillName: state.pendingSkillName || null,
+        options: { maxTokens: 2400, temperature: 0.1, fastMode: false },
       };
+      let browserFallbackRaw;
+      try {
+        browserFallbackRaw = await backend.generateAnswer(browserHintQuery, browserHintPayload, browserHintPayload.options, null);
+      } catch (llmErr) {
+        logger.warn(`[Node:PlanSkills] browser.act re-plan LLM call failed: ${llmErr.message}`);
+        browserFallbackRaw = null;
+      }
+      const browserFallbackPlan = browserFallbackRaw ? parsePlan(browserFallbackRaw, logger) : null;
+      if (browserFallbackPlan && Array.isArray(browserFallbackPlan) && browserFallbackPlan.length > 0 &&
+          !browserFallbackPlan.some(s => s.skill === 'needs_skill')) {
+        logger.info(`[Node:PlanSkills] Scout intercept: browser.act re-plan produced ${browserFallbackPlan.length} steps`);
+        if (progressCallback) progressCallback({
+          type: 'plan_ready',
+          steps: browserFallbackPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })),
+          intent: state.intent?.type || 'command_automate',
+        });
+        return {
+          ...state,
+          skillPlan: browserFallbackPlan,
+          skillCursor: 0,
+          scoutPending: false,
+          planError: null,
+          recoveryContext: null,
+        };
+      }
+      // LLM still returned needs_skill or failed — nothing more we can do in this node
+      logger.warn(`[Node:PlanSkills] Scout intercept: browser.act re-plan returned no usable steps — passing through`);
     }
     // ─────────────────────────────────────────────────────────────────────────────
 

@@ -314,8 +314,30 @@ module.exports = async function executeCommand(state) {
     };
   }
 
+  // Write live plan document on every pass so the UI / debugging tools can track progress
+  const { writePlanDoc } = require('../utils/planDocument');
+  writePlanDoc(state, 'start');
+
   // All steps done
   if (skillCursor >= skillPlan.length) {
+    // ── Sub-plan completion check ───────────────────────────────────────────
+    // If we're inside a sub-plan (subPlanStack non-empty), pop back to the
+    // parent plan so execution resumes at the step that triggered the sub-plan
+    // (e.g. the authenticated request that triggered the login sub-plan).
+    const subPlanStackCheck = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
+    if (subPlanStackCheck.length > 0) {
+      const { completeSubPlan } = require('../utils/subPlanEngine');
+      const resumed = completeSubPlan(state);
+      logger.info(`[Node:ExecuteCommand] Sub-plan complete — resuming parent plan at cursor ${resumed.skillCursor}`);
+      return {
+        ...state,
+        ...resumed,           // subPlanStack (popped), skillPlan (parent), skillCursor (failed step)
+        commandExecuted: false,
+        failedStep:      null,
+        activeBrowserSessionId: state.activeBrowserSessionId || null,
+      };
+    }
+
     const completedCount = skillResults.filter(r => r.ok).length;
     logger.debug(`[Node:ExecuteCommand] All ${skillPlan.length} steps complete`);
 
@@ -364,6 +386,9 @@ module.exports = async function executeCommand(state) {
       }
     });
     if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults, savedFilePaths: [...new Set(savedFilePaths)] });
+
+    // Archive the completed plan document
+    writePlanDoc({ ...state, skillResults, skillCursor }, 'complete');
 
     // Build a rich commandOutput summary for the answer node to interpret
     const stepSummaries = skillResults.map((r, i) => {
@@ -434,25 +459,6 @@ module.exports = async function executeCommand(state) {
       commandOutput: stepSummaries,
       activeBrowserSessionId,
       answer
-    };
-  }
-
-  // ── Sub-plan completion check ─────────────────────────────────────────────
-  // Before treating all steps as done (commandExecuted: true), check whether
-  // we are running inside a sub-plan (subPlanStack is non-empty).  If so, pop
-  // back to the parent plan so execution resumes at the step that originally
-  // failed (e.g. the authenticated request that triggered the login sub-plan).
-  const subPlanStack = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
-  if (subPlanStack.length > 0) {
-    const { completeSubPlan } = require('../utils/subPlanEngine');
-    const resumed = completeSubPlan(state);
-    logger.info(`[Node:ExecuteCommand] Sub-plan complete — resuming parent plan at cursor ${resumed.skillCursor}`);
-    return {
-      ...state,
-      ...resumed,           // subPlanStack (popped), skillPlan (parent), skillCursor (failed step)
-      commandExecuted: false,
-      failedStep:      null,
-      activeBrowserSessionId,
     };
   }
 
@@ -566,6 +572,193 @@ module.exports = async function executeCommand(state) {
   }
 
 
+  // ── ask_user pseudo-skill ────────────────────────────────────────────────
+  // Used by buildLoginSubPlan (and general sub-plans) to collect credentials
+  // or other user input mid-execution, then store the answer in state so the
+  // next profile.store_secret step can persist it to keychain safely.
+  //
+  // Uses guide.step style: shows an instruction card with an input field.
+  // The answer is stored in state._gatheredVars[args.varName] for the
+  // following profile.store_secret step to read.
+  if (skill === 'ask_user') {
+    const {
+      question: askQuestion = 'Please provide the required information.',
+      inputHint = 'Your answer',
+      varName,
+      sensitive = false,
+    } = args;
+
+    logger.info(`[Node:ExecuteCommand] ask_user: "${askQuestion.slice(0, 80)}"`);
+
+    const gatherCredentialCallback = state.gatherCredentialCallback || null;
+    let gathered = null;
+
+    if (typeof gatherCredentialCallback === 'function') {
+      try {
+        // Emit gather_credential to show the masked input card in the Queue tab UI
+        // (same pattern as planSkills.js credential gate)
+        if (progressCallback) progressCallback({
+          type: 'gather_credential',
+          credentialKey: varName || inputHint,
+          question: askQuestion,
+          hint: inputHint,
+          sensitive,
+          optional: args.optional || false,
+          stepIndex: skillCursor,
+          totalSteps: skillPlan.length,
+        });
+        // gatherCredentialCallback waits for the user to submit via IPC gather:credential
+        // and returns { stored: boolean, value: string | null }
+        const result = await gatherCredentialCallback(varName || inputHint, {
+          question: askQuestion,
+          hint: inputHint,
+          sensitive,
+        });
+        gathered = result?.value ?? null;
+        if (gathered !== null) {
+          logger.info(`[Node:ExecuteCommand] ask_user: credential received for "${varName}"`);
+          if (progressCallback) progressCallback({ type: 'gather_credential_stored', credentialKey: varName || inputHint });
+        }
+      } catch (cbErr) {
+        logger.warn(`[Node:ExecuteCommand] ask_user: gatherCredentialCallback threw: ${cbErr.message}`);
+      }
+    }
+
+    if (gathered === null) {
+      // No callback — surface as a pendingQuestion (IPC fallback) and pause execution
+      logger.info(`[Node:ExecuteCommand] ask_user: no gatherCredentialCallback — surfacing pendingQuestion`);
+      if (progressCallback) progressCallback({
+        type: 'guide_step',
+        stepIndex: skillCursor,
+        totalSteps: skillPlan.length,
+        instruction: askQuestion,
+        inputHint,
+        sensitive,
+        varName,
+      });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'ask_user', args, description, ok: true, stdout: `[Waiting for user input: ${askQuestion.slice(0, 60)}]` }],
+        skillCursor: skillCursor + 1,
+        commandExecuted: false,
+        pendingQuestion: {
+          question: askQuestion,
+          inputHint,
+          sensitive,
+          varName,
+          options: [],
+        },
+        failedStep: null,
+      };
+    }
+
+    // Store gathered value in transient state for profile.store_secret
+    const updatedGatheredVars = { ...(state._gatheredVars || {}), [varName]: gathered };
+    if (progressCallback) progressCallback({
+      type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length,
+      skill: 'ask_user', description: description || `Collected: ${inputHint}`,
+      stdout: sensitive ? '[credential collected]' : gathered,
+    });
+    return {
+      ...state,
+      _gatheredVars: updatedGatheredVars,
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'ask_user', args, description, ok: true, stdout: sensitive ? '[credential collected]' : `Collected: ${inputHint}` }],
+      skillCursor: skillCursor + 1,
+      failedStep: null,
+    };
+  }
+
+  // ── profile.store_secret pseudo-skill ────────────────────────────────────
+  // Persists a credential collected by ask_user to macOS keychain AND writes a
+  // KEYTAR:<key> pointer to user-memory profile DB. After storing, the value is
+  // accessible via KEYTAR resolution in subsequent browser.act fill steps.
+  //
+  // Args:
+  //   keytarKey  {string}  Key under which to store in keychain (e.g. GMAIL_EMAIL)
+  //   valueVar   {string}  _gatheredVars key where the plaintext value lives
+  //   service    {string}  Service label (e.g. 'gmail') for profile pointer
+  //   label      {string}  Human-readable label (e.g. 'Gmail email')
+  if (skill === 'profile.store_secret') {
+    const { keytarKey, valueVar, service: secretService = '', label: secretLabel = '' } = args;
+    const gatheredVars = state._gatheredVars || {};
+    const secretValue = gatheredVars[valueVar];
+
+    if (!secretValue || !keytarKey) {
+      logger.warn(`[Node:ExecuteCommand] profile.store_secret: missing keytarKey="${keytarKey}" or valueVar="${valueVar}" not in _gatheredVars`);
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'profile.store_secret', args, description, ok: true, stdout: `[Skipped — no value for ${valueVar}]` }],
+        skillCursor: skillCursor + 1,
+        failedStep: null,
+      };
+    }
+
+    try {
+      const { spawnSync } = require('child_process');
+
+      // 1. Store in macOS keychain under thinkdrop service
+      const keychainResult = spawnSync(
+        'security',
+        ['add-generic-password', '-s', 'thinkdrop', '-a', keytarKey, '-w', secretValue, '-U'],
+        { encoding: 'utf8', timeout: 10000 }
+      );
+      if (keychainResult.status !== 0) {
+        logger.warn(`[Node:ExecuteCommand] profile.store_secret: keychain write failed for "${keytarKey}": ${keychainResult.stderr?.trim?.()}`);
+      } else {
+        logger.info(`[Node:ExecuteCommand] profile.store_secret: stored "${keytarKey}" in keychain`);
+      }
+
+      // 2. Write KEYTAR pointer to user-memory profile DB (standard <service>:* key format)
+      if (mcpAdapter && secretService) {
+        // Derive standard service key from keytarKey (e.g. GMAIL_EMAIL → gmail:username)
+        const normalKey = keytarKey.toLowerCase();
+        const profileKey = normalKey.includes('email') || normalKey.includes('username')
+          ? `${secretService.toLowerCase()}:username`
+          : normalKey.includes('password')
+            ? `${secretService.toLowerCase()}:password`
+            : `${secretService.toLowerCase()}:${normalKey.replace(/^[a-z]+_/, '')}`;
+
+        await mcpAdapter.callService('user-memory', 'profile.set', {
+          key:      keytarKey,
+          valueRef: `KEYTAR:${keytarKey}`,
+          service:  secretService,
+          label:    secretLabel || keytarKey,
+        }, { timeoutMs: 5000 }).catch(e => logger.warn(`[Node:ExecuteCommand] profile.store_secret: profile.set failed: ${e.message}`));
+
+        // Also write standard <service>:username / <service>:password pointer
+        if (profileKey !== keytarKey) {
+          await mcpAdapter.callService('user-memory', 'profile.set', {
+            key:      profileKey,
+            valueRef: `KEYTAR:${keytarKey}`,
+            service:  secretService,
+            label:    secretLabel || profileKey,
+          }, { timeoutMs: 5000 }).catch(e => logger.warn(`[Node:ExecuteCommand] profile.store_secret: profile.set (alias) failed: ${e.message}`));
+        }
+      }
+
+      if (progressCallback) progressCallback({
+        type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length,
+        skill: 'profile.store_secret', description: description || `Stored: ${keytarKey}`,
+        stdout: `[credential stored securely: ${keytarKey}]`,
+      });
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'profile.store_secret', args, description, ok: true, stdout: `[credential stored securely: ${keytarKey}]` }],
+        skillCursor: skillCursor + 1,
+        failedStep: null,
+      };
+    } catch (storeErr) {
+      logger.error(`[Node:ExecuteCommand] profile.store_secret threw: ${storeErr.message}`);
+      // Non-fatal — continue execution even if store failed
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'profile.store_secret', args, description, ok: true, stdout: `[credential store failed: ${storeErr.message}]` }],
+        skillCursor: skillCursor + 1,
+        failedStep: null,
+      };
+    }
+  }
+
   // ── api_suggest pseudo-skill ─────────────────────────────────────────────
   // Pauses the plan and surfaces an API-first offer to the user.
   // The LLM uses this when a task is better served by an app's API (e.g. Slack,
@@ -609,6 +802,13 @@ module.exports = async function executeCommand(state) {
   // Surface a clear ask_user card instead.
   if (skill === 'needs_skill') {
     const { capability = 'an unknown capability', suggestion = '' } = args;
+    // If planSkills already set a scout selection card (_isScoutSelect:true), preserve it —
+    // don't overwrite with a plain "Yes, build the skill" card.  The scout card has the
+    // full provider list and will route to the correct provider-selection flow in main.js.
+    if (state.pendingQuestion?._isScoutSelect) {
+      logger.info(`[Node:ExecuteCommand] needs_skill: scout card already pending — preserving scout pendingQuestion for "${capability}"`);
+      return { ...state, commandExecuted: false };
+    }
     const message = `🔧 ThinkDrop needs a custom skill to: **${capability}**${suggestion ? `\n\nSuggested services: ${suggestion}` : ''}\n\nWould you like to build this skill now?`;
     logger.info(`[Node:ExecuteCommand] needs_skill: surfacing capability gap for "${capability}"`);
     if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'needs_skill', description: description || `Skill needed: ${capability}`, stdout: message });
@@ -687,16 +887,42 @@ module.exports = async function executeCommand(state) {
       // registered once per session in getSession(). No eval, no polling, no CSP issues.
       logger.info(`[Node:ExecuteCommand] guide.step: waiting for page trigger on session=${guideSessionId}`);
       let triggered = false;
+      let waitTriggerRaw = null;
 
       try {
-        await mcpAdapter.callService('command', 'command.automate', {
+        const waitTriggerRes = await mcpAdapter.callService('command', 'command.automate', {
           skill: 'browser.act',
           args: { action: 'waitForTrigger', sessionId: guideSessionId, timeoutMs: guideTimeout }
         }, { timeoutMs: guideTimeout + 5000 });
+        waitTriggerRaw = waitTriggerRes?.data || waitTriggerRes;
         triggered = true;
       } catch (err) {
         triggered = true;
         logger.info(`[Node:ExecuteCommand] guide.step: waitForTrigger ended (${err.message?.slice(0, 60)}) — auto-continuing`);
+      }
+
+      // ── Auth wall detection ─────────────────────────────────────────────────
+      // waitForTrigger is aliased to waitForStableText in the command service.
+      // When the browser is on a login/redirect page, waitForStableText returns
+      // quickly with authRequired:true (stable login-page text). This is NOT
+      // a real user interaction — surface it to the user immediately instead of
+      // continuing through guide steps that do nothing.
+      if (waitTriggerRaw?.authRequired) {
+        let friendlyHost = 'the site';
+        try {
+          friendlyHost = new URL(state.activeBrowserUrl || guideUrl || '').hostname.replace(/^www\./, '');
+        } catch (_) {}
+        logger.info(`[Node:ExecuteCommand] guide.step: auth wall on session=${guideSessionId} (${friendlyHost}) — surfacing login requirement`);
+        if (progressCallback) progressCallback({ type: 'all_done', totalCount: skillResults.length + 1, skillResults });
+        return {
+          ...state,
+          answer: `I need you to sign in to **${friendlyHost}** first. The browser opened the login page — please enter your credentials there. Once you're logged in, ask me to retry.`,
+          examineBlocked: true,
+          skillCursor: skillPlan.length,
+          commandExecuted: true,
+          failedStep: null,
+          skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: false, stdout: '[auth wall — login required]', authWall: true }],
+        };
       }
 
       continued = true;
@@ -1682,6 +1908,19 @@ module.exports = async function executeCommand(state) {
     resolvedArgs = JSON.parse(argsJson);
   }
 
+  // Resolve {{service:field}} / {{_varName}} credential tokens and KEYTAR pointer values.
+  // Resolution order: _gatheredVars (in-memory) → keychain template tokens → KEYTAR pointers.
+  // Must run AFTER synthesisAnswer/prev_stdout substitution and BEFORE dispatch.
+  // Never log resolvedArgs after this point as it may contain plaintext credentials.
+  {
+    const { resolveStepCredentials } = require('../utils/resolveStepCredentials');
+    resolvedArgs = await resolveStepCredentials(
+      { ...step, args: resolvedArgs },
+      mcpAdapter,
+      state._gatheredVars || {}
+    );
+  }
+
   // Expand ~ in shell.run argv — the LLM may generate paths with single-quoted tilde
   // (e.g. '~/.thinkdrop/...') which bash cannot expand. Pre-expand here unconditionally.
   if (skill === 'shell.run' && Array.isArray(resolvedArgs.argv)) {
@@ -2164,6 +2403,99 @@ module.exports = async function executeCommand(state) {
       const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
       if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
       return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── Unresolved credential token guard ────────────────────────────────────────
+  // If a browser.act fill step still has a {{service:field}} token in value/text
+  // after resolveStepCredentials ran (meaning the key is NOT in the keychain),
+  // we must NOT type the literal token text into the page.  Instead, treat it
+  // exactly like an auth_wall — spawn a login sub-plan that will ask the user for
+  // credentials, store them, then retry the fill.
+  // Note: {{_varName}} gathered-var tokens are intentionally excluded — those are
+  // handled by the ask_user step and will be resolved when the sub-plan runs.
+  {
+    const SERVICE_CRED_TOKEN = /\{\{[a-z0-9_.-]+:[a-z0-9_]+\}\}/i;
+    const fillVal = resolvedArgs.value ?? resolvedArgs.text ?? '';
+    if (
+      skill === 'browser.act' &&
+      resolvedArgs.action === 'fill' &&
+      typeof fillVal === 'string' &&
+      SERVICE_CRED_TOKEN.test(fillVal)
+    ) {
+      const tokenMatch = fillVal.match(/\{\{([a-z0-9_.-]+):([a-z0-9_]+)\}\}/i);
+      const credService  = tokenMatch?.[1] || 'unknown';
+      const authLoginUrl = state.activeBrowserUrl || resolvedArgs.url || '';
+      logger.warn(`[Node:ExecuteCommand] Unresolved credential token "${tokenMatch?.[0]}" in fill step — routing to auth_wall sub-plan for "${credService}"`);
+      if (progressCallback) progressCallback({
+        type:    'auth_wall_detected',
+        stepIndex: skillCursor,
+        service: credService,
+        message: `Credentials not found for ${credService} — asking user`,
+      });
+      const credFailedStep = {
+        step: skillCursor + 1, skill, args: resolvedArgs, description,
+        ok: false,
+        reason:    'auth_wall',
+        service:   credService,
+        loginUrl:  authLoginUrl,
+        sessionId: resolvedArgs.sessionId || state.activeBrowserSessionId || null,
+        error:     `unresolved_credential: ${tokenMatch?.[0]} not in keychain`,
+      };
+      return {
+        ...state,
+        skillResults:           [...skillResults, credFailedStep],
+        skillCursor,
+        failedStep:             credFailedStep,
+        commandExecuted:        false,
+        activeBrowserSessionId: resolvedArgs.sessionId || state.activeBrowserSessionId || null,
+        activeBrowserUrl:       authLoginUrl || state.activeBrowserUrl,
+      };
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  // ── skipIfEmpty / skipIfPrevEmpty guard ──────────────────────────────────────
+  // Some steps emitted by buildLoginSubPlan are marked optional and should be
+  // quietly skipped when a value was not collected (e.g. 2FA code left blank).
+  //
+  //   step.skipIfEmpty  = true        → skip if resolvedArgs.value is empty/blank
+  //   step.args.skipIfEmpty = true    → same (canonical location)
+  //   step.skipIfPrevEmpty = varName  → skip if state._gatheredVars[varName] is empty
+  //   step.args.skipIfPrevEmpty = v   → same
+  {
+    const gatheredVars = state._gatheredVars || {};
+    const skipIfEmpty = step.skipIfEmpty || args.skipIfEmpty;
+    const skipIfPrevEmpty = step.skipIfPrevEmpty || args.skipIfPrevEmpty;
+
+    const shouldSkipByEmpty = skipIfEmpty &&
+      (!resolvedArgs.value || String(resolvedArgs.value).trim() === '' ||
+       // still has unresolved template token (value was not in gatheredVars or keychain)
+       /^\{\{/.test(String(resolvedArgs.value)));
+
+    const shouldSkipByPrev = skipIfPrevEmpty &&
+      (!gatheredVars[skipIfPrevEmpty] || String(gatheredVars[skipIfPrevEmpty]).trim() === '');
+
+    if (shouldSkipByEmpty || shouldSkipByPrev) {
+      const whySkipped = shouldSkipByEmpty ? 'value is empty' : `"${skipIfPrevEmpty}" not collected`;
+      logger.info(`[Node:ExecuteCommand] Skipping optional step ${skillCursor + 1} (${skill}): ${whySkipped}`);
+      if (progressCallback) progressCallback({
+        type: 'step_skipped', stepIndex: skillCursor, totalSteps: skillPlan.length,
+        skill, description: description || skill, reason: whySkipped,
+      });
+      const skippedResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: true, skipped: true, stdout: `[Skipped: ${whySkipped}]` };
+      const nextCursor = skillCursor + 1;
+      if (nextCursor >= skillPlan.length) {
+        const subPlanStackNow = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
+        if (subPlanStackNow.length > 0) {
+          const { completeSubPlan } = require('./subPlanEngine');
+          const resumed = completeSubPlan({ ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor });
+          return { ...state, ...resumed, commandExecuted: false, failedStep: null };
+        }
+        return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: true, failedStep: null };
+      }
+      return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: false, failedStep: null };
     }
   }
   // ─────────────────────────────────────────────────────────────────────────────
@@ -2713,62 +3045,60 @@ module.exports = async function executeCommand(state) {
       const stepDoneDescription = description || (resolvedSkillName ? `external.skill — ${resolvedSkillName}` : skill);
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepDoneDescription, stdout: stepResult.stdout || stepResult.output, exitCode: stepResult.exitCode });
 
-      // ── Auth wall detected by waitForStableText ───────────────────────────
-      // When waitForStableText returns authRequired:true the page is a login wall.
-      // Record it in the step result and fast-forward past any remaining
-      // fill/press/waitForStableText steps for the same sessionId so the plan
-      // continues to the next site automatically — no user intervention needed.
-      if (skill === 'browser.act' && resolvedArgs.action === 'waitForStableText' && raw.authRequired) {
+      // ── Auth wall detected by waitForStableText or navigate ─────────────────
+      // When waitForStableText (or navigate cold-start) returns authRequired:true
+      // the page is a login wall. Spawn a login sub-plan rather than silently
+      // skipping — this gives the engine a chance to authenticate autonomously
+      // (using stored credentials) or ask the user for credentials (guide.step)
+      // before retrying the original task.
+      const isAuthWallResult = raw.authRequired && (
+        resolvedArgs.action === 'waitForStableText' ||
+        resolvedArgs.action === 'navigate'
+      );
+      if (skill === 'browser.act' && isAuthWallResult) {
         const authSessionId = resolvedArgs.sessionId || '';
+        // Derive the original URL (the service we actually wanted to reach)
+        const navStep = [...skillResults].reverse().find(
+          r => r.skill === 'browser.act' && r.args?.action === 'navigate' && r.args?.sessionId === authSessionId
+        );
+        const authLoginUrl = navStep?.args?.url || resolvedArgs.url || state.activeBrowserUrl || '';
         const authSite = (() => {
-          try {
-            // Try to get site name from the URL of the most recent navigate for this session
-            const navStep = [...skillResults].reverse().find(r => r.skill === 'browser.act' && r.args?.action === 'navigate' && r.args?.sessionId === authSessionId);
-            return new URL(navStep?.args?.url || state.activeBrowserUrl || '').hostname.replace(/^www\./, '');
-          } catch (_) { return authSessionId || 'this site'; }
+          try { return new URL(authLoginUrl).hostname.replace(/^www\./, ''); }
+          catch (_) { return authSessionId || 'this site'; }
         })();
-        logger.info(`[Node:ExecuteCommand] Auth wall on ${authSite} (session=${authSessionId}) — skipping remaining steps for this site`);
 
-        // Patch this step's stdout so synthesize sees a meaningful note, not empty
-        stepResult.stdout = `[Auth wall on ${authSite} — not logged in, no data collected]`;
-        stepResult.authRequired = true;
+        logger.info(`[Node:ExecuteCommand] Auth wall on ${authSite} (session=${authSessionId}) — routing to login sub-plan`);
 
-        // Fast-forward: skip all consecutive fill/press/waitForStableText steps
-        // that follow and target the same sessionId (they would just type into the login form)
-        const SKIPPABLE = new Set(['fill', 'type', 'press', 'click', 'waitForStableText', 'waitForContent', 'waitForSelector']);
-        let lookahead = skillCursor + 1;
-        while (lookahead < skillPlan.length) {
-          const next = skillPlan[lookahead];
-          const nextArgs = next?.args || {};
-          const nextAction = nextArgs.action || '';
-          const nextSession = nextArgs.sessionId || '';
-          // Stop skipping when we hit a different site (tab-new, navigate to new URL, or different sessionId)
-          if (next?.skill !== 'browser.act') break;
-          if (!SKIPPABLE.has(nextAction)) break;
-          if (nextSession && nextSession !== authSessionId) break;
-          logger.info(`[Node:ExecuteCommand] Auth wall skip: step ${lookahead + 1} (${nextAction})`);
-          lookahead++;
-        }
-        // Return updated state jumping past the skipped steps
-        if (lookahead > skillCursor + 1) {
-          const skippedCount = lookahead - skillCursor - 1;
-          const skippedResults = skillPlan.slice(skillCursor + 1, lookahead).map((s, i) => ({
-            step: skillCursor + 2 + i,
-            skill: s.skill,
-            args: s.args || {},
-            ok: true,
-            stdout: `[Skipped — auth wall on ${authSite}]`,
-            description: s.description || null,
-          }));
-          logger.info(`[Node:ExecuteCommand] Auth wall: fast-forwarded ${skippedCount} steps`);
-          return {
-            ...state,
-            skillCursor: lookahead - 1,
-            skillResults: [...updatedResults, ...skippedResults],
-            activeBrowserSessionId,
-            activeBrowserUrl,
-          };
-        }
+        const authWallFailedStep = {
+          step:        skillCursor + 1,
+          skill,
+          args:        resolvedArgs,
+          description,
+          ok:          false,
+          reason:      'auth_wall',
+          service:     authSite,
+          loginUrl:    authLoginUrl,
+          sessionId:   authSessionId,
+          error:       `auth_wall_detected: login required for ${authSite}`,
+          pageContext:  raw.authWallText || raw.result || '',
+        };
+
+        if (progressCallback) progressCallback({
+          type:      'auth_wall_detected',
+          stepIndex: skillCursor,
+          service:   authSite,
+          message:   `Login required for ${authSite} — spawning login sub-plan`,
+        });
+
+        return {
+          ...state,
+          skillResults:            [...skillResults, authWallFailedStep],
+          skillCursor,
+          failedStep:              authWallFailedStep,
+          commandExecuted:         false,
+          activeBrowserSessionId:  authSessionId || state.activeBrowserSessionId,
+          activeBrowserUrl:        authLoginUrl  || state.activeBrowserUrl,
+        };
       }
     }
 
@@ -2974,6 +3304,26 @@ module.exports = async function executeCommand(state) {
     }
 
     const isLastStep = skillCursor + 1 >= (patchedSkillPlan || skillPlan).length;
+
+    // ── Sub-plan last-step pop ────────────────────────────────────────────────
+    // When inside a sub-plan (subPlanStack non-empty) and the last step just
+    // finished, pop back to the parent plan immediately instead of routing to
+    // reviewExecution/all_done.  The parent plan resumes at the step that
+    // originally triggered the sub-plan.
+    if (isLastStep && Array.isArray(state.subPlanStack) && state.subPlanStack.length > 0) {
+      const { completeSubPlan } = require('../utils/subPlanEngine');
+      const resumed = completeSubPlan({ ...state, skillResults: updatedResults });
+      logger.info(`[Node:ExecuteCommand] Sub-plan last-step complete — resuming parent plan at cursor ${resumed.skillCursor}`);
+      return {
+        ...state,
+        ...resumed,        // subPlanStack (popped), skillPlan (parent), skillCursor (retry step)
+        skillResults:      updatedResults,
+        commandExecuted:   false,
+        failedStep:        null,
+        activeBrowserSessionId,
+        activeBrowserUrl,
+      };
+    }
 
     // If this was the last step, emit all_done now (the graph routes to logConversation
     // immediately — it never loops back for a second executeCommand pass, so the

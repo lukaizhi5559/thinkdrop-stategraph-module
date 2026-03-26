@@ -79,22 +79,26 @@ function isLoginSignal(urlOrError) {
 /**
  * Infer a service name from a URL or explicit override.
  * Returns 'unknown' when no match — triggers link-discovery path.
+ * Also normalises domain-style service names (e.g. 'mail.google.com' → 'gmail').
  */
 function inferService(url, knownService) {
+  // Check both the explicit override and the URL against known patterns
+  const check = String(knownService || url || '').toLowerCase();
+  if (check.includes('google') || check.includes('gmail'))      return 'gmail';
+  if (check.includes('github'))                                  return 'github';
+  if (check.includes('twitter') || check.includes('x.com'))     return 'twitter';
+  if (check.includes('slack'))                                   return 'slack';
+  if (check.includes('discord'))                                 return 'discord';
+  if (check.includes('notion'))                                  return 'notion';
+  if (check.includes('microsoft') || check.includes('outlook'))  return 'outlook';
+  if (check.includes('apple') || check.includes('appleid'))      return 'apple';
+  if (check.includes('spotify'))                                 return 'spotify';
+  if (check.includes('instagram'))                               return 'instagram';
+  if (check.includes('linkedin'))                                return 'linkedin';
+  if (check.includes('youtube'))                                 return 'youtube';
+  // If an explicit knownService was given but didn't match patterns above,
+  // use it as-is (lowercased)
   if (knownService) return String(knownService).toLowerCase();
-  const u = String(url || '').toLowerCase();
-  if (u.includes('google') || u.includes('gmail'))     return 'gmail';
-  if (u.includes('github'))                             return 'github';
-  if (u.includes('twitter') || u.includes('x.com'))    return 'twitter';
-  if (u.includes('slack'))                              return 'slack';
-  if (u.includes('discord'))                            return 'discord';
-  if (u.includes('notion'))                             return 'notion';
-  if (u.includes('microsoft') || u.includes('outlook')) return 'outlook';
-  if (u.includes('apple'))                              return 'apple';
-  if (u.includes('spotify'))                            return 'spotify';
-  if (u.includes('instagram'))                          return 'instagram';
-  if (u.includes('linkedin'))                           return 'linkedin';
-  if (u.includes('youtube'))                            return 'youtube';
   return 'unknown';   // → use link-discovery path
 }
 
@@ -182,13 +186,17 @@ function buildLoginSubPlan(opts = {}) {
     loginError                                  = '',
     alreadyOnLoginPage                          = false,
     missingCredentialKeys:  missingKeys          = [],
+    // URL resolved via web search — takes precedence over everything
+    resolvedLoginUrl                             = null,
+    // URL to navigate back to after login succeeds (e.g. mail.google.com after Google auth)
+    destinationUrl                               = '',
   } = opts;
 
   const service  = inferService(rawLoginUrl, rawService);
   const knownUrl = KNOWN_AUTH_URLS[service] || '';
-  // Use the provided URL first; fall back to a known URL; final fallback =
-  // stay on current page and use link-discovery.
-  const startUrl = rawLoginUrl || knownUrl;
+  // Priority: web-search result → known auth URL → raw app URL (e.g. mail.google.com)
+  // The "raw" URL from the plan is often the app domain, not the sign-in form.
+  const startUrl = resolvedLoginUrl || knownUrl || rawLoginUrl;
 
   const { usernameKey, passwordKey } = deriveCredentialKeys(service, startUrl, creds);
 
@@ -221,9 +229,11 @@ function buildLoginSubPlan(opts = {}) {
   // ── Step C: Link-discovery — click "Sign in" if no password field yet ──
   // This covers ANY site: the LLM step uses browser.act's smart element search
   // to find a link whose text matches common login labels, then clicks it.
-  // It is marked optional so it is silently skipped when the password field
-  // is already visible (i.e. the navigate above landed directly on the form).
-  if (!alreadyOnLoginPage) {
+  // Skip when navigating directly to a known OAuth/login page (e.g. Google's
+  // accounts.google.com/signin) — the page IS the form so there's nothing to
+  // click; clicking a sign-in link there would open an unwanted new tab.
+  const startUrlIsLoginPage = isLoginSignal(startUrl) || !!KNOWN_AUTH_URLS[service];
+  if (!alreadyOnLoginPage && !startUrlIsLoginPage) {
     steps.push({
       skill: 'browser.act',
       args: {
@@ -259,7 +269,7 @@ function buildLoginSubPlan(opts = {}) {
       skill: 'ask_user',
       args: {
         question:  `What email or username do you use to sign in to ${svcLabel}?`,
-        inputHint: 'Email / username',
+        inputHint: `Email / username — or just log in manually in the Chrome window that opened`,
         varName:   `_gathered_${usernameKey}`,
       },
       description: `Gather missing email/username for ${service}`,
@@ -293,7 +303,11 @@ function buildLoginSubPlan(opts = {}) {
         'input[placeholder*="username" i]',
         'input[type="text"]:first-of-type',
       ].join(', '),
-      value:       `KEYTAR:${usernameKey}`,
+      // Use gathered var (in-memory, no keychain prompt) when we just asked the user for
+      // this credential; fall back to KEYTAR pointer when it was already stored.
+      value:       missingKeys.includes(usernameKey)
+        ? `{{_gathered_${usernameKey}}}`
+        : `KEYTAR:${usernameKey}`,
       sessionId,
       description: `Enter email or username`,
     },
@@ -330,7 +344,7 @@ function buildLoginSubPlan(opts = {}) {
       skill: 'ask_user',
       args: {
         question:  `What is your password for ${svcLabel}?`,
-        inputHint: 'Password (stored securely — never saved as plain text)',
+        inputHint: `Password (stored securely in macOS Keychain — never saved as plain text). You can also just log in via the browser window instead.`,
         varName:   `_gathered_${passwordKey}`,
         sensitive: true,
       },
@@ -360,7 +374,11 @@ function buildLoginSubPlan(opts = {}) {
         'input[autocomplete="current-password"]',
         'input[placeholder*="password" i]',
       ].join(', '),
-      value:       `KEYTAR:${passwordKey}`,
+      // Use gathered var (in-memory, no keychain prompt) when we just asked the user for
+      // this credential; fall back to KEYTAR pointer when it was already stored.
+      value:       missingKeys.includes(passwordKey)
+        ? `{{_gathered_${passwordKey}}}`
+        : `KEYTAR:${passwordKey}`,
       sessionId,
       description: `Enter password`,
     },
@@ -453,7 +471,76 @@ function buildLoginSubPlan(opts = {}) {
     optional:    true,
   });
 
+  // ── Step K: Wait for post-login page to stabilise ─────────────────────
+  // After form submit (and optional 2FA), wait for navigation to settle.
+  // Detects if we landed on another auth page (redirect loops) or the dashboard.
+  steps.push({
+    skill: 'browser.act',
+    args: {
+      action:        'waitForStableText',
+      timeoutMs:     20000,
+      settleMs:      1500,
+      sessionId,
+      description:   'Wait for post-login page to stabilise',
+    },
+    description: 'Wait for post-login navigation to settle',
+    optional:    true,
+  });
+
+  // ── Step K+: Navigate back to the original destination ───────────────
+  // After OAuth/login the browser may have landed on an account settings page
+  // (e.g. myaccount.google.com) rather than the user's intended destination.
+  // If a destinationUrl was captured from the parent plan, navigate there now.
+  if (destinationUrl && destinationUrl !== startUrl) {
+    steps.push({
+      skill: 'browser.act',
+      args: {
+        action:      'navigate',
+        url:         destinationUrl,
+        sessionId,
+        description: `Navigate to original destination after login`,
+      },
+      description: `Navigate to ${destinationUrl} (original goal after login)`,
+      optional:    true,
+    });
+    steps.push({
+      skill: 'browser.act',
+      args: {
+        action:    'waitForStableText',
+        timeoutMs: 15000,
+        settleMs:  1500,
+        sessionId,
+        description: 'Wait for destination page to settle after navigation',
+      },
+      description: 'Wait for destination page to settle',
+      optional:    true,
+    });
+  }
+
+  // ── Step L: Persist session cookies so future runs skip the login form ─
+  // Writes cookies + localStorage to ~/.thinkdrop/browser-sessions/<sessionId>.json
+  // so `hasSession: true` can be passed next time to restore auth instantly.
+  if (sessionId) {
+    const os   = require('os');
+    const path = require('path');
+    const sessionFile = path.join(
+      os.homedir(), '.thinkdrop', 'browser-sessions',
+      `${sessionId.replace(/[^a-zA-Z0-9-_]/g, '_')}.json`
+    );
+    steps.push({
+      skill: 'browser.act',
+      args: {
+        action:    'state-save',
+        filePath:  sessionFile,
+        sessionId,
+        description: `Save ${service} browser session after login`,
+      },
+      description: `Persist ${service} session cookies to disk`,
+      optional:    true,
+    });
+  }
+
   return steps;
 }
 
-module.exports = { buildLoginSubPlan, isLoginSignal, inferService, deriveCredentialKeys };
+module.exports = { buildLoginSubPlan, isLoginSignal, inferService, deriveCredentialKeys, KNOWN_AUTH_URLS };

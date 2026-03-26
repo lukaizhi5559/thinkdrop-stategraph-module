@@ -25,6 +25,7 @@ const parseSkillNode = require('./nodes/parseSkill');
 const synthesizeNode = require('./nodes/synthesize');
 const enrichIntentNode = require('./nodes/enrichIntent');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
+const reviewExecutionNode = require('./nodes/reviewExecution');
 const creatorPlanningNode = require('./nodes/creatorPlanning');
 const gatherContextNode = require('./nodes/gatherContext');
 const appControlNode = require('./nodes/appControl');
@@ -181,6 +182,7 @@ class StateGraphBuilder {
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter, llmBackend }),
       recoverSkill: (state) => recoverSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       evaluateSkills: (state) => evaluateSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
+      reviewExecution: (state) => reviewExecutionNode({ ...state, logger, mcpAdapter, llmBackend }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
       synthesize: (state) => synthesizeNode({ ...state, logger, mcpAdapter, llmBackend }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -312,14 +314,33 @@ class StateGraphBuilder {
         if (state.failedStep) {
           return 'recoverSkill';
         }
+        // Scout card is waiting for user provider selection — stop looping, surface ASK_USER
+        if (state.scoutPending || state.pendingQuestion?._isScoutSelect) {
+          return 'logConversation';
+        }
         // More steps remaining — loop back
         if (Array.isArray(state.skillPlan) && state.skillCursor < state.skillPlan.length) {
           return 'executeCommand';
         }
-        // All steps done — evaluate result quality before logging
+        // All steps done — review outcomes before quality evaluation
         if (state.commandExecuted || state.answer) {
-          return 'evaluateSkills';
+          return 'reviewExecution';
         }
+        return 'reviewExecution';
+      },
+
+      // reviewExecution: FAILED → re-execute patched step, ASK_USER → surface to user, else → evaluateSkills
+      reviewExecution: (state) => {
+        const verdict = state.reviewVerdict;
+        if (verdict === 'FAILED') {
+          logger.info(`[StateGraph:Router] reviewExecution FAILED → executeCommand (retry with patch)`);
+          return 'executeCommand';
+        }
+        if (verdict === 'ASK_USER') {
+          logger.info('[StateGraph:Router] reviewExecution ASK_USER → logConversation');
+          return 'logConversation';
+        }
+        // UNVERIFIABLE or VERIFIED — proceed to content quality evaluation
         return 'evaluateSkills';
       },
 
