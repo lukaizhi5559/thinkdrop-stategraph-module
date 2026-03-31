@@ -191,6 +191,40 @@ module.exports = async function parseSkill(state) {
     }
   }
 
+  // ── Strategy 2.8: diagnostic/repair intent → prefer debug/repair skills ──────────
+  // "why is my calendar broken" must route to oauth.debug, NOT gcal.event.
+  // The LLM semantic match (Strategy 3) misroutes these because the service keyword
+  // ("calendar") dominates over the diagnostic intent. Catch them deterministically:
+  // if the message signals that something is broken/needs fixing, AND an installed
+  // skill whose name contains "debug"/"repair"/"diagnose"/"health" has at least one
+  // meaningful word in common with the message, prefer that skill.
+  {
+    const DIAGNOSTIC_INTENT_RE = /\b(why\s+(is|are|isn'?t|aren'?t|won'?t|doesn'?t|can'?t)|broken[\s?!]|(isn'?t|not|won'?t|doesn'?t)\s+work(ing)?|fix\s+(my|this|the)|debug\s+(my|this|the)|diagnose|repair\s+(my|this|the)|what'?s\s+wrong|something'?s\s+(wrong|off|broken)|keep(s)?\s+(failing|breaking|erroring|looping))\b/i;
+    const DIAGNOSTIC_NAME_MARKERS = ['debug', 'repair', 'diagnose', 'health'];
+
+    if (DIAGNOSTIC_INTENT_RE.test(classifyMessage) && !userWantsToCreate) {
+      const diagSkills = installedSkills.filter(s =>
+        DIAGNOSTIC_NAME_MARKERS.some(m => s.name.toLowerCase().includes(m))
+      );
+      if (diagSkills.length > 0) {
+        const msgTokens = new Set(
+          classifyMessage.toLowerCase().split(/\W+/).filter(w => w.length > 3)
+        );
+        const scored = diagSkills.map(s => {
+          const descWords = (s.description || s.summary || '').toLowerCase().split(/\W+/);
+          const overlap = descWords.filter(w => w.length > 3 && msgTokens.has(w)).length;
+          return { skill: s, overlap };
+        }).sort((a, b) => b.overlap - a.overlap);
+
+        if (scored[0] && scored[0].overlap >= 1) {
+          const best = scored[0].skill;
+          logger.info(`[Node:ParseSkill] Diagnostic-intent match: "${classifyMessage.substring(0, 60)}" → skill "${best.name}" (overlap=${scored[0].overlap})`);
+          return _matchedState(state, best.name);
+        }
+      }
+    }
+  }
+
   // ── Strategy 3: LLM semantic match ──────────────────────────────────────────
   // Only fires when both string strategies miss AND we have an LLM backend.
   // Builds a compact skill menu (name + description) and asks the LLM for a

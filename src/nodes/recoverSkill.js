@@ -143,6 +143,56 @@ module.exports = async function recoverSkill(state) {
     return state;
   }
 
+  // ── OAuth failure short-circuit ───────────────────────────────────────────
+  // When a skill fails because it has no token or the wrong scopes, the LLM
+  // cannot auto-patch it — only reconnecting via the Skills tab can fix it.
+  // Skip the full recover pipeline and surface a direct actionable message.
+  // Also return triggerOAuthRepair so main.js auto-runs the scope repair.
+  if (failedStep.needsOAuth) {
+    const skillLabel = failedStep.args?.name
+      || (failedStep.skill === 'external.skill' ? null : failedStep.skill)
+      || 'this skill';
+    const oauthMsg = `I\'ve started scanning **${skillLabel}** to detect the required OAuth permissions. Once the repair finishes:\n\n1. Open the **Skills** tab\n2. Find **${skillLabel}** — the scopes should now be populated\n3. Click **Reconnect** to grant access, then try again`;
+    logger.info(`[Node:RecoverSkill] OAuth failure for "${skillLabel}" — triggering auto-repair + surfacing Skills tab guidance`);
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      triggerOAuthRepair: { skillName: skillLabel },
+      pendingQuestion: {
+        question: oauthMsg,
+        _isOAuthGuidance: true,
+      },
+      commandExecuted: false,
+    };
+  }
+
+  // ── shell.run 403 OAuth scope error ──────────────────────────────────────
+  // When shell.run exits 0 but the API returns 403 "insufficient authentication
+  // scopes", the token exists but was granted too few scopes. The LLM cannot
+  // fix this — only a reconnect with the correct scopes can.
+  // Extract the skill name from the bash command's token-file path reference.
+  const isShellRun403 =
+    failedStep.skill === 'shell.run' &&
+    /403|insufficient.*scope|invalid authentication credentials/i.test(failedStep.error || '');
+  if (isShellRun403) {
+    const argv = (failedStep.args?.argv || []).join(' ');
+    const tokenMatch = argv.match(/tokens\/([a-zA-Z0-9._-]+)\.json/) ||
+                       argv.match(/skill:([a-zA-Z0-9._-]+):/);
+    const skillLabel = tokenMatch ? tokenMatch[1] : 'this skill';
+    const oauthMsg = `I've started scanning **${skillLabel}** to detect the required OAuth permissions. Once the repair finishes:\n\n1. Open the **Skills** tab\n2. Find **${skillLabel}** — the scopes should now be populated\n3. Click **Reconnect** to grant access with the detected permissions, then try again`;
+    logger.info(`[Node:RecoverSkill] shell.run 403 OAuth scope error for "${skillLabel}" — triggering auto-repair`);
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      triggerOAuthRepair: { skillName: skillLabel },
+      pendingQuestion: {
+        question: oauthMsg,
+        _isOAuthGuidance: true,
+      },
+      commandExecuted: false,
+    };
+  }
+
   logger.debug(`[Node:RecoverSkill] Recovering from: ${failedStep.skill} — ${failedStep.error}`);
 
   // Update plan document to reflect the failed step and recovery attempt

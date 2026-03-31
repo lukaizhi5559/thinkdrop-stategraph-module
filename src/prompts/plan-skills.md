@@ -107,6 +107,10 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 
 **`synthesize` ordering rule — CRITICAL:** Place ALL `synthesize` steps AFTER all data-collection steps (browser.act, shell.run, getPageText, waitForStableText) are complete. **NEVER interleave `synthesize` between browser steps on different sites.** Wrong: [chatgpt scrape → synthesize → gmail scrape → synthesize]. Right: [chatgpt scrape → gmail scrape → synthesize all → send].
 
+**API shell.run rule — CRITICAL:** When `shell.run` calls an external API endpoint (URL containing `http`, a bearer token, or a known CLI tool like `gcalcli`, `gh`, `git`) and is expected to return structured data (JSON, table), you MUST append a `synthesize` step. The `args.prompt` must describe what to present in plain English (e.g. `"List each event with title, date/time, and location in a readable format"`). Omitting `synthesize` after an API call will show the user a raw JSON blob — this is always wrong.
+
+**OAuth token rule — CRITICAL:** When calling any OAuth-authenticated API via `shell.run bash -c`, ALWAYS use the pre-injected env var `$<PROVIDER>_ACCESS_TOKEN` — where `<PROVIDER>` is the uppercased provider name (e.g. `$GOOGLE_ACCESS_TOKEN` for Google APIs, `$SLACK_ACCESS_TOKEN` for Slack, `$GITHUB_ACCESS_TOKEN` for GitHub, `$NOTION_ACCESS_TOKEN` for Notion, `$MICROSOFT_ACCESS_TOKEN` for Microsoft). **NEVER read from `~/.thinkdrop/tokens/*.json` files directly** — those files may contain stale access tokens. The env vars are automatically refreshed and injected by the runtime before every shell.run call. Example: `-H "Authorization: Bearer $GOOGLE_ACCESS_TOKEN"` not `$(python3 -c "...json.load(open('$TOKEN_FILE'))...")`. **Enforcement: any shell.run step whose script reads from `~/.thinkdrop/tokens/` is rejected by the runtime validator — it will fail immediately and require recovery.**
+
 ## Python scripts for data and file tasks
 
 Python is the preferred tool for: file patching, JSON/CSV/Excel mutation, data analysis, complex conditional logic, and any task requiring packages. Use bash only for simple single-command system ops.

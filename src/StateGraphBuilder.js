@@ -10,6 +10,7 @@
 
 const StateGraph = require('./core/StateGraph');
 const MockMCPAdapter = require('./adapters/MockMCPAdapter');
+const decomposePromptNode = require('./nodes/decomposePrompt');
 const parseIntentNode = require('./nodes/parseIntent');
 const answerNode = require('./nodes/answer');
 const retrieveMemoryNode = require('./nodes/retrieveMemory');
@@ -167,6 +168,7 @@ class StateGraphBuilder {
     
     // Full nodes with intent-based routing
     const nodes = {
+      decomposePrompt: (state) => decomposePromptNode({ ...state, logger, llmBackend }),
       resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter }),
       parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -193,7 +195,8 @@ class StateGraphBuilder {
     
     // Intent-based routing (matches DistilBERT classifier intents)
     const edges = {
-      start: 'resolveReferences',
+      start: 'decomposePrompt',
+      decomposePrompt: 'resolveReferences',
       resolveReferences: 'parseSkill',
       parseSkill: (state) => {
         // If parseSkill matched an installed skill, skip parseIntent entirely

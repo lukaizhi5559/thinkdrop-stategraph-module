@@ -844,8 +844,16 @@ Task: "${userMessage}"`;
       const scData = scRes?.data || scRes;
       const contractMd = scData?.contractMd || scData?.contract_md || '';
       if (contractMd && contractMd.trim()) {
-        skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands or ## Plan section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step. It is NOT a dispatchable skill.\n3. FORBIDDEN: Do NOT use external.skill for this.\n4. The ONLY way to execute this skill is via shell.run with the curl command shown in the contract.\n\n${contractMd.slice(0, 3000)}`;
-        logger.info(`[Node:PlanSkills] Injected contract_md for matched skill "${state.matchedSkillName}" (${contractMd.length} chars)`);
+        // Detect exec_type from frontmatter — node skills must use external.skill, not shell.run
+        const _fmMatch = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
+        const _isNodeSkill = _fmMatch && /exec_type:\s*node\b/i.test(_fmMatch[1]);
+
+        if (_isNodeSkill) {
+          skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is a Node.js runtime skill (exec_type: node). Generate a SINGLE step: { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n2. You MAY include additional args to pass context (e.g. { "name": "${state.matchedSkillName}", "action": "diagnose" }).\n3. FORBIDDEN: Do NOT generate shell.run or curl steps — this skill runs as a Node.js module.\n4. FORBIDDEN: Do NOT use "${state.matchedSkillName}" directly as the skill type in any step.\n\n${contractMd.slice(0, 2000)}`;
+        } else {
+          skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands or ## Plan section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step. It is NOT a dispatchable skill.\n3. FORBIDDEN: Do NOT use external.skill for this.\n4. The ONLY way to execute this skill is via shell.run with the curl command shown in the contract.\n\n${contractMd.slice(0, 3000)}`;
+        }
+        logger.info(`[Node:PlanSkills] Injected contract_md for matched skill "${state.matchedSkillName}" (${contractMd.length} chars, exec_type: ${_isNodeSkill ? 'node' : 'shell'})`);
       }
     } catch (scErr) {
       logger.warn(`[Node:PlanSkills] Could not fetch contract_md for "${state.matchedSkillName}": ${scErr.message}`);

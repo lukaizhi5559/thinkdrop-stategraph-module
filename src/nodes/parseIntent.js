@@ -23,6 +23,63 @@ module.exports = async function parseIntent(state) {
     return state;
   }
 
+  // ── Multi-intent plan: process sub-prompts produced by decomposePrompt ──────
+  // When decomposePrompt detected a complex/multi-intent message and produced an
+  // intentPlan, we classify each sub-prompt independently:
+  //   - Sub-prompt [0]: run through THIS full function (recursive, no intentPlan) so all
+  //     hard overrides and DistilBERT operate on the clean, focused sub-prompt text.
+  //   - Sub-prompts [1..N]: quick phi4 classification (already short, focused) → intentQueue.
+  // The original message is preserved in state.originalPrompt for context/logging.
+  if (state.intentPlan && Array.isArray(state.intentPlan) && state.intentPlan.length > 1) {
+    logger.info(`[Node:ParseIntent] intentPlan detected (${state.intentPlan.length} sub-prompts) — processing multi-intent pipeline`);
+
+    const firstSub = state.intentPlan[0];
+
+    // Classify first sub-prompt through the full parseIntent logic
+    const firstResult = await module.exports({
+      ...state,
+      message:        firstSub.text,
+      resolvedMessage: firstSub.text,
+      intentPlan:     null,   // prevent infinite recursion
+      carriedIntent:  null,   // suppress prior carriedIntent — sub-prompts are self-contained
+    });
+
+    // Classify remaining sub-prompts via phi4 directly
+    const intentQueue = [];
+    for (const subPrompt of state.intentPlan.slice(1)) {
+      let classifiedIntent = subPrompt.estimatedIntent;
+      let classifiedConf   = 0.65;
+
+      if (mcpAdapter) {
+        try {
+          const r = await mcpAdapter.callService('phi4', 'intent.parse', {
+            message: subPrompt.text,
+            context: { sessionId: state.context?.sessionId, userId: state.context?.userId },
+          });
+          const d = r?.data || r;
+          if (d?.intent) {
+            classifiedIntent = d.intent;
+            classifiedConf   = d.confidence || 0.65;
+          }
+        } catch (e) {
+          logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] classification error: ${e.message}`);
+        }
+      }
+
+      intentQueue.push({ ...subPrompt, intent: classifiedIntent, confidence: classifiedConf });
+      logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] "${subPrompt.text.slice(0, 60)}" → ${classifiedIntent} (${classifiedConf.toFixed(2)})`);
+    }
+
+    return {
+      ...firstResult,
+      intentQueue,
+      intentResults:  [],
+      dataContext:    {},
+      isMultiIntent:  true,
+      originalPrompt: state.message,
+    };
+  }
+
   // Prefer coreference-resolved message for classification
   // NOTE: declared as let so the non-English translation block can update it before phi4.
   let classifyMessage = resolvedMessage || message;

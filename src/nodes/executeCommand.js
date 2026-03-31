@@ -857,7 +857,7 @@ module.exports = async function executeCommand(state) {
 
     if (!instruction) {
       logger.warn('[Node:ExecuteCommand] guide.step: missing instruction — skipping');
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'guide.step', description: description || 'Guide step', stdout: 'Skipped (no instruction)' });
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'guide.step', description: description || 'Guide step', stdout: 'Skipped (no instruction)', instruction: '' });
       return {
         ...state,
         skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'Skipped (no instruction)' }],
@@ -1000,7 +1000,7 @@ module.exports = async function executeCommand(state) {
               logger.info(`[Node:ExecuteCommand] Post-nav rescan: same page path (hash change only) — continuing plan`);
               return {
                 ...state,
-                skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing' }],
+                skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing', instruction: instruction || '' }],
                 skillCursor: skillCursor + 1,
                 activeBrowserUrl: newPageUrl,
                 activeBrowserPageElements: { url: newPageUrl, elements: els },
@@ -1010,7 +1010,7 @@ module.exports = async function executeCommand(state) {
             }
 
             // Real page change — force a replan with real elements from the new page.
-            const updatedResults = [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing' }];
+            const updatedResults = [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing', instruction: instruction || '' }];
             const replanSignal = {
               step: skillCursor + 1,
               skill: 'guide.step',
@@ -1052,11 +1052,11 @@ module.exports = async function executeCommand(state) {
       }
     }
 
-    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'guide.step', description: description || 'Guide step', stdout: 'User action detected — continuing' });
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'guide.step', description: description || 'Guide step', stdout: 'User action detected — continuing', instruction: instruction || '' });
 
     return {
       ...state,
-      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing' }],
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing', instruction: instruction || '' }],
       skillCursor: skillCursor + 1,
       commandExecuted: false
     };
@@ -1599,7 +1599,7 @@ module.exports = async function executeCommand(state) {
     // Gather all getPageText results from prior steps
     logger.debug(`[Node:ExecuteCommand] synthesize: skillResults has ${skillResults.length} entries`);
     skillResults.forEach((r, i) => {
-      logger.debug(`[Node:ExecuteCommand]   [${i}] skill=${r.skill} action=${r.args?.action} ok=${r.ok} result=${r.result ? String(r.result).substring(0, 80) : 'null'}`);
+      logger.debug(`[Node:ExecuteCommand]   [${i}] skill=${r.skill} action=${r.args?.action} ok=${r.ok} stdout_len=${r.stdout?.length ?? 'null'} result=${r.result ? String(r.result).substring(0, 80) : 'null'}`);
     });
     const pageTextResults = skillResults
       .filter(r => r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText') && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0)
@@ -1610,6 +1610,135 @@ module.exports = async function executeCommand(state) {
     const shellStdoutResults = skillResults
       .filter(r => r.skill === 'shell.run' && r.ok && r.stdout && r.stdout.trim().length > 0)
       .map(r => `=== Shell output (${r.description || r.args?.cmd || 'shell.run'}) ===\n${r.stdout}`);
+
+    // ── Full-fidelity API response handling ──────────────────────────────────
+    // Never truncate — write every large JSON response to ~/.thinkdrop/tmp/ in
+    // full so no data is ever lost. Then use a size-gated strategy for context:
+    //   Small  (<  5K): use raw string — no processing needed
+    //   Medium (5K–60K): field-prune in JS to strip universal noise fields
+    //   Large  (> 60K): write to disk, preview first 50 items here, then run
+    //                   an async chunk+filter LLM pass inside if(llmBackend)
+    const _synthFs   = require('fs');
+    const _synthPath = require('path');
+    const _synthOs   = require('os');
+    const _apiTmpDir = _synthPath.join(_synthOs.homedir(), '.thinkdrop', 'tmp');
+
+    // Ensure tmp dir exists
+    try { if (!_synthFs.existsSync(_apiTmpDir)) _synthFs.mkdirSync(_apiTmpDir, { recursive: true }); } catch (_) {}
+
+    // Lazy cleanup: remove api-*.json files older than 30 minutes on each run
+    try {
+      const _ttlCutoff = Date.now() - 30 * 60 * 1000;
+      _synthFs.readdirSync(_apiTmpDir)
+        .filter(f => f.startsWith('api-') && f.endsWith('.json'))
+        .forEach(f => {
+          try {
+            const _fp = _synthPath.join(_apiTmpDir, f);
+            if (_synthFs.statSync(_fp).mtimeMs < _ttlCutoff) {
+              _synthFs.unlinkSync(_fp);
+              logger.debug(`[synthesize] tmp cleanup: deleted ${f}`);
+            }
+          } catch (_) {}
+        });
+    } catch (_e) { logger.warn('[synthesize] tmp cleanup error:', _e.message); }
+
+    // Recursively strip universally noisy API metadata fields + overly-long strings
+    const _PRUNED_FIELDS = new Set([
+      'etag', 'kind', 'iCalUID', 'htmlLink', 'selfLink', 'calendarId',
+      'recurringEventId', 'originalStartTime', 'visibility', 'guestsCanInviteOthers',
+      'guestsCanModify', 'guestsCanSeeOtherGuests', 'reminders', 'eventType',
+      'sequence', 'created', 'updated', 'creator', 'organizer',
+      'conferenceData', 'extendedProperties',
+    ]);
+    const _KEEP_LONG_FIELDS = new Set([
+      'summary', 'title', 'description', 'body', 'name',
+      'displayName', 'text', 'content', 'subject', 'message',
+    ]);
+    function _pruneApiObject(obj) {
+      if (Array.isArray(obj)) return obj.map(_pruneApiObject);
+      if (obj && typeof obj === 'object') {
+        const out = {};
+        for (const [k, v] of Object.entries(obj)) {
+          if (_PRUNED_FIELDS.has(k)) continue;
+          if (typeof v === 'string' && v.length > 400 && !_KEEP_LONG_FIELDS.has(k)) continue;
+          out[k] = _pruneApiObject(v);
+        }
+        return out;
+      }
+      return obj;
+    }
+
+    const _SMALL_THRESHOLD  =  5000; // < 5K: use raw
+    const _MEDIUM_THRESHOLD = 60000; // 5K–60K: field prune; > 60K: chunk+filter
+    const _CHUNK_PAGE_SIZE  =    50; // items per LLM filter page
+
+    // Populated below for large responses — consumed in the if(llmBackend) block
+    const _shellTmpFiles = [];
+
+    // Helper: extract the primary items array from a plain array or wrapped object
+    function _extractItemsArray(p) {
+      if (Array.isArray(p)) return p;
+      const k = Object.keys(p).find(key => Array.isArray(p[key]) && p[key].length > 0);
+      return k ? p[k] : null;
+    }
+
+    const processedShellResults = shellStdoutResults.map(s => {
+      const headerMatch = s.match(/^(=== Shell output[^\n]*\n)([\s\S]*)$/);
+      if (!headerMatch) return s;
+      const header = headerMatch[1];
+      const body   = headerMatch[2].trim();
+
+      if (!body.startsWith('[') && !body.startsWith('{')) return s; // not JSON
+
+      let parsed;
+      try { parsed = JSON.parse(body); } catch (_) { return s; }
+
+      const rawSize = body.length;
+
+      // Write full response to disk for any non-trivial JSON (zero data loss)
+      let tmpFilePath = null;
+      if (rawSize > _SMALL_THRESHOLD) {
+        try {
+          const rawSlug = (header.match(/\(([^)]+)\)/) || ['', 'api'])[1]
+            .toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40).replace(/-+$/, '');
+          tmpFilePath = _synthPath.join(_apiTmpDir, `api-${rawSlug}-${Date.now()}.json`);
+          _synthFs.writeFileSync(tmpFilePath, body, 'utf8');
+          logger.debug(`[synthesize] wrote API response (${rawSize} chars) → ${tmpFilePath}`);
+        } catch (e) { logger.warn('[synthesize] tmp write failed:', e.message); }
+      }
+
+      if (rawSize <= _SMALL_THRESHOLD) return s; // Small: use raw, no processing
+
+      if (rawSize <= _MEDIUM_THRESHOLD) {
+        // Medium: field-prune in JS — keeps all items, just removes metadata fat
+        try {
+          const pruned    = _pruneApiObject(parsed);
+          const prunedStr = JSON.stringify(pruned, null, 2);
+          logger.debug(`[synthesize] field-pruned: ${rawSize} → ${prunedStr.length} chars`);
+          return header + prunedStr;
+        } catch (_) { return s; }
+      }
+
+      // Large: preview first 50 pruned items now; schedule remaining for async chunk+filter
+      const items = _extractItemsArray(parsed);
+      if (items && items.length > 0) {
+        const totalItems = items.length;
+        const preview    = _pruneApiObject(items.slice(0, _CHUNK_PAGE_SIZE));
+        const previewStr = JSON.stringify(preview, null, 2);
+        if (totalItems > _CHUNK_PAGE_SIZE && tmpFilePath) {
+          _shellTmpFiles.push({ path: tmpFilePath, parsed, header, totalItems });
+        }
+        const note = totalItems > _CHUNK_PAGE_SIZE
+          ? `\n\n// Large response: ${totalItems} items total — previewing first ${_CHUNK_PAGE_SIZE}; additional relevant items injected via chunk+filter pass below`
+          : '';
+        return header + previewStr + note;
+      }
+
+      // Large non-array object: field-prune best-effort
+      try {
+        return header + JSON.stringify(_pruneApiObject(parsed), null, 2);
+      } catch (_) { return s; }
+    });
 
     // Include web.crawl results — the crawled page content is essential for
     // synthesize steps that generate skill.md from API documentation
@@ -1658,7 +1787,7 @@ module.exports = async function executeCommand(state) {
 
     const allContextParts = [
       ...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`),
-      ...shellStdoutResults,
+      ...processedShellResults,
       ...webCrawlResults,
       ...fileBridgeResults,
       ...fsReadResults,
@@ -1681,11 +1810,12 @@ module.exports = async function executeCommand(state) {
 
     const _rawSynthesisContext = allContextParts.length > 0
       ? allContextParts.join('\n\n')
-      : crossTurnContext || skillResults.filter(r => r.ok && r.result).map(r => String(r.result)).join('\n\n');
+      : crossTurnContext || skillResults.filter(r => r.ok && (r.result || r.stdout)).map(r => String(r.result || r.stdout)).join('\n\n');
     // Cap context to ~60k chars (~15k tokens) to prevent LLM context overflow on large fs.read/explore results.
     // Trim from the middle so we keep the directory tree (start) and most recent file content (end).
     const _SYNTH_CTX_LIMIT = 60000;
-    const synthesisContext = _rawSynthesisContext.length > _SYNTH_CTX_LIMIT
+    // Note: kept as `let` so the chunk+filter pass below can append filtered items
+    let synthesisContext = _rawSynthesisContext.length > _SYNTH_CTX_LIMIT
       ? (() => {
           const half = Math.floor(_SYNTH_CTX_LIMIT / 2);
           const trimmed = _rawSynthesisContext.slice(0, half) + '\n\n[... content truncated for length ...]\n\n' + _rawSynthesisContext.slice(_rawSynthesisContext.length - half);
@@ -1728,6 +1858,48 @@ module.exports = async function executeCommand(state) {
       const hasImageAnalysis = imageAnalyzeResults.length > 0 || crossTurnContext.includes('Image analysis:');
       const _editKeywords = /\b(edit|modify|update|change|replace|rewrite|add|remove|delete|insert|append|fix|correct|rename|move|sort|format|clean up)\b/i;
       const isFileEdit = hasFileContent && _editKeywords.test(synthesisPrompt);
+      // Detect when shell output is raw JSON from an API call (e.g. GitHub REST API, curl)
+      // — needs different synthesis instructions than plain file content
+      const _isJsonShellOutput = shellStdoutResults.some(s => /=== Shell output[^\n]*\n\s*[\[{]/.test(s));
+
+      // ── User question — used by chunk+filter pass and synthesis prompt ────
+      const _userQuestion = state.originalMessage || state.resolvedMessage || state.message || synthesisPrompt;
+
+      // ── Chunk+filter pass for large API responses (> 60K) ─────────────────
+      // Pages through items that didn't fit in the initial 50-item preview and
+      // asks the LLM (fast mode) which ones are relevant to the user's question.
+      // Only runs when _shellTmpFiles was populated in the processedShellResults pass.
+      if (_shellTmpFiles.length > 0) {
+        for (const { parsed, header, totalItems } of _shellTmpFiles) {
+          const items = _extractItemsArray(parsed);
+          if (!items) continue;
+          const _relevantItems = [];
+          // Start from _CHUNK_PAGE_SIZE — the first page is already in the preview
+          for (let _ci = _CHUNK_PAGE_SIZE; _ci < items.length; _ci += _CHUNK_PAGE_SIZE) {
+            const page      = items.slice(_ci, _ci + _CHUNK_PAGE_SIZE);
+            const prunedPg  = _pruneApiObject(page);
+            const filterPmt = `The user asked: "${_userQuestion}"\n\nBelow are ${page.length} items (items ${_ci}–${_ci + page.length - 1} of ${totalItems} total) from an API response. Return ONLY the JSON array of items from this page that are relevant to the user's question. If none are relevant return []. Output ONLY valid JSON, no explanation.\n\n${JSON.stringify(prunedPg, null, 2)}`;
+            try {
+              const filterResult = await llmBackend.generateAnswer(filterPmt, {
+                query: filterPmt,
+                context: { conversationHistory: [], systemInstructions: 'You are a JSON filter. Output only a valid JSON array, no explanation.', intent: 'command_automate' },
+                options: { maxTokens: 2000, temperature: 0, fastMode: true }
+              }, { maxTokens: 2000, temperature: 0, fastMode: true }, null);
+              const jMatch = filterResult.match(/\[[\s\S]*\]/);
+              if (jMatch) _relevantItems.push(...JSON.parse(jMatch[0]));
+            } catch (e) {
+              logger.warn(`[synthesize] chunk+filter page ${_ci} failed:`, e.message);
+              _relevantItems.push(...prunedPg); // fallback: include all on error
+            }
+          }
+          if (_relevantItems.length > 0) {
+            const filteredStr = JSON.stringify(_relevantItems, null, 2);
+            synthesisContext += `\n\n${header}(Chunk+filter pass — ${_relevantItems.length} additional relevant items from ${totalItems} total)\n${filteredStr}`;
+            logger.debug(`[synthesize] chunk+filter: appended ${_relevantItems.length} relevant items to context`);
+          }
+        }
+      }
+
       const synthesisQuery = hasFileContent
         ? `${synthesisPrompt}\n\nHere is the current file content:\n\n${synthesisContext}`
         : `${synthesisPrompt}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
@@ -1771,6 +1943,8 @@ module.exports = async function executeCommand(state) {
         : '';
       const synthesisInstructions = (isFileEdit
         ? `You are a file editing assistant. The user has asked you to modify a file. You have been given the current file content. Your job is to output the COMPLETE updated file content with ONLY the requested changes applied. Output the full file text only — no preamble, no explanation, no markdown code fences, no commentary. Preserve all existing structure, headings, and formatting. Only change what was explicitly requested.`
+        : _isJsonShellOutput
+        ? `You are a technical analyst. You have been given data returned by a shell command or API call.\n\nThe user asked: "${_userQuestion}"\n\nAnswer their specific question directly and concisely using ONLY the relevant data. Format output in markdown — use bold for names/titles, bullet points for lists, and human-readable dates (e.g. "Monday, Jan 20 at 3:00 PM"). Skip internal IDs, raw URLs, and low-level metadata unless the user explicitly asked for them. Do NOT output raw JSON or JSON field names verbatim.`
         : hasFileContent
         ? `You are a document analyst. The user has asked you to analyze, summarize, or explain the contents of one or more files. You have been given the raw file content. Your job is to provide a clear, well-structured explanation of what the file(s) contain — describe the purpose, key information, structure, and any notable details. Do NOT just repeat or list the raw content. Write in plain prose with headings where helpful. Be concise and informative.`
         : hasImageAnalysis
@@ -2508,6 +2682,48 @@ module.exports = async function executeCommand(state) {
 
     const raw = result.data || result;
 
+    // ── OAuth gate ────────────────────────────────────────────────────────────
+    // external.skill returns needsOAuth when a declared provider has no stored token.
+    // Pause execution, show the OAuth connect modal, and retry the same step once
+    // the user has connected. Mirrors the gather:credential pattern.
+    if (raw.needsOAuth && raw.needsOAuth.provider) {
+      const { provider, providers, tokenKey, scopes } = raw.needsOAuth;
+      const skillLabel = skill === 'external.skill' ? (resolvedArgs.name || '') : skill;
+      logger.warn(`[Node:ExecuteCommand] OAuth required for skill "${skillLabel}" — provider: ${provider}`);
+      if (progressCallback) progressCallback({
+        type:       'gather_oauth',
+        provider,
+        tokenKey:   tokenKey || `oauth:${provider}`,
+        scopes:     scopes || '',
+        skillName:  skillLabel,
+        stepIndex:  skillCursor,
+        totalSteps: skillPlan.length,
+        message:    raw.error || `Connect ${provider} to continue`,
+      });
+      const gatherOAuthCallback = state.gatherOAuthCallback || null;
+      if (typeof gatherOAuthCallback === 'function') {
+        let oauthResult;
+        try { oauthResult = await gatherOAuthCallback(provider, tokenKey || `oauth:${provider}`); } catch (_) {}
+        if (oauthResult?.connected) {
+          // Token now in keytar — retry this step by returning without advancing cursor
+          logger.info(`[Node:ExecuteCommand] OAuth connected for ${provider} — retrying step ${skillCursor + 1}`);
+          return { ...state, skillResults, skillCursor, commandExecuted: false, failedStep: null };
+        }
+      }
+      // User skipped or no callback — surface as a failed step
+      const oauthFailStep = {
+        step: skillCursor + 1, skill, args: resolvedArgs, description,
+        ok: false, needsOAuth: true,
+        error: raw.error || `OAuth connection required: ${providers ? providers.join(', ') : provider}`,
+      };
+      if (progressCallback) progressCallback({
+        type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill,
+        error: oauthFailStep.error,
+      });
+      return { ...state, skillResults: [...skillResults, oauthFailStep], skillCursor, failedStep: oauthFailStep, commandExecuted: false };
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     // For ui.waitFor steps: synthesize a human-readable stdout from matched condition
     let waitForStdout = null;
     if (skill === 'ui.waitFor' && raw.success) {
@@ -2569,7 +2785,7 @@ module.exports = async function executeCommand(state) {
       ok: skill === 'ui.screen.verify'
         ? verifyOk
         : (raw.ok ?? raw.success ?? false),
-      stdout: raw.stdout || waitForStdout || browserStdout || fsReadStdout || null,
+      stdout: raw.stdout || raw.output || waitForStdout || browserStdout || fsReadStdout || null,
       stderr: raw.stderr || null,
       exitCode: raw.exitCode ?? null,
       result: raw.result ?? (skill === 'file.watch' ? raw : null),
@@ -2584,7 +2800,8 @@ module.exports = async function executeCommand(state) {
       reason: raw.reason || null,
       verified: raw.verified !== undefined ? raw.verified : null,
       reasoning: raw.reasoning || null,
-      suggestion: raw.suggestion || null
+      suggestion: raw.suggestion || null,
+      output: raw.output || null
     };
 
     // Detect shell.run search commands that returned no results — treat as soft failure
@@ -2681,7 +2898,77 @@ module.exports = async function executeCommand(state) {
       };
     }
 
-    const updatedResults = [...skillResults, stepResult];
+    // Normalise external.skill result: copy `output` → `stdout` so review/synthesize nodes
+    // can treat it the same as shell.run output without special-casing.
+    const _normalizedResult = (skill === 'external.skill' && stepResult.ok && stepResult.output && !stepResult.stdout)
+      ? { ...stepResult, stdout: stepResult.output }
+      : stepResult;
+
+    const updatedResults = [...skillResults, _normalizedResult];
+
+    // ── BLOCKED: OAuth token-file read — inline auto-patch, silent retry ───────
+    // When validate() rejects a shell.run because the script reads from
+    // ~/.thinkdrop/tokens/, don't route to recoverSkill (LLM round-trip + red X).
+    // Strip the token-reading preamble, replace $ACCESS_TOKEN with the correct
+    // $<PROVIDER>_ACCESS_TOKEN env var, and silently retry the same step.
+    if (
+      skill === 'shell.run' &&
+      !stepResult.ok &&
+      typeof stepResult.error === 'string' &&
+      stepResult.error.startsWith('BLOCKED:') &&
+      !resolvedArgs._blockedPatched
+    ) {
+      const _rawArgv = resolvedArgs.argv || [];
+      const _PROVIDER_MAP = {
+        gcal: 'GOOGLE', google: 'GOOGLE', gmail: 'GOOGLE', gsheets: 'GOOGLE', gdrive: 'GOOGLE',
+        ms: 'MICROSOFT', msft: 'MICROSOFT', outlook: 'MICROSOFT', onedrive: 'MICROSOFT',
+        spotify: 'SPOTIFY', dropbox: 'DROPBOX', zoom: 'ZOOM',
+        slack: 'SLACK', github: 'GITHUB', notion: 'NOTION',
+        atlassian: 'ATLASSIAN', jira: 'ATLASSIAN', confluence: 'ATLASSIAN',
+        hubspot: 'HUBSPOT',
+      };
+      const _patchedArgv = _rawArgv.map(a => {
+        if (typeof a !== 'string') return a;
+        // Derive provider from token file path (e.g. "gcal.event" → "GOOGLE")
+        const _providerMatch = a.match(/\.thinkdrop\/tokens\/([a-zA-Z0-9]+)/);
+        const _firstSeg = _providerMatch ? _providerMatch[1].toLowerCase() : 'google';
+        const _provider = _PROVIDER_MAP[_firstSeg] || _firstSeg.toUpperCase();
+        const _envVar = `$${_provider}_ACCESS_TOKEN`;
+        let _patched = a;
+        // Remove: TOKEN_FILE="..." followed by ; and/or newline (all separator variants)
+        _patched = _patched.replace(/TOKEN_FILE="[^"]*"[;\s\n]*/g, '');
+        // Remove the ACCESS_TOKEN=$(python3...) or ACCESS_TOKEN=$(cat...) assignment segment
+        // Split on both '; ' and '\n' to handle all LLM output formats
+        _patched = _patched.split(/;\s*|\n/).filter(seg => {
+          const t = seg.trim();
+          return t.length > 0 &&
+            !t.startsWith('ACCESS_TOKEN=$(') &&
+            !t.startsWith('ACCESS_TOKEN=') &&
+            !t.startsWith('ACCESS_TOKEN =') &&
+            !t.startsWith('TOKEN_FILE=');
+        }).join('; ');
+        // Remove: if [ -z "$ACCESS_TOKEN" ]; then ... exit 1; fi
+        _patched = _patched.replace(/if\s*\[\s*-z\s*['"]\$ACCESS_TOKEN['"]\s*\].*?fi\s*;?\s*/gs, '');
+        // Replace remaining $ACCESS_TOKEN / ${ACCESS_TOKEN} refs
+        _patched = _patched.replace(/\$\{?ACCESS_TOKEN\}?/g, _envVar);
+        // Clean up any leading "; " artifact from the split/join
+        _patched = _patched.replace(/^;\s*/, '').trim();
+        return _patched;
+      });
+      const _patchedStep = { ...skillPlan[skillCursor], args: { ...resolvedArgs, argv: _patchedArgv, _blockedPatched: true } };
+      const _patchedPlan = skillPlan.map((s, i) => i === skillCursor ? _patchedStep : s);
+      logger.info('[Node:ExecuteCommand] BLOCKED token-read auto-patched → retrying with injected env var');
+      // Re-emit step_start so the step stays running (no red X shown to user)
+      if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: description || skill });
+      return {
+        ...state,
+        skillPlan:    _patchedPlan,
+        skillResults,         // don't persist the failed result
+        skillCursor,          // stay at same step for retry
+        failedStep:   null,
+        commandExecuted: false,
+      };
+    }
 
     // ── CLI / API Scout execution ────────────────────────────────────────────
     // If this step is external.skill AND the skill dir has cli.json or api.json
@@ -3351,6 +3638,9 @@ module.exports = async function executeCommand(state) {
         ? [...updatedResults].reverse().find(r => r.skill === 'browser.act' && r.ok)
         : null;
       const imageAnalyzeResult = [...updatedResults].reverse().find(r => r.skill === 'image.analyze' && r.ok && r.stdout);
+      // external.skill result — the Node.js skill returned a string in the `output` field.
+      // Must be checked before the shell.run fallback — external.skill produces rich markdown reports.
+      const lastExternalSkillResult = [...updatedResults].reverse().find(r => r.skill === 'external.skill' && r.ok && r.output?.trim());
       // Last waitForStableText/getPageText result — the actual page content the user asked for.
       // waitForStableText returns `result` (string), getPageText returns `stdout`.
       const pageTextResult = [...updatedResults].reverse().find(r =>
@@ -3364,6 +3654,10 @@ module.exports = async function executeCommand(state) {
 
       if (imageAnalyzeResult) {
         lastStepAnswer = imageAnalyzeResult.stdout;
+      } else if (lastExternalSkillResult) {
+        // Node.js skill returned a string report — stream it directly.
+        lastStepAnswer = lastExternalSkillResult.output;
+        logger.debug(`[Node:ExecuteCommand] synthesize: external.skill answer (${lastStepAnswer.length} chars) from "${lastExternalSkillResult.skillName || lastExternalSkillResult.args?.name || 'unknown'}"`);
       } else if (pageTextContent) {
         // Raw innerText may have literal "\n" escape sequences (from JSON serialization) — convert to real newlines.
         // Also collapse runs of 3+ blank lines into 2 so the output isn't excessively spaced.
