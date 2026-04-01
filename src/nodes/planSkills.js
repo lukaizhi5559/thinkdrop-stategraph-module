@@ -775,6 +775,7 @@ Task: "${userMessage}"`;
   // Fetch installed user skills — inject into prompt so LLM uses external.skill instead of needs_skill
   let installedSkillsNote = '';
   let installedSkillsList = []; // kept in outer scope for scout intercept dedup check below
+  let shellSkillNames = new Set(); // names of shell/contract skills — used in post-plan guard
   if (mcpAdapter) {
     try {
       const isRes = await mcpAdapter.callService('user-memory', 'skill.listNames', {}, { timeoutMs: 3000 }).catch(() => null);
@@ -797,6 +798,7 @@ Task: "${userMessage}"`;
         if (shellSkills.length > 0) {
           const lines = shellSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
           noteParts.push(`SHELL-PLAN SKILLS (contract_md defines steps — generate shell.run steps directly, do NOT use external.skill):\n${lines}\n  RULE: Only use these when the task directly matches the skill's stated purpose.`);
+          shellSkills.forEach(s => shellSkillNames.add(s.name));
         }
         if (noteParts.length > 0) installedSkillsNote = '\n\n' + noteParts.join('\n\n');
       }
@@ -836,6 +838,7 @@ Task: "${userMessage}"`;
   // and inject it as planning context. This replaces the old creatorPlanning code-gen
   // pipeline: skill.md IS the plan — shell.run/curl steps are derived from it directly.
   let skillContractNote = '';
+  let _shellContractMd = null; // contractMd for matched non-node (shell) skill — used in post-plan guard
   if (state.matchedSkillName && mcpAdapter) {
     try {
       const scRes = await mcpAdapter.callService('user-memory', 'skill.get', {
@@ -852,6 +855,8 @@ Task: "${userMessage}"`;
           skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is a Node.js runtime skill (exec_type: node). Generate a SINGLE step: { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n2. You MAY include additional args to pass context (e.g. { "name": "${state.matchedSkillName}", "action": "diagnose" }).\n3. FORBIDDEN: Do NOT generate shell.run or curl steps — this skill runs as a Node.js module.\n4. FORBIDDEN: Do NOT use "${state.matchedSkillName}" directly as the skill type in any step.\n\n${contractMd.slice(0, 2000)}`;
         } else {
           skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands or ## Plan section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step. It is NOT a dispatchable skill.\n3. FORBIDDEN: Do NOT use external.skill for this.\n4. The ONLY way to execute this skill is via shell.run with the curl command shown in the contract.\n\n${contractMd.slice(0, 3000)}`;
+          _shellContractMd = contractMd; // save for post-plan guard
+          shellSkillNames.add(state.matchedSkillName); // ensure guarded even if listNames had stale execType
         }
         logger.info(`[Node:PlanSkills] Injected contract_md for matched skill "${state.matchedSkillName}" (${contractMd.length} chars, exec_type: ${_isNodeSkill ? 'node' : 'shell'})`);
       }
@@ -1183,6 +1188,48 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
     if (!Array.isArray(skillPlan) && skillPlan && typeof skillPlan === 'object' && skillPlan.skill) {
       logger.debug(`[Node:PlanSkills] LLM returned single-step object — wrapping in array`);
       skillPlan = [skillPlan];
+    }
+
+    // ── Hard guard: contract-based (shell) skills must never use external.skill ──
+    // The LLM sometimes ignores FORBIDDEN instructions and emits external.skill for
+    // shell contract skills (exec_type:shell / .md exec_path). When detected, retry
+    // once with a very targeted override before hard-failing.
+    if (Array.isArray(skillPlan) && shellSkillNames.size > 0) {
+      const contractViolation = skillPlan.find(
+        s => s.skill === 'external.skill' && s.args?.name && shellSkillNames.has(s.args.name)
+      );
+      if (contractViolation) {
+        const badName = contractViolation.args.name;
+        const cMd = _shellContractMd || '';
+        logger.warn(`[Node:PlanSkills] Contract guard: LLM emitted external.skill for shell skill "${badName}" — retrying with targeted override`);
+        const forceMsg = [
+          `CRITICAL CORRECTION: You generated { "skill": "external.skill", "args": { "name": "${badName}" } } — this is WRONG.`,
+          `"${badName}" is a shell contract skill (exec_type: shell). It is NOT a Node.js module.`,
+          `You MUST generate shell.run steps with curl commands from the contract below.`,
+          `Do NOT use external.skill. Output ONLY a valid JSON array with shell.run (and optionally synthesize) steps.`,
+          cMd ? `\nCONTRACT:\n${cMd.slice(0, 2500)}` : '',
+        ].filter(Boolean).join('\n');
+        const retryPayload2 = {
+          ...payload,
+          messages: [...(payload.messages || []), { role: 'user', content: forceMsg }],
+        };
+        const rawRetry2 = await backend.generateAnswer(planningQuery, retryPayload2, payload.options, null);
+        const retryPlan2 = parsePlan(rawRetry2, logger);
+        if (
+          retryPlan2 &&
+          !retryPlan2.find(s => s.skill === 'external.skill' && shellSkillNames.has(s.args?.name))
+        ) {
+          skillPlan = retryPlan2;
+          logger.info(`[Node:PlanSkills] Contract guard: retry succeeded for "${badName}"`);
+        } else {
+          logger.error(`[Node:PlanSkills] Contract guard: retry still emitted external.skill for "${badName}" — blocking execution`);
+          if (progressCallback) progressCallback({ type: 'plan_error', error: `Skill "${badName}" is a shell contract and cannot run via external.skill. Please try again.` });
+          return {
+            ...state,
+            planError: `Contract skill "${badName}" cannot be executed via external.skill. Please rephrase your request and try again.`,
+          };
+        }
+      }
     }
 
     // ── Phase 2: Segment expansion ─────────────────────────────────────────

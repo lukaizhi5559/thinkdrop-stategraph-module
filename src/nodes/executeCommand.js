@@ -1969,6 +1969,37 @@ module.exports = async function executeCommand(state) {
         logger.error('[Node:ExecuteCommand] synthesize LLM call failed:', err.message);
         synthesisAnswer = `[Synthesis failed: ${err.message}]`;
       }
+
+      // ── Apology / refusal fallback: pretty-print raw JSON ─────────────────
+      // When the LLM returns a refusal or apology instead of a summary, fall
+      // back to showing the raw JSON data in a readable code block so the user
+      // still gets their data. Also saves a pretty-printed .json temp file they
+      // can open directly.
+      const _APOLOGY_RE = /^(i apologize|i'm sorry|i'm unable|i cannot|i was unable|unfortunately,|i am sorry|i am unable)/i;
+      if (_APOLOGY_RE.test(synthesisAnswer.trim())) {
+        logger.warn('[Node:ExecuteCommand] synthesize: LLM returned apology — falling back to pretty-printed JSON');
+        const _jsonResult = skillResults.find(
+          r => r.skill === 'shell.run' && r.ok && r.stdout && /^\s*[\[{]/.test(r.stdout.trim())
+        );
+        if (_jsonResult) {
+          try {
+            const _parsedJson = JSON.parse(_jsonResult.stdout.trim());
+            // Prune noise fields for readability
+            const _prettyJson = JSON.stringify(_pruneApiObject(_parsedJson), null, 2);
+            // Write to a named temp file the user can open
+            const _jsonTmpPath = require('path').join(require('os').homedir(), '.thinkdrop', 'tmp', `gcal-${Date.now()}.json`);
+            try {
+              require('fs').mkdirSync(require('path').dirname(_jsonTmpPath), { recursive: true });
+              require('fs').writeFileSync(_jsonTmpPath, _prettyJson, 'utf8');
+              logger.info(`[Node:ExecuteCommand] synthesize: raw JSON saved to ${_jsonTmpPath}`);
+            } catch (_) {}
+            synthesisAnswer = `Here is the raw data returned — the summary could not be generated:\n\n\`\`\`json\n${_prettyJson.slice(0, 12000)}${_prettyJson.length > 12000 ? '\n// ... truncated' : ''}\n\`\`\`${_jsonTmpPath ? `\n\n📄 Full JSON saved to: \`${_jsonTmpPath}\`` : ''}`;
+          } catch (_parseErr) {
+            // Not valid JSON — just show raw stdout
+            synthesisAnswer = `Here is the raw output:\n\n\`\`\`\n${_jsonResult.stdout.slice(0, 8000)}\n\`\`\``;
+          }
+        }
+      }
     } else {
       logger.warn('[Node:ExecuteCommand] synthesize: no llmBackend in state — skipping LLM call');
     }
