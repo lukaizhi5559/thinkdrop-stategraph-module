@@ -38,7 +38,8 @@ module.exports = async function synthesizeNode(state) {
   const isStreaming = typeof streamCallback === 'function';
 
   const synthesisQuery = `${synthesisPrompt || queryMessage}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
-  const synthesisInstructions = `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual.`;
+  const _todayISO = new Date().toISOString().slice(0, 10);
+  const synthesisInstructions = `You are a helpful assistant. Today's date is ${_todayISO}. The user asked you to summarize or analyze data from API responses or web sources. You have been given the content. Provide a clear, concise answer that directly addresses the user's request. When the user's question references a time period (e.g. "last week", "yesterday", "two weeks ago"), reason relative to today (${_todayISO}). Do not assume a date from your training data.`;
 
   const synthPayload = {
     query: synthesisQuery,

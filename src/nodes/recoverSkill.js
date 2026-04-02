@@ -178,7 +178,7 @@ module.exports = async function recoverSkill(state) {
     const argv = (failedStep.args?.argv || []).join(' ');
     const tokenMatch = argv.match(/tokens\/([a-zA-Z0-9._-]+)\.json/) ||
                        argv.match(/skill:([a-zA-Z0-9._-]+):/);
-    const skillLabel = tokenMatch ? tokenMatch[1] : 'this skill';
+    const skillLabel = tokenMatch ? tokenMatch[1] : (state.matchedSkillName || 'this skill');
     const oauthMsg = `I've started scanning **${skillLabel}** to detect the required OAuth permissions. Once the repair finishes:\n\n1. Open the **Skills** tab\n2. Find **${skillLabel}** — the scopes should now be populated\n3. Click **Reconnect** to grant access with the detected permissions, then try again`;
     logger.info(`[Node:RecoverSkill] shell.run 403 OAuth scope error for "${skillLabel}" — triggering auto-repair`);
     return {
@@ -638,6 +638,26 @@ Decide the recovery strategy.`;
 function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0, creatorSkillPath = null) {
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
+
+  // ── payload.check: LLM already classified the failure — dispatch directly ──
+  // _payloadCheckResult is set inline in executeCommand after a semantic payload
+  // check fails. The reason is already known, so skip the LLM recovery round-trip.
+  if (failedStep._payloadCheckResult) {
+    const { reason, explanation, suggestion } = failedStep._payloadCheckResult;
+    if (reason === 'ask_user') {
+      logger.debug(`[Node:RecoverSkill] Fast-path: payload.check user_correctable → ASK_USER`);
+      return {
+        action: 'ASK_USER',
+        question: explanation + (suggestion ? `\n\nSuggestion: ${suggestion}` : ''),
+      };
+    }
+    // system_issue or any other reason → replan
+    logger.debug(`[Node:RecoverSkill] Fast-path: payload.check system_issue → REPLAN`);
+    return {
+      action: 'REPLAN',
+      reason: explanation,
+    };
+  }
 
   // ui.screen.verify: failed for any reason (vision LLM said verified=false, or the call itself failed)
   if (skill === 'ui.screen.verify') {

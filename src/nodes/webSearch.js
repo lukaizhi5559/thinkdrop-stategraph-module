@@ -24,8 +24,9 @@ module.exports = async function webSearch(state) {
   }
 
   try {
-    // Extract search query
-    const query = message.replace(/^(search for|search|find|look up|google)\s+/i, '').trim();
+    // Extract search query — prepend _dataPrefix (injected by multi-intent queue runner) if present
+    const query = (state._dataPrefix ? state._dataPrefix + ' ' : '') +
+                  message.replace(/^(search for|search|find|look up|google)\s+/i, '').trim();
     
     logger.debug(`[Node:WebSearch] Query: "${query}"`);
 

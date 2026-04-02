@@ -99,12 +99,23 @@ module.exports = async function logConversation(state) {
     // which is useless for the next turn's planSkills conversationNote.
     const skillResults = state.skillResults || [];
     let richAssistantText = answer;
-    if (intent?.type === 'command_automate' && skillResults.length > 0) {
+    if (intent?.type === 'command_automate') {
       // For the final synthesize step: use the generated answer text (not raw stdout)
       // so that follow-up prompts like "text this to me" get the full formatted content.
-      const synthAnswer = state.answer && typeof state.answer === 'string' && state.answer.trim().length > 50
+      // NOTE: executeCommand sets answer:undefined after synthesize (line ~2104), so
+      // state.answer is always falsy here for command_automate. Fall back to the synthesize
+      // step's stdout in skillResults so the [synthesize]: entry is always written.
+      const _stateAnswer = state.answer && typeof state.answer === 'string' && state.answer.trim().length > 50
         ? state.answer.trim()
         : null;
+      const _synthStepStdout = (() => {
+        const s = skillResults.slice().reverse().find(
+          r => r.skill === 'synthesize' && r.ok !== false && r.stdout &&
+               typeof r.stdout === 'string' && r.stdout.trim().length > 50
+        );
+        return s ? s.stdout.trim() : null;
+      })();
+      const synthAnswer = _stateAnswer || _synthStepStdout;
       const keyOutputs = skillResults
         .filter(r => r.ok && r.stdout && r.stdout.trim().length > 0)
         .map((r, idx, arr) => {
@@ -122,10 +133,25 @@ module.exports = async function logConversation(state) {
           return `[${label}]:\n${out}`;
         });
       if (keyOutputs.length > 0) {
+        // Always append the LLM-generated synthesized answer as a dedicated [synthesize]
+        // entry so that follow-up messaging tasks ("text this to me") get the formatted
+        // human-readable summary rather than a raw shell/JSON output snippet.
+        if (synthAnswer) {
+          keyOutputs.push(`[synthesize]:\n${synthAnswer.slice(0, 2000)}`);
+        }
         richAssistantText = `${answer || 'Done.'}\n\nStep outputs:\n${keyOutputs.join('\n\n')}`;
+      } else if (synthAnswer && skillResults.some(r => r.ok !== false)) {
+        // No skill-step stdout but there's a meaningful answer — preserve for follow-up
+        // prompts ("text this to me") that need prior content as message body.
+        // Guard: only store as synthesis when at least one step succeeded — prevents
+        // error/recovery turns from being tagged as [synthesize]: (which would corrupt
+        // the body for the next SMS/email prompt in the same session).
+        richAssistantText = `${answer || 'Done.'}\n\nStep outputs:\n[synthesize]:\n${synthAnswer}`;
       }
     }
 
+    // [DEBUG DIAG] Remove after BODY fix confirmed
+    logger.info(`[Node:LogConversation] richText preview (${richAssistantText?.length ?? 0}): ${(richAssistantText || '').slice(0, 200).replace(/\n/g, '↵')}`);
     if (richAssistantText && typeof richAssistantText === 'string') {
       logPromises.push(
         mcpAdapter.callService('conversation', 'message.add', {

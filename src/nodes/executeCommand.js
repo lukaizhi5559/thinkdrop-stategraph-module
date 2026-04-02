@@ -124,8 +124,24 @@ async function _repairSkillMd(content, llmBackend, logger, filePath, context = {
       changed = true;
     }
     if (!/^exec_type\s*:/m.test(fmBody)) {
-      fmBody += `\nexec_type: node`;
+      // _applyStaticFixes is only called on .md skill repair — default to shell
+      fmBody += `\nexec_type: shell`;
       changed = true;
+    }
+
+    // Cross-field consistency: exec_type must match exec_path extension
+    const _execTypeM = fmBody.match(/^exec_type:\s*(\S+)/m);
+    const _execPathM = fmBody.match(/^exec_path:\s*(\S+)/m);
+    if (_execTypeM && _execPathM) {
+      const _isMdPath   = /\.md$/i.test(_execPathM[1]);
+      const _isNodePath = /\.(cjs|js)$/i.test(_execPathM[1]);
+      if (_execTypeM[1] === 'node' && _isMdPath) {
+        fmBody = fmBody.replace(/^exec_type:\s*\S+/m, 'exec_type: shell');
+        changed = true;
+      } else if (_execTypeM[1] === 'shell' && _isNodePath) {
+        fmBody = fmBody.replace(/^exec_type:\s*\S+/m, 'exec_type: node');
+        changed = true;
+      }
     }
 
     if (changed) str = `---\n${fmBody.trim()}\n---` + str.slice(fm[0].length);
@@ -246,7 +262,7 @@ ${s}`;
         // Try to pull a short description from the first non-heading sentence in the body
         const descMatch = cleaned.match(/^(?:#+\s+.+\n+)*([A-Z][^.\n]{10,100}\.)/m);
         const autoDesc = descMatch ? descMatch[1].trim() : `${svc} skill — send messages via API`;
-        const injectedFm = `---\nname: ${dirName || 'skill.name'}\ndescription: ${autoDesc}\nsecrets: ${secretsList}\nschedule: null\nexec_path: ~/.thinkdrop/skills/${dirName}/skill.md\nexec_type: node\n---\n\n`;
+        const injectedFm = `---\nname: ${dirName || 'skill.name'}\ndescription: ${autoDesc}\nsecrets: ${secretsList}\nschedule: null\nexec_path: ~/.thinkdrop/skills/${dirName}/skill.md\nexec_type: shell\n---\n\n`;
         cleaned = injectedFm + cleaned;
       }
 
@@ -263,7 +279,7 @@ ${s}`;
     const svc = dirName.split('.')[0];
     const pat = { 'clicksend': ['CLICKSEND_USERNAME', 'CLICKSEND_API_KEY'], 'twilio': ['TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN'], 'mailgun': ['MAILGUN_API_KEY', 'MAILGUN_DOMAIN'], 'sendgrid': ['SENDGRID_API_KEY'], 'vonage': ['VONAGE_API_KEY', 'VONAGE_API_SECRET'] }[svc];
     const secretsList = pat ? `[${pat.map(k => `'${k}'`).join(', ')}]` : '[]';
-    const fallbackFm = `---\nname: ${dirName}\ndescription: ${svc} skill\nsecrets: ${secretsList}\nschedule: null\nexec_path: ~/.thinkdrop/skills/${dirName}/skill.md\nexec_type: node\n---\n\n`;
+    const fallbackFm = `---\nname: ${dirName}\ndescription: ${svc} skill\nsecrets: ${secretsList}\nschedule: null\nexec_path: ~/.thinkdrop/skills/${dirName}/skill.md\nexec_type: shell\n---\n\n`;
     s = fallbackFm + s;
   }
   return s;
@@ -1335,7 +1351,9 @@ module.exports = async function executeCommand(state) {
               logger.debug(`[Node:ExecuteCommand] skill.install: injected exec_path for ${inferName}`);
             }
             if (!/^exec_type\s*:/m.test(fmBody)) {
-              fmBody += `\nexec_type: node`;
+              // Derive from exec_path: .md → shell, .cjs/.js → node
+              const _ep = (fmBody.match(/^exec_path:\s*(\S+)/m) || [])[1] || '';
+              fmBody += `\nexec_type: ${/\.(cjs|js)$/i.test(_ep) ? 'node' : 'shell'}`;
               logger.debug(`[Node:ExecuteCommand] skill.install: injected exec_type for ${inferName}`);
             }
             contractMd = `---\n${fmBody}\n---` + bodyAfterFm;
@@ -1424,6 +1442,14 @@ module.exports = async function executeCommand(state) {
             fm = fm.replace(/^exec_type\s*:.+$/m, `exec_type: shell`);
             patched = true;
             logger.info(`[Node:ExecuteCommand] skill.install pre-flight: fixed invalid exec_type "${execTypeM[1].trim()}" → shell`);
+          } else {
+            // Cross-field consistency: exec_type: node requires a .cjs/.js exec_path, not .md
+            const execPathInFm = fm.match(/^exec_path\s*:\s*(\S+)/m);
+            if (execPathInFm && execTypeM[1].trim() === 'node' && /\.md$/i.test(execPathInFm[1].trim())) {
+              fm = fm.replace(/^exec_type\s*:.+$/m, `exec_type: shell`);
+              patched = true;
+              logger.info(`[Node:ExecuteCommand] skill.install pre-flight: fixed exec_type node→shell for .md exec_path`);
+            }
           }
 
           // 3. exec_path missing — derive from skillPath
@@ -1626,11 +1652,11 @@ module.exports = async function executeCommand(state) {
     // Ensure tmp dir exists
     try { if (!_synthFs.existsSync(_apiTmpDir)) _synthFs.mkdirSync(_apiTmpDir, { recursive: true }); } catch (_) {}
 
-    // Lazy cleanup: remove api-*.json files older than 30 minutes on each run
+    // Lazy cleanup: remove api-*, raw-*, payload-*.json files older than 30 minutes on each run
     try {
       const _ttlCutoff = Date.now() - 30 * 60 * 1000;
       _synthFs.readdirSync(_apiTmpDir)
-        .filter(f => f.startsWith('api-') && f.endsWith('.json'))
+        .filter(f => (f.startsWith('api-') || f.startsWith('raw-') || f.startsWith('payload-')) && f.endsWith('.json'))
         .forEach(f => {
           try {
             const _fp = _synthPath.join(_apiTmpDir, f);
@@ -1970,35 +1996,59 @@ module.exports = async function executeCommand(state) {
         synthesisAnswer = `[Synthesis failed: ${err.message}]`;
       }
 
-      // ── Apology / refusal fallback: pretty-print raw JSON ─────────────────
-      // When the LLM returns a refusal or apology instead of a summary, fall
-      // back to showing the raw JSON data in a readable code block so the user
-      // still gets their data. Also saves a pretty-printed .json temp file they
-      // can open directly.
+      // ── Apology / refusal fallback: retry then pretty-print raw JSON ────────
+      // When the LLM returns a refusal or apology instead of a summary, first
+      // retry with a simpler direct prompt. Only fall back to raw JSON if the
+      // retry also fails/apologises.
       const _APOLOGY_RE = /^(i apologize|i'm sorry|i'm unable|i cannot|i was unable|unfortunately,|i am sorry|i am unable)/i;
       if (_APOLOGY_RE.test(synthesisAnswer.trim())) {
-        logger.warn('[Node:ExecuteCommand] synthesize: LLM returned apology — falling back to pretty-printed JSON');
-        const _jsonResult = skillResults.find(
-          r => r.skill === 'shell.run' && r.ok && r.stdout && /^\s*[\[{]/.test(r.stdout.trim())
-        );
-        if (_jsonResult) {
-          try {
-            const _parsedJson = JSON.parse(_jsonResult.stdout.trim());
-            // Prune noise fields for readability
-            const _prettyJson = JSON.stringify(_pruneApiObject(_parsedJson), null, 2);
-            // Write to a named temp file the user can open
-            const _jsonTmpPath = require('path').join(require('os').homedir(), '.thinkdrop', 'tmp', `gcal-${Date.now()}.json`);
-            try {
-              require('fs').mkdirSync(require('path').dirname(_jsonTmpPath), { recursive: true });
-              require('fs').writeFileSync(_jsonTmpPath, _prettyJson, 'utf8');
-              logger.info(`[Node:ExecuteCommand] synthesize: raw JSON saved to ${_jsonTmpPath}`);
-            } catch (_) {}
-            synthesisAnswer = `Here is the raw data returned — the summary could not be generated:\n\n\`\`\`json\n${_prettyJson.slice(0, 12000)}${_prettyJson.length > 12000 ? '\n// ... truncated' : ''}\n\`\`\`${_jsonTmpPath ? `\n\n📄 Full JSON saved to: \`${_jsonTmpPath}\`` : ''}`;
-          } catch (_parseErr) {
-            // Not valid JSON — just show raw stdout
-            synthesisAnswer = `Here is the raw output:\n\n\`\`\`\n${_jsonResult.stdout.slice(0, 8000)}\n\`\`\``;
+        logger.warn('[Node:ExecuteCommand] synthesize: LLM returned apology — retrying with simplified prompt');
+        let _retrySucceeded = false;
+        try {
+          const _retrySysInstr = `You are a helpful assistant. The user asked: "${_userQuestion}". Use the data below to answer directly in plain text with markdown formatting. Do not apologise or refuse.`;
+          const _retryQuery = `${_userQuestion}\n\nData:\n${synthesisContext.slice(0, 6000)}`;
+          const _retryAnswer = await llmBackend.generateAnswer(_retryQuery, {
+            query: _retryQuery,
+            context: { conversationHistory: [], systemInstructions: _retrySysInstr, intent: 'command_automate' },
+            options: { maxTokens: 1500, temperature: 0.3, fastMode: false },
+          }, { maxTokens: 1500, temperature: 0.3 }, null);
+          if (_retryAnswer && !_APOLOGY_RE.test(_retryAnswer.trim())) {
+            synthesisAnswer = _retryAnswer;
+            _retrySucceeded = true;
+            logger.info('[Node:ExecuteCommand] synthesize: retry succeeded');
+            if (!isStreaming && typeof streamCallback === 'function') streamCallback(synthesisAnswer);
+          } else {
+            logger.warn('[Node:ExecuteCommand] synthesize: retry also returned apology — falling back to pretty-printed JSON');
           }
+        } catch (_retryErr) {
+          logger.warn('[Node:ExecuteCommand] synthesize retry failed:', _retryErr.message);
         }
+
+        if (!_retrySucceeded) {
+          const _jsonResult = skillResults.find(
+            r => r.skill === 'shell.run' && r.ok && r.stdout && /^\s*[\[{]/.test(r.stdout.trim())
+          );
+          if (_jsonResult) {
+            try {
+              const _parsedJson = JSON.parse(_jsonResult.stdout.trim());
+              // Prune noise fields for readability
+              const _prettyJson = JSON.stringify(_pruneApiObject(_parsedJson), null, 2);
+              // Write to a named temp file the user can open
+              const _rawSlug = (_jsonResult.description || _jsonResult.skill || 'api')
+                .toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40).replace(/-+$/, '');
+              const _jsonTmpPath = require('path').join(require('os').homedir(), '.thinkdrop', 'tmp', `raw-${_rawSlug}-${Date.now()}.json`);
+              try {
+                require('fs').mkdirSync(require('path').dirname(_jsonTmpPath), { recursive: true });
+                require('fs').writeFileSync(_jsonTmpPath, _prettyJson, 'utf8');
+                logger.info(`[Node:ExecuteCommand] synthesize: raw JSON saved to ${_jsonTmpPath}`);
+              } catch (_) {}
+              synthesisAnswer = `Here is the raw data returned — the summary could not be generated:\n\n\`\`\`json\n${_prettyJson.slice(0, 12000)}${_prettyJson.length > 12000 ? '\n// ... truncated' : ''}\n\`\`\`${_jsonTmpPath ? `\n\n📄 Full JSON saved to: \`${_jsonTmpPath}\`` : ''}`;
+            } catch (_parseErr) {
+              // Not valid JSON — just show raw stdout
+              synthesisAnswer = `Here is the raw output:\n\n\`\`\`\n${_jsonResult.stdout.slice(0, 8000)}\n\`\`\``;
+            }
+          }
+        } // end if (!_retrySucceeded)
       }
     } else {
       logger.warn('[Node:ExecuteCommand] synthesize: no llmBackend in state — skipping LLM call');
@@ -2896,6 +2946,85 @@ module.exports = async function executeCommand(state) {
         stepResult.ok = false;
         stepResult.error = `Missing credentials: ${_out} — please enter your API credentials in the Skills tab`;
         logger.warn(`[Node:ExecuteCommand] shell.run credential guard fired: ${_out}`);
+      }
+    }
+
+    // ── shell.run curl: write full payload to ~/.thinkdrop/tmp/ + inline payload.check ──
+    // For any curl-based shell.run step that returns valid JSON and is still ok=true at
+    // this point, write the raw payload to disk and run an LLM semantic check. This
+    // catches application-level failures (e.g. INVALID_RECIPIENT nested inside messages[])
+    // that the HTTP-level curl guard above cannot see.
+    {
+      const _isCurlForPayload = skill === 'shell.run' && stepResult.ok && stepResult.stdout &&
+        ((args.cmd === 'curl') ||
+         (args.cmd === 'bash' && Array.isArray(args.argv) && args.argv.some(a => typeof a === 'string' && a.includes('curl '))));
+
+      if (_isCurlForPayload && /^\s*[\[{]/.test(stepResult.stdout.trim())) {
+        // Sub-change B: write raw payload to tmp file
+        try {
+          const _pcFs   = require('fs');
+          const _pcPath = require('path');
+          const _pcOs   = require('os');
+          const _pcTmpDir = _pcPath.join(_pcOs.homedir(), '.thinkdrop', 'tmp');
+          if (!_pcFs.existsSync(_pcTmpDir)) _pcFs.mkdirSync(_pcTmpDir, { recursive: true });
+          const _pcSlug = (description || args.cmd || 'api')
+            .toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 40).replace(/-+$/, '');
+          const _pcTmpPath = _pcPath.join(_pcTmpDir, `payload-${_pcSlug}-${Date.now()}.json`);
+          _pcFs.writeFileSync(_pcTmpPath, stepResult.stdout, 'utf8');
+          stepResult._tmpPayloadFile = _pcTmpPath;
+          logger.debug(`[Node:ExecuteCommand] payload.check: wrote ${stepResult.stdout.length} chars → ${_pcTmpPath}`);
+        } catch (_pcWriteErr) {
+          logger.warn(`[Node:ExecuteCommand] payload.check: tmp write failed: ${_pcWriteErr.message}`);
+        }
+
+        // Sub-change C: inline LLM semantic check
+        const _pcLlm = state.llmBackend;
+        if (_pcLlm && stepResult._tmpPayloadFile) {
+          try {
+            const _pcFs2    = require('fs');
+            const _pcPath2  = require('path');
+            const _payloadStr = _pcFs2.readFileSync(stepResult._tmpPayloadFile, 'utf8');
+            const _pcPromptRaw = _pcFs2.readFileSync(
+              _pcPath2.join(__dirname, '../prompts/payload-check.md'), 'utf8'
+            );
+            const _pcContext = description || step.description || 'API call via curl';
+            const _pcPrompt  = _pcPromptRaw
+              .replace('{{context}}', _pcContext)
+              .replace('{{payload}}', _payloadStr);
+
+            const _pcRaw = await _pcLlm.generateAnswer(_pcPrompt, {
+              query: _pcPrompt,
+              context: {
+                conversationHistory: [],
+                systemInstructions: 'You are a strict JSON API response validator. Output only valid JSON, no explanation.',
+                intent: 'command_automate',
+              },
+              options: { maxTokens: 300, temperature: 0, fastMode: true },
+            }, { maxTokens: 300, temperature: 0, fastMode: true }, null);
+
+            // Parse — must be valid JSON; on any error we fail open (no-op)
+            const _jsonMatch = _pcRaw.match(/\{[\s\S]*\}/);
+            if (_jsonMatch) {
+              const _pcVerdict = JSON.parse(_jsonMatch[0]);
+              logger.debug(`[Node:ExecuteCommand] payload.check verdict: ${_pcVerdict.verdict} (${_pcVerdict.errorType || 'none'})`);
+
+              if (_pcVerdict.verdict === 'APP_ERROR') {
+                stepResult.ok    = false;
+                stepResult.error = _pcVerdict.explanation || 'API call returned an application-level error';
+                stepResult._payloadCheckResult = {
+                  reason:       _pcVerdict.errorType === 'user_correctable' ? 'ask_user' : 'replan',
+                  explanation:  _pcVerdict.explanation  || '',
+                  suggestion:   _pcVerdict.suggestion   || '',
+                  affectedField: _pcVerdict.affectedField || null,
+                };
+                logger.warn(`[Node:ExecuteCommand] payload.check flagged APP_ERROR (${_pcVerdict.errorType}): ${_pcVerdict.explanation}`);
+              }
+            }
+          } catch (_pcErr) {
+            // Never block on LLM failure — log and continue
+            logger.warn(`[Node:ExecuteCommand] payload.check LLM call failed (non-blocking): ${_pcErr.message}`);
+          }
+        }
       }
     }
 

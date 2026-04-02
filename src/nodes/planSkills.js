@@ -116,7 +116,9 @@ module.exports = async function planSkills(state) {
 
   const logger = state.logger || console;
   const progressCallback = state.progressCallback || null;
-  const userMessage = resolvedMessage || message;
+  // Prepend _dataPrefix (injected by multi-intent queue runner) when a prior step's result
+  // needs to be visible to the LLM planner (e.g. memory retrieved in step 0 informs step 1).
+  const userMessage = (state._dataPrefix ? state._dataPrefix + '\n' : '') + (resolvedMessage || message);
 
   // ── Project skill plan passthrough ────────────────────────────────────────
   // If parseIntent already classified this as a project command and set projectSkillPlan,
@@ -413,11 +415,42 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
     // Extract the last synthesized answer from conversation history so that
     // follow-up messaging tasks ("text this to me", "email this info") use the
     // actual prior content as the message body — not a placeholder.
-    const lastAssistantMsg = recentTurns.slice().reverse().find(m => m.role === 'assistant');
-    if (lastAssistantMsg?.content) {
-      const stepOutputsIdx = lastAssistantMsg.content.indexOf('Step outputs:');
+    // IMPORTANT: scan ALL recent assistant messages for a [synthesize]: section, not just
+    // the last one. Example scenario: gcal query → failed SMS attempt → user resumes with
+    // phone number. The last assistant message is the SMS error (no [synthesize]:) so a
+    // naive lastMsg search would inject the error JSON as the message body instead of the
+    // calendar synthesis from 2 turns earlier.
+    // [DEBUG DIAG] Remove after BODY fix confirmed — confirms whether [synthesize]: is in history
+    logger.info(`[Node:PlanSkills] priorBody scan: history=${conversationHistory.length} recent=${recentTurns.length} asst=[${recentTurns.filter(m=>m.role==='assistant').map(m=>(m.content||'').slice(0,120).replace(/\n/g,'↵')).join(' || ')}]`);
+    const lastSynthMsg = recentTurns.slice().reverse().find(m =>
+      m.role === 'assistant' && m.content?.includes('[synthesize]:'));
+    if (lastSynthMsg?.content) {
+      const stepOutputsIdx = lastSynthMsg.content.indexOf('Step outputs:');
       if (stepOutputsIdx !== -1) {
-        priorSynthesizedContent = lastAssistantMsg.content.slice(stepOutputsIdx + 'Step outputs:'.length).trim().slice(0, 2000);
+        const stepOutputsContent = lastSynthMsg.content.slice(stepOutputsIdx + 'Step outputs:'.length).trim();
+        const synthSectionMatch = stepOutputsContent.match(/\[synthesize\]:\n([\s\S]+?)(?=\n\[|$)/);
+        if (synthSectionMatch) {
+          priorSynthesizedContent = synthSectionMatch[1].trim().slice(0, 2000);
+        }
+      }
+    } else {
+      // Fallback: no [synthesize]: found anywhere in recent history — use last assistant
+      // step outputs (raw shell/API output). Better than nothing for non-synthesized results.
+      const lastAssistantMsg = recentTurns.slice().reverse().find(m => m.role === 'assistant');
+      if (lastAssistantMsg?.content) {
+        const stepOutputsIdx = lastAssistantMsg.content.indexOf('Step outputs:');
+        if (stepOutputsIdx !== -1) {
+          const stepOutputsContent = lastAssistantMsg.content.slice(stepOutputsIdx + 'Step outputs:'.length).trim();
+          priorSynthesizedContent = stepOutputsContent.slice(0, 2000);
+        }
+      }
+      // Last-resort: no 'Step outputs:' section either — the prior answer itself may be the body.
+      // Handles: gcal query stored without Step outputs: when skillResults was empty.
+      if (!priorSynthesizedContent && lastAssistantMsg?.content) {
+        const _rawPrior = lastAssistantMsg.content.trim();
+        if (_rawPrior.length > 50 && !/^(error|failed|sorry|i couldn)/i.test(_rawPrior)) {
+          priorSynthesizedContent = _rawPrior.slice(0, 2000);
+        }
       }
     }
   }
@@ -430,7 +463,39 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
   const isMessagingTask = /^(text|send|email|message|forward|share|ping|tell|notify)/i.test(userMessage.trim()) ||
     /\b(text|sms|send.*message|email.*me|message.*me)\b/i.test(userMessage);
   if (isMessagingTask && priorSynthesizedContent) {
-    messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${priorSynthesizedContent}\n---\nIMPORTANT: Use this full text as the MSG/body variable in your shell.run command. Do NOT use "Here is the information you requested." or any other placeholder.`;
+    // Sanitize: if the prior content is a raw JSON fallback (from the synthesis apology
+    // path), extract a human-readable summary from the calendar/API items so we don't
+    // inject broken JSON as a message body.
+    let _sanitizedBody = priorSynthesizedContent;
+    if (/^here is the raw data returned/i.test(_sanitizedBody.trim()) ||
+        /^\[shell\.run\]:\s*[\[{]/m.test(_sanitizedBody)) {
+      // Try to parse calendar events out of any embedded JSON and format them as plain text
+      const _jsonMatch = _sanitizedBody.match(/```json\n([\s\S]*?)\n```/) ||
+                         _sanitizedBody.match(/\[shell\.run\]:\n*([\s\S]+)/);
+      if (_jsonMatch) {
+        try {
+          const _parsed = JSON.parse(_jsonMatch[1].trim());
+          const _items = Array.isArray(_parsed) ? _parsed : (_parsed?.items || []);
+          if (_items.length > 0) {
+            const _lines = _items.map(item => {
+              const start = item.start?.dateTime || item.start?.date || '';
+              const title = item.summary || item.title || 'Untitled';
+              if (start) {
+                const d = new Date(start);
+                const timeStr = !isNaN(d.getTime())
+                  ? d.toLocaleString('en-US', { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+                  : start;
+                return `• ${title} at ${timeStr}`;
+              }
+              return `• ${title}`;
+            }).join('\n');
+            _sanitizedBody = `Today's calendar events:\n${_lines}`;
+            logger.info('[Node:PlanSkills] Sanitized raw JSON fallback to plain text for messaging body');
+          }
+        } catch (_) {}
+      }
+    }
+    messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${_sanitizedBody}\n---\nIMPORTANT: Use this text as the message body string. When building a JSON payload in a shell command, ALWAYS use jq to safely encode the body to avoid escaping errors (example: \`jq -n --arg body "$MSG" --arg to "+15551234567" '{"messages":[{"source":"sdk","body":$body,"to":$to}]}'\`). Never embed raw text or JSON objects directly inside a shell string literal.`;
     logger.info('[Node:PlanSkills] Injected prior synthesized content as messaging body');
   }
 
@@ -1128,6 +1193,107 @@ OS: ${os}
 Home directory: ${homeDir}
 User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
+  // ── Contract-driven fast path ───────────────────────────────────────────────
+  // When parseSkill matched a shell skill whose contract has a ## Commands section,
+  // skip free-form LLM plan generation entirely. Instead:
+  //   1. Parse command templates from the contract (no LLM)
+  //   2. One small focused LLM call to pick the template + fill params
+  //   3. Assemble steps deterministically — no jsonrepair, no truncation risk
+  // Falls through to the existing LLM path if the contract lacks ## Commands or
+  // if this is a recovery replan (recoveryContext is set) — let full planning handle it.
+  if (_shellContractMd && !recoveryContext && !state.forceSkillBuild) {
+    const _contractParsed = parseContractCommands(_shellContractMd);
+    if (_contractParsed && _contractParsed.commands.length > 0) {
+      logger.info(`[Node:PlanSkills] Contract fast path: ${_contractParsed.commands.length} template(s) for "${state.matchedSkillName}"`);
+
+      // PII stays out of the LLM — only need the template index back.
+      // Phone/email/body are resolved deterministically after the LLM call.
+      const _sel = await selectCommandTemplate(_contractParsed.commands, userMessage, backend);
+
+      if (_sel !== null) {
+        // ── Deterministic date resolution ────────────────────────────────────────
+        // Convert natural-language temporal phrases ("last week", "3 hours ago", etc.)
+        // into concrete UTC ISO ranges before applyContractParams runs.
+        // When a phrase is found, params.timeMin/timeMax override $(date ...) in the URL.
+        // The {{TOKEN}} variants (TIME_MIN, UNIX_MIN, DATE_MIN etc.) handle non-gcal APIs.
+        // When no phrase is found, resolveDateRange returns null and $(date ...) is left
+        // untouched so bash evaluates it at runtime (correct for "upcoming" queries).
+        const _resolvedDates = resolveDateRange(userMessage);
+        if (_resolvedDates) {
+          _sel.params.timeMin = _resolvedDates.timeMin;
+          _sel.params.timeMax = _resolvedDates.timeMax;
+          Object.assign(_sel.params, {
+            TIME_MIN: _resolvedDates.TIME_MIN,
+            TIME_MAX: _resolvedDates.TIME_MAX,
+            UNIX_MIN: _resolvedDates.UNIX_MIN,
+            UNIX_MAX: _resolvedDates.UNIX_MAX,
+            DATE_MIN: _resolvedDates.DATE_MIN,
+            DATE_MAX: _resolvedDates.DATE_MAX,
+          });
+          logger.info(`[Node:PlanSkills] resolveDateRange: timeMin=${_resolvedDates.timeMin} timeMax=${_resolvedDates.timeMax}`);
+        }
+        // ─────────────────────────────────────────────────────────────────────────
+
+        // ── Deterministic param resolution (phone, email, body) ─────────────────
+        // Merge runtime params into _sel.params — dates from resolveDateRange already set.
+        // buildRuntimeParams handles: extractMessageParams + profile fallback + BODY escape.
+        Object.assign(_sel.params, buildRuntimeParams(userMessage, profileContext, priorSynthesizedContent));
+        logger.info(`[Node:PlanSkills] fast path _sel.params keys: ${JSON.stringify(Object.keys(_sel.params))}`);
+        // ─────────────────────────────────────────────────────────────────────────
+
+        const _chosenTemplate = _contractParsed.commands[_sel.index];
+        logger.info(`[Node:PlanSkills] template code preview: ${(_chosenTemplate.code || '').slice(0, 120)}`);
+        // substituteTokens handles applyContractParams output + any remaining {{TOKEN}};
+        // uses split/join throughout to avoid String.replace $-special-char issues.
+        let _filledCode = substituteTokens(applyContractParams(_chosenTemplate.code, _sel), _sel.params, logger);
+        logger.info(`[Node:PlanSkills] _filledCode after substituteTokens (preview): ${_filledCode.slice(0, 200)}`);
+
+        // Build the deterministic plan
+        const _contractPlan = [];
+
+        // Step 1: auth check (always, if contract has an ## Auth block)
+        if (_contractParsed.authScript) {
+          _contractPlan.push({
+            skill: 'shell.run',
+            args: { cmd: 'bash', argv: ['-c', _contractParsed.authScript] },
+            description: `Check ${state.matchedSkillName} auth`,
+          });
+        }
+
+        // Step 2: the selected command
+        _contractPlan.push({
+          skill: 'shell.run',
+          args: { cmd: 'bash', argv: ['-c', _filledCode] },
+          description: _chosenTemplate.heading,
+        });
+
+        // Step 3: synthesize
+        _contractPlan.push({
+          skill: 'synthesize',
+          args: { prompt: userMessage },
+          description: 'Summarize result',
+        });
+
+        logger.info(`[Node:PlanSkills] Contract fast path: built ${_contractPlan.length}-step plan (template: "${_chosenTemplate.heading}")`);
+        if (progressCallback) progressCallback({
+          type: 'plan_ready',
+          steps: _contractPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })),
+          intent: state.intent?.type || 'command_automate',
+        });
+
+        return {
+          ...state,
+          skillPlan: _contractPlan,
+          skillCursor: 0,
+          recoveryContext: null,
+          planError: null,
+        };
+      }
+      logger.warn('[Node:PlanSkills] Contract fast path: template selection failed — falling through to LLM planning');
+    }
+  }
+  // ───────────────────────────────────────────────────────────────────────────
+
   const payload = {
     query: planningQuery,
     context: {
@@ -1138,7 +1304,7 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
       intent: 'command_automate'
     },
     options: {
-      maxTokens: 2400,
+      maxTokens: 3600,
       temperature: 0.1,
       fastMode: false
     }
@@ -2106,6 +2272,27 @@ Output ONLY the pattern text. No markdown, no explanation.`;
       });
     }
 
+    // ── Post-LLM-plan token resolution ───────────────────────────────────────
+    // The LLM may copy {{TO}}/{{BODY}} tokens literally from a contract template.
+    // Resolve all runtime params and substitute them into any shell.run steps.
+    if (Array.isArray(skillPlan)) {
+      const _rtParams = buildRuntimeParams(userMessage, profileContext, priorSynthesizedContent);
+      if (Object.keys(_rtParams).length > 0) {
+        skillPlan = skillPlan.map(step => {
+          if (step.skill !== 'shell.run') return step;
+          const _cmd = step.args?.argv?.[1];
+          if (!_cmd || !_cmd.includes('{{')) return step;
+          const _resolved = substituteTokens(_cmd, _rtParams, logger);
+          if (_resolved !== _cmd) {
+            logger.info(`[Node:PlanSkills] Post-plan token substitution applied to shell.run step`);
+            return { ...step, args: { ...step.args, argv: [step.args.argv[0], _resolved] } };
+          }
+          return step;
+        });
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     return {
       ...state,
       skillPlan,
@@ -2125,6 +2312,523 @@ Output ONLY the pattern text. No markdown, no explanation.`;
     };
   }
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract-driven execution helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Parse the ## Auth block and all ## Commands code blocks from a skill.md contract.
+ *
+ * Returns:
+ *   {
+ *     authScript: string | null,   — full bash code from the ## Auth section
+ *     commands: [{ heading, code }] — one entry per ### heading + fenced bash block
+ *   }
+ * or null if the contract has no ## Commands section or no parseable code blocks.
+ */
+function parseContractCommands(contractMd) {
+  if (!contractMd || typeof contractMd !== 'string') return null;
+
+  // Extract ## Auth bash block — only from the text BETWEEN ## Auth and the next ## section.
+  // Without the boundary, the regex greedily matches into ## Commands and picks up the SMS template.
+  let authScript = null;
+  const authSectionBody = contractMd.match(/##\s+Auth\s*\n([\s\S]*?)(?=\n##\s)/i);
+  if (authSectionBody) {
+    const authCodeBlock = authSectionBody[1].match(/```(?:bash|sh)?\s*\n([\s\S]*?)\n```/i);
+    if (authCodeBlock) authScript = authCodeBlock[1].trim();
+  }
+
+  // Find the ## Commands section
+  const cmdSectionMatch = contractMd.match(/##\s+Commands\s*\n([\s\S]*?)(?=\n##\s|\n---|\s*$)/i);
+  if (!cmdSectionMatch) return null;
+
+  const cmdSection = cmdSectionMatch[1];
+
+  // Extract each ### <heading> + fenced code block pair
+  const commands = [];
+  const cmdBlockRe = /###\s+(.+?)\n[\s\S]*?```(?:bash|sh)?\s*\n([\s\S]*?)\n```/gi;
+  let m;
+  while ((m = cmdBlockRe.exec(cmdSection)) !== null) {
+    commands.push({ heading: m[1].trim(), code: m[2].trim() });
+  }
+
+  // Fallback: fenced blocks without a ### heading
+  if (commands.length === 0) {
+    const rawBlockRe = /```(?:bash|sh)?\s*\n([\s\S]*?)\n```/gi;
+    let idx = 0;
+    while ((m = rawBlockRe.exec(cmdSection)) !== null) {
+      commands.push({ heading: `Command ${++idx}`, code: m[1].trim() });
+    }
+  }
+
+  if (commands.length === 0) return null;
+
+  return { authScript, commands };
+}
+
+/**
+ * Deterministically resolve natural-language temporal phrases in a user message into
+ * concrete UTC ISO 8601 date ranges.  Zero LLM involvement — uses only new Date().
+ *
+ * Returns an object with 8 tokens when a phrase is matched, or null otherwise.
+ * When null is returned, $(date ...) expressions stay in the template and bash
+ * evaluates them at runtime (correct "from now" behaviour for unqualified queries).
+ *
+ * Token map:
+ *   timeMin / timeMax  — ISO UTC string  — replaces $(date ...) in applyContractParams
+ *   TIME_MIN / TIME_MAX — same             — replaces {{TIME_MIN}} / {{TIME_MAX}} in templates
+ *   UNIX_MIN / UNIX_MAX — unix seconds    — replaces {{UNIX_MIN}} / {{UNIX_MAX}} (Slack etc.)
+ *   DATE_MIN / DATE_MAX — 'YYYY-MM-DD'   — replaces {{DATE_MIN}} / {{DATE_MAX}}
+ */
+function resolveDateRange(userMessage, now = new Date()) {
+  const msg = userMessage.toLowerCase();
+
+  // Normalize English word-numbers to digits so phrases like "two weeks ago",
+  // "three days ago", "a couple of hours" all hit the numeric regex paths below.
+  const WORD_TO_N = { one:1, two:2, three:3, four:4, five:5, six:6, seven:7, eight:8, nine:9, ten:10 };
+  const msgN = msg.replace(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\b/g, w => WORD_TO_N[w]);
+
+  // Helper: pad to 2 digits
+  const p = n => String(n).padStart(2, '0');
+
+  // Helper: ISO UTC string from a Date object
+  const iso = d => `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}T${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}Z`;
+
+  // Helper: date-only string from a Date object
+  const dateOnly = d => `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())}`;
+
+  // Helper: unix epoch seconds from a Date
+  const unix = d => Math.floor(d.getTime() / 1000);
+
+  // Helper: start of a UTC day (midnight)
+  const startOfUTCDay = d => {
+    const r = new Date(d);
+    r.setUTCHours(0, 0, 0, 0);
+    return r;
+  };
+
+  // Helper: end of a UTC day (23:59:59)
+  const endOfUTCDay = d => {
+    const r = new Date(d);
+    r.setUTCHours(23, 59, 59, 999);
+    return r;
+  };
+
+  // Helper: build the 8-token result from two Date objects
+  const result = (minDate, maxDate) => ({
+    timeMin:  iso(minDate),
+    timeMax:  iso(maxDate),
+    TIME_MIN: iso(minDate),
+    TIME_MAX: iso(maxDate),
+    UNIX_MIN: unix(minDate),
+    UNIX_MAX: unix(maxDate),
+    DATE_MIN: dateOnly(minDate),
+    DATE_MAX: dateOnly(maxDate),
+  });
+
+  // ── N-based patterns (check before named patterns to avoid partial mismatches) ──
+
+  // "N hours ago" / "last N hours" / "past N hours"
+  let m = msgN.match(/\b(\d+)\s+hours?\s+ago\b/) ||
+          msgN.match(/\b(?:last|past)\s+(\d+)\s+hours?\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const min = new Date(now.getTime() - n * 3600 * 1000);
+    return result(min, now);
+  }
+
+  // "last N days" / "past N days"
+  m = msgN.match(/\b(?:last|past)\s+(\d+)\s+days?\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const min = new Date(now.getTime() - n * 86400 * 1000);
+    return result(min, now);
+  }
+
+  // "N days ago" → the entire named day
+  m = msgN.match(/\b(\d+)\s+days?\s+ago\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const target = new Date(now.getTime() - n * 86400 * 1000);
+    return result(startOfUTCDay(target), endOfUTCDay(target));
+  }
+
+  // "N weeks ago" → the full ISO week that was N weeks back
+  m = msgN.match(/\b(\d+)\s+weeks?\s+ago\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const anchor = new Date(now.getTime() - n * 7 * 86400 * 1000);
+    const anchorDow = anchor.getUTCDay();
+    const anchorDsm = (anchorDow + 6) % 7; // days since Monday
+    const weekStart = new Date(anchor.getTime() - anchorDsm * 86400 * 1000);
+    const weekEnd = new Date(weekStart.getTime() + 6 * 86400 * 1000);
+    return result(startOfUTCDay(weekStart), endOfUTCDay(weekEnd));
+  }
+
+  // "last N weeks" / "past N weeks"
+  m = msgN.match(/\b(?:last|past)\s+(\d+)\s+weeks?\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const min = new Date(now.getTime() - n * 7 * 86400 * 1000);
+    return result(min, now);
+  }
+
+  // "last N months" / "past N months"
+  m = msgN.match(/\b(?:last|past)\s+(\d+)\s+months?\b/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    const min = new Date(now);
+    min.setUTCMonth(min.getUTCMonth() - n);
+    return result(min, now);
+  }
+
+  // ── Fixed-length fuzzy-count phrases ──────────────────────────────────────────
+
+  if (/\ba\s+couple\s+(?:of\s+)?hours?\b/.test(msg) || /\bcouple\s+(?:of\s+)?hours?\b/.test(msg)) {
+    return result(new Date(now.getTime() - 2 * 3600 * 1000), now);
+  }
+  if (/\ba?\s*few\s+hours?\b/.test(msg)) {
+    return result(new Date(now.getTime() - 3 * 3600 * 1000), now);
+  }
+  if (/\ba\s+couple\s+(?:of\s+)?days?\b/.test(msg) || /\bcouple\s+(?:of\s+)?days?\b/.test(msg)) {
+    return result(new Date(now.getTime() - 2 * 86400 * 1000), now);
+  }
+  if (/\ba?\s*few\s+days?\b/.test(msg)) {
+    return result(new Date(now.getTime() - 3 * 86400 * 1000), now);
+  }
+
+  // ── Time-of-day phrases ───────────────────────────────────────────────────────
+
+  if (/\bthis\s+morning\b/.test(msg)) {
+    const min = startOfUTCDay(now); // 00:00
+    const max = new Date(now); max.setUTCHours(12, 0, 0, 0);
+    return result(min, max);
+  }
+  if (/\bthis\s+afternoon\b/.test(msg)) {
+    const min = new Date(now); min.setUTCHours(12, 0, 0, 0);
+    const max = new Date(now); max.setUTCHours(18, 0, 0, 0);
+    return result(min, max);
+  }
+  if (/\btonight\b|\bthis\s+evening\b/.test(msg)) {
+    const min = new Date(now); min.setUTCHours(18, 0, 0, 0);
+    const max = endOfUTCDay(now);
+    return result(min, max);
+  }
+
+  // ── Named single-day phrases ──────────────────────────────────────────────────
+
+  if (/\byesterday\b/.test(msg)) {
+    const d = new Date(now.getTime() - 86400 * 1000);
+    return result(startOfUTCDay(d), endOfUTCDay(d));
+  }
+  if (/\btoday\b/.test(msg)) {
+    return result(startOfUTCDay(now), endOfUTCDay(now));
+  }
+  if (/\btomorrow\b/.test(msg)) {
+    const d = new Date(now.getTime() + 86400 * 1000);
+    return result(startOfUTCDay(d), endOfUTCDay(d));
+  }
+
+  // ── Weekend phrases ───────────────────────────────────────────────────────────
+
+  // Weekday numbers: Sun=0, Mon=1, ..., Sat=6 (getUTCDay)
+  // Days-since-Saturday: (dayOfWeek + 1) % 7
+  if (/\blast\s+weekend\b/.test(msg)) {
+    const dow = now.getUTCDay(); // 0=Sun
+    const daysSinceLastSun = dow === 0 ? 7 : dow;
+    const lastSun = new Date(now.getTime() - daysSinceLastSun * 86400 * 1000);
+    const lastSat = new Date(lastSun.getTime() - 86400 * 1000);
+    return result(startOfUTCDay(lastSat), endOfUTCDay(lastSun));
+  }
+  if (/\b(?:this|next)\s+weekend\b/.test(msg) || /\bthe\s+weekend\b/.test(msg)) {
+    const dow = now.getUTCDay();
+    const daysUntilSat = (6 - dow + 7) % 7 || 7; // days until next Saturday (min 1)
+    const sat = new Date(now.getTime() + daysUntilSat * 86400 * 1000);
+    const sun = new Date(sat.getTime() + 86400 * 1000);
+    return result(startOfUTCDay(sat), endOfUTCDay(sun));
+  }
+
+  // ── Week phrases (ISO: Mon–Sun) ───────────────────────────────────────────────
+
+  // Days-since-Monday: (dayOfWeek + 6) % 7 (Sun=0 → 6, Mon=1 → 0, ..., Sat=6 → 5)
+  const dowNow = now.getUTCDay();
+  const daysSinceMon = (dowNow + 6) % 7;
+
+  if (/\blast\s+week\b/.test(msg)) {
+    const thisMonday = new Date(now.getTime() - daysSinceMon * 86400 * 1000);
+    const lastMonday = new Date(thisMonday.getTime() - 7 * 86400 * 1000);
+    const lastSunday = new Date(thisMonday.getTime() - 86400 * 1000);
+    return result(startOfUTCDay(lastMonday), endOfUTCDay(lastSunday));
+  }
+  if (/\bthis\s+week\b/.test(msg)) {
+    const thisMonday = new Date(now.getTime() - daysSinceMon * 86400 * 1000);
+    const thisSunday = new Date(thisMonday.getTime() + 6 * 86400 * 1000);
+    return result(startOfUTCDay(thisMonday), endOfUTCDay(thisSunday));
+  }
+  if (/\bnext\s+week\b/.test(msg)) {
+    const thisMonday = new Date(now.getTime() - daysSinceMon * 86400 * 1000);
+    const nextMonday = new Date(thisMonday.getTime() + 7 * 86400 * 1000);
+    const nextSunday = new Date(nextMonday.getTime() + 6 * 86400 * 1000);
+    return result(startOfUTCDay(nextMonday), endOfUTCDay(nextSunday));
+  }
+
+  // ── Month phrases ─────────────────────────────────────────────────────────────
+
+  if (/\blast\s+month\b/.test(msg)) {
+    const y = now.getUTCMonth() === 0 ? now.getUTCFullYear() - 1 : now.getUTCFullYear();
+    const mo = now.getUTCMonth() === 0 ? 11 : now.getUTCMonth() - 1;
+    const first = new Date(Date.UTC(y, mo, 1));
+    const last = new Date(Date.UTC(y, mo + 1, 0, 23, 59, 59, 999));
+    return result(first, last);
+  }
+  if (/\bthis\s+month\b/.test(msg)) {
+    const y = now.getUTCFullYear(), mo = now.getUTCMonth();
+    const first = new Date(Date.UTC(y, mo, 1));
+    const last = new Date(Date.UTC(y, mo + 1, 0, 23, 59, 59, 999));
+    return result(first, last);
+  }
+  if (/\bnext\s+month\b/.test(msg)) {
+    const y = now.getUTCFullYear(), mo = now.getUTCMonth();
+    const nextMo = (mo + 1) % 12;
+    const nextY = mo === 11 ? y + 1 : y;
+    const first = new Date(Date.UTC(nextY, nextMo, 1));
+    const last = new Date(Date.UTC(nextY, nextMo + 1, 0, 23, 59, 59, 999));
+    return result(first, last);
+  }
+
+  // ── Year phrases ──────────────────────────────────────────────────────────────
+
+  if (/\blast\s+year\b/.test(msg)) {
+    const y = now.getUTCFullYear() - 1;
+    return result(new Date(Date.UTC(y, 0, 1)), new Date(Date.UTC(y, 11, 31, 23, 59, 59, 999)));
+  }
+  if (/\bthis\s+year\b/.test(msg)) {
+    const y = now.getUTCFullYear();
+    return result(new Date(Date.UTC(y, 0, 1)), new Date(Date.UTC(y, 11, 31, 23, 59, 59, 999)));
+  }
+  if (/\bnext\s+year\b/.test(msg)) {
+    const y = now.getUTCFullYear() + 1;
+    return result(new Date(Date.UTC(y, 0, 1)), new Date(Date.UTC(y, 11, 31, 23, 59, 59, 999)));
+  }
+
+  // No temporal phrase matched → return null so $(date ...) stays untouched
+  return null;
+}
+
+/**
+ * Extract recipient, address, amount, and other runtime parameters from the user message.
+ * Acts as the messaging/location/payment counterpart to resolveDateRange().
+ * Returns a flat params object (Token → value) or null if nothing useful was found.
+ *
+ * Supported tokens:
+ *   TO       — E.164 phone number of the primary recipient (or email if no phone given)
+ *   PHONE    — alias for TO (some templates prefer PHONE over TO)
+ *   EMAIL    — recipient email address
+ *   URL      — URL mentioned in the message
+ *   AMOUNT   — monetary amount (digits, optional decimals)
+ *   ZIP      — ZIP code
+ *   FILENAME — filename mentioned in the message
+ */
+function extractMessageParams(userMessage) {
+  if (!userMessage) return null;
+  const params = {};
+  const msg = userMessage.trim();
+
+  // ── Phone number extraction (priority order) ───────────────────────────────
+  // 1. "to <10-digit US>" with optional separators
+  const _toPhone = msg.match(/\bto\s+\+?1?\s*[-.]?\s*([2-9]\d{2})\s*[-.]?\s*(\d{3})\s*[-.]?\s*(\d{4})\b/i);
+  if (_toPhone) {
+    params.TO = `+1${_toPhone[1]}${_toPhone[2]}${_toPhone[3]}`;
+    params.PHONE = params.TO;
+  } else {
+    // 2. Bare E.164 already in message
+    const _e164 = msg.match(/(\+1[2-9]\d{9}|\+[2-9]\d{6,14})\b/);
+    if (_e164) {
+      params.TO = _e164[1];
+      params.PHONE = _e164[1];
+    } else {
+      // 3. Bare 10-digit US number (no country code)
+      const _bare10 = msg.match(/\b([2-9]\d{2})[.\-\s]?(\d{3})[.\-\s]?(\d{4})\b/);
+      if (_bare10) {
+        params.TO = `+1${_bare10[1]}${_bare10[2]}${_bare10[3]}`;
+        params.PHONE = params.TO;
+      }
+    }
+  }
+
+  // ── Email extraction ───────────────────────────────────────────────────────
+  const _email = msg.match(/\b([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})\b/);
+  if (_email) {
+    params.EMAIL = _email[1];
+    if (!params.TO) params.TO = _email[1]; // use email as TO when no phone given
+  }
+
+  // ── URL extraction ─────────────────────────────────────────────────────────
+  const _url = msg.match(/https?:\/\/[^\s"'<>]+/i);
+  if (_url) params.URL = _url[0];
+
+  // ── Monetary amount ────────────────────────────────────────────────────────
+  const _amt = msg.match(/\$\s*(\d+(?:\.\d{1,2})?)\b/)
+    || msg.match(/\b(\d+(?:\.\d{2}))\s*(?:dollars?|usd|eur|gbp)\b/i);
+  if (_amt) params.AMOUNT = _amt[1];
+
+  // ── ZIP code ───────────────────────────────────────────────────────────────
+  const _zip = msg.match(/\b(\d{5}(?:-\d{4})?)\b/);
+  if (_zip) params.ZIP = _zip[1];
+
+  // ── Filename ──────────────────────────────────────────────────────────────
+  const _file = msg.match(/\b([\w.\-]+\.(pdf|docx?|xlsx?|csv|txt|png|jpe?g|gif|mp3|mp4|zip))\b/i);
+  if (_file) params.FILENAME = _file[1];
+
+  return Object.keys(params).length > 0 ? params : null;
+}
+
+/**
+ * Build the full set of runtime substitution params for a user message.
+ * Combines extractMessageParams (phone/email/url), profile facts fallback,
+ * and shell-safe BODY from priorSynthesizedContent.
+ *
+ * Does NOT overwrite an existing value — callers can pre-seed the object.
+ */
+function buildRuntimeParams(userMessage, profileContext, priorSynthesizedContent) {
+  const params = {};
+  const msgParams = extractMessageParams(userMessage);
+  if (msgParams) Object.assign(params, msgParams);
+  if (!params.TO && profileContext?.facts) {
+    const myPhone = profileContext.facts.find(f => f.field === 'my_phone');
+    if (myPhone?.value) { params.TO = myPhone.value; params.PHONE = myPhone.value; }
+    const myEmail = profileContext.facts.find(f => f.field === 'my_email');
+    if (myEmail?.value && !params.EMAIL) params.EMAIL = myEmail.value;
+  }
+  if (priorSynthesizedContent && !params.BODY) {
+    params.BODY = priorSynthesizedContent
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/`/g, '\\`')
+      .replace(/\$/g, '\\$')
+      .replace(/\r/g, '')
+      .replace(/\n/g, '\\n')
+      .slice(0, 1200);
+  }
+  // ── DEBUG (remove after fix confirmed) ──────────────────────────────────────
+  console.info(
+    '[buildRuntimeParams] msg="%s" | TO=%s | BODY_LEN=%d | profileFacts=%d | priorBodyLen=%d',
+    (userMessage || '').slice(0, 80),
+    params.TO ?? '(none)',
+    params.BODY?.length ?? 0,
+    profileContext?.facts?.length ?? 0,
+    priorSynthesizedContent?.length ?? 0
+  );
+  // ────────────────────────────────────────────────────────────────────────────
+  return params;
+}
+
+/**
+ * Substitute all {{TOKEN}} placeholders in `code` with values from `params`.
+ * Uses split/join instead of String.replace() to avoid $-special-char issues
+ * (e.g. $& or $1 in replacement strings when values contain $ characters).
+ */
+function substituteTokens(code, params, logger) {
+  if (!code || !code.includes('{{')) return code;
+  let result = code;
+  for (const [k, v] of Object.entries(params)) {
+    const tok = `{{${k}}}`;
+    if (result.includes(tok)) {
+      result = result.split(tok).join(String(v));
+      if (logger) logger.info(`[Node:PlanSkills] substituteTokens: resolved {{${k}}}`);
+    }
+  }
+  return result;
+}
+
+/**
+ * Ask the LLM to pick the right command template by index only.
+ * PII (phone, email, message body) is NOT sent to the LLM — all substitutions
+ * are applied deterministically after this call via extractMessageParams() and
+ * priorSynthesizedContent in applyContractParams / the split/join safety pass.
+ *
+ * Returns { index: number, substitutions: [], params: {} } or null on failure.
+ */
+async function selectCommandTemplate(commands, userMessage, backend) {
+  // Scrub PII from the message before it touches the LLM.
+  // Replace phone numbers, emails, and URLs with neutral placeholders.
+  const _scrubbedMsg = userMessage
+    .replace(/\+?1?[\s.-]?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g, '[PHONE]')
+    .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[EMAIL]')
+    .replace(/https?:\/\/\S+/g, '[URL]');
+
+  const commandList = commands
+    .map((c, i) => `--- Template ${i}: ${c.heading} ---`)
+    .join('\n');
+
+  const query = `User request: "${_scrubbedMsg}"
+
+Available command templates:
+${commandList}
+
+Output ONLY valid JSON with the best matching template index (0-based):
+{ "index": <number> }`;
+
+  try {
+    const raw = await backend.generateAnswer(query, {
+      query,
+      context: { conversationHistory: [], systemInstructions: 'You are a command template selector. Pick the best matching template index and output only { "index": N }. Do not output anything else.', intent: 'command_automate' },
+      options: { maxTokens: 20, temperature: 0, fastMode: true },
+    }, { maxTokens: 20, temperature: 0, fastMode: true }, null);
+
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (typeof parsed.index !== 'number' || parsed.index < 0 || parsed.index >= commands.length) return null;
+    // Return empty substitutions — all token replacement is done post-LLM
+    return { index: parsed.index, substitutions: [], params: {} };
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Substitute parameter values into a command template.
+ * Replaces $(date ...) subshells with pre-computed ISO strings when the LLM
+ * supplied timeMin/timeMax/date params, and splices in any other key=value pairs.
+ */
+function applyContractParams(code, sel) {
+  let result = code;
+
+  // ── Primary: literal find/replace substitutions from LLM ──────────────────
+  const substitutions = Array.isArray(sel.substitutions) ? sel.substitutions : [];
+  const sorted = [...substitutions]
+    .filter(s => s && typeof s.find === 'string' && s.find.length > 0 && s.replace !== undefined)
+    .filter(s => !/^\$\{?[A-Z_][A-Z0-9_]*\}?$/.test(s.find.trim())) // never strip shell $VAR / ${VAR} env references
+    .filter(s => !/^\$\(date\b/.test(s.find.trim())) // never replace $(date ...) — bash evaluates at runtime
+    .sort((a, b) => b.find.length - a.find.length); // longest match first
+  for (const { find, replace } of sorted) {
+    result = result.split(find).join(String(replace));
+  }
+
+  // ── Fallback: legacy params-based date expansion ───────────────────────────
+  const params = sel.params || {};
+  if (params.timeMin) {
+    result = result.replace(/\$\(date[^)]*%Y-%m-%dT%H:%M:%SZ[^)]*\)/g, params.timeMin);
+    result = result.replace(/\$\(date[^)]*%Y-%m-%dT00:00:00Z[^)]*\)/g, params.timeMin);
+    result = result.replace(/\$\(date[^)]*%Y-%m-%dT[^)]*\)/g, params.timeMin);
+  }
+  if (params.timeMax) {
+    result = result.replace(/(\?|&)(timeMax=)[^&"\s]*/g, `$1$2${params.timeMax}`);
+    if (!result.includes('timeMax=')) result = result.replace(/(\?[^"]*)(")/, `$1&timeMax=${params.timeMax}$2`);
+  }
+  if (params.date) result = result.replace(/\$\(date[^)]*\)/g, params.date);
+  for (const [k, v] of Object.entries(params)) {
+    if (k === 'timeMin' || k === 'timeMax' || k === 'date') continue;
+    // split/join avoids String.replace() $-special-character substitution issues
+    // (e.g. $& or $1 in replacement string when body/phone contains $ characters)
+    const _tok = `{{${k}}}`;
+    if (result.includes(_tok)) result = result.split(_tok).join(String(v));
+  }
+
+  return result;
+}
 
 /**
  * Extract and parse a JSON array/object from LLM output.

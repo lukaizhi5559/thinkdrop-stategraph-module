@@ -8,12 +8,40 @@
                                                                                                                                                                                                                                                                                               *
  * NOTE: Project detection (launch/stop/edit of ~/.thinkdrop/projects) is handled
  * by the parseProject node, which runs AFTER enrichIntent routes app_control_start.
- * This keeps parseIntent lean — no LLM call on every message.
+ * This keeps parseIntent lean — classification is handled by decomposePrompt's LLM call.
  */
+
+const fs   = require('fs');
+const path = require('path');
+
+// Structured JSON Lines log — one record per intent classification decision.
+// Location: <repo>/logs/intent-classifier.jsonl
+// Tail with: tail -f logs/intent-classifier.jsonl | jq .
+const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.jsonl');
+function writeIntentLog(entry) {
+  try { fs.appendFileSync(INTENT_LOG_PATH, JSON.stringify(entry) + '\n', 'utf8'); }
+  catch (_) { /* never throw — logging must never block classification */ }
+}
 
 module.exports = async function parseIntent(state) {
   const { mcpAdapter, message, resolvedMessage, carriedIntent, context, llmBackend, conversationHistory, activeBrowserSessionId, activeBrowserUrl } = state;
   const logger = state.logger || console;
+
+  // ── Phase 3: Resume guard — restore serialized long-task context ───────────
+  // When main.js re-injects a prompt via voice:inject-prompt with _resumeContext,
+  // skip all classification and restore the serialized queue state directly.
+  if (state._resumeContext && typeof state._resumeContext === 'object') {
+    const ctx = state._resumeContext;
+    logger.info('[Node:ParseIntent] _resumeContext detected — restoring long-task queue state');
+    return {
+      ...state,
+      intentQueue:   ctx.intentQueue   || [],
+      intentResults: ctx.intentResults || [],
+      dataContext:   ctx.dataContext   || {},
+      isMultiIntent: (ctx.intentQueue && ctx.intentQueue.length > 0) || (ctx.intentResults && ctx.intentResults.length > 0),
+      _resumeContext: null,  // consumed — clear it
+    };
+  }
 
   // ── skill_build fast-path: never re-classify skill build requests ──────────
   // main.js sets intent.type='skill_build' + skillBuildRequest before calling execute().
@@ -35,39 +63,26 @@ module.exports = async function parseIntent(state) {
 
     const firstSub = state.intentPlan[0];
 
-    // Classify first sub-prompt through the full parseIntent logic
+    // Run first sub-prompt through parseIntent: hard overrides fire first, then
+    // the decompose-passthrough fast-path picks up firstSub.estimatedIntent.
     const firstResult = await module.exports({
       ...state,
-      message:        firstSub.text,
+      message:         firstSub.text,
       resolvedMessage: firstSub.text,
-      intentPlan:     null,   // prevent infinite recursion
-      carriedIntent:  null,   // suppress prior carriedIntent — sub-prompts are self-contained
+      intentPlan:      [firstSub],  // 1-item plan → decompose-passthrough after overrides
+      carriedIntent:   null,        // suppress prior carriedIntent — sub-prompts are self-contained
     });
 
-    // Classify remaining sub-prompts via phi4 directly
+    // Classify remaining sub-prompts — trust estimatedIntent from decomposePrompt directly.
+    // The LLM had the full original message as context when classifying each sub-prompt.
+    // Heuristic-decomposed sub-prompts keep 'general_knowledge' (LLM was unavailable).
     const intentQueue = [];
     for (const subPrompt of state.intentPlan.slice(1)) {
-      let classifiedIntent = subPrompt.estimatedIntent;
-      let classifiedConf   = 0.65;
-
-      if (mcpAdapter) {
-        try {
-          const r = await mcpAdapter.callService('phi4', 'intent.parse', {
-            message: subPrompt.text,
-            context: { sessionId: state.context?.sessionId, userId: state.context?.userId },
-          });
-          const d = r?.data || r;
-          if (d?.intent) {
-            classifiedIntent = d.intent;
-            classifiedConf   = d.confidence || 0.65;
-          }
-        } catch (e) {
-          logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] classification error: ${e.message}`);
-        }
-      }
+      const classifiedIntent = subPrompt.estimatedIntent;
+      const classifiedConf   = state._decomposedBy === 'llm' ? 0.92 : 0.65;
 
       intentQueue.push({ ...subPrompt, intent: classifiedIntent, confidence: classifiedConf });
-      logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] "${subPrompt.text.slice(0, 60)}" → ${classifiedIntent} (${classifiedConf.toFixed(2)})`);
+      logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] "${subPrompt.text.slice(0, 60)}" → ${classifiedIntent} (${classifiedConf.toFixed(2)}) via:${state._decomposedBy}`);
     }
 
     return {
@@ -178,8 +193,8 @@ module.exports = async function parseIntent(state) {
     new RegExp(`^(text|send|email|message|forward)\\s+(this|it|that|these|those)(\\s+\\w+)?\\s+${TO_ME_DEST.source}`, 'i')
     // "text the info to me", "send the results to my phone"
     || new RegExp(`^(text|send|email|message|forward)\\s+the\\s+\\w[\\w\\s]{0,30}\\s+${TO_ME_DEST.source}`, 'i')
-    // verb + me + object: "text me this", "send me the results", "email me it"
-    || /^(text|send|email|message|forward)\s+me\s+(this|it|that|these|the\s+\w+)/i
+    // verb + me + object: "text me this", "send me the results", "email me it", "text me the previous conversation"
+    || /^(text|send|email|message|forward)\s+me\s+(this|it|that|these|the(\s+\w+)+)/i
     // bare messaging verb + demonstrative: "text this info", "send that", "email these results"
     || /^(text|send|email|message|forward)\s+(this|it|that|these|those|the)\s+/i;
   if (MESSAGING_VERB_OVERRIDE.test(classifyMessage)) {
@@ -464,6 +479,7 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   const systemResourceQuery = /\b(cpu|gpu|ram|memory usage|disk usage|disk\s+space|free\s+storage|battery|bandwidth|network speed|cpu usage|ram usage|disk speed|read.?write speed|throughput)\b|\bc\.?\s*p\.?\s*u\b|\bg\.?\s*p\.?\s*u\b|\bwhat'?s\s+my\s+disk\b/i;
   if (personalAttributeQuery.test(classifyMessage.trim()) && !systemResourceQuery.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Personal-attribute retrieval override → memory_retrieve: "${classifyMessage}"`);
+    writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent || null, parser: 'personal-attribute-override', intent: 'memory_retrieve', confidence: 0.95 });
     return {
       ...state,
       intent: {
@@ -602,19 +618,12 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
     };
   }
 
-  // Short-circuit: resolveReferences already determined intent via carryover
+  // carriedIntent: now a soft hint for the LLM classifier — not a hard bypass.
+  // Injected into the LLM prompt as continuation context. The LLM determines whether
+  // this message continues the prior intent or represents a topic pivot.
+  // Hard bypass at confidence:1.0 could suppress correct reclassification on topic changes.
   if (carriedIntent) {
-    logger.debug(`[Node:ParseIntent] Using carried intent from resolveReferences: ${carriedIntent}`);
-    return {
-      ...state,
-      intent: {
-        type: carriedIntent,
-        confidence: 1.0,
-        entities: [],
-        requiresMemoryAccess: carriedIntent === 'memory_retrieve'
-      },
-      metadata: { parser: 'intent-carryover', processingTimeMs: 0 }
-    };
+    logger.debug(`[Node:ParseIntent] carriedIntent hint available (${carriedIntent}) — passing to LLM classifier`);
   }
 
   // ── Learned intent override check (before phi4) ───────────────────────────
@@ -645,79 +654,59 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
     }
   }
 
-  // ── DistilBERT early classification ──────────────────────────────────────
-  // All structural/meta guards above (app-launch, app-control, messaging verbs,
-  // lift/set_constraint, skill invocations, carriedIntent, DuckDB self-corrections)
-  // must always run unconditionally — they are correct by definition.
-  //
-  // Everything BELOW this point is a language-pattern safety net that was written
-  // to compensate for the old cosine-similarity parser's mistakes. DistilBERT
-  // (fine-tuned on 6,250 labelled examples) handles these patterns directly.
-  //
-  // Strategy: call the model here. If it is highly confident (>= MODEL_CONF_THRESHOLD)
-  // return immediately and skip all the language-pattern guards below. If it is
-  // uncertain the guards below run as a safety net — preserving existing behaviour.
-  // Over time, as DistilBERT is retrained on edge cases collected via intent_override,
-  // fewer and fewer prompts will need the safety net.
-  const MODEL_CONF_THRESHOLD = 0.75;
-  let earlyModelResult = null;
-  if (mcpAdapter) {
-    try {
-      const _earlyCall = await mcpAdapter.callService('phi4', 'intent.parse', {
-        message: classifyMessage,
-        context: { sessionId: context?.sessionId, userId: context?.userId }
-      });
-      earlyModelResult = _earlyCall?.data || _earlyCall;
-    } catch (e) {
-      logger.debug(`[Node:ParseIntent] Early DistilBERT call skipped: ${e.message}`);
-    }
+  // ── RESEARCH_INTENT_OVERRIDE — runs before LLM classification ───────────
+  // Catches research-framed prompts that use execution vocabulary. Eliminates
+  // a critical failure category where hypothetical/comparison phrasing triggers
+  // command_automate when the user clearly wants information, not an action.
+  const isResearchFrame =
+    /^(what|which|are there|any)\s+(are|other|good|popular|best|common|free|paid|cheap|reliable)?\s*\w*\s*(options?|alternatives?|ways?|tools?|services?|apis?|platforms?|apps?|products?|solutions?)\b/i.test(classifyMessage) ||
+    /^(how\s+(do|can|would|should)\s+(i|you|we|one))\s+(find|choose|compare|get|use|pick|select|decide|know)\b/i.test(classifyMessage) ||
+    /^what'?s\s+(the\s+)?(best|cheapest|easiest|fastest|most\s+\w+)\s+way\s+to\b/i.test(classifyMessage) ||
+    /^(if\s+i\s+(want(ed)?|need(ed)?|were?\s+to)|suppose\s+i|hypothetically|what\s+if\s+i)\b/i.test(classifyMessage) ||
+    /^(can\s+you\s+explain|tell\s+me\s+(about|how|why|what)|what'?s\s+the\s+difference)\b/i.test(classifyMessage);
+
+  if (isResearchFrame) {
+    logger.debug(`[Node:ParseIntent] Research-intent override → web_search: "${classifyMessage}"`);
+    return {
+      ...state,
+      intent: { type: 'web_search', confidence: 0.97, entities: [], requiresMemoryAccess: false },
+      metadata: { parser: 'research-intent-override', processingTimeMs: 0 },
+    };
   }
 
-  if (earlyModelResult && (earlyModelResult.confidence ?? 0) >= MODEL_CONF_THRESHOLD) {
-    const _eIntent = earlyModelResult.intent || 'general_query';
-    const _eConf   = earlyModelResult.confidence;
-    logger.debug(`[Node:ParseIntent] DistilBERT early → ${_eIntent} (${_eConf.toFixed(2)}): "${classifyMessage}"`);
-    // Signal 1: record low-confidence candidates for self-repair review
-    if (_eConf < 0.55) {
-      mcpAdapter?.callService('user-memory', 'intent_override.upsert', {
-        examplePrompt: classifyMessage, correctIntent: _eIntent, wrongIntent: null, source: 'low_confidence_candidate'
-      }).catch(() => {});
-    }
+  // ── decomposePrompt fast-path ─────────────────────────────────────────────
+  // decomposePrompt has already classified this message via its LLM call.
+  // Hard overrides above still run first; landing here means none fired.
+  if (state.intentPlan && Array.isArray(state.intentPlan) && state.intentPlan.length >= 1) {
+    const intent = state.intentPlan[0].estimatedIntent || 'general_knowledge';
 
-    // Browser-context override: DistilBERT says memory_store but there's an active browser
-    // session on a video/streaming platform and the message looks like a refinement/follow-up
-    // action rather than a genuine fact to store.
-    // E.g. "this revealing truth channel less then 5 mins" (0.88 memory_store) when browser
-    // is on YouTube — user is refining a previous browse request, not storing a memory.
-    if (_eIntent === 'memory_store' && _eConf < 0.92 &&
+    // Browser-context override: decompose may return memory_store for a browser-session
+    // refinement message because the LLM lacks visibility into the active browser context.
+    if (intent === 'memory_store' &&
         activeBrowserSessionId &&
         /\b(youtube|twitch|tiktok|vimeo|netflix|instagram|channel|video)\.?(com)?/i.test(activeBrowserUrl || '') &&
         /\b(channel|video|videos|list|less\s+than|under|min(ute)?s?|filter|shorts?|clips?)\b/i.test(classifyMessage) &&
         !/\b(remember|note|save|store|track|don.?t forget)\b/i.test(classifyMessage)) {
-      logger.debug(`[Node:ParseIntent] Browser-context override: memory_store → command_automate (active video session, refinement pattern): "${classifyMessage}"`);
+      logger.debug(`[Node:ParseIntent] Browser-context override: memory_store → command_automate: "${classifyMessage}"`);
+      writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent || null, parser: 'browser-context-override', intent: 'command_automate', confidence: 0.85, llmOriginal: 'memory_store' });
       return {
         ...state,
         intent: { type: 'command_automate', confidence: 0.85, entities: [], requiresMemoryAccess: false },
-        metadata: { parser: 'browser-context-override', processingTimeMs: earlyModelResult.metadata?.processingTimeMs || 0 }
+        metadata: { parser: 'browser-context-override', processingTimeMs: 0 },
       };
     }
 
+    logger.debug(`[Node:ParseIntent] decompose-passthrough → ${intent}: "${classifyMessage}"`);
+    writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent || null, parser: 'decompose-passthrough', intent, confidence: 0.92 });
     return {
       ...state,
-      intent: {
-        type: _eIntent,
-        confidence: _eConf,
-        entities: earlyModelResult.entities || [],
-        requiresMemoryAccess: earlyModelResult.requiresMemoryAccess || false
-      },
-      metadata: { parser: 'distilbert-early', processingTimeMs: earlyModelResult.metadata?.processingTimeMs || 0 }
+      intent: { type: intent, confidence: 0.92, entities: [], requiresMemoryAccess: intent === 'memory_retrieve' },
+      metadata: { parser: 'decompose-passthrough', processingTimeMs: 0 },
     };
   }
 
-  // DistilBERT was uncertain or unavailable — language-pattern safety nets follow.
-  if (earlyModelResult) {
-    logger.debug(`[Node:ParseIntent] DistilBERT uncertain (${earlyModelResult.confidence?.toFixed(2)}) — pattern guards active`);
-  }
+  // No intentPlan (LLM was unavailable, heuristic also failed) — pattern guards below run as fallback.
+  logger.debug(`[Node:ParseIntent] No intentPlan — falling through to pattern guards`);
 
   // "I need you to [action]" / "I want you to [action]" / "Can you [action]" → command_automate.
   // NOTE: DistilBERT (retrained with R12) now handles these at 0.91-0.94 confidence → early exit.
@@ -2136,97 +2125,11 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
 
   // ─────────────────────────────────────────────────────────────────────────
 
-  // Check if MCP adapter is available
-  if (!mcpAdapter) {
-    logger.warn('[Node:ParseIntent] No MCP adapter - using rule-based fallback');
-    return fallbackIntentClassification(state);
-  }
-
-  try {
-    // Reuse the early DistilBERT result when available (model was called earlier
-    // but was uncertain; all pattern guards fired without a match — use model's
-    // best guess). Only call the service again if the early call was never attempted.
-    const result = earlyModelResult
-      ? { data: earlyModelResult }
-      : await mcpAdapter.callService('phi4', 'intent.parse', {
-          message: classifyMessage,
-          context: { sessionId: context?.sessionId, userId: context?.userId }
-        });
-
-    // MCP protocol wraps response in 'data' field
-    const intentData = result.data || result;
-    
-    const finalIntent = intentData.intent || 'general_query';
-    const finalConfidence = intentData.confidence || 0.5;
-    
-    logger.debug(`[Node:ParseIntent] Classified as: ${finalIntent} (confidence: ${finalConfidence.toFixed(2)})`);
-
-    // Low-confidence signal: phi4 was uncertain — record as self-repair candidate.
-    // The stored entry marks this prompt for future human or automated review.
-    // wrongIntent is null because we don't yet know what was wrong; source flags it as a candidate.
-    const INTENT_SIGNAL_THRESHOLD = 0.55;
-    if (finalConfidence < INTENT_SIGNAL_THRESHOLD) {
-      mcpAdapter.callService('user-memory', 'intent_override.upsert', {
-        examplePrompt: classifyMessage,
-        correctIntent: finalIntent,
-        wrongIntent: null,
-        source: 'low_confidence_candidate'
-      }).catch(() => {}); // fire-and-forget — never block intent resolution on this write
-      logger.debug(`[Node:ParseIntent] Low-confidence signal recorded: "${classifyMessage.slice(0, 60)}" → ${finalIntent} (${finalConfidence.toFixed(2)})`);
-    }
-
-    // Post-phi4 correction: low-confidence memory_store with retrieval verbs → memory_retrieve.
-    // phi4 sometimes misclassifies "give the date of that day", "tell me what X was" as memory_store.
-    const lowConfRetrievalVerb = /^(give|tell|show|what|which|when|where|who|how|list|find|recall|describe|explain)\b/i;
-    if (finalIntent === 'memory_store' && finalConfidence < 0.6 && lowConfRetrievalVerb.test(classifyMessage.trim())) {
-      logger.debug(`[Node:ParseIntent] Post-phi4 correction: low-confidence memory_store + retrieval verb → memory_retrieve`);
-      return {
-        ...state,
-        intent: {
-          type: 'memory_retrieve',
-          confidence: 0.80,
-          entities: intentData.entities || [],
-          requiresMemoryAccess: true
-        },
-        metadata: { parser: 'phi4-corrected-retrieve', processingTimeMs: intentData.metadata?.processingTimeMs || 0 }
-      };
-    }
-
-    // Post-phi4 correction: low-confidence memory_store with action verbs → command_automate.
-    // phi4 sometimes misclassifies "I need to renew/book/apply/fix..." as memory_store.
-    // Exclude "book" when followed by club/shelf/store/fair (e.g. "reading for my book club").
-    const lowConfActionVerb = /\b(renew|apply|register|schedule|order|buy|purchase|sign up|fill out|submit|install|download|update|fix|set up|create|send|navigate|open|search|find|go to)\b|\bbook(?!\s+(club|shelf|store|fair|review|summary|recommendation))\b/i;
-    if (finalIntent === 'memory_store' && finalConfidence < 0.5 && lowConfActionVerb.test(classifyMessage)) {
-      logger.debug(`[Node:ParseIntent] Post-phi4 correction: low-confidence memory_store + action verb → command_automate`);
-      return {
-        ...state,
-        intent: {
-          type: 'command_automate',
-          confidence: 0.85,
-          entities: intentData.entities || [],
-          requiresMemoryAccess: false
-        },
-        metadata: { parser: 'phi4-corrected', processingTimeMs: intentData.metadata?.processingTimeMs || 0 }
-      };
-    }
-    
-    return {
-      ...state,
-      intent: {
-        type: finalIntent,
-        confidence: finalConfidence,
-        entities: intentData.entities || [],
-        requiresMemoryAccess: intentData.requiresMemoryAccess || false
-      },
-      metadata: {
-        parser: 'phi4',
-        processingTimeMs: intentData.metadata?.processingTimeMs || 0
-      }
-    };
-  } catch (error) {
-    logger.warn('[Node:ParseIntent] MCP call failed, using fallback:', error.message);
-    return fallbackIntentClassification(state);
-  }
+  // ── Final fallback ─────────────────────────────────────────────────────────
+  // All pattern guards ran without a match and the LLM was unavailable (or timed out).
+  // Use the rule-based fallbackIntentClassification for basic coverage.
+  logger.debug(`[Node:ParseIntent] No pattern match and LLM unavailable → rule-based fallback: "${classifyMessage.slice(0, 60)}"`);
+  return fallbackIntentClassification(state);
 };
 
 /**

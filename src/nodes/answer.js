@@ -82,6 +82,11 @@ module.exports = async function answer(state) {
   // originalMessage holds the user's actual words; message/resolvedMessage hold the English
   // translation that was only used for intent classification — not for answering.
   let queryMessage = state.originalMessage || resolvedMessage || message;
+  // Prepend _dataPrefix (injected by multi-intent queue runner) when context from a prior
+  // step should be visible to the answer LLM (e.g. memory result feeding into a follow-up).
+  if (state._dataPrefix) {
+    queryMessage = `${state._dataPrefix}\n\n${queryMessage}`;
+  }
   if (typeof queryMessage !== 'string') {
     queryMessage = typeof queryMessage === 'object'
       ? JSON.stringify(queryMessage)

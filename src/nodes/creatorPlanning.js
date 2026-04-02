@@ -34,6 +34,48 @@ const os   = require('os');
 const fs   = require('fs');
 const { isOAuthProvider, getOAuthScopes } = require('./oauthProviders');
 
+/**
+ * Normalize auto-generated skill command templates by replacing concrete example
+ * values (phone numbers, emails, message bodies, addresses, amounts) with
+ * {{TOKEN}} placeholders. These are resolved at execution time by extractMessageParams()
+ * and applyContractParams() in planSkills.js.
+ *
+ * @param {string} cmdString  — raw command string (curl / cli)
+ * @param {string} capability — skill capability name (e.g. "send.sms", "send.email")
+ */
+function normalizeCommandTokens(cmdString, capability) {
+  if (!cmdString || typeof cmdString !== 'string') return cmdString;
+  const isMessaging = /\b(sms|text|email|message|notification|notify|whatsapp|push|mail|send)\b/i.test(capability);
+  const isLocation  = /\b(map|route|ship|deliver|address|geo|location)\b/i.test(capability);
+  const isPayment   = /\b(pay|charge|invoice|transfer|amount)\b/i.test(capability);
+  let r = cmdString;
+
+  if (isMessaging) {
+    // Phone numbers → {{TO}}
+    r = r.replace(/"(\+?1?[2-9]\d{2}[2-9]\d{6})"/g, '"{{TO}}"');
+    r = r.replace(/"(\+[2-9]\d{6,14})"/g, '"{{TO}}"');
+    r = r.replace(/'(\+?1?[2-9]\d{2}[2-9]\d{6})'/g, "'{{TO}}'");
+    // Email addresses → {{EMAIL}}
+    r = r.replace(/"([a-zA-Z0-9._%+\-]+@[^\s"']{4,})"/g, '"{{EMAIL}}"');
+    // Message body/content fields → {{BODY}}
+    r = r.replace(/(["'](?:body|message|text|content)["']\s*:\s*["'])[^"']{5,}(["'])/gi, '$1{{BODY}}$2');
+    // Subject/title fields → {{SUBJECT}}
+    r = r.replace(/(["'](?:subject|title)["']\s*:\s*["'])[^"']{3,}(["'])/gi, '$1{{SUBJECT}}$2');
+    // From field with phone/email → {{FROM}}
+    r = r.replace(/(["']from["']\s*:\s*["'])(\+?[\d]{7,}|\S+@\S+)(["'])/gi, '$1{{FROM}}$3');
+  }
+
+  if (isLocation) {
+    r = r.replace(/(["'](?:address|location|destination)["']\s*:\s*["'])[^"']{5,}(["'])/gi, '$1{{ADDRESS}}$2');
+  }
+
+  if (isPayment) {
+    r = r.replace(/\b(\d+\.\d{2})\b/g, '{{AMOUNT}}');
+  }
+
+  return r;
+}
+
 // ── Module-level mutex ────────────────────────────────────────────────────────
 // Only one creator pipeline runs at a time. Concurrent command_automate prompts
 // queue here so they don't saturate the shared LLM WebSocket simultaneously.
@@ -154,6 +196,43 @@ module.exports = async function creatorPlanning(state) {
         ? rawSchedule
         : 'on_demand';
 
+      // ── Pre-compute reusable blocks for ## Auth and ## Commands ────────────
+      const _keytarLines = (config.authEnv || []).map(
+        k => `${k}=$(security find-generic-password -s thinkdrop -a "skill:${skillName}:${k}" -w 2>/dev/null)`
+      );
+
+      // Human-readable heading derived from capability (e.g. "send.sms" → "Send Sms")
+      const _capHeading = capability
+        .split(/[._\-\s]+/)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+
+      // Build the ### Heading + ```bash block entries for ## Commands
+      const _commandEntries = (() => {
+        const sources = config.exampleCmds?.length
+          ? config.exampleCmds
+          : config.exampleSnippet
+          ? [config.exampleSnippet]
+          : null;
+
+        if (!sources) {
+          // No example provided — emit one minimal block so the fast path can fire
+          const _fallback = isCliMatch
+            ? `${config.tool} --help`
+            : `curl -s ${config.baseUrl || 'https://api.example.com'} \\\n  -H "Content-Type: application/json"`;
+          return [`### ${_capHeading}`, '```bash', ..._keytarLines, normalizeCommandTokens(_fallback, capability), '```'];
+        }
+
+        return sources.flatMap((cmd, i) => {
+          const heading = sources.length === 1 ? _capHeading : `${_capHeading} ${i + 1}`;
+          const normalizedCmd = normalizeCommandTokens(cmd, capability);
+          // Prepend keytar retrieval if the example command doesn't already include it
+          const needsKeytar = _keytarLines.length > 0 && !normalizedCmd.includes('security find-generic-password');
+          const lines = needsKeytar ? [..._keytarLines, normalizedCmd] : [normalizedCmd];
+          return [`### ${heading}`, '```bash', ...lines, '```'];
+        });
+      })();
+
       const skillMd = [
         '---',
         `name: ${skillName}`,
@@ -164,6 +243,7 @@ module.exports = async function creatorPlanning(state) {
         isOAuthProvider(provider) ? `oauth: ${provider}` : null,
         isOAuthProvider(provider) ? `oauth_scopes: ${provider}=${getOAuthScopes(provider) || config.scopes || ''}` : null,
         `schedule: ${scheduleVal}`,
+        `exec_type: shell`,
         `secrets:`,
         secretsList || '  []',
         '---',
@@ -175,23 +255,28 @@ module.exports = async function creatorPlanning(state) {
           ? `Install: \`${config.installCmd}\``
           : (config.npm ? `Install: \`npm install ${config.npm}\`` : `Install: none (uses Node.js built-in https)`),
         '',
-        '### Required credentials',
-        ...(config.authEnv || []).map(k => `- \`${k}\``),
+        // ── ## Auth ────────────────────────────────────────────────────────────
+        '## Auth',
         '',
-        '### Usage',
-        isCliMatch && config.helpCmd
-          ? `Get full CLI help: \`${config.helpCmd}\``
-          : !isCliMatch && config.npm
-          ? `Docs: \`npm info ${config.npm}\``
-          : config.baseUrl
-          ? `Base URL: \`${config.baseUrl}\``
-          : '',
-        ...(config.exampleCmds?.length
-          ? ['', '**Example commands:**', ...config.exampleCmds.map(c => `\`\`\`\n${c}\n\`\`\``)]
-          : config.exampleSnippet
-          ? ['', '**Example request:**', '```js', config.exampleSnippet, '```']
+        `Secrets are stored in macOS keytar under service "thinkdrop".`,
+        `Retrieval: \`security find-generic-password -s thinkdrop -a "skill:${skillName}:<KEY>" -w 2>/dev/null\``,
+        ...(_keytarLines.length
+          ? ['', '```bash', ..._keytarLines, 'echo "Auth loaded"', '```']
           : []),
         '',
+        // ── ## Commands ────────────────────────────────────────────────────────
+        '## Commands',
+        '',
+        ..._commandEntries,
+        '',
+        // ── ## Plan ────────────────────────────────────────────────────────────
+        '## Plan',
+        '',
+        '1. `shell.run bash` — retrieve secrets from keytar',
+        `2. \`shell.run bash\` — execute ${isCliMatch ? `\`${config.tool}\`` : 'curl'} command with retrieved credentials`,
+        '3. `synthesize` — confirm result or surface error',
+        '',
+        // ── Links (reference only) ─────────────────────────────────────────────
         '### Links',
         ...(config.links?.length
           ? (config.links || []).map(l => `- [${l.label}](${l.url})`)

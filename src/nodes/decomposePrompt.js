@@ -1,58 +1,25 @@
 'use strict';
 
+const fs   = require('fs');
+const path = require('path');
+
+// Structured JSON Lines log — one record per decomposition/classification decision.
+const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.jsonl');
+function writeDecomposeLog(entry) {
+  try { fs.appendFileSync(INTENT_LOG_PATH, JSON.stringify(entry) + '\n', 'utf8'); }
+  catch (_) { /* never throw — logging must never block decomposition */ }
+}
+
 /**
  * decomposePrompt node
  *
- * Detects complex/multi-intent prompts and breaks them into an ordered plan of
- * single-intent sub-prompts that DistilBERT can accurately classify (128-token max).
- *
- * SIMPLE path (fewer than 2 complexity signals) → state unchanged, zero added latency.
- * COMPLEX path → calls state.llmBackend to decompose, falls back to heuristic splitter.
+ * Breaks every user prompt into an ordered plan of single-intent sub-prompts via
+ * the LLM backend.  Falls back to a heuristic splitter when the LLM is unavailable.
+ * If neither produces ≥2 sub-prompts the message passes through unchanged.
  *
  * Sets state.intentPlan when decomposition fires:
  *   [{ text, estimatedIntent, order, dependsOn: number[], isLongRunning: bool, dataTemplate?: string }]
- *
- * Complexity requires 2+ independent signals to avoid false triggers on long-but-simple queries:
- *   - length      : message > 100 characters
- *   - sentence_boundary : 1+ sentence endings followed by new content (". X", "? X")
- *   - temporal_connector: "and then", "after that", "when done", "text me when", etc.
- *   - multi_class_signals: 2+ distinct intent-class keywords matched (memory + automation, etc.)
  */
-
-// ── Intent-signal word lists (one per DistilBERT class) ──────────────────────
-const INTENT_SIGNALS = {
-  memory:     /\b(remember|recall|note|save|store|keep track|what did i|do you remember|i told you|my preference|note that|i had (an |a |that )idea)\b/i,
-  automation: /\b(open|launch|go to|goto|navigate|click|fill|send|create|make|book|schedule|text me|call me|email|start|run|execute|download|install|type|press|submit|build|generate|play)\b/i,
-  search:     /\b(search|look up|find|google|what'?s the|best|latest|current|who is|when is|where is|top|price of|news about|does .{1,40} have)\b/i,
-  screen:     /\b(on my screen|read this|screenshot|screen capture|summarize this|what does (it|this|the screen) say)\b/i,
-};
-
-// ── Temporal / sequencing connectors ─────────────────────────────────────────
-const TEMPORAL_RE = /\b(and then|then|after that|when done|when (it'?s|you'?re|that'?s) (done|finished|complete[d]?)|once (done|finished|complete[d]?)|text me when|let me know when|notify me when|after you|followed by|first[,\s]|second[,\s])\b/i;
-
-// ── Sentence boundary counter ─────────────────────────────────────────────────
-function countSentenceBoundaries(msg) {
-  // Matches ". X" or "? X" where X starts a new clause (capital or common word)
-  return (msg.match(/[.?]\s+[A-Za-z]/g) || []).length;
-}
-
-// ── Complexity check — requires 2+ independent signals ───────────────────────
-function checkComplexity(message) {
-  const signals = [];
-
-  if (message.length > 100) signals.push('length');
-  if (countSentenceBoundaries(message) >= 1) signals.push('sentence_boundary');
-  if (TEMPORAL_RE.test(message)) signals.push('temporal_connector');
-
-  // Count how many distinct intent classes are signalled
-  const matchedClasses = Object.entries(INTENT_SIGNALS)
-    .filter(([, re]) => re.test(message))
-    .map(([cls]) => cls);
-
-  if (matchedClasses.length >= 2) signals.push('multi_class_signals');
-
-  return { isComplex: signals.length >= 2, signals, matchedClasses };
-}
 
 // ── Heuristic clause splitter (no LLM needed) ────────────────────────────────
 function heuristicSplit(message) {
@@ -66,7 +33,7 @@ function heuristicSplit(message) {
 
   return chunks.map((text, i) => ({
     text,
-    estimatedIntent: 'general_knowledge', // DistilBERT will refine
+    estimatedIntent: 'general_knowledge', // LLM will classify at parseIntent time (heuristic path)
     order: i,
     dependsOn: [],
     isLongRunning: false,
@@ -74,11 +41,12 @@ function heuristicSplit(message) {
   }));
 }
 
+// TODO: app_control_start excluded from decomposition — reserved for real-time voice/UI screen control, handled via a separate pipeline path
 // ── LLM decomposition system prompt ──────────────────────────────────────────
-const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for a DistilBERT intent classifier with these strict constraints:
-- Each sub-prompt "text" must be ≤128 tokens, containing exactly ONE distinct action or intent
-- Keep "text" fields SHORT and action-focused — these are used for intent CLASSIFICATION only, not for execution
-- Valid estimatedIntent values: command_automate, app_control_start, screen_intelligence, web_search, memory_store, memory_retrieve, general_knowledge, greeting
+const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent classifier. Sub-prompts are executed by a downstream intent router:
+- Each sub-prompt "text" must contain exactly ONE distinct action or intent — include enough context for accurate classification
+- Keep "text" fields focused on the specific intent of that step; avoid combining multiple actions
+- Valid estimatedIntent values: command_automate, screen_intelligence, web_search, memory_store, memory_retrieve, general_knowledge, greeting
 - Mark isLongRunning:true ONLY for steps involving a browser automation task expected to take more than 30 seconds (e.g. AI generation, filling a long form)
 - Mark dependsOn:[N] when this step requires the OUTPUT of step N to execute correctly
 - Use dataTemplate (optional) with "{{result[N]}}" as a placeholder where step N's result should be injected at execution time — omit if no dependency
@@ -88,8 +56,11 @@ JSON shape (example):
 {"subPrompts":[{"text":"retrieve game idea for gambo ai","estimatedIntent":"memory_retrieve","order":0,"dependsOn":[],"isLongRunning":false},{"text":"build game on gambo ai using idea","estimatedIntent":"command_automate","order":1,"dependsOn":[0],"isLongRunning":true,"dataTemplate":"Use this game idea from memory: {{result[0]}}"},{"text":"text me when the game is done","estimatedIntent":"command_automate","order":2,"dependsOn":[1],"isLongRunning":false}]}`;
 
 // ── LLM decompose call ────────────────────────────────────────────────────────
-async function llmDecompose(message, llmBackend, logger) {
-  const userPrompt = `Decompose this user message into ordered single-intent sub-prompts:\n\n"${message}"`;
+async function llmDecompose(message, llmBackend, carriedIntent, logger) {
+  const continuationHint = carriedIntent
+    ? `\nContext: the previous message intent was "${carriedIntent}" — this may be a continuation or a topic pivot.`
+    : '';
+  const userPrompt = `Decompose this user message into ordered single-intent sub-prompts.${continuationHint}\n\n"${message}"`;
 
   let raw;
   try {
@@ -115,8 +86,8 @@ async function llmDecompose(message, llmBackend, logger) {
     const parsed = JSON.parse(cleaned);
     const subPrompts = parsed.subPrompts || parsed.sub_prompts;
 
-    if (!Array.isArray(subPrompts) || subPrompts.length < 2) {
-      logger.debug(`[Node:DecomposePrompt] LLM returned <2 sub-prompts — treating as simple`);
+    if (!Array.isArray(subPrompts) || subPrompts.length < 1) {
+      logger.debug(`[Node:DecomposePrompt] LLM returned no sub-prompts`);
       return null;
     }
 
@@ -137,7 +108,7 @@ async function llmDecompose(message, llmBackend, logger) {
 
 // ── Main node ─────────────────────────────────────────────────────────────────
 module.exports = async function decomposePrompt(state) {
-  const { message, llmBackend } = state;
+  const { message, llmBackend, carriedIntent } = state;
   const logger = state.logger || console;
 
   // Pass-through: no message, skill_build fast-path, or already decomposed
@@ -145,16 +116,7 @@ module.exports = async function decomposePrompt(state) {
     return state;
   }
 
-  const check = checkComplexity(message);
-
-  logger.debug(`[Node:DecomposePrompt] complexity — signals: [${check.signals.join(', ')}]${check.matchedClasses.length ? `, classes: [${check.matchedClasses.join(', ')}]` : ''}, isComplex: ${check.isComplex}`);
-
-  if (!check.isComplex) {
-    // Simple prompt — parseIntent handles it at full speed
-    return state;
-  }
-
-  logger.info(`[Node:DecomposePrompt] Complex prompt detected (${check.signals.join(', ')}) — decomposing: "${message.slice(0, 80)}${message.length > 80 ? '...' : ''}"`);
+  logger.debug(`[Node:DecomposePrompt] Attempting decomposition: "${message.slice(0, 80)}${message.length > 80 ? '...' : ''}"`);
 
   let plan = null;
   let decomposedBy = 'heuristic';
@@ -166,10 +128,27 @@ module.exports = async function decomposePrompt(state) {
 
     if (available) {
       const startMs = Date.now();
-      plan = await llmDecompose(message, llmBackend, logger);
+      plan = await llmDecompose(message, llmBackend, carriedIntent, logger);
 
       if (plan) {
         decomposedBy = 'llm';
+        writeDecomposeLog({
+          ts:             new Date().toISOString(),
+          message,
+          carriedHint:    carriedIntent || null,
+          parser:         'llm-decompose',
+          intent:         plan[0].estimatedIntent,
+          subPromptCount: plan.length,
+          durationMs:     Date.now() - startMs,
+          subPrompts:     plan.map(sp => ({
+            order:           sp.order,
+            text:            sp.text,
+            estimatedIntent: sp.estimatedIntent,
+            dependsOn:       sp.dependsOn,
+            isLongRunning:   sp.isLongRunning,
+            dataTemplate:    sp.dataTemplate || null,
+          })),
+        });
         logger.info(`[Node:DecomposePrompt] LLM decomposed into ${plan.length} sub-prompts in ${Date.now() - startMs}ms`);
         plan.forEach((sp, i) =>
           logger.debug(`  [${i}] "${sp.text}" → ${sp.estimatedIntent}${sp.isLongRunning ? ' [LONG_RUNNING]' : ''}${sp.dependsOn.length ? ` dependsOn:[${sp.dependsOn.join(',')}]` : ''}`)

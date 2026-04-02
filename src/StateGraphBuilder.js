@@ -33,6 +33,52 @@ const appControlNode = require('./nodes/appControl');
 const storeConstraintNode = require('./nodes/storeConstraint');
 const liftConstraintNode  = require('./nodes/liftConstraint');
 const parseProjectNode = require('./nodes/parseProject');
+const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
+
+/**
+ * Extract the most useful short result string from a completed intent step.
+ * Used to populate state.dataContext[N] for injection into dependent steps.
+ */
+function extractStepResult(state) {
+  const intent = state.intent?.type;
+
+  // memory_retrieve: use first memory's source text
+  if (intent === 'memory_retrieve' && Array.isArray(state.filteredMemories) && state.filteredMemories.length > 0) {
+    return state.filteredMemories
+      .slice(0, 3)
+      .map(m => m.source_text || m.extracted_text || '')
+      .filter(Boolean)
+      .join(' | ')
+      .slice(0, 500);
+  }
+
+  // web_search: use top result snippet
+  if (intent === 'web_search' && Array.isArray(state.contextDocs) && state.contextDocs.length > 0) {
+    return state.contextDocs
+      .slice(0, 2)
+      .map(d => d.snippet || d.title || '')
+      .filter(Boolean)
+      .join(' | ')
+      .slice(0, 500);
+  }
+
+  // command_automate: use answer or last skill stdout
+  if (intent === 'command_automate') {
+    if (state.answer) return state.answer.slice(0, 500);
+    if (Array.isArray(state.skillResults)) {
+      const last = state.skillResults.filter(r => r.ok && r.stdout).pop();
+      if (last) return last.stdout.slice(0, 500);
+    }
+  }
+
+  // memory_store: confirm text
+  if (intent === 'memory_store') {
+    return `Stored: ${state.message?.slice(0, 200) || 'memory stored'}`;
+  }
+
+  // Default: use state.answer if available
+  return state.answer?.slice(0, 500) || state.message?.slice(0, 200) || '';
+}
 
 class StateGraphBuilder {
   /**
@@ -190,23 +236,27 @@ class StateGraphBuilder {
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
       appControl: (state) => appControlNode({ ...state, logger }),
       parseProject: (state) => parseProjectNode({ ...state, logger, llmBackend }),
-      logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
+      logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter }),
+      summarizeMultiIntent: (state) => summarizeMultiIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
     const edges = {
       start: 'decomposePrompt',
       decomposePrompt: 'resolveReferences',
-      resolveReferences: 'parseSkill',
+      resolveReferences: 'parseIntent',
+      parseIntent: 'parseSkill',
       parseSkill: (state) => {
-        // If parseSkill matched an installed skill, skip parseIntent entirely
+        // parseIntent has already run upstream — always proceed to enrichIntent.
+        // parseSkill may have set matchedSkillName via strategies 1/2 (exact/phrase match)
+        // or strategy 2.5/2.7/3 (gated on command_automate). Intent is preserved either way.
         if (state.matchedSkillName) {
-          logger.debug(`[StateGraph:Router] parseSkill matched "${state.matchedSkillName}" — skipping to enrichIntent`);
-          return 'enrichIntent';
+          logger.debug(`[StateGraph:Router] parseSkill matched "${state.matchedSkillName}" — routing to enrichIntent`);
+        } else {
+          logger.debug(`[StateGraph:Router] parseSkill no match — routing to enrichIntent (intent: ${state.intent?.type})`);
         }
-        return 'parseIntent';
+        return 'enrichIntent';
       },
-      parseIntent: 'enrichIntent',
 
       // enrichIntent router: handles MODE B re-routing + MODE A gap/resolve routing
       enrichIntent: (state) => {
@@ -414,7 +464,205 @@ class StateGraphBuilder {
       retrieveMemory: 'answer',
       answer: 'logConversation',
       synthesize: 'logConversation',
-      logConversation: 'end'
+      summarizeMultiIntent: 'logConversation',
+
+      // Multi-intent queue runner.
+      // Each time logConversation completes for a step, this conditional checks whether
+      // more steps remain in intentQueue and loops back through enrichIntent.
+      // Once the queue is empty and isMultiIntent=true it routes to summarizeMultiIntent.
+      // summarizeMultiIntent sets isMultiIntent=false so the final logConversation exits here.
+      logConversation: async (state) => {
+        // ── More steps remain — execute next sub-intent ──────────────────────
+        if (state.isMultiIntent && Array.isArray(state.intentQueue) && state.intentQueue.length > 0) {
+
+          // 1. Collect this step's result
+          const completedStep = {
+            step:      state.intentResults?.length ?? 0,
+            intent:    state.intent?.type,
+            subPrompt: state.intent?.subPrompt || state.message,
+            result:    extractStepResult(state),
+          };
+
+          state.intentResults = [...(state.intentResults || []), completedStep];
+          state.dataContext   = { ...(state.dataContext || {}), [completedStep.step]: completedStep.result };
+
+          // Emit step-done progress event
+          if (typeof state.progressCallback === 'function') {
+            try {
+              state.progressCallback({
+                type:      'intent:pipeline_step',
+                step:      completedStep.step + 1,
+                total:     completedStep.step + 1 + state.intentQueue.length + 1,
+                intent:    completedStep.intent,
+                subPrompt: completedStep.subPrompt,
+                result:    (completedStep.result || '').slice(0, 100),
+                status:    'done',
+              });
+            } catch (_) { /* progress callback must never block execution */ }
+          }
+
+          // 2. Pop next step
+          const [nextStep, ...remaining] = state.intentQueue;
+
+          // 3. Resolve {{result[N]}} placeholders in the sub-prompt text
+          let resolvedText = nextStep.text;
+          for (const depIdx of (nextStep.dependsOn || [])) {
+            const depResult = state.dataContext[depIdx] || '';
+            resolvedText = resolvedText.replace(
+              new RegExp(`\\{\\{result\\[${depIdx}\\]\\}\\}`, 'g'),
+              depResult
+            );
+          }
+
+          // 4. Resolve dataTemplate into _dataPrefix
+          let dataPrefix = null;
+          if (nextStep.dataTemplate) {
+            dataPrefix = nextStep.dataTemplate;
+            for (const depIdx of (nextStep.dependsOn || [])) {
+              const depResult = state.dataContext[depIdx] || '';
+              dataPrefix = dataPrefix.replace(
+                new RegExp(`\\{\\{result\\[${depIdx}\\]\\}\\}`, 'g'),
+                depResult
+              );
+            }
+          }
+
+          // 5. Phase 3: Long-running async dispatch
+          if (nextStep.isLongRunning) {
+            const taskRunner = require('./nodes/taskRunner');
+            const { randomUUID } = require('crypto');
+            const taskId = (typeof randomUUID === 'function') ? randomUUID() : 'task_' + Date.now();
+
+            // Parse completion signal from dataTemplate if present
+            // e.g. dataTemplate: "waitForContent: Game build complete"
+            let completionSignal = 'waitForContent';
+            let completionArg    = 'complete';
+            if (nextStep.dataTemplate) {
+              const m = nextStep.dataTemplate.match(/^waitFor(Content|Selector):\s*(.+)$/i);
+              if (m) {
+                completionSignal = 'waitFor' + m[1];
+                completionArg    = m[2].trim();
+              }
+            }
+
+            await taskRunner.dispatch({
+              taskId,
+              subPrompt:        nextStep.text,
+              intent:           nextStep.intent,
+              stepOrder:        nextStep.order,
+              completionSignal,
+              completionArg,
+              planContext: {
+                intentResults: state.intentResults || [],
+                dataContext:   state.dataContext   || {},
+                intentQueue:   remaining,
+              },
+              originalPrompt:   state.originalPrompt || state.message,
+              sessionId:        (state.context && state.context.sessionId) || state.sessionId || null,
+              onComplete: async (tid, result) => {
+                logger.info(`[StateGraph:LongTask] Task ${tid} done — result ready for queue resume`);
+                if (typeof state.progressCallback === 'function') {
+                  state.progressCallback({
+                    type:      'long_task_resume',
+                    taskId:    tid,
+                    stepOrder: nextStep.order,
+                    result:    result ? result.slice(0, 500) : '',
+                  });
+                }
+              },
+              onTimeout: async (tid, pendingSteps, reason) => {
+                logger.warn(`[StateGraph:LongTask] Task ${tid} timed out — surfacing ASK_USER`);
+                state.answer              = `The task "${nextStep.text.slice(0, 80)}" didn't complete — ${reason}. Would you like to retry, skip this step, or cancel?`;
+                state.askUserReason       = reason;
+                state.pendingStepsAfterTimeout = pendingSteps;
+                if (typeof state.progressCallback === 'function') {
+                  state.progressCallback({
+                    type:         'ask_user',
+                    question:     state.answer,
+                    options:      ['Retry', 'Skip this step', 'Cancel all'],
+                    taskId:       tid,
+                    pendingSteps: pendingSteps.length,
+                  });
+                }
+              },
+              progressCallback: state.progressCallback || null,
+              logger,
+            });
+
+            // Update state — mark queue consumed up to this dispatched step
+            state.intentQueue  = remaining;
+            state._longTaskId  = taskId;
+            logger.info(`[StateGraph:LongTask] Async task ${taskId} dispatched — holding in logConversation`);
+            // Hold here: graph stays alive; taskRunner fires completion async via IPC
+            return 'logConversation';
+          }
+
+          logger.info(`[StateGraph:IntentQueue] Step ${completedStep.step + 1} done → executing step ${completedStep.step + 2}/${completedStep.step + 2 + remaining.length}: ${nextStep.intent} — "${resolvedText.slice(0, 60)}"`);
+
+          // Emit step-starting progress event
+          if (typeof state.progressCallback === 'function') {
+            try {
+              state.progressCallback({
+                type:      'intent:pipeline_step',
+                step:      completedStep.step + 2,
+                total:     completedStep.step + 2 + remaining.length,
+                intent:    nextStep.intent,
+                subPrompt: nextStep.text,
+                status:    'running',
+              });
+            } catch (_) { /* progress callback must never block execution */ }
+          }
+
+          // 6. Reset state for next step — clear previous step output to prevent bleed
+          Object.assign(state, {
+            message:          resolvedText,
+            resolvedMessage:  resolvedText,
+            _dataPrefix:      dataPrefix,
+            intent: {
+              type:       nextStep.intent,
+              confidence: nextStep.confidence,
+              subPrompt:  nextStep.text,
+              entities:   [],
+            },
+            intentQueue:       remaining,
+            conversationLogged: false,
+            // Clear previous step's output so it doesn't bleed into this step
+            answer:            null,
+            filteredMemories:  [],
+            contextDocs:       [],
+            searchResults:     [],
+            skillResults:      [],
+            skillPlan:         null,
+            skillCursor:       0,
+            commandExecuted:   false,
+            commandOutput:     null,
+            executionResult:   null,
+            failedStep:        null,
+            recoveryAction:    null,
+            carriedIntent:     null,
+            enrichmentNeeded:  [],
+            matchedSkillName:  null,
+          });
+
+          return 'enrichIntent';
+        }
+
+        // ── Queue exhausted — collect final step and summarize ────────────────
+        if (state.isMultiIntent && Array.isArray(state.intentResults) && state.intentResults.length > 0) {
+          const finalStep = {
+            step:      state.intentResults.length,
+            intent:    state.intent?.type,
+            subPrompt: state.intent?.subPrompt || state.message,
+            result:    extractStepResult(state),
+          };
+          state.intentResults = [...state.intentResults, finalStep];
+          state.dataContext   = { ...state.dataContext, [finalStep.step]: finalStep.result };
+          return 'summarizeMultiIntent';
+        }
+
+        // ── Single-intent path — normal exit ─────────────────────────────────
+        return 'end';
+      },
     };
     
     return new StateGraph(nodes, edges, {
