@@ -15,10 +15,6 @@ external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user
 - `{{prev_stdout}}` — stdout of the immediately preceding step
 
 **Credential template tokens — ALWAYS use these for `browser.act` fill/type steps that need a login, NEVER hardcode or guess values:**
-- `{{gmail:username}}` — Gmail / Google email address from keychain
-- `{{gmail:password}}` — Gmail / Google password from keychain
-- `{{github:username}}` — GitHub username from keychain
-- `{{github:password}}` — GitHub password from keychain
 - `{{<service>:username}}` — any service email/username (replace `<service>` with the site slug)
 - `{{<service>:password}}` — any service password
 
@@ -172,6 +168,8 @@ Python is the preferred tool for: file patching, JSON/CSV/Excel mutation, data a
 - **Stopping/closing a ThinkDrop project app** — use `project.stopper` with the projectName. NEVER use `needs_skill` or `shell.run kill` for this. Example: user says "close it", "stop the app", "shut down the cold plunge project" → `project.stopper { "projectName": "schedule-daily-cold-plunge-sessions-at-6" }`. Use partial name matching — "cold plunge" matches "schedule-daily-cold-plunge-sessions-at-6".
 - **Closing a file on macOS** — use `osascript -e 'tell application "AppName" to close (every document whose name is "filename")'`. NEVER use `lsof | kill`, `kill -9`, or `xargs kill` — those kill the whole app or random processes. To find which app has the file open: `mdls -name kMDItemLastUsedApp "/path/to/file"`. For .txt files the app is usually "TextEdit". For PDFs use "Preview". Always close the document, not the application (unless the user explicitly says "quit TextEdit").
 - **Opening apps** — always `shell.run open -a AppName`, never `ui.findAndClick`
+- **macOS System Settings / System Preferences** — NEVER use `browser.act` for System Settings, System Preferences, or ANY native macOS system dialogs. Playwright-cli controls web browsers ONLY — it cannot interact with macOS native apps or system dialogs. To open a specific System Settings pane use `shell.run bash -c 'open "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"'` (substitute the relevant pane identifier). For general System Settings: `shell.run bash -c 'open -a "System Settings"'`. NEVER generate `browser.act` steps with `sessionId: "macos"` or similar — there is no macOS browser session.
+- **osascript / AppleScript** — use `shell.run bash -c 'osascript -e "..."'` for simple AppleScript commands. Note: macOS requires the user to grant Automation permission in System Settings → Privacy & Security → Automation before osascript can control other apps. If a simpler alternative exists (e.g. `open -a AppName` to open an app, `bash -c "echo hello"` to run a command), prefer it over osascript.
 - **Reading/writing files** — always `shell.run bash -c`, never open a GUI app
 - **Editing an existing file** — read it first, then synthesize, then write
 - **Finding a file by name then reading/analyzing it** — always 3 steps: (1) `shell.run bash -c "mdfind -name 'SOME FILE'"` to locate it, (2) `shell.run bash -c "cat /found/path"` to read it, (3) `synthesize` to answer. Never stop at just `find` — always follow through with read + synthesize when the user wants to know what's in the file.

@@ -773,6 +773,27 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     };
   }
 
+  // ── macOS Automation / Apple Events permission denial ─────────────────────
+  // osascript attempting to control apps via Apple Events fails with error -1743
+  // ("not allowed to send Apple events to X") when macOS Automation permission
+  // hasn't been granted. The LLM cannot fix this — only the user can grant access.
+  if (skill === 'shell.run' && (
+    combinedError.includes('not allowed to send apple events') ||
+    combinedError.includes('not authorized to send apple events') ||
+    combinedError.includes('sending apple events to') ||
+    /-1743/.test(combinedError)
+  )) {
+    logger.debug(`[Node:RecoverSkill] Fast-path: Apple Events permission denied → ASK_USER`);
+    // Extract the target app name from the error if possible (e.g. "not allowed to send Apple events to Terminal")
+    const appMatch = combinedError.match(/(?:apple events to|send apple events to)\s+([a-z][a-z\s]+?)(?:\.|,|$)/i);
+    const appName = appMatch ? appMatch[1].trim() : 'the target app';
+    return {
+      action: 'ASK_USER',
+      question: `macOS blocked ThinkDrop from sending Apple Events to **${appName}** — this requires Automation permission.\n\n**To fix this:**\n1. Open **System Settings → Privacy & Security → Automation**\n2. Enable ThinkDrop access for **${appName}**\n3. Try again\n\nOr I can run the command directly without opening a Terminal window (no AppleScript needed).`,
+      options: ['Open System Settings → Automation', 'Run without Terminal window', 'Skip this step'],
+    };
+  }
+
   // ── Auth wall fast-path ─────────────────────────────────────────────────
   // executeCommand.js sets failedStep.reason = 'auth_wall' when waitForStableText
   // (or a navigate/examine) detects that the page is a login/auth wall.

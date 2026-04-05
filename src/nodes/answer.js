@@ -388,22 +388,8 @@ module.exports = async function answer(state) {
 
     const match = finalAnswer.match(GUIDE_OFFER_RE) || finalAnswer.match(simpleGuideRE);
     if (match && (intentType === 'web_search' || intentType === 'general_knowledge' || intentType === 'screen_intelligence' || intentType === 'general_query')) {
-      const questionText = match[1].trim();
-      // Strip the separator + question from the displayed answer
+      // Strip the separator + question from the displayed answer (guide offer card disabled)
       displayAnswer = finalAnswer.slice(0, finalAnswer.lastIndexOf(match[0])).trimEnd();
-
-      pendingQuestion = {
-        question: questionText,
-        options: [
-          `Walk me through it step by step`,
-          `Let's do it together — guide me`,
-          `No thanks, the explanation is enough`
-        ],
-        _guideContext: (queryMessage.length > 80 ? queryMessage.substring(0, 77) + '...' : queryMessage),
-        _isGuideOffer: true
-      };
-
-      logger.debug(`[Node:Answer] Guide offer extracted from LLM response — surfacing as pendingQuestion`);
 
       // Re-emit the trimmed answer via streamCallback so UI doesn't show the question as text
       if (typeof streamCallback === 'function' && displayAnswer !== finalAnswer) {

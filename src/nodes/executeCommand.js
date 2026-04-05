@@ -306,7 +306,16 @@ module.exports = async function executeCommand(state) {
   } = state;
 
   const logger = state.logger || console;
-  const progressCallback = state.progressCallback || null;
+  const _rawProgressCallback = state.progressCallback || null;
+  // When a skill plan file is tracked, fan-out plan:* mirror events alongside native events
+  const progressCallback = (_rawProgressCallback && state._skillPlanFile)
+    ? (event) => {
+        _rawProgressCallback(event);
+        if (event.type === 'step_done')   _rawProgressCallback({ ...event, type: 'plan:step_done' });
+        if (event.type === 'step_failed') _rawProgressCallback({ ...event, type: 'plan:step_failed' });
+        if (event.type === 'all_done')    _rawProgressCallback({ ...event, type: 'plan:complete' });
+      }
+    : _rawProgressCallback;
 
   if (intent?.type !== 'command_automate') {
     return state;
@@ -401,6 +410,20 @@ module.exports = async function executeCommand(state) {
         logger.info(`[Node:ExecuteCommand] all_done step[${i}] script: ${script.substring(0, 120)}`);
       }
     });
+    // Update skill plan file status on completion
+    if (state._skillPlanFile) {
+      try {
+        const _planMd = fs.readFileSync(state._skillPlanFile, 'utf8');
+        const _allOk = skillResults.every(r => r.ok);
+        const _newStatus = _allOk ? 'complete' : 'failed';
+        const _updatedMd = _planMd.replace(/^(status:\s*)(pending|failed)(\s*)$/m, `$1${_newStatus}$3`);
+        fs.writeFileSync(state._skillPlanFile, _updatedMd, 'utf8');
+        logger.info(`[Node:ExecuteCommand] Plan file status updated to ${_newStatus}: ${state._skillPlanFile}`);
+      } catch (_planErr) {
+        logger.warn(`[Node:ExecuteCommand] Could not update plan file status: ${_planErr.message}`);
+      }
+    }
+
     if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults, savedFilePaths: [...new Set(savedFilePaths)] });
 
     // Archive the completed plan document
@@ -507,6 +530,11 @@ module.exports = async function executeCommand(state) {
       activeBrowserSessionId: null,
       activeBrowserUrl: null
     };
+  }
+
+  // Emit plan:step_start for PlanPanel step tracking
+  if (_rawProgressCallback && state._skillPlanFile) {
+    _rawProgressCallback({ type: 'plan:step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description });
   }
 
   // ── schedule pseudo-skill (NON-BLOCKING) ─────────────────────────────────

@@ -27,6 +27,30 @@ module.exports = async function parseIntent(state) {
   const { mcpAdapter, message, resolvedMessage, carriedIntent, context, llmBackend, conversationHistory, activeBrowserSessionId, activeBrowserUrl } = state;
   const logger = state.logger || console;
 
+  // ── Plan execution fast-path: skip all classification for plan:approve re-runs ─
+  // When main.js re-injects a stategraph execute() with _planFile set, we skip
+  // all intent classification — planExecutor handles routing from the plan file.
+  if (state._planFile && typeof state._planFile === 'string') {
+    logger.info('[Node:ParseIntent] _planFile detected — routing straight to planExecutor');
+    return {
+      ...state,
+      intent: { type: 'plan_execute', confidence: 1.0, entities: [], requiresMemoryAccess: false },
+      metadata: { parser: 'plan-execute-passthrough', processingTimeMs: 0 },
+    };
+  }
+
+  // ── Skill plan fast-path: skip classification when _skillPlan array is pre-built ──
+  // When planSkills approval gate re-enqueues with _skillPlan, force command_automate
+  // so enrichIntent routes directly to planSkills (which has a fast-path for _skillPlan).
+  if (state._skillPlan && Array.isArray(state._skillPlan)) {
+    logger.info('[Node:ParseIntent] _skillPlan detected — setting command_automate fast-path');
+    return {
+      ...state,
+      intent: { type: 'command_automate', confidence: 1.0, entities: [], requiresMemoryAccess: false },
+      metadata: { parser: 'skill-plan-passthrough', processingTimeMs: 0 },
+    };
+  }
+
   // ── Phase 3: Resume guard — restore serialized long-task context ───────────
   // When main.js re-injects a prompt via voice:inject-prompt with _resumeContext,
   // skip all classification and restore the serialized queue state directly.

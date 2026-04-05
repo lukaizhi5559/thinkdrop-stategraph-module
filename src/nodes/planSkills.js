@@ -21,8 +21,112 @@
  */
 
 const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const { jsonrepair } = require('jsonrepair');
 const { buildReminderSkill } = require('../utils/buildReminderSkill');
+
+const PLANS_DIR = path.join(os.homedir(), '.thinkdrop', 'plans');
+
+/**
+ * Find a similar previously-run plan that completed 100% successfully.
+ * Only returns plans with status: complete — never pending or failed.
+ * Returns { planFile, title, file, similarity, skillPlan } or null.
+ */
+function findSimilarCompletePlan(prompt, logger) {
+  try {
+    if (!fs.existsSync(PLANS_DIR)) return null;
+    const files = fs.readdirSync(PLANS_DIR)
+      .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
+      .sort().reverse().slice(0, 20);
+
+    const promptWords = new Set(
+      prompt.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 4)
+    );
+
+    for (const file of files) {
+      const planPath = path.join(PLANS_DIR, file);
+      try {
+        const content = fs.readFileSync(planPath, 'utf8');
+        // Only match 100% successfully completed plans
+        const statusMatch = content.match(/^status:\s*(.+)/m);
+        const status = statusMatch ? statusMatch[1].trim() : '';
+        if (status !== 'complete') continue;
+
+        // Must have stored skill_plan_json to be reusable
+        const jsonMatch = content.match(/^skill_plan_json:\s*'([^']+)'/m);
+        if (!jsonMatch) continue;
+
+        const titleMatch = content.match(/^# Plan:\s*(.+)/m);
+        const promptMatch = content.match(/^original_prompt:\s*"([^"]+)"/m);
+        const planText = ((titleMatch ? titleMatch[1] : '') + ' ' + (promptMatch ? promptMatch[1] : '')).toLowerCase().replace(/[^a-z0-9 ]/g, ' ');
+        const planWords = new Set(planText.split(/\s+/).filter(w => w.length > 4));
+
+        const intersection = [...promptWords].filter(w => planWords.has(w));
+        const union = new Set([...promptWords, ...planWords]);
+        const similarity = union.size > 0 ? intersection.length / union.size : 0;
+
+        if (similarity >= 0.3) {
+          try {
+            const decoded = Buffer.from(jsonMatch[1], 'base64').toString('utf8');
+            const skillPlan = JSON.parse(decoded);
+            logger.info(`[Node:PlanSkills] Similar completed plan found (${Math.round(similarity * 100)}% match): ${file}`);
+            return { planFile: planPath, title: titleMatch?.[1]?.trim() || file, file, similarity, skillPlan };
+          } catch (_) { continue; }
+        }
+      } catch (_) { /* skip unreadable */ }
+    }
+  } catch (err) {
+    logger.warn(`[Node:PlanSkills] findSimilarCompletePlan error: ${err.message}`);
+  }
+  return null;
+}
+
+/**
+ * Serialize a JSON skill plan to a human-readable .md file.
+ * Stores skill_plan_json (base64) in frontmatter so future similarity matches
+ * can reuse the exact steps without re-invoking the LLM.
+ * Status starts as 'pending' — only updated to 'complete' by executeCommand
+ * after ALL steps succeed.
+ */
+function serializeSkillPlanToMd(skillPlan, originalPrompt, planId, sessionId) {
+  const now = new Date().toISOString();
+  const safePrompt = (originalPrompt || '').replace(/"/g, '\\"').slice(0, 300);
+  const shortTitle = (originalPrompt || '').split(/\s+/).slice(0, 6).join(' ');
+  const skillPlanB64 = Buffer.from(JSON.stringify(skillPlan)).toString('base64');
+
+  const lines = [
+    '---',
+    `id: ${planId}`,
+    `created: ${now}`,
+    `status: pending`,
+    `original_prompt: "${safePrompt}"`,
+    `session_id: ${sessionId || 'unknown'}`,
+    `skill_plan: true`,
+    `skill_plan_json: '${skillPlanB64}'`,
+    '---',
+    '',
+    `# Plan: ${shortTitle}`,
+    '',
+    '## Steps',
+    '',
+  ];
+
+  skillPlan.forEach((step, i) => {
+    const num = i + 1;
+    const desc = step.description || buildStepDescription(step);
+    lines.push(`### Step ${num} — ${desc}`);
+    lines.push(`- **Skill**: ${step.skill}`);
+    if (step.args) {
+      const argsStr = JSON.stringify(step.args, null, 0).slice(0, 200);
+      lines.push(`- **Args**: \`${argsStr}\``);
+    }
+    lines.push(`- **Status**: ⬜ pending`);
+    lines.push('');
+  });
+
+  return lines.join('\n');
+}
 
 /**
  * Build a human-readable description for a plan step.
@@ -143,6 +247,17 @@ module.exports = async function planSkills(state) {
 
   if (intent?.type !== 'command_automate') {
     return state;
+  }
+
+  // ── Pre-approved skill plan fast-path: skip all LLM planning ─────────────────
+  // When main.js re-enqueues after user approval, _skillPlan contains the already-
+  // generated step array. Copy to skillPlan and hand off to executeCommand directly.
+  if (state._skillPlan && Array.isArray(state._skillPlan) && state._skillPlan.length > 0) {
+    logger.info(`[Node:PlanSkills] _skillPlan pre-built — skipping LLM planning (${state._skillPlan.length} steps)`);
+    const prebuiltPlan = state._skillPlan;
+    // Do NOT emit plan_ready — PlanPanel handles progress via plan:step_start/done/complete.
+    // Emitting plan_ready would cause AutomationProgress to show alongside PlanPanel.
+    return { ...state, skillPlan: prebuiltPlan, skillCursor: 0, _skillPlan: null, recoveryContext: null, planError: null };
   }
 
   // ── Login resume: skip replanning, return existing plan as-is ────────────────
@@ -305,6 +420,39 @@ module.exports = async function planSkills(state) {
     logger.warn('[Node:PlanSkills] Constraint gate error:', _constraintGateErr?.message);
   }
   // ── End constraint gate ──────────────────────────────────────────────────────
+
+  // ── Existing plan similarity check ───────────────────────────────────────────
+  // Before invoking the LLM, check for a previously completed identical/similar plan.
+  // Only offers reuse when the plan ran 100% successfully (status: complete).
+  // Guards: skip when replanning after failure, multi-intent queue, or _forceNewPlan.
+  if (!recoveryContext && !state.isMultiIntent && !state._forceNewPlan) {
+    const similarPlan = findSimilarCompletePlan(userMessage, logger);
+    if (similarPlan) {
+      const skillPlanB64 = Buffer.from(JSON.stringify(similarPlan.skillPlan)).toString('base64');
+      if (progressCallback) {
+        let existingContent = '';
+        try { existingContent = fs.readFileSync(similarPlan.planFile, 'utf8'); } catch (_) {}
+        progressCallback({
+          type: 'plan:found_existing',
+          planFile: similarPlan.planFile,
+          title: similarPlan.title,
+          file: similarPlan.file,
+          similarity: similarPlan.similarity,
+          content: existingContent,
+          skillPlanJson: skillPlanB64,
+        });
+      }
+      return {
+        ...state,
+        awaitingPlanApproval: true,
+        _skillPlanFile: similarPlan.planFile,
+        skillPlan: null,
+        skillCursor: 0,
+        recoveryContext: null,
+        planError: null,
+      };
+    }
+  }
 
   logger.debug('[Node:PlanSkills] Planning skill steps...');
   if (progressCallback) progressCallback({ type: 'planning', message: 'Generating skill plan...' });
@@ -2230,7 +2378,11 @@ IMPORTANT: No CLI binary or installable npm/API package was found for this task.
     }
     // ─────────────────────────────────────────────────────────────────────────────
 
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })), intent: state.intent?.type || 'command_automate' });
+    // Only emit plan_ready when NOT gating for approval — otherwise PlanPanel and
+    // AutomationProgress both activate simultaneously.
+    if (!(!recoveryContext && skillPlan.length >= 2)) {
+      if (progressCallback) progressCallback({ type: 'plan_ready', steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })), intent: state.intent?.type || 'command_automate', recoveryReplan: !!recoveryContext });
+    }
 
     // ── RAG learn: if no snippet matched, extract a reusable pattern and save it ─
     // This is fire-and-forget — it runs async after the plan is returned.
@@ -2293,6 +2445,45 @@ Output ONLY the pattern text. No markdown, no explanation.`;
     }
     // ─────────────────────────────────────────────────────────────────────────
 
+    // ── Approval gate: multi-step plans require user review before execution ──
+    // Only fires for fresh LLM-generated plans (not recovery replans, not
+    // single-step plans, not multi-intent stacks). Writes a .md file with the
+    // serialized skill plan so the PlanPanel can render it for approval, and so
+    // executeCommand can mark it 'complete' after 100% successful execution.
+    if (!recoveryContext && skillPlan.length >= 2) {
+      const _ts = Date.now();
+      const _planId = `plan-${_ts}`;
+      const _planFile = path.join(PLANS_DIR, `${_planId}.md`);
+      const _mdContent = serializeSkillPlanToMd(skillPlan, state.message || userMessage, _planId, state.context?.sessionId);
+      try {
+        fs.mkdirSync(PLANS_DIR, { recursive: true });
+        fs.writeFileSync(_planFile, _mdContent, 'utf8');
+        logger.info(`[Node:PlanSkills] Approval gate: plan written to ${_planFile}`);
+      } catch (_writeErr) {
+        logger.warn(`[Node:PlanSkills] Approval gate: failed to write plan file: ${_writeErr.message}`);
+      }
+      const _skillPlanB64 = Buffer.from(JSON.stringify(skillPlan)).toString('base64');
+      if (progressCallback) progressCallback({
+        type: 'plan:generated',
+        planFile: _planFile,
+        planId: _planId,
+        content: _mdContent,
+        title: (userMessage || '').split(/\s+/).slice(0, 6).join(' '),
+        skillPlanJson: _skillPlanB64,
+        generatedBy: 'planSkills',
+      });
+      return {
+        ...state,
+        awaitingPlanApproval: true,
+        _skillPlanFile: _planFile,
+        skillPlan: null,
+        skillCursor: 0,
+        recoveryContext: null,
+        planError: null,
+        pendingSkillName: state.pendingSkillName || null,
+      };
+    }
+
     return {
       ...state,
       skillPlan,
@@ -2300,7 +2491,11 @@ Output ONLY the pattern text. No markdown, no explanation.`;
       recoveryContext: null,   // Clear recovery context after re-plan
       planError: null,
       // Persist the locked skill name so replans use the same name (prevents duplicate skills)
-      pendingSkillName: state.pendingSkillName || null
+      pendingSkillName: state.pendingSkillName || null,
+      // Clear stale skillResults from the failed attempt so the all_done failedCount is 0.
+      // skillResults was already read above (priorResultsNote) before this return so LLM had
+      // the prior step outputs as context — it's safe to reset for the fresh execution.
+      skillResults: recoveryContext ? [] : state.skillResults,
     };
 
   } catch (error) {

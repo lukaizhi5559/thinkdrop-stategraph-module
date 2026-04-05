@@ -141,8 +141,8 @@ class StateGraph {
           }
         }
 
-        // Determine next node
-        const nextNode = this._getNextNode(currentNode, state);
+        // Determine next node (edge functions may be async — always await)
+        const nextNode = await this._getNextNode(currentNode, state);
         if (this.debug) {
           this.logger.debug(`[StateGraph] Routing: ${currentNode} → ${nextNode}`);
         }
@@ -189,7 +189,7 @@ class StateGraph {
    * @param {Object} state - Current state
    * @returns {string} Next node name
    */
-  _getNextNode(currentNode, state) {
+  async _getNextNode(currentNode, state) {
     const edge = this.edges[currentNode];
 
     // No edge defined = end
@@ -202,9 +202,9 @@ class StateGraph {
       return edge;
     }
 
-    // Dynamic edge (function)
+    // Dynamic edge (function — may be sync or async)
     if (typeof edge === 'function') {
-      return edge(state);
+      return await edge(state);
     }
 
     // Invalid edge

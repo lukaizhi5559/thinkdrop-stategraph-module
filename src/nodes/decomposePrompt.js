@@ -51,9 +51,96 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - Mark dependsOn:[N] when this step requires the OUTPUT of step N to execute correctly
 - Use dataTemplate (optional) with "{{result[N]}}" as a placeholder where step N's result should be injected at execution time — omit if no dependency
 - Return ONLY valid JSON — no markdown fences, no explanation
+- CRITICAL: If ALL proposed sub-prompts are implementation steps toward a single artifact (a skill, script, automation, cron job, scheduled task, or workflow), return ONE sub-prompt using the original user message text with estimatedIntent:'command_automate'. Only split into multiple sub-prompts when the user clearly expresses multiple INDEPENDENT goals they want executed separately (e.g. answering a question AND performing an unrelated action).
 
 JSON shape (example):
 {"subPrompts":[{"text":"retrieve game idea for gambo ai","estimatedIntent":"memory_retrieve","order":0,"dependsOn":[],"isLongRunning":false},{"text":"build game on gambo ai using idea","estimatedIntent":"command_automate","order":1,"dependsOn":[0],"isLongRunning":true,"dataTemplate":"Use this game idea from memory: {{result[0]}}"},{"text":"text me when the game is done","estimatedIntent":"command_automate","order":2,"dependsOn":[1],"isLongRunning":false}]}`;
+
+// ── Single-artifact keyword guard (Layer 3) ─────────────────────────────────
+// Skip decomposition entirely when the message is asking to build ONE artifact
+// (skill, cron, scheduled task, background job) with no obvious multi-goal connector.
+const SINGLE_ARTIFACT_RE = /\b(create|build|write|make|generate|set up|setup)\b.{0,80}\b(skill|cron job|scheduled (script|task|job)|background (script|task|job)|automation that runs|script that runs)\b/i;
+const MULTI_GOAL_CONNECTOR_RE = /\b(and (?:also|then)|after that|also|additionally|plus)\b.{0,30}\b(open|search|email|text|send|message|call|look|find|go to|navigate|check|tweet|post)\b/i;
+
+// ── Linear CA-chain collapse (Layer 2) ───────────────────────────────────────
+// After LLM decomposes, detect and collapse command_automate steps that form a
+// fully-linear dependency chain (no branching). This prevents implementation-step
+// enumeration ("create script → log to file → schedule it") from being executed
+// as 3 separate planSkills roundtrips.
+function collapseLinearCAChain(plan, originalMessage, logger) {
+  if (!Array.isArray(plan) || plan.length <= 1) return plan;
+
+  const caSteps    = plan.filter(sp => sp.estimatedIntent === 'command_automate');
+  const nonCaSteps = plan.filter(sp => sp.estimatedIntent !== 'command_automate');
+
+  if (caSteps.length <= 1) return plan; // nothing to collapse
+
+  const caOrderSet = new Set(caSteps.map(sp => sp.order));
+
+  // Linearity check: each CA node may have at most 1 CA predecessor and 1 CA successor.
+  for (const ca of caSteps) {
+    const caPredCount = ca.dependsOn.filter(d => caOrderSet.has(d)).length;
+    const caSuccCount = caSteps.filter(other => other.dependsOn.includes(ca.order)).length;
+    if (caPredCount > 1 || caSuccCount > 1) {
+      logger.debug(`[Node:DecomposePrompt] CA chain branches at step [${ca.order}] — skipping collapse`);
+      return plan;
+    }
+  }
+
+  // Collect properties of the collapsed CA step
+  const sortedCa   = [...caSteps].sort((a, b) => a.order - b.order);
+  const externalDeps = [];
+  let isLongRunning  = false;
+  let dataTemplate   = null;
+  const caTexts      = [];
+
+  for (const ca of sortedCa) {
+    caTexts.push(ca.text);
+    if (ca.isLongRunning) isLongRunning = true;
+    for (const dep of ca.dependsOn) {
+      if (!caOrderSet.has(dep) && !externalDeps.includes(dep)) externalDeps.push(dep);
+    }
+    if (!dataTemplate && ca.dataTemplate) dataTemplate = ca.dataTemplate;
+  }
+
+  // Use the original message when all steps were CA (no non-CA steps)
+  const collapsedText = nonCaSteps.length === 0 ? originalMessage : caTexts.join(' and ');
+
+  const collapsedStep = {
+    text:            collapsedText,
+    estimatedIntent: 'command_automate',
+    order:           sortedCa[0].order, // temporary; re-indexed below
+    dependsOn:       externalDeps,
+    isLongRunning,
+    dataTemplate,
+  };
+
+  // Sort the new plan and build old-order → new-index map
+  const newPlanUnsorted = [...nonCaSteps, collapsedStep].sort((a, b) => a.order - b.order);
+
+  const oldToNewIdx = new Map();
+  newPlanUnsorted.forEach((sp, i) => {
+    if (sp === collapsedStep) {
+      sortedCa.forEach(ca => oldToNewIdx.set(ca.order, i));
+    } else {
+      oldToNewIdx.set(sp.order, i);
+    }
+  });
+
+  // Re-index orders and remap dependsOn references
+  const remapped = newPlanUnsorted.map((sp, i) => ({
+    ...sp,
+    order:     i,
+    dependsOn: [...new Set(
+      sp.dependsOn
+        .map(d => oldToNewIdx.get(d))
+        .filter(d => d !== undefined && d < i)
+    )],
+  }));
+
+  logger.info(`[Node:DecomposePrompt] Collapsed ${caSteps.length} linear CA steps → 1 (plan: ${plan.length} → ${remapped.length} sub-prompts)`);
+  return remapped;
+}
 
 // ── LLM decompose call ────────────────────────────────────────────────────────
 async function llmDecompose(message, llmBackend, carriedIntent, logger) {
@@ -116,7 +203,27 @@ module.exports = async function decomposePrompt(state) {
     return state;
   }
 
+  // Plan execution fast-path: skip decomposition when executing an approved plan
+  if (state._planFile) {
+    logger.info('[Node:DecomposePrompt] _planFile detected — skipping decomposition (plan execute passthrough)');
+    return state;
+  }
+
+  // Skill plan fast-path: skip decomposition when _skillPlan array is already built
+  if (state._skillPlan && Array.isArray(state._skillPlan)) {
+    logger.info('[Node:DecomposePrompt] _skillPlan detected — skipping decomposition (skill plan passthrough)');
+    return state;
+  }
+
   logger.debug(`[Node:DecomposePrompt] Attempting decomposition: "${message.slice(0, 80)}${message.length > 80 ? '...' : ''}"`);
+
+  // ── Layer 3: single-artifact keyword guard ────────────────────────────────
+  // If the message is requesting one artifact (skill/cron/scheduled job) with no
+  // multi-goal connectors, skip decomposition and let the creator handle it whole.
+  if (SINGLE_ARTIFACT_RE.test(message) && !MULTI_GOAL_CONNECTOR_RE.test(message)) {
+    logger.debug('[Node:DecomposePrompt] Single-artifact request detected — passing through as atomic');
+    return state;
+  }
 
   let plan = null;
   let decomposedBy = 'heuristic';
@@ -170,6 +277,15 @@ module.exports = async function decomposePrompt(state) {
   // ── Could not decompose — treat as simple ────────────────────────────────
   if (!plan) {
     logger.debug('[Node:DecomposePrompt] Could not produce a meaningful split — treating as simple prompt');
+    return state;
+  }
+
+  // ── Layer 2: collapse linear CA chains ───────────────────────────────────
+  plan = collapseLinearCAChain(plan, message, logger);
+
+  // If collapse reduced everything to 1 sub-prompt, treat as simple
+  if (plan.length === 1 && plan[0].text === message) {
+    logger.debug('[Node:DecomposePrompt] Post-collapse single sub-prompt equals original — treating as simple prompt');
     return state;
   }
 

@@ -35,6 +35,9 @@ const liftConstraintNode  = require('./nodes/liftConstraint');
 const parseProjectNode = require('./nodes/parseProject');
 const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
 
+
+
+
 /**
  * Extract the most useful short result string from a completed intent step.
  * Used to populate state.dataContext[N] for injection into dependent steps.
@@ -261,7 +264,7 @@ class StateGraphBuilder {
       // enrichIntent router: handles MODE B re-routing + MODE A gap/resolve routing
       enrichIntent: (state) => {
         const intentType = state.intent?.type || 'general_query';
-        logger.debug(`[StateGraph:Router] enrichIntent exit — intent: ${intentType}`);
+        logger.info(`[StateGraph:Router] enrichIntent exit — intent: ${intentType} | _planFile: ${!!state._planFile} | _planMode: ${!!state._planMode}`);
 
         // Enrichment gaps remain — ask user first (surface the question via logConversation)
         if (Array.isArray(state.enrichmentNeeded) && state.enrichmentNeeded.length > 0) {
@@ -352,8 +355,12 @@ class StateGraphBuilder {
       gatherContext: () => 'planSkills',
       creatorPlanning: () => 'planSkills',
 
-      // planSkills → executeCommand (plan ready) or logConversation (plan error)
+      // planSkills → end (awaiting approval) or executeCommand (plan ready) or logConversation (plan error)
       planSkills: (state) => {
+        if (state.awaitingPlanApproval) {
+          logger.info('[StateGraph:Router] planSkills: awaitingPlanApproval=true — exiting for user review');
+          return 'end';
+        }
         if (state.planError && !state.skillPlan) {
           logger.debug(`[StateGraph:Router] planSkills failed: ${state.planError}`);
           return 'logConversation';
@@ -465,6 +472,7 @@ class StateGraphBuilder {
       answer: 'logConversation',
       synthesize: 'logConversation',
       summarizeMultiIntent: 'logConversation',
+      // planExecutor loops back through its own edge (above)
 
       // Multi-intent queue runner.
       // Each time logConversation completes for a step, this conditional checks whether
@@ -472,6 +480,48 @@ class StateGraphBuilder {
       // Once the queue is empty and isMultiIntent=true it routes to summarizeMultiIntent.
       // summarizeMultiIntent sets isMultiIntent=false so the final logConversation exits here.
       logConversation: async (state) => {
+        // ── Plan mode: step just completed — hand back to planExecutor ────────
+        // _planMode is set by planExecutor for each step it dispatches.
+        // After the step runs through the normal node pipeline and reaches
+        // logConversation, we capture the result and re-enter planExecutor.
+        if (state._planMode && state._planFile) {
+          const stepResult = state.answer || state.commandOutput || '';
+          if (typeof state.progressCallback === 'function') {
+            try {
+              state.progressCallback({
+                type: 'plan:step_done',
+                stepNum: state._planStepNum,
+                totalSteps: state._planTotalSteps,
+                intent: state.intent?.type,
+                result: (stepResult || '').slice(0, 200),
+                status: (state.failedStep || state.planError) ? '❌ failed' : '✅ done',
+                planFile: state._planFile,
+              });
+            } catch (_) {}
+          }
+          // Re-enter planExecutor with the completed step result
+          Object.assign(state, {
+            _planStepResult: stepResult,
+            conversationLogged: false,
+            answer: null,
+            filteredMemories: [],
+            contextDocs: [],
+            searchResults: [],
+            skillResults: [],
+            skillPlan: null,
+            skillCursor: 0,
+            commandExecuted: false,
+            commandOutput: null,
+            executionResult: null,
+            failedStep: null,
+            planError: null,
+            recoveryAction: null,
+            enrichmentNeeded: [],
+            matchedSkillName: null,
+          });
+          return 'planExecutor';
+        }
+
         // ── More steps remain — execute next sub-intent ──────────────────────
         if (state.isMultiIntent && Array.isArray(state.intentQueue) && state.intentQueue.length > 0) {
 

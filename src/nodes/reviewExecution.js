@@ -163,6 +163,17 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };
   }
 
+  // ── Multi-intent queue: skip deep review for intermediate steps ────────────
+  // When more sub-intents are queued, suppress ASK_USER/retry loops so the
+  // pipeline keeps moving. Issues surface in summarizeMultiIntent at the end.
+  const isQueuedStep = state.isMultiIntent &&
+    Array.isArray(state.intentQueue) &&
+    state.intentQueue.length > 0;
+  if (isQueuedStep) {
+    logger.info('[Node:ReviewExecution] Mid-queue step — skipping deep review to keep pipeline moving');
+    return { ...state, reviewVerdict: 'UNVERIFIABLE' };
+  }
+
   // Second pass — a patch was applied last time but re-verification still failed.
   // Don't loop: surface what we know to the user.
   if (reviewRetryCount > 0) {
