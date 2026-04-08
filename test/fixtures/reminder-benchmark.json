@@ -461,7 +461,7 @@
       "fires": true,
       "tier": "notify",
       "skillNameValid": true,
-      "cronHour": 6,
+      "cronHour": null,
       "cronMinute": 0,
       "dayOfWeek": null,
       "recurring": true
@@ -1584,7 +1584,7 @@
       "fires": true,
       "tier": "notify",
       "skillNameValid": true,
-      "cronHour": 6,
+      "cronHour": null,
       "cronMinute": 0,
       "dayOfWeek": null,
       "recurring": true
@@ -2044,7 +2044,7 @@
       "fires": true,
       "tier": "notify",
       "skillNameValid": true,
-      "cronHour": 6,
+      "cronHour": null,
       "cronMinute": 0,
       "dayOfWeek": null,
       "recurring": true
@@ -2829,7 +2829,7 @@
       "fires": true,
       "tier": "notify",
       "skillNameValid": true,
-      "cronHour": 6,
+      "cronHour": null,
       "cronMinute": 0,
       "dayOfWeek": null,
       "recurring": true
@@ -5579,6 +5579,19 @@
       "tier": "notify",
       "skillNameValid": true,
       "cronHour": 6,
+      "recurring": true
+    }
+  },
+  {
+    "id": "rs-501",
+    "message": "Create me a skill that checks my public IP address and logs it to a file every hour",
+    "expected": {
+      "fires": true,
+      "tier": "bridge",
+      "skillNameValid": true,
+      "cronHour": null,
+      "cronMinute": 0,
+      "dayOfWeek": null,
       "recurring": true
     }
   }

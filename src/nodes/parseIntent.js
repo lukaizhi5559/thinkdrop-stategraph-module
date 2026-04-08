@@ -334,9 +334,11 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   }
 
   // Capability question override:
-  // "Do you have a skill to X", "Can you X for me", "Is there a skill that X"
+  // "Do you have a skill to X", "Is there a skill that X", "Can you run X in terminal"
   // These mean "use a skill to do X" = command_automate, not screen_intelligence.
-  if (/\b(do you have (a skill|the ability|a way|a tool) to\b|can you (use|run|execute|do) .{0,40}\b(skill|command|shell|terminal|browser)\b|is there a skill (to|that|for)\b)/i.test(classifyMessage)) {
+  // NOTE: "do you have the ability to X" is intentionally excluded — it is a capability
+  // inquiry that should be answered as general_knowledge, not dispatched as an action.
+  if (/\b(do you have (a skill|a way|a tool) to\b|can you (use|run|execute|do) .{0,40}\b(skill|command|shell|terminal|browser)\b|is there a skill (to|that|for)\b)/i.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] Capability-question override → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'capability-question-override', processingTimeMs: 0 } };
   }
@@ -698,6 +700,35 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
     };
   }
 
+  // ── Correction-of-personal-fact override ─────────────────────────────────
+  // "no it's X", "no that's X", "actually it's X" after a memory_retrieve answer
+  // means the user is correcting a stored personal attribute → memory_store.
+  // This must run BEFORE decompose-passthrough because the LLM (lacking conversation
+  // context) sees "gmail.com" in "no it's cakers5559@gmail.com" and returns command_automate.
+  const CORRECTION_PREFIX_RE = /^(no[,.]?\s+(it'?s|that'?s|it\s+is)|nope[,.]?\s+(it'?s|that'?s)|actually[,.]?\s+(it'?s|that'?s|it\s+is))\s+\S/i;
+  const PERSONAL_ATTR_ANSWER_RE = /\b(your\s+(name|email|phone|number|address|birthday|username|password|wife|husband|partner|son|daughter|brother|sister|mom|mother|dad|father|doctor|boss|manager|coach|mentor|trainer|lawyer|dentist|vet|accountant|realtor|therapist|coach|neighbor|roommate)|your\s+\w+\s+(is|are|was)\b)/i;
+  if (CORRECTION_PREFIX_RE.test(classifyMessage.trim())) {
+    // Only fire when the most recent assistant message looks like a personal-attribute answer.
+    const lastAssistantMsg = Array.isArray(conversationHistory)
+      ? conversationHistory.filter(m => m.role === 'assistant').slice(-1)[0]
+      : null;
+    if (lastAssistantMsg && PERSONAL_ATTR_ANSWER_RE.test(lastAssistantMsg.content || '')) {
+      logger.info(`[Node:ParseIntent] Correction-of-personal-fact override → memory_store: "${classifyMessage}"`);
+      writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent || null, parser: 'correction-of-personal-fact-override', intent: 'memory_store', confidence: 0.95 });
+      return {
+        ...state,
+        intent: {
+          type: 'memory_store',
+          confidence: 0.95,
+          entities: [],
+          requiresMemoryAccess: false,
+          factDeclaration: true,
+        },
+        metadata: { parser: 'correction-of-personal-fact-override', processingTimeMs: 0 },
+      };
+    }
+  }
+
   // ── decomposePrompt fast-path ─────────────────────────────────────────────
   // decomposePrompt has already classified this message via its LLM call.
   // Hard overrides above still run first; landing here means none fired.
@@ -732,11 +763,66 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   // No intentPlan (LLM was unavailable, heuristic also failed) — pattern guards below run as fallback.
   logger.debug(`[Node:ParseIntent] No intentPlan — falling through to pattern guards`);
 
+  // ── _decomposedIntent soft signal ─────────────────────────────────────────
+  // decomposePrompt's LLM call classified this message but collapsed the plan (single
+  // sub-prompt = original message). The estimatedIntent is preserved in state._decomposedIntent.
+  // Use it as a high-priority signal for command_automate — the rule-based fallback cannot
+  // reliably detect imperative-action phrasing that the LLM correctly identifies.
+  // Confidence 0.88: below full intentPlan path (0.92) but above rule-based fallback (0.60).
+  if (state._decomposedIntent === 'command_automate') {
+    logger.debug(`[Node:ParseIntent] _decomposedIntent passthrough → command_automate: "${classifyMessage}"`);
+    writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent || null, parser: 'decomposed-intent-passthrough', intent: 'command_automate', confidence: 0.88 });
+    return {
+      ...state,
+      intent: { type: 'command_automate', confidence: 0.88, entities: [], requiresMemoryAccess: false },
+      metadata: { parser: 'decomposed-intent-passthrough', processingTimeMs: 0 },
+    };
+  }
+
+  // ── carriedIntent continuation guard ─────────────────────────────────────
+  // When there is no intentPlan AND the message is a short, context-dependent follow-up
+  // that has no standalone meaning without the prior turn (e.g. "regarding appts though",
+  // "what about this year", "nothing in my memories"), the carriedIntent from
+  // resolveReferences is the most reliable signal available. Pattern guards cannot handle
+  // these reliably and the rule-based fallback would mis-classify them as 'question'.
+  //
+  // Matches phrases that are explicitly follow-up continuations:
+  //   "regarding appts though"   → matches ^(regarding|about|what about|...)
+  //   "what about this year"     → matches ^(what about ...)
+  //   Short temporal follow-ups: "this year", "last month", "this week" (< 35 chars)
+  //
+  // NOTE: self-contained questions ("what's the last letter of the alphabet") do NOT
+  // match because they contain a full noun phrase topic, not a continuation marker.
+  if (carriedIntent) {
+    const trimmed = classifyMessage.trim();
+    const isContinuationMarker =
+      /^(regarding|about|how about|what about|on that|concerning|and\s+what|but\s+what)\b/i.test(trimmed) ||
+      /^(nothing|not\s+much|same|still|any|anything|everything)\s+(in\s+my|there|about|regarding|new|else|more)\b/i.test(trimmed) ||
+      (trimmed.length < 35 && /\b(this|that|last|these|those)\s+(year|month|week|time|one|topic|subject)\b/i.test(trimmed));
+    if (isContinuationMarker) {
+      logger.info(`[Node:ParseIntent] Context follow-up detected — using carriedIntent (${carriedIntent}): "${trimmed}"`);
+      writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent, parser: 'carried-intent-followup', intent: carriedIntent, confidence: 0.85 });
+      return {
+        ...state,
+        intent: { type: carriedIntent, confidence: 0.85, entities: [], requiresMemoryAccess: carriedIntent === 'memory_retrieve' },
+        metadata: { parser: 'carried-intent-followup', processingTimeMs: 0 },
+      };
+    }
+  }
+
+  // "Do it/that/this for me" — task-delegation shorthand referencing context from the prior turn.
+  // The user is confirming or delegating a pending task → always command_automate.
+  if (/^(just\s+)?(do|go\s+ahead\s+(and|do)|proceed\s+and)\s+(it|that|this)\s*(for\s+(me|us))?\s*[.!]?\s*$/i.test(classifyMessage.trim()) ||
+      /^(do\s+it|do\s+that|do\s+this)\s*(for\s+(me|us))?\s*[.!]?\s*$/i.test(classifyMessage.trim())) {
+    logger.debug(`[Node:ParseIntent] Action-delegation override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.95, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'action-delegation-override', processingTimeMs: 0 } };
+  }
+
   // "I need you to [action]" / "I want you to [action]" / "Can you [action]" → command_automate.
   // NOTE: DistilBERT (retrained with R12) now handles these at 0.91-0.94 confidence → early exit.
   // This guard only fires for unusual action verbs that fall below the 0.75 confidence threshold.
   // Keep as a secondary safety net — not a primary classification path.
-  if (/^(i\s+(need|want|would\s+like)\s+(you\s+to|for\s+you\s+to\s*)|can\s+you\s+|please\s+)(go\s+to|goto|navigate|watch|find|search|look\s+up|browse|open|play|visit|check\s+out|pull\s+up|bring\s+up|show\s+me|get\s+me|download|install|run|execute|send|email|text|create|make|draft|compose|book|reserve|schedule|click|fill|type|start|launch|switch|jump|take\s+me)\b/i.test(classifyMessage.trim())) {
+  if (/^(i\s+(need|want|would\s+like)\s+(you\s+to|for\s+you\s+to\s*)|can\s+you\s+|please\s+)(go\s+to|goto|navigate|watch|find|search|look\s+up|browse|open|play|visit|check\s+out|check\b|pull\s+up|bring\s+up|show\s+me|get\s+me|download|install|run|execute|send|email|text|create|make|draft|compose|book|reserve|schedule|click|fill|type|start|launch|switch|jump|take\s+me)\b/i.test(classifyMessage.trim())) {
     logger.debug(`[Node:ParseIntent] I-need-you-to-action override (safety net) → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.96, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'i-need-you-to-action-override', processingTimeMs: 0 } };
   }
@@ -2152,7 +2238,7 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   // ── Final fallback ─────────────────────────────────────────────────────────
   // All pattern guards ran without a match and the LLM was unavailable (or timed out).
   // Use the rule-based fallbackIntentClassification for basic coverage.
-  logger.debug(`[Node:ParseIntent] No pattern match and LLM unavailable → rule-based fallback: "${classifyMessage.slice(0, 60)}"`);
+  logger.debug(`[Node:ParseIntent] No pattern match → rule-based fallback: "${classifyMessage.slice(0, 60)}"`);
   return fallbackIntentClassification(state);
 };
 

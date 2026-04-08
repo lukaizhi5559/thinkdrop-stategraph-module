@@ -74,7 +74,9 @@ const MEMORY_RECALL_QUESTION = /^(how (have|many|much|often)\b|did i\b|what (ema
 const TEMPORAL_WORDS = /\b(today|yesterday|now|this morning|this afternoon|this evening|this week|last week|last night|last month|earlier|recently|at noon|at midnight|around \d|at \d)\b/i;
 
 // Deictic pronouns referring to prior retrieved content
-const DEICTIC_MEMORY_REFS = /\b(these|those|them|the ones|the files|the apps|the sites|the messages|the results|the entries|the items|the records|the data|the list)\b/i;
+// Includes singular web deictic NPs (the site, the page, the link, etc.) so that
+// "goto the site and check" after a web search correctly signals intent carryover.
+const DEICTIC_MEMORY_REFS = /\b(these|those|them|the ones|the files|the apps|the sites|the messages|the results|the entries|the items|the records|the data|the list|the site|the page|the link|the result|the article|the url)\b/i;
 
 // Activity verbs that pair with deictic refs to signal memory follow-up
 const ACTIVITY_VERBS = /\b(doing|working|using|looking|opening|open|running|editing|writing|reading|viewing|accessing|with|for|about|saved|created|deleted|moved|closed|have|had|were|was)\b/i;
@@ -118,8 +120,16 @@ function extractPriorSite(content) {
   return null;
 }
 
+// Personal-attribute retrieval queries — must be tested BEFORE PRIOR_COMMAND_SIGNALS because
+// words like "email", "send", "call" appear in both the query and command signals.
+// e.g. "what's my email" → memory_retrieve, not command_automate.
+const PERSONAL_ATTR_QUERY_RE = /^(what'?s|what is|whats|who is|who'?s|where is|where'?s)\s+my\b/i;
+
 function inferIntentFromContent(content) {
   if (PRIOR_SCREEN_SIGNALS.test(content)) return 'screen_intelligence';
+  // Personal-attribute queries come before command signals — "what's my email" must not
+  // match PRIOR_COMMAND_SIGNALS (which contains 'email') and get classified as command_automate.
+  if (PERSONAL_ATTR_QUERY_RE.test(content.trim())) return 'memory_retrieve';
   // Check command signals BEFORE memory signals — action verbs (create, push, comment, etc.)
   // are stronger indicators of prior automation than memory keywords like 'created' or 'was'.
   if (PRIOR_BROWSER_SIGNALS.test(content)) return 'command_automate';
@@ -140,6 +150,12 @@ function detectIntentCarryover(message, conversationHistory) {
   // e.g. "how have I sent emails today", "list the email addresses I emailed"
   // These should always go to memory_retrieve, not re-trigger browser automation.
   if (MEMORY_RECALL_QUESTION.test(msg)) return null;
+
+  // Correction messages NEVER carry over any prior intent — they must be re-classified fresh.
+  // "no it's X", "no that's X", "actually it's X" = user correcting a prior wrong answer.
+  // Carrying over command_automate here caused "no it's cakers5559@gmail.com" to open Gmail.
+  const CORRECTION_CARRYOVER_RE = /^(no[,.]?\s+(it'?s|that'?s|it\s+is|the\s+(correct|right)\s+(one|answer)\s+is|i\s+mean)|nope[,.]?\s+(it'?s|that'?s)|actually[,.]?\s+(it'?s|that'?s|it\s+is))\b/i;
+  if (CORRECTION_CARRYOVER_RE.test(message.trim())) return null;
 
   // Filesystem / capability action messages NEVER carry over any prior intent.
   // "I need you to scan the folder X", "scan folder X", "do you have a skill to X"
@@ -228,7 +244,13 @@ function detectIntentCarryover(message, conversationHistory) {
   const REFINEMENT_MARKERS = /\b(as well|not just|also include|include .* too|instead of|rather than|add .* too|plus |and also|but also|in addition)\b/i;
   const isRefinement = REFINEMENT_MARKERS.test(msg) && wordCount <= 12 && !hasStandaloneIntent;
 
-  if (!isContinuation && !isTemporalElliptical && !isDeiticMemoryFollowup && !isRefinement) return null;
+  // Signal 6: BROWSER NAV + DEICTIC — e.g. "goto the site and check", "visit the page"
+  // These exceed the ≤4-word continuation ceiling but unambiguously refer to a prior web result.
+  // The hasDeiticRef flag (set above from the expanded DEICTIC_MEMORY_REFS) must also be true.
+  const BROWSER_NAV_DEICTIC_RE = /^(go\s+to|goto|visit|check|open|browse|navigate\s+to|look\s+at)\s+(the\s+)?(site|page|link|url|article|result)\b/i;
+  const hasBrowserNavDeictic = BROWSER_NAV_DEICTIC_RE.test(msg) && hasDeiticRef;
+
+  if (!isContinuation && !isTemporalElliptical && !isDeiticMemoryFollowup && !isRefinement && !hasBrowserNavDeictic) return null;
 
   // ── Determine prior intent from conversation history ──────────────────────
   // Read the last 5 user messages, most recent first, and infer intent from content
@@ -250,9 +272,21 @@ function detectIntentCarryover(message, conversationHistory) {
   // Defaults when no prior intent found:
   // - Deictic memory refs → memory_retrieve (user is asking about retrieved content)
   // - Temporal ellipticals → memory_retrieve (time-based = "what was I doing then")
+  // - Browser nav deictic → command_automate ("goto the site" is always a browser command
+  //   regardless of what the prior turn was — even if inferIntentFromContent returned null
+  //   because the prior question was a general knowledge query like "what's the weather in Ohio")
+  // - Deictic ref + prior assistant had URLs → command_automate (web-search follow-up)
+  //   "check those sites", "show me those pages" after a web search answer
   // - Pure continuations with no history → null (can't safely infer)
   if (!previousIntent && isDeiticMemoryFollowup) previousIntent = 'memory_retrieve';
   if (!previousIntent && isTemporalElliptical) previousIntent = 'memory_retrieve';
+  if (!previousIntent && hasBrowserNavDeictic && conversationHistory.length > 0) previousIntent = 'command_automate';
+  if (!previousIntent && hasDeiticRef) {
+    const _lastAsst = conversationHistory.slice().reverse().find(m => m.role === 'assistant' && m.content);
+    if (_lastAsst?.content && /https?:\/\//.test(_lastAsst.content)) {
+      previousIntent = 'command_automate';
+    }
+  }
   if (!previousIntent) return null;
 
   // ── Build resolved message ────────────────────────────────────────────────
@@ -264,6 +298,29 @@ function detectIntentCarryover(message, conversationHistory) {
       : `what do you see on ${topic}`;
   } else {
     resolvedMessage = message; // preserve original for date parsing downstream
+  }
+
+  // ── Web deictic enrichment: extract URLs from prior assistant message ─────
+  // When the user says "goto the site", "check the page", etc. after a web search,
+  // the planner has no idea what URL "the site" refers to — it defaults to example.com.
+  // Extract URLs mentioned in the most recent assistant message and append them to
+  // resolvedMessage so the planning LLM can reason about the correct target.
+  // 1 URL → "(referring to: <url>)"
+  // 2+ URLs → "(prior answer mentioned these sites: <url1>, <url2>, ...)"
+  if (hasBrowserNavDeictic || (hasDeiticRef && /\b(site|page|link|url|article|result)\b/i.test(msg))) {
+    const lastAssistantMsg = conversationHistory
+      .slice()
+      .reverse()
+      .find(m => m.role === 'assistant' && m.content);
+    if (lastAssistantMsg?.content) {
+      const urlMatches = lastAssistantMsg.content.match(/https?:\/\/[^\s,)"'\]]+/g) || [];
+      const uniqueUrls = [...new Set(urlMatches)].slice(0, 5); // cap at 5 to avoid prompt bloat
+      if (uniqueUrls.length === 1) {
+        resolvedMessage = `${message} (referring to: ${uniqueUrls[0]})`;
+      } else if (uniqueUrls.length > 1) {
+        resolvedMessage = `${message} (prior answer mentioned these sites: ${uniqueUrls.join(', ')})`;
+      }
+    }
   }
 
   return { carriedIntent: previousIntent, resolvedMessage };

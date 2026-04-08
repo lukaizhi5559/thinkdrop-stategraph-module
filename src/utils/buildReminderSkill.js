@@ -250,13 +250,35 @@ function buildReminderSkill(userMessage, homeDir) {
   if (!hasReminderKw && !hasBridgeKw) return { fires: false };
 
   // ── 4. Parse time + derive skill name ────────────────────────────────────────
-  const { hour, minute, dayOfWeek } = parseTime(userMessage);
-  const minuteStr = minute.toString().padStart(2, '0');
+  // Detect interval cadences BEFORE parseTime — "every hour" and "every N hours"
+  // do not have a fixed clock time and need a different cron pattern entirely.
+  const _everyNHoursMatch = msgLow.match(/\bevery\s+(\d+)\s+hours?\b/);
+  const _everyHour        = !_everyNHoursMatch && /\bevery\s+hour\b/.test(msgLow);
+  const _intervalHours    = _everyNHoursMatch ? parseInt(_everyNHoursMatch[1], 10) : null;
 
-  // Build cron expression — weekly if day-of-week detected, else daily
-  const cronExpr = dayOfWeek !== null
-    ? `${minute} ${hour} * * ${dayOfWeek}`
-    : `${minute} ${hour} * * *`;
+  let hour, minute, minuteStr, dayOfWeek, cronExpr;
+  if (_everyHour) {
+    // Fire once per hour on the hour: 0 * * * *
+    hour = null; minute = 0; minuteStr = '00'; dayOfWeek = null;
+    cronExpr = '0 * * * *';
+  } else if (_intervalHours) {
+    // Fire every N hours on the hour: 0 */N * * *
+    hour = null; minute = 0; minuteStr = '00'; dayOfWeek = null;
+    cronExpr = `0 */${_intervalHours} * * *`;
+  } else {
+    // Standard time-of-day schedule — parse hour/minute from message text
+    ({ hour, minute, dayOfWeek } = parseTime(userMessage));
+    minuteStr = minute.toString().padStart(2, '0');
+    cronExpr = dayOfWeek !== null
+      ? `${minute} ${hour} * * ${dayOfWeek}`
+      : `${minute} ${hour} * * *`;
+  }
+
+  // Human-readable schedule string for step descriptions + plan section
+  const cadenceLabel = _everyHour      ? 'every hour'
+    : _intervalHours                   ? `every ${_intervalHours} hours`
+    : dayOfWeek !== null               ? `${hour}:${minuteStr} on day ${dayOfWeek}`
+    :                                    `${hour}:${minuteStr} daily`;
 
   const label     = buildLabel(userMessage);
   const skillName = `reminder.${label}`;
@@ -265,8 +287,9 @@ function buildReminderSkill(userMessage, homeDir) {
 
   // Truncate message for notification text (safe length, no newlines)
   const notifMsg = userMessage.replace(/[\n\r]/g, ' ').replace(/"/g, "'").substring(0, 100);
+  const scheduleLabel = _everyHour || _intervalHours ? 'Recurring' : 'Daily';
   const description = tier === 'notify'
-    ? `Daily reminder: ${notifMsg}`
+    ? `${scheduleLabel} reminder: ${notifMsg}`
     : `Scheduled task: ${notifMsg}`;
 
   // ── 5. Build skill.md with ALL required fields for skillRegistry.validateContract ──
@@ -291,7 +314,7 @@ function buildReminderSkill(userMessage, homeDir) {
   }
 
   const planSection = tier === 'notify'
-    ? `Fire a macOS notification every day at ${hour}:${minuteStr}.`
+    ? `Fire a macOS notification ${cadenceLabel}.`
     : `At fire time, ThinkDrop executes: "${extractActionBody(userMessage).replace(/[\n\r]/g, ' ').replace(/"/g, "'")}"`;
 
   const skillMd = `---\n${fmLines.join('\n')}\n---\n\n## Plan\n${planSection}\n`;
@@ -308,7 +331,7 @@ function buildReminderSkill(userMessage, homeDir) {
   const skillPlan = [
     {
       skill: 'shell.run',
-      description: `Write ${tier} skill.md for "${label}" at ${hour}:${minuteStr}${dayOfWeek !== null ? ` on day ${dayOfWeek}` : ' daily'}`,
+      description: `Write ${tier} skill.md for "${label}" ${cadenceLabel}`,
       args: { cmd: 'bash', argv: ['-c', setupScript] },
     },
     {
@@ -321,7 +344,7 @@ function buildReminderSkill(userMessage, homeDir) {
       description: `Sync SkillScheduler to activate the cron immediately`,
       args: {
         cmd: 'bash',
-        argv: ['-c', `curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo "✅ node-cron activated: ${skillName} at ${hour}:${minuteStr}${dayOfWeek !== null ? ` (DOW ${dayOfWeek})` : ' daily'}"`],
+        argv: ['-c', `curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo "✅ node-cron activated: ${skillName} (${cadenceLabel})"`],
       },
     },
   ];

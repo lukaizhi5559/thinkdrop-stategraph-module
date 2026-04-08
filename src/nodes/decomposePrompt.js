@@ -51,6 +51,7 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - Mark dependsOn:[N] when this step requires the OUTPUT of step N to execute correctly
 - Use dataTemplate (optional) with "{{result[N]}}" as a placeholder where step N's result should be injected at execution time — omit if no dependency
 - Return ONLY valid JSON — no markdown fences, no explanation
+- Correction messages that start with "no it's", "no that's", "actually it's", or "nope it's" where the value corrects a prior answer (e.g. "no it's cakers5559@gmail.com" after a wrong email was stated) should use estimatedIntent:'memory_store', NOT command_automate — even if the value contains a domain name like gmail.com
 - CRITICAL: If ALL proposed sub-prompts are implementation steps toward a single artifact (a skill, script, automation, cron job, scheduled task, or workflow), return ONE sub-prompt using the original user message text with estimatedIntent:'command_automate'. Only split into multiple sub-prompts when the user clearly expresses multiple INDEPENDENT goals they want executed separately (e.g. answering a question AND performing an unrelated action).
 
 JSON shape (example):
@@ -283,8 +284,15 @@ module.exports = async function decomposePrompt(state) {
   // ── Layer 2: collapse linear CA chains ───────────────────────────────────
   plan = collapseLinearCAChain(plan, message, logger);
 
-  // If collapse reduced everything to 1 sub-prompt, treat as simple
+  // If collapse reduced everything to 1 sub-prompt, treat as simple.
+  // Preserve the LLM's estimatedIntent as _decomposedIntent so parseIntent can use
+  // it as a soft signal — the full intentPlan is not useful but the intent label is.
   if (plan.length === 1 && plan[0].text === message) {
+    const collapsedIntent = plan[0].estimatedIntent;
+    if (collapsedIntent && collapsedIntent !== 'general_knowledge') {
+      logger.debug(`[Node:DecomposePrompt] Post-collapse single sub-prompt equals original — preserving _decomposedIntent=${collapsedIntent}`);
+      return { ...state, _decomposedIntent: collapsedIntent };
+    }
     logger.debug('[Node:DecomposePrompt] Post-collapse single sub-prompt equals original — treating as simple prompt');
     return state;
   }
