@@ -192,6 +192,19 @@ module.exports = async function evaluateSkills(state) {
   }
 
   const isFailurePath = evaluationFromFailure === true;
+
+  // Failure-path retry cap — after MAX_EVAL_RETRIES FIX cycles, escalate to ASK_USER
+  // (the non-failure-path cap lives in the `if (!evaluationFromFailure)` block above)
+  if (isFailurePath && evaluationRetryCount >= MAX_EVAL_RETRIES) {
+    logger.warn(`[Node:EvaluateSkills] Failure-path retry cap reached (${evaluationRetryCount}/${MAX_EVAL_RETRIES}) — escalating to ASK_USER`);
+    return {
+      ...state,
+      evaluationVerdict: 'ASK_USER',
+      evaluationFromFailure: false,
+      answer: `I tried ${evaluationRetryCount} different approaches but couldn\'t resolve this automatically. Please try a different approach or check the task manually.`,
+    };
+  }
+
   if (progressCallback) progressCallback({ type: 'evaluating', message: isFailurePath ? 'Analyzing failure...' : 'Evaluating result...' });
   logger.info(`[Node:EvaluateSkills] ${isFailurePath ? 'Failure-path evaluation' : 'Post-run evaluation'} (retry ${evaluationRetryCount}/${MAX_EVAL_RETRIES})`);
 
@@ -337,9 +350,8 @@ Output ONLY valid JSON.`;
       evaluationVerdict: 'FIX',
       evaluationFix: verdict,
       evaluationFromFailure: false,
-      // On failure path: reset counter so the post-run evaluator starts fresh after replan.
-      // On success path: increment to track how many post-run retries have been used.
-      evaluationRetryCount: isFailurePath ? 0 : evaluationRetryCount + 1,
+      // Always increment so the failure-path cap fires after MAX_EVAL_RETRIES cycles.
+      evaluationRetryCount: evaluationRetryCount + 1,
       // Clear plan state so planSkills reruns fresh with the new rule injected
       skillPlan: null,
       skillCursor: 0,

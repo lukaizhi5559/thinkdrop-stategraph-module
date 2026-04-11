@@ -2791,6 +2791,77 @@ module.exports = async function executeCommand(state) {
 
     const raw = result.data || result;
 
+    // ── Sub-agent turn visibility ─────────────────────────────────────────────
+    // cli.agent { action: run, agentId } and browser.agent { action: run } both return
+    // { agentId, task, transcript: [...], turns } when running agentically.
+    // Emit post-hoc agent:turn events so the UI shows what each sub-agent did.
+    // Reset first so that a retry of the same step (same skillCursor) does not duplicate bubbles.
+    if (progressCallback && raw.agentId) {
+      progressCallback({
+        type:      'agent:turns_reset',
+        stepIndex: skillCursor,
+      });
+      if (Array.isArray(raw.transcript) && raw.transcript.length > 0) {
+        for (const entry of raw.transcript) {
+          progressCallback({
+            type:       'agent:turn',
+            agentId:    raw.agentId,
+            turn:       entry.turn || 0,
+            maxTurns:   raw.turns || raw.transcript.length,
+            action:     entry.action,
+            outcome:    entry.outcome,
+            thoughts:   entry.thoughts,
+            stepIndex:  skillCursor,
+          });
+        }
+      }
+      progressCallback({
+        type:        'agent:complete',
+        agentId:     raw.agentId,
+        task:        raw.task,
+        totalTurns:  raw.turns || (raw.transcript?.length || 0),
+        done:        raw.done ?? raw.ok,
+        result:      raw.result || raw.stdout || '',
+        reasoning:   raw.reasoning,
+        ok:          raw.ok,
+        stepIndex:   skillCursor,
+      });
+      if (raw.savedRule) {
+        progressCallback({ type: 'agent:rule_learned', stepIndex: skillCursor, agentId: raw.agentId, rule: raw.savedRule });
+      }
+    }
+
+    // ── Agent ask_user short-circuit ──────────────────────────────────────────
+    // When cli.agent (or browser.agent api_key path) returns askUser: true, surface
+    // the agent's exact question directly without routing through recoverSkill.
+    // recoverSkill would call the LLM independently and generate a different question.
+    if (raw.agentId && raw.askUser === true && raw.question) {
+      logger.info(`[Node:ExecuteCommand] agent ask_user: "${String(raw.question).slice(0, 80)}"`);
+      const askUserStep = {
+        step: skillCursor + 1, skill, args: resolvedArgs, description,
+        ok: false, askUser: true, error: raw.question,
+      };
+      if (progressCallback) progressCallback({
+        type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill,
+        error: raw.question,
+      });
+      return {
+        ...state,
+        skillResults: [...skillResults, askUserStep],
+        skillCursor,
+        failedStep: null,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: raw.question,
+          options:  raw.options || [],
+          context:  `${description || skill} (step ${skillCursor + 1})`,
+          _isAgentAskUser: true,
+          agentId: raw.agentId || null,
+        },
+        commandExecuted: false,
+      };
+    }
+
     // ── OAuth gate ────────────────────────────────────────────────────────────
     // external.skill returns needsOAuth when a declared provider has no stored token.
     // Pause execution, show the OAuth connect modal, and retry the same step once

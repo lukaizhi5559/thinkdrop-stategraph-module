@@ -255,8 +255,10 @@ module.exports = async function planSkills(state) {
   if (state._skillPlan && Array.isArray(state._skillPlan) && state._skillPlan.length > 0) {
     logger.info(`[Node:PlanSkills] _skillPlan pre-built — skipping LLM planning (${state._skillPlan.length} steps)`);
     const prebuiltPlan = state._skillPlan;
-    // Do NOT emit plan_ready — PlanPanel handles progress via plan:step_start/done/complete.
-    // Emitting plan_ready would cause AutomationProgress to show alongside PlanPanel.
+    // Emit plan_ready so AutomationProgress initialises its step list.
+    // PlanPanel ignores plan_ready (it only handles plan: prefixed events), so this is safe
+    // for both ASK_USER recovery re-runs and PlanPanel-approved plan re-runs.
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: prebuiltPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || s.args?.task || s.skill, args: s.args })) });
     return { ...state, skillPlan: prebuiltPlan, skillCursor: 0, _skillPlan: null, recoveryContext: null, planError: null };
   }
 
@@ -1148,6 +1150,7 @@ Task: "${userMessage}"`;
   // and navigation patterns — so it doesn't plan redundant auth steps or prompt
   // the user for credentials that are already available.
   let agentContextNote = '';
+  let discoveryNote = '';
   if (mcpAdapter) {
     try {
       const agentRes = await mcpAdapter.callService('command', 'command.automate', {
@@ -1165,9 +1168,43 @@ Task: "${userMessage}"`;
           return `  - ${typeTag} ${a.id} (service: ${a.service}, tool: ${a.cliTool || 'browser'}) — capabilities: ${caps || 'see descriptor'}`;
         }).join('\n');
 
-        agentContextNote = `\n\nAVAILABLE AGENTS (already configured — auth/credentials resolved, no user prompt needed):\n${agentLines}\n  When a task uses one of these services, assume credentials are available and plan skill steps that use the service directly. Do NOT add auth setup steps for these services. For recurring/background tasks using these services, use needs_skill to build the automation skill.`;
+        agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.`;
 
         logger.debug(`[Node:PlanSkills] Agent context: ${healthyAgents.length} healthy agent(s) injected`);
+      }
+
+      // ── Discovery note: guide LLM to plan build_agent when service has no agent ──
+      // Detects services the user wants that aren't covered by any agent row (healthy or not).
+      // Injects a structured setup flow so the LLM plans build_agent → run, not a broken
+      // shell.run/curl attempt with placeholder credentials.
+      const coveredServiceIds = new Set(
+        agentRows.map(a => (a.service || a.id.replace('.agent', '')).toLowerCase())
+      );
+      // Gather services the user wants (from enrichIntent domainTags)
+      const wantedServices = [
+        ...(domainTags?.services || []),
+        ...(domainTags?.tags   || []),
+      ].map(s => s.toLowerCase()).filter(s => s.length >= 3);
+
+      const missingService = wantedServices.find(svc =>
+        !coveredServiceIds.has(svc) &&
+        !agentRows.some(a => (a.id || '').toLowerCase().includes(svc))
+      );
+
+      if (missingService) {
+        // Heuristic: OAuth/social/ecommerce → browser.agent; everything else → cli.agent
+        const browserTags = new Set(['browser', 'oauth', 'web', 'social', 'ecommerce', 'shopping', 'music', 'spotify', 'twitter', 'instagram', 'linkedin', 'discord', 'shopify']);
+        const agentTypeHint = (domainTags?.tags || []).some(t => browserTags.has(t.toLowerCase()))
+          ? 'browser.agent'
+          : 'cli.agent';
+        discoveryNote = `\n\nNO AGENT CONFIGURED FOR "${missingService.toUpperCase()}" — the user does not have this service set up yet.` +
+          ` Plan a discovery and setup flow — do NOT plan shell.run, curl, or skill.bootstrap steps:` +
+          `\n  Step 1: { "skill": "synthesize", "args": { "prompt": "You don't have ${missingService} set up yet. I can configure it for you in a moment." } }` +
+          `\n  Step 2: { "skill": "${agentTypeHint}", "args": { "action": "build_agent", "service": "${missingService}" } }` +
+          `\n  Step 3: { "skill": "${agentTypeHint}", "args": { "action": "run", "agentId": "${missingService}.agent", "task": "<repeat the user's original request verbatim>" } }` +
+          `\n  If the service type is ambiguous: use cli.agent for cloud/devops/API-key services, browser.agent for OAuth/social/ecommerce services.` +
+          `\n  If you don't know the service: emit { "skill": "web.search", "args": { "query": "${missingService} CLI or REST API setup" } } before build_agent.`;
+        logger.info(`[Node:PlanSkills] Discovery note injected for uncovered service: "${missingService}" (agent type hint: ${agentTypeHint})`);
       }
     } catch (_) { /* non-fatal */ }
   }
@@ -1339,7 +1376,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
+User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   // ── Contract-driven fast path ───────────────────────────────────────────────
   // When parseSkill matched a shell skill whose contract has a ## Commands section,
@@ -2335,7 +2372,7 @@ CRITICAL rules for skill.md:
 OS: ${os}
 Home directory: ${homeDir}
 User request: "${userMessage}"
-IMPORTANT: No CLI binary or installable npm/API package was found for this task. Do NOT output needs_skill. Use browser.act with playwright-cli to accomplish the task directly in the browser (navigate, snapshot, interact, synthesize). Plan it exactly like you would for "go to ChatGPT and search for X".${domainContextNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
+IMPORTANT: No CLI binary or installable npm/API package was found for this task. Do NOT output needs_skill. Use browser.act with playwright-cli to accomplish the task directly in the browser (navigate, snapshot, interact, synthesize). Plan it exactly like you would for "go to ChatGPT and search for X".${domainContextNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;
 
       const browserHintPayload = {
         query: browserHintQuery,

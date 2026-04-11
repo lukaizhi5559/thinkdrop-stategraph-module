@@ -187,7 +187,9 @@ module.exports = async function reviewExecution(state) {
   // then pass (original user goal + synthesize output + snapshot) to the LLM to judge
   // whether the task was actually fulfilled.
   // Regex hollow patterns serve as a fast-path fallback when the LLM is unavailable.
-  const shellSteps = skillResults.filter(r => r.skill === 'shell.run');
+  // cli.agent results carry exitCode/stdout/ok just like shell.run — include them
+  // so CLI-only plans route to the LLM shell-review path, not the browser-snapshot path.
+  const shellSteps = skillResults.filter(r => r.skill === 'shell.run' || r.skill === 'cli.agent');
   if (shellSteps.length === 0) {
     // Extract synthesize output
     const synthesizeStep = skillResults.find(r => r.skill === 'synthesize' && r.ok !== false);

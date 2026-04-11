@@ -375,7 +375,8 @@ class StateGraphBuilder {
           return 'recoverSkill';
         }
         // Scout card is waiting for user provider selection — stop looping, surface ASK_USER
-        if (state.scoutPending || state.pendingQuestion?._isScoutSelect) {
+        // Also short-circuit for CLI/browser agent ask_user so recoverSkill is not invoked.
+        if (state.scoutPending || state.pendingQuestion?._isScoutSelect || state.pendingQuestion?._isAgentAskUser) {
           return 'logConversation';
         }
         // More steps remaining — loop back

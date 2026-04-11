@@ -44,8 +44,8 @@ Flag a step as suspicious when **ALL** three are true:
 **Pattern A — `&&/||` short-circuit:**
 The command uses `READ_CMD --json ... && echo 'done' || MUTATION_CMD` where the read command (`gh repo view`, `gh api GET`, `curl -X GET`) always exits 0 — so `&&` always fires, `||` never fires, and the mutation never runs.
 
-**Pattern B — Empty stdout from mutation:**
-A shell mutation step that should print something (create, star, follow, send) printed nothing and the intent was clearly to perform an action.
+**Pattern B — Empty stdout from a command that always prints confirmation:**
+A shell mutation step printed nothing AND the specific command is known to always print confirmation text on success (e.g. `gh repo star OWNER/REPO` prints `Starred OWNER/REPO`, `brew install` prints package info, `gh repo fork` prints fork details). Do NOT apply this pattern to CLIs that proxy HTTP requests or use exit codes as the sole success signal — empty stdout at exitCode=0 is normal for HTTP 204 responses. If you are not certain the command always prints on success — do NOT flag.
 
 **Pattern C — "Already X" from a suspicious conditional:**
 Stdout says "Already done" but the step used a `&&/||` pattern (Pattern A) — the "already done" output came from the echo in the `&&` branch, not from a real idempotency check.
@@ -84,12 +84,13 @@ gh repo view OWNER/REPO --json viewerSubscription && echo 'Watching' || gh repo 
 **expectedPattern**: `"SUBSCRIBED"`
 **Patched argv**: `["-c", "SUB=$(gh repo view OWNER/REPO --json viewerSubscription -q .viewerSubscription 2>/dev/null); if [ \"$SUB\" = \"SUBSCRIBED\" ]; then echo \"Already watching OWNER/REPO\"; else gh repo watch OWNER/REPO && echo \"Now watching OWNER/REPO\"; fi"]`
 
-### Safe patterns — do NOT flag these
+### Evaluating ambiguous output
 
-- `gh api -X PUT /user/following/USERNAME` — `gh api` with a mutating method only exits 0 on success. PASS.
-- `curl -X POST ...` or `curl -X DELETE ...` — exits non-zero on failure. PASS.
-- `gh pr create ...` — prints PR URL on success. PASS if stdout contains a URL.
-- `gh issue create ...` — prints issue URL. PASS if stdout contains a URL.
+Use your knowledge of CLI behavior to assess each step. The key principles:
+
+1. **exitCode=0 is the primary success signal.** For any CLI that reliably exits non-zero on failure (network errors, HTTP 4xx/5xx, auth failures), exitCode=0 with empty stdout is valid success — do NOT flag as Pattern B.
+2. **Only flag empty stdout** when the specific command is documented to always print something on success (e.g. `gh repo star`, `gh pr create`, `brew install`). If you are not certain the command prints on success — do NOT flag.
+3. **Output-confirming commands** (flag if stdout is empty at exitCode=0): `gh pr create` expects a PR URL, `gh issue create` expects an issue URL, `gh repo star` expects `Starred OWNER/REPO`, `brew install` expects package output. These are the exception, not the rule.
 
 ## Rules
 
