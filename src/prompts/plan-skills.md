@@ -7,7 +7,7 @@ project.launcher|args:{projectName:string,port?:number}|Starts_a_previously_buil
 project.stopper|args:{projectName:string,port?:number}|Stops_a_running_ThinkDrop_project_server_and_kills_its_Node.js_process.__Use_when_the_user_says_"close_the_app",_"stop_the_project",_"shut_it_down",_"close_it",_"kill_the_server"_and_the_user_is_referring_to_a_previously_launched_ThinkDrop_project_(built_with_project.builder).__projectName_is_the_slug_or_fuzzy_name_eg_"cold-plunge"_or_"schedule-plunge".__NEVER_use_needs_skill_or_shell.run_for_stopping_a_ThinkDrop_project.
 needs_skill|args:{capability:string,suggestion:string}|Use_for_TWO_cases:_(1)_recurring_background_daemons_that_cannot_be_done_via_one-off_API_call,_(2)_desktop_UI_automation_/_app_control_tasks_(scroll,_type,_shortcuts,_interact_with_native_apps)_that_require_a_full_project_—_NOT_a_skill.md.__RULE:_if_the_user_asks_to_"create_a_skill"_or_"build_a_tool"_for_controlling_apps_(keyboard,_mouse,_scroll,_shortcuts,_window_control),_output_needs_skill_with_the_described_capability.
 external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user_installed_external_skill_by_name
-playwright.agent|args:{goal:string,sessionId?:string,url?:string,maxTurns?:number,headed?:boolean,timeoutMs?:number}|[sub-agent]_agentic_browser_loop__LLM_drives_snapshot→action→repeat_until_goal_done__use_for_complex_open_ended_web_tasks_where_exact_steps_cannot_be_pre_planned__(login_flows,_multi_step_fill+navigate+verify,_scraping_with_unknown_page_structure)
+playwright.agent|args:{goal:string,sessionId?:string,url?:string,maxTurns?:number,headed?:boolean,timeoutMs?:number}|[sub-agent]_agentic_browser_loop__LLM_drives_snapshot→action→repeat_until_goal_done__use_for_complex_open_ended_tasks_on_PUBLIC_or_ANONYMOUS_sites_only__(scraping,_read-only_research,_AI_chatbots_with_no_API).__⚠️_NEVER_use_for_any_service_in_AVAILABLE_AGENTS_or_any_registered_OAuth_service_(Gmail,_Slack,_Notion,_etc.)—those_MUST_use_browser.agent_{action:run}.
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI_agent_factory+runner.__Takes_ONE_high-level_task,_reads_agent_descriptor_from_DuckDB,_infers_correct_CLI_commands_via_LLM,_executes,_returns_result.__actions:_run_(delegate_task),_build_agent_(discover+install+register_CLI_service),_list_agents,_validate_agent,_preflight_check.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists;_use_action:build_agent_to_create_new_agents.
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_Browser/REST_API_agent_factory+runner.__Handles_OAuth_browser_services_AND_REST_API/API-key_services_(ClickSend,_Mailgun,_Twilio,_etc.).__Takes_ONE_task,_reads_descriptor,_handles_all_auth,_infers+executes_curl_or_browser_steps.__actions:_run_(delegate_task),_build_agent_(crawl_docs+create_descriptor),_list_agents.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists.
 
@@ -28,18 +28,26 @@ browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|
 4. Example correct fill step: `{ "skill": "browser.act", "args": { "action": "fill", "selector": "input[type='email']", "value": "{{gmail:username}}", "sessionId": "gmail" } }`
 
 
-**Use `shell.run curl` for any service with a REST API. Use `browser.act` ONLY for unauthenticated public web browsing.**
+**SKILL ROUTING — use the right skill for every task type:**
 
-| Task | Use |
-|------|-----|
-| GitHub — create PR, comment, list, push, star, fetch README | `cli.agent` with the agentId from AVAILABLE AGENTS if a github agent exists; otherwise `shell.run` + GitHub REST API |
-| Slack, Jira, Linear, Notion, Trello | `shell.run` + their REST APIs |
-| Weather, public pages, scraping | `browser.act` navigate + `getPageText` |
-| AI chatbots (ChatGPT, Claude, Perplexity) | `browser.act` (no open API for chat UI) |
-| Any login-gated action | `shell.run curl` with token — **NEVER `browser.act`** |
-| Complex login + navigate + interact flow where steps are not fully known | `playwright.agent` with `goal` and `url` |
+| Task | Correct skill |
+|------|---------------|
+| External REST API service with api_key or bearer token (Mailgun, SendGrid, Stripe, Twilio, ClickSend, Postmark, etc.) | `browser.agent { action: 'build_agent', service: '...' }` then `{ action: 'run', agentId: '...', task: '...' }` |
+| OAuth service (Gmail, Google Calendar, Slack, Notion, Linear, Jira, Trello, GitHub no CLI, etc.) | `browser.agent { action: 'build_agent', service: '...' }` then `{ action: 'run', agentId: '...', task: '...' }` — browser.agent detects OAuth and automatically delegates to playwright.agent for login |
+| Service with a CLI binary (GitHub via `gh`, AWS via `aws`, Heroku via `heroku`, etc.) | `cli.agent { action: 'build_agent', service: '...' }` then `{ action: 'run', agentId: '...', task: '...' }` |
+| **Service listed in AVAILABLE AGENTS with type [browser]** (Gmail, Slack, Notion, etc.) | `browser.agent { action: 'run', agentId: '<id from AVAILABLE AGENTS>', task: '...' }` — **NEVER** `playwright.agent` |
+| Public web scraping, AI chatbots (ChatGPT, Claude, Perplexity — no open API), open-ended tasks on **anonymous/public** sites where no agent is registered | `playwright.agent` with `goal` and `url` |
+| Weather, public pages, read-only scraping (no auth) | `browser.act` navigate + `getPageText` |
+| **Local system only**: file ops, grep, ffmpeg, local git, run local scripts, open apps | `shell.run` bash |
 
-**NOTE — registered services:** If an agent for the needed service appears in the AVAILABLE AGENTS block injected above (e.g. `github.agent` for GitHub tasks), delegate via `cli.agent { action: 'run', agentId: '<exact agentId from AVAILABLE AGENTS>', task: '...' }` — use the EXACT agentId string shown in the block, do NOT guess or substitute a different name. The sub-agent handles auth and command inference. The rules below apply only when using `shell.run` directly for services WITHOUT a registered agent.
+**FORBIDDEN — never use `shell.run curl` to call external API services** (Mailgun, Gmail API, Slack API, Stripe, Twilio, etc.). `shell.run` has no credential management, no keychain access, no token refresh, and no retry on 401 — it always fails when tokens expire or keys are unset. Use `browser.agent` or `cli.agent` for ALL external services. `shell.run` is for local system commands only.
+
+**Registered agents — check AVAILABLE AGENTS block first (highest priority).** If an agent for the needed service is listed there, skip `build_agent` and delegate directly via `action: 'run'`:
+```json
+{ "skill": "browser.agent", "args": { "action": "run", "agentId": "<exact id from AVAILABLE AGENTS>", "task": "<full user request verbatim>" } }
+{ "skill": "cli.agent",     "args": { "action": "run", "agentId": "<exact id from AVAILABLE AGENTS>", "task": "<full user request verbatim>" } }
+```
+Use the EXACT agentId string from the AVAILABLE AGENTS block — do NOT guess or substitute. The sub-agent reads its own descriptor, resolves credentials from the keychain, infers the correct commands, and executes end-to-end.
 
 **shell.run JSON body quoting — CRITICAL when user message text may contain apostrophes:**
 
@@ -80,9 +88,9 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 
 **`synthesize` ordering rule — CRITICAL:** Place ALL `synthesize` steps AFTER all data-collection steps (browser.act, shell.run, getPageText, waitForStableText) are complete. **NEVER interleave `synthesize` between browser steps on different sites.** Wrong: [chatgpt scrape → synthesize → gmail scrape → synthesize]. Right: [chatgpt scrape → gmail scrape → synthesize all → send].
 
-**API shell.run rule — CRITICAL:** When `shell.run` calls an external API endpoint (URL containing `http`, a bearer token, or a known CLI tool like `gcalcli`, `gh`, `git`) and is expected to return structured data (JSON, table), you MUST append a `synthesize` step. The `args.prompt` must describe what to present in plain English (e.g. `"List each event with title, date/time, and location in a readable format"`). Omitting `synthesize` after an API call will show the user a raw JSON blob — this is always wrong.
+**shell.run synthesize rule — CRITICAL:** When `shell.run` runs a local CLI tool (e.g. `gcalcli`, `gh`, `git`) and is expected to return structured data (JSON, table), you MUST append a `synthesize` step. The `args.prompt` must describe what to present in plain English. Omitting `synthesize` after a data-producing command shows the user a raw blob — always wrong.
 
-**OAuth token rule — CRITICAL:** When calling any OAuth-authenticated API via `shell.run bash -c`, ALWAYS use the pre-injected env var `$<PROVIDER>_ACCESS_TOKEN` — where `<PROVIDER>` is the uppercased provider name (e.g. `$GOOGLE_ACCESS_TOKEN` for Google APIs, `$SLACK_ACCESS_TOKEN` for Slack, `$GITHUB_ACCESS_TOKEN` for GitHub, `$NOTION_ACCESS_TOKEN` for Notion, `$MICROSOFT_ACCESS_TOKEN` for Microsoft). **NEVER read from `~/.thinkdrop/tokens/*.json` files directly** — those files may contain stale access tokens. The env vars are automatically refreshed and injected by the runtime before every shell.run call. Example: `-H "Authorization: Bearer $GOOGLE_ACCESS_TOKEN"` not `$(python3 -c "...json.load(open('$TOKEN_FILE'))...")`. **Enforcement: any shell.run step whose script reads from `~/.thinkdrop/tokens/` is rejected by the runtime validator — it will fail immediately and require recovery.**
+**OAuth token rule (fallback only — prefer browser.agent):** In the rare case where `shell.run` must call an OAuth API directly (no agent configured), use the pre-injected env var `$<PROVIDER>_ACCESS_TOKEN` — e.g. `$GOOGLE_ACCESS_TOKEN`, `$SLACK_ACCESS_TOKEN`, `$GITHUB_ACCESS_TOKEN`, `$NOTION_ACCESS_TOKEN`, `$MICROSOFT_ACCESS_TOKEN`. **NEVER read from `~/.thinkdrop/tokens/*.json` directly** — those may be stale. **NEVER use shell.run for OAuth services when browser.agent can handle them** — browser.agent manages token refresh and re-auth automatically, shell.run does not.
 
 ## Python scripts for data and file tasks
 
@@ -338,7 +346,7 @@ Rules:
 - Submitting a form you can fill automatically
 - Any action where `browser.act` can do it directly
 - **OAuth login walls (Gmail, GitHub, Notion, etc.)** — the system handles login automatically via sub-plans using `{{service:username}}` / `{{service:password}}` credential tokens. NEVER add guide.step for login.
-- **Setting up API credentials, API keys, or account registration** — use `skill.bootstrap` (keychain + gatherContext handles credentials automatically, no manual steps)
+- **Setting up API credentials, API keys, or account registration** — use `browser.agent { action: 'build_agent', service: '<name>' }` to register the agent (credentials handled automatically via keychain), then `browser.agent { action: 'run' }` to execute
 - **"Sign up for X", "log in to X", "copy your API key from X dashboard"** — these are credential setup steps, never guide.step
 - **Testing a curl command in the terminal** — execute it directly via `shell.run`
 
@@ -358,7 +366,7 @@ When `guide.step` IS appropriate:
 
 Use as the FIRST step when the task is recurring, scheduled, or would be fragile via UI automation. Almost all major platforms have REST APIs (Slack, GitHub, Jira, Gmail, Notion, Linear, Stripe, etc.). Do NOT use for one-off tasks — just do the action directly.
 
-**IMPORTANT: If a `DOMAIN CONTEXT` block is present in this prompt (injected above), do NOT use `api_suggest`. Use `skill.bootstrap` instead — the target service is already known. `api_suggest` is only for ambiguous cases where you cannot determine the service.**
+**IMPORTANT: If a `DOMAIN CONTEXT` block is present in this prompt (injected above), do NOT use `api_suggest`. Use `browser.agent { action: 'build_agent' }` or `browser.agent { action: 'run' }` instead — the target service is already known. `api_suggest` is only for ambiguous cases where you cannot determine the service.**
 
 ## file.bridge — key action rules
 

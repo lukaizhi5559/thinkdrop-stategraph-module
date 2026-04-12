@@ -2480,6 +2480,12 @@ module.exports = async function executeCommand(state) {
   if (skill === 'project_launch') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 30000);
   }
+  // browser.agent / cli.agent: pipeline is waitForAuth (up to 120s) + playwright.agent
+  // (up to 15 turns × ~3s each). 60s default kills the task mid-execution and causes
+  // a retry that hijacks the same Chrome session, corrupting in-progress automation.
+  if (skill === 'browser.agent' || skill === 'cli.agent') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 300000); // 5 min
+  }
 
   // ── project_build: route to project.builder MCP skill ──────────────────────
   if (skill === 'project_build') {
@@ -2784,9 +2790,16 @@ module.exports = async function executeCommand(state) {
   // ─────────────────────────────────────────────────────────────────────────────
 
   try {
+    // For cli.agent / browser.agent: inject _progressCallbackUrl so the agent can POST
+    // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
+    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent';
+    const _callArgs = _isAgentSkill
+      ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, context: { ...(resolvedArgs.context || {}), _dataFile: state._dataFile || null } }
+      : resolvedArgs;
+
     const result = await mcpAdapter.callService('command', 'command.automate', {
       skill,
-      args: resolvedArgs
+      args: _callArgs
     }, { timeoutMs: stepTimeoutMs });
 
     const raw = result.data || result;
@@ -3956,6 +3969,12 @@ module.exports = async function executeCommand(state) {
         } else {
           lastStepAnswer = cleanedPageText;
         }
+      } else if ([...updatedResults].reverse().find(r => (r.skill === 'cli.agent' || r.skill === 'browser.agent') && r.ok && (r.result || r.stdout))) {
+        // ── cli.agent / browser.agent returned an answer — use it as the summary ─
+        const _agentRes = [...updatedResults].reverse().find(r => (r.skill === 'cli.agent' || r.skill === 'browser.agent') && r.ok && (r.result || r.stdout));
+        const _agentText = _agentRes.result || _agentRes.stdout;
+        lastStepAnswer = typeof _agentText === 'string' ? _agentText : JSON.stringify(_agentText);
+        logger.debug(`[Node:ExecuteCommand] isLastStep: using ${_agentRes.skill} result as answer (${lastStepAnswer.length} chars)`);
       } else if (hasBrowserSteps && lastBrowserResult?.url) {
         const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
         lastStepAnswer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;

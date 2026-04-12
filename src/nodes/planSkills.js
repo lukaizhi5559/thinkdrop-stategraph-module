@@ -222,7 +222,11 @@ module.exports = async function planSkills(state) {
   const progressCallback = state.progressCallback || null;
   // Prepend _dataPrefix (injected by multi-intent queue runner) when a prior step's result
   // needs to be visible to the LLM planner (e.g. memory retrieved in step 0 informs step 1).
-  const userMessage = (state._dataPrefix ? state._dataPrefix + '\n' : '') + (resolvedMessage || message);
+  // If _dataFile is set, append a note pointing to the full-content buffer file.
+  const _dataFileSuffix = state._dataFile
+    ? `\n[Full content available at: ${state._dataFile} — read with fs.readFileSync if needed]`
+    : '';
+  const userMessage = (state._dataPrefix ? state._dataPrefix + '\n' : '') + (resolvedMessage || message) + _dataFileSuffix;
 
   // ── Project skill plan passthrough ────────────────────────────────────────
   // If parseIntent already classified this as a project command and set projectSkillPlan,
@@ -1085,6 +1089,7 @@ Task: "${userMessage}"`;
   // accurate tool availability context and can plan the right install/auth steps upfront.
   // Only fires when there are no active skillResults (fresh plan, not a recovery replan).
   // Kept fast via a tight 5s timeout — never blocks planning if cli.agent is unavailable.
+  let _preflightCliMap = {}; // service → { hasCli: bool } — hoisted for agentTypeHint below
   let cliPreflightNote = '';
   const isRecoveryReplan = !!recoveryContext;
   if (mcpAdapter && !isRecoveryReplan) {
@@ -1114,9 +1119,10 @@ Task: "${userMessage}"`;
         // Per-CLI status
         if (Array.isArray(pf.detectedClis) && pf.detectedClis.length > 0) {
           for (const c of pf.detectedClis) {
+            _preflightCliMap[c.service.toLowerCase()] = { hasCli: !!c.cli };
             if (!c.cli) {
               if (c.isOAuth)  lines.push(`${c.service}: OAuth-based service — no CLI, browser or API flow required`);
-              else if (c.isApiKey) lines.push(`${c.service}: API key required (${c.apiKeyEnvVar || 'check service settings'}) — use shell.run curl with the key`);
+              else if (c.isApiKey) lines.push(`${c.service}: API key required (${c.apiKeyEnvVar || 'check service settings'}) — no CLI binary; use browser.agent { action: 'build_agent' } then { action: 'run' } — the api_key loop handles credential injection and curl automatically (do NOT use shell.run)`);
               continue;
             }
             if (!c.installed) {
@@ -1168,7 +1174,7 @@ Task: "${userMessage}"`;
           return `  - ${typeTag} ${a.id} (service: ${a.service}, tool: ${a.cliTool || 'browser'}) — capabilities: ${caps || 'see descriptor'}`;
         }).join('\n');
 
-        agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.`;
+        agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.\n  ⚠️ HARD RULE: For every [browser] agent listed above, you MUST use browser.agent { action: "run" } — NEVER playwright.agent. playwright.agent bypasses the OAuth flow that browser.agent manages — it will see a login page and immediately fail.`;
 
         logger.debug(`[Node:PlanSkills] Agent context: ${healthyAgents.length} healthy agent(s) injected`);
       }
@@ -1192,11 +1198,14 @@ Task: "${userMessage}"`;
       );
 
       if (missingService) {
-        // Heuristic: OAuth/social/ecommerce → browser.agent; everything else → cli.agent
-        const browserTags = new Set(['browser', 'oauth', 'web', 'social', 'ecommerce', 'shopping', 'music', 'spotify', 'twitter', 'instagram', 'linkedin', 'discord', 'shopify']);
-        const agentTypeHint = (domainTags?.tags || []).some(t => browserTags.has(t.toLowerCase()))
-          ? 'browser.agent'
-          : 'cli.agent';
+        // Use preflight CLI data as the authoritative signal — c.cli is null when no binary exists.
+        // Fall back to browser.agent when the service was not in the preflight scan:
+        // browser.agent handles both REST/api_key and OAuth paths, so it is always safe.
+        // cli.agent only works when a real binary is installed.
+        const preflightEntry = _preflightCliMap[missingService.toLowerCase()];
+        const agentTypeHint = preflightEntry
+          ? (preflightEntry.hasCli ? 'cli.agent' : 'browser.agent')
+          : 'browser.agent'; // default: browser.agent is safe for any REST/OAuth service
         discoveryNote = `\n\nNO AGENT CONFIGURED FOR "${missingService.toUpperCase()}" — the user does not have this service set up yet.` +
           ` Plan a discovery and setup flow — do NOT plan shell.run, curl, or skill.bootstrap steps:` +
           `\n  Step 1: { "skill": "synthesize", "args": { "prompt": "You don't have ${missingService} set up yet. I can configure it for you in a moment." } }` +
@@ -1318,7 +1327,7 @@ Task: "${userMessage}"`;
       const crawlInstruction = docsUrl
         ? `web.crawl("${docsUrl}")`
         : `web.crawl("https://www.google.com/search?q=${encodeURIComponent(chosenService + ' API documentation send notification')}") to discover the real docs URL, then web.crawl that URL`;
-      domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Use the skill.bootstrap pattern — ${crawlInstruction} → synthesize skill.md as "${skillName}" → skill.install.\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials. Credentials are handled automatically via keychain.\n- FORBIDDEN: Do NOT use api_suggest — the service is already chosen.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
+      domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Use browser.agent to register and execute — step 1: { "skill": "browser.agent", "args": { "action": "build_agent", "service": "${svcLower}" } }, step 2: { "skill": "browser.agent", "args": { "action": "run", "agentId": "${svcLower}.agent", "task": "<repeat the full user request verbatim>" } }.\n- FORBIDDEN: Do NOT use skill.bootstrap — it is not a registered skill and will always fail with "Unknown skill: skill.bootstrap".\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials. Credentials are handled automatically via keychain.\n- FORBIDDEN: Do NOT use api_suggest — the service is already chosen.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
       logger.info(`[Node:PlanSkills] Domain context (chosen service): ${chosenService} → ${skillName}`);
       // Store the locked skill name back on state so subsequent replans reuse the exact same name
       state = { ...state, pendingSkillName: skillName };
@@ -1337,7 +1346,7 @@ Task: "${userMessage}"`;
         domainContextNote = `\n\n⚠️ DOMAIN CONTEXT:\n${parts.map(p => `- ${p}`).join('\n')}\n- This capability is provided by the built-in "${firstHint}" skill — do NOT use skill.bootstrap pattern.\n- If the user is asking to CREATE or BUILD a new skill/tool for this capability, output: [{"skill":"needs_skill","args":{"capability":"<describe what they want>","suggestion":"${firstHint}"}}]\n- OUTPUT: A valid JSON array only.`;
         logger.info(`[Node:PlanSkills] Domain context injected (builtin): ${domainTags.tags?.join(', ')} → ${firstHint}`);
       } else {
-        domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Because this is a messaging/API task with a known target service, you MUST use the skill.bootstrap pattern (web.crawl docs → synthesize skill.md → skill.install).\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials like <TWILIO_ACCOUNT_SID> or <API_KEY>. Credentials are handled automatically via keychain — never hardcode them.\n- FORBIDDEN: Do NOT use api_suggest — the service is already identified above.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
+        domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Because this is a messaging/API task with a known target API service, use browser.agent — { "skill": "browser.agent", "args": { "action": "build_agent", "service": "<detected-service>" } } to register, then { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "<full user request verbatim>" } } to execute.\n- FORBIDDEN: Do NOT use skill.bootstrap — it is not a registered skill and will always fail with "Unknown skill: skill.bootstrap".\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials like <TWILIO_ACCOUNT_SID> or <API_KEY>. Credentials are handled automatically via keychain — never hardcode them.\n- FORBIDDEN: Do NOT use api_suggest — the service is already identified above.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
         logger.info(`[Node:PlanSkills] Domain context injected: ${domainTags.tags?.join(', ')} → ${domainTags.skillHints?.[0]}`);
       }
     }

@@ -41,6 +41,9 @@ const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
 /**
  * Extract the most useful short result string from a completed intent step.
  * Used to populate state.dataContext[N] for injection into dependent steps.
+ *
+ * Returns either a plain string (≤2000 chars) or an object { summary, file }
+ * when the full result exceeds 2000 chars and was written to a pipeline buffer file.
  */
 function extractStepResult(state) {
   const intent = state.intent?.type;
@@ -52,7 +55,7 @@ function extractStepResult(state) {
       .map(m => m.source_text || m.extracted_text || '')
       .filter(Boolean)
       .join(' | ')
-      .slice(0, 500);
+      .slice(0, 2000);
   }
 
   // web_search: use top result snippet
@@ -62,15 +65,35 @@ function extractStepResult(state) {
       .map(d => d.snippet || d.title || '')
       .filter(Boolean)
       .join(' | ')
-      .slice(0, 500);
+      .slice(0, 2000);
   }
 
-  // command_automate: use answer or last skill stdout
+  // command_automate: use answer or last skill stdout — buffer to file if > 2000 chars
   if (intent === 'command_automate') {
-    if (state.answer) return state.answer.slice(0, 500);
-    if (Array.isArray(state.skillResults)) {
-      const last = state.skillResults.filter(r => r.ok && r.stdout).pop();
-      if (last) return last.stdout.slice(0, 500);
+    const raw = state.answer || (() => {
+      if (Array.isArray(state.skillResults)) {
+        const last = state.skillResults.filter(r => r.ok && r.stdout).pop();
+        return last ? last.stdout : null;
+      }
+      return null;
+    })();
+    if (raw) {
+      if (raw.length <= 2000) return raw;
+      // Write full content to a pipeline buffer file; return summary + file ref
+      try {
+        const _fs = require('fs');
+        const _os = require('os');
+        const _path = require('path');
+        const runId  = state._runId || state.sessionId || `run_${Date.now()}`;
+        const stepN  = state.intentResults ? state.intentResults.length : 0;
+        const bufDir = _path.join(_os.homedir(), '.thinkdrop', 'pipeline', runId);
+        _fs.mkdirSync(bufDir, { recursive: true });
+        const filePath = _path.join(bufDir, `step_${stepN}.md`);
+        _fs.writeFileSync(filePath, raw, 'utf8');
+        return { summary: raw.slice(0, 2000), file: filePath };
+      } catch (_) {
+        return raw.slice(0, 2000); // fallback: truncate if file write fails
+      }
     }
   }
 
@@ -80,7 +103,7 @@ function extractStepResult(state) {
   }
 
   // Default: use state.answer if available
-  return state.answer?.slice(0, 500) || state.message?.slice(0, 200) || '';
+  return state.answer?.slice(0, 2000) || state.message?.slice(0, 200) || '';
 }
 
 class StateGraphBuilder {
@@ -375,7 +398,7 @@ class StateGraphBuilder {
           return 'recoverSkill';
         }
         // Scout card is waiting for user provider selection — stop looping, surface ASK_USER
-        // Also short-circuit for CLI/browser agent ask_user so recoverSkill is not invoked.
+        // Also short-circuit for CLI/browser agent ask_user and needsLogin so recoverSkill is not invoked.
         if (state.scoutPending || state.pendingQuestion?._isScoutSelect || state.pendingQuestion?._isAgentAskUser) {
           return 'logConversation';
         }
@@ -556,9 +579,11 @@ class StateGraphBuilder {
           const [nextStep, ...remaining] = state.intentQueue;
 
           // 3. Resolve {{result[N]}} placeholders in the sub-prompt text
+          // dataContext[N] may be a plain string or { summary, file } object — use summary for text substitution
           let resolvedText = nextStep.text;
           for (const depIdx of (nextStep.dependsOn || [])) {
-            const depResult = state.dataContext[depIdx] || '';
+            const dep = state.dataContext[depIdx];
+            const depResult = (dep && typeof dep === 'object') ? (dep.summary || '') : (dep || '');
             resolvedText = resolvedText.replace(
               new RegExp(`\\{\\{result\\[${depIdx}\\]\\}\\}`, 'g'),
               depResult
@@ -570,12 +595,20 @@ class StateGraphBuilder {
           if (nextStep.dataTemplate) {
             dataPrefix = nextStep.dataTemplate;
             for (const depIdx of (nextStep.dependsOn || [])) {
-              const depResult = state.dataContext[depIdx] || '';
+              const dep = state.dataContext[depIdx];
+              const depResult = (dep && typeof dep === 'object') ? (dep.summary || '') : (dep || '');
               dataPrefix = dataPrefix.replace(
                 new RegExp(`\\{\\{result\\[${depIdx}\\]\\}\\}`, 'g'),
                 depResult
               );
             }
+          }
+
+          // Resolve _dataFile: carry the full-content buffer file from dependent steps (if any)
+          let dataFile = null;
+          for (const depIdx of (nextStep.dependsOn || [])) {
+            const dep = state.dataContext[depIdx];
+            if (dep && typeof dep === 'object' && dep.file) { dataFile = dep.file; break; }
           }
 
           // 5. Phase 3: Long-running async dispatch
@@ -669,6 +702,7 @@ class StateGraphBuilder {
             message:          resolvedText,
             resolvedMessage:  resolvedText,
             _dataPrefix:      dataPrefix,
+            _dataFile:        dataFile,
             intent: {
               type:       nextStep.intent,
               confidence: nextStep.confidence,
