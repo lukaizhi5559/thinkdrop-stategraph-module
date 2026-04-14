@@ -1170,11 +1170,11 @@ Task: "${userMessage}"`;
       if (healthyAgents.length > 0) {
         const agentLines = healthyAgents.map(a => {
           const caps = Array.isArray(a.capabilities) ? a.capabilities.slice(0, 6).join(', ') : '';
-          const typeTag = a.type === 'browser' ? '[browser]' : '[cli]';
+          const typeTag = a.type === 'browser' ? '[browser]' : (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') ? '[api_key]' : '[cli]';
           return `  - ${typeTag} ${a.id} (service: ${a.service}, tool: ${a.cliTool || 'browser'}) — capabilities: ${caps || 'see descriptor'}`;
         }).join('\n');
 
-        agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.\n  ⚠️ HARD RULE: For every [browser] agent listed above, you MUST use browser.agent { action: "run" } — NEVER playwright.agent. playwright.agent bypasses the OAuth flow that browser.agent manages — it will see a login page and immediately fail.`;
+        agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — add \"requiresAuth\": true to args ONLY when the user's explicit goal is to log in / sign in / connect an account to the service; omit it for all other tasks\n  - [api_key] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — DEVELOPER API ONLY. If the task is TALKING TO / USING an AI service interactively (ChatGPT, Gemini, Claude, Grok, Suno, Midjourney, etc.), use the [browser] consumer-site agent for that service instead.\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.\n  ⚠️ HARD RULE: For every [browser] agent listed above, you MUST use browser.agent { action: "run" } — NEVER playwright.agent. playwright.agent bypasses the OAuth flow that browser.agent manages — it will see a login page and immediately fail.\n  ⚠️ [api_key] AGENTS CANNOT NAVIGATE: [api_key] agents (openai.agent, anthropic.agent, mistral.agent, etc.) are DEVELOPER API consoles — they have NO browser and CANNOT fulfill any task that says "goto", "go to", "open", "visit", or "navigate to" a service. ANY navigation-verb task unconditionally requires a [browser] agent. If the AVAILABLE AGENTS list above has no [browser] match for the desired service, emit { "skill": "browser.agent", "args": { "action": "build_agent", "service": "<service-name>" } } as the first step to create it at runtime — do NOT substitute a [api_key] agent. [api_key] agents are for programmatic API calls ONLY (sending data, querying an API programmatically — not browsing, chatting interactively, or navigating).`;
 
         logger.debug(`[Node:PlanSkills] Agent context: ${healthyAgents.length} healthy agent(s) injected`);
       }
@@ -2487,6 +2487,35 @@ Output ONLY the pattern text. No markdown, no explanation.`;
           }
           return step;
         });
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
+    // ── {{synthesisAnswer}} order validation + auto-fix ───────────────────────
+    // INVARIANT: any step whose serialized args contain '{{synthesisAnswer}}' MUST
+    // appear AFTER the synthesize step that produces it.  If the LLM got the order
+    // wrong (consumer before producer), auto-reorder rather than silently fail at
+    // runtime with a literal '{{synthesisAnswer}}' typed into a form field.
+    if (Array.isArray(skillPlan)) {
+      const _argsStr = s => JSON.stringify(s.args || {});
+      if (skillPlan.some(s => _argsStr(s).includes('{{synthesisAnswer}}'))) {
+        // A consumer step is only "bad" if NO synthesize step exists BEFORE it.
+        // Multi-stage pipelines (e.g. read email → synthesize → ask AI with {{synthesisAnswer}}
+        // → synthesize → reply with {{synthesisAnswer}}) are intentionally interleaved and must
+        // NOT be reordered — each {{synthesisAnswer}} consumer follows its own preceding synthesize.
+        const _bad = skillPlan.filter((s, i) => {
+          if (!_argsStr(s).includes('{{synthesisAnswer}}')) return false;
+          // Bad only if there is no synthesize at any earlier index
+          return !skillPlan.slice(0, i).some(p => p.skill === 'synthesize');
+        });
+        if (_bad.length > 0) {
+          logger.warn(`[Node:PlanSkills] {{synthesisAnswer}} order violation: ${_bad.length} consumer step(s) appear before any synthesize — auto-reordering`);
+          const _consumers = skillPlan.filter(s => _argsStr(s).includes('{{synthesisAnswer}}'));
+          const _producers = skillPlan.filter(s => !_argsStr(s).includes('{{synthesisAnswer}}'));
+          // producers already contain the synthesize step; consumers go after all producers
+          skillPlan = [..._producers, ..._consumers];
+          logger.info(`[Node:PlanSkills] Plan reordered: [${_producers.map(s => s.skill).join(' → ')}] → [${_consumers.map(s => s.skill).join(' → ')}]`);
+        }
       }
     }
     // ─────────────────────────────────────────────────────────────────────────

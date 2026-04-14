@@ -1655,9 +1655,20 @@ module.exports = async function executeCommand(state) {
     skillResults.forEach((r, i) => {
       logger.debug(`[Node:ExecuteCommand]   [${i}] skill=${r.skill} action=${r.args?.action} ok=${r.ok} stdout_len=${r.stdout?.length ?? 'null'} result=${r.result ? String(r.result).substring(0, 80) : 'null'}`);
     });
+    // Scope to results AFTER the last synthesize step so each synthesize in a
+    // multi-stage pipeline (e.g. read email → synthesize → ask AI → synthesize → reply)
+    // only sees the extraction results that belong to IT, not results from earlier stages.
+    const lastSynthesizeStep = [...skillResults].reduceRight(
+      (found, r) => found || (r.skill === 'synthesize' ? r.step : 0), 0
+    );
+    logger.debug(`[Node:ExecuteCommand] synthesize: scoping to results after step ${lastSynthesizeStep} (last synthesize)`);
     const pageTextResults = skillResults
-      .filter(r => r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText') && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0)
-      .map(r => ({ source: r.args?.sessionId || 'unknown', url: r.url || '', text: r.result }));
+      .filter(r => (
+        (r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText')) ||
+        (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:'))
+      ) && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0
+        && r.step > lastSynthesizeStep)
+      .map(r => ({ source: r.args?.sessionId || r.args?.agentId || 'browser.agent', url: r.url || '', text: r.result }));
     logger.debug(`[Node:ExecuteCommand] synthesize: found ${pageTextResults.length} getPageText/waitForStableText results`);
 
     // Include shell.run stdout (e.g. cat file output) as well as browser getPageText results
@@ -2003,7 +2014,7 @@ module.exports = async function executeCommand(state) {
         ? `You are a document analyst. The user has asked you to analyze, summarize, or explain the contents of one or more files. You have been given the raw file content. Your job is to provide a clear, well-structured explanation of what the file(s) contain — describe the purpose, key information, structure, and any notable details. Do NOT just repeat or list the raw content. Write in plain prose with headings where helpful. Be concise and informative.`
         : hasImageAnalysis
         ? `You are a report writer. The user has analyzed a folder of images/screenshots and wants a summary. You have been given the vision AI analysis of each image. Write a clear, structured report using ONLY the actual file names and descriptions provided — do NOT invent or guess file names, sizes, or content. Use the exact file path from each "Image analysis: <path>" heading as the file name.`
-        : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual.`) + _synthLangSuffix;
+        : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual. Never ask the user for clarification or additional information — produce the best-effort response using only the provided content. Do not output a question as your answer.`) + _synthLangSuffix;
       const synthPayload = {
         query: synthesisQuery,
         context: {
@@ -2189,6 +2200,18 @@ module.exports = async function executeCommand(state) {
       argsJson = argsJson.replace(/\{\{prev_watchId\}\}/g, prevWatchId.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
     }
     resolvedArgs = JSON.parse(argsJson);
+  }
+
+  // Guard: if {{synthesisAnswer}} survived unsubstituted, synthesize hasn't run yet —
+  // the plan order is wrong.  Abort immediately with a clear error rather than
+  // typing the literal placeholder into a form field.
+  if (JSON.stringify(resolvedArgs).includes('{{synthesisAnswer}}')) {
+    logger.error(`[Node:ExecuteCommand] Step ${skillCursor + 1} (${skill}) uses {{synthesisAnswer}} but no synthesize step has run yet — plan order is wrong`);
+    return {
+      ...state,
+      planError: 'Plan ordering error: a step references {{synthesisAnswer}} before the synthesize step that produces it. Please retry.',
+      commandExecuted: false,
+    };
   }
 
   // Resolve {{service:field}} / {{_varName}} credential tokens and KEYTAR pointer values.
