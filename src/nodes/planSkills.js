@@ -159,7 +159,8 @@ function buildStepDescription(step) {
 function loadSystemPrompt() {
   const path = require('path');
   const isWindows = process.platform === 'win32';
-  const promptFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
+  const isAgentBrowser = process.env.THINKDROP_CLI_DRIVER === 'agentbrowser';
+  const promptFile = isAgentBrowser ? 'plan-skills-agentbrowser.md' : (isWindows ? 'plan-skills-windows.md' : 'plan-skills.md');
   const promptPath = path.join(__dirname, '../prompts', promptFile);
   try {
     return fs.readFileSync(promptPath, 'utf8').trim();
@@ -535,6 +536,7 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
   // e.g. "that file", "add more to it" when the file path was mentioned in a prior turn
   let conversationNote = '';
   let priorSynthesizedContent = '';
+  let cacheShortCircuitNote = '';
   if (conversationHistory && conversationHistory.length > 0) {
     const recentTurns = conversationHistory.slice(-6); // last 3 exchanges
 
@@ -604,6 +606,41 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
         const _rawPrior = lastAssistantMsg.content.trim();
         if (_rawPrior.length > 50 && !/^(error|failed|sorry|i couldn)/i.test(_rawPrior)) {
           priorSynthesizedContent = _rawPrior.slice(0, 2000);
+        }
+      }
+    }
+
+    // ── Prior synthesis cache short-circuit note ─────────────────────────────
+    // When freshly synthesized data exists in recent history (< 30 min), tell
+    // the planner it MAY skip redundant browser.agent scraping steps and use
+    // the cached synthesis directly. The LLM decides semantic relevance.
+    if (priorSynthesizedContent && lastSynthMsg?.timestamp) {
+      const _cacheAgeMs = Date.now() - new Date(lastSynthMsg.timestamp).getTime();
+      const _cacheAgeMin = Math.round(_cacheAgeMs / 60000);
+      const _CACHE_TTL_MIN = 360; // 6 hours
+      if (_cacheAgeMin < _CACHE_TTL_MIN) {
+        const _cachePreview = priorSynthesizedContent.slice(0, 1500).replace(/\n/g, ' ');
+        const _cacheAgeLabel = _cacheAgeMin < 60 ? `${_cacheAgeMin} min ago` : `${Math.round(_cacheAgeMin / 60 * 10) / 10} hr ago`;
+        cacheShortCircuitNote = `\n\n💾 PRIOR SYNTHESIS CACHE (${_cacheAgeLabel}):\nThe following data was synthesized ${_cacheAgeLabel} from browser agent results for a prior run:\n---\n${_cachePreview}${priorSynthesizedContent.length > 1500 ? '...(truncated)' : ''}\n---\nINSTRUCTION: If the cached content above clearly covers the data needed for the CURRENT request (same topic, same entities, same scope), you MAY replace browser.agent scraping steps with a synthesize step whose description starts with "[cached]". The synthesize engine will automatically use this cached content. Only skip browser.agent steps when the cache is clearly applicable — do NOT skip when the user explicitly asks for a fresh lookup, live data, news, real-time info, or when the topic differs materially.`;
+        logger.info(`[Node:PlanSkills] Cache short-circuit available: ${_cacheAgeLabel} old, ${priorSynthesizedContent.length} chars`);
+
+        // ── Service mismatch guard ─────────────────────────────────────────────
+        // If the user explicitly names AI services (Grok, Qwen, etc.) that differ
+        // from what appears in the cached content (ChatGPT, Gemini, etc.), the
+        // cache is NOT applicable for agent selection. Append a hard warning so
+        // the LLM cannot silently inherit the wrong agent IDs from prior context.
+        const _AI_SERVICES = [
+          'chatgpt', 'gemini', 'grok', 'claude', 'qwen', 'deepseek',
+          'perplexity', 'mistral', 'llama', 'cohere', 'copilot', 'openai',
+          'bing', 'bingchat', 'you', 'phind', 'poe', 'together',
+        ];
+        const _userServices  = _AI_SERVICES.filter(s => new RegExp(`\\b${s}\\b`, 'i').test(userMessage));
+        const _cacheServices = _AI_SERVICES.filter(s => new RegExp(`\\b${s}\\b`, 'i').test(priorSynthesizedContent));
+        const _mismatchedServices = _userServices.filter(s => !_cacheServices.includes(s));
+        if (_userServices.length > 0 && _mismatchedServices.length > 0) {
+          const _requiredAgents = _userServices.map(s => `${s}.agent`).join(', ');
+          cacheShortCircuitNote += `\n\n⚠️ SERVICE MISMATCH — CACHE NOT APPLICABLE FOR AGENT SELECTION:\nThe user explicitly named: ${_userServices.join(', ')}. The cached data is from: ${_cacheServices.length > 0 ? _cacheServices.join(', ') : 'different services'}. These are DIFFERENT services — do NOT inherit agent IDs from the cache. You MUST plan fresh browser.agent steps using: ${_requiredAgents}. The cache content above is irrelevant for choosing which agents to call.`;
+          logger.info(`[Node:PlanSkills] Service mismatch detected: user=[${_userServices.join(',')}] cache=[${_cacheServices.join(',')}] — cache note flagged as non-applicable`);
         }
       }
     }
@@ -1385,7 +1422,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
+User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${cacheShortCircuitNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   // ── Contract-driven fast path ───────────────────────────────────────────────
   // When parseSkill matched a shell skill whose contract has a ## Commands section,

@@ -14,7 +14,10 @@
     "bench:offline": "node test/intent-bench.js --offline",
     "bench:failures": "node test/intent-bench.js --failures",
     "bench:gen": "node test/gen-bench-data.js",
-    "bench:both": "node test/intent-bench.js --dataset=both"
+    "bench:both": "node test/intent-bench.js --dataset=both",
+    "test:classify": "node test/classify-heuristic-intent.test.js",
+    "test:autobuild": "node test/browser-agent-auto-build.test.js",
+    "test:type": "node test/browser-agent-type.test.js"
   },
   "keywords": [
     "workflow",

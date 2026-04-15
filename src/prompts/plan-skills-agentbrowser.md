@@ -7,7 +7,7 @@ project.launcher|args:{projectName:string,port?:number}|Starts_a_previously_buil
 project.stopper|args:{projectName:string,port?:number}|Stops_a_running_ThinkDrop_project_server_and_kills_its_Node.js_process.__Use_when_the_user_says_"close_the_app",_"stop_the_project",_"shut_it_down",_"close_it",_"kill_the_server"_and_the_user_is_referring_to_a_previously_launched_ThinkDrop_project_(built_with_project.builder).__projectName_is_the_slug_or_fuzzy_name_eg_"cold-plunge"_or_"schedule-plunge".__NEVER_use_needs_skill_or_shell.run_for_stopping_a_ThinkDrop_project.
 needs_skill|args:{capability:string,suggestion:string}|Use_for_TWO_cases:_(1)_recurring_background_daemons_that_cannot_be_done_via_one-off_API_call,_(2)_desktop_UI_automation_/_app_control_tasks_(scroll,_type,_shortcuts,_interact_with_native_apps)_that_require_a_full_project_—_NOT_a_skill.md.__RULE:_if_the_user_asks_to_"create_a_skill"_or_"build_a_tool"_for_controlling_apps_(keyboard,_mouse,_scroll,_shortcuts,_window_control),_output_needs_skill_with_the_described_capability.
 external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user_installed_external_skill_by_name
-playwright.agent|args:{goal:string,sessionId?:string,url?:string,maxTurns?:number,headed?:boolean,timeoutMs?:number}|[sub-agent]_agentic_browser_loop__LLM_drives_snapshot→action→repeat_until_goal_done__use_for_complex_open_ended_tasks_on_PUBLIC_or_ANONYMOUS_sites_only__(scraping,_read-only_research,_AI_chatbots_with_no_API).__⚠️_NEVER_use_for_any_service_in_AVAILABLE_AGENTS_or_any_registered_OAuth_service_(Gmail,_Slack,_Notion,_etc.)—those_MUST_use_browser.agent_{action:run}.
+playwright.agent|args:{goal:string,sessionId?:string,url?:string,maxTurns?:number,headed?:boolean,timeoutMs?:number}|[sub-agent]_agentic_browser_loop__plan-execute_on_any_anonymous_site__uses_agent-browser_CLI_(compact_@eN_refs,_keyboard-type_for_contenteditable,_eval_for_browser_JS).__⚠️_NEVER_use_for_registered_OAuth_services_(Gmail,_Slack,_Notion,_etc.)—those_MUST_use_browser.agent_{action:run}.
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI_agent_factory+runner.__Takes_ONE_high-level_task,_reads_agent_descriptor_from_DuckDB,_infers_correct_CLI_commands_via_LLM,_executes,_returns_result.__actions:_run_(delegate_task),_build_agent_(discover+install+register_CLI_service),_list_agents,_validate_agent,_preflight_check.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists;_use_action:build_agent_to_create_new_agents.
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_Browser/REST_API_agent_factory+runner.__Handles_OAuth_browser_services_AND_REST_API/API-key_services_(ClickSend,_Mailgun,_Twilio,_etc.).__Takes_ONE_task,_reads_descriptor,_handles_all_auth,_infers+executes_curl_or_browser_steps.__actions:_run_(delegate_task),_build_agent_(crawl_docs+create_descriptor),_list_agents.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists.
 
@@ -168,7 +168,7 @@ Python is the preferred tool for: file patching, JSON/CSV/Excel mutation, data a
 - **Stopping/closing a ThinkDrop project app** — use `project.stopper` with the projectName. NEVER use `needs_skill` or `shell.run kill` for this. Example: user says "close it", "stop the app", "shut down the cold plunge project" → `project.stopper { "projectName": "schedule-daily-cold-plunge-sessions-at-6" }`. Use partial name matching — "cold plunge" matches "schedule-daily-cold-plunge-sessions-at-6".
 - **Closing a file on macOS** — use `osascript -e 'tell application "AppName" to close (every document whose name is "filename")'`. NEVER use `lsof | kill`, `kill -9`, or `xargs kill` — those kill the whole app or random processes. To find which app has the file open: `mdls -name kMDItemLastUsedApp "/path/to/file"`. For .txt files the app is usually "TextEdit". For PDFs use "Preview". Always close the document, not the application (unless the user explicitly says "quit TextEdit").
 - **Opening apps** — always `shell.run open -a AppName`, never `browser.act`
-- **macOS System Settings / System Preferences** — NEVER use `browser.act` for System Settings, System Preferences, or ANY native macOS system dialogs. Playwright-cli controls web browsers ONLY — it cannot interact with macOS native apps or system dialogs. To open a specific System Settings pane use `shell.run bash -c 'open "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"'` (substitute the relevant pane identifier). For general System Settings: `shell.run bash -c 'open -a "System Settings"'`. NEVER generate `browser.act` steps with `sessionId: "macos"` or similar — there is no macOS browser session.
+- **macOS System Settings / System Preferences** — NEVER use `browser.act` for System Settings, System Preferences, or ANY native macOS system dialogs. agent-browser controls web browsers ONLY — it cannot interact with macOS native apps or system dialogs. To open a specific System Settings pane use `shell.run bash -c 'open "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"'` (substitute the relevant pane identifier). For general System Settings: `shell.run bash -c 'open -a "System Settings"'`. NEVER generate `browser.act` steps with `sessionId: "macos"` or similar — there is no macOS browser session.
 - **osascript / AppleScript** — use `shell.run bash -c 'osascript -e "..."'` for simple AppleScript commands. Note: macOS requires the user to grant Automation permission in System Settings → Privacy & Security → Automation before osascript can control other apps. If a simpler alternative exists (e.g. `open -a AppName` to open an app, `bash -c "echo hello"` to run a command), prefer it over osascript.
 - **Reading/writing files** — always `shell.run bash -c`, never open a GUI app
 - **Editing an existing file** — read it first, then synthesize, then write
@@ -218,32 +218,35 @@ Use `playwright.agent` when the browser task is **open-ended** — you know the 
 { "skill": "playwright.agent", "args": { "goal": "Log in to GitHub and star the repo anthropics/anthropic-sdk-python", "url": "https://github.com", "sessionId": "github", "maxTurns": 10 } }
 ```
 
-The agent runs up to `maxTurns` reasoning turns (default 12). Each turn: reads ARIA snapshot → LLM decides next action → executes via `browser.act` → re-snapshots. Declares `done: true` when it has **confirmed** the goal is achieved. Returns full `transcript` for debugging. Aborts after 3 consecutive failures.
+The agent runs a full plan-execute loop: reads compact `@eN` accessibility snapshot → LLM generates complete ordered plan → executes each step via agent-browser CLI → repairs failed steps inline. Token-efficient: snapshots are ~200-500 tokens (vs ~27k YAML for playwright-cli). Declares `done: true` when confirmed. Returns full `transcript` for debugging.
 
-## browser.act key actions
+## browser.act key actions (agent-browser CLI)
 
-navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|select|check|uncheck|press|keyboard|scroll|screenshot|pdf|getText|getPageText|evaluate|waitForSelector|waitForContent|waitForStableText|newPage|tab-new|tab-list|tab-close|tab-select|state-save|state-load|resize|examine
+navigate|click|dblclick|fill|keyboard-type|press|select|check|uncheck|hover|scroll|drag|find-role|find-label|find-text|wait-url|wait-text|eval|getPageText|screenshot|snapshot|dialog-accept|dialog-dismiss|state-save|state-load|tab-new|tab-list|tab-close|tab-select|waitForSelector|waitForContent|waitForStableText
 
-**browser.act is a pure playwright-cli terminal skill** — every action spawns a `playwright-cli` subprocess. No Node API, no npm packages. Sessions are managed by playwright-cli daemon via `-s=<sessionId>`. The `snapshot` command captures the accessibility tree and returns numbered element refs (`e1`, `e21`, etc.) used for click/fill/hover.
+**browser.act uses the agent-browser CLI** — every action spawns an `agent-browser` subprocess. Sessions auto-persist auth via `--session-name`. The `snapshot -i` command returns compact interactive-only text with `[ref=eN]` refs (e.g. `- button "Sign in" [ref=e10]`). Use `@eN` as the selector in click/fill/hover — e.g. `[ref=e10]` → `"selector": "@e10"`. The `@` prefix is **required** — missing `@` causes "Ref not found" errors.
 
-### snapshot + ref flow (the correct pattern for clicking/filling any element)
+### snapshot + @eN ref flow (the correct pattern for clicking/filling any element)
 
-click/fill/hover automatically take a fresh snapshot and resolve the `selector` label to a ref. You only need to call `snapshot` explicitly when you need to see the accessibility tree output in the plan result.
+agent-browser snapshot returns compact interactive text like `- button "Compose" [ref=e1]` and `- textbox "To" [ref=e3]`. Use `@eN` as the selector value in click/fill/hover (e.g. `[ref=e1]` → `"selector": "@e1"`). The `@` prefix is **required** — never omit it.
+
+For contenteditable/rich-text areas (Gmail body, Notion, AI chat inputs): do NOT use `fill` — use `click` to focus the element, then `keyboard-type` to type text.
+
+For data extraction: use `eval` with browser-side JavaScript (`document.body.innerText`, `document.querySelectorAll`, etc.) — NO `page` object, NO `require()`.
 
 ```json
 [
   { "skill": "browser.act", "args": { "action": "navigate", "url": "https://example.com" } },
-  { "skill": "browser.act", "args": { "action": "click", "selector": "Sign in" } },
-  { "skill": "browser.act", "args": { "action": "fill", "selector": "Email", "text": "user@example.com" } },
+  { "skill": "browser.act", "args": { "action": "click", "selector": "@e12" } },
+  { "skill": "browser.act", "args": { "action": "fill", "selector": "@e15", "text": "user@example.com" } },
   { "skill": "browser.act", "args": { "action": "press", "key": "Enter" } }
 ]
 ```
 
-**Selector rules:**
-- **When CURRENT PAGE ELEMENTS are provided above with `[eN]` refs: use the `eN` ref as the `selector` value — do NOT use the label text.** e.g. `"selector": "e42"` not `"selector": "Bible Study"`
-- **When `[eN]` refs are provided, NEVER add an `examine` step** — the refs are already known and up-to-date.
-- When no refs are provided (fresh navigate with no pre-scan): pass the **visible label or aria-name** as `selector` (e.g. `"Sign in"`, `"Email"`, `"Search"`)
-- For typing into a search box without a known label: use `fill` with `selector` set to the placeholder text or visible label
+**Selector rules (agent-browser):**
+- **When `@eN` refs are provided above: use `@eN` as the `selector` value — include the `@` prefix.** e.g. `"selector": "@e42"` not `"selector": "e42"` and not `"selector": "Bible Study"`
+- **When `@eN` refs are provided, NEVER add a snapshot step** — the refs are already known.
+- When no refs are provided (fresh page): use `find-label`, `find-role`, or `find-text` as semantic fallbacks, or navigate then snapshot to get fresh refs.
 
 **CRITICAL — AI chatbot URLs (use these exact URLs, NOT the wrong ones):**
 | Name | Correct URL | WRONG URL (do NOT use) |
@@ -254,8 +257,11 @@ click/fill/hover automatically take a fresh snapshot and resolve the `selector` 
 | Claude | `https://claude.ai` | `anthropic.com` |
 
 **CRITICAL — AI chatbots use contenteditable divs, not `<input>` fields.**
-`fill` will fail with "Element is not an input/textarea" on most AI chat UIs.
-Use `fill` as normal; the skill handles the fallback. Do NOT add a separate `click` step before `fill`.
+`fill` will fail on most AI chat UIs — use `keyboard-type` instead.
+Pattern: `click` the editor ref to focus it → `keyboard-type` the text (no separate fill).
+Do NOT add a `fill` step before `keyboard-type`.
+
+**CRITICAL — Refs require `@` prefix.** `"selector": "@e24"` is correct. `"selector": "e24"` causes Ref not found error.
 
 **CRITICAL — Multi-site tasks: use ONE sessionId + tabs, NOT multiple sessionIds.**
 Multiple `sessionId`s open SEPARATE browser windows. Use `tab-new` within ONE session instead.

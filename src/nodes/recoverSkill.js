@@ -639,6 +639,41 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
 
+  // ── browser.agent run: auth timeout or login wall ─────────────────────────
+  // When waitForAuth times out or a login wall is detected, the failure is
+  // user-correctable (they need to sign in) — NOT plan-correctable. Falling
+  // through to the LLM causes a REPLAN → same step → 120s timeout → REPLAN
+  // loop (up to MAX_REPLANS=10, ~20 min). Surface as ASK_USER immediately.
+  if (skill === 'browser.agent' && (
+    failedStep.loginWallDetected ||
+    /auth failed|waitforauth.*timed out|auth.*timed out|authentication not completed/i.test(combinedError)
+  )) {
+    const agentId     = args?.agentId || '';
+    const serviceName = agentId.replace(/\.agent$/, '') || 'this service';
+    logger.info(`[Node:RecoverSkill] Fast-path: browser.agent auth timeout/login-wall for "${agentId}" → ASK_USER`);
+    return {
+      action: 'ASK_USER',
+      question: `I was unable to sign in to **${serviceName}** automatically — the browser window should be open at the login page.\n\nPlease sign in, then click **"I signed in — retry"** to continue.`,
+      options: ['I signed in — retry', 'Skip this step', 'Cancel task'],
+    };
+  }
+
+  // ── browser.agent run: agent not found (needsBuild) ──────────────────────
+  // browser.agent.cjs auto-builds the agent inline during run. If it still returns
+  // needsBuild:true it means the auto-build itself failed (no KNOWN_BROWSER_SERVICES
+  // entry, network error, etc.). REPLAN with an explicit build_agent step rather than
+  // falling through to the LLM which always defaults to ASK_USER for this pattern.
+  if (skill === 'browser.agent' && failedStep.needsBuild) {
+    const agentId    = args.agentId || '';
+    const serviceKey = agentId.replace(/\.agent$/, '');
+    logger.debug(`[Node:RecoverSkill] Fast-path: browser.agent needsBuild for "${agentId}" → REPLAN`);
+    return {
+      action: 'REPLAN',
+      suggestion: `Agent "${agentId}" could not be auto-built. Add an explicit browser.agent build_agent step for service "${serviceKey}" immediately before the run step.`,
+      constraint: `MUST insert: { "skill": "browser.agent", "args": { "action": "build_agent", "service": "${serviceKey}" } } immediately before the failing run step. Do NOT use action:run for an agent that does not exist.`,
+    };
+  }
+
   // ── payload.check: LLM already classified the failure — dispatch directly ──
   // _payloadCheckResult is set inline in executeCommand after a semantic payload
   // check fails. The reason is already known, so skip the LLM recovery round-trip.
@@ -1698,3 +1733,6 @@ function parseDecision(raw, logger) {
     return null;
   }
 }
+
+// Attach test helper AFTER main export so it is not clobbered.
+module.exports._tryFastRecovery = tryFastRecovery;

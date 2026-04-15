@@ -21,6 +21,16 @@ function writeDecomposeLog(entry) {
  *   [{ text, estimatedIntent, order, dependsOn: number[], isLongRunning: bool, dataTemplate?: string }]
  */
 
+// ── Lightweight intent classifier for heuristic-split sub-prompts ─────────────
+// Used when the LLM decompose call fails — detects action/navigation verbs that
+// signal command_automate so the downstream skill router is correctly invoked.
+function classifyHeuristicIntent(text) {
+  if (/\b(goto|go\s+to|navigate\s+to|open|visit|send|email|compose|draft|reply|click|check|search|find|look\s+up|compare|create|make|download|install|run|execute|text|book|reserve|schedule|fill|type|start|launch|switch|get\s+me|show\s+me|bring\s+up|pull\s+up|ask|query|summarize|compile|gather)\b/i.test(text)) {
+    return 'command_automate';
+  }
+  return 'general_knowledge';
+}
+
 // ── Heuristic clause splitter (no LLM needed) ────────────────────────────────
 function heuristicSplit(message) {
   const chunks = message
@@ -33,7 +43,7 @@ function heuristicSplit(message) {
 
   return chunks.map((text, i) => ({
     text,
-    estimatedIntent: 'general_knowledge', // LLM will classify at parseIntent time (heuristic path)
+    estimatedIntent: classifyHeuristicIntent(text),
     order: i,
     dependsOn: [],
     isLongRunning: false,
@@ -194,6 +204,10 @@ async function llmDecompose(message, llmBackend, carriedIntent, logger) {
   }
 }
 
+// Exported for unit testing — does not affect runtime behavior.
+// Set BEFORE main export so TS/Node treats this file as a plain function export;
+// the property is re-attached below after the function is assigned.
+
 // ── Main node ─────────────────────────────────────────────────────────────────
 module.exports = async function decomposePrompt(state) {
   const { message, llmBackend, carriedIntent } = state;
@@ -304,3 +318,6 @@ module.exports = async function decomposePrompt(state) {
     _decomposedAt:  Date.now(),
   };
 };
+
+// Attach test helper AFTER the main export assignment to avoid being clobbered.
+module.exports._classifyHeuristicIntent = classifyHeuristicIntent;

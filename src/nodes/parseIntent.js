@@ -97,12 +97,18 @@ module.exports = async function parseIntent(state) {
       carriedIntent:   null,        // suppress prior carriedIntent — sub-prompts are self-contained
     });
 
-    // Classify remaining sub-prompts — trust estimatedIntent from decomposePrompt directly.
-    // The LLM had the full original message as context when classifying each sub-prompt.
-    // Heuristic-decomposed sub-prompts keep 'general_knowledge' (LLM was unavailable).
+    // Classify remaining sub-prompts — trust estimatedIntent from decomposePrompt directly
+    // when the LLM produced it. For heuristic-decomposed plans (_decomposedBy !== 'llm'),
+    // re-classify with action-verb detection rather than trusting the heuristic's
+    // estimatedIntent blindly — covers goto/send/compose/compare/etc.
     const intentQueue = [];
     for (const subPrompt of state.intentPlan.slice(1)) {
-      const classifiedIntent = subPrompt.estimatedIntent;
+      let classifiedIntent = subPrompt.estimatedIntent;
+      if (state._decomposedBy !== 'llm' && classifiedIntent === 'general_knowledge') {
+        if (/\b(goto|go\s+to|navigate\s+to|open|visit|send|email|compose|draft|reply|click|check|search|look\s+up|compare|create|make|download|install|run|execute|text|book|reserve|schedule|fill|type|start|launch|switch|get\s+me|show\s+me|bring\s+up|pull\s+up|ask|query|summarize|compile|gather)\b/i.test(subPrompt.text)) {
+          classifiedIntent = 'command_automate';
+        }
+      }
       const classifiedConf   = state._decomposedBy === 'llm' ? 0.92 : 0.65;
 
       intentQueue.push({ ...subPrompt, intent: classifiedIntent, confidence: classifiedConf });
@@ -732,9 +738,16 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   // ── decomposePrompt fast-path ─────────────────────────────────────────────
   // decomposePrompt has already classified this message via its LLM call.
   // Hard overrides above still run first; landing here means none fired.
+  // Exception: when the heuristic splitter (not LLM) produced 'general_knowledge',
+  // skip the fast-path so pattern guards below can reclassify it correctly
+  // (e.g. I-need-you-to-action override fires for "goto ChatGPT..." sub-prompts).
   if (state.intentPlan && Array.isArray(state.intentPlan) && state.intentPlan.length >= 1) {
     const intent = state.intentPlan[0].estimatedIntent || 'general_knowledge';
 
+    if (intent === 'general_knowledge' && state._decomposedBy !== 'llm') {
+      logger.debug(`[Node:ParseIntent] Heuristic general_knowledge — skipping fast-path, falling through to pattern guards: "${classifyMessage}"`);
+      // fall through to pattern guards below
+    } else {
     // Browser-context override: decompose may return memory_store for a browser-session
     // refinement message because the LLM lacks visibility into the active browser context.
     if (intent === 'memory_store' &&
@@ -758,6 +771,7 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
       intent: { type: intent, confidence: 0.92, entities: [], requiresMemoryAccess: intent === 'memory_retrieve' },
       metadata: { parser: 'decompose-passthrough', processingTimeMs: 0 },
     };
+    } // end: heuristic-general_knowledge skip guard
   }
 
   // No intentPlan (LLM was unavailable, heuristic also failed) — pattern guards below run as fallback.
@@ -822,7 +836,7 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   // NOTE: DistilBERT (retrained with R12) now handles these at 0.91-0.94 confidence → early exit.
   // This guard only fires for unusual action verbs that fall below the 0.75 confidence threshold.
   // Keep as a secondary safety net — not a primary classification path.
-  if (/^(i\s+(need|want|would\s+like)\s+(you\s+to|for\s+you\s+to\s*)|can\s+you\s+|please\s+)(go\s+to|goto|navigate|watch|find|search|look\s+up|browse|open|play|visit|check\s+out|check\b|pull\s+up|bring\s+up|show\s+me|get\s+me|download|install|run|execute|send|email|text|create|make|draft|compose|book|reserve|schedule|click|fill|type|start|launch|switch|jump|take\s+me)\b/i.test(classifyMessage.trim())) {
+  if (/^(i\s+(need|want|would\s+like)\s+(you\s+to\s+|for\s+you\s+to\s+)|can\s+you\s+|please\s+)\s*(go\s+to|goto|navigate|watch|find|search|look\s+up|browse|open|play|visit|check\s+out|check\b|pull\s+up|bring\s+up|show\s+me|get\s+me|download|install|run|execute|send|email|text|create|make|draft|compose|book|reserve|schedule|click|fill|type|start|launch|switch|jump|take\s+me|ask|compare|gather|compile|summarize)\b/i.test(classifyMessage.trim())) {
     logger.debug(`[Node:ParseIntent] I-need-you-to-action override (safety net) → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.96, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'i-need-you-to-action-override', processingTimeMs: 0 } };
   }

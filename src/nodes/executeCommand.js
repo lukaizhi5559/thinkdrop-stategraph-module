@@ -1647,7 +1647,12 @@ module.exports = async function executeCommand(state) {
   // subsequent steps execute. This allows post-synthesize steps to use
   // {{synthesisAnswer}} in their args (e.g. smartType the comparison into Google).
   if (skill === 'synthesize') {
-    logger.debug(`[Node:ExecuteCommand] synthesize step — running LLM inline`);
+    const _isCachedStep = /^\[cached\]/i.test(description || '');
+    if (_isCachedStep) {
+      logger.info(`[Node:ExecuteCommand] synthesize [CACHED] — skipping live scrape, will use cross-turn context from conversation history`);
+    } else {
+      logger.debug(`[Node:ExecuteCommand] synthesize step — running LLM inline`);
+    }
     if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'synthesize', description: description || 'Comparing results...' });
 
     // Gather all getPageText results from prior steps
@@ -2014,7 +2019,9 @@ module.exports = async function executeCommand(state) {
         ? `You are a document analyst. The user has asked you to analyze, summarize, or explain the contents of one or more files. You have been given the raw file content. Your job is to provide a clear, well-structured explanation of what the file(s) contain — describe the purpose, key information, structure, and any notable details. Do NOT just repeat or list the raw content. Write in plain prose with headings where helpful. Be concise and informative.`
         : hasImageAnalysis
         ? `You are a report writer. The user has analyzed a folder of images/screenshots and wants a summary. You have been given the vision AI analysis of each image. Write a clear, structured report using ONLY the actual file names and descriptions provided — do NOT invent or guess file names, sizes, or content. Use the exact file path from each "Image analysis: <path>" heading as the file name.`
-        : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual. Never ask the user for clarification or additional information — produce the best-effort response using only the provided content. Do not output a question as your answer.`) + _synthLangSuffix;
+        : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual. Never ask the user for clarification or additional information — produce the best-effort response using only the provided content. Do not output a question as your answer.
+
+⚠️ ANTI-HALLUCINATION RULE: If the content from a source clearly shows a login page, sign-in form, or authentication wall (e.g. it contains phrases like "Sign in", "Log in", "Create account", "Welcome back" with minimal substantive content), you MUST explicitly state that [service] required login and could not be queried. Do NOT use your internal training knowledge to invent or simulate what that service would have said — only report from actual scraped content. A fabricated AI response is worse than an honest "login required" note.`) + _synthLangSuffix;
       const synthPayload = {
         query: synthesisQuery,
         context: {
@@ -2817,7 +2824,7 @@ module.exports = async function executeCommand(state) {
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
     const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent';
     const _callArgs = _isAgentSkill
-      ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, context: { ...(resolvedArgs.context || {}), _dataFile: state._dataFile || null } }
+      ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
       : resolvedArgs;
 
     const result = await mcpAdapter.callService('command', 'command.automate', {
