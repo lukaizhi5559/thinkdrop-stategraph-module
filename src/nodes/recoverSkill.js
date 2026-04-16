@@ -644,13 +644,13 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   // user-correctable (they need to sign in) — NOT plan-correctable. Falling
   // through to the LLM causes a REPLAN → same step → 120s timeout → REPLAN
   // loop (up to MAX_REPLANS=10, ~20 min). Surface as ASK_USER immediately.
-  if (skill === 'browser.agent' && (
+  if ((skill === 'browser.agent' || skill === 'agentbrowser.agent') && (
     failedStep.loginWallDetected ||
     /auth failed|waitforauth.*timed out|auth.*timed out|authentication not completed/i.test(combinedError)
   )) {
     const agentId     = args?.agentId || '';
     const serviceName = agentId.replace(/\.agent$/, '') || 'this service';
-    logger.info(`[Node:RecoverSkill] Fast-path: browser.agent auth timeout/login-wall for "${agentId}" → ASK_USER`);
+    logger.info(`[Node:RecoverSkill] Fast-path: ${skill} auth timeout/login-wall for "${agentId}" → ASK_USER`);
     return {
       action: 'ASK_USER',
       question: `I was unable to sign in to **${serviceName}** automatically — the browser window should be open at the login page.\n\nPlease sign in, then click **"I signed in — retry"** to continue.`,

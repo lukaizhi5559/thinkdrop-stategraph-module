@@ -34,6 +34,7 @@ const storeConstraintNode = require('./nodes/storeConstraint');
 const liftConstraintNode  = require('./nodes/liftConstraint');
 const parseProjectNode = require('./nodes/parseProject');
 const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
+const resolveUserContextNode = require('./nodes/resolveUserContext');
 
 
 
@@ -245,6 +246,7 @@ class StateGraphBuilder {
       parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
+      resolveUserContext: (state) => resolveUserContextNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
       storeConstraint: (state) => storeConstraintNode({ ...state, logger, mcpAdapter }),
@@ -299,7 +301,7 @@ class StateGraphBuilder {
         // or MODE A success: command_automate with profile complete — proceed to plan
         if (intentType === 'command_automate') {
           // Skill already installed (parseSkill matched) — skip gatherContext + creatorPlanning,
-          // go straight to planSkills which will emit external.skill as the only step.
+          // go straight to resolveUserContext → planSkills.
           // BUT: if the skill is a stub (no index.cjs on disk), we must go through gatherContext
           // first so credentials/service info are collected before the skill build kicks off.
           if (state.matchedSkillName) {
@@ -313,17 +315,17 @@ class StateGraphBuilder {
             const _apiJson   = _path.join(_skillDir, 'api.json');
             const _cliJson   = _path.join(_skillDir, 'cli.json');
             if (_fs.existsSync(_skillExec) || _fs.existsSync(_skillMd) || _fs.existsSync(_apiJson) || _fs.existsSync(_cliJson)) {
-              logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is installed — skipping to planSkills`);
-              return 'planSkills';
+              logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is installed — skipping to resolveUserContext`);
+              return 'resolveUserContext';
             }
-            // Stub-only: no index.cjs on disk — fall through to planSkills which handles it
-            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub — routing to planSkills`);
+            // Stub-only: no index.cjs on disk — fall through to resolveUserContext which handles it
+            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub — routing to resolveUserContext`);
             state.matchedSkillName = null;
             // fall through below
           }
-          // gatherContext + creatorPlanning both bypassed — route direct to planSkills
-          logger.debug('[StateGraph:Router] enrichIntent: command_automate — planSkills (creator pipeline bypassed)');
-          return 'planSkills';
+          // gatherContext + creatorPlanning both bypassed — route to resolveUserContext → planSkills
+          logger.debug('[StateGraph:Router] enrichIntent: command_automate — resolveUserContext');
+          return 'resolveUserContext';
         }
 
         // All other intents: route the same as parseIntent used to
@@ -363,7 +365,10 @@ class StateGraphBuilder {
       storeConstraint: 'logConversation',
       // Constraint lift path: liftConstraint → logConversation → end
       liftConstraint: 'logConversation',
-      
+
+      // resolveUserContext: always proceeds to planSkills (context enriched or no-op)
+      resolveUserContext: 'planSkills',
+
       // gatherContext bypassed — kept for future re-enable
       // gatherContext: () => 'creatorPlanning',
       // creatorPlanning → planSkills (pass/warnings) or logConversation (reviewer fail)

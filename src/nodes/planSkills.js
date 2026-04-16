@@ -161,6 +161,7 @@ function loadSystemPrompt() {
   const isWindows = process.platform === 'win32';
   const isAgentBrowser = process.env.THINKDROP_CLI_DRIVER === 'agentbrowser';
   const promptFile = isAgentBrowser ? 'plan-skills-agentbrowser.md' : (isWindows ? 'plan-skills-windows.md' : 'plan-skills.md');
+  console.info(`[Node:PlanSkills] system prompt: ${promptFile} (THINKDROP_CLI_DRIVER=${process.env.THINKDROP_CLI_DRIVER || 'unset'})`);
   const promptPath = path.join(__dirname, '../prompts', promptFile);
   try {
     return fs.readFileSync(promptPath, 'utf8').trim();
@@ -506,7 +507,8 @@ RECOVERY CONTEXT (previous attempt failed — DO NOT repeat the same plan):
 - Suggestion: ${recoveryContext.suggestion}
 - Constraint: ${recoveryContext.constraint || 'none'}
 ${recoveryContext.alternativeCwd ? `- Use cwd: "${recoveryContext.alternativeCwd}" instead` : ''}
-You MUST produce a DIFFERENT plan than the one that just failed. Use the actual URL above to understand what page is currently loaded. If the search failed, try a different selector, use examine first to identify the correct input, or navigate to a specific search URL directly.`;
+You MUST produce a DIFFERENT plan than the one that just failed. Use the actual URL above to understand what page is currently loaded. If the search failed, try a different selector, use examine first to identify the correct input, or navigate to a specific search URL directly.
+RECOVERY TOOL CONSTRAINT: "DIFFERENT plan" means a different task decomposition, different selectors, or a different URL — NOT switching the skill type for registered agents. Any step that previously used browser.agent { action: "run" } for a registered agent MUST continue to use browser.agent { action: "run" } in the recovery plan. NEVER replace a browser.agent step with browser.act navigation steps, playwright.agent direct calls, or shell.run curl commands for a registered agent. If a browser.agent step failed, change only the "task" string (make it more specific or retry with a clearer goal) — never decompose it into raw browser steps.`;
   }
 
   // Build prior results context so LLM can resolve references like "that file"
@@ -742,6 +744,28 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
     logger.info(`[Node:PlanSkills] Injecting ${profileContext.facts.length} profile fact(s) into planning query`);
   }
 
+  // ── SMS gateway injection (from resolveUserContext) ──────────────────────
+  // When an SMS gateway target has been resolved, inject it as a mandatory
+  // routing block so the planner sends via gmail.agent email-to-SMS instead
+  // of proposing a paid SMS API.
+  if (state.smsGatewayTarget) {
+    const gwt = state.smsGatewayTarget;
+    if (gwt.email) {
+      const maxChars = 160;
+      profileContextNote += `\n\n⚠️ SMS GATEWAY ROUTE (resolved — use this EXACTLY, no paid SMS API needed):
+  Recipient:  ${gwt.name} (${gwt.phone}, carrier: ${gwt.carrier})
+  Send to:    ${gwt.email}  ← email-to-SMS gateway address
+  Method:     Send as plain email via gmail.agent (browser.agent action:run agentId:gmail.agent)
+  Subject:    (empty — leave blank)
+  Body:       The SMS message text — keep under ${maxChars} characters
+  RULE: NEVER use Twilio, ClickSend, Vonage, or any paid SMS API. The gateway email is already resolved.`;
+      logger.info(`[Node:PlanSkills] Injecting SMS gateway target: ${gwt.email}`);
+    } else if (gwt.carrierOptions) {
+      profileContextNote += `\n\n⚠️ SMS GATEWAY: Carrier unknown for ${gwt.name} (${gwt.phone}).
+  Add a guide.step asking the user to select their carrier, then retry with the gateway email.`;
+    }
+  }
+
   // ── Credential intelligence pre-scan ────────────────────────────────────────
   // Detect referenced services in the user message, check credential store for
   // KEYTAR refs and user constraints (hard/soft).  Runs with a 1.5 s timeout so
@@ -920,145 +944,148 @@ Task: "${userMessage}"`;
     browserSessionNote = `\n\nACTIVE BROWSER SESSION: sessionId="${sid}" is already open at ${livePageUrl}. Use this EXACT sessionId for all browser.act steps. If this task targets the SAME site, skip navigate. If it targets a DIFFERENT site, include a navigate step first.${doneNote}\n\nCURRENT PAGE ELEMENTS (${livePageUrl}):\n${hasRefs ? 'Use the [eN] ref as the selector value for click/fill/hover — do NOT use the label text as selector when a ref is provided. Skip examine steps — refs are already known.' : 'Use ONLY these exact labels as selectors — do not invent labels.'}\n${elList}`;
   }
 
-  // ── RAG: fetch relevant skill prompt snippets from DuckDB ───────────────────
-  // Search skill_prompts table for snippets matching the user's request.
-  // Matched snippets are injected at the top of the system prompt so the LLM
-  // gets precise, focused guidance without loading the full plan-skills.md rules.
+  // ── RAG prompts + context rules + installed skills: parallel pre-LLM gatherers ──
+  // All three are independent — run concurrently to cut ~9s sequential → ~3s.
   let skillPromptSnippets = [];
   let skillPromptMatched = false;
-  if (mcpAdapter && userMessage) {
-    try {
-      const spRes = await mcpAdapter.callService('user-memory', 'skill_prompt.search', {
-        query: userMessage,
-        topK: 3
-      }, { timeoutMs: 3000 }).catch(() => null);
-      const results = spRes?.data?.results || spRes?.results || [];
-      if (results.length > 0) {
-        skillPromptSnippets = results;
-        skillPromptMatched = true;
-        logger.debug(`[Node:PlanSkills] RAG: ${results.length} skill prompt snippet(s) matched (top score: ${results[0].similarity})`);
-      } else {
-        logger.debug('[Node:PlanSkills] RAG: no skill prompt snippets matched — using full plan-skills.md');
-      }
-    } catch (spErr) {
-      logger.warn(`[Node:PlanSkills] RAG skill_prompt.search failed (non-fatal): ${spErr.message}`);
-    }
-  }
-
-  // ── Context rules: fetch per-site/app prompt rules from DuckDB ─────────────
-  // Extracts hostnames from URLs in the message + active browser URL (context_type=site)
-  // and app names from state.activeAppName / message keywords (context_type=app).
-  // Injected as a block into the LLM prompt — lightweight exact-match, no embeddings.
-  // ThinkDrop AI writes rules via context_rule.upsert after diagnosing failures.
   let siteRulesBlock = '';
-  if (mcpAdapter && (userMessage || state.activeBrowserUrl || state.activeAppName)) {
-    try {
-      const contextKeys = new Set();
-
-      // Extract hostnames from full URLs (https?://) in the message and active browser URL
-      const urlRegex = /https?:\/\/([a-zA-Z0-9.-]+)/g;
-      const searchText = `${userMessage || ''} ${state.activeBrowserUrl || ''}`;
-      let m;
-      while ((m = urlRegex.exec(searchText)) !== null) {
-        contextKeys.add(m[1].toLowerCase().replace(/^www\./, ''));
-      }
-      if (state.activeBrowserUrl) {
-        try {
-          const h = new URL(state.activeBrowserUrl).hostname.toLowerCase().replace(/^www\./, '');
-          if (h) contextKeys.add(h);
-        } catch (_) {}
-      }
-      // Also extract bare domain names (no protocol) from the message text
-      // e.g. "go to github.com and star" → "github.com"
-      const bareDomainRegex = /\b([a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.(?:com|io|org|net|dev|app|ai|co|gov|edu|us|me))\b/g;
-      const bareDomainText = userMessage || '';
-      let bd;
-      while ((bd = bareDomainRegex.exec(bareDomainText)) !== null) {
-        contextKeys.add(bd[1].toLowerCase());
-      }
-
-      // Include recovery context key — when replanning after a failure, the error was
-      // diagnosed against a specific contextKey (e.g. "github.com") that holds the fix rule.
-      // skillResults is cleared on replan so the URL scan above finds nothing — add it directly.
-      if (state.recoveryContext?.contextKey) {
-        contextKeys.add(String(state.recoveryContext.contextKey).toLowerCase());
-      }
-
-      // Add active app name for native app rules (e.g. 'slack', 'excel', 'discord')
-      if (state.activeAppName) {
-        contextKeys.add(state.activeAppName.toLowerCase().trim());
-      }
-      // Also detect common app names mentioned in the message
-      const APP_KEYWORDS = ['slack', 'discord', 'excel', 'outlook', 'teams', 'notion', 'figma', 'zoom', 'xcode', 'vscode', 'terminal', 'finder'];
-      const msgLower = (userMessage || '').toLowerCase();
-      for (const app of APP_KEYWORDS) {
-        if (msgLower.includes(app)) contextKeys.add(app);
-      }
-      // Also scan actual visited URLs from prior skillResults — rules may have been
-      // written under the redirect target (e.g. chatgpt.com) not the planned URL.
-      // This is the dynamic alias fix: no hardcoded pairs needed.
-      const priorResults = Array.isArray(state.skillResults) ? state.skillResults : [];
-      for (const r of priorResults) {
-        if (r.url) {
-          try { contextKeys.add(new URL(r.url).hostname.toLowerCase().replace(/^www\./, '')); } catch (_) {}
-        }
-        if (r.args?.url) {
-          try { contextKeys.add(new URL(r.args.url).hostname.toLowerCase().replace(/^www\./, '')); } catch (_) {}
-        }
-      }
-
-      const keys = [...contextKeys];
-      if (keys.length > 0) {
-        const crRes = await mcpAdapter.callService('user-memory', 'context_rule.search', {
-          contextKeys: keys
-        }, { timeoutMs: 3000 }).catch(() => null);
-        const crResults = crRes?.data?.results || crRes?.results || [];
-        if (crResults.length > 0) {
-          const ruleLines = crResults
-            .map(r => `- [${r.contextKey}${r.category !== 'general' ? ` / ${r.category}` : ''}] ${r.ruleText}`)
-            .join('\n');
-          siteRulesBlock = `\n\nSITE/APP-SPECIFIC RULES (learned from prior interactions — follow exactly):\n${ruleLines}`;
-          logger.info(`[Node:PlanSkills] Context rules: ${crResults.length} rule(s) injected for [${keys.join(', ')}]`);
-        } else {
-          logger.debug(`[Node:PlanSkills] Context rules: none found for [${keys.join(', ')}]`);
-        }
-      }
-    } catch (crErr) {
-      logger.warn(`[Node:PlanSkills] context_rule.search failed (non-fatal): ${crErr.message}`);
-    }
-  }
-
-  // Fetch installed user skills — inject into prompt so LLM uses external.skill instead of needs_skill
   let installedSkillsNote = '';
   let installedSkillsList = []; // kept in outer scope for scout intercept dedup check below
   let shellSkillNames = new Set(); // names of shell/contract skills — used in post-plan guard
   if (mcpAdapter) {
-    try {
-      const isRes = await mcpAdapter.callService('user-memory', 'skill.listNames', {}, { timeoutMs: 3000 }).catch(() => null);
-      const isRaw = isRes?.data || isRes;
-      const isNames = Array.isArray(isRaw?.results) ? isRaw.results : [];
-      installedSkillsList = isNames; // save for scout intercept check
-      if (isNames.length > 0) {
-        const isMdSkill = s => s.execType === 'shell' || (s.execPath || '').endsWith('.md');
-        // Exclude registered projects — they should only be launchable when the user
-        // explicitly references the project name. Including them causes the LLM to
-        // shortcut to project.launcher for generic capability requests.
-        const isProject = s => s.execType === 'project' || s.projectDir || s.type === 'project';
-        const nodeSkills  = isNames.filter(s => !isMdSkill(s) && !isProject(s));
-        const shellSkills = isNames.filter(s =>  isMdSkill(s) && !isProject(s));
-        const noteParts = [];
-        if (nodeSkills.length > 0) {
-          const lines = nodeSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
-          noteParts.push(`INSTALLED SKILLS (use external.skill ONLY when the skill's purpose DIRECTLY matches the task — do NOT use as a fallback for vaguely related tasks):\n${lines}\n  Usage: { "skill": "external.skill", "args": { "name": "<skill-name>", ...args } }\n  RULE: If the task cannot be fulfilled by one of these skills exactly, use shell.run or needs_skill instead. Never pick an installed skill just because it seems related.`);
+    await Promise.all([
+      // 1) RAG: skill prompt snippets
+      (async () => {
+        if (!userMessage) return;
+        try {
+          const spRes = await mcpAdapter.callService('user-memory', 'skill_prompt.search', {
+            query: userMessage,
+            topK: 3
+          }, { timeoutMs: 3000 }).catch(() => null);
+          const results = spRes?.data?.results || spRes?.results || [];
+          if (results.length > 0) {
+            skillPromptSnippets = results;
+            skillPromptMatched = true;
+            logger.debug(`[Node:PlanSkills] RAG: ${results.length} skill prompt snippet(s) matched (top score: ${results[0].similarity})`);
+          } else {
+            logger.debug('[Node:PlanSkills] RAG: no skill prompt snippets matched — using full plan-skills.md');
+          }
+        } catch (spErr) {
+          logger.warn(`[Node:PlanSkills] RAG skill_prompt.search failed (non-fatal): ${spErr.message}`);
         }
-        if (shellSkills.length > 0) {
-          const lines = shellSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
-          noteParts.push(`SHELL-PLAN SKILLS (contract_md defines steps — generate shell.run steps directly, do NOT use external.skill):\n${lines}\n  RULE: Only use these when the task directly matches the skill's stated purpose.`);
-          shellSkills.forEach(s => shellSkillNames.add(s.name));
+      })(),
+
+      // 2) Context rules: per-site/app prompt rules from DuckDB
+      // Extracts hostnames from URLs in the message + active browser URL (context_type=site)
+      // and app names from state.activeAppName / message keywords (context_type=app).
+      (async () => {
+        if (!userMessage && !state.activeBrowserUrl && !state.activeAppName) return;
+        try {
+          const contextKeys = new Set();
+
+          // Extract hostnames from full URLs (https?://) in the message and active browser URL
+          const urlRegex = /https?:\/\/([a-zA-Z0-9.-]+)/g;
+          const searchText = `${userMessage || ''} ${state.activeBrowserUrl || ''}`;
+          let m;
+          while ((m = urlRegex.exec(searchText)) !== null) {
+            contextKeys.add(m[1].toLowerCase().replace(/^www\./, ''));
+          }
+          if (state.activeBrowserUrl) {
+            try {
+              const h = new URL(state.activeBrowserUrl).hostname.toLowerCase().replace(/^www\./, '');
+              if (h) contextKeys.add(h);
+            } catch (_) {}
+          }
+          // Also extract bare domain names (no protocol) from the message text
+          // e.g. "go to github.com and star" → "github.com"
+          const bareDomainRegex = /\b([a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.(?:com|io|org|net|dev|app|ai|co|gov|edu|us|me))\b/g;
+          const bareDomainText = userMessage || '';
+          let bd;
+          while ((bd = bareDomainRegex.exec(bareDomainText)) !== null) {
+            contextKeys.add(bd[1].toLowerCase());
+          }
+
+          // Include recovery context key — when replanning after a failure, the error was
+          // diagnosed against a specific contextKey (e.g. "github.com") that holds the fix rule.
+          // skillResults is cleared on replan so the URL scan above finds nothing — add it directly.
+          if (state.recoveryContext?.contextKey) {
+            contextKeys.add(String(state.recoveryContext.contextKey).toLowerCase());
+          }
+
+          // Add active app name for native app rules (e.g. 'slack', 'excel', 'discord')
+          if (state.activeAppName) {
+            contextKeys.add(state.activeAppName.toLowerCase().trim());
+          }
+          // Also detect common app names mentioned in the message
+          const APP_KEYWORDS = ['slack', 'discord', 'excel', 'outlook', 'teams', 'notion', 'figma', 'zoom', 'xcode', 'vscode', 'terminal', 'finder'];
+          const msgLower = (userMessage || '').toLowerCase();
+          for (const app of APP_KEYWORDS) {
+            if (msgLower.includes(app)) contextKeys.add(app);
+          }
+          // Also scan actual visited URLs from prior skillResults — rules may have been
+          // written under the redirect target (e.g. chatgpt.com) not the planned URL.
+          // This is the dynamic alias fix: no hardcoded pairs needed.
+          const priorResults = Array.isArray(state.skillResults) ? state.skillResults : [];
+          for (const r of priorResults) {
+            if (r.url) {
+              try { contextKeys.add(new URL(r.url).hostname.toLowerCase().replace(/^www\./, '')); } catch (_) {}
+            }
+            if (r.args?.url) {
+              try { contextKeys.add(new URL(r.args.url).hostname.toLowerCase().replace(/^www\./, '')); } catch (_) {}
+            }
+          }
+
+          const keys = [...contextKeys];
+          if (keys.length > 0) {
+            const crRes = await mcpAdapter.callService('user-memory', 'context_rule.search', {
+              contextKeys: keys
+            }, { timeoutMs: 3000 }).catch(() => null);
+            const crResults = crRes?.data?.results || crRes?.results || [];
+            if (crResults.length > 0) {
+              const ruleLines = crResults
+                .map(r => `- [${r.contextKey}${r.category !== 'general' ? ` / ${r.category}` : ''}] ${r.ruleText}`)
+                .join('\n');
+              siteRulesBlock = `\n\nSITE/APP-SPECIFIC RULES (learned from prior interactions — follow exactly):\n${ruleLines}`;
+              logger.info(`[Node:PlanSkills] Context rules: ${crResults.length} rule(s) injected for [${keys.join(', ')}]`);
+            } else {
+              logger.debug(`[Node:PlanSkills] Context rules: none found for [${keys.join(', ')}]`);
+            }
+          }
+        } catch (crErr) {
+          logger.warn(`[Node:PlanSkills] context_rule.search failed (non-fatal): ${crErr.message}`);
         }
-        if (noteParts.length > 0) installedSkillsNote = '\n\n' + noteParts.join('\n\n');
-      }
-    } catch (_) { /* non-fatal */ }
+      })(),
+
+      // 3) Installed skills — inject into prompt so LLM uses external.skill instead of needs_skill
+      (async () => {
+        try {
+          const isRes = await mcpAdapter.callService('user-memory', 'skill.listNames', {}, { timeoutMs: 3000 }).catch(() => null);
+          const isRaw = isRes?.data || isRes;
+          const isNames = Array.isArray(isRaw?.results) ? isRaw.results : [];
+          installedSkillsList = isNames; // save for scout intercept check
+          if (isNames.length > 0) {
+            const isMdSkill = s => s.execType === 'shell' || (s.execPath || '').endsWith('.md');
+            // Exclude registered projects — they should only be launchable when the user
+            // explicitly references the project name. Including them causes the LLM to
+            // shortcut to project.launcher for generic capability requests.
+            const isProject = s => s.execType === 'project' || s.projectDir || s.type === 'project';
+            const nodeSkills  = isNames.filter(s => !isMdSkill(s) && !isProject(s));
+            const shellSkills = isNames.filter(s =>  isMdSkill(s) && !isProject(s));
+            const noteParts = [];
+            if (nodeSkills.length > 0) {
+              const lines = nodeSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
+              noteParts.push(`INSTALLED SKILLS (use external.skill ONLY when the skill's purpose DIRECTLY matches the task — do NOT use as a fallback for vaguely related tasks):\n${lines}\n  Usage: { "skill": "external.skill", "args": { "name": "<skill-name>", ...args } }\n  RULE: If the task cannot be fulfilled by one of these skills exactly, use shell.run or needs_skill instead. Never pick an installed skill just because it seems related.`);
+            }
+            if (shellSkills.length > 0) {
+              const lines = shellSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
+              noteParts.push(`SHELL-PLAN SKILLS (contract_md defines steps — generate shell.run steps directly, do NOT use external.skill):\n${lines}\n  RULE: Only use these when the task directly matches the skill's stated purpose.`);
+              shellSkills.forEach(s => shellSkillNames.add(s.name));
+            }
+            if (noteParts.length > 0) installedSkillsNote = '\n\n' + noteParts.join('\n\n');
+          }
+        } catch (_) { /* non-fatal */ }
+      })(),
+    ]);
   }
 
   // ── "You already have this" short-circuit ────────────────────────────────────
@@ -1089,173 +1116,171 @@ Task: "${userMessage}"`;
     };
   }
 
-  // ── Skill contract injection ─────────────────────────────────────────────────
-  // When parseSkill matched an installed skill, fetch its full contract_md from DB
-  // and inject it as planning context. This replaces the old creatorPlanning code-gen
-  // pipeline: skill.md IS the plan — shell.run/curl steps are derived from it directly.
+  // ── Skill contract injection + CLI pre-flight + agent registry ────────────────
+  // Three independent calls run concurrently: bottleneck ~5s (preflight) vs ~12s sequential.
+  // Note: list_agents reads _preflightCliMap for agentTypeHint — when both run in parallel
+  // the map may be empty, so the safe fallback 'browser.agent' applies. Acceptable trade-off.
   let skillContractNote = '';
   let _shellContractMd = null; // contractMd for matched non-node (shell) skill — used in post-plan guard
-  if (state.matchedSkillName && mcpAdapter) {
-    try {
-      const scRes = await mcpAdapter.callService('user-memory', 'skill.get', {
-        name: state.matchedSkillName
-      }, { timeoutMs: 3000 }).catch(() => null);
-      const scData = scRes?.data || scRes;
-      const contractMd = scData?.contractMd || scData?.contract_md || '';
-      if (contractMd && contractMd.trim()) {
-        // Detect exec_type from frontmatter — node skills must use external.skill, not shell.run
-        const _fmMatch = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
-        const _isNodeSkill = _fmMatch && /exec_type:\s*node\b/i.test(_fmMatch[1]);
-
-        if (_isNodeSkill) {
-          skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is a Node.js runtime skill (exec_type: node). Generate a SINGLE step: { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n2. You MAY include additional args to pass context (e.g. { "name": "${state.matchedSkillName}", "action": "diagnose" }).\n3. FORBIDDEN: Do NOT generate shell.run or curl steps — this skill runs as a Node.js module.\n4. FORBIDDEN: Do NOT use "${state.matchedSkillName}" directly as the skill type in any step.\n\n${contractMd.slice(0, 2000)}`;
-        } else {
-          skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands or ## Plan section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step. It is NOT a dispatchable skill.\n3. FORBIDDEN: Do NOT use external.skill for this.\n4. The ONLY way to execute this skill is via shell.run with the curl command shown in the contract.\n\n${contractMd.slice(0, 3000)}`;
-          _shellContractMd = contractMd; // save for post-plan guard
-          shellSkillNames.add(state.matchedSkillName); // ensure guarded even if listNames had stale execType
-        }
-        logger.info(`[Node:PlanSkills] Injected contract_md for matched skill "${state.matchedSkillName}" (${contractMd.length} chars, exec_type: ${_isNodeSkill ? 'node' : 'shell'})`);
-      }
-    } catch (scErr) {
-      logger.warn(`[Node:PlanSkills] Could not fetch contract_md for "${state.matchedSkillName}": ${scErr.message}`);
-    }
-  }
-
-  // ── CLI pre-flight check: detect required CLIs, check brew/curl + install/auth status ──
-  // Calls cli.agent preflight_check BEFORE the LLM prompt is built so the LLM gets
-  // accurate tool availability context and can plan the right install/auth steps upfront.
-  // Only fires when there are no active skillResults (fresh plan, not a recovery replan).
-  // Kept fast via a tight 5s timeout — never blocks planning if cli.agent is unavailable.
   let _preflightCliMap = {}; // service → { hasCli: bool } — hoisted for agentTypeHint below
   let cliPreflightNote = '';
   const isRecoveryReplan = !!recoveryContext;
-  if (mcpAdapter && !isRecoveryReplan) {
-    try {
-      const pfRes = await mcpAdapter.callService('command', 'command.automate', {
-        skill: 'cli.agent',
-        args: { action: 'preflight_check', task: userMessage },
-      }, { timeoutMs: 5000 }).catch(() => null);
-
-      const pf = pfRes?.data || pfRes;
-
-      if (pf?.ok) {
-        const lines = [];
-
-        // Bootstrap tools
-        if (!pf.brew?.installed) {
-          lines.push('brew: NOT INSTALLED — install first: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"');
-        } else {
-          lines.push('brew: installed ✓');
-        }
-        if (!pf.curl?.installed) {
-          lines.push('curl: NOT INSTALLED — cannot use curl-based API calls until installed');
-        } else {
-          lines.push('curl: installed ✓');
-        }
-
-        // Per-CLI status
-        if (Array.isArray(pf.detectedClis) && pf.detectedClis.length > 0) {
-          for (const c of pf.detectedClis) {
-            _preflightCliMap[c.service.toLowerCase()] = { hasCli: !!c.cli };
-            if (!c.cli) {
-              if (c.isOAuth)  lines.push(`${c.service}: OAuth-based service — no CLI, browser or API flow required`);
-              else if (c.isApiKey) lines.push(`${c.service}: API key required (${c.apiKeyEnvVar || 'check service settings'}) — no CLI binary; use browser.agent { action: 'build_agent' } then { action: 'run' } — the api_key loop handles credential injection and curl automatically (do NOT use shell.run)`);
-              continue;
-            }
-            if (!c.installed) {
-              const installCmd = c.installMethod === 'npm'
-                ? `npm install -g ${c.installPkg}`
-                : `brew install ${c.installPkg || c.cli}`;
-              lines.push(`${c.cli} (${c.service}): NOT INSTALLED — MUST install before use: ${installCmd}`);
-            } else if (c.authStatus === 'not_authenticated') {
-              lines.push(`${c.cli} (${c.service}): installed v${c.version} — NOT AUTHENTICATED. Run \`${c.cli} auth login\` or equivalent before use.`);
-            } else if (c.authStatus === 'authenticated') {
-              lines.push(`${c.cli} (${c.service}): installed v${c.version} — authenticated ✓ — use directly, skip auth setup steps`);
-            } else {
-              lines.push(`${c.cli} (${c.service}): installed v${c.version} — auth status unknown`);
-            }
-          }
-        }
-
-        if (lines.length > 0) {
-          cliPreflightNote = `\n\nCLI PRE-FLIGHT STATUS (verified at plan time — use this to decide whether to add install/auth steps):\n${lines.map(l => `- ${l}`).join('\n')}`;
-          logger.info(`[Node:PlanSkills] CLI pre-flight: ${pf.detectedClis?.length || 0} CLI(s) checked`);
-        }
-      }
-    } catch (pfErr) {
-      logger.warn(`[Node:PlanSkills] CLI pre-flight check failed (non-fatal): ${pfErr.message}`);
-    }
-  }
-
-  // ── Agent registry: inject healthy agent descriptors into planning context ──
-  // Query the agent registry (cli.agent + browser.agent) for all healthy agents.
-  // Their descriptors tell the LLM which services have resolved auth, CLI tools,
-  // and navigation patterns — so it doesn't plan redundant auth steps or prompt
-  // the user for credentials that are already available.
   let agentContextNote = '';
   let discoveryNote = '';
   if (mcpAdapter) {
-    try {
-      const agentRes = await mcpAdapter.callService('command', 'command.automate', {
-        skill: 'cli.agent',
-        args: { action: 'list_agents' },
-      }, { timeoutMs: 4000 }).catch(() => null);
+    await Promise.all([
+      // 4) Skill contract — fetch contract_md for matched skill (conditional)
+      (async () => {
+        if (!state.matchedSkillName) return;
+        try {
+          const scRes = await mcpAdapter.callService('user-memory', 'skill.get', {
+            name: state.matchedSkillName
+          }, { timeoutMs: 3000 }).catch(() => null);
+          const scData = scRes?.data || scRes;
+          const contractMd = scData?.contractMd || scData?.contract_md || '';
+          if (contractMd && contractMd.trim()) {
+            // Detect exec_type from frontmatter — node skills must use external.skill, not shell.run
+            const _fmMatch = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
+            const _isNodeSkill = _fmMatch && /exec_type:\s*node\b/i.test(_fmMatch[1]);
 
-      const agentRows = agentRes?.data?.agents || agentRes?.agents || [];
-      const healthyAgents = agentRows.filter(a => a.status === 'healthy' || a.status === 'degraded');
+            if (_isNodeSkill) {
+              skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is a Node.js runtime skill (exec_type: node). Generate a SINGLE step: { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n2. You MAY include additional args to pass context (e.g. { "name": "${state.matchedSkillName}", "action": "diagnose" }).\n3. FORBIDDEN: Do NOT generate shell.run or curl steps — this skill runs as a Node.js module.\n4. FORBIDDEN: Do NOT use "${state.matchedSkillName}" directly as the skill type in any step.\n\n${contractMd.slice(0, 2000)}`;
+            } else {
+              skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands or ## Plan section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step. It is NOT a dispatchable skill.\n3. FORBIDDEN: Do NOT use external.skill for this.\n4. The ONLY way to execute this skill is via shell.run with the curl command shown in the contract.\n\n${contractMd.slice(0, 3000)}`;
+              _shellContractMd = contractMd; // save for post-plan guard
+              shellSkillNames.add(state.matchedSkillName); // ensure guarded even if listNames had stale execType
+            }
+            logger.info(`[Node:PlanSkills] Injected contract_md for matched skill "${state.matchedSkillName}" (${contractMd.length} chars, exec_type: ${_isNodeSkill ? 'node' : 'shell'})`);
+          }
+        } catch (scErr) {
+          logger.warn(`[Node:PlanSkills] Could not fetch contract_md for "${state.matchedSkillName}": ${scErr.message}`);
+        }
+      })(),
 
-      if (healthyAgents.length > 0) {
-        const agentLines = healthyAgents.map(a => {
-          const caps = Array.isArray(a.capabilities) ? a.capabilities.slice(0, 6).join(', ') : '';
-          const typeTag = a.type === 'browser' ? '[browser]' : (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') ? '[api_key]' : '[cli]';
-          return `  - ${typeTag} ${a.id} (service: ${a.service}, tool: ${a.cliTool || 'browser'}) — capabilities: ${caps || 'see descriptor'}`;
-        }).join('\n');
+      // 5) CLI pre-flight check (fresh plan only, not recovery replans)
+      (async () => {
+        if (isRecoveryReplan) return;
+        try {
+          const pfRes = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'cli.agent',
+            args: { action: 'preflight_check', task: userMessage },
+          }, { timeoutMs: 5000 }).catch(() => null);
 
-        agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — add \"requiresAuth\": true to args ONLY when the user's explicit goal is to log in / sign in / connect an account to the service; omit it for all other tasks\n  - [api_key] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — DEVELOPER API ONLY. If the task is TALKING TO / USING an AI service interactively (ChatGPT, Gemini, Claude, Grok, Suno, Midjourney, etc.), use the [browser] consumer-site agent for that service instead.\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.\n  ⚠️ HARD RULE: For every [browser] agent listed above, you MUST use browser.agent { action: "run" } — NEVER playwright.agent. playwright.agent bypasses the OAuth flow that browser.agent manages — it will see a login page and immediately fail.\n  ⚠️ [api_key] AGENTS CANNOT NAVIGATE: [api_key] agents (openai.agent, anthropic.agent, mistral.agent, etc.) are DEVELOPER API consoles — they have NO browser and CANNOT fulfill any task that says "goto", "go to", "open", "visit", or "navigate to" a service. ANY navigation-verb task unconditionally requires a [browser] agent. If the AVAILABLE AGENTS list above has no [browser] match for the desired service, emit { "skill": "browser.agent", "args": { "action": "build_agent", "service": "<service-name>" } } as the first step to create it at runtime — do NOT substitute a [api_key] agent. [api_key] agents are for programmatic API calls ONLY (sending data, querying an API programmatically — not browsing, chatting interactively, or navigating).`;
+          const pf = pfRes?.data || pfRes;
 
-        logger.debug(`[Node:PlanSkills] Agent context: ${healthyAgents.length} healthy agent(s) injected`);
-      }
+          if (pf?.ok) {
+            const lines = [];
 
-      // ── Discovery note: guide LLM to plan build_agent when service has no agent ──
-      // Detects services the user wants that aren't covered by any agent row (healthy or not).
-      // Injects a structured setup flow so the LLM plans build_agent → run, not a broken
-      // shell.run/curl attempt with placeholder credentials.
-      const coveredServiceIds = new Set(
-        agentRows.map(a => (a.service || a.id.replace('.agent', '')).toLowerCase())
-      );
-      // Gather services the user wants (from enrichIntent domainTags)
-      const wantedServices = [
-        ...(domainTags?.services || []),
-        ...(domainTags?.tags   || []),
-      ].map(s => s.toLowerCase()).filter(s => s.length >= 3);
+            // Bootstrap tools
+            if (!pf.brew?.installed) {
+              lines.push('brew: NOT INSTALLED — install first: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"');
+            } else {
+              lines.push('brew: installed ✓');
+            }
+            if (!pf.curl?.installed) {
+              lines.push('curl: NOT INSTALLED — cannot use curl-based API calls until installed');
+            } else {
+              lines.push('curl: installed ✓');
+            }
 
-      const missingService = wantedServices.find(svc =>
-        !coveredServiceIds.has(svc) &&
-        !agentRows.some(a => (a.id || '').toLowerCase().includes(svc))
-      );
+            // Per-CLI status
+            if (Array.isArray(pf.detectedClis) && pf.detectedClis.length > 0) {
+              for (const c of pf.detectedClis) {
+                _preflightCliMap[c.service.toLowerCase()] = { hasCli: !!c.cli };
+                if (!c.cli) {
+                  if (c.isOAuth)  lines.push(`${c.service}: OAuth-based service — no CLI, browser or API flow required`);
+                  else if (c.isApiKey) lines.push(`${c.service}: API key required (${c.apiKeyEnvVar || 'check service settings'}) — no CLI binary; use browser.agent { action: 'build_agent' } then { action: 'run' } — the api_key loop handles credential injection and curl automatically (do NOT use shell.run)`);
+                  continue;
+                }
+                if (!c.installed) {
+                  const installCmd = c.installMethod === 'npm'
+                    ? `npm install -g ${c.installPkg}`
+                    : `brew install ${c.installPkg || c.cli}`;
+                  lines.push(`${c.cli} (${c.service}): NOT INSTALLED — MUST install before use: ${installCmd}`);
+                } else if (c.authStatus === 'not_authenticated') {
+                  lines.push(`${c.cli} (${c.service}): installed v${c.version} — NOT AUTHENTICATED. Run \`${c.cli} auth login\` or equivalent before use.`);
+                } else if (c.authStatus === 'authenticated') {
+                  lines.push(`${c.cli} (${c.service}): installed v${c.version} — authenticated ✓ — use directly, skip auth setup steps`);
+                } else {
+                  lines.push(`${c.cli} (${c.service}): installed v${c.version} — auth status unknown`);
+                }
+              }
+            }
 
-      if (missingService) {
-        // Use preflight CLI data as the authoritative signal — c.cli is null when no binary exists.
-        // Fall back to browser.agent when the service was not in the preflight scan:
-        // browser.agent handles both REST/api_key and OAuth paths, so it is always safe.
-        // cli.agent only works when a real binary is installed.
-        const preflightEntry = _preflightCliMap[missingService.toLowerCase()];
-        const agentTypeHint = preflightEntry
-          ? (preflightEntry.hasCli ? 'cli.agent' : 'browser.agent')
-          : 'browser.agent'; // default: browser.agent is safe for any REST/OAuth service
-        discoveryNote = `\n\nNO AGENT CONFIGURED FOR "${missingService.toUpperCase()}" — the user does not have this service set up yet.` +
-          ` Plan a discovery and setup flow — do NOT plan shell.run, curl, or skill.bootstrap steps:` +
-          `\n  Step 1: { "skill": "synthesize", "args": { "prompt": "You don't have ${missingService} set up yet. I can configure it for you in a moment." } }` +
-          `\n  Step 2: { "skill": "${agentTypeHint}", "args": { "action": "build_agent", "service": "${missingService}" } }` +
-          `\n  Step 3: { "skill": "${agentTypeHint}", "args": { "action": "run", "agentId": "${missingService}.agent", "task": "<repeat the user's original request verbatim>" } }` +
-          `\n  If the service type is ambiguous: use cli.agent for cloud/devops/API-key services, browser.agent for OAuth/social/ecommerce services.` +
-          `\n  If you don't know the service: emit { "skill": "web.search", "args": { "query": "${missingService} CLI or REST API setup" } } before build_agent.`;
-        logger.info(`[Node:PlanSkills] Discovery note injected for uncovered service: "${missingService}" (agent type hint: ${agentTypeHint})`);
-      }
-    } catch (_) { /* non-fatal */ }
+            if (lines.length > 0) {
+              cliPreflightNote = `\n\nCLI PRE-FLIGHT STATUS (verified at plan time — use this to decide whether to add install/auth steps):\n${lines.map(l => `- ${l}`).join('\n')}`;
+              logger.info(`[Node:PlanSkills] CLI pre-flight: ${pf.detectedClis?.length || 0} CLI(s) checked`);
+            }
+          }
+        } catch (pfErr) {
+          logger.warn(`[Node:PlanSkills] CLI pre-flight check failed (non-fatal): ${pfErr.message}`);
+        }
+      })(),
+
+      // 6) Agent registry — inject healthy agent descriptors into planning context
+      (async () => {
+        try {
+          const agentRes = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'cli.agent',
+            args: { action: 'list_agents' },
+          }, { timeoutMs: 4000 }).catch(() => null);
+
+          const agentRows = agentRes?.data?.agents || agentRes?.agents || [];
+          const healthyAgents = agentRows.filter(a => a.status === 'healthy' || a.status === 'degraded' || a.status === 'needs_auth');
+
+          if (healthyAgents.length > 0) {
+            const agentLines = healthyAgents.map(a => {
+              const caps = Array.isArray(a.capabilities) ? a.capabilities.slice(0, 6).join(', ') : '';
+              const typeTag = a.type === 'browser' ? '[browser]' : (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') ? '[api_key]' : '[cli]';
+              return `  - ${typeTag} ${a.id} (service: ${a.service}, tool: ${a.cliTool || 'browser'}) — capabilities: ${caps || 'see descriptor'}`;
+            }).join('\n');
+
+            agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — add \"requiresAuth\": true to args ONLY when the user's explicit goal is to log in / sign in / connect an account to the service; omit it for all other tasks\n  - [api_key] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — DEVELOPER API ONLY. If the task is TALKING TO / USING an AI service interactively (ChatGPT, Gemini, Claude, Grok, Suno, Midjourney, etc.), use the [browser] consumer-site agent for that service instead.\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.\n  ⚠️ HARD RULE: For every [browser] agent listed above, you MUST use browser.agent { action: "run" } — NEVER playwright.agent. playwright.agent bypasses the OAuth flow that browser.agent manages — it will see a login page and immediately fail.\n  ⚠️ [api_key] AGENTS CANNOT NAVIGATE: [api_key] agents (openai.agent, anthropic.agent, mistral.agent, etc.) are DEVELOPER API consoles — they have NO browser and CANNOT fulfill any task that says "goto", "go to", "open", "visit", or "navigate to" a service. ANY navigation-verb task unconditionally requires a [browser] agent. If the AVAILABLE AGENTS list above has no [browser] match for the desired service, emit { "skill": "browser.agent", "args": { "action": "build_agent", "service": "<service-name>" } } as the first step to create it at runtime — do NOT substitute a [api_key] agent. [api_key] agents are for programmatic API calls ONLY (sending data, querying an API programmatically — not browsing, chatting interactively, or navigating).`;
+
+            logger.debug(`[Node:PlanSkills] Agent context: ${healthyAgents.length} healthy agent(s) injected`);
+          }
+
+          // ── Discovery note: guide LLM to plan build_agent when service has no agent ──
+          // Detects services the user wants that aren't covered by any agent row (healthy or not).
+          // Injects a structured setup flow so the LLM plans build_agent → run, not a broken
+          // shell.run/curl attempt with placeholder credentials.
+          const coveredServiceIds = new Set(
+            agentRows.map(a => (a.service || a.id.replace('.agent', '')).toLowerCase())
+          );
+          // Gather services the user wants (from enrichIntent domainTags)
+          const wantedServices = [
+            ...(domainTags?.services || []),
+            ...(domainTags?.tags   || []),
+          ].map(s => s.toLowerCase()).filter(s => s.length >= 3);
+
+          const missingService = wantedServices.find(svc =>
+            !coveredServiceIds.has(svc) &&
+            !agentRows.some(a => (a.id || '').toLowerCase().includes(svc))
+          );
+
+          if (missingService) {
+            // Use preflight CLI data as the authoritative signal — c.cli is null when no binary exists.
+            // Fall back to browser.agent when the service was not in the preflight scan:
+            // browser.agent handles both REST/api_key and OAuth paths, so it is always safe.
+            // cli.agent only works when a real binary is installed.
+            const preflightEntry = _preflightCliMap[missingService.toLowerCase()];
+            const agentTypeHint = preflightEntry
+              ? (preflightEntry.hasCli ? 'cli.agent' : 'browser.agent')
+              : 'browser.agent'; // default: browser.agent is safe for any REST/OAuth service
+            discoveryNote = `\n\nNO AGENT CONFIGURED FOR "${missingService.toUpperCase()}" — the user does not have this service set up yet.` +
+              ` Plan a discovery and setup flow — do NOT plan shell.run, curl, or skill.bootstrap steps:` +
+              `\n  Step 1: { "skill": "synthesize", "args": { "prompt": "You don't have ${missingService} set up yet. I can configure it for you in a moment." } }` +
+              `\n  Step 2: { "skill": "${agentTypeHint}", "args": { "action": "build_agent", "service": "${missingService}" } }` +
+              `\n  Step 3: { "skill": "${agentTypeHint}", "args": { "action": "run", "agentId": "${missingService}.agent", "task": "<repeat the user's original request verbatim>" } }` +
+              `\n  If the service type is ambiguous: use cli.agent for cloud/devops/API-key services, browser.agent for OAuth/social/ecommerce services.` +
+              `\n  If you don't know the service: emit { "skill": "web.search", "args": { "query": "${missingService} CLI or REST API setup" } } before build_agent.`;
+            logger.info(`[Node:PlanSkills] Discovery note injected for uncovered service: "${missingService}" (agent type hint: ${agentTypeHint})`);
+          }
+        } catch (_) { /* non-fatal */ }
+      })(),
+    ]);
   }
 
-  // Build injected snippets block — placed at top of system prompt for maximum LLM attention
   let ragSnippetsBlock = '';
   if (skillPromptSnippets.length > 0) {
     const snippetLines = skillPromptSnippets
@@ -1525,6 +1550,12 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
   }
   // ───────────────────────────────────────────────────────────────────────────
 
+  // Dynamic token cap: estimate plan complexity from connective words and action verbs.
+  // Single-step tasks → 1000 tokens; complex multi-site pipelines → up to 3600.
+  const _estimatedSteps = (userMessage.match(/\bthen\b/gi)?.length || 0) + 1 +
+    (/(compare|send|email|synthesize|research|gather)/gi.test(userMessage) ? 1 : 0);
+  const _planMaxTokens = Math.min(3600, Math.max(1000, _estimatedSteps * 320 + 600));
+
   const payload = {
     query: planningQuery,
     context: {
@@ -1535,7 +1566,7 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
       intent: 'command_automate'
     },
     options: {
-      maxTokens: 3600,
+      maxTokens: _planMaxTokens,
       temperature: 0.1,
       fastMode: false
     }
@@ -1981,6 +2012,28 @@ CRITICAL rules for skill.md:
     // main.js resumes with cliMatch/apiMatch set → creatorPlanning fast-path runs.
     const needsSkillStep = skillPlan.find(s => s.skill === 'needs_skill');
     if (needsSkillStep) {
+      // ── SMS gateway bypass: if smsGatewayTarget is resolved, skip scout entirely ──
+      // The planner should already have used gmail.agent via the injected gateway block,
+      // but if it still emitted needs_skill for SMS, force a replan with the gateway note.
+      if (state.smsGatewayTarget?.email) {
+        const capability = needsSkillStep.args?.capability || userMessage;
+        const SMS_KEYWORDS = /\b(sms|text message|text.*someone|send.*text|message.*via.*sms)\b/i;
+        if (SMS_KEYWORDS.test(capability) || SMS_KEYWORDS.test(userMessage)) {
+          logger.info(`[Node:PlanSkills] SMS gateway bypass: replan with forced gmail.agent route for "${capability}"`);
+          const gwt = state.smsGatewayTarget;
+          const bypassPlan = [{
+            skill: 'browser.agent',
+            args: {
+              action: 'run',
+              agentId: 'gmail.agent',
+              task: `Send email to ${gwt.email} with empty subject and body: ${userMessage}`,
+            },
+            description: `Send SMS to ${gwt.name} via carrier gateway (${gwt.carrier})`,
+          }];
+          return { ...state, skillPlan: bypassPlan, skillCursor: 0, scoutPending: false };
+        }
+      }
+
       // forceSkillBuild: user already selected a provider from the scout card.
       // Skip registry scout and LLM replan — directly generate an external.skill step
       // using the chosen provider so executeCommand triggers the creator build pipeline.

@@ -7,6 +7,7 @@ project.launcher|args:{projectName:string,port?:number}|Starts_a_previously_buil
 project.stopper|args:{projectName:string,port?:number}|Stops_a_running_ThinkDrop_project_server_and_kills_its_Node.js_process.__Use_when_the_user_says_"close_the_app",_"stop_the_project",_"shut_it_down",_"close_it",_"kill_the_server"_and_the_user_is_referring_to_a_previously_launched_ThinkDrop_project_(built_with_project.builder).__projectName_is_the_slug_or_fuzzy_name_eg_"cold-plunge"_or_"schedule-plunge".__NEVER_use_needs_skill_or_shell.run_for_stopping_a_ThinkDrop_project.
 needs_skill|args:{capability:string,suggestion:string}|Use_for_TWO_cases:_(1)_recurring_background_daemons_that_cannot_be_done_via_one-off_API_call,_(2)_desktop_UI_automation_/_app_control_tasks_(scroll,_type,_shortcuts,_interact_with_native_apps)_that_require_a_full_project_—_NOT_a_skill.md.__RULE:_if_the_user_asks_to_"create_a_skill"_or_"build_a_tool"_for_controlling_apps_(keyboard,_mouse,_scroll,_shortcuts,_window_control),_output_needs_skill_with_the_described_capability.
 external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user_installed_external_skill_by_name
+user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string,entities?:string[],dateRange?:{start:string,end?:string},isCommsTask?:boolean}|[context_assembler]_resolves_user_identity_data_from_user_profile+memory+conversation_history.__action:'resolve_form'_→_fills_name/phone/email/address/any_form_fields.__action:'resolve_context'_→_assembles_richer_user_context_(projects,_interests,_contacts,_conversation_history)_for_content_generation.__ALWAYS_use_before_tasks_that_need_user_personal_data:_forms,_emails_addressed_to_user,_document_templates,_anything_referencing_"my_X".__Returns_{resolved:{field:value,...},summary:string,missingFields:string[]}.__summary_can_be_injected_directly_into_a_synthesize_prompt.
 playwright.agent|args:{goal:string,sessionId?:string,url?:string,maxTurns?:number,headed?:boolean,timeoutMs?:number}|[sub-agent]_agentic_browser_loop__LLM_drives_snapshot→action→repeat_until_goal_done__use_for_complex_open_ended_tasks_on_PUBLIC_or_ANONYMOUS_sites_only__(scraping,_read-only_research,_AI_chatbots_with_no_API).__⚠️_NEVER_use_for_any_service_in_AVAILABLE_AGENTS_or_any_registered_OAuth_service_(Gmail,_Slack,_Notion,_etc.)—those_MUST_use_browser.agent_{action:run}.
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI_agent_factory+runner.__Takes_ONE_high-level_task,_reads_agent_descriptor_from_DuckDB,_infers_correct_CLI_commands_via_LLM,_executes,_returns_result.__actions:_run_(delegate_task),_build_agent_(discover+install+register_CLI_service),_list_agents,_validate_agent,_preflight_check.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists;_use_action:build_agent_to_create_new_agents.
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_Browser/REST_API_agent_factory+runner.__Handles_OAuth_browser_services_AND_REST_API/API-key_services_(ClickSend,_Mailgun,_Twilio,_etc.).__Takes_ONE_task,_reads_descriptor,_handles_all_auth,_infers+executes_curl_or_browser_steps.__actions:_run_(delegate_task),_build_agent_(crawl_docs+create_descriptor),_list_agents.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists.
@@ -38,10 +39,31 @@ browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|
 | **Service listed in AVAILABLE AGENTS with type [browser]** (Gmail, Slack, Notion, etc.) | `browser.agent { action: 'run', agentId: '<id from AVAILABLE AGENTS>', task: '...' }` — **NEVER** `playwright.agent` |
 | **Service listed in AVAILABLE AGENTS with type [api_key]** (openai.agent, anthropic.agent, mistral.agent, etc.) | ⚠️ **DEVELOPER API ONLY** — programmatic API calls ONLY. **`[api_key]` agents CANNOT navigate** — they have no browser and cannot fulfill any task phrased as "goto", "go to", "open", "visit", or "navigate to" a service. Those tasks unconditionally require a `[browser]` agent. If no `[browser]` agent exists for the target service → `build_agent` it first. Rule of thumb: talking *to* or visiting an AI → `[browser]` consumer-site agent. Building *with* an AI API → `[api_key]` developer agent. |
 | **Any web app that requires a login/account** — AI chatbots (ChatGPT, Claude, Perplexity, Gemini, Grok, etc.), productivity tools, social platforms, SaaS apps — **even if no open API exists** | Check AVAILABLE AGENTS first; if not found → `browser.agent { action: 'build_agent', service: '<name>' }` then `{ action: 'run', agentId: '...', task: '...' }`. Each service gets its own isolated browser session with persistent auth — no shared session, no re-login. **NEVER use `playwright.agent` for services requiring login.** |
+| **Discovery task on a known agent** — "find", "browse", "show me what's on", "explore", "discover", "look for", "search for" something on a site where the navigation path is UNKNOWN | `browser.agent { action: 'explore', agentId: '<id>', goal: '<discovery goal>' }` — explore navigates, detects auth, iterates nav items until goal is met. Use `explore` when steps are NOT predetermined. Use `run` when specific actions are known (compose, send, fill, create). |
 | Truly public / anonymous content — no login required (Wikipedia, news articles, public docs, weather, open-access pages) | `playwright.agent` with `goal` and `url` — or `browser.act` for simple navigate + read |
 | **Local system only**: file ops, grep, ffmpeg, local git, run local scripts, open apps | `shell.run` bash |
 
 **FORBIDDEN — never use `shell.run curl` to call external API services** (Mailgun, Gmail API, Slack API, Stripe, Twilio, etc.). `shell.run` has no credential management, no keychain access, no token refresh, and no retry on 401 — it always fails when tokens expire or keys are unset. Use `browser.agent` or `cli.agent` for ALL external services. `shell.run` is for local system commands only.
+
+**SMS routing rule — ALWAYS use free carrier email gateway (NO paid SMS APIs needed):**
+When the pipeline provides a `smsGatewayTarget` block, the SMS must be sent as a plain email via `gmail.agent`:
+```
+⚠️ SMS GATEWAY ROUTE:
+  To: {smsGatewayTarget.email}   ← carrier gateway address e.g. 5551234567@vtext.com
+  From: your Gmail account
+  Subject: (empty string)
+  Body: message text (max 160 chars — SMS will truncate silently beyond that)
+  Use browser.agent action:run with gmail.agent to SEND this email
+  NEVER use Twilio, ClickSend, or any paid SMS API — the free email gateway is already resolved
+```
+If `smsGatewayTarget.email` is null but `smsGatewayTarget.carrierOptions` is present, add a `guide.step` asking the user to pick their carrier first.
+
+**user.agent routing rules:**
+- Use `user.agent { action: 'resolve_form' }` BEFORE any task that needs the user's personal data: filling in a profile/application form, sending a document with user details, drafting an email that refers to "my name / my address / my phone", looking up a contact's info.
+- Use `user.agent { action: 'resolve_context' }` BEFORE writing, summarising, or synthesising content that should sound like the user: emails, messages, proposals, bios, summaries of past conversations.
+- Pass `user.agent`'s `summary` output into the following `synthesize` step's `prompt` field — it acts as automatic context injection.
+- If `missingFields` is non-empty, add a `guide.step` asking the user to provide the missing values, THEN continue the plan.
+- NEVER use `user.agent` for tasks that have nothing to do with the user's personal context (web searches, code generation, generic system tasks).
 
 **Registered agents — check AVAILABLE AGENTS block first (highest priority).** If an agent for the needed service is listed there, skip `build_agent` and delegate directly via `action: 'run'`:
 ```json

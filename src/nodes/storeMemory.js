@@ -166,6 +166,97 @@ function _detectKeyType(label) {
   return 'CREDENTIAL';
 }
 
+// ── user_profile dual-write helper ──────────────────────────────────────────
+// Maps personal_profile parsed fields to structured user_profile keys so that
+// resolveUserContext and user.agent can do fast O(1) lookups instead of
+// relying on semantic search every time.
+//
+// Key naming convention:
+//   self:<field>         — user's own data (name, phone, email, address…)
+//   contact:<label>:<field> — a named contact (e.g. contact:wife:phone)
+
+const SELF_FIELD_MAP = {
+  user_name:    'self:first_name',  // full name stored too; split is best-effort
+  my_phone:     'self:phone',
+  my_email:     'self:email',
+  home_address: 'self:address',
+  work_address: 'self:work_address',
+};
+
+/**
+ * Derive one or more profile keys from a parsed personal fact.
+ * Returns an array of { key, value } pairs to write to user_profile.
+ */
+function _profileKeysFrom(parsed) {
+  const pairs = [];
+
+  // ── Self scalar fields (name, phone, email, address) ─────────────────────
+  const selfKey = SELF_FIELD_MAP[parsed.field];
+  if (selfKey) {
+    pairs.push({ key: selfKey, value: parsed.value });
+
+    // Best-effort first/last split for names
+    if (parsed.field === 'user_name') {
+      const parts = parsed.value.trim().split(/\s+/);
+      if (parts.length >= 2) {
+        pairs.push({ key: 'self:first_name', value: parts[0] });
+        pairs.push({ key: 'self:last_name',  value: parts.slice(1).join(' ') });
+      } else {
+        pairs.push({ key: 'self:first_name', value: parsed.value });
+      }
+      // Also store as full name
+      pairs.push({ key: 'self:name', value: parsed.value });
+    }
+
+    // Phone: also store carrier lookup opportunity flag
+    if (parsed.field === 'my_phone') {
+      pairs.push({ key: 'self:phone_carrier_lookup_needed', value: '1' });
+    }
+    return pairs;
+  }
+
+  // ── Contact / relationship fields (wife, boss, dentist, etc.) ─────────────
+  // field = 'wife', label = 'wife', value = 'Sarah'  → contact:wife:name
+  // field = 'dentist_phone', label = 'dentist phone' → contact:dentist:phone
+  const label  = (parsed.label || parsed.field || '').toLowerCase().trim();
+  const fieldLC = parsed.field.toLowerCase();
+
+  // If the field ends with a known sub-field type, use contact:<role>:<type>
+  const subFieldMap = { phone: 'phone', email: 'email', address: 'address', number: 'phone' };
+  for (const [suffix, subKey] of Object.entries(subFieldMap)) {
+    if (fieldLC.endsWith(`_${suffix}`)) {
+      const role = fieldLC.slice(0, fieldLC.length - suffix.length - 1).replace(/_/g, ' ');
+      pairs.push({ key: `contact:${role}:${subKey}`, value: parsed.value });
+      return pairs;
+    }
+  }
+
+  // Default: store as contact:<label>:name
+  if (label) {
+    pairs.push({ key: `contact:${label.replace(/\s+/g, '_')}:name`, value: parsed.value });
+  }
+  return pairs;
+}
+
+/**
+ * Fire-and-forget profile dual-write. Never throws — storeMemory must not
+ * fail just because user_profile is unreachable.
+ */
+async function _dualWriteProfile(mcpAdapter, profilePairs, userId, logger) {
+  for (const { key, value } of profilePairs) {
+    try {
+      await mcpAdapter.callService('user-memory', 'profile.set', {
+        key,
+        value,
+        userId,
+      }, { timeoutMs: 4000 });
+      logger.debug(`[Node:StoreMemory] profile.set key="${key}"`);
+    } catch (e) {
+      logger.warn(`[Node:StoreMemory] profile.set failed for key="${key}": ${e.message}`);
+    }
+  }
+}
+
 // ── Main node ────────────────────────────────────────────────────────────────
 
 module.exports = async function storeMemory(state) {
@@ -264,6 +355,15 @@ module.exports = async function storeMemory(state) {
 
         const memoryData = result?.data || result;
         logger.info(`[Node:StoreMemory] Stored ${parsed.memType}: "${parsed.memText}"`);
+
+        // ── Dual-write to user_profile for fast O(1) key lookup ──────────────
+        if (parsed.memType === 'personal_profile') {
+          const profilePairs = _profileKeysFrom(parsed);
+          if (profilePairs.length > 0) {
+            // fire-and-forget — don't block on this; storeMemory must stay fast
+            _dualWriteProfile(mcpAdapter, profilePairs, userId, logger).catch(() => {});
+          }
+        }
 
         return {
           ...state,

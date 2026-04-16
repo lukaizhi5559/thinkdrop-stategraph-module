@@ -1,8 +1,24 @@
 /**
  * @thinkdrop/stategraph - Standalone StateGraph Module
- * 
+ *
  * Progressive workflow orchestration with optional MCP integration
  */
+
+// Load stategraph-level .env so THINKDROP_CLI_DRIVER is set before any node module
+// reads it (e.g. planSkills.js loadSystemPrompt). Uses a simple KEY=value parser so
+// there is no dotenv dependency required. Does NOT override vars already set by a
+// parent process (e.g. Electron main.js dotenv or shell env).
+(function _loadStategraphEnv() {
+  try {
+    const _fs = require('fs');
+    const _path = require('path');
+    const _envPath = _path.join(__dirname, '../.env');
+    _fs.readFileSync(_envPath, 'utf8').split('\n').forEach(line => {
+      const m = line.match(/^([A-Z][A-Z0-9_]*)=(.*)$/);
+      if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+    });
+  } catch (_) { /* .env optional */ }
+})();
 
 const StateGraph = require('./core/StateGraph');
 const StateGraphBuilder = require('./StateGraphBuilder');

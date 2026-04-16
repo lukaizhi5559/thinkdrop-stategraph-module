@@ -2516,6 +2516,12 @@ module.exports = async function executeCommand(state) {
   if (skill === 'browser.agent' || skill === 'cli.agent') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 300000); // 5 min
   }
+  // agentbrowser.agent: waitForAuth alone needs 120s (user must log in manually) + agent
+  // execution. Without a long enough HTTP timeout the MCP client fires 3 concurrent retries
+  // that each call close-all, killing the Chrome window the user is mid-login on.
+  if (skill === 'agentbrowser.agent') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 300000); // 5 min: 120s auth + agent execution
+  }
 
   // ── project_build: route to project.builder MCP skill ──────────────────────
   if (skill === 'project_build') {
@@ -2822,7 +2828,7 @@ module.exports = async function executeCommand(state) {
   try {
     // For cli.agent / browser.agent: inject _progressCallbackUrl so the agent can POST
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
-    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent';
+    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent' || skill === 'agentbrowser.agent';
     const _callArgs = _isAgentSkill
       ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
       : resolvedArgs;
