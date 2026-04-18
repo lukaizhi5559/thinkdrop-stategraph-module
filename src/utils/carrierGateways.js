@@ -22,6 +22,7 @@
 'use strict';
 
 const https = require('https');
+const http = require('http');
 
 // ── Carrier → SMS gateway domain map ────────────────────────────────────────
 // Sources: carrier websites + CTIA carrier gateway documentation (2024)
@@ -143,8 +144,8 @@ async function lookupCarrier(phone, apiKey) {
   }
 
   return new Promise((resolve, reject) => {
-    const url = `https://apilayer.net/api/validate?access_key=${encodeURIComponent(key)}&number=${encodeURIComponent(digits)}&country_code=US&format=1`;
-    const req = https.get(url, (res) => {
+    const url = `http://apilayer.net/api/validate?access_key=${encodeURIComponent(key)}&number=${encodeURIComponent(digits)}&country_code=US&format=1`;
+    const req = http.get(url, (res) => {
       let body = '';
       res.on('data', (chunk) => { body += chunk; });
       res.on('end', () => {

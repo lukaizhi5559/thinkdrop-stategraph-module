@@ -456,7 +456,7 @@ ThinkDrop runs a SkillScheduler daemon (node-cron) inside command-service. Any i
 | "Check if my app is running at 9am" | **bridge** | `type: bridge` | Requires screen-check execution — NOT a nudge |
 | "Every morning, look at my screen and summarize what's open" | **bridge** | `type: bridge` | Uses screen.capture + synthesize — needs AI session |
 | "Summarize my browser tabs every evening" | **bridge** | `type: bridge` | Agentic task — requires skill execution |
-| "Send me a daily SMS at 9pm" | **needs_skill** | external Twilio/ClickSend | Requires external API credentials |
+| "Send me a daily SMS at 9pm" | **bridge** (if `smsGatewayTarget` resolved) OR **needs_skill** (if not) | `type: bridge` with gmail.agent instruction, OR external Twilio/ClickSend | When the pipeline resolves `smsGatewayTarget.email`, use `bridge` — SkillScheduler writes WS:INSTRUCTION → AI sends email-to-SMS via gmail.agent. Only fall back to `needs_skill` when `smsGatewayTarget` is NOT present |
 
 **"remind me to X" always → `notify`**, even if X contains action words. The word "remind" means nudge, not execution.
 
@@ -466,11 +466,13 @@ ThinkDrop runs a SkillScheduler daemon (node-cron) inside command-service. Any i
 
 **Decision flowchart:**
 ```
+Is this a recurring SMS task AND smsGatewayTarget.email is resolved (free carrier gateway)?
+  YES → bridge (type: bridge, instruction sends email to gateway address via gmail.agent)
 Does the task require looking at the screen, reading data, or executing steps?
   YES → bridge (type: bridge)
 Does the task only need to pop up a reminder message to the user?
   YES → notify (type: notify)
-Does the task require an external API (SMS, email, OAuth service)?
+Does the task require an external API (SMS without gateway, email OAuth, other service)?
   YES → needs_skill
 ```
 

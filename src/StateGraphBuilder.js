@@ -23,6 +23,7 @@ const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
 const resolveReferencesNode = require('./nodes/resolveReferences');
 const parseSkillNode = require('./nodes/parseSkill');
+const checkPlanCacheNode = require('./nodes/checkPlanCache');
 const synthesizeNode = require('./nodes/synthesize');
 const enrichIntentNode = require('./nodes/enrichIntent');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
@@ -245,6 +246,7 @@ class StateGraphBuilder {
       resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter }),
       parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
+      checkPlanCache: (state) => checkPlanCacheNode({ ...state, logger }),
       enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
       resolveUserContext: (state) => resolveUserContextNode({ ...state, logger, mcpAdapter }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
@@ -273,7 +275,8 @@ class StateGraphBuilder {
       start: 'decomposePrompt',
       decomposePrompt: 'resolveReferences',
       resolveReferences: 'parseIntent',
-      parseIntent: 'parseSkill',
+      parseIntent: 'checkPlanCache',
+      checkPlanCache: 'parseSkill',
       parseSkill: (state) => {
         // parseIntent has already run upstream — always proceed to enrichIntent.
         // parseSkill may have set matchedSkillName via strategies 1/2 (exact/phrase match)

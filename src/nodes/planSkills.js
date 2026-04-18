@@ -25,62 +25,17 @@ const path = require('path');
 const os = require('os');
 const { jsonrepair } = require('jsonrepair');
 const { buildReminderSkill } = require('../utils/buildReminderSkill');
+const {
+  HIGH_CONFIDENCE_THRESHOLD,
+  extractEntityAnchors,
+  anchorSetsMatch,
+  findSimilarCompletePlan,
+  _sessionCacheKey,
+  _sessionCacheGet,
+  _sessionCacheSet,
+} = require('../utils/planCacheHelpers');
 
 const PLANS_DIR = path.join(os.homedir(), '.thinkdrop', 'plans');
-
-/**
- * Find a similar previously-run plan that completed 100% successfully.
- * Only returns plans with status: complete — never pending or failed.
- * Returns { planFile, title, file, similarity, skillPlan } or null.
- */
-function findSimilarCompletePlan(prompt, logger) {
-  try {
-    if (!fs.existsSync(PLANS_DIR)) return null;
-    const files = fs.readdirSync(PLANS_DIR)
-      .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
-      .sort().reverse().slice(0, 20);
-
-    const promptWords = new Set(
-      prompt.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 4)
-    );
-
-    for (const file of files) {
-      const planPath = path.join(PLANS_DIR, file);
-      try {
-        const content = fs.readFileSync(planPath, 'utf8');
-        // Only match 100% successfully completed plans
-        const statusMatch = content.match(/^status:\s*(.+)/m);
-        const status = statusMatch ? statusMatch[1].trim() : '';
-        if (status !== 'complete') continue;
-
-        // Must have stored skill_plan_json to be reusable
-        const jsonMatch = content.match(/^skill_plan_json:\s*'([^']+)'/m);
-        if (!jsonMatch) continue;
-
-        const titleMatch = content.match(/^# Plan:\s*(.+)/m);
-        const promptMatch = content.match(/^original_prompt:\s*"([^"]+)"/m);
-        const planText = ((titleMatch ? titleMatch[1] : '') + ' ' + (promptMatch ? promptMatch[1] : '')).toLowerCase().replace(/[^a-z0-9 ]/g, ' ');
-        const planWords = new Set(planText.split(/\s+/).filter(w => w.length > 4));
-
-        const intersection = [...promptWords].filter(w => planWords.has(w));
-        const union = new Set([...promptWords, ...planWords]);
-        const similarity = union.size > 0 ? intersection.length / union.size : 0;
-
-        if (similarity >= 0.3) {
-          try {
-            const decoded = Buffer.from(jsonMatch[1], 'base64').toString('utf8');
-            const skillPlan = JSON.parse(decoded);
-            logger.info(`[Node:PlanSkills] Similar completed plan found (${Math.round(similarity * 100)}% match): ${file}`);
-            return { planFile: planPath, title: titleMatch?.[1]?.trim() || file, file, similarity, skillPlan };
-          } catch (_) { continue; }
-        }
-      } catch (_) { /* skip unreadable */ }
-    }
-  } catch (err) {
-    logger.warn(`[Node:PlanSkills] findSimilarCompletePlan error: ${err.message}`);
-  }
-  return null;
-}
 
 /**
  * Serialize a JSON skill plan to a human-readable .md file.
@@ -261,6 +216,9 @@ module.exports = async function planSkills(state) {
   if (state._skillPlan && Array.isArray(state._skillPlan) && state._skillPlan.length > 0) {
     logger.info(`[Node:PlanSkills] _skillPlan pre-built — skipping LLM planning (${state._skillPlan.length} steps)`);
     const prebuiltPlan = state._skillPlan;
+    // Populate session cache so next identical request executes instantly without a modal.
+    const _ck = _sessionCacheKey(userMessage);
+    _sessionCacheSet(_ck, prebuiltPlan, require('../utils/planCacheHelpers').extractEntityAnchors(userMessage));
     // Emit plan_ready so AutomationProgress initialises its step list.
     // PlanPanel ignores plan_ready (it only handles plan: prefixed events), so this is safe
     // for both ASK_USER recovery re-runs and PlanPanel-approved plan re-runs.
@@ -434,8 +392,51 @@ module.exports = async function planSkills(state) {
   // Only offers reuse when the plan ran 100% successfully (status: complete).
   // Guards: skip when replanning after failure, multi-intent queue, or _forceNewPlan.
   if (!recoveryContext && !state.isMultiIntent && !state._forceNewPlan) {
+    // ── Phase 3: In-memory session cache — zero disk I/O on exact repeats ──────
+    const _cacheKey = _sessionCacheKey(userMessage);
+    const _cached   = _sessionCacheGet(_cacheKey);
+    if (_cached) {
+      logger.info(`[Node:PlanSkills] Session cache hit — reusing plan instantly (key="${_cacheKey.slice(0, 60)}")`);
+      if (progressCallback) progressCallback({
+        type: 'plan:auto_executed',
+        source: 'session_cache',
+        message: 'Reusing cached plan (instant)',
+      });
+      return {
+        ...state,
+        skillPlan: _cached.skillPlan,
+        skillCursor: 0,
+        recoveryContext: null,
+        planError: null,
+      };
+    }
+
+    // ── Phase 1+2: Disk-based plan match with entity-anchor guard ─────────────
     const similarPlan = findSimilarCompletePlan(userMessage, logger);
     if (similarPlan) {
+      // Phase 2: High-confidence + anchor match → auto-execute, skip approval modal
+      if (similarPlan.autoExecute) {
+        logger.info(`[Node:PlanSkills] Auto-executing cached plan (${Math.round(similarPlan.similarity * 100)}% match, anchors verified)`);
+        if (progressCallback) progressCallback({
+          type: 'plan:auto_executed',
+          planFile: similarPlan.planFile,
+          title: similarPlan.title,
+          similarity: similarPlan.similarity,
+          source: 'disk_cache',
+          message: `Reusing cached plan (${Math.round(similarPlan.similarity * 100)}% match)`,
+        });
+        // Populate session cache so next identical request is instant
+        _sessionCacheSet(_cacheKey, similarPlan.skillPlan, similarPlan.anchors);
+        return {
+          ...state,
+          skillPlan: similarPlan.skillPlan,
+          skillCursor: 0,
+          recoveryContext: null,
+          planError: null,
+        };
+      }
+
+      // Medium confidence or anchor mismatch → show approval modal
       const skillPlanB64 = Buffer.from(JSON.stringify(similarPlan.skillPlan)).toString('base64');
       if (progressCallback) {
         let existingContent = '';
@@ -763,6 +764,37 @@ RECOVERY TOOL CONSTRAINT: "DIFFERENT plan" means a different task decomposition,
     } else if (gwt.carrierOptions) {
       profileContextNote += `\n\n⚠️ SMS GATEWAY: Carrier unknown for ${gwt.name} (${gwt.phone}).
   Add a guide.step asking the user to select their carrier, then retry with the gateway email.`;
+    }
+  }
+
+  // ── Resolved self-context injection (from resolveUserContext) ────────────────
+  // Pre-resolved facts (memory hits, email, conversation snippets) are injected
+  // directly into the planning prompt so the planner never needs to guess or
+  // ask about them.
+  if (state.resolvedSelfContext) {
+    const rsc = state.resolvedSelfContext;
+    const lines = [];
+
+    if (rsc.phone)  lines.push(`- User's phone: ${rsc.phone}`);
+    if (rsc.email)  lines.push(`- User's email: ${rsc.email}`);
+
+    if (rsc.memories && typeof rsc.memories === 'object') {
+      for (const [topic, hits] of Object.entries(rsc.memories)) {
+        lines.push(`- Memory — "${topic}":`);
+        hits.forEach(h => lines.push(`    • ${h}`));
+      }
+    }
+
+    if (rsc.conversation && typeof rsc.conversation === 'object') {
+      for (const [topic, hits] of Object.entries(rsc.conversation)) {
+        lines.push(`- Conversation context — "${topic}":`);
+        hits.forEach(h => lines.push(`    ${h}`));
+      }
+    }
+
+    if (lines.length > 0) {
+      profileContextNote += `\n\n⚠️ RESOLVED USER CONTEXT (use these exact values — never use placeholders):\n${lines.join('\n')}`;
+      logger.info(`[Node:PlanSkills] Injecting resolvedSelfContext (${lines.length} line(s))`);
     }
   }
 
@@ -1328,26 +1360,29 @@ Task: "${userMessage}"`;
   // If enrichIntent leaked a chosenService or domainTags from a phi4 false-positive, clear
   // them before the domain context note is built, so the LLM sees a clean message and
   // respects the launchd/node-cron pattern in plan-skills.md.
+  // Use mutable shadows — chosenService/domainTags are const-destructured from state.
+  let _chosenService = chosenService;
+  let _domainTags = domainTags;
   {
     const _PRE_LLM_RECURRING_RE = /\b(every\s+(morning|day|night|evening|week|month|hour|\d)|daily|weekly|monthly|each\s+(morning|day|night|evening|week)|remind\s+me\s+(daily|every)|recurring|repeat(ing)?|on\s+a\s+(daily|weekly|\w+)\s+schedule|alarm)\b/i;
     const _PRE_LLM_EXPLICIT_SVC_RE = /\b(discord|telegram|slack|twilio|clicksend|sendgrid|mailgun|pushover|pushbullet|onesignal|whatsapp)\b/i;
     if (_PRE_LLM_RECURRING_RE.test(userMessage) && !_PRE_LLM_EXPLICIT_SVC_RE.test(userMessage)) {
-      if (chosenService || domainTags) {
-        logger.info(`[Node:PlanSkills] Local recurring reminder pre-LLM guard: cleared chosenService="${chosenService}" and domainTags for: "${userMessage.substring(0, 60)}"`);
-        chosenService = null;
-        domainTags = null;
+      if (_chosenService || _domainTags) {
+        logger.info(`[Node:PlanSkills] Local recurring reminder pre-LLM guard: cleared chosenService="${_chosenService}" and domainTags for: "${userMessage.substring(0, 60)}"`);
+        _chosenService = null;
+        _domainTags = null;
       }
     }
   }
 
   let domainContextNote = '';
-  if (domainTags && (domainTags.tags?.length > 0 || domainTags.skillHints?.length > 0)) {
+  if (_domainTags && (_domainTags.tags?.length > 0 || _domainTags.skillHints?.length > 0)) {
     const parts = [];
-    if (domainTags.tags?.length > 0) parts.push(`Domain: ${domainTags.tags.join(', ')}`);
+    if (_domainTags.tags?.length > 0) parts.push(`Domain: ${_domainTags.tags.join(', ')}`);
 
     // If user already chose a specific service, lock it in — single target, not a list
-    if (chosenService) {
-      const svcLower = chosenService.toLowerCase();
+    if (_chosenService) {
+      const svcLower = _chosenService.toLowerCase();
       const docsUrl = KNOWN_DOCS_URLS[svcLower];
       // Reuse a previously derived skill name (from a prior plan/replan) so duplicate
       // skills never get created under different names for the same task.
@@ -1358,7 +1393,7 @@ Task: "${userMessage}"`;
         // Extract the core action from the user message or skill hints.
         // Format: <service>.<capability>.<action> — e.g. clicksend.sms.send
         const msgLower = (state.message || state.resolvedMessage || '').toLowerCase();
-        const hints = (domainTags?.skillHints || []).map(h => h.toLowerCase());
+        const hints = (_domainTags?.skillHints || []).map(h => h.toLowerCase());
         // If skillHints already provide a dotted name that belongs to this service, use it.
         // MUST start with svcLower — reject unrelated hints like 'twitter.post' when service='clicksend'.
         const dottedHint = hints.find(h => h.includes('.') && h.startsWith(svcLower));
@@ -1371,7 +1406,7 @@ Task: "${userMessage}"`;
           const _NOISE_TAGS = new Set(['social-media', 'smart-home', 'billing', 'scheduling', 'vehicle']);
           const simpleHints = hints.filter(h => !h.includes('.') && !_NOISE_TAGS.has(h));
           const capability = simpleHints[0]
-            || (domainTags?.tags || []).find(t => !_NOISE_TAGS.has(t))?.toLowerCase().replace(/[^a-z0-9]/g, '')
+            || (_domainTags?.tags || []).find(t => !_NOISE_TAGS.has(t))?.toLowerCase().replace(/[^a-z0-9]/g, '')
             || 'api';
           // Extract verb: match common action words near the start of the message
           const verbMatch = msgLower.match(/\b(send|check|get|create|list|delete|update|monitor|watch|read|write|track|schedule|cancel|search|play|control|open|close|turn|set|move|find|book|order|pay|call|text|email|push|notify|forward|upload|download|sync|backup|export|import|analyze|convert|translate|generate|summarize|record|stream)\b/);
@@ -1379,7 +1414,7 @@ Task: "${userMessage}"`;
           skillName = `${svcLower}.${capability}.${action}`;
         }
       }
-      parts.push(`Chosen service: ${chosenService} (user selected)`);
+      parts.push(`Chosen service: ${_chosenService} (user selected)`);
       if (docsUrl) {
         parts.push(`API docs URL: ${docsUrl}`);
       } else {
@@ -1388,28 +1423,28 @@ Task: "${userMessage}"`;
       parts.push(`Skill name to create: ${skillName}`);
       const crawlInstruction = docsUrl
         ? `web.crawl("${docsUrl}")`
-        : `web.crawl("https://www.google.com/search?q=${encodeURIComponent(chosenService + ' API documentation send notification')}") to discover the real docs URL, then web.crawl that URL`;
+        : `web.crawl("https://www.google.com/search?q=${encodeURIComponent(_chosenService + ' API documentation send notification')}") to discover the real docs URL, then web.crawl that URL`;
       domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Use browser.agent to register and execute — step 1: { "skill": "browser.agent", "args": { "action": "build_agent", "service": "${svcLower}" } }, step 2: { "skill": "browser.agent", "args": { "action": "run", "agentId": "${svcLower}.agent", "task": "<repeat the full user request verbatim>" } }.\n- FORBIDDEN: Do NOT use skill.bootstrap — it is not a registered skill and will always fail with "Unknown skill: skill.bootstrap".\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials. Credentials are handled automatically via keychain.\n- FORBIDDEN: Do NOT use api_suggest — the service is already chosen.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
-      logger.info(`[Node:PlanSkills] Domain context (chosen service): ${chosenService} → ${skillName}`);
+      logger.info(`[Node:PlanSkills] Domain context (chosen service): ${_chosenService} → ${skillName}`);
       // Store the locked skill name back on state so subsequent replans reuse the exact same name
       state = { ...state, pendingSkillName: skillName };
     } else {
-      if (domainTags.services?.length > 0) parts.push(`Target services (in priority order): ${domainTags.services.join(', ')}`);
-      if (domainTags.skillHints?.length > 0) parts.push(`Suggested skill name: ${domainTags.skillHints[0]}`);
+      if (_domainTags.services?.length > 0) parts.push(`Target services (in priority order): ${_domainTags.services.join(', ')}`);
+      if (_domainTags.skillHints?.length > 0) parts.push(`Suggested skill name: ${_domainTags.skillHints[0]}`);
 
       // Built-in skills (browser.act, shell.run, ui.*, etc.) don't need the skill.bootstrap
       // pipeline — they are already available. Only force skillCreator for external API services.
       const BUILTIN_SKILLS = new Set(['browser.act', 'shell.run', 'ui.axClick', 'ui.typeText', 'ui.click', 'ui.moveMouse', 'ui.waitFor', 'ui.screen.verify', 'image.analyze', 'fs.read', 'web.crawl', 'screen.capture']);
-      const firstHint = (domainTags.skillHints?.[0] || '').toLowerCase();
+      const firstHint = (_domainTags.skillHints?.[0] || '').toLowerCase();
       const isBuiltin = BUILTIN_SKILLS.has(firstHint) || [...BUILTIN_SKILLS].some(b => firstHint.startsWith(b));
 
       if (isBuiltin) {
         // Built-in skill — just inject domain context as info, don't force skillCreator
         domainContextNote = `\n\n⚠️ DOMAIN CONTEXT:\n${parts.map(p => `- ${p}`).join('\n')}\n- This capability is provided by the built-in "${firstHint}" skill — do NOT use skill.bootstrap pattern.\n- If the user is asking to CREATE or BUILD a new skill/tool for this capability, output: [{"skill":"needs_skill","args":{"capability":"<describe what they want>","suggestion":"${firstHint}"}}]\n- OUTPUT: A valid JSON array only.`;
-        logger.info(`[Node:PlanSkills] Domain context injected (builtin): ${domainTags.tags?.join(', ')} → ${firstHint}`);
+        logger.info(`[Node:PlanSkills] Domain context injected (builtin): ${_domainTags.tags?.join(', ')} → ${firstHint}`);
       } else {
         domainContextNote = `\n\n⚠️ DOMAIN CONTEXT — READ BEFORE PLANNING:\n${parts.map(p => `- ${p}`).join('\n')}\n- REQUIRED: Because this is a messaging/API task with a known target API service, use browser.agent — { "skill": "browser.agent", "args": { "action": "build_agent", "service": "<detected-service>" } } to register, then { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "<full user request verbatim>" } } to execute.\n- FORBIDDEN: Do NOT use skill.bootstrap — it is not a registered skill and will always fail with "Unknown skill: skill.bootstrap".\n- FORBIDDEN: Do NOT use shell.run with placeholder credentials like <TWILIO_ACCOUNT_SID> or <API_KEY>. Credentials are handled automatically via keychain — never hardcode them.\n- FORBIDDEN: Do NOT use api_suggest — the service is already identified above.\n- OUTPUT: A valid JSON array only. No prose, no markdown outside the array.`;
-        logger.info(`[Node:PlanSkills] Domain context injected: ${domainTags.tags?.join(', ')} → ${domainTags.skillHints?.[0]}`);
+        logger.info(`[Node:PlanSkills] Domain context injected: ${_domainTags.tags?.join(', ')} → ${_domainTags.skillHints?.[0]}`);
       }
     }
   }
@@ -2014,13 +2049,86 @@ CRITICAL rules for skill.md:
     if (needsSkillStep) {
       // ── SMS gateway bypass: if smsGatewayTarget is resolved, skip scout entirely ──
       // The planner should already have used gmail.agent via the injected gateway block,
-      // but if it still emitted needs_skill for SMS, force a replan with the gateway note.
+      // but if it still emitted needs_skill for SMS, force a bypass plan here.
+      // For recurring tasks: write a bridge skill.md so SkillScheduler handles it.
+      // For one-off tasks: generate an immediate gmail.agent send.
       if (state.smsGatewayTarget?.email) {
         const capability = needsSkillStep.args?.capability || userMessage;
-        const SMS_KEYWORDS = /\b(sms|text message|text.*someone|send.*text|message.*via.*sms)\b/i;
+        const SMS_KEYWORDS = /\b(sms|text message|text.*someone|send.*text|message.*via.*sms|daily.*sms|sms.*summary)\b/i;
         if (SMS_KEYWORDS.test(capability) || SMS_KEYWORDS.test(userMessage)) {
-          logger.info(`[Node:PlanSkills] SMS gateway bypass: replan with forced gmail.agent route for "${capability}"`);
           const gwt = state.smsGatewayTarget;
+          const RECURRING_RE = /\b(daily|every|weekly|each\s+(morning|evening|day|night)|at\s+\d+\s*(am|pm)|cron|recurring|each\s+week)\b/i;
+          const isRecurring = RECURRING_RE.test(userMessage) || RECURRING_RE.test(capability);
+
+          if (isRecurring) {
+            // ── Bridge skill plan — SkillScheduler will handle the cron ───────
+            logger.info(`[Node:PlanSkills] SMS gateway bypass (recurring): writing bridge skill for "${capability}"`);
+
+            // Derive a cron expression from the message heuristically
+            // e.g. "daily at 9pm" → "0 21 * * *", "every morning" → "0 8 * * *"
+            let cronExpr = '0 9 * * *'; // default: 9am daily
+            const timeMatch = userMessage.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+            if (timeMatch) {
+              let h = parseInt(timeMatch[1], 10);
+              const min = parseInt(timeMatch[2] || '0', 10);
+              const period = (timeMatch[3] || '').toLowerCase();
+              if (period === 'pm' && h < 12) h += 12;
+              if (period === 'am' && h === 12) h = 0;
+              cronExpr = `${min} ${h} * * *`;
+            } else if (/every\s+morning|each\s+morning/i.test(userMessage)) {
+              cronExpr = '0 8 * * *';
+            } else if (/every\s+evening|each\s+evening/i.test(userMessage)) {
+              cronExpr = '0 18 * * *';
+            } else if (/weekly|every\s+week/i.test(userMessage)) {
+              cronExpr = '0 9 * * 1'; // Monday 9am
+            }
+
+            const skillSlug = `sms.gateway.${gwt.name.replace(/\s+/g, '.').toLowerCase()}`.slice(0, 50);
+            const instruction = `Send SMS to ${gwt.name} via email gateway: send email to ${gwt.email} with empty subject and body containing the SMS content. Original request: ${userMessage.slice(0, 200)}`;
+
+            const bridgePlan = [
+              {
+                skill: 'shell.run',
+                args: {
+                  cmd: 'bash',
+                  argv: ['-c', [
+                    `mkdir -p "$HOME/.thinkdrop/skills/${skillSlug}"`,
+                    `cat > "$HOME/.thinkdrop/skills/${skillSlug}/skill.md" << 'SKILLEOF'`,
+                    `---`,
+                    `name: ${skillSlug}`,
+                    `schedule: "${cronExpr}"`,
+                    `type: bridge`,
+                    `title: SMS to ${gwt.name}`,
+                    `instruction: ${instruction.replace(/\n/g, ' ')}`,
+                    `description: Recurring SMS to ${gwt.name} via carrier gateway (${gwt.carrier})`,
+                    `---`,
+                    `## Plan`,
+                    `Send SMS via email-to-SMS carrier gateway.`,
+                    `SKILLEOF`,
+                    `echo 'Bridge SMS skill written'`,
+                  ].join(' && ')],
+                },
+                description: `Write bridge skill.md for recurring SMS to ${gwt.name}`,
+              },
+              {
+                skill: 'skill.install',
+                args: { skillPath: `~/.thinkdrop/skills/${skillSlug}/skill.md` },
+                description: 'Register skill so SkillScheduler picks up the cron',
+              },
+              {
+                skill: 'shell.run',
+                args: {
+                  cmd: 'bash',
+                  argv: ['-c', "curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo 'node-cron activated'"],
+                },
+                description: 'Sync SkillScheduler to activate the cron immediately',
+              },
+            ];
+            return { ...state, skillPlan: bridgePlan, skillCursor: 0, scoutPending: false };
+          }
+
+          // ── One-off immediate send ─────────────────────────────────────────
+          logger.info(`[Node:PlanSkills] SMS gateway bypass (one-off): gmail.agent send for "${capability}"`);
           const bypassPlan = [{
             skill: 'browser.agent',
             args: {
@@ -2187,11 +2295,16 @@ CRITICAL rules for skill.md:
             steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })),
             intent: state.intent?.type || 'command_automate',
           });
+          // If phone is known but carrier failed (e.g. Numverify returned empty for a ported number),
+          // pre-fill the FREE gateway card and show the carrier dropdown so user picks once permanently.
+          const _gwt = state.smsGatewayTarget;
+          const _smsNeedsCarrier = _gwt?.phone && !_gwt?.carrier;
           if (progressCallback) progressCallback({
             type: 'scout_match',
             capability: capability || userMessage,
             suggestion,
             matches: allMatches,
+            ...(_smsNeedsCarrier && { prefillPhone: _gwt.phone, showCarrierDropdown: true }),
           });
 
           // Pause state — main.js will resume with scout:select IPC carrying chosen match
@@ -2259,11 +2372,14 @@ CRITICAL rules for skill.md:
                   steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })),
                   intent: state.intent?.type || 'command_automate',
                 });
+                const _gwt2 = state.smsGatewayTarget;
+                const _smsNeedsCarrier2 = _gwt2?.phone && !_gwt2?.carrier;
                 if (progressCallback) progressCallback({
                   type: 'scout_match',
                   capability: capability || userMessage,
                   suggestion,
                   matches: dynamicMatches,
+                  ...(_smsNeedsCarrier2 && { prefillPhone: _gwt2.phone, showCarrierDropdown: true }),
                 });
                 return {
                   ...state,

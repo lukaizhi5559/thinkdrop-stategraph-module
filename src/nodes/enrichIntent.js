@@ -459,6 +459,25 @@ module.exports = async function enrichIntent(state) {
     ? null
     : await extractDomainTags(commandMessage, mcpAdapter, logger);
 
+  // ── Pre-capture NLI SMS/email signal before guards can null domainTags ──────
+  // The NLI (nli-deberta-v3-small) fires sms/text-message for all explicit SMS
+  // phrasings including variants like "via text message", "shoot me a text", etc.
+  // Both the LLM-validation guard and the local-recurring guard may discard
+  // domainTags entirely, but resolveUserContext still needs to know whether to
+  // pre-fetch phone/carrier context for the task.
+  //
+  // Guard: exclude when slack/discord are in tags — the NLI fires text-message
+  // for "DM"/"message" keywords even when the actual service is a chat app.
+  const _SMS_NLI_LABELS  = new Set(['sms', 'text-message', 'phone-call']);
+  const _CHAT_NLI_LABELS = new Set(['slack', 'discord']);
+  let _smsTagSignal   = false;
+  let _emailTagSignal = false;
+  if (domainTags && Array.isArray(domainTags.tags)) {
+    const _noChatOverride = !domainTags.tags.some(t => _CHAT_NLI_LABELS.has(t));
+    _smsTagSignal   = _noChatOverride && domainTags.tags.some(t => _SMS_NLI_LABELS.has(t));
+    _emailTagSignal = domainTags.tags.includes('email');
+  }
+
   if (domainTags && domainTags.services?.length > 0 && llmBackend) {
     try {
       const _validationPrompt = `A task classification model returned these service tags for a user message. Answer YES if the tags genuinely apply (the task requires contacting or using these services), or NO if they are false positives (the task is unrelated — e.g. browser navigation, file operation, search).
@@ -491,10 +510,14 @@ Answer with exactly one word: YES or NO.`;
   // external delivery channel, discard domainTags entirely so planSkills
   // receives a clean slate and can use the launchd/node-cron pattern.
   const _LOCAL_RECURRING_RE = /\b(every\s+(morning|day|night|evening|week|month|hour|\d)|daily|weekly|monthly|each\s+(morning|day|night|evening|week)|remind\s+me\s+(daily|every)|recurring|repeat(ing)?|on\s+a\s+(daily|weekly|\w+)\s+schedule|alarm)\b/i;
-  const _EXPLICIT_EXTERNAL_SVC_RE = /\b(discord|telegram|slack|twilio|clicksend|sendgrid|mailgun|pushover|pushbullet|onesignal|whatsapp|sms\s+me|text\s+me)\b/i;
+  // Include bare \bsms\b and text message/summary/update so recurring SMS tasks
+  // (e.g. "send daily SMS summary") are NOT cleared by the local-recurring guard.
+  const _EXPLICIT_EXTERNAL_SVC_RE = /\b(discord|telegram|slack|twilio|clicksend|sendgrid|mailgun|pushover|pushbullet|onesignal|whatsapp|sms\s+me|text\s+me|sms|text\s+(message|summary|update|alert|report))\b/i;
   if (_LOCAL_RECURRING_RE.test(commandMessage) && !_EXPLICIT_EXTERNAL_SVC_RE.test(commandMessage)) {
     logger.info(`[Node:EnrichIntent] Local recurring reminder guard — clearing domain tags for: "${commandMessage.substring(0, 60)}"`);
     domainTags = null;
+    _smsTagSignal   = false;  // confirmed local recurring task — no external messaging
+    _emailTagSignal = false;
   }
 
   // Filter phi4 results to real messaging providers (seed + learned)
@@ -585,7 +608,7 @@ Answer with exactly one word: YES or NO.`;
   const triggered = _wasTranslated ? [] : GAP_DETECTORS.filter(d => d.pattern.test(commandMessage));
   if (triggered.length === 0 && entityRefs.length === 0) {
     logger.debug('[Node:EnrichIntent] No gaps detected — passthrough');
-    return { ...state, domainTags: domainTags || state.domainTags, chosenService: chosenService || state.chosenService };
+    return { ...state, domainTags: domainTags || state.domainTags, chosenService: chosenService || state.chosenService, _smsTagSignal, _emailTagSignal };
   }
 
   const resolvedFacts = [];
@@ -659,6 +682,8 @@ Answer with exactly one word: YES or NO.`;
       profileContext,
       domainTags: domainTags || state.domainTags,
       chosenService: chosenService || state.chosenService,
+      _smsTagSignal,
+      _emailTagSignal,
       enrichmentNeeded: deduped,
       answer: questionText,
       enrichmentPendingMessage: commandMessage,
@@ -671,6 +696,8 @@ Answer with exactly one word: YES or NO.`;
     profileContext,
     domainTags: domainTags || state.domainTags,
     chosenService: chosenService || state.chosenService,
+    _smsTagSignal,
+    _emailTagSignal,
     enrichmentNeeded: [],
   };
 };

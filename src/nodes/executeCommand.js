@@ -2880,6 +2880,48 @@ module.exports = async function executeCommand(state) {
       }
     }
 
+    // ── Credential gather card path ───────────────────────────────────────────
+    // When browser.agent returns needsCredentials: true, show the gather_credential
+    // UI card directly (instead of a plain text question). The user types the value,
+    // it gets stored encrypted, then we retry the same step automatically.
+    if (raw.agentId && raw.askUser === true && raw.needsCredentials && raw.credentialKey && typeof gatherCredentialCallback === 'function') {
+      logger.info(`[Node:ExecuteCommand] credential gate: gathering ${raw.credentialKey} for ${raw.agentId}`);
+      try {
+        if (progressCallback) progressCallback({
+          type:          'gather_credential',
+          credentialKey: raw.credentialKey,
+          question:      raw.question,
+          hint:          `Stored securely for future logins to ${raw.agentId}.`,
+          sensitive:     false,
+          optional:      true,
+          stepIndex:     skillCursor,
+          totalSteps:    skillPlan?.length || 1,
+        });
+        const _gathered = await gatherCredentialCallback(raw.credentialKey, {
+          question:  raw.question,
+          sensitive: false,
+        });
+        if (_gathered?.stored) {
+          logger.info(`[Node:ExecuteCommand] credential gate: stored ${raw.credentialKey} — retrying step`);
+          if (progressCallback) progressCallback({ type: 'gather_credential_stored', credentialKey: raw.credentialKey });
+          // Retry the same step: keep skillCursor unchanged, clear failure state
+          return {
+            ...state,
+            skillResults,
+            skillCursor,
+            failedStep:      null,
+            pendingQuestion: null,
+            recoveryAction:  null,
+            commandExecuted: false,
+          };
+        }
+        // User skipped or gather timed out — fall through to plain ask_user text prompt
+        logger.info(`[Node:ExecuteCommand] credential gate: skipped or error — falling through to ask_user`);
+      } catch (_gatherErr) {
+        logger.warn(`[Node:ExecuteCommand] credential gate error: ${_gatherErr.message}`);
+      }
+    }
+
     // ── Agent ask_user short-circuit ──────────────────────────────────────────
     // When cli.agent (or browser.agent api_key path) returns askUser: true, surface
     // the agent's exact question directly without routing through recoverSkill.
@@ -2906,6 +2948,7 @@ module.exports = async function executeCommand(state) {
           context:  `${description || skill} (step ${skillCursor + 1})`,
           _isAgentAskUser: true,
           agentId: raw.agentId || null,
+          needsCredentials: raw.needsCredentials || false,
         },
         commandExecuted: false,
       };

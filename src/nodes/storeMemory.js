@@ -247,7 +247,7 @@ async function _dualWriteProfile(mcpAdapter, profilePairs, userId, logger) {
     try {
       await mcpAdapter.callService('user-memory', 'profile.set', {
         key,
-        value,
+        valueRef: value,
         userId,
       }, { timeoutMs: 4000 });
       logger.debug(`[Node:StoreMemory] profile.set key="${key}"`);
