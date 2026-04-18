@@ -387,11 +387,19 @@ module.exports = async function planSkills(state) {
   }
   // ── End constraint gate ──────────────────────────────────────────────────────
 
+  // ── isRecurring: hoisted early — guards both plan cache and cacheShortCircuitNote ──
+  // Recurring automation tasks always have user-specified timing ("every 2 minutes",
+  // "daily at 9pm") that MUST be replanned from scratch. Caching a prior schedule
+  // would silently inherit the old timing and ignore what the user just asked for.
+  const RECURRING_RE = /\b(daily|every|weekly|each\s+(morning|evening|day|night)|at\s+\d+\s*(am|pm)|cron|recurring|each\s+week)\b/i;
+  const isRecurring = RECURRING_RE.test(userMessage);
+
   // ── Existing plan similarity check ───────────────────────────────────────────
   // Before invoking the LLM, check for a previously completed identical/similar plan.
   // Only offers reuse when the plan ran 100% successfully (status: complete).
-  // Guards: skip when replanning after failure, multi-intent queue, or _forceNewPlan.
-  if (!recoveryContext && !state.isMultiIntent && !state._forceNewPlan) {
+  // Guards: skip when replanning after failure, multi-intent queue, _forceNewPlan,
+  // or recurring tasks (schedule parameters in the message must always be re-planned).
+  if (!recoveryContext && !state.isMultiIntent && !state._forceNewPlan && !isRecurring) {
     // ── Phase 3: In-memory session cache — zero disk I/O on exact repeats ──────
     const _cacheKey = _sessionCacheKey(userMessage);
     const _cached   = _sessionCacheGet(_cacheKey);
@@ -621,7 +629,9 @@ RECOVERY TOOL CONSTRAINT: "DIFFERENT plan" means a different task decomposition,
       const _cacheAgeMs = Date.now() - new Date(lastSynthMsg.timestamp).getTime();
       const _cacheAgeMin = Math.round(_cacheAgeMs / 60000);
       const _CACHE_TTL_MIN = 360; // 6 hours
-      if (_cacheAgeMin < _CACHE_TTL_MIN) {
+      // Skip for recurring tasks — the prior synthesis is a setup confirmation for a
+      // different schedule, not reusable data. LLM would inherit the old cron timing.
+      if (_cacheAgeMin < _CACHE_TTL_MIN && !isRecurring) {
         const _cachePreview = priorSynthesizedContent.slice(0, 1500).replace(/\n/g, ' ');
         const _cacheAgeLabel = _cacheAgeMin < 60 ? `${_cacheAgeMin} min ago` : `${Math.round(_cacheAgeMin / 60 * 10) / 10} hr ago`;
         cacheShortCircuitNote = `\n\n💾 PRIOR SYNTHESIS CACHE (${_cacheAgeLabel}):\nThe following data was synthesized ${_cacheAgeLabel} from browser agent results for a prior run:\n---\n${_cachePreview}${priorSynthesizedContent.length > 1500 ? '...(truncated)' : ''}\n---\nINSTRUCTION: If the cached content above clearly covers the data needed for the CURRENT request (same topic, same entities, same scope), you MAY replace browser.agent scraping steps with a synthesize step whose description starts with "[cached]". The synthesize engine will automatically use this cached content. Only skip browser.agent steps when the cache is clearly applicable — do NOT skip when the user explicitly asks for a fresh lookup, live data, news, real-time info, or when the topic differs materially.`;
@@ -653,9 +663,14 @@ RECOVERY TOOL CONSTRAINT: "DIFFERENT plan" means a different task decomposition,
   // When the user says "text this info to me", "email this to my phone", etc.,
   // the LLM has no idea what "this info" is unless we explicitly provide it.
   // Inject the prior synthesized content as the EXACT message body to send.
+  //
+  // GUARD: isRecurring (hoisted above) — recurring tasks gather fresh content at
+  // run time; the prior synthesis is a stale setup confirmation, not a message body.
   let messagingBodyNote = '';
-  const isMessagingTask = /^(text|send|email|message|forward|share|ping|tell|notify)/i.test(userMessage.trim()) ||
-    /\b(text|sms|send.*message|email.*me|message.*me)\b/i.test(userMessage);
+  const isMessagingTask = !isRecurring && (
+    /^(text|send|email|message|forward|share|ping|tell|notify)/i.test(userMessage.trim()) ||
+    /\b(text|sms|send.*message|email.*me|message.*me)\b/i.test(userMessage)
+  );
   if (isMessagingTask && priorSynthesizedContent) {
     // Sanitize: if the prior content is a raw JSON fallback (from the synthesis apology
     // path), extract a human-readable summary from the calendar/API items so we don't
@@ -2084,30 +2099,102 @@ CRITICAL rules for skill.md:
             }
 
             const skillSlug = `sms.gateway.${gwt.name.replace(/\s+/g, '.').toLowerCase()}`.slice(0, 50);
-            const instruction = `Send SMS to ${gwt.name} via email gateway: send email to ${gwt.email} with empty subject and body containing the SMS content. Original request: ${userMessage.slice(0, 200)}`;
+            const instruction = userMessage.slice(0, 400).trim();
+
+            // ── Detect installed email agent for a service-specific ## Commands block ──
+            // installedSkillsList is populated in outer scope during pre-planning lookups.
+            // If a known email agent is installed, bake its exact REST API curl into the
+            // skill.md body so parseContractCommands() finds a ## Commands block and the
+            // contract fast path assembles steps deterministically (no free-form LLM).
+            // Fallback: generic ## Plan guidance when no known email agent is detected.
+            const _SMS_EMAIL_AGENTS = [
+              {
+                agentName: 'gmail.agent',
+                oauth: 'google',
+                oauthScopes: 'google=https://www.googleapis.com/auth/gmail.send',
+                commandLines: [
+                  '## Commands',
+                  '',
+                  '### Send SMS via Gmail API',
+                  '```bash',
+                  'SUMMARY="[DATA FROM STEP 1]"',
+                  `RAW=$(printf "To: ${gwt.email}\\r\\nSubject: \\r\\n\\r\\n%s" "$SUMMARY" | base64 | tr '+/' '-_' | tr -d '=\\n')`,
+                  'curl -s -X POST "https://gmail.googleapis.com/gmail/v1/users/me/messages/send" \\',
+                  '  -H "Authorization: Bearer $GOOGLE_ACCESS_TOKEN" \\',
+                  '  -H "Content-Type: application/json" \\',
+                  `  -d "{\\"raw\\":\\"$RAW\\"}"`,
+                  '```',
+                  'CRITICAL: $GOOGLE_ACCESS_TOKEN is pre-injected. Use shell.run + curl above. Do NOT use browser.agent or gmail.agent.',
+                ],
+              },
+              {
+                agentName: 'outlook.agent',
+                oauth: 'microsoft',
+                oauthScopes: 'microsoft=Mail.Send',
+                commandLines: [
+                  '## Commands',
+                  '',
+                  '### Send SMS via Outlook Graph API',
+                  '```bash',
+                  'SUMMARY="[DATA FROM STEP 1]"',
+                  'curl -s -X POST "https://graph.microsoft.com/v1.0/me/sendMail" \\',
+                  '  -H "Authorization: Bearer $MICROSOFT_ACCESS_TOKEN" \\',
+                  '  -H "Content-Type: application/json" \\',
+                  `  -d "{\\"message\\":{\\"subject\\":\\"\\",\\"body\\":{\\"contentType\\":\\"Text\\",\\"content\\":\\"$SUMMARY\\"},\\"toRecipients\\":[{\\"emailAddress\\":{\\"address\\":\\"${gwt.email}\\"}}]}}"`,
+                  '```',
+                  'CRITICAL: $MICROSOFT_ACCESS_TOKEN is pre-injected. Use shell.run + curl above. Do NOT use browser.agent or outlook.agent.',
+                ],
+              },
+            ];
+            const _detectedEmailAgent = _SMS_EMAIL_AGENTS.find(e =>
+              installedSkillsList.some(s => s.name === e.agentName)
+            );
+
+            const _oauthFmLines = _detectedEmailAgent
+              ? [`oauth: ${_detectedEmailAgent.oauth}`, `oauth_scopes: ${_detectedEmailAgent.oauthScopes}`]
+              : [];
+            const _bodyLines = _detectedEmailAgent
+              ? [
+                  ..._detectedEmailAgent.commandLines,
+                  '',
+                  '## Plan',
+                  '1. Gather content described in the instruction using the appropriate agent or data source.',
+                  '2. Send the result using the curl command in ## Commands above. Do NOT use browser.agent.',
+                ]
+              : [
+                  '## Plan',
+                  '1. Gather content described in the instruction using the appropriate agent or data source.',
+                  `2. Send the result as an email to ${gwt.email} with an empty subject using the user's connected email service REST API with the injected access token. Use shell.run + curl. Do NOT use browser.agent.`,
+                ];
+
+            const skillMd = [
+              '---',
+              `name: ${skillSlug}`,
+              `schedule: "${cronExpr}"`,
+              'type: bridge',
+              `title: SMS to ${gwt.name}`,
+              `instruction: ${instruction.replace(/\n/g, ' ')}`,
+              `description: Recurring SMS to ${gwt.name} via carrier gateway (${gwt.carrier})`,
+              `sms_gateway_email: ${gwt.email}`,
+              `sms_gateway_name: ${gwt.name}`,
+              ..._oauthFmLines,
+              '---',
+              '',
+              ..._bodyLines,
+            ].join('\n');
+
+            const setupScript = [
+              `mkdir -p "$HOME/.thinkdrop/skills/${skillSlug}"`,
+              `cat > "$HOME/.thinkdrop/skills/${skillSlug}/skill.md" << 'SKILLEOF'`,
+              skillMd,
+              'SKILLEOF',
+              `echo 'Bridge SMS skill written'`,
+            ].join('\n');
 
             const bridgePlan = [
               {
                 skill: 'shell.run',
-                args: {
-                  cmd: 'bash',
-                  argv: ['-c', [
-                    `mkdir -p "$HOME/.thinkdrop/skills/${skillSlug}"`,
-                    `cat > "$HOME/.thinkdrop/skills/${skillSlug}/skill.md" << 'SKILLEOF'`,
-                    `---`,
-                    `name: ${skillSlug}`,
-                    `schedule: "${cronExpr}"`,
-                    `type: bridge`,
-                    `title: SMS to ${gwt.name}`,
-                    `instruction: ${instruction.replace(/\n/g, ' ')}`,
-                    `description: Recurring SMS to ${gwt.name} via carrier gateway (${gwt.carrier})`,
-                    `---`,
-                    `## Plan`,
-                    `Send SMS via email-to-SMS carrier gateway.`,
-                    `SKILLEOF`,
-                    `echo 'Bridge SMS skill written'`,
-                  ].join(' && ')],
-                },
+                args: { cmd: 'bash', argv: ['-c', setupScript] },
                 description: `Write bridge skill.md for recurring SMS to ${gwt.name}`,
               },
               {
@@ -2128,12 +2215,16 @@ CRITICAL rules for skill.md:
           }
 
           // ── One-off immediate send ─────────────────────────────────────────
-          logger.info(`[Node:PlanSkills] SMS gateway bypass (one-off): gmail.agent send for "${capability}"`);
+          // Use the detected email agent if one is installed; fall back to gmail.agent.
+          const _oneOffEmailAgentId = installedSkillsList.find(s =>
+            ['gmail.agent', 'outlook.agent'].includes(s.name)
+          )?.name || 'gmail.agent';
+          logger.info(`[Node:PlanSkills] SMS gateway bypass (one-off): ${_oneOffEmailAgentId} send for "${capability}"`);
           const bypassPlan = [{
             skill: 'browser.agent',
             args: {
               action: 'run',
-              agentId: 'gmail.agent',
+              agentId: _oneOffEmailAgentId,
               task: `Send email to ${gwt.email} with empty subject and body: ${userMessage}`,
             },
             description: `Send SMS to ${gwt.name} via carrier gateway (${gwt.carrier})`,
@@ -2518,6 +2609,179 @@ CRITICAL rules for skill.md:
             // Full user message becomes the instruction so the AI has complete context at fire time.
             const bridgeInstruction = userMessage;
 
+            // ── Detect installed email agent for email/SMS-related bridge skills ──
+            // If the instruction involves sending email/SMS, bake service-specific
+            // ## Commands + oauth frontmatter so the contract fast path runs deterministically
+            // at cron fire time instead of the LLM picking browser.agent.
+            const _bridgeEmailKwRe = /\b(email|gmail|send.*message|sms|text.*me|text.*summary|carrier.*gateway|@vtext|@txt|@mms)\b/i;
+            const _bridgeNeedsEmail = _bridgeEmailKwRe.test(bridgeInstruction);
+
+            // Reuse SMS gateway email if already resolved (resolvedSelfContext may carry it)
+            const _bridgeGatewayEmail = state.context?.smsGatewayEmail || null;
+
+            // Known email agents — same pattern as _SMS_EMAIL_AGENTS in SMS gateway bypass
+            // startUrl is the canonical inbox URL for the agent — used to anchor playwright.agent
+            // to the right starting page even if the browser session drifted elsewhere.
+            // Add any new email agent here alongside its startUrl and it will automatically
+            // get a pre-cached single-step execution plan at skill-creation time.
+            const _BRIDGE_EMAIL_AGENTS = [
+              {
+                agentName: 'gmail.agent',
+                startUrl: 'https://mail.google.com/mail/u/0/#inbox',
+                oauth: 'google',
+                oauthScopes: 'google=https://www.googleapis.com/auth/gmail.send',
+                buildCommandLines: (toEmail) => {
+                  const toArg = toEmail || '[RECIPIENT_EMAIL]';
+                  return [
+                    '## Commands',
+                    '',
+                    '### Send message via Gmail API',
+                    '```bash',
+                    'BODY="[DATA FROM STEP 1]"',
+                    `RAW=$(printf "To: ${toArg}\\r\\nSubject: \\r\\n\\r\\n%s" "$BODY" | base64 | tr '+/' '-_' | tr -d '=\\n')`,
+                    'curl -s -X POST "https://gmail.googleapis.com/gmail/v1/users/me/messages/send" \\',
+                    '  -H "Authorization: Bearer $GOOGLE_ACCESS_TOKEN" \\',
+                    '  -H "Content-Type: application/json" \\',
+                    '  -d "{\\"raw\\":\\"$RAW\\"}"',
+                    '```',
+                    'CRITICAL: $GOOGLE_ACCESS_TOKEN is pre-injected. Use shell.run + curl. Do NOT use browser.agent or gmail.agent.',
+                  ];
+                },
+              },
+              {
+                agentName: 'outlook.agent',
+                startUrl: 'https://outlook.live.com/mail/0/inbox',
+                oauth: 'microsoft',
+                oauthScopes: 'microsoft=Mail.Send',
+                buildCommandLines: (toEmail) => {
+                  const toArg = toEmail || '[RECIPIENT_EMAIL]';
+                  return [
+                    '## Commands',
+                    '',
+                    '### Send message via Outlook Graph API',
+                    '```bash',
+                    'BODY="[DATA FROM STEP 1]"',
+                    'curl -s -X POST "https://graph.microsoft.com/v1.0/me/sendMail" \\',
+                    '  -H "Authorization: Bearer $MICROSOFT_ACCESS_TOKEN" \\',
+                    '  -H "Content-Type: application/json" \\',
+                    `  -d "{\\"message\\":{\\"subject\\":\\"\\",\\"body\\":{\\"contentType\\":\\"Text\\",\\"content\\":\\"$BODY\\"},\\"toRecipients\\":[{\\"emailAddress\\":{\\"address\\":\\"${toArg}\\"}}]}}"`,
+                    '```',
+                    'CRITICAL: $MICROSOFT_ACCESS_TOKEN is pre-injected. Use shell.run + curl. Do NOT use browser.agent or outlook.agent.',
+                  ];
+                },
+              },
+              {
+                agentName: 'yahoo.agent',
+                startUrl: 'https://mail.yahoo.com',
+                oauth: 'yahoo',
+                oauthScopes: '',
+                buildCommandLines: () => [],
+              },
+              {
+                agentName: 'protonmail.agent',
+                startUrl: 'https://mail.proton.me',
+                oauth: 'proton',
+                oauthScopes: '',
+                buildCommandLines: () => [],
+              },
+              {
+                agentName: 'fastmail.agent',
+                startUrl: 'https://www.fastmail.com',
+                oauth: 'fastmail',
+                oauthScopes: '',
+                buildCommandLines: () => [],
+              },
+              {
+                agentName: 'zohomail.agent',
+                startUrl: 'https://mail.zoho.com',
+                oauth: 'zoho',
+                oauthScopes: '',
+                buildCommandLines: () => [],
+              },
+            ];
+
+            // ── Service-aware agent selection (mention-first, generic fallback) ──────────
+            // Priority 1: extract the email service the user explicitly named.
+            //   Two-pass: (1) well-known keyword list, (2) generic "my X account/email/inbox".
+            // Priority 2: normalise legacy aliases (verizon→yahoo, hotmail/live/msn→outlook).
+            // Priority 3: look up in _BRIDGE_EMAIL_AGENTS for an API-shortcut entry.
+            //   → known AND installed:     use full API-shortcut entry
+            //   → known AND NOT installed: generic stub + set _needsBuildAgent
+            //   → unknown service:         generic stub + set _needsBuildAgent
+            // Priority 4: no service named → first installed agent from _BRIDGE_EMAIL_AGENTS.
+            // This means ANY email service works — no list expansion required.
+            const _BRIDGE_SERVICE_ALIASES = {
+              verizon: 'yahoo', hotmail: 'outlook', live: 'outlook', msn: 'outlook',
+            };
+
+            // Pass 1: explicit well-known service name
+            const _knownSvcRe = /\b(gmail|outlook|yahoo|aol|verizon|protonmail|fastmail|zohomail|zoho|icloud|hotmail|live|msn|tutanota|tuta|hey|superhuman|spark)\b/i;
+            let _mentionedService = (_knownSvcRe.exec(bridgeInstruction)?.[1] || '').toLowerCase();
+
+            // Pass 2: generic "my X account/email/inbox" — catches any unknown service
+            if (!_mentionedService) {
+              const _genericSvcMatch = /\bmy\s+(\w+)\s+(?:account|email|inbox|mail)\b/i.exec(bridgeInstruction)
+                                    || /\b(\w+)\s+(?:account|email|inbox|mail)\b/i.exec(bridgeInstruction);
+              if (_genericSvcMatch) {
+                const _candidate = _genericSvcMatch[1].toLowerCase();
+                const _NOT_SVC = new Set(['my','the','a','an','email','some','any','this','that','your','our','new','old','main','primary','secondary','work','personal']);
+                if (!_NOT_SVC.has(_candidate) && _candidate.length >= 3) {
+                  _mentionedService = _candidate;
+                }
+              }
+            }
+
+            // Normalise aliases
+            if (_mentionedService && _BRIDGE_SERVICE_ALIASES[_mentionedService]) {
+              _mentionedService = _BRIDGE_SERVICE_ALIASES[_mentionedService];
+            }
+
+            const _mentionedAgentId = _mentionedService ? `${_mentionedService}.agent` : null;
+            const _mentionedInstalled = _mentionedAgentId
+              ? installedSkillsList.some(s => s.name === _mentionedAgentId)
+              : false;
+
+            // True when user named a service they haven't connected yet → prepend build_agent
+            const _needsBuildAgent = !!(_mentionedAgentId && !_mentionedInstalled);
+
+            let _bridgeDetectedAgent;
+            if (!_bridgeNeedsEmail) {
+              _bridgeDetectedAgent = null;
+            } else if (_mentionedService) {
+              // User named a service — honour it. Use API-shortcut entry if available.
+              const _knownEntry = _BRIDGE_EMAIL_AGENTS.find(e => e.agentName === _mentionedAgentId);
+              _bridgeDetectedAgent = _knownEntry || {
+                // Generic stub — browser.agent handles compose natively for any service
+                agentName: _mentionedAgentId,
+                startUrl: null, // unknown — no pre-cached plan; LLM handles at fire time
+                oauth: _mentionedService,
+                oauthScopes: '',
+                buildCommandLines: () => [],
+              };
+            } else {
+              // No service named → fall back to first installed agent from the known list
+              _bridgeDetectedAgent = _BRIDGE_EMAIL_AGENTS.find(e =>
+                installedSkillsList.some(s => s.name === e.agentName)
+              ) || null;
+            }
+
+            const _bridgeOauthFmLines = _bridgeDetectedAgent
+              ? [`oauth: ${_bridgeDetectedAgent.oauth}`, `oauth_scopes: ${_bridgeDetectedAgent.oauthScopes}`]
+              : [];
+
+            const _bridgeBodyLines = _bridgeDetectedAgent
+              ? [
+                  ..._bridgeDetectedAgent.buildCommandLines(_bridgeGatewayEmail),
+                  '',
+                  '## Plan',
+                  '1. Gather content described in the instruction using the appropriate agent or data source.',
+                  '2. Send the result using the curl command in ## Commands above. Do NOT use browser.agent.',
+                ]
+              : [
+                  '## Plan',
+                  `At fire time, ThinkDrop executes: "${bridgeInstruction}"`,
+                ];
+
             skillMd = [
               `---`,
               `name: ${skillName}`,
@@ -2526,10 +2790,11 @@ CRITICAL rules for skill.md:
               `title: ${label}`,
               `instruction: ${bridgeInstruction}`,
               `description: Scheduled task — ${notifMsg}`,
+              ..._bridgeOauthFmLines,
+              ...(_bridgeGatewayEmail ? [`sms_gateway_email: ${_bridgeGatewayEmail}`] : []),
               `---`,
               ``,
-              `## Plan`,
-              `At fire time, ThinkDrop executes: "${bridgeInstruction}"`,
+              ..._bridgeBodyLines,
             ].join('\n');
 
             setupScript = [
@@ -2540,7 +2805,44 @@ CRITICAL rules for skill.md:
               `echo "✅ Bridge skill written: ${skillName}"`,
             ].join('\n');
 
+            // ── Pre-cache a single browser.agent execution plan at skill-creation time.
+            // One agent per domain — playwright.agent handles all sub-steps internally
+            // (read inbox + compose + send) exactly as it would for a direct user prompt.
+            // This avoids the LLM re-planning on first cron fire and keeps the execution
+            // deterministic for every user on every install.
+            // startUrl comes from the agent's own entry in _BRIDGE_EMAIL_AGENTS above —
+            // no hardcoding here, new agents just need a startUrl in that list.
+            const _inboxUrl = _bridgeDetectedAgent?.startUrl || null;
+
+            const _execPlan = (_bridgeDetectedAgent && _inboxUrl && _bridgeGatewayEmail) ? [
+              {
+                skill: 'browser.agent',
+                description: label,
+                args: {
+                  action: 'run',
+                  agentId: _bridgeDetectedAgent.agentName,
+                  url: _inboxUrl,
+                  task: `${bridgeInstruction}. Send the result to ${_bridgeGatewayEmail} via email compose.`,
+                },
+              },
+            ] : null;
+
+            const _plansDir = `${homeDir}/.thinkdrop/plans`;
+            const _planHeredoc = _execPlan ? [
+              `mkdir -p "${_plansDir}"`,
+              `cat > "${_plansDir}/bridge.${skillName}.json" << 'EXECPLAN_EOF'`,
+              JSON.stringify(_execPlan, null, 2),
+              `EXECPLAN_EOF`,
+              `echo "✅ Pre-cached execution plan: ${skillName}"`,
+            ].join('\n') : null;
+
             reminderPlan = [
+              // If user named an email service not yet set up, build the agent first
+              ...(_needsBuildAgent ? [{
+                skill: 'browser.agent',
+                description: `Set up ${_mentionedService} email account`,
+                args: { action: 'build_agent', service: _mentionedService },
+              }] : []),
               {
                 skill: 'shell.run',
                 description: `Write bridge skill.md for "${label}" (AI task at ${hour}:${minuteStr} daily)`,
@@ -2556,9 +2858,20 @@ CRITICAL rules for skill.md:
                 description: `Sync SkillScheduler to activate the cron immediately`,
                 args: { cmd: 'bash', argv: ['-c', `curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo "✅ node-cron activated: ${skillName} at ${hour}:${minuteStr} daily"`] },
               },
+              ...(_planHeredoc ? [{
+                skill: 'shell.run',
+                description: `Pre-cache single-agent execution plan for ${skillName}`,
+                args: { cmd: 'bash', argv: ['-c', _planHeredoc] },
+              }] : []),
             ];
 
-            logger.info(`[Node:PlanSkills] Local reminder intercept [bridge]: "${label}" cron="${cronExpr}"`);
+            if (_needsBuildAgent) {
+              logger.info(`[Node:PlanSkills] Local reminder intercept [bridge+build-agent]: "${label}" cron="${cronExpr}" building=${_mentionedAgentId}`);
+            } else if (_bridgeDetectedAgent) {
+              logger.info(`[Node:PlanSkills] Local reminder intercept [bridge+email-api]: "${label}" cron="${cronExpr}" agent=${_bridgeDetectedAgent.agentName}`);
+            } else {
+              logger.info(`[Node:PlanSkills] Local reminder intercept [bridge]: "${label}" cron="${cronExpr}"`);
+            }
           }
 
           if (progressCallback) progressCallback({
@@ -2731,7 +3044,9 @@ Output ONLY the pattern text. No markdown, no explanation.`;
     // single-step plans, not multi-intent stacks). Writes a .md file with the
     // serialized skill plan so the PlanPanel can render it for approval, and so
     // executeCommand can mark it 'complete' after 100% successful execution.
-    if (!recoveryContext && skillPlan.length >= 2) {
+    // Bridge/cron executions always auto-approve — no human is present to click.
+    const _isBridgeSource = state.context?.source === 'bridge_listener';
+    if (!recoveryContext && skillPlan.length >= 2 && !_isBridgeSource) {
       const _ts = Date.now();
       const _planId = `plan-${_ts}`;
       const _planFile = path.join(PLANS_DIR, `${_planId}.md`);

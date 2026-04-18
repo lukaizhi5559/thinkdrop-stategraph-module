@@ -56,7 +56,7 @@ When the pipeline provides a `smsGatewayTarget` block, the SMS must be sent as a
   Use browser.agent action:run with gmail.agent to SEND this email
   NEVER use Twilio, ClickSend, or any paid SMS API — the free email gateway is already resolved
 ```
-If `smsGatewayTarget.email` is null but `smsGatewayTarget.carrierOptions` is present, add a `guide.step` asking the user to pick their carrier first.
+If `smsGatewayTarget.email` is null, the carrier has not been configured — skip the SMS send step entirely and note in the step description that SMS delivery requires carrier configuration. Do NOT add a `guide.step` or ask the user for carrier information in the plan.
 
 **user.agent routing rules:**
 - Use `user.agent { action: 'resolve_form' }` BEFORE any task that needs the user's personal data: filling in a profile/application form, sending a document with user details, drafting an email that refers to "my name / my address / my phone", looking up a contact's info.

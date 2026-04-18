@@ -76,6 +76,9 @@ const RECURRING_KWS = [
   'morning routine', 'evening routine',
   // "morning reminder at 7am" / "evening reminder at 8pm" — implicit daily recurrence
   'morning reminder', 'evening reminder', 'morning hydration', 'morning alarm',
+  // Sub-hour intervals
+  'every minute', 'every 5 minutes', 'every 10 minutes', 'every 15 minutes',
+  'every 30 minutes', 'every 2 minutes', 'every 3 minutes',
 ];
 
 // ── Bare time references — used for time parsing ONLY, not to gate firing ────
@@ -89,10 +92,11 @@ const TIME_KWS = [
 
 // ── Bridge action keywords (AI tasks that need fresh context at fire time) ────
 const BRIDGE_ACTION_KWS = [
-  'update', 'review', 'check', 'go through', 'organize', 'summarize',
+  'update', 'review', 'check', 'go through', 'organize', 'summarize', 'summary',
   'draft', 'process', 'clean up', 'analyze', 'categorize', 'compile',
   'go over', 'look at', 'write up', 'prepare', 'audit',
   'triage', 'sort', 'file', 'archive',
+  'watch', 'monitor', 'collect', 'fetch', 'scan',
 ];
 
 // ── Stop words for skill name label extraction ────────────────────────────────
@@ -225,10 +229,7 @@ function buildLabel(userMessage) {
 function buildReminderSkill(userMessage, homeDir) {
   const msgLow = userMessage.toLowerCase();
 
-  // ── 1. External service gate — let LLM handle API integrations ──────────────
-  if (EXTERNAL_SVCS.some(s => msgLow.includes(s))) return { fires: false };
-
-  // ── 2. Classify signal presence ─────────────────────────────────────────────
+  // ── 1. Classify signal presence (must come before EXTERNAL_SVCS gate) ────────
   const hasExplicitRemind = /\b(remind\s+me|reminder|set\s+(a|an)\s+(reminder|alarm)|ping\s+me|alert\s+me|wake\s+me|give\s+me.{0,20}reminder)\b/i.test(userMessage);
   const hasReminderKw  = LOCAL_REMINDER_KWS.some(k => msgLow.includes(k));
   const hasRecurringKw = RECURRING_KWS.some(k => msgLow.includes(k))  // explicit recurrence signal
@@ -241,6 +242,11 @@ function buildReminderSkill(userMessage, homeDir) {
     && hasRecurringKw
     && BRIDGE_ACTION_KWS.some(k => msgLow.includes(k));
 
+  // ── 2. External service gate — only blocks non-bridge requests ───────────────
+  // Bridge requests mentioning gmail/sms/etc. are intentionally allowed through —
+  // the bridge tier delegates to email/messaging agents at cron fire time.
+  if (!hasBridgeKw && EXTERNAL_SVCS.some(s => msgLow.includes(s))) return { fires: false };
+
   // ── 3. Must have a RECURRING signal to fire — bare time refs are not enough ──
   // "Remind me to take meds at 8am"     → hasTimeKw only    → fires: false (one-time)
   // "Remind me to take meds every day"  → hasRecurringKw    → fires: true
@@ -250,14 +256,25 @@ function buildReminderSkill(userMessage, homeDir) {
   if (!hasReminderKw && !hasBridgeKw) return { fires: false };
 
   // ── 4. Parse time + derive skill name ────────────────────────────────────────
-  // Detect interval cadences BEFORE parseTime — "every hour" and "every N hours"
+  // Detect interval cadences BEFORE parseTime — sub-hour intervals and "every hour"
   // do not have a fixed clock time and need a different cron pattern entirely.
-  const _everyNHoursMatch = msgLow.match(/\bevery\s+(\d+)\s+hours?\b/);
-  const _everyHour        = !_everyNHoursMatch && /\bevery\s+hour\b/.test(msgLow);
-  const _intervalHours    = _everyNHoursMatch ? parseInt(_everyNHoursMatch[1], 10) : null;
+  const _everyMinute        = /\bevery\s+minute\b/.test(msgLow);
+  const _everyNMinutesMatch = !_everyMinute && msgLow.match(/\bevery\s+(\d+)\s+minutes?\b/);
+  const _everyNHoursMatch   = !_everyMinute && !_everyNMinutesMatch && msgLow.match(/\bevery\s+(\d+)\s+hours?\b/);
+  const _everyHour          = !_everyMinute && !_everyNMinutesMatch && !_everyNHoursMatch && /\bevery\s+hour\b/.test(msgLow);
+  const _intervalMinutes    = _everyNMinutesMatch ? parseInt(_everyNMinutesMatch[1], 10) : null;
+  const _intervalHours      = _everyNHoursMatch ? parseInt(_everyNHoursMatch[1], 10) : null;
 
   let hour, minute, minuteStr, dayOfWeek, cronExpr;
-  if (_everyHour) {
+  if (_everyMinute) {
+    // Fire every minute: * * * * *
+    hour = null; minute = null; minuteStr = '00'; dayOfWeek = null;
+    cronExpr = '* * * * *';
+  } else if (_intervalMinutes) {
+    // Fire every N minutes: */N * * * *
+    hour = null; minute = null; minuteStr = '00'; dayOfWeek = null;
+    cronExpr = `*/${_intervalMinutes} * * * *`;
+  } else if (_everyHour) {
     // Fire once per hour on the hour: 0 * * * *
     hour = null; minute = 0; minuteStr = '00'; dayOfWeek = null;
     cronExpr = '0 * * * *';
@@ -275,7 +292,9 @@ function buildReminderSkill(userMessage, homeDir) {
   }
 
   // Human-readable schedule string for step descriptions + plan section
-  const cadenceLabel = _everyHour      ? 'every hour'
+  const cadenceLabel = _everyMinute    ? 'every minute'
+    : _intervalMinutes                 ? `every ${_intervalMinutes} minutes`
+    : _everyHour                       ? 'every hour'
     : _intervalHours                   ? `every ${_intervalHours} hours`
     : dayOfWeek !== null               ? `${hour}:${minuteStr} on day ${dayOfWeek}`
     :                                    `${hour}:${minuteStr} daily`;

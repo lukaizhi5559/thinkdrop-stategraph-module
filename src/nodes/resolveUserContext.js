@@ -28,7 +28,7 @@
 
 'use strict';
 
-const { lookupCarrier, getGatewayEmail, CARRIER_OPTIONS } = require('../utils/carrierGateways');
+const { lookupCarrier, getGatewayEmail, CARRIER_OPTIONS, _normalizeCarrierName } = require('../utils/carrierGateways');
 const { parseDateRange } = require('../utils/parseDateRange');
 
 const MEMORY_URL = process.env.MCP_USER_MEMORY_URL    || 'http://127.0.0.1:3001';
@@ -276,12 +276,56 @@ async function _resolvePhoneAndCarrier(mcpAdapter, profilePrefix, searchQuery, u
     const alreadyTried = await _profileGet(mcpAdapter, lookupFlag, userId, logger);
     if (alreadyTried !== 'done') {
       carrier = await _autoDetectCarrier(phone, logger);
-      if (carrier) await _profileSet(mcpAdapter, carrierKey, carrier, userId, logger);
-      await _profileSet(mcpAdapter, lookupFlag, 'done', userId, logger);
+      if (carrier) {
+        // Only mark done when we actually got a carrier — failed attempts should be retried
+        await _profileSet(mcpAdapter, carrierKey, carrier, userId, logger);
+        await _profileSet(mcpAdapter, lookupFlag, 'done', userId, logger);
+      }
+      // If carrier still null: fallthrough — caller handles via gatherAnswerCallback
     }
   }
 
   return { phone, carrier };
+}
+
+// ── Carrier gather helper ────────────────────────────────────────────────────
+
+/**
+ * When a phone is resolved but carrier is unknown, ask the user via the amber
+ * gather prompt (orange border on the prompt capture window) instead of
+ * generating a browser guide card.
+ */
+async function _askCarrierAndResolve(mcpAdapter, phone, profilePrefix, userId, logger, gatherAnswerCallback, displayName) {
+  const carrierList = CARRIER_OPTIONS.filter(c => c.value).map(c => c.label).join(', ');
+  const isMe = displayName === 'me';
+  const question = `What carrier does ${isMe ? 'your' : `${displayName}'s`} number ${phone} use? (${carrierList})`;
+  logger.info('[Node:ResolveUserContext] Carrier unknown — asking user via gather prompt');
+
+  let answer = null;
+  try {
+    answer = await gatherAnswerCallback(question);
+  } catch (e) {
+    logger.warn(`[Node:ResolveUserContext] gatherAnswerCallback failed: ${e.message}`);
+    return null;
+  }
+
+  if (!answer) {
+    logger.info('[Node:ResolveUserContext] No carrier answer received — skipping gateway resolution');
+    return null;
+  }
+
+  const carrier = _normalizeCarrierName(answer.trim());
+  if (!carrier) {
+    logger.warn(`[Node:ResolveUserContext] Could not normalize carrier from answer: "${answer}"`);
+    return null;
+  }
+
+  await _profileSet(mcpAdapter, `${profilePrefix}:phone_carrier`, carrier, userId, logger);
+  await _profileSet(mcpAdapter, `${profilePrefix}:phone_carrier_lookup_needed`, 'done', userId, logger);
+
+  const gatewayEmail = getGatewayEmail(phone, carrier);
+  logger.info(`[Node:ResolveUserContext] Carrier "${carrier}" answered → gateway: ${gatewayEmail}`);
+  return { name: displayName, phone, carrier, email: gatewayEmail };
 }
 
 // ── Main node ────────────────────────────────────────────────────────────────
@@ -308,7 +352,7 @@ module.exports = async function resolveUserContext(state) {
 
   // Derive context needs from NLI signals + light regex (no topic bucketing)
   const needsSmsPhone = !!(state._smsTagSignal ||
-    /\b(text me|sms me|send me a (text|sms)|my phone|my number|my cell|daily sms|sms summary|sms update|sms report|sms alert)\b/i.test(msg));
+    /\b(text me|sms me|send me a (text|sms)|my phone|my number|my cell|daily sms|sms summary|sms update|sms report|sms alert|text message|via text|via sms|by text|by sms|send.*text)\b/i.test(msg));
   const needsEmail = !!(state._emailTagSignal ||
     /\b(email me|send me an email|mail me|my email)\b/i.test(msg));
   const resolvedSelfContext = {};
@@ -332,14 +376,17 @@ module.exports = async function resolveUserContext(state) {
 
     if (phoneResult?.phone) {
       const gatewayEmail = phoneResult.carrier ? getGatewayEmail(phoneResult.phone, phoneResult.carrier) : null;
-      smsGatewayTarget = {
-        name: targetName,
-        phone: phoneResult.phone,
-        carrier: phoneResult.carrier || null,
-        email: gatewayEmail,
-        ...(!gatewayEmail && { carrierOptions: CARRIER_OPTIONS }),
-      };
-      if (gatewayEmail) logger.info(`[Node:ResolveUserContext] External contact gateway: ${gatewayEmail}`);
+      if (gatewayEmail) {
+        smsGatewayTarget = { name: targetName, phone: phoneResult.phone, carrier: phoneResult.carrier, email: gatewayEmail };
+        logger.info(`[Node:ResolveUserContext] External contact gateway: ${gatewayEmail}`);
+      } else if (state.gatherAnswerCallback) {
+        smsGatewayTarget = await _askCarrierAndResolve(
+          mcpAdapter, phoneResult.phone, `contact:${normalizedName}`, userId, logger, state.gatherAnswerCallback, targetName,
+        ) || { name: targetName, phone: phoneResult.phone, carrier: null, email: null };
+      } else {
+        smsGatewayTarget = { name: targetName, phone: phoneResult.phone, carrier: null, email: null };
+        logger.info('[Node:ResolveUserContext] Carrier unknown and no gather callback — SMS will be skipped');
+      }
     } else {
       logger.info(`[Node:ResolveUserContext] Could not resolve phone for "${targetName}"`);
     }
@@ -366,14 +413,19 @@ module.exports = async function resolveUserContext(state) {
       if (phoneResult?.phone) {
         resolvedSelfContext.phone = phoneResult.phone;
         const gatewayEmail = phoneResult.carrier ? getGatewayEmail(phoneResult.phone, phoneResult.carrier) : null;
-        smsGatewayTarget = {
-          name: 'me',
-          phone: phoneResult.phone,
-          carrier: phoneResult.carrier || null,
-          email: gatewayEmail,
-          ...(!gatewayEmail && { carrierOptions: CARRIER_OPTIONS }),
-        };
-        if (gatewayEmail) logger.info(`[Node:ResolveUserContext] Self SMS gateway: ${gatewayEmail}`);
+        if (gatewayEmail) {
+          smsGatewayTarget = { name: 'me', phone: phoneResult.phone, carrier: phoneResult.carrier, email: gatewayEmail };
+          logger.info(`[Node:ResolveUserContext] Self SMS gateway: ${gatewayEmail}`);
+        } else if (state.gatherAnswerCallback) {
+          // Carrier unknown — ask user inline via amber gather prompt (no guide card)
+          smsGatewayTarget = await _askCarrierAndResolve(
+            mcpAdapter, phoneResult.phone, 'self', userId, logger, state.gatherAnswerCallback, 'me',
+          ) || { name: 'me', phone: phoneResult.phone, carrier: null, email: null };
+        } else {
+          // No gather available (bridge runs, etc.) — leave email null, planSkills will skip SMS
+          smsGatewayTarget = { name: 'me', phone: phoneResult.phone, carrier: null, email: null };
+          logger.info('[Node:ResolveUserContext] Carrier unknown and no gather callback — SMS will be skipped');
+        }
       } else {
         logger.info('[Node:ResolveUserContext] self:phone not found in profile, memory, or conversation');
       }
