@@ -110,7 +110,11 @@ async function _resolveField(mcpAdapter, profileKey, searchQuery, userId, logger
     }
     if (_isEmailQ) {
       const em = snippet.match(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/);
-      if (em) { value = em[0]; break; }
+      if (em) {
+        const _emDomain = em[0].split('@')[1]?.toLowerCase();
+        if (_PLACEHOLDER_EMAIL_DOMAINS.has(_emDomain)) { continue; } // skip LLM placeholder email
+        value = em[0]; break;
+      }
       continue; // no valid email in this snippet — try next
     }
     if (snippet.length > 5) { value = snippet.slice(0, 400); break; }
@@ -125,6 +129,14 @@ async function _resolveField(mcpAdapter, profileKey, searchQuery, userId, logger
 }
 
 // ── MCP helpers ──────────────────────────────────────────────────────────────
+
+// Placeholder/example domains that LLMs commonly emit in example emails.
+// Never store these as real user email addresses (Layer 3 safety guard).
+const _PLACEHOLDER_EMAIL_DOMAINS = new Set([
+  'yourdomain.com', 'example.com', 'domain.com', 'test.com',
+  'placeholder.com', 'company.com', 'email.com', 'yourcompany.com',
+  'acme.com', 'sample.com', 'mail.com', 'user.com',
+]);
 
 async function _profileGet(mcpAdapter, key, userId, logger) {
   try {
@@ -234,6 +246,7 @@ async function _conversationSearchByDate(mcpAdapter, msg, userId, logger) {
     }, { timeoutMs: 5000 });
     const messages = result?.data?.messages || result?.messages || [];
     return messages
+      .filter(m => !m.role || m.role === 'user') // skip assistant/LLM messages that may contain placeholder emails
       .map(m => m.text || m.content || '')
       .filter(Boolean)
       .map(t => t.slice(0, 300));
@@ -339,6 +352,28 @@ module.exports = async function resolveUserContext(state) {
 
   // ── Quick-exit: nothing self-referential in this message ─────────────────
   if (!_hasSelfReferentialContext(state, msg)) {
+    // Bridge/cron prompts never trigger the full resolver, but planSkills needs
+    // self:email for _deliveryEmail in _buildBridgeReminderPlan. Do a cheap O(1)
+    // profile.get to hydrate resolvedSelfContext.email when not already set.
+    if (mcpAdapter && !state.resolvedSelfContext?.email) {
+      const _quickEmail = await _profileGet(mcpAdapter, 'self:email', userId, logger).catch(() => null);
+      if (_quickEmail) {
+        // Auto-heal: if a placeholder email leaked into profile, delete it and skip.
+        const _quickDomain = _quickEmail.split('@')[1]?.toLowerCase();
+        if (_PLACEHOLDER_EMAIL_DOMAINS.has(_quickDomain)) {
+          logger.warn(`[Node:ResolveUserContext] pass-through: deleting placeholder email from profile: ${_quickEmail}`);
+          try { await mcpAdapter.callService('user-memory', 'profile.delete', { key: 'self:email', userId }, { timeoutMs: 3000 }); } catch (_) {}
+          // fall through — no valid email to inject
+        } else {
+          logger.debug(`[Node:ResolveUserContext] pass-through: hydrated self:email for bridge plans`);
+          return {
+            ...state,
+            resolveUserContextDone: true,
+            resolvedSelfContext: { ...(state.resolvedSelfContext || {}), email: _quickEmail },
+          };
+        }
+      }
+    }
     logger.debug('[Node:ResolveUserContext] No self-referential context needed — pass-through');
     return { ...state, resolveUserContextDone: true };
   }

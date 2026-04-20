@@ -192,11 +192,15 @@ function extractActionBody(userMessage) {
   for (const kw of BRIDGE_ACTION_KWS) {
     if (msgLow.startsWith(kw)) return userMessage.trim();
   }
-  // Otherwise the message starts with a scheduling prefix — slice from the first action keyword
+  // Find the EARLIEST occurrence of any bridge action keyword (not the first keyword in the array)
+  let earliestIdx = -1;
   for (const kw of BRIDGE_ACTION_KWS) {
     const idx = msgLow.indexOf(kw);
-    if (idx > 0) return userMessage.slice(idx).trim();
+    if (idx > 0 && (earliestIdx === -1 || idx < earliestIdx)) {
+      earliestIdx = idx;
+    }
   }
+  if (earliestIdx > 0) return userMessage.slice(earliestIdx).trim();
   return userMessage.trim();
 }
 
@@ -304,8 +308,10 @@ function buildReminderSkill(userMessage, homeDir) {
   const skillDir  = `${homeDir}/.thinkdrop/skills/${skillName}`;
   const tier      = hasBridgeKw ? 'bridge' : 'notify';
 
-  // Truncate message for notification text (safe length, no newlines)
-  const notifMsg = userMessage.replace(/[\n\r]/g, ' ').replace(/"/g, "'").substring(0, 100);
+  // Sanitize message — strip newlines and unsafe quotes for heredocs/frontmatter.
+  // Do NOT truncate here: notifMsg is used in description: for both tiers.
+  // The notify message: field (osascript display) truncates separately below.
+  const notifMsg = userMessage.replace(/[\n\r]/g, ' ').replace(/"/g, "'");
   const scheduleLabel = _everyHour || _intervalHours ? 'Recurring' : 'Daily';
   const description = tier === 'notify'
     ? `${scheduleLabel} reminder: ${notifMsg}`
@@ -322,12 +328,13 @@ function buildReminderSkill(userMessage, homeDir) {
   ];
   if (tier === 'notify') {
     fmLines.push(`title: ThinkDrop Reminder`);
-    fmLines.push(`message: ${notifMsg}`);
+    fmLines.push(`message: ${notifMsg.substring(0, 100)}`); // osascript display — truncate to safe length
   } else {
-    // Store only the ACTION body as instruction — scheduling prefix (e.g. "Daily at 9pm,")
-    // is already captured in the cron schedule. Storing the full message causes the
-    // bridge listener to re-trigger the planSkills reminder intercept when cron fires.
-    const actionBody = extractActionBody(userMessage).replace(/[\n\r]/g, ' ').replace(/"/g, "'");
+    // Use the full user message as instruction — the bridge listener already sets
+    // source: 'bridge_listener' which skips the reminder interceptor, so there is
+    // no re-trigger risk. The full context (service, gateway email, schedule intent)
+    // is essential for the agent to act correctly at cron fire time.
+    const actionBody = userMessage.replace(/[\n\r]/g, ' ').replace(/"/g, "'");
     fmLines.push(`title: ${label}`);
     fmLines.push(`instruction: ${actionBody}`);
   }

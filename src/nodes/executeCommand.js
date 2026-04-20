@@ -46,6 +46,31 @@ function _readSessionLanguage() {
 
 const _LANG_NAMES = { zh: 'Chinese (Mandarin)', es: 'Spanish', fr: 'French', pt: 'Portuguese', ar: 'Arabic', ja: 'Japanese', ko: 'Korean', hi: 'Hindi', de: 'German', it: 'Italian', ru: 'Russian' };
 
+function _extractMissingPathFromError(errorText) {
+  if (typeof errorText !== 'string' || !errorText.trim()) return null;
+  const match = errorText.match(/(?:Output not created|file not found)\s*:\s*(~\/[^\s]+|\/[^\s]+)/i);
+  if (!match || !match[1]) return null;
+  const rawPath = match[1].trim();
+  if (rawPath.startsWith('~/')) return path.join(os.homedir(), rawPath.slice(2));
+  return rawPath;
+}
+
+function _enrichFailureContext(stepResult) {
+  if (!stepResult || stepResult.ok) return stepResult;
+
+  const enriched = { ...stepResult };
+  if (!enriched.missingPath && typeof enriched.error === 'string') {
+    enriched.missingPath = _extractMissingPathFromError(enriched.error);
+  }
+  if (!enriched.toolName && enriched.skill === 'shell.run') {
+    enriched.toolName = enriched.args?.cmd || null;
+  }
+  if (!enriched.stderrHint && typeof enriched.stderr === 'string') {
+    enriched.stderrHint = enriched.stderr.trim().slice(0, 300) || null;
+  }
+  return enriched;
+}
+
 // Persistent scheduler — writes pending-schedule.json + launchd plist
 // so macOS can relaunch the app at the target time if it was closed.
 let _scheduler = null;
@@ -502,7 +527,22 @@ module.exports = async function executeCommand(state) {
   }
 
   const step = skillPlan[skillCursor];
-  const { skill, args = {}, optional = false, description } = step;
+  const { skill, optional = false, description } = step;
+
+  // ── {{PREV_OUTPUT}} template injection ───────────────────────────────────
+  // Allows multi-step plans to pass data from one step to the next.
+  // The previous step's stdout is injected into any arg string containing
+  // the {{PREV_OUTPUT}} marker at dispatch time (not at plan-write time).
+  let args = step.args || {};
+  if (skillCursor > 0 && skillResults.length > 0) {
+    const prevStdout = (skillResults[skillResults.length - 1]?.stdout || '').slice(0, 4000);
+    if (prevStdout) {
+      const injectPrev = (val) => typeof val === 'string' ? val.replace(/\{\{PREV_OUTPUT\}\}/g, prevStdout) : val;
+      const newArgs = {};
+      for (const [k, v] of Object.entries(args)) newArgs[k] = injectPrev(v);
+      args = newArgs;
+    }
+  }
 
   // ── Guide cancellation check — runs before EVERY step ────────────────────
   // Checked here so Stop Guide aborts immediately at the start of any step,
@@ -3073,7 +3113,13 @@ module.exports = async function executeCommand(state) {
       verified: raw.verified !== undefined ? raw.verified : null,
       reasoning: raw.reasoning || null,
       suggestion: raw.suggestion || null,
-      output: raw.output || null
+      output: raw.output || null,
+      missingPath: raw.missingPath || null,
+      toolName: raw.toolName || null,
+      stderrHint: raw.stderrHint || null,
+      userAllowlistHint: !!raw.userAllowlistHint,
+      commandName: raw.commandName || null,
+      userAllowlistPath: raw.userAllowlistPath || null,
     };
 
     // Detect shell.run search commands that returned no results — treat as soft failure
@@ -3097,6 +3143,8 @@ module.exports = async function executeCommand(state) {
       stepResult.ok = false;
       stepResult.error = `search_no_results: search returned no results for the given query`;
     }
+
+    let enrichedStepResult = stepResult;
 
     // ── shell.run curl: detect HTTP API error responses ──────────────────────
     // curl returns exit code 0 even on HTTP 4xx/5xx errors. Check stdout for
@@ -3219,6 +3267,8 @@ module.exports = async function executeCommand(state) {
       }
     }
 
+    enrichedStepResult = _enrichFailureContext(stepResult);
+
     // ── browser.act examine: NEEDS_USER / authRequired → fail fast with user message ──
     // When the page examiner detects a condition the user must fix (not logged in,
     // element doesn't exist, paywall, etc.) surface the message immediately and
@@ -3240,9 +3290,9 @@ module.exports = async function executeCommand(state) {
       });
       return {
         ...state,
-        skillResults: [...skillResults, { ...stepResult, ok: false, error: fullMsg }],
+        skillResults: [...skillResults, { ...enrichedStepResult, ok: false, error: fullMsg }],
         skillCursor,
-        failedStep: { ...stepResult, ok: false, error: fullMsg },
+        failedStep: _enrichFailureContext({ ...enrichedStepResult, ok: false, error: fullMsg }),
         commandExecuted: false,
         answer: fullMsg,
         examineBlocked: true,
@@ -3251,9 +3301,9 @@ module.exports = async function executeCommand(state) {
 
     // Normalise external.skill result: copy `output` → `stdout` so review/synthesize nodes
     // can treat it the same as shell.run output without special-casing.
-    const _normalizedResult = (skill === 'external.skill' && stepResult.ok && stepResult.output && !stepResult.stdout)
-      ? { ...stepResult, stdout: stepResult.output }
-      : stepResult;
+    const _normalizedResult = (skill === 'external.skill' && enrichedStepResult.ok && enrichedStepResult.output && !enrichedStepResult.stdout)
+      ? { ...enrichedStepResult, stdout: enrichedStepResult.output }
+      : enrichedStepResult;
 
     const updatedResults = [...skillResults, _normalizedResult];
 
@@ -3264,9 +3314,9 @@ module.exports = async function executeCommand(state) {
     // $<PROVIDER>_ACCESS_TOKEN env var, and silently retry the same step.
     if (
       skill === 'shell.run' &&
-      !stepResult.ok &&
-      typeof stepResult.error === 'string' &&
-      stepResult.error.startsWith('BLOCKED:') &&
+      !enrichedStepResult.ok &&
+      typeof enrichedStepResult.error === 'string' &&
+      enrichedStepResult.error.startsWith('BLOCKED:') &&
       !resolvedArgs._blockedPatched
     ) {
       const _rawArgv = resolvedArgs.argv || [];
@@ -3458,9 +3508,9 @@ module.exports = async function executeCommand(state) {
       // send to recoverSkill (which has no way to build code). Instead, kick off
       // the skill build pipeline so buildSkill → validateSkill → installSkill runs.
       const isMissingSkill = skill === 'external.skill' &&
-        typeof stepResult.error === 'string' &&
-        (stepResult.error.includes('Skill file not found') ||
-         stepResult.error.includes('No installed skill named'));
+        typeof enrichedStepResult.error === 'string' &&
+        (enrichedStepResult.error.includes('Skill file not found') ||
+         enrichedStepResult.error.includes('No installed skill named'));
 
       if (isMissingSkill && !!state.creatorProjectId && !state.skillCreatorRegenAttempted && mcpAdapter) {
         // Creator skill missing — re-run skillCreator silently before failing (once only)
@@ -3650,13 +3700,13 @@ module.exports = async function executeCommand(state) {
       }
 
       // Step failed and is not optional — hand off to recoverSkill
-      logger.warn(`[Node:ExecuteCommand] Step ${skillCursor + 1} failed: ${stepResult.error}`);
-      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: stepResult.error, stderr: stepResult.stderr });
+      logger.warn(`[Node:ExecuteCommand] Step ${skillCursor + 1} failed: ${enrichedStepResult.error}`);
+      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: enrichedStepResult.error, stderr: enrichedStepResult.stderr });
       return {
         ...state,
         skillResults: updatedResults,
         skillCursor,           // cursor stays at failed step
-        failedStep: stepResult,
+        failedStep: enrichedStepResult,
         commandExecuted: false
       };
     }

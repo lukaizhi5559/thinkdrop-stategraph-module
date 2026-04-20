@@ -105,7 +105,7 @@ module.exports = async function retrieveMemory(state) {
       context?.sessionId
         ? mcpAdapter.callService('conversation', 'message.list', {
             sessionId: context.sessionId,
-            limit: 10,
+            limit: 20,
             direction: 'DESC'
           }).catch(err => {
             logger.warn('[Node:RetrieveMemory] Conversation fetch failed:', err.message);

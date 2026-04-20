@@ -411,7 +411,7 @@ module.exports = async function resolveReferences(state) {
     if (sessionId) {
       const histResult = await mcpAdapter.callService('conversation', 'message.list', {
         sessionId,
-        limit: 10,
+        limit: 20,
         direction: 'DESC'
       });
       const histData = histResult.data || histResult;

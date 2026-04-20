@@ -694,6 +694,78 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     };
   }
 
+  // shell.run: command not allowlisted yet — ask user to allow and retry.
+  // The write to ~/.thinkdrop/allowed-commands.json is handled in main.js on explicit user consent.
+  if (skill === 'shell.run' && failedStep.userAllowlistHint && failedStep.commandName) {
+    const cmdName = String(failedStep.commandName).trim();
+    logger.debug(`[Node:RecoverSkill] Fast-path: shell.run allowlist gate for "${cmdName}" → ASK_USER`);
+    return {
+      action: 'ASK_USER',
+      question: `"${cmdName}" is not in your trusted command allowlist yet. Allow it and retry this step?`,
+      options: [
+        `Allow "${cmdName}" and retry`,
+        'Cancel',
+      ],
+    };
+  }
+
+  // shell.run: output verification failed — branch by tool + stderr hints.
+  if (skill === 'shell.run' && failedStep.missingPath) {
+    const toolName = String(failedStep.toolName || failedStep.args?.cmd || '').toLowerCase();
+    const stderrHint = String(failedStep.stderrHint || failedStep.stderr || failedStep.error || '');
+    const stderrLow = stderrHint.toLowerCase();
+
+    if (toolName === 'pandoc') {
+      if (/pdflatex|xelatex|lualatex|latex|texlive|pdf engine|no such file or directory/i.test(stderrHint)) {
+        logger.debug('[Node:RecoverSkill] Fast-path: pandoc missing PDF engine → REPLAN');
+        return {
+          action: 'REPLAN',
+          suggestion: `Pandoc failed to generate ${failedStep.missingPath} because the default PDF engine is unavailable. Retry using wkhtmltopdf and verify output existence after conversion.`,
+          constraint: 'Before pandoc conversion, check wkhtmltopdf availability and install if missing: command -v wkhtmltopdf >/dev/null 2>&1 || brew install wkhtmltopdf. Then run pandoc with --pdf-engine=wkhtmltopdf and verify the output file exists.',
+        };
+      }
+      if (/wkhtmltopdf|no pdf engine/i.test(stderrLow)) {
+        logger.debug('[Node:RecoverSkill] Fast-path: pandoc still missing engine after retry → ASK_USER');
+        return {
+          action: 'ASK_USER',
+          question: `I could not create ${failedStep.missingPath} because no working PDF engine is installed. Would you like me to install wkhtmltopdf and retry, switch to HTML output, or stop here?`,
+          options: [
+            'Install wkhtmltopdf and retry',
+            'Switch to HTML output instead',
+            'Cancel',
+          ],
+        };
+      }
+    }
+
+    if (toolName === 'curl' || toolName === 'wget') {
+      logger.debug('[Node:RecoverSkill] Fast-path: download output missing → ASK_USER');
+      return {
+        action: 'ASK_USER',
+        question: `The download did not produce ${failedStep.missingPath}. This may be a bad URL, blocked request, or auth issue. What would you like to do?`,
+        options: [
+          'Retry with the same URL',
+          'Provide a different URL',
+          'Cancel',
+        ],
+      };
+    }
+
+    if (toolName === 'mkdir' && /permission denied|operation not permitted/i.test(stderrLow)) {
+      logger.debug('[Node:RecoverSkill] Fast-path: mkdir permission error → ASK_USER');
+      return {
+        action: 'ASK_USER',
+        question: `Could not create ${failedStep.missingPath} due to permissions. Choose a writable location to continue.`,
+        options: [
+          'Use Desktop instead',
+          'Use Documents instead',
+          'Use /tmp instead',
+          'Cancel',
+        ],
+      };
+    }
+  }
+
   // ui.screen.verify: failed for any reason (vision LLM said verified=false, or the call itself failed)
   if (skill === 'ui.screen.verify') {
     const reasoning  = failedStep.reasoning  || (failedStep.error ? `Vision check error: ${failedStep.error}` : 'Visual verification could not confirm success.');

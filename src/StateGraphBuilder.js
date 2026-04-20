@@ -36,6 +36,7 @@ const liftConstraintNode  = require('./nodes/liftConstraint');
 const parseProjectNode = require('./nodes/parseProject');
 const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
 const resolveUserContextNode = require('./nodes/resolveUserContext');
+const gatherPlanContextNode = require('./nodes/gatherPlanContext');
 
 
 
@@ -249,6 +250,7 @@ class StateGraphBuilder {
       checkPlanCache: (state) => checkPlanCacheNode({ ...state, logger }),
       enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
       resolveUserContext: (state) => resolveUserContextNode({ ...state, logger, mcpAdapter }),
+      gatherPlanContext: (state) => gatherPlanContextNode({ ...state, logger, mcpAdapter, llmBackend }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       storeMemory: (state) => storeMemoryNode({ ...state, logger, mcpAdapter }),
       storeConstraint: (state) => storeConstraintNode({ ...state, logger, mcpAdapter }),
@@ -369,8 +371,19 @@ class StateGraphBuilder {
       // Constraint lift path: liftConstraint → logConversation → end
       liftConstraint: 'logConversation',
 
-      // resolveUserContext: always proceeds to planSkills (context enriched or no-op)
-      resolveUserContext: 'planSkills',
+      // resolveUserContext → gatherPlanContext → planSkills
+      // gatherPlanContext asks up to 3 clarifying questions for ambiguous command_automate tasks.
+      resolveUserContext: 'gatherPlanContext',
+
+      // gatherPlanContext: proceed to planSkills when complete/skipped, or pause for user answer
+      gatherPlanContext: (state) => {
+        if (state.planGatheringComplete || state.planGatheringSkipped) {
+          logger.debug('[StateGraph:Router] gatherPlanContext: complete/skipped — proceeding to planSkills');
+          return 'planSkills';
+        }
+        logger.debug('[StateGraph:Router] gatherPlanContext: awaiting user clarification — logConversation');
+        return 'logConversation';
+      },
 
       // gatherContext bypassed — kept for future re-enable
       // gatherContext: () => 'creatorPlanning',
