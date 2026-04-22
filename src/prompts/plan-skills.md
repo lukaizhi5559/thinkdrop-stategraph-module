@@ -18,6 +18,10 @@ browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|
 - `{{synthesisAnswerFile}}` — temp file path containing the synthesis output
 - `{{prev_stdout}}` — stdout of the immediately preceding step
 
+## Output Format Requirements
+
+**CRITICAL — Every step MUST include a `description` field.** The description is a short, human-readable summary of what the step does (e.g., 'Search for OpenClaw information on Grok', 'Set up Gmail agent', 'Send email with OpenClaw summary and PDF attachment'). NEVER omit the description field — it is required for plan readability and user review.
+
 **Credential template tokens — ALWAYS use these for `browser.act` fill/type steps that need a login, NEVER hardcode or guess values:**
 - `{{<service>:username}}` — any service email/username (replace `<service>` with the site slug)
 - `{{<service>:password}}` — any service password
@@ -36,14 +40,20 @@ browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|
 | External REST API service with api_key or bearer token (Mailgun, SendGrid, Stripe, Twilio, ClickSend, Postmark, etc.) | `browser.agent { action: 'build_agent', service: '...' }` then `{ action: 'run', agentId: '...', task: '...' }` |
 | OAuth service (Gmail, Google Calendar, Slack, Notion, Linear, Jira, Trello, GitHub no CLI, etc.) | `browser.agent { action: 'build_agent', service: '...' }` then `{ action: 'run', agentId: '...', task: '...' }` — browser.agent detects OAuth and automatically delegates to playwright.agent for login |
 | Service with a CLI binary (GitHub via `gh`, AWS via `aws`, Heroku via `heroku`, etc.) | `cli.agent { action: 'build_agent', service: '...' }` then `{ action: 'run', agentId: '...', task: '...' }` |
-| **Service listed in AVAILABLE AGENTS with type [browser]** (Gmail, Slack, Notion, etc.) | `browser.agent { action: 'run', agentId: '<id from AVAILABLE AGENTS>', task: '...' }` — **NEVER** `playwright.agent` |
+| **Service listed in AVAILABLE AGENTS with type [browser]** (Gmail, Slack, Notion, etc.) | `browser.agent { action: 'run', agentId: '<id from AVAILABLE AGENTS>', task: '...' }` — **NEVER** `playwright.agent` AND **NEVER** raw `browser.act` steps |
 | **Service listed in AVAILABLE AGENTS with type [api_key]** (openai.agent, anthropic.agent, mistral.agent, etc.) | ⚠️ **DEVELOPER API ONLY** — programmatic API calls ONLY. **`[api_key]` agents CANNOT navigate** — they have no browser and cannot fulfill any task phrased as "goto", "go to", "open", "visit", or "navigate to" a service. Those tasks unconditionally require a `[browser]` agent. If no `[browser]` agent exists for the target service → `build_agent` it first. Rule of thumb: talking *to* or visiting an AI → `[browser]` consumer-site agent. Building *with* an AI API → `[api_key]` developer agent. |
-| **Any web app that requires a login/account** — AI chatbots (ChatGPT, Claude, Perplexity, Gemini, Grok, etc.), productivity tools, social platforms, SaaS apps — **even if no open API exists** | Check AVAILABLE AGENTS first; if not found → `browser.agent { action: 'build_agent', service: '<name>' }` then `{ action: 'run', agentId: '...', task: '...' }`. Each service gets its own isolated browser session with persistent auth — no shared session, no re-login. **NEVER use `playwright.agent` for services requiring login.** |
+| **Any web app that requires a login/account** — AI chatbots (ChatGPT, Claude, Perplexity, Gemini, Grok, etc.), productivity tools, social platforms, SaaS apps — **even if no open API exists** | Check AVAILABLE AGENTS first; if not found → `browser.agent { action: 'build_agent', service: '<name>' }` then `{ action: 'run', agentId: '...', task: '...' }`. Each service gets its own isolated browser session with persistent auth — no shared session, no re-login. **NEVER use `playwright.agent` or raw `browser.act` steps for services requiring login.** |
 | **Discovery task on a known agent** — "find", "browse", "show me what's on", "explore", "discover", "look for", "search for" something on a site where the navigation path is UNKNOWN | `browser.agent { action: 'explore', agentId: '<id>', goal: '<discovery goal>' }` — explore navigates, detects auth, iterates nav items until goal is met. Use `explore` when steps are NOT predetermined. Use `run` when specific actions are known (compose, send, fill, create). |
 | Truly public / anonymous content — no login required (Wikipedia, news articles, public docs, weather, open-access pages) | `playwright.agent` with `goal` and `url` — or `browser.act` for simple navigate + read |
 | **Local system only**: file ops, grep, ffmpeg, local git, run local scripts, open apps | `shell.run` bash |
 
 **FORBIDDEN — never use `shell.run curl` to call external API services** (Mailgun, Gmail API, Slack API, Stripe, Twilio, etc.). `shell.run` has no credential management, no keychain access, no token refresh, and no retry on 401 — it always fails when tokens expire or keys are unset. Use `browser.agent` or `cli.agent` for ALL external services. `shell.run` is for local system commands only.
+
+**AI SERVICE ENDPOINT ROUTING — chat-first by default:**
+When the task is to ask, query, research, look up, or have a conversation with an AI service (DeepSeek, Perplexity, Mistral, Grok, etc.), route to the chat/research interface, NOT the developer API console. Use the plain service name (`deepseek`, `perplexity`) for chat tasks. Only use the `*platform` variant (e.g. `deepseekplatform`, `perplexityplatform`) when the task explicitly mentions API keys, tokens, or developer console access.
+- Chat / research / "ask it": `agentId: "deepseek.agent"` → chat.deepseek.com
+- API keys / platform / developer console: `agentId: "deepseekplatform.agent"` → platform.deepseek.com
+- Same pattern for Perplexity: `"perplexity.agent"` → www.perplexity.ai (chat); `"perplexityplatform.agent"` → settings/api
 
 **SMS routing rule — ALWAYS use free carrier email gateway (NO paid SMS APIs needed):**
 When the pipeline provides a `smsGatewayTarget` block, the SMS must be sent as a plain email via `gmail.agent`:
@@ -72,7 +82,7 @@ If `smsGatewayTarget.email` is null, the carrier has not been configured — ski
 ```
 Use the EXACT agentId string from the AVAILABLE AGENTS block — do NOT guess or substitute. The sub-agent reads its own descriptor, resolves credentials from the keychain, infers the correct commands, and executes end-to-end.
 
-⚠️ **User request is the authoritative source for service/agent selection.** Services explicitly named in the `User request:` field CANNOT be substituted with services inferred from `RECENT CONVERSATION` or `PRIOR SYNTHESIS CACHE`. If the user says "goto Grok and Qwen", you MUST plan `grok.agent` and `qwen.agent` — never `chatgpt.agent` or `gemini.agent` — even when prior conversation history or the cache contains results from those services on an identical topic. The user's explicit service names always override any implicit association from prior context.
+⚠️ **User request is the authoritative source for service/agent selection.** Services explicitly named in the `User request:` field CANNOT be substituted with services inferred from `RECENT CONVERSATION` or `PRIOR SYNTHESIS CACHE`. You MUST use exactly the services the user named — never substitute a different service, even if it offers similar functionality or the cache contains results from a different provider on an identical topic. The user's explicit service names always override any implicit association from prior context.
 
 **shell.run JSON body quoting — CRITICAL when user message text may contain apostrophes:**
 

@@ -43,7 +43,7 @@ module.exports = async function checkPlanCache(state) {
   }
 
   // Skip when guards are set (recovery, multi-intent, force-new)
-  if (state._forceNewPlan || state.recoveryContext || state.isMultiIntent) {
+  if (state._forceNewPlan || state.recoveryContext || state.isMultiIntent || state._planCorrectionMode) {
     return state;
   }
 

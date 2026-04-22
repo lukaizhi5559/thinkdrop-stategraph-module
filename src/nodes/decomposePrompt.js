@@ -44,6 +44,7 @@ function heuristicSplit(message) {
   return chunks.map((text, i) => ({
     text,
     estimatedIntent: classifyHeuristicIntent(text),
+    confidence:      0.65,
     order: i,
     dependsOn: [],
     isLongRunning: false,
@@ -193,6 +194,7 @@ async function llmDecompose(message, llmBackend, carriedIntent, logger) {
     return subPrompts.map((sp, i) => ({
       text:             String(sp.text || '').trim().slice(0, 300),
       estimatedIntent:  sp.estimatedIntent || sp.estimated_intent || 'general_knowledge',
+      confidence:       typeof (sp.confidence) === 'number' ? sp.confidence : 0.70,
       order:            typeof sp.order === 'number' ? sp.order : i,
       dependsOn:        Array.isArray(sp.dependsOn || sp.depends_on) ? (sp.dependsOn || sp.depends_on) : [],
       isLongRunning:    Boolean(sp.isLongRunning || sp.is_long_running),
@@ -227,6 +229,12 @@ module.exports = async function decomposePrompt(state) {
   // Skill plan fast-path: skip decomposition when _skillPlan array is already built
   if (state._skillPlan && Array.isArray(state._skillPlan)) {
     logger.info('[Node:DecomposePrompt] _skillPlan detected — skipping decomposition (skill plan passthrough)');
+    return state;
+  }
+
+  // Plan correction fast-path: keep the correction prompt intact for replanning.
+  if (state._planCorrectionMode) {
+    logger.info('[Node:DecomposePrompt] _planCorrectionMode detected — skipping decomposition');
     return state;
   }
 

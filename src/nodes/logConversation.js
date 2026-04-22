@@ -148,19 +148,36 @@ module.exports = async function logConversation(state) {
         // the body for the next SMS/email prompt in the same session).
         richAssistantText = `${answer || 'Done.'}\n\nStep outputs:\n[synthesize]:\n${synthAnswer}`;
       }
+      // Append saved file paths so the next turn's planner can resolve "that file" /
+      // "attach that" references to the real path — without this, savedFilePaths
+      // never reaches conversationHistory and the planner hallucinates a filename.
+      const _savedPaths = (state.savedFilePaths || []).filter(Boolean);
+      if (_savedPaths.length > 0) {
+        richAssistantText = (richAssistantText || `${answer || 'Done.'}`) +
+          `\n\nSaved files:\n${_savedPaths.join('\n')}`;
+      }
     }
 
     // [DEBUG DIAG] Remove after BODY fix confirmed
     logger.info(`[Node:LogConversation] richText preview (${richAssistantText?.length ?? 0}): ${(richAssistantText || '').slice(0, 200).replace(/\n/g, '↵')}`);
     if (richAssistantText && typeof richAssistantText === 'string') {
+      // Recovery/ASK_USER turns are system UI events — log them as role:'system' so the
+      // planner's poison filter drops them from conversationNote. Logging them as
+      // role:'assistant' causes prior recovery messages (e.g. "X returned a
+      // navigation/welcome page") to leak into the next turn's planning context and
+      // bias agent selection toward unrelated services.
+      const _isRecoveryTurn = !!(state.recoveryAction || state.recoveryQuestion ||
+                                 state._isAgentAskUser || state.askUser);
+      const _assistantRole = _isRecoveryTurn ? 'system' : 'assistant';
       logPromises.push(
         mcpAdapter.callService('conversation', 'message.add', {
           sessionId,
           text: richAssistantText,
-          sender: 'assistant',
+          sender: _assistantRole,
           metadata: {
             intent: intent?.type,
             source: 'stategraph',
+            _isRecovery: _isRecoveryTurn,
             timestamp: new Date().toISOString()
           }
         }).catch(err => {

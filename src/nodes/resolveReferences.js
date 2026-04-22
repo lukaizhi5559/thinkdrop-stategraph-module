@@ -416,6 +416,7 @@ module.exports = async function resolveReferences(state) {
       });
       const histData = histResult.data || histResult;
       conversationHistory = (histData.messages || [])
+        .filter(msg => msg.sender !== 'system') // exclude recovery/system turns tagged by logConversation
         .map(msg => ({
           role: msg.sender === 'user' ? 'user' : 'assistant',
           content: stripHtml(msg.text || msg.content || ''),

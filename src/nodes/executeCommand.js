@@ -457,8 +457,10 @@ module.exports = async function executeCommand(state) {
     // Build a rich commandOutput summary for the answer node to interpret
     const stepSummaries = skillResults.map((r, i) => {
       const label = r.description || r.skill;
-      const status = r.ok ? '✓' : '✗';
-      const detail = r.result
+      const status = r.skipped ? '⚠️' : (r.ok ? '✓' : '✗');
+      const detail = r.skipped && r.skipReason
+        ? `Skipped: ${r.skipReason}`
+        : r.result
         ? (typeof r.result === 'object' ? JSON.stringify(r.result) : String(r.result))
         : r.stdout
           ? r.stdout.trim().slice(0, 300)
@@ -1715,6 +1717,9 @@ module.exports = async function executeCommand(state) {
         && r.step > lastSynthesizeStep)
       .map(r => ({ source: r.args?.sessionId || r.args?.agentId || 'browser.agent', url: r.url || '', text: r.result }));
     logger.debug(`[Node:ExecuteCommand] synthesize: found ${pageTextResults.length} getPageText/waitForStableText results`);
+    const skippedStepNotes = skillResults
+      .filter(r => r.skipped && r.skipReason && r.step > lastSynthesizeStep)
+      .map(r => `- Step ${r.step} (${r.description || r.skill}): ${r.skipReason}`);
 
     // Include shell.run stdout (e.g. cat file output) as well as browser getPageText results
     const shellStdoutResults = skillResults
@@ -1935,6 +1940,9 @@ module.exports = async function executeCommand(state) {
       : _rawSynthesisContext;
 
     const synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
+    const skippedStepsNote = skippedStepNotes.length > 0
+      ? `\n\nNOTE — The following steps were skipped because the service was unavailable or not ready:\n${skippedStepNotes.join('\n')}\nPlease acknowledge these gaps in the summary.`
+      : '';
     let synthesisFilePath = args.saveToFile || null;
 
     // If saveToFile contains {{prev_stdout}}, resolve it now using the previous step's stdout
@@ -2011,8 +2019,8 @@ module.exports = async function executeCommand(state) {
       }
 
       const synthesisQuery = hasFileContent
-        ? `${synthesisPrompt}\n\nHere is the current file content:\n\n${synthesisContext}`
-        : `${synthesisPrompt}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
+        ? `${synthesisPrompt}${skippedStepsNote}\n\nHere is the current file content:\n\n${synthesisContext}`
+        : `${synthesisPrompt}${skippedStepsNote}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
       // Detect response language from the original user message (same approach as answer.js).
       // Voice: read sessionLanguage from journal. Text: detect from script/accent heuristics.
       const _SYNTH_LANG_NAMES = { zh: 'Chinese (Mandarin)', es: 'Spanish', fr: 'French', pt: 'Portuguese', ar: 'Arabic', ja: 'Japanese', ko: 'Korean', hi: 'Hindi', de: 'German', it: 'Italian', ru: 'Russian' };
@@ -2175,7 +2183,134 @@ module.exports = async function executeCommand(state) {
           cleanedAnswer = await _repairSkillMd(cleanedAnswer, llmBackend, logger, synthesisFilePath, repairContext);
         }
 
-        fs.writeFileSync(synthesisFilePath, cleanedAnswer, 'utf8');
+        // ── Format dispatch ──────────────────────────────────────────────────
+        // Route to the right conversion engine based on target extension.
+        // Supported rich formats: .pdf .docx .pptx .xlsx .html .epub .rtf .odt
+        // Plain/data formats (.csv .md .txt .json and anything else) → write as-is.
+        const { execSync: _execSync } = require('child_process');
+        const _fmtExt = path.extname(synthesisFilePath).toLowerCase();
+        const _tmpMdPath = path.join(os.tmpdir(), `thinkdrop_synthesis_${Date.now()}.md`);
+        // Helper: try a shell command, return true on success
+        const _tryCmd = (cmd, timeoutMs = 30000) => {
+          try { _execSync(`${cmd} 2>&1`, { timeout: timeoutMs }); return true; }
+          catch (_) { return false; }
+        };
+        // Format registry — each entry is a function(tmpMd, outPath) → boolean (success)
+        const _FORMAT_HANDLERS = {
+          '.pdf': (src, out) => {
+            // Write markdown to temp file, try pandoc engines, then AppleScript
+            fs.writeFileSync(src, cleanedAnswer, 'utf8');
+            for (const _engine of ['wkhtmltopdf', 'pdflatex', 'weasyprint', '']) {
+              const _flag = _engine ? `--pdf-engine=${_engine} ` : '';
+              if (_tryCmd(`pandoc "${src}" -o "${out}" ${_flag}--standalone`)) {
+                logger.debug(`[Node:ExecuteCommand] synthesize: PDF written via pandoc${_engine ? `+${_engine}` : ''} → ${out}`);
+                return true;
+              }
+            }
+            // AppleScript Print-to-PDF fallback (macOS only)
+            const _htmlPath = src.replace(/\.md$/, '.html');
+            if (_tryCmd(`pandoc "${src}" -o "${_htmlPath}" --standalone`, 15000)) {
+              const _as = `set htmlFile to POSIX file "${_htmlPath}"\nset pdfOut to POSIX file "${out}"\ntell application "Safari"\nactivate\nopen htmlFile\ndelay 2\nprint with properties {target printer:"PDF", job disposition:"save", save path:pdfOut}\nend tell`;
+              if (_tryCmd(`osascript -e '${_as.replace(/'/g, "'\\''")}'`, 45000)) {
+                logger.debug(`[Node:ExecuteCommand] synthesize: PDF written via AppleScript → ${out}`);
+                return true;
+              }
+            }
+            return false;
+          },
+          '.docx': (src, out) => {
+            fs.writeFileSync(src, cleanedAnswer, 'utf8');
+            if (_tryCmd(`pandoc "${src}" -o "${out}" --standalone`)) {
+              logger.debug(`[Node:ExecuteCommand] synthesize: DOCX written via pandoc → ${out}`);
+              return true;
+            }
+            return false;
+          },
+          '.pptx': (src, out) => {
+            fs.writeFileSync(src, cleanedAnswer, 'utf8');
+            // pandoc → pptx (requires reference pptx, attempt anyway)
+            if (_tryCmd(`pandoc "${src}" -o "${out}" --standalone`)) {
+              logger.debug(`[Node:ExecuteCommand] synthesize: PPTX written via pandoc → ${out}`);
+              return true;
+            }
+            // LibreOffice fallback
+            const _tmpOdpPath = src.replace(/\.md$/, '.odp');
+            if (_tryCmd(`pandoc "${src}" -o "${_tmpOdpPath}" --standalone`) &&
+                _tryCmd(`soffice --headless --convert-to pptx "${_tmpOdpPath}" --outdir "${path.dirname(out)}"`, 60000)) {
+              // soffice writes <name>.pptx alongside the source; rename if needed
+              const _sofficeOut = path.join(path.dirname(out), path.basename(_tmpOdpPath, '.odp') + '.pptx');
+              if (_sofficeOut !== out) { try { fs.renameSync(_sofficeOut, out); } catch (_) {} }
+              logger.debug(`[Node:ExecuteCommand] synthesize: PPTX written via LibreOffice → ${out}`);
+              return true;
+            }
+            return false;
+          },
+          '.xlsx': (src, out) => {
+            fs.writeFileSync(src, cleanedAnswer, 'utf8');
+            // ssconvert (Gnumeric) can convert CSV → xlsx
+            const _csvPath = src.replace(/\.md$/, '.csv');
+            fs.writeFileSync(_csvPath, cleanedAnswer, 'utf8');
+            if (_tryCmd(`ssconvert "${_csvPath}" "${out}"`, 30000)) {
+              logger.debug(`[Node:ExecuteCommand] synthesize: XLSX written via ssconvert → ${out}`);
+              return true;
+            }
+            if (_tryCmd(`soffice --headless --convert-to xlsx "${_csvPath}" --outdir "${path.dirname(out)}"`, 60000)) {
+              const _sofficeOut = path.join(path.dirname(out), path.basename(_csvPath, '.csv') + '.xlsx');
+              if (_sofficeOut !== out) { try { fs.renameSync(_sofficeOut, out); } catch (_) {} }
+              logger.debug(`[Node:ExecuteCommand] synthesize: XLSX written via LibreOffice → ${out}`);
+              return true;
+            }
+            return false;
+          },
+          '.html': (src, out) => {
+            fs.writeFileSync(src, cleanedAnswer, 'utf8');
+            if (_tryCmd(`pandoc "${src}" -o "${out}" --to=html5 --standalone`)) {
+              logger.debug(`[Node:ExecuteCommand] synthesize: HTML written via pandoc → ${out}`);
+              return true;
+            }
+            return false;
+          },
+          '.epub': (src, out) => {
+            fs.writeFileSync(src, cleanedAnswer, 'utf8');
+            if (_tryCmd(`pandoc "${src}" -o "${out}" --standalone`)) {
+              logger.debug(`[Node:ExecuteCommand] synthesize: EPUB written via pandoc → ${out}`);
+              return true;
+            }
+            return false;
+          },
+          '.rtf': (src, out) => {
+            fs.writeFileSync(src, cleanedAnswer, 'utf8');
+            if (_tryCmd(`pandoc "${src}" -o "${out}" --standalone`)) {
+              logger.debug(`[Node:ExecuteCommand] synthesize: RTF written via pandoc → ${out}`);
+              return true;
+            }
+            return false;
+          },
+          '.odt': (src, out) => {
+            fs.writeFileSync(src, cleanedAnswer, 'utf8');
+            if (_tryCmd(`pandoc "${src}" -o "${out}" --standalone`)) {
+              logger.debug(`[Node:ExecuteCommand] synthesize: ODT written via pandoc → ${out}`);
+              return true;
+            }
+            return false;
+          },
+        };
+
+        const _handler = _FORMAT_HANDLERS[_fmtExt];
+        if (_handler) {
+          const _fmtDone = _handler(_tmpMdPath, synthesisFilePath);
+          if (!_fmtDone) {
+            // All conversion engines failed — save as .txt with matching stem
+            const _txtPath = synthesisFilePath.replace(/\.[^.]+$/, '.txt');
+            fs.writeFileSync(_txtPath, cleanedAnswer, 'utf8');
+            logger.warn(`[Node:ExecuteCommand] synthesize: all ${_fmtExt} engines failed — saved as plain text to ${_txtPath}`);
+            synthesisFilePath = _txtPath;
+          }
+          try { fs.unlinkSync(_tmpMdPath); } catch (_) {}
+        } else {
+          // Plain / data format (.csv .md .txt .json etc.) — write directly
+          fs.writeFileSync(synthesisFilePath, cleanedAnswer, 'utf8');
+        }
         logger.debug(`[Node:ExecuteCommand] synthesize: saved to ${synthesisFilePath}`);
       } catch (writeErr) {
         logger.warn(`[Node:ExecuteCommand] synthesize: could not write file: ${writeErr.message}`);
@@ -2990,6 +3125,105 @@ module.exports = async function executeCommand(state) {
           agentId: raw.agentId || null,
           needsCredentials: raw.needsCredentials || false,
         },
+        commandExecuted: false,
+      };
+    }
+
+    // ── Research-content-empty gate ────────────────────────────────────────────
+    // browser.agent quality gate detected the page returned nav/welcome content
+    // instead of actual research data.  Propagate as a fast-path ASK_USER so
+    // recoverSkill can offer alternative sources without calling the LLM.
+    if (skill === 'browser.agent' && raw.researchContentEmpty === true) {
+      if (raw.serviceUnavailable === true) {
+        const serviceLabel = raw.agentId || resolvedArgs.agentId || 'browser.agent';
+        const skipReason = `${serviceLabel} was unavailable (${raw.unavailableReason || raw.httpStatus || 'service error'})`;
+        logger.info(`[Node:ExecuteCommand] service-unavailable skip: "${serviceLabel}" — advancing to next step`);
+        if (progressCallback) progressCallback({
+          type: 'step_skipped', stepIndex: skillCursor, totalSteps: skillPlan.length,
+          skill, description: description || skill, reason: skipReason,
+        });
+        const skippedResult = {
+          step: skillCursor + 1,
+          skill,
+          args: resolvedArgs,
+          description,
+          ok: true,
+          skipped: true,
+          serviceUnavailable: true,
+          skipReason,
+          unavailableReason: raw.unavailableReason || null,
+          httpStatus: Number.isInteger(raw.httpStatus) ? raw.httpStatus : null,
+          stdout: `[Skipped: ${skipReason}]`,
+          error: raw.error || undefined,
+        };
+        const nextCursor = skillCursor + 1;
+        if (nextCursor >= skillPlan.length) {
+          const subPlanStackNow = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
+          if (subPlanStackNow.length > 0) {
+            const { completeSubPlan } = require('./subPlanEngine');
+            const resumed = completeSubPlan({ ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor });
+            return { ...state, ...resumed, commandExecuted: false, failedStep: null };
+          }
+          return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: true, failedStep: null };
+        }
+        return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+      }
+
+      const serviceLabel = raw.agentId || resolvedArgs.agentId || 'browser.agent';
+      const skipReason = `${serviceLabel} returned no useful research content`;
+      logger.info(`[Node:ExecuteCommand] research-content-empty skip: "${serviceLabel}" — advancing to next step`);
+      if (progressCallback) progressCallback({
+        type: 'step_skipped', stepIndex: skillCursor, totalSteps: skillPlan.length,
+        skill, description: description || skill, reason: skipReason,
+      });
+      const skippedResult = {
+        step: skillCursor + 1,
+        skill,
+        args: resolvedArgs,
+        description,
+        ok: true,
+        skipped: true,
+        researchContentEmpty: true,
+        skipReason,
+        stdout: `[Skipped: ${skipReason}]`,
+        error: raw.error || undefined,
+      };
+      const nextCursor = skillCursor + 1;
+      if (nextCursor >= skillPlan.length) {
+        const subPlanStackNow = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
+        if (subPlanStackNow.length > 0) {
+          const { completeSubPlan } = require('./subPlanEngine');
+          const resumed = completeSubPlan({ ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor });
+          return { ...state, ...resumed, commandExecuted: false, failedStep: null };
+        }
+        return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: true, failedStep: null };
+      }
+      return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+    }
+
+    // ── Wrong-destination gate ─────────────────────────────────────────────────
+    // browser.agent pre-navigation resolver detected a mismatch between task intent
+    // and configured startUrl, and no high-confidence auto-correction was available.
+    // Propagate the resolver's question verbatim so recoverSkill picks it up as a
+    // fast-path ASK_USER without calling the LLM.
+    if (skill === 'browser.agent' && raw.askUser === true && raw.wrongDestination) {
+      logger.info(`[Node:ExecuteCommand] wrong-destination: "${raw.agentId}" — routing to recoverSkill fast-path`);
+      const wdStep = {
+        step: skillCursor + 1, skill, args: resolvedArgs, description,
+        ok: false, error: raw.question || 'Wrong destination detected',
+        wrongDestination: true,
+        question:  raw.question,
+        options:   raw.options || [],
+      };
+      if (progressCallback) progressCallback({
+        type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill,
+        error: wdStep.error,
+      });
+      return {
+        ...state,
+        skillResults: [...skillResults, wdStep],
+        skillCursor,
+        failedStep: wdStep,
         commandExecuted: false,
       };
     }

@@ -23,6 +23,103 @@ function writeIntentLog(entry) {
   catch (_) { /* never throw — logging must never block classification */ }
 }
 
+// ── Browser-service hard guard data ──────────────────────────────────────────
+// Canonical list of known browser services split into two force tiers.
+// Tier A (AI consumer apps + platforms): force command_automate on any action verb match.
+// Tier B (productivity, social, cloud, etc.): force only when action verb clearly present.
+// Source of truth: stategraph-module/src/data/browser-services.json
+// (Generated from KNOWN_BROWSER_SERVICES in browser.agent.cjs — no direct dependency.)
+let _browserServices = null;
+function getBrowserServices() {
+  if (!_browserServices) {
+    try {
+      const raw = fs.readFileSync(path.join(__dirname, '../data/browser-services.json'), 'utf8');
+      _browserServices = JSON.parse(raw);
+    } catch (_) {
+      _browserServices = { tierA: [], tierB: [] };
+    }
+  }
+  return _browserServices;
+}
+
+// Action verbs that indicate the user intends to navigate to / interact with a service.
+const BROWSER_ACTION_VERB_RE = /\b(go\s+to|goto|navigate(\s+to)?|open|visit|use|ask|look\s+up|search|check|find|bring\s+up|pull\s+up|load|launch|go\s+on|hop\s+on|jump\s+to|head\s+to|send|post|reply|submit|upload|download|sign\s+in|log\s+in|log\s+into)\b/i;
+
+// Yes/no question pattern — skip Tier B guard for these (avoid false positives like "is gmail free to use")
+const QUESTION_OPENER_RE = /^(is|are|was|were|does|do|did|what|who|which|when|why|how|can|could|would|should|will|shall)\s+/i;
+
+/**
+ * Browser-service hard guard.
+ * Returns { matched: true, intent: 'command_automate', tier, service } or { matched: false }.
+ */
+function checkBrowserServiceGuard(text) {
+  const lower = text.toLowerCase();
+  const { tierA, tierB } = getBrowserServices();
+
+  // Tier A: match any action verb OR bare service mention (AI chat apps are always navigated to)
+  for (const svc of tierA) {
+    const svcLower = svc.toLowerCase();
+    if (lower.includes(svcLower)) {
+      if (BROWSER_ACTION_VERB_RE.test(text)) {
+        return { matched: true, intent: 'command_automate', tier: 'A', service: svc };
+      }
+    }
+  }
+
+  // Tier B: require an explicit action verb AND not a yes/no question
+  // (skip guard for "is gmail free to use?", "does slack have video?", etc.)
+  if (BROWSER_ACTION_VERB_RE.test(text) && !QUESTION_OPENER_RE.test(text.trim())) {
+    for (const svc of tierB) {
+      const svcLower = svc.toLowerCase();
+      if (lower.includes(svcLower)) {
+        return { matched: true, intent: 'command_automate', tier: 'B', service: svc };
+      }
+    }
+  }
+
+  return { matched: false };
+}
+
+/**
+ * Ensemble adjudication: compare LLM estimatedIntent vs Xenova topIntent.
+ * Returns { winner, confidence, reason }.
+ *
+ * Winner policy:
+ *  1. Xenova conf >= 0.82 AND Xenova − LLM >= 0.12  → Xenova wins
+ *  2. LLM conf >= 0.78 AND LLM − Xenova >= 0.10     → LLM wins
+ *  3. Tie-break: command_automate vs web_search with service+action evidence → command_automate
+ *  4. All else → higher confidence wins
+ */
+function adjudicateEnsemble(llmIntent, llmConf, xenovaIntent, xenovaConf, text) {
+  // Both agree — easy win
+  if (llmIntent === xenovaIntent) {
+    return { winner: llmIntent, confidence: Math.max(llmConf, xenovaConf), reason: 'ensemble-agree' };
+  }
+
+  // Xenova strong win
+  if (xenovaConf >= 0.82 && (xenovaConf - llmConf) >= 0.12) {
+    return { winner: xenovaIntent, confidence: xenovaConf, reason: 'xenova-strong' };
+  }
+
+  // LLM strong win
+  if (llmConf >= 0.78 && (llmConf - xenovaConf) >= 0.10) {
+    return { winner: llmIntent, confidence: llmConf, reason: 'llm-strong' };
+  }
+
+  // Tie-break: command_automate vs web_search — prefer command_automate when service+verb evidence exists
+  const isCAvsWS = (llmIntent === 'command_automate' && xenovaIntent === 'web_search') ||
+                   (xenovaIntent === 'command_automate' && llmIntent === 'web_search');
+  if (isCAvsWS && BROWSER_ACTION_VERB_RE.test(text)) {
+    return { winner: 'command_automate', confidence: Math.max(llmConf, xenovaConf), reason: 'tiebreak-ca-over-ws' };
+  }
+
+  // Default: higher confidence wins
+  if (xenovaConf >= llmConf) {
+    return { winner: xenovaIntent, confidence: xenovaConf, reason: 'xenova-higher' };
+  }
+  return { winner: llmIntent, confidence: llmConf, reason: 'llm-higher' };
+}
+
 module.exports = async function parseIntent(state) {
   const { mcpAdapter, message, resolvedMessage, carriedIntent, context, llmBackend, conversationHistory, activeBrowserSessionId, activeBrowserUrl } = state;
   const logger = state.logger || console;
@@ -48,6 +145,16 @@ module.exports = async function parseIntent(state) {
       ...state,
       intent: { type: 'command_automate', confidence: 1.0, entities: [], requiresMemoryAccess: false },
       metadata: { parser: 'skill-plan-passthrough', processingTimeMs: 0 },
+    };
+  }
+
+  // Plan correction fast-path: corrections should always re-enter automation planning.
+  if (state._planCorrectionMode) {
+    logger.info('[Node:ParseIntent] _planCorrectionMode detected — forcing command_automate');
+    return {
+      ...state,
+      intent: { type: 'command_automate', confidence: 1.0, entities: [], requiresMemoryAccess: false },
+      metadata: { parser: 'plan-correction-override', processingTimeMs: 0 },
     };
   }
 
@@ -101,18 +208,26 @@ module.exports = async function parseIntent(state) {
     // when the LLM produced it. For heuristic-decomposed plans (_decomposedBy !== 'llm'),
     // re-classify with action-verb detection rather than trusting the heuristic's
     // estimatedIntent blindly — covers goto/send/compose/compare/etc.
+    // Browser-service hard guard is applied to every sub-prompt regardless of decompose source.
     const intentQueue = [];
     for (const subPrompt of state.intentPlan.slice(1)) {
       let classifiedIntent = subPrompt.estimatedIntent;
-      if (state._decomposedBy !== 'llm' && classifiedIntent === 'general_knowledge') {
+      let classifiedConf   = state._decomposedBy === 'llm' ? 0.70 : 0.65;
+
+      // Browser-service guard takes priority over LLM and heuristic estimates
+      const subGuard = checkBrowserServiceGuard(subPrompt.text);
+      if (subGuard.matched) {
+        classifiedIntent = 'command_automate';
+        classifiedConf   = subGuard.tier === 'A' ? 0.97 : 0.93;
+        logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] browser-service guard (tier ${subGuard.tier}) → command_automate`);
+      } else if (state._decomposedBy !== 'llm' && classifiedIntent === 'general_knowledge') {
         if (/\b(goto|go\s+to|navigate\s+to|open|visit|send|email|compose|draft|reply|click|check|search|look\s+up|compare|create|make|download|install|run|execute|text|book|reserve|schedule|fill|type|start|launch|switch|get\s+me|show\s+me|bring\s+up|pull\s+up|ask|query|summarize|compile|gather)\b/i.test(subPrompt.text)) {
           classifiedIntent = 'command_automate';
         }
       }
-      const classifiedConf   = state._decomposedBy === 'llm' ? 0.92 : 0.65;
 
       intentQueue.push({ ...subPrompt, intent: classifiedIntent, confidence: classifiedConf });
-      logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] "${subPrompt.text.slice(0, 60)}" → ${classifiedIntent} (${classifiedConf.toFixed(2)}) via:${state._decomposedBy}`);
+      logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] "${subPrompt.text.slice(0, 60)}" → ${classifiedIntent} (${classifiedConf.toFixed(2)}) via:${subGuard.matched ? `guard-tier${subGuard.tier}` : state._decomposedBy}`);
     }
 
     return {
@@ -315,6 +430,37 @@ module.exports = async function parseIntent(state) {
     /\b(go|find|get|show|list|give|search|look|navigate|browse|open|play|watch|click|run|navigate|pull|bring|check)\b/i.test(classifyMessage)) {
     logger.debug(`[Node:ParseIntent] "I mean" clarification override → command_automate: "${classifyMessage}"`);
     return { ...state, intent: { type: 'command_automate', confidence: 0.92, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'i-mean-clarification-override', processingTimeMs: 0 } };
+  }
+
+  // Prior-automation correction-redirect guard — pre-DistilBERT, pre-carriedIntent.
+  // Fires when the user complains about the prior run and redirects to a different
+  // service / approach.  Examples:
+  //   "I shouldn't have to sign into perplexity for this and instead of qwen/deepseek just use grok"
+  //   "instead of chatgpt use claude"
+  //   "don't use deepseek, use perplexity instead"
+  //   "use grok instead of qwen"
+  // Two-part gate:
+  //   Part 1 — context gate: a prior automation ran in the last 6 turns
+  //            (assistant message containing "Step outputs:").  conversationHistory
+  //            uses {role, content} — confirmed from retrieveMemory.js mapping.
+  //   Part 2 — loose redirection signal: any complaint + service-redirect phrasing.
+  // A strong-pattern fallback fires even without prior automation context.
+  const _recentHistory = (state.conversationHistory || []).slice(-6);
+  const _hadRecentAutomation = _recentHistory.some(
+    m => m.role === 'assistant' && (m.content || '').includes('Step outputs:')
+  );
+  // Loose signal: catches common redirection patterns after a failed automation
+  const _REDIRECT_SIGNAL_RE = /\b(?:instead\s+of|don'?t\s+use|use\s+\w[\w\s]{0,20}instead|shouldn'?t\s+(?:have|need)\s+to|try\s+(?:using\s+)?\w+\s+instead|use\s+\w+\s+(?:not|rather\s+than)|switch\s+to\s+\w|go\s+to\s+\w+\s+instead)\b/i;
+  if (_hadRecentAutomation && _REDIRECT_SIGNAL_RE.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Correction-redirect (context+signal) override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.95, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'correction-redirect-override', processingTimeMs: 0 } };
+  }
+  // Strong-pattern fallback: explicit "X instead of Y" / "don't use X, use Y" patterns
+  // fire regardless of prior automation context — these are unambiguous re-execution requests.
+  const _STRONG_REDIRECT_RE = /(?:instead\s+of\s+\w[\w\s]{0,30}(?:just\s+)?(?:use|try)|(?:don'?t|do\s+not)\s+use\s+\w[\w\s]{0,20},?\s+use\s+\w[\w\s]{0,20}instead|use\s+\w[\w\s]{0,20}instead\s+of\s+\w)/i;
+  if (_STRONG_REDIRECT_RE.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntent] Correction-redirect (strong-pattern) override → command_automate: "${classifyMessage}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 0.93, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'correction-redirect-strong-override', processingTimeMs: 0 } };
   }
 
   // Screenshot / screen-capture hard override — must run BEFORE DistilBERT early exit.
@@ -742,15 +888,16 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
   // skip the fast-path so pattern guards below can reclassify it correctly
   // (e.g. I-need-you-to-action override fires for "goto ChatGPT..." sub-prompts).
   if (state.intentPlan && Array.isArray(state.intentPlan) && state.intentPlan.length >= 1) {
-    const intent = state.intentPlan[0].estimatedIntent || 'general_knowledge';
+    const llmEstimatedIntent = state.intentPlan[0].estimatedIntent || 'general_knowledge';
+    const llmEstimatedConf   = typeof state.intentPlan[0].confidence === 'number' ? state.intentPlan[0].confidence : 0.70;
 
-    if (intent === 'general_knowledge' && state._decomposedBy !== 'llm') {
+    if (llmEstimatedIntent === 'general_knowledge' && state._decomposedBy !== 'llm') {
       logger.debug(`[Node:ParseIntent] Heuristic general_knowledge — skipping fast-path, falling through to pattern guards: "${classifyMessage}"`);
       // fall through to pattern guards below
     } else {
     // Browser-context override: decompose may return memory_store for a browser-session
     // refinement message because the LLM lacks visibility into the active browser context.
-    if (intent === 'memory_store' &&
+    if (llmEstimatedIntent === 'memory_store' &&
         activeBrowserSessionId &&
         /\b(youtube|twitch|tiktok|vimeo|netflix|instagram|channel|video)\.?(com)?/i.test(activeBrowserUrl || '') &&
         /\b(channel|video|videos|list|less\s+than|under|min(ute)?s?|filter|shorts?|clips?)\b/i.test(classifyMessage) &&
@@ -764,12 +911,78 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
       };
     }
 
-    logger.debug(`[Node:ParseIntent] decompose-passthrough → ${intent}: "${classifyMessage}"`);
-    writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent || null, parser: 'decompose-passthrough', intent, confidence: 0.92 });
+    // ── Browser-service hard guard ──────────────────────────────────────────
+    // If the message mentions a known browser service + action verb, force
+    // command_automate regardless of what the LLM estimated. This catches LLM
+    // backend regressions (e.g. Groq returning web_search for "go to perplexity").
+    const guardResult = checkBrowserServiceGuard(classifyMessage);
+    if (guardResult.matched) {
+      logger.info(`[Node:ParseIntent] Browser-service hard guard (tier ${guardResult.tier}, service=${guardResult.service}) → command_automate: "${classifyMessage}"`);
+      writeIntentLog({
+        ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent || null,
+        parser: `hard-guard.browser-service-tier${guardResult.tier}`,
+        intent: 'command_automate', confidence: guardResult.tier === 'A' ? 0.97 : 0.93,
+        hardGuardMatched: true, serviceEvidence: guardResult.service,
+        llmIntent: llmEstimatedIntent, llmConfidence: llmEstimatedConf,
+      });
+      return {
+        ...state,
+        intent: { type: 'command_automate', confidence: guardResult.tier === 'A' ? 0.97 : 0.93, entities: [], requiresMemoryAccess: false },
+        metadata: { parser: `hard-guard.browser-service-tier${guardResult.tier}`, processingTimeMs: 0 },
+      };
+    }
+
+    // ── Ensemble adjudication (LLM + Xenova cross-check) ───────────────────
+    // Call phi4 /intent.classify (Xenova zero-shot) to cross-check the LLM's
+    // estimatedIntent. Winner policy is applied in adjudicateEnsemble().
+    // Falls back to LLM intent if phi4 is unavailable (no regression path).
+    let finalIntent    = llmEstimatedIntent;
+    let finalConf      = llmEstimatedConf;
+    let adjudicationReason = 'llm-only';
+    let xenovaIntent   = null;
+    let xenovaConf     = 0;
+    let top2Gap        = null;
+    let lowConfidence  = false;
+
+    if (mcpAdapter) {
+      try {
+        const classifyRes = await mcpAdapter.callService('phi4', 'intent.classify', {
+          message: classifyMessage,
+          llmIntent: llmEstimatedIntent,
+          llmConfidence: llmEstimatedConf,
+        });
+        if (classifyRes && classifyRes.topIntent) {
+          xenovaIntent = classifyRes.topIntent;
+          xenovaConf   = classifyRes.topConfidence || 0;
+          top2Gap      = classifyRes.top2Gap != null ? classifyRes.top2Gap : null;
+
+          const adj = adjudicateEnsemble(llmEstimatedIntent, llmEstimatedConf, xenovaIntent, xenovaConf, classifyMessage);
+          finalIntent        = adj.winner;
+          finalConf          = adj.confidence;
+          adjudicationReason = adj.reason;
+
+          lowConfidence = (llmEstimatedConf < 0.60 && xenovaConf < 0.60);
+          logger.debug(`[Node:ParseIntent] Ensemble: llm=${llmEstimatedIntent}(${llmEstimatedConf.toFixed(2)}) xenova=${xenovaIntent}(${xenovaConf.toFixed(2)}) → ${finalIntent} (${adjudicationReason})`);
+        }
+      } catch (ensembleErr) {
+        logger.warn(`[Node:ParseIntent] Ensemble phi4 call failed (using LLM intent): ${ensembleErr.message}`);
+      }
+    }
+
+    logger.debug(`[Node:ParseIntent] decompose-passthrough → ${finalIntent} (${adjudicationReason}): "${classifyMessage}"`);
+    writeIntentLog({
+      ts: new Date().toISOString(), message: classifyMessage, carriedHint: carriedIntent || null,
+      parser: 'decompose-passthrough',
+      intent: finalIntent, confidence: finalConf,
+      llmIntent: llmEstimatedIntent, llmConfidence: llmEstimatedConf,
+      xenovaIntent, xenovaConfidence: xenovaConf,
+      adjudicationReason, hardGuardMatched: false, serviceEvidence: null,
+      lowConfidence, top2Gap,
+    });
     return {
       ...state,
-      intent: { type: intent, confidence: 0.92, entities: [], requiresMemoryAccess: intent === 'memory_retrieve' },
-      metadata: { parser: 'decompose-passthrough', processingTimeMs: 0 },
+      intent: { type: finalIntent, confidence: finalConf, entities: [], requiresMemoryAccess: finalIntent === 'memory_retrieve', lowConfidence: lowConfidence || undefined },
+      metadata: { parser: 'decompose-passthrough', adjudicationReason, processingTimeMs: 0 },
     };
     } // end: heuristic-general_knowledge skip guard
   }

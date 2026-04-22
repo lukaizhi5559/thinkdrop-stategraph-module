@@ -639,6 +639,69 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
 
+  // ── browser.agent run: wrong destination — auto-correct surfaced as ASK_USER ──
+  // browser.agent returned {wrongDestination:true} when the pre-navigation resolver
+  // detected the configured startUrl doesn't match the task intent and no high-confidence
+  // correction existed. Surface the exact question the resolver built so the user can
+  // pick the right endpoint. On resume, browser.agent injects the answer as resume context
+  // and re-runs without prompting again.
+  if ((skill === 'browser.agent' || skill === 'agentbrowser.agent') && failedStep.wrongDestination) {
+    const agentId     = args?.agentId || '';
+    const question    = failedStep.question || `Which version of ${agentId.replace(/\.agent$/, '')} would you like to open?`;
+    const options     = Array.isArray(failedStep.options) ? failedStep.options : [];
+    logger.info(`[Node:RecoverSkill] Fast-path: ${skill} wrong-destination for "${agentId}" → ASK_USER`);
+    return {
+      action:   'ASK_USER',
+      question,
+      options,
+      _isAgentAskUser: true,
+      agentId,
+    };
+  }
+
+  // ── browser.agent run: research content empty (login/nav page) ──────────
+  // browser.agent returned {researchContentEmpty:true} when the page loaded but
+  // contained only navigation/welcome content instead of actual research data.
+  //
+  // Auto-fallback chain (transparent to the user until all options are exhausted):
+  //   1. Any service other than googleaimode/duckduckgo → try Google AI Mode first
+  //   2. googleaimode.agent failed           → try DuckDuckGo
+  //   3. duckduckgo.agent failed             → ASK_USER (all auto-fallbacks done)
+  if ((skill === 'browser.agent' || skill === 'agentbrowser.agent') && failedStep.researchContentEmpty) {
+    const agentId     = args?.agentId || '';
+    const agentBase   = agentId.replace(/\.agent$/, '').toLowerCase();
+    const serviceName = agentId.replace(/\.agent$/, '') || 'this service';
+    const taskDesc    = args?.task || '';
+
+    if (agentBase !== 'googleaimode' && agentBase !== 'duckduckgo') {
+      // First fallback: try Google AI Mode automatically
+      logger.info(`[Node:RecoverSkill] Fast-path: ${skill} research-content-empty for "${agentId}" → auto-REPLAN googleaimode.agent`);
+      return {
+        action: 'REPLAN',
+        suggestion: `${serviceName} returned a navigation/welcome page. Automatically retrying with Google AI Mode (google.com).`,
+        constraint: `Replace the failing ${agentId} step with a googleaimode.agent step: { "skill": "browser.agent", "args": { "action": "run", "agentId": "googleaimode.agent", "task": "${taskDesc.replace(/"/g, '\\"')}" } }. Keep all other plan steps unchanged.`,
+      };
+    }
+
+    if (agentBase === 'googleaimode') {
+      // Second fallback: try DuckDuckGo automatically
+      logger.info(`[Node:RecoverSkill] Fast-path: googleaimode.agent research-content-empty → auto-REPLAN duckduckgo.agent`);
+      return {
+        action: 'REPLAN',
+        suggestion: `Google AI Mode also returned a navigation page. Automatically retrying with DuckDuckGo.`,
+        constraint: `Replace the failing googleaimode.agent step with a duckduckgo.agent step: { "skill": "browser.agent", "args": { "action": "run", "agentId": "duckduckgo.agent", "task": "${taskDesc.replace(/"/g, '\\"')}" } }. Keep all other plan steps unchanged.`,
+      };
+    }
+
+    // All auto-fallbacks exhausted — ask the user
+    logger.info(`[Node:RecoverSkill] Fast-path: duckduckgo.agent research-content-empty → ASK_USER (all fallbacks exhausted)`);
+    return {
+      action: 'ASK_USER',
+      question: `All automatic search fallbacks failed (tried ${serviceName}, Google AI Mode, and DuckDuckGo) — each returned a navigation/welcome page instead of results.\n\nHow would you like to proceed?`,
+      options: ['Try a different source (specify below)', 'Skip this research step', 'Cancel task'],
+    };
+  }
+
   // ── browser.agent run: auth timeout or login wall ─────────────────────────
   // When waitForAuth times out or a login wall is detected, the failure is
   // user-correctable (they need to sign in) — NOT plan-correctable. Falling

@@ -106,6 +106,15 @@ function buildStepDescription(step) {
     const p = (args.prompt || '').slice(0, 40);
     return p ? `synthesize — ${p}…` : 'synthesize';
   }
+  if (skill === 'browser.agent') {
+    return args.task ? `browser.agent — ${args.task.slice(0, 60)}…` : `browser.agent — ${args.action} (${args.service || args.agentId || ''})`;
+  }
+  if (skill === 'cli.agent') {
+    return args.task ? `cli.agent — ${args.task.slice(0, 60)}…` : `cli.agent — ${args.action} (${args.service || args.agentId || ''})`;
+  }
+  if (skill === 'playwright.agent') {
+    return args.goal ? `playwright.agent — ${args.goal.slice(0, 50)}…` : 'playwright.agent';
+  }
   if (skill === 'external.skill') return `external.skill — ${args.name || ''}`;
   if (skill === 'guide.step') return `guide.step — ${(args.instruction || '').slice(0, 40)}`;
   return skill;
@@ -184,6 +193,12 @@ module.exports = async function planSkills(state) {
     ? `\n[Full content available at: ${state._dataFile} — read with fs.readFileSync if needed]`
     : '';
   const userMessage = (state._dataPrefix ? state._dataPrefix + '\n' : '') + (resolvedMessage || message) + _dataFileSuffix;
+  const correctionSourcePrompt = state._planCorrectionMode && state._planCorrectionSourcePrompt
+    ? String(state._planCorrectionSourcePrompt)
+    : '';
+  const runtimeParamMessage = correctionSourcePrompt
+    ? `${correctionSourcePrompt}\n${userMessage}`
+    : userMessage;
 
   // ── Project skill plan passthrough ────────────────────────────────────────
   // If parseIntent already classified this as a project command and set projectSkillPlan,
@@ -520,6 +535,35 @@ You MUST produce a DIFFERENT plan than the one that just failed. Use the actual 
 RECOVERY TOOL CONSTRAINT: "DIFFERENT plan" means a different task decomposition, different selectors, or a different URL — NOT switching the skill type for registered agents. Any step that previously used browser.agent { action: "run" } for a registered agent MUST continue to use browser.agent { action: "run" } in the recovery plan. NEVER replace a browser.agent step with browser.act navigation steps, playwright.agent direct calls, or shell.run curl commands for a registered agent. If a browser.agent step failed, change only the "task" string (make it more specific or retry with a clearer goal) — never decompose it into raw browser steps.`;
   }
 
+  let correctionNote = '';
+  if (state._planCorrectionMode && state._planCorrectionText) {
+    correctionNote = `
+
+PLAN CORRECTION MODE (user is revising a pending plan):
+- Feedback: "${String(state._planCorrectionText).replace(/"/g, '\\"').slice(0, 400)}"
+- Base plan file: ${state._basePlanFile || state._skillPlanFile || 'unknown'}
+Apply this correction directly to the previous plan intent. Keep the same overall goal and only adjust strategy/skills needed to satisfy this feedback.`;
+
+    if (correctionSourcePrompt) {
+      correctionNote += `\n- Original request that produced the pending plan: "${correctionSourcePrompt.replace(/"/g, '\\"').slice(0, 500)}"`;
+    }
+
+    if (state._skillPlanJson) {
+      try {
+        const parsedBase = JSON.parse(Buffer.from(state._skillPlanJson, 'base64').toString('utf8'));
+        if (Array.isArray(parsedBase) && parsedBase.length > 0) {
+          const summary = parsedBase
+            .slice(0, 12)
+            .map((step, idx) => `  ${idx + 1}. ${step?.skill || 'unknown'}${step?.description ? ` — ${String(step.description).slice(0, 80)}` : ''}`)
+            .join('\n');
+          correctionNote += `\nPrevious approved draft steps (for targeted revision):\n${summary}`;
+        }
+      } catch (_corrDecodeErr) {
+        logger.warn('[Node:PlanSkills] Could not decode _skillPlanJson in correction mode');
+      }
+    }
+  }
+
   // Build prior results context so LLM can resolve references like "that file"
   const skillResults = state.skillResults || [];
   let priorResultsNote = '';
@@ -566,6 +610,34 @@ RECOVERY TOOL CONSTRAINT: "DIFFERENT plan" means a different task decomposition,
 
     const turnLines = recentTurns
       .filter(m => (m.role !== 'system' && m.sender !== 'system') && m.content && m.content.trim())
+      // ── priorBody poison filter ────────────────────────────────────────────
+      // Exclude prior ASSISTANT messages that are plain conversational responses
+      // (e.g. "Got it — I'll use Grok instead") but carry no step-output data.
+      // These messages have misled the planner into treating the assistant's
+      // prior interpretation as a new constraint (e.g. "user wants Grok" bleed).
+      // KEEP: assistant messages with "Step outputs:" (actual execution context).
+      // KEEP: assistant messages that are short confirmations (< 80 chars) — they are
+      //       safe turn markers that help the LLM understand conversation flow.
+      // DROP: mid-length assistant conversational answers that interpret or summarise
+      //       prior user intent — these are the poison vectors.
+      .filter(m => {
+        if (m.role !== 'assistant') return true; // always keep user turns
+        const _c = (m.content || '').trim();
+        if (_c.includes('Step outputs:')) return true; // always keep execution context
+        // Drop assistant messages whose first token is a conversational interpretation phrase.
+        // These are the specific poison vectors that bleed prior intent into the planner:
+        //   "Got it — I'll use Grok instead"   → planner reads "use Grok" as a constraint
+        //   "I'll search Perplexity for you"   → planner re-anchors to wrong service
+        //   "Based on your request, ..."       → planner inherits stale framing
+        // Messages that DON'T start with these phrases are kept regardless of length
+        // (real errors, file paths, multi-step answers, etc. are all safe).
+        const _POISON_STARTS = /^(got\s+it\b|i'?ll\s+(use|try|search|go\s+to|open|run|look)|i\s+understand\b|based\s+on\b|understood\b|i\s+see[,.\s]|the\s+user\s+wants\b|it\s+seems\s+like\b|you'?d\s+like\s+me\s+to\b|sure[,!\s]|of\s+course[,!\s]|happy\s+to\b)/i;
+        if (_POISON_STARTS.test(_c)) return false;
+        // Also drop recovery UI messages (stored before logConversation fix tagged them as system).
+        // These are our own template strings — safe to match by content, won't misfire on real NL.
+        const _RECOVERY_CONTENT = /returned a navigation\/welcome page|requires login or redirected|automatic search fallbacks failed|all auto-fallbacks/i;
+        return !_RECOVERY_CONTENT.test(_c);
+      })
       .map(m => {
         const role = m.role === 'user' ? 'User' : 'Assistant';
         const content = m.content.trim();
@@ -1174,6 +1246,7 @@ Task: "${userMessage}"`;
   const isRecoveryReplan = !!recoveryContext;
   let agentContextNote = '';
   let discoveryNote = '';
+  let _registeredAgentServiceMap = {}; // service-name → agentId — for post-parse bypass detection
   if (mcpAdapter) {
     await Promise.all([
       // 4) Skill contract — fetch contract_md for matched skill (conditional)
@@ -1273,7 +1346,7 @@ Task: "${userMessage}"`;
           }, { timeoutMs: 4000 }).catch(() => null);
 
           const agentRows = agentRes?.data?.agents || agentRes?.agents || [];
-          const healthyAgents = agentRows.filter(a => a.status === 'healthy' || a.status === 'degraded' || a.status === 'needs_auth');
+          const healthyAgents = agentRows.filter(a => a.status === 'healthy' || a.status === 'degraded' || a.status === 'needs_auth' || a.status === 'needs_validation');
 
           if (healthyAgents.length > 0) {
             const agentLines = healthyAgents.map(a => {
@@ -1282,9 +1355,17 @@ Task: "${userMessage}"`;
               return `  - ${typeTag} ${a.id} (service: ${a.service}, tool: ${a.cliTool || 'browser'}) — capabilities: ${caps || 'see descriptor'}`;
             }).join('\n');
 
-            agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — add \"requiresAuth\": true to args ONLY when the user's explicit goal is to log in / sign in / connect an account to the service; omit it for all other tasks\n  - [api_key] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — DEVELOPER API ONLY. If the task is TALKING TO / USING an AI service interactively (ChatGPT, Gemini, Claude, Grok, Suno, Midjourney, etc.), use the [browser] consumer-site agent for that service instead.\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.\n  ⚠️ HARD RULE: For every [browser] agent listed above, you MUST use browser.agent { action: "run" } — NEVER playwright.agent. playwright.agent bypasses the OAuth flow that browser.agent manages — it will see a login page and immediately fail.\n  ⚠️ [api_key] AGENTS CANNOT NAVIGATE: [api_key] agents (openai.agent, anthropic.agent, mistral.agent, etc.) are DEVELOPER API consoles — they have NO browser and CANNOT fulfill any task that says "goto", "go to", "open", "visit", or "navigate to" a service. ANY navigation-verb task unconditionally requires a [browser] agent. If the AVAILABLE AGENTS list above has no [browser] match for the desired service, emit { "skill": "browser.agent", "args": { "action": "build_agent", "service": "<service-name>" } } as the first step to create it at runtime — do NOT substitute a [api_key] agent. [api_key] agents are for programmatic API calls ONLY (sending data, querying an API programmatically — not browsing, chatting interactively, or navigating).`;
+            agentContextNote = `\n\nAVAILABLE AGENTS (already configured — the sub-agent owns auth, credentials, and execution end-to-end):\n${agentLines}\n  When a task uses one of these services, emit ONE delegation step — do NOT plan individual shell.run/curl steps for registered services:\n  - [cli] agent: { "skill": "cli.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } }\n  - [browser] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — add \"requiresAuth\": true to args ONLY when the user's explicit goal is to log in / sign in / connect an account to the service; omit it for all other tasks\n  - [api_key] agent: { "skill": "browser.agent", "args": { "action": "run", "agentId": "<id>", "task": "<plain-language goal>" } } — DEVELOPER API ONLY. If the task is TALKING TO / USING an AI service or creative tool interactively (any AI chatbot, image generator, music generator, etc.), use the [browser] consumer-site agent for that service instead.\n  The sub-agent reads its own descriptor, resolves credentials, infers the correct commands, and executes — you do NOT need to add auth setup steps or inline shell commands.\n  For recurring/background tasks using these services, use needs_skill to build the automation skill.\n  ⚠️ HARD RULE: For every [browser] agent listed above, you MUST use browser.agent { action: "run" } — NEVER playwright.agent AND NEVER raw browser.act navigate/fill/press steps. Both bypass auth, session management, and the URL registry — they hit login walls and use stale URLs. If no registered [browser] agent exists for a service the user named, emit { "skill": "browser.agent", "args": { "action": "build_agent", "service": "<service-name>" } } as the first step — do NOT guess a URL with browser.act.\n  ⚠️ [api_key] AGENTS CANNOT NAVIGATE: [api_key] agents are DEVELOPER API consoles — they have NO browser and CANNOT fulfill any task that says "goto", "go to", "open", "visit", or "navigate to" a service. ANY navigation-verb task unconditionally requires a [browser] agent. If the AVAILABLE AGENTS list above has no [browser] match for the desired service, emit { "skill": "browser.agent", "args": { "action": "build_agent", "service": "<service-name>" } } as the first step to create it at runtime — do NOT substitute a [api_key] agent. [api_key] agents are for programmatic API calls ONLY (sending data, querying an API programmatically — not browsing, chatting interactively, or navigating).`;
 
             logger.debug(`[Node:PlanSkills] Agent context: ${healthyAgents.length} healthy agent(s) injected`);
+
+            // Populate service map for post-parse browser.act bypass detection
+            for (const _a of healthyAgents) {
+              const _svc = (_a.service || _a.id.replace(/\.agent$/, '')).toLowerCase();
+              _registeredAgentServiceMap[_svc] = _a.id;
+              const _idBase = _a.id.replace(/\.agent$/, '').toLowerCase();
+              if (_idBase !== _svc) _registeredAgentServiceMap[_idBase] = _a.id;
+            }
           }
 
           // ── Discovery note: guide LLM to plan build_agent when service has no agent ──
@@ -1873,7 +1954,8 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 OS: ${os}
 Home directory: ${homeDir}
-User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${cacheShortCircuitNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
+⚠️ GROUND TRUTH RULE: The "User request" line below is the ONLY source of truth for which services, tools, or agents to use. Any prior conversation messages that mention a different service (e.g. a prior turn that references a different provider) are historical context ONLY — do NOT let them override the service names in the current request. You MUST use whichever service the user explicitly named. Do NOT substitute with any service the user did not explicitly name in this request.
+User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${correctionNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${cacheShortCircuitNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   // ── Contract-driven fast path ───────────────────────────────────────────────
   // When parseSkill matched a shell skill whose contract has a ## Commands section,
@@ -1919,7 +2001,7 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
         // ── Deterministic param resolution (phone, email, body) ─────────────────
         // Merge runtime params into _sel.params — dates from resolveDateRange already set.
         // buildRuntimeParams handles: extractMessageParams + profile fallback + BODY escape.
-        Object.assign(_sel.params, buildRuntimeParams(userMessage, profileContext, priorSynthesizedContent));
+        Object.assign(_sel.params, buildRuntimeParams(runtimeParamMessage, profileContext, priorSynthesizedContent));
         logger.info(`[Node:PlanSkills] fast path _sel.params keys: ${JSON.stringify(Object.keys(_sel.params))}`);
         // ─────────────────────────────────────────────────────────────────────────
 
@@ -2044,6 +2126,29 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
       skillPlan = [skillPlan];
     }
 
+    // Guard: {"steps":[...]} wrapper escaped parsePlan's unwrap (e.g. came from
+    // the jsonrepair path that hit the object branch before the steps check)
+    if (!Array.isArray(skillPlan) && skillPlan && typeof skillPlan === 'object' && Array.isArray(skillPlan.steps)) {
+      logger.debug(`[Node:PlanSkills] post-parse: unwrapping {"steps":[...]} wrapper`);
+      skillPlan = skillPlan.steps;
+    }
+    // Guard: arbitrary object — same deep-scan as parsePlan itself.  Catches any
+    // object that survived the parsePlan null-return path (e.g. via a retry route
+    // that calls parsePlan and doesn't go through the null-path).
+    if (!Array.isArray(skillPlan) && skillPlan && typeof skillPlan === 'object') {
+      let _found = null;
+      for (const _v of Object.values(skillPlan)) {
+        if (Array.isArray(_v) && _v.length > 0 && typeof _v[0]?.skill === 'string') { _found = _v; break; }
+      }
+      if (_found) {
+        logger.debug('[Node:PlanSkills] post-parse deep-scan: unwrapped arbitrary object key → step array');
+        skillPlan = _found;
+      } else {
+        logger.warn('[Node:PlanSkills] post-parse deep-scan: non-array, non-step object — treating as parse failure');
+        skillPlan = null;
+      }
+    }
+
     // ── Hard guard: contract-based (shell) skills must never use external.skill ──
     // The LLM sometimes ignores FORBIDDEN instructions and emits external.skill for
     // shell contract skills (exec_type:shell / .md exec_path). When detected, retry
@@ -2083,6 +2188,108 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
             planError: `Contract skill "${badName}" cannot be executed via external.skill. Please rephrase your request and try again.`,
           };
         }
+      }
+    }
+
+    // ── browser.act bypass detector ────────────────────────────────────────
+    // LLMs sometimes ignore the HARD RULE in the prompt and emit raw browser.act
+    // navigate steps for services that have registered browser.agent agents.
+    // This code-side guard catches that and retries with a targeted correction.
+    // One retry only — if the second response still has bypasses, accept best effort.
+    
+    // Well-known AI/research services the LLM frequently bypasses with browser.act
+    // even when no agent is registered yet. For these, correction emits build_agent → run.
+    const _BYPASS_GUARD_SERVICES = new Set([
+      'perplexity', 'grok', 'claude', 'deepseek', 'mistral', 'copilot',
+      'suno', 'midjourney', 'runway', 'chatgpt', 'gemini', 'openai',
+    ]);
+    // All browser.act actions that navigate to a URL (not just 'navigate')
+    const _NAV_ACTIONS = new Set(['navigate', 'tab-new', 'newPage']);
+    
+    let _bypassRetryDone = false;
+    if (Array.isArray(skillPlan)) {
+
+      const _collectBypasses = (plan) => {
+        const _found = [];
+        for (const _s of plan) {
+          if (_s.skill !== 'browser.act' || !_NAV_ACTIONS.has(_s.args?.action) || !_s.args?.url) continue;
+          let _host = '';
+          try { _host = new URL(_s.args.url).hostname.replace(/^www\./, ''); } catch (_e) { continue; }
+          // Strip TLD to get bare service name: "perplexity.ai" → "perplexity"
+          const _bare = _host.replace(/\.(ai|com|io|org|net|co|app|dev|me|us|uk)(\.[a-z]{2})?$/, '');
+          const _matched = _registeredAgentServiceMap[_bare] || _registeredAgentServiceMap[_host];
+          if (_matched && !_found.some(b => b.agentId === _matched)) {
+            _found.push({ service: _bare || _host, agentId: _matched, needsBuild: false });
+            continue;
+          }
+          // Not registered — but known to always require browser.agent not browser.act
+          const _guardKey = _bare || _host.split('.')[0];
+          if (_BYPASS_GUARD_SERVICES.has(_guardKey) && !_found.some(b => b.service === _guardKey)) {
+            _found.push({ service: _guardKey, agentId: `${_guardKey}.agent`, needsBuild: true });
+            continue;
+          }
+          // Also check sessionId (e.g. { sessionId: "perplexity" })
+          const _sid = (_s.args?.sessionId || '').toLowerCase();
+          if (_sid && _registeredAgentServiceMap[_sid] && !_found.some(b => b.agentId === _registeredAgentServiceMap[_sid])) {
+            _found.push({ service: _sid, agentId: _registeredAgentServiceMap[_sid], needsBuild: false });
+          } else if (_sid && _BYPASS_GUARD_SERVICES.has(_sid) && !_found.some(b => b.service === _sid)) {
+            _found.push({ service: _sid, agentId: `${_sid}.agent`, needsBuild: true });
+          }
+        }
+        return _found;
+      };
+
+      const _bypasses = _collectBypasses(skillPlan);
+      if (_bypasses.length > 0) {
+        const _bypassList = _bypasses.map(b => `${b.service} (use ${b.agentId}${b.needsBuild ? ', needs build_agent first' : ''})`).join(', ');
+        logger.warn(`[Node:PlanSkills] browser.act bypass detected for: [${_bypassList}] — rewriting plan in-code`);
+
+        // ── Deterministic structural rewrite (no LLM retry) ─────────────────
+        // Group consecutive browser.act steps that belong to the same bypassed service
+        // into clusters, then replace each cluster with build_agent (if needed) + run.
+        // Task string = first type/fill/keyboard-type text in the cluster, else userMessage.
+        const _bypassServiceKeys = new Set(_bypasses.map(b => b.service));
+        const _rewritten = [];
+        let i = 0;
+        while (i < skillPlan.length) {
+          const _s = skillPlan[i];
+          // Check if this is a browser.act step for a bypassed service
+          let _clusterService = null;
+          if (_s.skill === 'browser.act') {
+            let _url = _s.args?.url || '';
+            let _clusterHost = '';
+            try { _clusterHost = new URL(_url).hostname.replace(/^www\./, ''); } catch (_e) {}
+            const _clusterBare = _clusterHost.replace(/\.(ai|com|io|org|net|co|app|dev|me|us|uk)(\.[a-z]{2})?$/, '');
+            const _clusterSid = (_s.args?.sessionId || '').toLowerCase();
+            if (_bypassServiceKeys.has(_clusterBare)) _clusterService = _clusterBare;
+            else if (_bypassServiceKeys.has(_clusterHost.split('.')[0])) _clusterService = _clusterHost.split('.')[0];
+            else if (_bypassServiceKeys.has(_clusterSid)) _clusterService = _clusterSid;
+          }
+
+          if (_clusterService) {
+            // Collect all consecutive browser.act steps for this service cluster
+            const _cluster = [];
+            let j = i;
+            while (j < skillPlan.length && skillPlan[j].skill === 'browser.act') {
+              _cluster.push(skillPlan[j]);
+              j++;
+            }
+            // Extract task text from type/fill actions in cluster
+            const _typeAction = _cluster.find(c => ['type','fill','keyboard-type'].includes(c.args?.action) && c.args?.text);
+            const _taskStr = _typeAction?.args?.text || userMessage;
+            const _bypassEntry = _bypasses.find(b => b.service === _clusterService);
+            if (_bypassEntry?.needsBuild) {
+              _rewritten.push({ skill: 'browser.agent', args: { action: 'build_agent', service: _clusterService }, description: `Set up ${_clusterService} agent` });
+            }
+            _rewritten.push({ skill: 'browser.agent', args: { action: 'run', agentId: _bypassEntry?.agentId || `${_clusterService}.agent`, task: _taskStr }, description: `Research on ${_clusterService} via browser.agent` });
+            i = j; // skip entire cluster
+          } else {
+            _rewritten.push(_s);
+            i++;
+          }
+        }
+        skillPlan = _rewritten;
+        logger.info(`[Node:PlanSkills] bypass rewrite complete — plan now has ${skillPlan.length} steps`);
       }
     }
 
@@ -3110,7 +3317,7 @@ Output ONLY the pattern text. No markdown, no explanation.`;
     // The LLM may copy {{TO}}/{{BODY}} tokens literally from a contract template.
     // Resolve all runtime params and substitute them into any shell.run steps.
     if (Array.isArray(skillPlan)) {
-      const _rtParams = buildRuntimeParams(userMessage, profileContext, priorSynthesizedContent);
+      const _rtParams = buildRuntimeParams(runtimeParamMessage, profileContext, priorSynthesizedContent);
       if (Object.keys(_rtParams).length > 0) {
         skillPlan = skillPlan.map(step => {
           if (step.skill !== 'shell.run') return step;
@@ -3772,7 +3979,30 @@ function parsePlan(raw, logger) {
   try {
     // jsonrepair handles control chars, bad escapes, trailing commas, truncation,
     // smart-quotes, missing brackets, JS comments — anything the LLM throws.
-    return JSON.parse(jsonrepair(text));
+    const parsed = JSON.parse(jsonrepair(text));
+    // Unwrap {"steps":[...]} wrapper format — LLMs occasionally return this shape
+    // instead of a bare array. Without this, the .forEach call below crashes.
+    if (!Array.isArray(parsed) && parsed && typeof parsed === 'object' && Array.isArray(parsed.steps)) {
+      logger.debug('[Node:PlanSkills] parsePlan: unwrapping {"steps":[...]} wrapper');
+      return parsed.steps;
+    }
+    // Last-resort deep-scan: LLM sometimes embeds JSON prose-fragments like
+    // {"type":"plan","services":[...],...} where the step array lives under an
+    // arbitrary key.  Scan every value for the first array whose elements look
+    // like plan steps ({skill: string, ...}).
+    if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
+      for (const val of Object.values(parsed)) {
+        if (Array.isArray(val) && val.length > 0 && typeof val[0]?.skill === 'string') {
+          logger.debug('[Node:PlanSkills] parsePlan: deep-scan unwrapped arbitrary object key → step array');
+          return val;
+        }
+      }
+      // No step array found under any key — treat as a parse failure so the
+      // retry path kicks in rather than crashing on .forEach.
+      logger.warn('[Node:PlanSkills] parsePlan: object has no step-array under any key — returning null');
+      return null;
+    }
+    return parsed;
   } catch (e) {
     logger.warn('[Node:PlanSkills] JSON parse failed:', e.message);
     return null;
