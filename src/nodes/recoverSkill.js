@@ -193,6 +193,36 @@ module.exports = async function recoverSkill(state) {
     };
   }
 
+  // ── Chrome crash detection ───────────────────────────────────────────────
+  // When playwright.agent reports chromeCrash: true, this is a browser crash
+  // not an auth/connection issue. The browser needs to be restarted.
+  const isChromeCrash = 
+    (failedStep.skill === 'playwright.agent' || failedStep.skill === 'browser.agent') &&
+    (failedStep.result?.chromeCrash || /Chrome.*crashed|about:blank|browser crashed/i.test(failedStep.error || ''));
+  
+  if (isChromeCrash) {
+    logger.info(`[Node:RecoverSkill] Chrome crash detected for ${failedStep.skill} — triggering browser restart instead of auth repair`);
+    
+    // Extract agent name from the failure for better error messaging
+    const agentName = failedStep.error?.match(/([a-zA-Z]+\.agent)/)?.[1] || 
+                     failedStep.result?.debugContext?.sessionId?.replace(/_/g, '.') || 
+                     'the browser agent';
+    
+    const crashMsg = `**Chrome browser crashed** during automation with **${agentName}**. This is a technical issue, not an authentication problem.\n\n**What happened:**\n• Chrome window unexpectedly closed or crashed to "about:blank"\n• Debugging data was captured to help diagnose the issue\n\n**To continue:**\n1. Try your request again — a fresh browser session will start automatically\n2. If crashes persist, restart the ThinkDrop app to clear any browser state issues\n\n**Debugging info captured:**\n• Session duration and action history\n• Network and console errors\n• Trace and video recordings (if available)`;
+    
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      pendingQuestion: {
+        question: crashMsg,
+        _isChromeCrash: true,
+        context: failedStep.result?.debugContext
+      },
+      commandExecuted: false,
+      answer: crashMsg
+    };
+  }
+
   logger.debug(`[Node:RecoverSkill] Recovering from: ${failedStep.skill} — ${failedStep.error}`);
 
   // Update plan document to reflect the failed step and recovery attempt
@@ -536,6 +566,19 @@ module.exports = async function recoverSkill(state) {
     ? `\nPrevious recovery attempts (already tried — DO NOT repeat these):\n${patchHistory.map((p, i) => `  ${i + 1}. ${p}`).join('\n')}\n`
     : '';
 
+  // Add DevTools debugging data if available
+  const devToolsSection = failedStep.result?.debugContext?.devToolsData 
+    ? `\nDevTools debugging data:
+  Network requests (${failedStep.result.debugContext.devToolsData.networkRequests.length}):
+${failedStep.result.debugContext.devToolsData.networkRequests.slice(-5).map(r => 
+    `    • ${r.method} ${r.url} (${r.status}) - ${r.duration}ms`).join('\n') || '    (none)'}
+  Console logs (${failedStep.result.debugContext.devToolsData.consoleLogs.length}):
+${failedStep.result.debugContext.devToolsData.consoleLogs.slice(-3).map(l => 
+    `    • ${l}`).join('\n') || '    (none)'}
+  DevTools WebSocket: ${failedStep.result.debugContext.devToolsUrl || 'N/A'}
+`
+    : '';
+
   const recoveryQuery = `Original user request: "${resolvedMessage || message}"
 
 Failed step:
@@ -545,7 +588,7 @@ Failed step:
   Error: ${failedStep.error}
   Exit code: ${failedStep.exitCode ?? 'N/A'}
   Stderr: ${failedStep.stderr || '(none)'}
-${skillContextSection}${patchHistorySection}
+${skillContextSection}${patchHistorySection}${devToolsSection}
 Completed steps so far:
 ${completedSteps}
 

@@ -2195,9 +2195,23 @@ module.exports = async function executeCommand(state) {
           try { _execSync(`${cmd} 2>&1`, { timeout: timeoutMs }); return true; }
           catch (_) { return false; }
         };
-        // Format registry — each entry is a function(tmpMd, outPath) → boolean (success)
+        // One-time pandoc availability check — warn early so user knows to install
+        let _pandocAvailable;
+        try { _execSync('which pandoc 2>&1', { timeout: 3000 }); _pandocAvailable = true; }
+        catch (_) { _pandocAvailable = false; }
+        if (!_pandocAvailable && ['.pdf', '.docx', '.pptx', '.epub', '.rtf', '.odt', '.html'].includes(_fmtExt)) {
+          logger.warn(`[Node:ExecuteCommand] synthesize: pandoc not installed — ${_fmtExt} will use Node.js fallback. Install with: brew install pandoc`);
+        }
+        // Strip markdown syntax for plain-text rendering in Node.js fallbacks
+        const _plainText = cleanedAnswer
+          .replace(/#{1,6}\s?/g, '')
+          .replace(/\*\*(.+?)\*\*/g, '$1')
+          .replace(/\*(.+?)\*/g, '$1')
+          .replace(/`([^`]+)`/g, '$1')
+          .replace(/^[-*+]\s/gm, '  • ');
+        // Format registry — each entry is an async function(tmpMd, outPath) → boolean (success)
         const _FORMAT_HANDLERS = {
-          '.pdf': (src, out) => {
+          '.pdf': async (src, out) => {
             // Write markdown to temp file, try pandoc engines, then AppleScript
             fs.writeFileSync(src, cleanedAnswer, 'utf8');
             for (const _engine of ['wkhtmltopdf', 'pdflatex', 'weasyprint', '']) {
@@ -2211,18 +2225,59 @@ module.exports = async function executeCommand(state) {
             const _htmlPath = src.replace(/\.md$/, '.html');
             if (_tryCmd(`pandoc "${src}" -o "${_htmlPath}" --standalone`, 15000)) {
               const _as = `set htmlFile to POSIX file "${_htmlPath}"\nset pdfOut to POSIX file "${out}"\ntell application "Safari"\nactivate\nopen htmlFile\ndelay 2\nprint with properties {target printer:"PDF", job disposition:"save", save path:pdfOut}\nend tell`;
-              if (_tryCmd(`osascript -e '${_as.replace(/'/g, "'\\''")}'`, 45000)) {
+              if (_tryCmd(`osascript -e '${_as.replace(/'/g, "'\\''")}' `, 45000)) {
                 logger.debug(`[Node:ExecuteCommand] synthesize: PDF written via AppleScript → ${out}`);
                 return true;
               }
             }
+            // pdfkit Node.js fallback — zero system dependencies
+            try {
+              const PDFDocument = require('pdfkit');
+              await new Promise((resolve, reject) => {
+                const _doc = new PDFDocument({ margin: 50 });
+                const _chunks = [];
+                _doc.on('data', c => _chunks.push(c));
+                _doc.on('end', () => {
+                  try { fs.writeFileSync(out, Buffer.concat(_chunks)); resolve(); }
+                  catch (we) { reject(we); }
+                });
+                _doc.on('error', reject);
+                _doc.fontSize(12).text(_plainText, { paragraphGap: 6, lineGap: 2 });
+                _doc.end();
+              });
+              logger.info(`[Node:ExecuteCommand] synthesize: PDF written via pdfkit fallback → ${out}`);
+              return true;
+            } catch (_pdfkitErr) {
+              logger.warn(`[Node:ExecuteCommand] synthesize: pdfkit fallback failed: ${_pdfkitErr.message}`);
+            }
             return false;
           },
-          '.docx': (src, out) => {
+          '.docx': async (src, out) => {
             fs.writeFileSync(src, cleanedAnswer, 'utf8');
             if (_tryCmd(`pandoc "${src}" -o "${out}" --standalone`)) {
               logger.debug(`[Node:ExecuteCommand] synthesize: DOCX written via pandoc → ${out}`);
               return true;
+            }
+            // docx npm package fallback — pure JS, no binary needed
+            try {
+              const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require('docx');
+              const _paras = cleanedAnswer.split('\n').map(line => {
+                const _headMatch = line.match(/^(#{1,6})\s+(.+)$/);
+                if (_headMatch) {
+                  const _lvl = [HeadingLevel.HEADING_1, HeadingLevel.HEADING_2, HeadingLevel.HEADING_3,
+                    HeadingLevel.HEADING_4, HeadingLevel.HEADING_5, HeadingLevel.HEADING_6][_headMatch[1].length - 1];
+                  return new Paragraph({ heading: _lvl, children: [new TextRun(_headMatch[2])] });
+                }
+                if (line.trim() === '') return new Paragraph({ children: [new TextRun('')] });
+                return new Paragraph({ children: [new TextRun(line.replace(/^[-*+]\s/, ''))] });
+              });
+              const _wordDoc = new Document({ sections: [{ children: _paras }] });
+              const _buf = await Packer.toBuffer(_wordDoc);
+              fs.writeFileSync(out, _buf);
+              logger.info(`[Node:ExecuteCommand] synthesize: DOCX written via docx fallback → ${out}`);
+              return true;
+            } catch (_docxErr) {
+              logger.warn(`[Node:ExecuteCommand] synthesize: docx fallback failed: ${_docxErr.message}`);
             }
             return false;
           },
@@ -2298,13 +2353,21 @@ module.exports = async function executeCommand(state) {
 
         const _handler = _FORMAT_HANDLERS[_fmtExt];
         if (_handler) {
-          const _fmtDone = _handler(_tmpMdPath, synthesisFilePath);
+          const _requestedPath = synthesisFilePath;
+          const _fmtDone = await _handler(_tmpMdPath, synthesisFilePath);
           if (!_fmtDone) {
-            // All conversion engines failed — save as .txt with matching stem
+            // All conversion engines failed (including Node.js fallbacks) — save as .txt
             const _txtPath = synthesisFilePath.replace(/\.[^.]+$/, '.txt');
             fs.writeFileSync(_txtPath, cleanedAnswer, 'utf8');
             logger.warn(`[Node:ExecuteCommand] synthesize: all ${_fmtExt} engines failed — saved as plain text to ${_txtPath}`);
             synthesisFilePath = _txtPath;
+            // Emit degradation event so UI can surface it and downstream steps know the real path
+            if (progressCallback) progressCallback({
+              type: 'file_format_degraded',
+              requestedPath: _requestedPath,
+              actualPath: _txtPath,
+              reason: `No conversion engine available for ${_fmtExt} — saved as plain text`,
+            });
           }
           try { fs.unlinkSync(_tmpMdPath); } catch (_) {}
         } else {
@@ -2382,6 +2445,29 @@ module.exports = async function executeCommand(state) {
       argsJson = argsJson.replace(/\{\{prev_watchId\}\}/g, prevWatchId.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
     }
     resolvedArgs = JSON.parse(argsJson);
+  }
+
+  // ── browser.agent task-description cap ───────────────────────────────────────
+  // The {{synthesisAnswer}} token expands to the full prior synthesize output, which
+  // may include failure diagnostics, markdown reports, or [DATA FROM PRIOR STEP]
+  // blocks.  These are injected into the browser.agent `task` string that playwright.agent
+  // sees as its planning goal — long or contradictory narratives cause the LLM to
+  // skip steps like pasteAttachment. Cap the task field at 300 chars for browser.agent
+  // steps so the planner sees only the intent, not the full payload.
+  // The actual email body content is delivered via the `type` step at runtime.
+  if (skill === 'browser.agent' && resolvedArgs && typeof resolvedArgs.task === 'string') {
+    let _task = resolvedArgs.task;
+    // Strip [DATA FROM PRIOR STEP] and [CONTENT OF ...] injection blocks
+    _task = _task.replace(/\[DATA FROM PRIOR STEP\][^[]*?(?=\[|$)/gs, '').trim();
+    _task = _task.replace(/\[CONTENT OF [^\]]*\][^[]*?(?=\[|$)/gs, '').trim();
+    // Cap remaining task description at 300 chars
+    if (_task.length > 300) {
+      _task = _task.slice(0, 297) + '...';
+      logger.debug(`[Node:ExecuteCommand] browser.agent task description capped at 300 chars`);
+    }
+    if (_task !== resolvedArgs.task) {
+      resolvedArgs = { ...resolvedArgs, task: _task };
+    }
   }
 
   // Guard: if {{synthesisAnswer}} survived unsubstituted, synthesize hasn't run yet —
@@ -2482,6 +2568,58 @@ module.exports = async function executeCommand(state) {
       return a;
     });
     resolvedArgs = { ...resolvedArgs, argv: _fixedOsaArgv };
+  }
+
+  // ── POSIX file clipboard-copy guard ─────────────────────────────────────────
+  // Before any shell.run that copies a file to the OS clipboard via osascript
+  // "POSIX file" pattern, verify the file actually exists on disk.
+  // osascript exits 0 silently when the file is missing — clipboard stays empty
+  // and downstream attach/paste steps fail without a clear error.
+  //
+  // Resolution order:
+  //   1. File exists               → pass through unchanged
+  //   2. File missing, stem match in savedFilePaths → auto-substitute actual path
+  //   3. File missing, no match    → fail fast → recoverSkill → replan
+  {
+    const _osaScript = (skill === 'shell.run' && Array.isArray(resolvedArgs.argv))
+      ? resolvedArgs.argv.find(a => typeof a === 'string' && a.includes('POSIX file'))
+      : null;
+    if (_osaScript) {
+      // Extract the file path from: set the clipboard to (POSIX file "/path/to/file")
+      // or: POSIX file "/path/to/file"
+      const _posixMatch = _osaScript.match(/POSIX\s+file\s+["']([^"']+)["']/i);
+      if (_posixMatch) {
+        const _clipPath = _posixMatch[1];
+        if (!fs.existsSync(_clipPath)) {
+          // Try to find a saved file with the same basename stem (different extension)
+          const _pathMod = require('path');
+          const _stem = _pathMod.basename(_clipPath, _pathMod.extname(_clipPath)).toLowerCase();
+          const _savedPaths = state.savedFilePaths || [];
+          const _substitute = _savedPaths.find(p =>
+            _pathMod.basename(p, _pathMod.extname(p)).toLowerCase() === _stem && fs.existsSync(p)
+          );
+          if (_substitute) {
+            logger.warn(`[Node:ExecuteCommand] clipboard guard: "${_clipPath}" missing — substituting "${_substitute}"`);
+            const _fixedArgv = resolvedArgs.argv.map(a =>
+              typeof a === 'string' ? a.split(_clipPath).join(_substitute) : a
+            );
+            resolvedArgs = { ...resolvedArgs, argv: _fixedArgv };
+          } else {
+            const _guardErr = `File '${_clipPath}' does not exist — cannot copy to clipboard. The synthesize step may have failed to produce the requested format.`;
+            logger.warn(`[Node:ExecuteCommand] clipboard guard: ${_guardErr}`);
+            const _guardResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: _guardErr };
+            if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: _guardErr });
+            return {
+              ...state,
+              skillResults: [...skillResults, _guardResult],
+              skillCursor,
+              failedStep: _guardResult,
+              commandExecuted: false,
+            };
+          }
+        }
+      }
+    }
   }
 
   // Fix multi-line file content in curl JSON bodies.

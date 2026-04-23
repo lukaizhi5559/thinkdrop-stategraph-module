@@ -137,6 +137,13 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 
 **shell.run synthesize rule — CRITICAL:** When `shell.run` runs a local CLI tool (e.g. `gcalcli`, `gh`, `git`) and is expected to return structured data (JSON, table), you MUST append a `synthesize` step. The `args.prompt` must describe what to present in plain English. Omitting `synthesize` after a data-producing command shows the user a raw blob — always wrong.
 
+**Email-with-attachment synthesize rule — CRITICAL:** When the plan includes a `synthesize(saveToFile)` step that writes a file (e.g. `saveToFile: "/Users/.../report.pdf"`) AND a subsequent `browser.agent` email send step, the synthesize step for the **email body** MUST output a SHORT COVER NOTE only — 3 to 5 sentences maximum. It must:
+- Say what the topic is in one sentence
+- State that the full details are in the attachment
+- Close professionally
+
+It must NOT reproduce the attachment's full content. The full content belongs in the file. Example prompt: `"Write a 3-sentence email cover note for an email attaching report.pdf. One sentence summarising what [topic] is about, one sentence stating the full details are in the attached PDF, and one professional closing sentence. Plain text only, no markdown headers."`
+
 **OAuth token rule (fallback only — prefer browser.agent):** In the rare case where `shell.run` must call an OAuth API directly (no agent configured), use the pre-injected env var `$<PROVIDER>_ACCESS_TOKEN` — e.g. `$GOOGLE_ACCESS_TOKEN`, `$SLACK_ACCESS_TOKEN`, `$GITHUB_ACCESS_TOKEN`, `$NOTION_ACCESS_TOKEN`, `$MICROSOFT_ACCESS_TOKEN`. **NEVER read from `~/.thinkdrop/tokens/*.json` directly** — those may be stale. **NEVER use shell.run for OAuth services when browser.agent can handle them** — browser.agent manages token refresh and re-auth automatically, shell.run does not.
 
 ## Python scripts for data and file tasks
@@ -254,13 +261,50 @@ The agent runs up to `maxTurns` reasoning turns (default 12). Each turn: reads A
 
 ## browser.act key actions
 
-navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|select|check|uncheck|press|keyboard|scroll|screenshot|pdf|getText|getPageText|evaluate|waitForSelector|waitForContent|waitForStableText|newPage|tab-new|tab-list|tab-close|tab-select|state-save|state-load|resize|examine
+navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|select|check|uncheck|press|keyboard|scroll|screenshot|pdf|getText|getPageText|evaluate|waitForSelector|waitForContent|waitForStableText|newPage|tab-new|tab-list|tab-close|tab-select|state-save|state-load|resize|examine|paste|pasteAttachment
 
 **browser.act is a pure playwright-cli terminal skill** — every action spawns a `playwright-cli` subprocess. No Node API, no npm packages. Sessions are managed by playwright-cli daemon via `-s=<sessionId>`. The `snapshot` command captures the accessibility tree and returns numbered element refs (`e1`, `e21`, etc.) used for click/fill/hover.
 
 ### snapshot + ref flow (the correct pattern for clicking/filling any element)
 
 click/fill/hover automatically take a fresh snapshot and resolve the `selector` label to a ref. You only need to call `snapshot` explicitly when you need to see the accessibility tree output in the plan result.
+
+### file attachments — copy + paste-into-body method (human workflow)
+Mimic exactly what a human does: copy the file to the OS clipboard with Finder, focus the email compose **body**, then paste. Gmail/most chat apps detect the clipboard File and auto-attach it. **Do NOT click the paperclip / "Attach files" button** — that opens a native file chooser modal that blocks keyboard events in playwright-cli.
+
+**Step 1 — Copy the file to the clipboard (macOS osascript):**
+```json
+{ "skill": "shell.run", "args": { "command": "osascript -e 'tell application \"Finder\" to set the clipboard to (POSIX file \"/path/to/file.pdf\")'" } }
+```
+Multiple files:
+```json
+{ "skill": "shell.run", "args": { "command": "osascript -e 'tell application \"Finder\" to set the clipboard to {POSIX file \"/a.pdf\", POSIX file \"/b.pdf\"}'" } }
+```
+
+**Step 2 — Paste into the compose body (preferred):** use `pasteAttachment`. It finds the compose body textbox, focuses it, then presses `Meta+V` on macOS / `Ctrl+V` elsewhere:
+```json
+{ "skill": "browser.act", "args": { "action": "pasteAttachment", "sessionId": "gmail_agent" } }
+```
+You may optionally pin the body by label (only if the default scanner picks the wrong textbox):
+```json
+{ "skill": "browser.act", "args": { "action": "pasteAttachment", "selector": "Message Body", "sessionId": "gmail_agent" } }
+```
+
+**Canonical order in a send-with-attachment plan:**
+1. `synthesize(saveToFile)` → produce the file (PDF, DOCX, etc.) — this step MUST succeed before any clipboard copy
+2. `shell.run` osascript → copy the **exact path returned by step 1** to the clipboard — NEVER reference a path that was not explicitly produced by a prior `synthesize(saveToFile)` step
+3. browser.act navigate + click Compose + fill To/Subject + type SHORT email body (cover note only)
+4. `browser.act pasteAttachment` — **after** the body is typed, **before** Send
+5. click Send
+
+**File existence rule — CRITICAL:** NEVER put a file path in a `shell.run` osascript clipboard copy step unless that **exact path** was explicitly written by a prior `synthesize(saveToFile)` step in the same plan. If the prior synthesize used a different extension (e.g. `.txt` instead of `.pdf`), use the `.txt` path in the clipboard step — do not reference the original `.pdf` path. The runtime will auto-substitute when possible, but the plan MUST use the confirmed real path.
+
+**Things to AVOID:**
+- Clicking the paperclip / "Attach" button before paste — opens a file chooser modal and blocks keys.
+- Emitting `press Ctrl+v` on macOS — use `Meta+v` (or better: use `pasteAttachment` so the key is chosen for you).
+- Using the low-level `paste` action on an un-focused page — it pastes into whatever happens to have focus.
+
+Cross-platform: macOS uses `osascript`, Windows uses `Set-Clipboard -Path` (PowerShell), Linux uses `xclip -selection clipboard -t <mime> -i <file>`. `pasteAttachment` picks the right modifier key automatically.
 
 ```json
 [

@@ -849,12 +849,44 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
     // ── PHASE 1: EXTRACTOR ────────────────────────────────────────────────────
     // Focused solely on extracting facts from the user message.
     // On round 1 it extracts everything. On later rounds it confirms nothing new remains.
-    const extractPrompt = [
-      `User's automation request: "${userMessage}"`,
-      '',
+    
+    // Build comprehensive context from resolveUserContext
+    const selfContext = state.resolvedSelfContext || {};
+    const smsTarget = state.smsGatewayTarget || null;
+    
+    let contextInfo = [
       `System context:`,
       `- OS timezone: ${systemTz} (always use this as schedule_tz)`,
       `- Platform: ${process.platform}`,
+    ];
+    
+    // Add self context information
+    if (selfContext.email) {
+      contextInfo.push(`- User email: ${selfContext.email}`);
+    }
+    if (selfContext.phone) {
+      contextInfo.push(`- User phone: ${selfContext.phone}`);
+    }
+    
+    // Add SMS target information
+    if (smsTarget) {
+      contextInfo.push(`- SMS target: ${smsTarget.name} (${smsTarget.phone})`);
+    }
+    
+    // Add memory context
+    if (selfContext.memories?.context?.length > 0) {
+      contextInfo.push(`- User memories: ${selfContext.memories.context.slice(0, 3).join('; ')}`);
+    }
+    
+    // Add conversation context
+    if (selfContext.conversation?.context?.length > 0) {
+      contextInfo.push(`- Recent conversation context: ${selfContext.conversation.context.slice(0, 2).join('; ')}`);
+    }
+    
+    const extractPrompt = [
+      `User's automation request: "${userMessage}"`,
+      '',
+      ...contextInfo,
       '',
       resolvedSummary ? `Already resolved (do NOT re-extract these):\n${resolvedSummary}` : '',
     ].filter(Boolean).join('\n');
@@ -908,6 +940,8 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
 
     const gapsPrompt = [
       `User's automation request: "${userMessage}"`,
+      '',
+      ...contextInfo,
       '',
       `Already resolved — do NOT ask about any of these:`,
       resolvedSummaryForGaps || '(none yet)',

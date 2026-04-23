@@ -45,8 +45,31 @@ function getBrowserServices() {
 // Action verbs that indicate the user intends to navigate to / interact with a service.
 const BROWSER_ACTION_VERB_RE = /\b(go\s+to|goto|navigate(\s+to)?|open|visit|use|ask|look\s+up|search|check|find|bring\s+up|pull\s+up|load|launch|go\s+on|hop\s+on|jump\s+to|head\s+to|send|post|reply|submit|upload|download|sign\s+in|log\s+in|log\s+into)\b/i;
 
+// Strong navigation keywords that indicate browser automation intent
+const NAVIGATION_KEYWORDS = /\b(go\s+online|goto|navigate\s+to|go\s+to|open|visit)\b/i;
+
 // Yes/no question pattern — skip Tier B guard for these (avoid false positives like "is gmail free to use")
 const QUESTION_OPENER_RE = /^(is|are|was|were|does|do|did|what|who|which|when|why|how|can|could|would|should|will|shall)\s+/i;
+
+/**
+ * Check for navigation context in text.
+ * Returns true if strong navigation keywords are present.
+ */
+function hasNavigationContext(text) {
+  return NAVIGATION_KEYWORDS.test(text);
+}
+
+/**
+ * Check if text mentions a browser service.
+ * Returns true if any known browser service is mentioned.
+ */
+function hasBrowserService(text) {
+  const lower = text.toLowerCase();
+  const { tierA, tierB } = getBrowserServices();
+  const allServices = [...tierA, ...tierB];
+  
+  return allServices.some(service => lower.includes(service.toLowerCase()));
+}
 
 /**
  * Browser-service hard guard.
@@ -223,6 +246,22 @@ module.exports = async function parseIntent(state) {
       } else if (state._decomposedBy !== 'llm' && classifiedIntent === 'general_knowledge') {
         if (/\b(goto|go\s+to|navigate\s+to|open|visit|send|email|compose|draft|reply|click|check|search|look\s+up|compare|create|make|download|install|run|execute|text|book|reserve|schedule|fill|type|start|launch|switch|get\s+me|show\s+me|bring\s+up|pull\s+up|ask|query|summarize|compile|gather)\b/i.test(subPrompt.text)) {
           classifiedIntent = 'command_automate';
+        }
+      }
+      
+      // Enhanced navigation context detection for LLM-classified sub-prompts
+      if (state._decomposedBy === 'llm' && classifiedIntent === 'web_search') {
+        // Check if original prompt had navigation context
+        const originalPrompt = state.message || '';
+        const hasOriginalNavContext = hasNavigationContext(originalPrompt) && hasBrowserService(originalPrompt);
+        
+        // Check if current sub-prompt has navigation context + browser service
+        const hasSubNavContext = hasNavigationContext(subPrompt.text) && hasBrowserService(subPrompt.text);
+        
+        if (hasOriginalNavContext || hasSubNavContext) {
+          classifiedIntent = 'command_automate';
+          classifiedConf = 0.85;
+          logger.debug(`[Node:ParseIntent] Sub-prompt [${subPrompt.order}] navigation context detected → command_automate (original: ${hasOriginalNavContext}, sub: ${hasSubNavContext})`);
         }
       }
 

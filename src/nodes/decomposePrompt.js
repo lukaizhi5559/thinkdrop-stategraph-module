@@ -65,6 +65,15 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - Correction messages that start with "no it's", "no that's", "actually it's", or "nope it's" where the value corrects a prior answer (e.g. "no it's cakers5559@gmail.com" after a wrong email was stated) should use estimatedIntent:'memory_store', NOT command_automate — even if the value contains a domain name like gmail.com
 - CRITICAL: If ALL proposed sub-prompts are implementation steps toward a single artifact (a skill, script, automation, cron job, scheduled task, or workflow), return ONE sub-prompt using the original user message text with estimatedIntent:'command_automate'. Only split into multiple sub-prompts when the user clearly expresses multiple INDEPENDENT goals they want executed separately (e.g. answering a question AND performing an unrelated action).
 
+IMPORTANT: Navigation vs Search Classification
+- When users say "go online", "goto", "navigate to", "open", "visit" + specific websites (ChatGPT, Perplexity, Grok, etc.), they want BROWSER AUTOMATION (command_automate), not web search
+- Examples of navigation → command_automate:
+  * "go online and goto perplexity and look up X" → command_automate
+  * "navigate to chatgpt and ask about Y" → command_automate
+  * "goto grok and research Z" → command_automate
+- Only use web_search for general web search WITHOUT specific website navigation
+- Research via specific websites should be command_automate, not web_search
+
 JSON shape (example):
 {"subPrompts":[{"text":"retrieve game idea for gambo ai","estimatedIntent":"memory_retrieve","order":0,"dependsOn":[],"isLongRunning":false},{"text":"build game on gambo ai using idea","estimatedIntent":"command_automate","order":1,"dependsOn":[0],"isLongRunning":true,"dataTemplate":"Use this game idea from memory: {{result[0]}}"},{"text":"text me when the game is done","estimatedIntent":"command_automate","order":2,"dependsOn":[1],"isLongRunning":false}]}`;
 

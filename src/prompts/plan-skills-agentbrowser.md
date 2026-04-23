@@ -222,7 +222,7 @@ The agent runs a full plan-execute loop: reads compact `@eN` accessibility snaps
 
 ## browser.act key actions (agent-browser CLI)
 
-navigate|click|dblclick|fill|keyboard-type|press|select|check|uncheck|hover|scroll|drag|find-role|find-label|find-text|wait-url|wait-text|eval|getPageText|screenshot|snapshot|dialog-accept|dialog-dismiss|state-save|state-load|tab-new|tab-list|tab-close|tab-select|waitForSelector|waitForContent|waitForStableText
+navigate|click|dblclick|fill|keyboard-type|press|select|check|uncheck|hover|scroll|drag|find-role|find-label|find-text|wait-url|wait-text|eval|getPageText|screenshot|snapshot|dialog-accept|dialog-dismiss|state-save|state-load|tab-new|tab-list|tab-close|tab-select|waitForSelector|waitForContent|waitForStableText|paste
 
 **browser.act uses the agent-browser CLI** — every action spawns an `agent-browser` subprocess. Sessions auto-persist auth via `--session-name`. The `snapshot -i` command returns compact interactive-only text with `[ref=eN]` refs (e.g. `- button "Sign in" [ref=e10]`). Use `@eN` as the selector in click/fill/hover — e.g. `[ref=e10]` → `"selector": "@e10"`. The `@` prefix is **required** — missing `@` causes "Ref not found" errors.
 
@@ -233,6 +233,7 @@ agent-browser snapshot returns compact interactive text like `- button "Compose"
 For contenteditable/rich-text areas (Gmail body, Notion, AI chat inputs): do NOT use `fill` — use `click` to focus the element, then `keyboard-type` to type text.
 
 For data extraction: use `eval` with browser-side JavaScript (`document.body.innerText`, `document.querySelectorAll`, etc.) — NO `page` object, NO `require()`.
+
 
 ```json
 [
