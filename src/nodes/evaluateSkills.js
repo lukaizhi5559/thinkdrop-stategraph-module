@@ -59,6 +59,23 @@ module.exports = async function evaluateSkills(state) {
       logger.info(`[Node:EvaluateSkills] Skipping post-run eval — task succeeded after recovery (replanCount=${replanCount})`);
       return { ...state, evaluationVerdict: 'PASS' };
     }
+    // Skip post-run evaluation when the last completed step was browser.agent or cli.agent
+    // returning ok:true. These sub-agents run their own internal reasoning loop (playwright.agent)
+    // and verify outcomes before returning. The raw delegation text they produce is NOT a
+    // reliable signal for the LLM judge — it contains internal orchestration prose like
+    // "I see the Gmail inbox is loaded..." rather than a clean confirmation, which causes the
+    // judge to fire FIX even on fully successful tasks (e.g. email sent, PR created).
+    // Note: skillResults may contain earlier failed+recovered steps (ok:false) from the same run,
+    // so we check the last step specifically rather than relying on allStepsPassed.
+    const _lastCompletedStep = Array.isArray(skillResults) && skillResults.length > 0
+      ? [...skillResults].reverse().find(r => r.ok !== false)
+      : null;
+    const _isAgentLastStep = _lastCompletedStep &&
+      (_lastCompletedStep.skill === 'browser.agent' || _lastCompletedStep.skill === 'cli.agent');
+    if (_isAgentLastStep) {
+      logger.info(`[Node:EvaluateSkills] Skipping post-run eval — last completed step was ${_lastCompletedStep.skill} ok:true (agent verified outcome internally)`);
+      return { ...state, evaluationVerdict: 'PASS' };
+    }
     // Skip post-run evaluation for pure interaction tasks (navigate + click/fill/examine)
     // when ALL steps passed — there's no content to judge, only actions. The LLM tends to
     // hallucinate URL mismatches (e.g. chatgpt.com vs chat.openai.com) on these tasks.
