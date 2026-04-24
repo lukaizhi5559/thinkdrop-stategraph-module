@@ -62,27 +62,38 @@ Respond with ONLY valid JSON in exactly one of these two shapes:
 {"complete": true}
 {"complete": false, "question": "<one concise clarifying question>"}
 
+CRITICAL CONTEXT:
+You will see TWO pieces of information:
+1. ORIGINAL USER REQUEST — the full multi-step automation the user wants
+2. CURRENT SUB-TASK — the specific step being analyzed right now
+
 Rules:
-- Return {"complete": true} if the request is specific enough to act on as-is.
-- Return {"complete": false, "question": "..."} ONLY when a truly critical piece is missing:
-  * WHO to send to (when the task involves messaging someone without naming a recipient)
-  * WHICH service/app (when multiple equally-valid services exist and the choice matters)
-  * WHAT schedule/time (when recurring is implied but no interval is stated)
-- Do NOT ask about credentials, optional preferences, or things the system can infer or look up.
-- Do NOT ask if the information is already present in the message, even loosely stated.
+- ONLY ask questions about the CURRENT SUB-TASK, not the overall request.
+- Return {"complete": true} if the sub-task is specific enough to act on as-is.
+- Return {"complete": false, "question": "..."} ONLY when a truly critical piece is missing FOR THIS SPECIFIC STEP:
+  * WHO to send to (only if THIS step involves messaging without a recipient)
+  * WHICH service/app (only if THIS step needs it and multiple options exist)
+  * WHAT schedule/time (only if THIS step implies scheduling)
+- Do NOT ask about information that exists in OTHER steps of the overall request.
+- Do NOT ask about credentials, optional preferences, or things the system can infer.
+- Do NOT ask if the information is already present in the CURRENT SUB-TASK.
 - Keep the question under 15 words.
 - Ask only one question — never combine two into one.`;
 
 // ── LLM call ──────────────────────────────────────────────────────────────────
 
-async function _askLLM(llmBackend, userMessage, priorQA, logger) {
+async function _askLLM(llmBackend, userMessage, originalMessage, priorQA, logger) {
   const priorContext = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
 
-  const prompt = `User request: "${userMessage}"${priorContext}
+  const prompt = `ORIGINAL USER REQUEST: "${originalMessage}"
 
-Is this request complete enough to automate without further clarification?`;
+CURRENT SUB-TASK: "${userMessage}"${priorContext}
+
+This is ONE STEP of a multi-step automation. Does THIS SPECIFIC SUB-TASK need clarification, or is it clear enough to execute?
+
+Is this specific sub-task complete enough to automate without further clarification?`;
 
   try {
     const raw = await llmBackend.generateAnswer(SYSTEM_PROMPT, prompt, { maxTokens: 80, temperature: 0 });
@@ -130,6 +141,8 @@ module.exports = async function gatherPlanContext(state) {
   }
 
   const userMsg = resolvedMessage || message || '';
+  // Get original full message for context — this is the complete user request before decomposition
+  const originalMsg = state.originalMessage || state.message || userMsg;
 
   // ── Skip: user asked to bypass ───────────────────────────────────────────────
   if (state._bypassGatherPlan || _wantsToBypass(userMsg)) {
@@ -158,7 +171,7 @@ module.exports = async function gatherPlanContext(state) {
   }
   logger.info(`[Node:GatherPlanContext] Round ${currentRound + 1}/${MAX_ROUNDS} — checking task clarity for: "${userMsg.slice(0, 80)}"`);
 
-  const result = await _askLLM(llmBackend, userMsg, priorAnswers, logger);
+  const result = await _askLLM(llmBackend, userMsg, originalMsg, priorAnswers, logger);
 
   // ── Task is clear — enrich resolvedMessage with any gathered context and proceed ──
   if (result.complete) {
@@ -175,6 +188,9 @@ module.exports = async function gatherPlanContext(state) {
       resolvedMessage: enriched,
       planGatheringComplete: true,
       planGatheringRound: currentRound,
+      // Clear gather resume flags — task is complete
+      _gatherQuestionPending: false,
+      _pendingIntent: undefined,
     };
   }
 
@@ -197,5 +213,8 @@ module.exports = async function gatherPlanContext(state) {
       _isGatherPlanQuestion: true,
       source: 'gatherPlanContext',
     },
+    // NEW: Flags to signal this is a gather answer awaiting response
+    _gatherQuestionPending: true,
+    _pendingIntent: state.intent,
   };
 };

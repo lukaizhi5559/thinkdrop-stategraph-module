@@ -21,15 +21,49 @@
  *   state.context.userId
  *
  * State outputs:
- *   state.smsGatewayTarget    — { name, phone, carrier, email } when SMS resolved
+ *   state.smsGatewayTarget    — { name, phone, carrier, email, mmsEmail, mode } when SMS/MMS resolved
  *   state.resolvedSelfContext — { phone?, email?, memories?, conversation? }
  *   state.resolveUserContextDone — boolean flag
  */
 
 'use strict';
 
-const { lookupCarrier, getGatewayEmail, CARRIER_OPTIONS, _normalizeCarrierName } = require('../utils/carrierGateways');
+const { lookupCarrier, getGatewayEmail, getMmsGatewayEmail, detectMmsIntent, CARRIER_OPTIONS, _normalizeCarrierName } = require('../utils/carrierGateways');
 const { parseDateRange } = require('../utils/parseDateRange');
+
+// ── Communication Guard: Validate emails/phones are real (not placeholders) ─────────────────
+
+/** Validate email is real (not placeholder) for actual communication */
+function isValidEmailForCommunication(email) {
+  if (!email || typeof email !== 'string') return false;
+  const lower = email.toLowerCase().trim();
+
+  const PLACEHOLDER_PATTERNS = [
+    /^test@/i, /^user@/i, /^email@/i, /^example@/i,
+    /^fake@/i, /^temp@/i, /^dummy@/i,
+    /@example\.(com|org|net)$/i, /@domain\.(com|org|net)$/i,
+    /@yourdomain\.(com|org|net)$/i, /@test\.(com|org|net)$/i,
+    /\.local$/i,
+  ];
+
+  return !PLACEHOLDER_PATTERNS.some(re => re.test(lower));
+}
+
+/** Validate phone is real (not placeholder) for actual communication */
+function isValidPhoneForCommunication(phone) {
+  if (!phone || typeof phone !== 'string') return false;
+  const digits = phone.replace(/\D/g, '');
+
+  // Must be 10+ digits
+  if (digits.length < 10) return false;
+
+  // Reject obvious fakes
+  if (digits === '1234567890') return false;
+  if (/^(\d)\1{9}$/.test(digits)) return false; // 1111111111, 2222222222, etc.
+  if (/^0{10}$/.test(digits)) return false; // 0000000000
+
+  return true;
+}
 
 const MEMORY_URL = process.env.MCP_USER_MEMORY_URL    || 'http://127.0.0.1:3001';
 const MEMORY_KEY = process.env.MCP_USER_MEMORY_API_KEY || '';
@@ -337,8 +371,9 @@ async function _askCarrierAndResolve(mcpAdapter, phone, profilePrefix, userId, l
   await _profileSet(mcpAdapter, `${profilePrefix}:phone_carrier_lookup_needed`, 'done', userId, logger);
 
   const gatewayEmail = getGatewayEmail(phone, carrier);
-  logger.info(`[Node:ResolveUserContext] Carrier "${carrier}" answered → gateway: ${gatewayEmail}`);
-  return { name: displayName, phone, carrier, email: gatewayEmail };
+  const mmsGatewayEmail = getMmsGatewayEmail(phone, carrier);
+  logger.info(`[Node:ResolveUserContext] Carrier "${carrier}" answered → gateway: ${gatewayEmail} / mms: ${mmsGatewayEmail}`);
+  return { name: displayName, phone, carrier, email: gatewayEmail, mmsEmail: mmsGatewayEmail, mode: 'sms' };
 }
 
 // ── Main node ────────────────────────────────────────────────────────────────
@@ -360,7 +395,7 @@ module.exports = async function resolveUserContext(state) {
       if (_quickEmail) {
         // Auto-heal: if a placeholder email leaked into profile, delete it and skip.
         const _quickDomain = _quickEmail.split('@')[1]?.toLowerCase();
-        if (_PLACEHOLDER_EMAIL_DOMAINS.has(_quickDomain)) {
+        if (_PLACEHOLDER_EMAIL_DOMAINS.has(_quickDomain) || !isValidEmailForCommunication(_quickEmail)) {
           logger.warn(`[Node:ResolveUserContext] pass-through: deleting placeholder email from profile: ${_quickEmail}`);
           try { await mcpAdapter.callService('user-memory', 'profile.delete', { key: 'self:email', userId }, { timeoutMs: 3000 }); } catch (_) {}
           // fall through — no valid email to inject
@@ -411,15 +446,16 @@ module.exports = async function resolveUserContext(state) {
 
     if (phoneResult?.phone) {
       const gatewayEmail = phoneResult.carrier ? getGatewayEmail(phoneResult.phone, phoneResult.carrier) : null;
+      const mmsGatewayEmail = phoneResult.carrier ? getMmsGatewayEmail(phoneResult.phone, phoneResult.carrier) : null;
       if (gatewayEmail) {
-        smsGatewayTarget = { name: targetName, phone: phoneResult.phone, carrier: phoneResult.carrier, email: gatewayEmail };
-        logger.info(`[Node:ResolveUserContext] External contact gateway: ${gatewayEmail}`);
+        smsGatewayTarget = { name: targetName, phone: phoneResult.phone, carrier: phoneResult.carrier, email: gatewayEmail, mmsEmail: mmsGatewayEmail, mode: 'sms' };
+        logger.info(`[Node:ResolveUserContext] External contact gateway: ${gatewayEmail} / mms: ${mmsGatewayEmail}`);
       } else if (state.gatherAnswerCallback) {
         smsGatewayTarget = await _askCarrierAndResolve(
           mcpAdapter, phoneResult.phone, `contact:${normalizedName}`, userId, logger, state.gatherAnswerCallback, targetName,
-        ) || { name: targetName, phone: phoneResult.phone, carrier: null, email: null };
+        ) || { name: targetName, phone: phoneResult.phone, carrier: null, email: null, mmsEmail: null, mode: 'sms' };
       } else {
-        smsGatewayTarget = { name: targetName, phone: phoneResult.phone, carrier: null, email: null };
+        smsGatewayTarget = { name: targetName, phone: phoneResult.phone, carrier: null, email: null, mmsEmail: null, mode: 'sms' };
         logger.info('[Node:ResolveUserContext] Carrier unknown and no gather callback — SMS will be skipped');
       }
     } else {
@@ -445,22 +481,25 @@ module.exports = async function resolveUserContext(state) {
         msg,
       );
 
-      if (phoneResult?.phone) {
+      if (phoneResult?.phone && isValidPhoneForCommunication(phoneResult.phone)) {
         resolvedSelfContext.phone = phoneResult.phone;
         const gatewayEmail = phoneResult.carrier ? getGatewayEmail(phoneResult.phone, phoneResult.carrier) : null;
+        const mmsGatewayEmail = phoneResult.carrier ? getMmsGatewayEmail(phoneResult.phone, phoneResult.carrier) : null;
         if (gatewayEmail) {
-          smsGatewayTarget = { name: 'me', phone: phoneResult.phone, carrier: phoneResult.carrier, email: gatewayEmail };
-          logger.info(`[Node:ResolveUserContext] Self SMS gateway: ${gatewayEmail}`);
+          smsGatewayTarget = { name: 'me', phone: phoneResult.phone, carrier: phoneResult.carrier, email: gatewayEmail, mmsEmail: mmsGatewayEmail, mode: 'sms' };
+          logger.info(`[Node:ResolveUserContext] Self SMS gateway: ${gatewayEmail} / mms: ${mmsGatewayEmail}`);
         } else if (state.gatherAnswerCallback) {
           // Carrier unknown — ask user inline via amber gather prompt (no guide card)
           smsGatewayTarget = await _askCarrierAndResolve(
             mcpAdapter, phoneResult.phone, 'self', userId, logger, state.gatherAnswerCallback, 'me',
-          ) || { name: 'me', phone: phoneResult.phone, carrier: null, email: null };
+          ) || { name: 'me', phone: phoneResult.phone, carrier: null, email: null, mmsEmail: null, mode: 'sms' };
         } else {
           // No gather available (bridge runs, etc.) — leave email null, planSkills will skip SMS
-          smsGatewayTarget = { name: 'me', phone: phoneResult.phone, carrier: null, email: null };
+          smsGatewayTarget = { name: 'me', phone: phoneResult.phone, carrier: null, email: null, mmsEmail: null, mode: 'sms' };
           logger.info('[Node:ResolveUserContext] Carrier unknown and no gather callback — SMS will be skipped');
         }
+      } else if (phoneResult?.phone) {
+        logger.warn(`[Node:ResolveUserContext] Rejecting placeholder phone from profile: "${phoneResult.phone}"`);
       } else {
         logger.info('[Node:ResolveUserContext] self:phone not found in profile, memory, or conversation');
       }
@@ -470,9 +509,11 @@ module.exports = async function resolveUserContext(state) {
   // ── 2. Resolve self:email if needed ──────────────────────────────────────
   if (needsEmail) {
     const email = await _resolveField(mcpAdapter, 'self:email', 'my email address', userId, logger, msg);
-    if (email) {
+    if (email && isValidEmailForCommunication(email)) {
       resolvedSelfContext.email = email;
       logger.info('[Node:ResolveUserContext] self:email resolved');
+    } else if (email) {
+      logger.warn(`[Node:ResolveUserContext] Rejecting placeholder email from profile: "${email}"`);
     }
   }
 
@@ -491,6 +532,12 @@ module.exports = async function resolveUserContext(state) {
   if (convSnippets.length > 0) {
     resolvedSelfContext.conversation = { context: convSnippets };
     logger.info(`[Node:ResolveUserContext] Broad conversation search: ${convSnippets.length} snippet(s)`);
+  }
+
+  // ── Detect MMS intent and flip mode if needed ──────────────────────────
+  if (smsGatewayTarget && detectMmsIntent(msg, state)) {
+    smsGatewayTarget.mode = 'mms';
+    logger.info(`[Node:ResolveUserContext] MMS intent detected — mode set to 'mms' (gateway: ${smsGatewayTarget.mmsEmail || smsGatewayTarget.email})`);
   }
 
   return {

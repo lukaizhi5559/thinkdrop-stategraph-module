@@ -288,6 +288,22 @@ module.exports = async function parseIntent(state) {
     logger.debug(`[Node:ParseIntent] Using resolved message: "${resolvedMessage}"`);
   }
 
+  // ── Gather answer resume guard ───────────────────────────────────────────
+  // If this message is answering a prior gather question, force the original intent
+  if (state._gatherQuestionPending && state._pendingIntent?.type === 'command_automate') {
+    logger.info(`[Node:ParseIntent] Gather answer resume detected — forcing ${state._pendingIntent.type}`);
+    return {
+      ...state,
+      intent: {
+        type: 'command_automate',
+        confidence: 0.98,
+        entities: [],
+        requiresMemoryAccess: false,
+      },
+      metadata: { parser: 'gather-answer-resume', processingTimeMs: 0 },
+    };
+  }
+
   // ── Hard overrides — run BEFORE carriedIntent and BEFORE phi4 ML ──────────
   // These must never be bypassed by resolveReferences carryover.
 

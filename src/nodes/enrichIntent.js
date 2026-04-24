@@ -279,6 +279,33 @@ module.exports = async function enrichIntent(state) {
     return await handleEnrichmentAnswer(state, recentAssistant, userId, logger);
   }
 
+  // ── Maintenance Scan intent — intercept before command_automate enrichment ─
+  const SCAN_INTENT_RE = /\b(run|start|trigger|kick\s*off|do|schedule|run\s+a)\s+(maintenance\s+scan|agent\s+scan|agents?\s+update|site\s+scan|domain\s+scan)\b|\b(scan\s+(my\s+)?(agents?|sites?|domains?))\b/i;
+  if (SCAN_INTENT_RE.test(userMessage) && intent?.type === 'command_automate') {
+    logger.info('[Node:EnrichIntent] Maintenance scan intent detected — routing to scan.run');
+    try {
+      const http = require('http');
+      const body = JSON.stringify({ trigger: 'user' });
+      await new Promise((resolve) => {
+        const req = http.request({
+          hostname: '127.0.0.1', port: 3007,
+          path: '/scan.run', method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          timeout: 4000,
+        }, (r) => { r.resume(); resolve(); });
+        req.on('error', () => resolve());
+        req.on('timeout', () => { req.destroy(); resolve(); });
+        req.write(body);
+        req.end();
+      });
+    } catch (_) {}
+    return {
+      ...state,
+      intent: { type: 'direct_response' },
+      response: 'Starting maintenance scan — I\'ll update all agent knowledge maps and show you the progress.',
+    };
+  }
+
   // ── MODE A: Enrich a command_automate request ─────────────────────────────
   if (intent?.type !== 'command_automate') return state;
 
@@ -634,8 +661,20 @@ Answer with exactly one word: YES or NO.`;
 
       if (hit) {
         const value = extractScalarValue(detector.field, hit.text) || hit.text.trim();
-        resolvedFacts.push({ field: detector.field, value, rawText: hit.text });
-        logger.info(`[Node:EnrichIntent] Resolved ${detector.field}: "${value}"`);
+
+        // COMMUNICATION GUARD: reject fake-looking values for actual messaging
+        if (detector.field === 'my_email' && !isValidEmailForCommunication(value)) {
+          logger.warn(`[Node:EnrichIntent] Rejecting placeholder email for communication: "${value}"`);
+          const q = await translateQuestion(detector.question, _langInstruction, llmBackend, logger);
+          unresolvedGaps.push({ field: detector.field, question: q });
+        } else if (detector.field === 'my_phone' && !isValidPhoneForCommunication(value)) {
+          logger.warn(`[Node:EnrichIntent] Rejecting placeholder phone for communication: "${value}"`);
+          const q = await translateQuestion(detector.question, _langInstruction, llmBackend, logger);
+          unresolvedGaps.push({ field: detector.field, question: q });
+        } else {
+          resolvedFacts.push({ field: detector.field, value, rawText: hit.text });
+          logger.info(`[Node:EnrichIntent] Resolved ${detector.field}: "${value}"`);
+        }
       } else {
         const q = await translateQuestion(detector.question, _langInstruction, llmBackend, logger);
         unresolvedGaps.push({ field: detector.field, question: q });
@@ -1062,6 +1101,38 @@ function extractScalarFromAnswer(field, text) {
 
 /** Build a scalar value extractor alias (used in entity resolution path) */
 const extractScalarValue = extractScalarFromAnswer;
+
+/** Validate email is real (not placeholder) for actual communication */
+function isValidEmailForCommunication(email) {
+  if (!email || typeof email !== 'string') return false;
+  const lower = email.toLowerCase().trim();
+
+  const PLACEHOLDER_PATTERNS = [
+    /^test@/i, /^user@/i, /^email@/i, /^example@/i,
+    /^fake@/i, /^temp@/i, /^dummy@/i,
+    /@example\.(com|org|net)$/i, /@domain\.(com|org|net)$/i,
+    /@yourdomain\.(com|org|net)$/i, /@test\.(com|org|net)$/i,
+    /\.local$/i,
+  ];
+
+  return !PLACEHOLDER_PATTERNS.some(re => re.test(lower));
+}
+
+/** Validate phone is real (not placeholder) for actual communication */
+function isValidPhoneForCommunication(phone) {
+  if (!phone || typeof phone !== 'string') return false;
+  const digits = phone.replace(/\D/g, '');
+
+  // Must be 10+ digits
+  if (digits.length < 10) return false;
+
+  // Reject obvious fakes
+  if (digits === '1234567890') return false;
+  if (/^(\d)\1{9}$/.test(digits)) return false; // 1111111111, 2222222222, etc.
+  if (/^0{10}$/.test(digits)) return false; // 0000000000
+
+  return true;
+}
 
 /**
  * Translate a hardcoded English question into the user's language via phi4.

@@ -71,6 +71,118 @@ function _enrichFailureContext(stepResult) {
   return enriched;
 }
 
+/**
+ * Analyze page content to detect if it has substantive content vs just UI/auth wall.
+ * Uses positive validation (content density, structure) not just negative filtering.
+ * Returns analysis with confidence score and reasoning.
+ */
+function analyzePageContent(text, url = '', agentId = '') {
+  if (!text || text.length < 50) {
+    return { hasContent: false, confidence: 0, reason: 'text_too_short', contentDensity: 0 };
+  }
+
+  // Extract domain context
+  let domain = '';
+  try {
+    domain = new URL(url).hostname.toLowerCase();
+  } catch (_) {}
+
+  // Check for ERROR PAGES (clear failures)
+  const ERROR_PATTERNS = [
+    /404\s+not\s+found/i,
+    /403\s+forbidden/i,
+    /500\s+internal\s+server\s+error/i,
+    /access\s+denied/i,
+    /that's an error/i,
+    /something\s+went\s+wrong/i,
+    /page\s+not\s+found/i,
+    /error\s+\d{3}/i,
+  ];
+  const isErrorPage = ERROR_PATTERNS.some(p => p.test(text.slice(0, 2000)));
+
+  // Check for AUTH WALLS (login required)
+  const AUTH_WALL_PATTERNS = [
+    /sign\s+in\s+to\s+continue/i,
+    /please\s+log\s+in.*to\s+view/i,
+    /authentication\s+required/i,
+    /login\s+required/i,
+    /create\s+an?\s+account\s+to/i,
+    /join\s+now\s+to\s+continue/i,
+  ];
+  const isAuthWall = AUTH_WALL_PATTERNS.some(p => p.test(text.slice(0, 1500)));
+
+  // CONTENT DENSITY ANALYSIS (positive signal)
+  const wordCount = text.split(/\s+/).filter(w => w.length > 2).length;
+  const paragraphCount = text.split(/\n\s*\n/).filter(p => p.length > 100).length;
+  const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 20);
+  const avgSentenceLength = sentences.reduce((a, s) => a + s.length, 0) / Math.max(1, sentences.length);
+  const punctuationDensity = (text.match(/[.!?;:]/g) || []).length / Math.max(1, wordCount);
+
+  // Density thresholds
+  const hasSubstantialText = wordCount >= 100;
+  const hasParagraphStructure = paragraphCount >= 2;
+  const hasPunctuation = punctuationDensity > 0.05;
+
+  // CONTENT MARKERS (positive signals)
+  const CONTENT_MARKERS = [
+    { pattern: /#{1,3}\s+\d+[).:]?\s+[A-Z]/, weight: 3, name: 'numbered_heading' },
+    { pattern: /^[\s]*[-•*]\s+[A-Z][a-z]{2,}/m, weight: 2, name: 'bullet_content' },
+    { pattern: /\*\*[A-Z][a-z]+.*?\*\*/, weight: 2, name: 'bold_section' },
+    { pattern: /[A-Z][^.]{80,200}[.][\s]+[A-Z]/, weight: 3, name: 'substantive_paragraph' },
+    { pattern: /\n\n[A-Z][^.]{100,}\.\n\n[A-Z]/, weight: 4, name: 'multi_para_section' },
+    { pattern: /(Summary|Overview|Introduction|Conclusion|Analysis|Key Points|Findings)/i, weight: 3, name: 'section_keyword' },
+    { pattern: /From:\s*\S+@\S+/i, weight: 3, name: 'email_from' },
+    { pattern: /Subject:\s*\S+/i, weight: 3, name: 'email_subject' },
+  ];
+
+  let contentScore = 0;
+  const matchedSignals = [];
+  CONTENT_MARKERS.forEach(marker => {
+    if (marker.pattern.test(text)) {
+      contentScore += marker.weight;
+      matchedSignals.push(marker.name);
+    }
+  });
+
+  // UI CHROME DETECTION
+  const UI_CHROME_PATTERNS = [
+    /^Skip to content/i,
+    /^(Chat history|New chat|Search chats|Images|Apps|Deep research)/im,
+    /^(Home|About|Contact|Menu|Navigation)/im,
+    /^(Inbox|Sent|Drafts|Trash|Compose)/im,
+  ];
+  const hasUiChrome = UI_CHROME_PATTERNS.some(p => p.test(text.slice(0, 800)));
+
+  // DECISION LOGIC
+  if (isErrorPage) {
+    return { hasContent: false, confidence: 0.95, reason: 'error_page_detected', contentDensity: 0 };
+  }
+  if (isAuthWall && wordCount < 150) {
+    return { hasContent: false, confidence: 0.9, reason: 'auth_wall_detected', contentDensity: 0 };
+  }
+
+  const hasRealContent = (contentScore >= 5) || (hasSubstantialText && hasParagraphStructure) || (hasSubstantialText && contentScore >= 3);
+  const confidence = Math.min(0.95, 0.5 + (contentScore * 0.05) + (hasParagraphStructure ? 0.15 : 0));
+
+  return {
+    hasContent: hasRealContent,
+    confidence,
+    reason: hasRealContent ? 'content_markers_present' : 'insufficient_content',
+    contentScore,
+    contentDensity: wordCount / 1000,
+    wordCount,
+    paragraphCount,
+    avgSentenceLength: Math.round(avgSentenceLength),
+    punctuationDensity: Math.round(punctuationDensity * 100) / 100,
+    uiChromeDetected: hasUiChrome,
+    authWallDetected: isAuthWall,
+    errorPageDetected: isErrorPage,
+    matchedSignals: matchedSignals.slice(0, 5),
+    domain,
+    agentId,
+  };
+}
+
 // Persistent scheduler — writes pending-schedule.json + launchd plist
 // so macOS can relaunch the app at the target time if it was closed.
 let _scheduler = null;
@@ -1715,7 +1827,27 @@ module.exports = async function executeCommand(state) {
         (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:'))
       ) && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0
         && r.step > lastSynthesizeStep)
-      .map(r => ({ source: r.args?.sessionId || r.args?.agentId || 'browser.agent', url: r.url || '', text: r.result }));
+      .map(r => {
+        const analysis = analyzePageContent(r.result, r.url, r.args?.agentId);
+        let processedText = r.result;
+        
+        // If we have UI chrome but also real content, add clarifying note
+        if (analysis.uiChromeDetected && analysis.hasContent) {
+          processedText = `[PAGE NOTE: Navigation UI detected at start, but ${analysis.contentScore} content sections found below. Extract substantive content.]\n\n${r.result}`;
+        }
+        
+        // If auth wall detected, mark clearly
+        if (analysis.authWallDetected) {
+          processedText = `[AUTH WALL: Login required]\n\n${r.result}`;
+        }
+        
+        return { 
+          source: r.args?.sessionId || r.args?.agentId || 'browser.agent', 
+          url: r.url || '', 
+          text: processedText,
+          _analysis: analysis // for debugging
+        };
+      });
     logger.debug(`[Node:ExecuteCommand] synthesize: found ${pageTextResults.length} getPageText/waitForStableText results`);
     const skippedStepNotes = skillResults
       .filter(r => r.skipped && r.skipReason && r.step > lastSynthesizeStep)

@@ -838,16 +838,20 @@ Apply this correction directly to the previous plan intent. Keep the same overal
   // of proposing a paid SMS API.
   if (state.smsGatewayTarget) {
     const gwt = state.smsGatewayTarget;
-    if (gwt.email) {
-      const maxChars = 160;
-      profileContextNote += `\n\n⚠️ SMS GATEWAY ROUTE (resolved — use this EXACTLY, no paid SMS API needed):
+    const isMms = gwt.mode === 'mms' && gwt.mmsEmail;
+    const activeEmail = isMms ? gwt.mmsEmail : gwt.email;
+    if (activeEmail) {
+      const maxChars = isMms ? 1600 : 160;
+      const modeLabel = isMms ? 'MMS (supports images/video — send as email with attachment)' : 'SMS (plain text)';
+      profileContextNote += `\n\n⚠️ ${isMms ? 'MMS' : 'SMS'} GATEWAY ROUTE (resolved — use this EXACTLY, no paid SMS API needed):
   Recipient:  ${gwt.name} (${gwt.phone}, carrier: ${gwt.carrier})
-  Send to:    ${gwt.email}  ← email-to-SMS gateway address
-  Method:     Send as plain email via gmail.agent (browser.agent action:run agentId:gmail.agent)
+  Send to:    ${activeEmail}  ← email-to-${isMms ? 'MMS' : 'SMS'} gateway address
+  Mode:       ${modeLabel}
+  Method:     Send as${isMms ? ' email with attachment' : ' plain email'} via gmail.agent (browser.agent action:run agentId:gmail.agent)
   Subject:    (empty — leave blank)
-  Body:       The SMS message text — keep under ${maxChars} characters
+  Body:       The ${isMms ? 'MMS' : 'SMS'} message text${isMms ? '' : ` — keep under ${maxChars} characters`}
   RULE: NEVER use Twilio, ClickSend, Vonage, or any paid SMS API. The gateway email is already resolved.`;
-      logger.info(`[Node:PlanSkills] Injecting SMS gateway target: ${gwt.email}`);
+      logger.info(`[Node:PlanSkills] Injecting ${isMms ? 'MMS' : 'SMS'} gateway target: ${activeEmail}`);
     } else if (gwt.carrierOptions) {
       profileContextNote += `\n\n⚠️ SMS GATEWAY: Carrier unknown for ${gwt.name} (${gwt.phone}).
   Add a guide.step asking the user to select their carrier, then retry with the gateway email.`;
@@ -2650,11 +2654,13 @@ CRITICAL rules for skill.md:
       // but if it still emitted needs_skill for SMS, force a bypass plan here.
       // For recurring tasks: write a bridge skill.md so SkillScheduler handles it.
       // For one-off tasks: generate an immediate gmail.agent send.
-      if (state.smsGatewayTarget?.email) {
+      if (state.smsGatewayTarget?.email || state.smsGatewayTarget?.mmsEmail) {
         const capability = needsSkillStep.args?.capability || userMessage;
-        const SMS_KEYWORDS = /\b(sms|text message|text.*someone|send.*text|message.*via.*sms|daily.*sms|sms.*summary)\b/i;
+        const SMS_KEYWORDS = /\b(sms|mms|text message|text.*someone|send.*text|message.*via.*sms|daily.*sms|sms.*summary)\b/i;
         if (SMS_KEYWORDS.test(capability) || SMS_KEYWORDS.test(userMessage)) {
           const gwt = state.smsGatewayTarget;
+          const _isMms = gwt.mode === 'mms' && gwt.mmsEmail;
+          const _activeEmail = _isMms ? gwt.mmsEmail : gwt.email;
           const RECURRING_RE = /\b(daily|every|weekly|each\s+(morning|evening|day|night)|at\s+\d+\s*(am|pm)|cron|recurring|each\s+week)\b/i;
           const isRecurring = RECURRING_RE.test(userMessage) || RECURRING_RE.test(capability);
 
@@ -2698,10 +2704,10 @@ CRITICAL rules for skill.md:
                 commandLines: [
                   '## Commands',
                   '',
-                  '### Send SMS via Gmail API',
+                  `### Send ${_isMms ? 'MMS' : 'SMS'} via Gmail API`,
                   '```bash',
                   'SUMMARY="[DATA FROM STEP 1]"',
-                  `RAW=$(printf "To: ${gwt.email}\\r\\nSubject: \\r\\n\\r\\n%s" "$SUMMARY" | base64 | tr '+/' '-_' | tr -d '=\\n')`,
+                  `RAW=$(printf "To: ${_activeEmail}\\r\\nSubject: \\r\\n\\r\\n%s" "$SUMMARY" | base64 | tr '+/' '-_' | tr -d '=\\n')`,
                   'curl -s -X POST "https://gmail.googleapis.com/gmail/v1/users/me/messages/send" \\',
                   '  -H "Authorization: Bearer $GOOGLE_ACCESS_TOKEN" \\',
                   '  -H "Content-Type: application/json" \\',
@@ -2717,13 +2723,13 @@ CRITICAL rules for skill.md:
                 commandLines: [
                   '## Commands',
                   '',
-                  '### Send SMS via Outlook Graph API',
+                  `### Send ${_isMms ? 'MMS' : 'SMS'} via Outlook Graph API`,
                   '```bash',
                   'SUMMARY="[DATA FROM STEP 1]"',
                   'curl -s -X POST "https://graph.microsoft.com/v1.0/me/sendMail" \\',
                   '  -H "Authorization: Bearer $MICROSOFT_ACCESS_TOKEN" \\',
                   '  -H "Content-Type: application/json" \\',
-                  `  -d "{\\"message\\":{\\"subject\\":\\"\\",\\"body\\":{\\"contentType\\":\\"Text\\",\\"content\\":\\"$SUMMARY\\"},\\"toRecipients\\":[{\\"emailAddress\\":{\\"address\\":\\"${gwt.email}\\"}}]}}"`,
+                  `  -d "{\\"message\\":{\\"subject\\":\\"\\",\\"body\\":{\\"contentType\\":\\"Text\\",\\"content\\":\\"$SUMMARY\\"},\\"toRecipients\\":[{\\"emailAddress\\":{\\"address\\":\\"${_activeEmail}\\"}}]}}"`,
                   '```',
                   'CRITICAL: $MICROSOFT_ACCESS_TOKEN is pre-injected. Use shell.run + curl above. Do NOT use browser.agent or outlook.agent.',
                 ],
@@ -2747,7 +2753,7 @@ CRITICAL rules for skill.md:
               : [
                   '## Plan',
                   '1. Gather content described in the instruction using the appropriate agent or data source.',
-                  `2. Send the result as an email to ${gwt.email} with an empty subject using the user's connected email service REST API with the injected access token. Use shell.run + curl. Do NOT use browser.agent.`,
+                  `2. Send the result as an email to ${_activeEmail} with an empty subject using the user's connected email service REST API with the injected access token. Use shell.run + curl. Do NOT use browser.agent.`,
                 ];
 
             const skillMd = [
@@ -2755,10 +2761,10 @@ CRITICAL rules for skill.md:
               `name: ${skillSlug}`,
               `schedule: "${cronExpr}"`,
               'type: bridge',
-              `title: SMS to ${gwt.name}`,
+              `title: ${_isMms ? 'MMS' : 'SMS'} to ${gwt.name}`,
               `instruction: ${instruction.replace(/\n/g, ' ')}`,
-              `description: Recurring SMS to ${gwt.name} via carrier gateway (${gwt.carrier})`,
-              `sms_gateway_email: ${gwt.email}`,
+              `description: Recurring ${_isMms ? 'MMS' : 'SMS'} to ${gwt.name} via carrier gateway (${gwt.carrier})`,
+              `sms_gateway_email: ${_activeEmail}`,
               `sms_gateway_name: ${gwt.name}`,
               ..._oauthFmLines,
               '---',
@@ -2808,9 +2814,9 @@ CRITICAL rules for skill.md:
             args: {
               action: 'run',
               agentId: _oneOffEmailAgentId,
-              task: `Send email to ${gwt.email} with empty subject and body: ${userMessage}`,
+              task: `Send email to ${_activeEmail} with empty subject and body: ${userMessage}`,
             },
-            description: `Send SMS to ${gwt.name} via carrier gateway (${gwt.carrier})`,
+            description: `Send ${_isMms ? 'MMS' : 'SMS'} to ${gwt.name} via carrier gateway (${gwt.carrier})`,
           }];
           return { ...state, skillPlan: bypassPlan, skillCursor: 0, scoutPending: false };
         }

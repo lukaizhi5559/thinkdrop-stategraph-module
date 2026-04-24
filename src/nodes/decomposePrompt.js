@@ -247,6 +247,12 @@ module.exports = async function decomposePrompt(state) {
     return state;
   }
 
+  // Gather answer fast-path: don't decompose answers to gather questions
+  if (state._gatherQuestionPending || state.pendingQuestion?._isGatherPlanQuestion) {
+    logger.info('[Node:DecomposePrompt] Gather answer detected — skipping decomposition');
+    return state;
+  }
+
   logger.debug(`[Node:DecomposePrompt] Attempting decomposition: "${message.slice(0, 80)}${message.length > 80 ? '...' : ''}"`);
 
   // ── Layer 3: single-artifact keyword guard ────────────────────────────────

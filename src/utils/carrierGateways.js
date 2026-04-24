@@ -67,6 +67,61 @@ const CARRIER_GATEWAYS = {
   'total':           'vtext.com',
 };
 
+// ── Carrier → MMS gateway domain map (supports attachments: images, video, files) ──
+// Sources: carrier MMS documentation + CTIA carrier gateway documentation (2024)
+const CARRIER_MMS_GATEWAYS = {
+  // Tier-1 US carriers
+  'verizon':         'vzwpix.com',
+  'at&t':            'mms.att.net',
+  'att':             'mms.att.net',
+  't-mobile':        'tmomail.net',   // T-Mobile uses same domain for SMS and MMS
+  'tmobile':         'tmomail.net',
+  'sprint':          'pm.sprint.com',
+  'boost mobile':    'myboostmobile.com',
+  'boost':           'myboostmobile.com',
+  'us cellular':     'mms.uscc.net',
+  'uscellular':      'mms.uscc.net',
+  // MVNOs and regional carriers
+  'cricket':         'mms.mycricket.com',
+  'cricket wireless':'mms.mycricket.com',
+  'metro pcs':       'mymetropcs.com',
+  'metro by t-mobile':'mymetropcs.com',
+  'metropcs':        'mymetropcs.com',
+  'straight talk':   'mypixmessages.com',
+  'tracfone':        'mmst5.tracfone.com',
+  'republic wireless':'text.republicwireless.com',
+  'republic':        'text.republicwireless.com',
+  'consumer cellular':'mailmymobile.net',
+  'consumer':        'mailmymobile.net',
+  'google fi':       'msg.fi.google.com',
+  'fi':              'msg.fi.google.com',
+  'mint mobile':     'mailmymobile.net',
+  'mint':            'mailmymobile.net',
+  'visible':         'vzwpix.com',
+  'xfinity mobile':  'mypixmessages.com',
+  'xfinity':         'mypixmessages.com',
+  'optimum mobile':  'mms.att.net',
+  'optimum':         'mms.att.net',
+  'wing':            'vzwpix.com',
+  'simple mobile':   'smtext.com',
+  'simple':          'smtext.com',
+  'net10':           'mms.att.net',
+  'total wireless':  'vzwpix.com',
+  'total':           'vzwpix.com',
+};
+
+// ── Deprecated SMS gateway domains (warn-only, no behavior change) ───────────
+// Carriers below have announced EOL dates for their legacy email-to-SMS domains.
+// When one of these deprecated domains is about to be used, _warnIfDeprecated()
+// fires a structured console.warn. No auto-switching — update CARRIER_GATEWAYS
+// manually when a carrier confirms the shutdown.
+const DEPRECATED_SMS_GATEWAYS = {
+  // carrier key → { deprecatedDomain, replacedBy, eolDate, source }
+  'verizon': { deprecatedDomain: 'vtext.com',  replacedBy: 'vzwpix.com',  eolDate: '2025-06-01', source: 'https://www.verizon.com/support/vtext-vzwpix-shutdown/' },
+  'at&t':    { deprecatedDomain: 'txt.att.net', replacedBy: 'mms.att.net', eolDate: '2025-06-30', source: 'https://www.att.com/StopEmail2Text' },
+  'att':     { deprecatedDomain: 'txt.att.net', replacedBy: 'mms.att.net', eolDate: '2025-06-30', source: 'https://www.att.com/StopEmail2Text' },
+};
+
 // ── Human-readable dropdown options (for prompt when Numverify is unavailable) ──
 const CARRIER_OPTIONS = [
   { label: 'Verizon',          value: 'verizon' },
@@ -88,6 +143,18 @@ const CARRIER_OPTIONS = [
   { label: 'Simple Mobile',    value: 'simple mobile' },
   { label: 'Other',            value: null },
 ];
+
+// ── Deprecation warning (warn-only, no behavior change) ────────────────────
+function _warnIfDeprecated(carrier, domain) {
+  if (!carrier || !domain) return;
+  const info = DEPRECATED_SMS_GATEWAYS[carrier.toLowerCase()];
+  if (info && domain === info.deprecatedDomain) {
+    console.warn(
+      `[carrierGateways] DEPRECATION WARNING: ${carrier} SMS gateway "${domain}" is scheduled for shutdown (EOL: ${info.eolDate}). ` +
+      `Migrate to MMS gateway "${info.replacedBy}" for attachment sends. Source: ${info.source}`
+    );
+  }
+}
 
 // ── Normalize a carrier name returned by Numverify ──────────────────────────
 // Numverify returns strings like "Verizon Wireless", "AT&T Mobility LLC", etc.
@@ -189,6 +256,7 @@ function getGatewayEmail(phone, carrier) {
   const localDigits = digits.length > 10 ? digits.slice(-10) : digits;
   const domain = CARRIER_GATEWAYS[carrier.toLowerCase()];
   if (!domain) return null;
+  _warnIfDeprecated(carrier, domain);
   return `${localDigits}@${domain}`;
 }
 
@@ -202,15 +270,73 @@ function getGatewayEmail(phone, carrier) {
 function getGatewayDomain(carrier) {
   if (!carrier) return null;
   const key = carrier.toLowerCase();
-  return CARRIER_GATEWAYS[key] || CARRIER_GATEWAYS[_normalizeCarrierName(carrier)] || null;
+  const domain = CARRIER_GATEWAYS[key] || CARRIER_GATEWAYS[_normalizeCarrierName(carrier)] || null;
+  if (domain) _warnIfDeprecated(carrier, domain);
+  return domain;
+}
+
+// ── MMS gateway helpers ──────────────────────────────────────────────────────
+/**
+ * Construct the email-to-MMS gateway address for a given phone + carrier.
+ * Use this when the send includes an image, video, or file attachment.
+ *
+ * @param {string} phone    - Phone number (digits only or formatted)
+ * @param {string} carrier  - Normalized carrier name (e.g. 'verizon')
+ * @returns {string|null}   - MMS gateway email or null if carrier not in map
+ */
+function getMmsGatewayEmail(phone, carrier) {
+  if (!phone || !carrier) return null;
+  const digits = _digitsOnly(phone);
+  if (digits.length < 10) return null;
+  const localDigits = digits.length > 10 ? digits.slice(-10) : digits;
+  const domain = CARRIER_MMS_GATEWAYS[carrier.toLowerCase()];
+  if (!domain) return null;
+  return `${localDigits}@${domain}`;
+}
+
+/**
+ * Given a carrier name, return the MMS gateway domain.
+ * Returns null if unmapped.
+ *
+ * @param {string} carrier - Carrier name (raw or normalized)
+ * @returns {string|null}
+ */
+function getMmsGatewayDomain(carrier) {
+  if (!carrier) return null;
+  const key = carrier.toLowerCase();
+  return CARRIER_MMS_GATEWAYS[key] || CARRIER_MMS_GATEWAYS[_normalizeCarrierName(carrier)] || null;
+}
+
+// ── MMS intent detection ─────────────────────────────────────────────────────
+/**
+ * Detect whether a send operation should use MMS (attachments) instead of plain SMS.
+ * Returns true if the message text contains attachment-related keywords OR if
+ * state.attachments / state.files arrays are non-empty.
+ *
+ * @param {string} message - User message / resolved command text
+ * @param {Object} [state] - StateGraph state object (optional)
+ * @returns {boolean}
+ */
+function detectMmsIntent(message, state) {
+  const MMS_KEYWORDS = /\b(photo|image|picture|pic|video|clip|gif|file|attachment|attach|send.*image|send.*photo|send.*video|mms)\b/i;
+  if (message && MMS_KEYWORDS.test(message)) return true;
+  if (state?.attachments?.length > 0) return true;
+  if (state?.files?.length > 0) return true;
+  return false;
 }
 
 module.exports = {
   CARRIER_GATEWAYS,
+  CARRIER_MMS_GATEWAYS,
+  DEPRECATED_SMS_GATEWAYS,
   CARRIER_OPTIONS,
   lookupCarrier,
   getGatewayEmail,
   getGatewayDomain,
+  getMmsGatewayEmail,
+  getMmsGatewayDomain,
+  detectMmsIntent,
   _normalizeCarrierName,  // exported for testing
-  _digitsOnly,             // exported for testing
+  _digitsOnly,            // exported for testing
+  _warnIfDeprecated,      // exported for testing
 };
