@@ -174,7 +174,13 @@ class VSCodeLLMBackend extends LLMBackend {
       });
     });
 
-    return accumulated || 'I apologize, but I was unable to generate a response.';
+    const fallback = 'I apologize, but I was unable to generate a response.';
+    if (!accumulated) {
+      // Copilot returned an empty stream — emit fallback via onToken so the UI shows it
+      if (onToken) onToken(fallback);
+      return fallback;
+    }
+    return accumulated;
   }
 
   async isAvailable() {

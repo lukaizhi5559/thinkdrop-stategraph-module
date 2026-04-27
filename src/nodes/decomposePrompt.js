@@ -83,6 +83,23 @@ JSON shape (example):
 const SINGLE_ARTIFACT_RE = /\b(create|build|write|make|generate|set up|setup)\b.{0,80}\b(skill|cron job|scheduled (script|task|job)|background (script|task|job)|automation that runs|script that runs)\b/i;
 const MULTI_GOAL_CONNECTOR_RE = /\b(and (?:also|then)|after that|also|additionally|plus)\b.{0,30}\b(open|search|email|text|send|message|call|look|find|go to|navigate|check|tweet|post)\b/i;
 
+// ── Layer 4: single-intent fast-path ─────────────────────────────────────────
+// Prompts that are obviously one intent never benefit from LLM decomposition —
+// the LLM always returns 1 sub-prompt equal to the original (wasting ~2s).
+// Detect them upfront and skip the LLM call entirely.
+
+// Patterns that reliably indicate a single intent (no multi-step):
+const SINGLE_QUESTION_RE   = /^(what|who|when|where|why|how|which|is|are|was|were|do|does|did|can|could|will|would|should|have|has|had|tell me|show me|explain|give me|find me|what'?s|who'?s|what is|what are|what was)\b/i;
+const SINGLE_MEMORY_RE     = /^(remember|my name|what'?s my|what is my|who am i|remind me|what did i|do you know my|what do you know|recall|look up my|retrieve my)\b/i;
+// Conservative fast-path for short, unambiguous navigation commands.
+// Only fires when: (1) starts with a clear browse verb, (2) task remainder after site
+// name is short (≤40 chars), (3) no multi-step connectors present.
+// Examples that fire: "goto biblegateway look up romans 1", "visit arxiv.org"
+// Examples that DON'T fire: "goto gmail open the first email from John and summarize it"
+const SINGLE_COMMAND_RE    = /^(goto|go\s+to|navigate\s+to|visit)\s+\S+/i;
+// Multi-step connectors that REQUIRE LLM decomposition (fast-path must not fire if present)
+const MULTI_STEP_SIGNAL_RE = /\b(and then|after that|after you|followed by|then (?:also|after|open|go|send|email|text|search|find|create|navigate|check|make)|also (?:send|text|email|open|go|search|find|check)|additionally|first .{0,60} then|step 1|step one|part 1|part one)\b/i;
+
 // ── Linear CA-chain collapse (Layer 2) ───────────────────────────────────────
 // After LLM decomposes, detect and collapse command_automate steps that form a
 // fully-linear dependency chain (no branching). This prevents implementation-step
@@ -253,7 +270,36 @@ module.exports = async function decomposePrompt(state) {
     return state;
   }
 
-  logger.debug(`[Node:DecomposePrompt] Attempting decomposition: "${message.slice(0, 80)}${message.length > 80 ? '...' : ''}"`);
+  logger.debug(`[Node:DecomposePrompt] Attempting decomposition: "${message.slice(0, 80)}${message.length > 80 ? '...' : ''}"`)
+
+  // ── Layer 4: single-intent fast-path ────────────────────────────────────
+  // Skip the LLM call for prompts that are obviously a single intent with no
+  // multi-step connectors. The LLM always collapses these to 1 sub-prompt anyway.
+  if (!MULTI_STEP_SIGNAL_RE.test(message) && (SINGLE_QUESTION_RE.test(message) || SINGLE_MEMORY_RE.test(message))) {
+    const fastIntent = classifyHeuristicIntent(message);
+    logger.debug(`[Node:DecomposePrompt] Single-intent fast-path — skipping LLM (intent=${fastIntent}): "${message.slice(0, 60)}"`);
+    writeDecomposeLog({ ts: new Date().toISOString(), message, parser: 'fast-path', intent: fastIntent, subPromptCount: 1, durationMs: 0, subPrompts: [] });
+    if (fastIntent && fastIntent !== 'general_knowledge') {
+      return { ...state, _decomposedIntent: fastIntent };
+    }
+    return state;
+  };
+
+  // ── Layer 4b: conservative navigation fast-path ───────────────────────────
+  // Short browse-verb prompts (goto/go to/navigate to/visit + site) with no
+  // multi-step connectors are always single-intent command_automate.
+  // Guard: only fires when task text after the site name is ≤40 chars.
+  if (!MULTI_STEP_SIGNAL_RE.test(message) && SINGLE_COMMAND_RE.test(message)) {
+    // Measure text after the first two tokens (verb + site name)
+    const _tokens = message.trim().split(/\s+/);
+    const _verbTokens = /^go\s+to$/i.test(_tokens.slice(0, 2).join(' ')) ? 2 : 1;
+    const _afterSite = _tokens.slice(_verbTokens + 1).join(' ');
+    if (_afterSite.length <= 40) {
+      logger.info(`[Node:DecomposePrompt] Navigation fast-path — skipping LLM (command_automate): "${message.slice(0, 60)}"`);
+      writeDecomposeLog({ ts: new Date().toISOString(), message, parser: 'nav-fast-path', intent: 'command_automate', subPromptCount: 1, durationMs: 0, subPrompts: [] });
+      return { ...state, _decomposedIntent: 'command_automate' };
+    }
+  }
 
   // ── Layer 3: single-artifact keyword guard ────────────────────────────────
   // If the message is requesting one artifact (skill/cron/scheduled job) with no

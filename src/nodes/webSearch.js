@@ -49,7 +49,9 @@ module.exports = async function webSearch(state) {
         id: r.url || r.link,
         text: `${r.title}\n${r.snippet || r.description || ''}`,
         source: 'web_search',
-        url: r.url || r.link
+        url: r.url || r.link,
+        title: r.title || '',
+        snippet: r.snippet || r.description || ''
       }))
     };
   } catch (error) {

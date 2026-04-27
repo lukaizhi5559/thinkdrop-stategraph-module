@@ -236,6 +236,24 @@ module.exports = async function parseSkill(state) {
     return state;
   }
 
+  // ── Guard: skip Strategy 3 when all installed skills are invalid (exec file missing on disk) ──
+  // Avoids a ~2-3s LLM round-trip when the only installed skill(s) have a broken
+  // exec_path (e.g. oauth.debug with no index.cjs). skill.review flags these at startup.
+  {
+    const fs = require('fs');
+    const os = require('os');
+    const executableSkills = installedSkills.filter(s => {
+      const execPath = s.execPath || s.exec_path;
+      if (!execPath) return false;
+      const resolved = execPath.startsWith('~/') ? require('path').join(os.homedir(), execPath.slice(2)) : execPath;
+      return fs.existsSync(resolved);
+    });
+    if (executableSkills.length === 0) {
+      logger.debug(`[Node:ParseSkill] Strategy 3 skipped — all ${installedSkills.length} skill(s) have invalid exec_path (no runnable skills): "${classifyMessage.substring(0, 80)}"`);
+      return state;
+    }
+  }
+
   // Only attempt if at least some skills have descriptions — otherwise the LLM
   // has nothing useful to compare against.
   let skillsWithDesc = installedSkills.filter(s => s.description || s.summary);

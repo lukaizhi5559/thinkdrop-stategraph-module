@@ -139,6 +139,31 @@ function loadSystemPrompt() {
   }
 }
 
+function loadSlimBrowserPrompt() {
+  const path = require('path');
+  try {
+    return fs.readFileSync(path.join(__dirname, '../prompts/plan-skills-browser.md'), 'utf8').trim();
+  } catch (_) {
+    return null;
+  }
+}
+
+// Heuristic: detect prompts that only need simple browser.act steps on public sites.
+// Must NOT fire for: login-required sites, API agents, CLI agents, SMS/email, file ops.
+const _SLIM_BROWSE_VERB_RE  = /^(goto|go\s+to|navigate\s+to|visit|open|look\s+up|search\s+on|search\s+for|browse)\b/i;
+const _SLIM_COMPLEX_VOCAB_RE = /\b(send|email|text\s+me|sms|slack|discord|telegram|whatsapp|dm|notify|login|log\s+in|sign\s+in|password|api|curl|shell|script|file|download|upload|create|build|make|generate|schedule|cron|agent|install|setup|summarize|synthesize|compare|spreadsheet|pdf|csv|excel|screenshot|screen)\b/i;
+const _SLIM_AGENT_REQUIRED_RE = /\b(gmail|notion|linear|jira|trello|github|stripe|twilio|clicksend|mailgun|sendgrid|spotify|netflix|linkedin)\b/i;
+
+function _shouldUseSlimBrowserPrompt(userMessage, state) {
+  if (!userMessage) return false;
+  if (state.activeBrowserSessionId) return false; // existing session — full context needed
+  if (state.creatorSkillName || state.projectSkillPlan) return false;
+  if (!_SLIM_BROWSE_VERB_RE.test(userMessage)) return false;
+  if (_SLIM_COMPLEX_VOCAB_RE.test(userMessage)) return false;
+  if (_SLIM_AGENT_REQUIRED_RE.test(userMessage)) return false;
+  return true;
+}
+
 const SKILL_SYSTEM_PROMPT_FALLBACK = `You are an automation planner. Convert the user's request into an ordered list of skill steps.
 
 Available skills: shell.run, browser.act, ui.axClick, ui.moveMouse, ui.click, ui.typeText, ui.waitFor, api_suggest, guide.step, needs_install
@@ -165,7 +190,6 @@ For synthesize steps: keep prompt strings UNDER 200 chars. If the prompt needs t
 If the request cannot be safely automated, output: { "error": "explain why it cannot be done" }`;
 
 module.exports = async function planSkills(state) {
-  const SKILL_SYSTEM_PROMPT = loadSystemPrompt() || SKILL_SYSTEM_PROMPT_FALLBACK;
   const {
     mcpAdapter,
     llmBackend,
@@ -193,6 +217,18 @@ module.exports = async function planSkills(state) {
     ? `\n[Full content available at: ${state._dataFile} — read with fs.readFileSync if needed]`
     : '';
   const userMessage = (state._dataPrefix ? state._dataPrefix + '\n' : '') + (resolvedMessage || message) + _dataFileSuffix;
+
+  // ── Select system prompt — slim for pure public-site browse tasks ──────────
+  // For prompts like "goto biblegateway look up romans 1", the full 690-line
+  // plan-skills.md (with SMS, Python, email, OAuth rules) is wasted token budget.
+  // The slim prompt is ~60 lines — browser.act only — reduces Copilot input ~80%.
+  const _useSlimPrompt = _shouldUseSlimBrowserPrompt(userMessage, state);
+  const SKILL_SYSTEM_PROMPT = _useSlimPrompt
+    ? (loadSlimBrowserPrompt() || loadSystemPrompt() || SKILL_SYSTEM_PROMPT_FALLBACK)
+    : (loadSystemPrompt() || SKILL_SYSTEM_PROMPT_FALLBACK);
+  if (_useSlimPrompt) {
+    logger.info(`[Node:PlanSkills] Using slim browser prompt (public-site navigate task): "${userMessage.slice(0, 60)}"`);
+  }
   const correctionSourcePrompt = state._planCorrectionMode && state._planCorrectionSourcePrompt
     ? String(state._planCorrectionSourcePrompt)
     : '';

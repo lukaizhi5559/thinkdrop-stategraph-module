@@ -1840,9 +1840,13 @@ module.exports = async function executeCommand(state) {
           processedText = `[PAGE NOTE: Navigation UI detected at start, but ${analysis.contentScore} content sections found below. Extract substantive content.]\n\n${r.result}`;
         }
         
-        // If auth wall detected, mark clearly
-        if (analysis.authWallDetected) {
+        // If auth wall detected AND no real content, mark clearly as login-blocked
+        // If authWallDetected but hasContent is true, the page loaded nav/sign-in chrome
+        // alongside the actual AI response — treat as UI chrome, not a true block.
+        if (analysis.authWallDetected && !analysis.hasContent) {
           processedText = `[AUTH WALL: Login required]\n\n${r.result}`;
+        } else if (analysis.authWallDetected && analysis.hasContent) {
+          processedText = `[PAGE NOTE: Sign-in nav detected but page has content below. Extract substantive content.]\n\n${r.result}`;
         }
         
         return { 

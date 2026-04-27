@@ -477,12 +477,27 @@ module.exports = async function enrichIntent(state) {
     // Non-fatal — fall back to seed set only
   }
 
+  // ── Browse-verb guard: skip domain.extract for navigation-only prompts ──────
+  // For prompts starting with a clear browse verb (goto/navigate/visit/open/look up)
+  // that contain NO messaging vocabulary, phi4 always returns false-positive tags
+  // (e.g. "database", "web-framework") that the LLM then discards. This wastes
+  // ~5s (phi4 call + LLM validation). Skip both calls entirely for these prompts.
+  const _BROWSE_VERB_PREFIX_RE = /^(goto|go\s+to|navigate\s+to|visit|open|look\s+up|search\s+on|search\s+for|browse)\b/i;
+  const _MESSAGING_VOCAB_RE    = /\b(send|text\s+me|email\s+me|email|message|DM|notify|sms|slack|discord|telegram|whatsapp|dm)\b/i;
+  const _isBrowseOnlyPrompt = intent?.type === 'command_automate'
+    && _BROWSE_VERB_PREFIX_RE.test(commandMessage)
+    && !_MESSAGING_VOCAB_RE.test(commandMessage);
+
+  if (_isBrowseOnlyPrompt) {
+    logger.info(`[Node:EnrichIntent] Browse-verb guard — skipping domain.extract (no messaging vocab): "${commandMessage.slice(0, 60)}"`);
+  }
+
   // Run domain.extract, then validate the result is actually relevant to this message.
   // phi4 (3B local model) hallucinates messaging/API services for unrelated tasks like
   // browser navigation. Instead of hardcoding patterns to skip, we ask the LLM backend
   // (the capable model) to confirm whether the returned tags genuinely apply.
   // This is self-healing: no list to maintain, any false-positive gets discarded.
-  let domainTags = state.matchedSkillName
+  let domainTags = (state.matchedSkillName || _isBrowseOnlyPrompt)
     ? null
     : await extractDomainTags(commandMessage, mcpAdapter, logger);
 

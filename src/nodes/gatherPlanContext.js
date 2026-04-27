@@ -103,7 +103,7 @@ This is ONE STEP of a multi-step automation. Does THIS SPECIFIC SUB-TASK need cl
 Is this specific sub-task complete enough to automate without further clarification?`;
 
   try {
-    const raw = await llmBackend.generateAnswer(SYSTEM_PROMPT, prompt, { maxTokens: 80, temperature: 0 });
+    const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: SYSTEM_PROMPT } }, { maxTokens: 80, temperature: 0 });
     const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
 
     // Strip optional markdown code fence (```json ... ``` or ``` ... ```)
@@ -159,7 +159,7 @@ module.exports = async function gatherPlanContext(state) {
 
   // ── Skip: self-contained browser task (named service + browse verb) ───────────
   // These tasks are always fully specified — no LLM call needed, no false questions.
-  const _BROWSER_SERVICES = /\b(chatgpt|gemini|google|bing|youtube|reddit|twitter|x\.com|instagram|facebook|linkedin|amazon|walmart|target|netflix|spotify|github|notion|slack|discord|venice\s*ai|perplexity|claude|copilot|openai|ebay|etsy|pinterest|tiktok|wikipedia)\b/i;
+  const _BROWSER_SERVICES = /\b(chatgpt|gemini|google|bing|youtube|reddit|twitter|x\.com|instagram|facebook|linkedin|amazon|walmart|target|netflix|spotify|github|notion|slack|discord|venice\s*ai|perplexity|claude|copilot|openai|ebay|etsy|pinterest|tiktok|wikipedia|biblegateway|bible\s*gateway|arxiv|stackoverflow|stack\s*overflow|medium|substack|quora|devto|dev\.to|hackernews|hacker\s*news|ycombinator|producthunt|product\s*hunt|npmjs|npm|pypi|cnn|bbc|reuters|techcrunch|theverge|wired|arstechnica|ars\s*technica|bloomberg|wsj|nytimes|washingtonpost|apnews|npr|forbes|businessinsider|engadget|zdnet|pcmag|pcworld|tomshardware|anandtech|macrumors|9to5mac|appleinsider|androidpolice|xda|gsmarena|digitaltrends|lifehacker|howtogeek|makeuseof|ifixit|instructables|wikihow|khanacademy|coursera|udemy|edx|duolingo|goodreads|letterboxd|imdb|rottentomatoes|metacritic|steamcommunity|steam|epicgames|gog|itch\.io|boardgamegeek|chess\.com|lichess|espn|nba|nfl|mlb|nhl|fifa|transfermarkt|flashscore|sofascore|strava|allrecipes|foodnetwork|seriouseats|epicurious|yummly|yelp|tripadvisor|booking|airbnb|expedia|kayak|skyscanner|zillow|redfin|realtor|craigslist|nextdoor|ancestry|23andme|pubmed|webmd|mayoclinic|healthline|drugs\.com|wolframalpha|mathway|desmos|geogebra|symbolab|chegg|quizlet|brainly|sparknotes|cliffsnotes|gutenberg|archive\.org|jstor|sciencedirect|springer|nature|cell)\b/i;
   const _BROWSE_VERBS     = /\b(go\s+to|goto|open|navigate|look\s+up|search|find|browse|check|visit|look\s+on|search\s+on|search\s+for|look\s+for)\b/i;
   if (_BROWSER_SERVICES.test(userMsg) && _BROWSE_VERBS.test(userMsg)) {
     logger.info(`[Node:GatherPlanContext] Self-contained browser task — skipping clarification for: "${userMsg.slice(0, 80)}"`);
