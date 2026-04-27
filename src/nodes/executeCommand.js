@@ -592,12 +592,14 @@ module.exports = async function executeCommand(state) {
     // Check if any image.analyze step produced a description — surface it directly
     const imageAnalyzeResult = [...skillResults].reverse().find(r => r.skill === 'image.analyze' && r.ok && r.stdout);
 
-    // Last waitForStableText/getPageText result — the actual page content the user asked for.
-    // waitForStableText returns `result` (string), getPageText returns `stdout`.
-    const pageTextResult = [...skillResults].reverse().find(r =>
-      r.skill === 'browser.act' && r.ok &&
-      ['waitForStableText', 'getPageText'].includes(r.args?.action) &&
-      (r.result || r.stdout)
+    // Last getPageText result — the actual page content the user asked for.
+    // Prefer getPageText (explicit canonical read); fall back to waitForStableText
+    // only for older plans that lack an explicit getPageText step.
+    const _getPageTextResult = [...skillResults].reverse().find(r =>
+      r.skill === 'browser.act' && r.ok && r.args?.action === 'getPageText' && (r.result || r.stdout)
+    );
+    const pageTextResult = _getPageTextResult || [...skillResults].reverse().find(r =>
+      r.skill === 'browser.act' && r.ok && r.args?.action === 'waitForStableText' && (r.result || r.stdout)
     );
     const pageTextContent = pageTextResult
       ? (typeof pageTextResult.result === 'string' && pageTextResult.result ? pageTextResult.result : pageTextResult.stdout)
@@ -624,8 +626,10 @@ module.exports = async function executeCommand(state) {
 
     // Stream the answer to the UI — answer node is bypassed for command_automate,
     // so we push the execution result here via streamCallback for the Results window.
+    // Guard: skip if answer node already streamed tokens (_answerStreamed=true) to
+    // prevent the full answer being sent a second time after live streaming completed.
     const streamCallback = state.streamCallback || null;
-    if (answer && typeof streamCallback === 'function') {
+    if (answer && typeof streamCallback === 'function' && !state._answerStreamed) {
       logger.info(`[Node:ExecuteCommand] Streaming execution answer (${answer.length} chars)`);
       streamCallback(answer);
     }
@@ -1823,7 +1827,7 @@ module.exports = async function executeCommand(state) {
     logger.debug(`[Node:ExecuteCommand] synthesize: scoping to results after step ${lastSynthesizeStep} (last synthesize)`);
     const pageTextResults = skillResults
       .filter(r => (
-        (r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText')) ||
+        (r.skill === 'browser.act' && r.args?.action === 'getPageText') ||
         (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:'))
       ) && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0
         && r.step > lastSynthesizeStep)
@@ -4546,12 +4550,14 @@ module.exports = async function executeCommand(state) {
       // external.skill result — the Node.js skill returned a string in the `output` field.
       // Must be checked before the shell.run fallback — external.skill produces rich markdown reports.
       const lastExternalSkillResult = [...updatedResults].reverse().find(r => r.skill === 'external.skill' && r.ok && r.output?.trim());
-      // Last waitForStableText/getPageText result — the actual page content the user asked for.
-      // waitForStableText returns `result` (string), getPageText returns `stdout`.
-      const pageTextResult = [...updatedResults].reverse().find(r =>
-        r.skill === 'browser.act' && r.ok &&
-        ['waitForStableText', 'getPageText'].includes(r.args?.action) &&
-        (r.result || r.stdout)
+      // Last getPageText result — the actual page content the user asked for.
+      // Prefer getPageText (explicit canonical read); fall back to waitForStableText
+      // only for older plans that lack an explicit getPageText step.
+      const _getPageTextResult2 = [...updatedResults].reverse().find(r =>
+        r.skill === 'browser.act' && r.ok && r.args?.action === 'getPageText' && (r.result || r.stdout)
+      );
+      const pageTextResult = _getPageTextResult2 || [...updatedResults].reverse().find(r =>
+        r.skill === 'browser.act' && r.ok && r.args?.action === 'waitForStableText' && (r.result || r.stdout)
       );
       const pageTextContent = pageTextResult
         ? (typeof pageTextResult.result === 'string' && pageTextResult.result ? pageTextResult.result : pageTextResult.stdout)
@@ -4700,11 +4706,10 @@ module.exports = async function executeCommand(state) {
         } catch (_) {}
       }
 
-      // Stream answer to Results window immediately — graph won't loop back here
-      if (lastStepAnswer && typeof state.streamCallback === 'function') {
-        logger.info(`[Node:ExecuteCommand] Streaming last-step answer (${lastStepAnswer.length} chars)`);
-        state.streamCallback(lastStepAnswer);
-      }
+      // Note: do NOT re-send lastStepAnswer here via streamCallback.
+      // The synthesize LLM call above (line ~2219) passes streamCallback directly to
+      // generateAnswer which streams every token live. Sending the full answer again
+      // here would duplicate content in the UI.
     }
 
     // ── Track last opened file path for close-verb context in planSkills ────────

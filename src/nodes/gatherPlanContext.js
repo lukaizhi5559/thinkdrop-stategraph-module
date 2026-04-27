@@ -78,7 +78,14 @@ Rules:
 - Do NOT ask about credentials, optional preferences, or things the system can infer.
 - Do NOT ask if the information is already present in the CURRENT SUB-TASK.
 - Keep the question under 15 words.
-- Ask only one question — never combine two into one.`;
+- Ask only one question — never combine two into one.
+
+CRITICAL ANTI-HALLUCINATION RULES — these override everything else:
+- "where to find X", "where can I find X", "where to buy X", "where to get X" = a SEARCH intent. NEVER interpret these as needing a message recipient. Return {"complete": true}.
+- If the task mentions a specific website or service by name (chatgpt, gemini, google, youtube, reddit, amazon, venice ai, etc.) the service is already specified — do NOT ask "which service".
+- Navigate / browse / look up / search / find / check tasks on a named site NEVER need a recipient. Only tasks that explicitly say "send", "text me", "email me", or "message" need a recipient.
+- If the task is "go to <site> and search/look up/find <topic>", return {"complete": true} immediately — no question needed.
+- "where to find them/it" after a search request refers to physical or online locations for the searched item — it is part of the search query, NOT a recipient field.`;
 
 // ── LLM call ──────────────────────────────────────────────────────────────────
 
@@ -148,6 +155,15 @@ module.exports = async function gatherPlanContext(state) {
   if (state._bypassGatherPlan || _wantsToBypass(userMsg)) {
     logger.info('[Node:GatherPlanContext] Bypass detected — passing through to planSkills');
     return { ...state, planGatheringComplete: true, planGatheringSkipped: false };
+  }
+
+  // ── Skip: self-contained browser task (named service + browse verb) ───────────
+  // These tasks are always fully specified — no LLM call needed, no false questions.
+  const _BROWSER_SERVICES = /\b(chatgpt|gemini|google|bing|youtube|reddit|twitter|x\.com|instagram|facebook|linkedin|amazon|walmart|target|netflix|spotify|github|notion|slack|discord|venice\s*ai|perplexity|claude|copilot|openai|ebay|etsy|pinterest|tiktok|wikipedia)\b/i;
+  const _BROWSE_VERBS     = /\b(go\s+to|goto|open|navigate|look\s+up|search|find|browse|check|visit|look\s+on|search\s+on|search\s+for|look\s+for)\b/i;
+  if (_BROWSER_SERVICES.test(userMsg) && _BROWSE_VERBS.test(userMsg)) {
+    logger.info(`[Node:GatherPlanContext] Self-contained browser task — skipping clarification for: "${userMsg.slice(0, 80)}"`);
+    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
   }
 
   // ── Skip: no LLM backend ─────────────────────────────────────────────────────

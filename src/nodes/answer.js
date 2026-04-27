@@ -447,6 +447,7 @@ module.exports = async function answer(state) {
     return {
       ...state,
       answer: displayAnswer,
+      _answerStreamed: isStreaming,
       ...(pendingQuestion ? { pendingQuestion } : {}),
       metadata: {
         ...state.metadata,
