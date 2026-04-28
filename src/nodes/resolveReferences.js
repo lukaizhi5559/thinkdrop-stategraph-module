@@ -250,7 +250,12 @@ function detectIntentCarryover(message, conversationHistory) {
   const BROWSER_NAV_DEICTIC_RE = /^(go\s+to|goto|visit|check|open|browse|navigate\s+to|look\s+at)\s+(the\s+)?(site|page|link|url|article|result)\b/i;
   const hasBrowserNavDeictic = BROWSER_NAV_DEICTIC_RE.test(msg) && hasDeiticRef;
 
-  if (!isContinuation && !isTemporalElliptical && !isDeiticMemoryFollowup && !isRefinement && !hasBrowserNavDeictic) return null;
+  // Signal 7: AGENT BUILD FOLLOW-UP — user wants to build an agent for a previous task
+  // e.g., "build an agent for this", "create an agent for that", "make an agent for it"
+  const AGENT_BUILD_FOLLOWUP_RE = /(build|create|make)\s+(an?\s+)?agent\s+(for|to)\s+(this|that|it)\b/i;
+  const isAgentBuildFollowup = AGENT_BUILD_FOLLOWUP_RE.test(msg) && conversationHistory.length > 0;
+
+  if (!isContinuation && !isTemporalElliptical && !isDeiticMemoryFollowup && !isRefinement && !hasBrowserNavDeictic && !isAgentBuildFollowup) return null;
 
   // ── Determine prior intent from conversation history ──────────────────────
   // Read the last 5 user messages, most recent first, and infer intent from content
@@ -285,6 +290,22 @@ function detectIntentCarryover(message, conversationHistory) {
     const _lastAsst = conversationHistory.slice().reverse().find(m => m.role === 'assistant' && m.content);
     if (_lastAsst?.content && /https?:\/\//.test(_lastAsst.content)) {
       previousIntent = 'command_automate';
+    }
+  }
+  // Agent build follow-up: carry over command_automate context and enrich with prior task info
+  if (isAgentBuildFollowup && previousIntent === 'command_automate') {
+    // Find the last user message to extract domain/task context
+    const lastUserMsg = conversationHistory.slice().reverse().find(m => m.role === 'user' && m.content);
+    if (lastUserMsg?.content) {
+      // Extract domain/URL from previous user message if present
+      const domainMatch = lastUserMsg.content.match(/\b(?:goto|visit|open|on|at)\s+(?:the\s+)?(amazon\.com|spotify\.com|youtube\.com|github\.com|twitter\.com|x\.com|linkedin\.com|notion\.so|figma\.com|[a-z0-9-]+\.[a-z]{2,})\b/i);
+      const urlMatch = lastUserMsg.content.match(/https?:\/\/[^\s,.)'"]+/);
+      
+      if (domainMatch || urlMatch) {
+        const domain = domainMatch ? domainMatch[1] : new URL(urlMatch[0]).hostname;
+        // Enrich message with context about what "this/that/it" refers to
+        resolvedMessage = `${message} (referring to: previous task on ${domain}: "${lastUserMsg.content.substring(0, 80)}...")`;
+      }
     }
   }
   if (!previousIntent) return null;

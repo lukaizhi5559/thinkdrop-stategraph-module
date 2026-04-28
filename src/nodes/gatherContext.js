@@ -34,6 +34,10 @@
 const fs = require('fs');
 const path = require('path');
 
+// ── User Memory & Personality Service Clients ──────────────────────────────────
+const userMemory = require('../services/userMemoryClient');
+const personality = require('../services/personalityClient');
+
 const MAX_ROUNDS = 8;
 const GATHER_TIMEOUT_MS = 10 * 60 * 1000; // 10 min per answer
 
@@ -380,6 +384,89 @@ Respond with ONLY valid JSON, no explanation, no markdown:
   if (SKILL_BUILD_INTENT_SIGNALS.some(r => r.test(userMessage))) {
     logger.info(`[Node:GatherContext] Explicit skill-build intent detected — forcing BUILD mode for: "${userMessage.slice(0, 80)}"`);
     state = { ...state, forceSkillBuild: true }; // fall through to gather loop below
+  }
+
+  // ── Intelligent Agent Recommendation Engine ──────────────────────────────────
+  // Uses user memory and personality data to make context-aware agent recommendations
+  // instead of simple keyword matching which causes notification fatigue
+  async function evaluateAgentRecommendation() {
+    // Extract domain from user message
+    const domainMatch = userMessage.match(/\b([a-z0-9-]+\.(?:com|org|net|io|co|ai|app))\b/i) ||
+                       userMessage.match(/\b(?:goto|visit|open|on|at)\s+(?:the\s+)?([a-z0-9-]+)/i);
+    const domain = domainMatch ? domainMatch[1] : null;
+    
+    if (!domain || state.agentRecommendationChecked) {
+      return null;
+    }
+    
+    try {
+      // Query user memory for domain visit history
+      const memories = await userMemory.searchByEntity(domain, 'domain');
+      const visitStats = userMemory.calculateVisitFrequency(memories, domain);
+      const taskSimilarity = userMemory.scoreTaskSimilarity(userMessage, memories);
+      
+      // Query personality profile for automation preferences
+      const automationProfile = await personality.getAutomationProfile();
+      const threshold = personality.getRecommendationThreshold(automationProfile);
+      
+      // Calculate recommendation score
+      let score = 0;
+      
+      // Frequency factor (0-0.4) - most important
+      if (visitStats.count >= 5) score += 0.4;
+      else if (visitStats.count >= 3) score += 0.25;
+      else if (visitStats.count >= 2) score += 0.1;
+      
+      // Task similarity (0-0.3)
+      score += taskSimilarity * 0.3;
+      
+      // Recency bonus (0-0.2) - visited within last 7 days
+      if (visitStats.daysSinceLast <= 7) score += 0.2;
+      else if (visitStats.daysSinceLast <= 30) score += 0.1;
+      
+      // Pattern match bonus (0-0.1) - current prompt shows recurring intent
+      const RECURRING_NEED_PATTERNS = [
+        /\bi\s+(?:need|want)\s+to\s+(?:buy|shop|purchase|get|find|search|check|track|monitor)/i,
+        /\bi\s+(?:always|often|frequently|regularly)\s+(?:buy|shop|visit|check)/i,
+        /\bevery\s+(?:time|day|week|month)/i,
+      ];
+      if (RECURRING_NEED_PATTERNS.some(r => r.test(userMessage))) {
+        score += 0.1;
+      }
+      
+      const confidence = Math.min(score, 1.0);
+      const shouldSuggest = personality.shouldShowSuggestion(automationProfile, confidence);
+      
+      logger.info(`[Node:GatherContext] Agent recommendation evaluated: domain=${domain}, visits=${visitStats.count}, confidence=${confidence.toFixed(2)}, threshold=${threshold.toFixed(2)}, suggest=${shouldSuggest}`);
+      
+      if (shouldSuggest && !state.suggestAgentBuild) {
+        return {
+          suggestAgentBuild: true,
+          agentRecommendation: {
+            domain,
+            confidence,
+            visitStats,
+            taskSimilarity,
+            reason: visitStats.count >= 3 
+              ? `You've visited ${domain} ${visitStats.count} times recently for similar tasks`
+              : `This looks like a recurring task on ${domain}`,
+            automationPreference: automationProfile.automation_preference
+          },
+          agentRecommendationChecked: true
+        };
+      }
+      
+      return { agentRecommendationChecked: true };
+    } catch (e) {
+      logger.warn(`[Node:GatherContext] Agent recommendation evaluation failed: ${e.message}`);
+      return { agentRecommendationChecked: true };
+    }
+  }
+  
+  // Run recommendation evaluation and update state
+  const recommendationResult = await evaluateAgentRecommendation();
+  if (recommendationResult) {
+    state = { ...state, ...recommendationResult };
   }
 
   // ── Hard validation gate: BUILD requires BOTH scheduling AND credential signals ─
