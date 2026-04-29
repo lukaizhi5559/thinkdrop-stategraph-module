@@ -46,6 +46,10 @@ const BYPASS_PATTERNS = [
   /\bno questions?\b/i,
   /\bdon'?t ask\b/i,
   /\bskip.*clarif/i,
+  // Research/extraction tasks with specific site + extract/get/save pattern
+  /\b(?:extract|get|find|search|look up|download).*\bfrom\b.*\b(?:wikipedia|google|youtube|reddit|amazon|github|stackoverflow)\b.*\b(?:save|write|export|extract|get)/i,
+  /\b(?:from|on)\s+(?:the\s+)?(?:wikipedia|google|youtube|reddit|amazon|github|stackoverflow)\b.*\b(?:extract|get|find|save|download|export)/i,
+  /\b(?:top|best|first|highest)\s+\d+\b.*\b(?:from|on)\b/i,
 ];
 
 function _wantsToBypass(msg) {
@@ -85,7 +89,14 @@ CRITICAL ANTI-HALLUCINATION RULES — these override everything else:
 - If the task mentions a specific website or service by name (chatgpt, gemini, google, youtube, reddit, amazon, venice ai, etc.) the service is already specified — do NOT ask "which service".
 - Navigate / browse / look up / search / find / check tasks on a named site NEVER need a recipient. Only tasks that explicitly say "send", "text me", "email me", or "message" need a recipient.
 - If the task is "go to <site> and search/look up/find <topic>", return {"complete": true} immediately — no question needed.
-- "where to find them/it" after a search request refers to physical or online locations for the searched item — it is part of the search query, NOT a recipient field.`;
+- "where to find them/it" after a search request refers to physical or online locations for the searched item — it is part of the search query, NOT a recipient field.
+- EXTRACTION/RESEARCH TASKS: If the task specifies a website + topic + action (extract/get/find/download/save/export), it is COMPLETE. Examples that need NO clarification:
+  * "get top 3 basketball players from wikipedia" — COMPLETE (site: wikipedia, topic: basketball players, action: get)
+  * "extract information from wikipedia and save to file" — COMPLETE (site: wikipedia, action: extract + save)
+  * "find the best restaurants from yelp and save" — COMPLETE (site: yelp, topic: best restaurants, action: find + save)
+  * "download the report from [site]" — COMPLETE (site specified, action: download)
+  * "get data from [site] and write to desktop" — COMPLETE (site + action + destination specified)
+- NEVER ask "which items" or "what specific data" for extraction tasks — the LLM planner can determine that from the site content. Return {"complete": true} for all extraction tasks with a specified site.`;
 
 // ── LLM call ──────────────────────────────────────────────────────────────────
 

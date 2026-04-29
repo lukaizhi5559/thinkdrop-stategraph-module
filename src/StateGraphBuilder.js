@@ -434,12 +434,12 @@ class StateGraphBuilder {
         return 'reviewExecution';
       },
 
-      // reviewExecution: FAILED → re-execute patched step, ASK_USER → surface to user, else → evaluateSkills
+      // reviewExecution: FAILED → recoverSkill (hollow result replan), ASK_USER → surface to user, else → evaluateSkills
       reviewExecution: (state) => {
         const verdict = state.reviewVerdict;
         if (verdict === 'FAILED') {
-          logger.info(`[StateGraph:Router] reviewExecution FAILED → executeCommand (retry with patch)`);
-          return 'executeCommand';
+          logger.info(`[StateGraph:Router] reviewExecution FAILED → recoverSkill (hollow result — attempt REPLAN)`);
+          return 'recoverSkill';
         }
         if (verdict === 'ASK_USER') {
           logger.info('[StateGraph:Router] reviewExecution ASK_USER → logConversation');

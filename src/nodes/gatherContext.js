@@ -34,10 +34,6 @@
 const fs = require('fs');
 const path = require('path');
 
-// ── User Memory & Personality Service Clients ──────────────────────────────────
-const userMemory = require('../services/userMemoryClient');
-const personality = require('../services/personalityClient');
-
 const MAX_ROUNDS = 8;
 const GATHER_TIMEOUT_MS = 10 * 60 * 1000; // 10 min per answer
 
@@ -395,24 +391,85 @@ Respond with ONLY valid JSON, no explanation, no markdown:
                        userMessage.match(/\b(?:goto|visit|open|on|at)\s+(?:the\s+)?([a-z0-9-]+)/i);
     const domain = domainMatch ? domainMatch[1] : null;
     
-    if (!domain || state.agentRecommendationChecked) {
+    if (!domain || state.agentRecommendationChecked || !state.mcpAdapter) {
       return null;
     }
     
     try {
+      const mcp = state.mcpAdapter;
+      
       // Query user memory for domain visit history
-      const memories = await userMemory.searchByEntity(domain, 'domain');
-      const visitStats = userMemory.calculateVisitFrequency(memories, domain);
-      const taskSimilarity = userMemory.scoreTaskSimilarity(userMessage, memories);
+      const memoriesResult = await mcp.callService('user-memory', 'memory.search', {
+        query: `visits to ${domain} domain browsing`,
+        topK: 20,
+        filters: { entityTypes: ['domain', 'url'] }
+      }, { timeoutMs: 3000 });
+      
+      const memories = memoriesResult?.results || memoriesResult?.data?.results || [];
+      
+      // Calculate visit frequency from memories
+      let visitCount = 0;
+      let lastVisit = null;
+      const domainMemories = memories.filter(m => 
+        m.text?.toLowerCase().includes(domain.toLowerCase()) ||
+        m.entities?.some(e => e.value?.toLowerCase() === domain.toLowerCase())
+      );
+      
+      domainMemories.forEach(m => {
+        visitCount++;
+        const ts = new Date(m.timestamp || m.created_at || 0);
+        if (!lastVisit || ts > lastVisit) lastVisit = ts;
+      });
+      
+      const daysSinceLast = lastVisit ? 
+        Math.floor((Date.now() - lastVisit.getTime()) / (1000 * 60 * 60 * 24)) : 
+        Infinity;
+      
+      const visitStats = {
+        count: visitCount,
+        daysSinceLast,
+        hasHistory: visitCount > 0
+      };
+      
+      // Calculate task similarity via semantic search comparison
+      let taskSimilarity = 0;
+      if (domainMemories.length > 0 && userMessage) {
+        const taskResult = await mcp.callService('user-memory', 'memory.search', {
+          query: userMessage,
+          topK: 5,
+          filters: { entityTypes: ['task', 'action', 'goal'] }
+        }, { timeoutMs: 3000 });
+        
+        const taskMemories = taskResult?.results || taskResult?.data?.results || [];
+        if (taskMemories.length > 0) {
+          taskSimilarity = Math.min(taskMemories.length / 5, 1.0);
+        }
+      }
       
       // Query personality profile for automation preferences
-      const automationProfile = await personality.getAutomationProfile();
-      const threshold = personality.getRecommendationThreshold(automationProfile);
+      const personalityResult = await mcp.callService('personality', 'personality.getTraits', {
+        traits: ['automation_preference', 'control_tolerance', 'exploration_drive', 'notification_tolerance', 'proactive_help']
+      }, { timeoutMs: 3000 });
+      
+      const traits = personalityResult?.traits || personalityResult?.data?.traits || [];
+      const profile = {
+        automation_preference: traits.find(t => t.name === 'automation_preference')?.value || 'medium',
+        notification_tolerance: traits.find(t => t.name === 'notification_tolerance')?.value || 'medium',
+        proactive_help: traits.find(t => t.name === 'proactive_help')?.value || 'medium'
+      };
+      
+      // Calculate recommendation threshold based on personality
+      const baseThreshold = 0.7;
+      const prefAdj = profile.automation_preference === 'high' ? -0.2 : 
+                      profile.automation_preference === 'low' ? 0.15 : 0;
+      const notifAdj = profile.notification_tolerance === 'high' ? -0.05 :
+                       profile.notification_tolerance === 'low' ? 0.1 : 0;
+      const threshold = Math.max(0.3, Math.min(0.9, baseThreshold + prefAdj + notifAdj));
       
       // Calculate recommendation score
       let score = 0;
       
-      // Frequency factor (0-0.4) - most important
+      // Frequency factor (0-0.4)
       if (visitStats.count >= 5) score += 0.4;
       else if (visitStats.count >= 3) score += 0.25;
       else if (visitStats.count >= 2) score += 0.1;
@@ -420,11 +477,11 @@ Respond with ONLY valid JSON, no explanation, no markdown:
       // Task similarity (0-0.3)
       score += taskSimilarity * 0.3;
       
-      // Recency bonus (0-0.2) - visited within last 7 days
+      // Recency bonus (0-0.2)
       if (visitStats.daysSinceLast <= 7) score += 0.2;
       else if (visitStats.daysSinceLast <= 30) score += 0.1;
       
-      // Pattern match bonus (0-0.1) - current prompt shows recurring intent
+      // Pattern match bonus (0-0.1)
       const RECURRING_NEED_PATTERNS = [
         /\bi\s+(?:need|want)\s+to\s+(?:buy|shop|purchase|get|find|search|check|track|monitor)/i,
         /\bi\s+(?:always|often|frequently|regularly)\s+(?:buy|shop|visit|check)/i,
@@ -435,7 +492,9 @@ Respond with ONLY valid JSON, no explanation, no markdown:
       }
       
       const confidence = Math.min(score, 1.0);
-      const shouldSuggest = personality.shouldShowSuggestion(automationProfile, confidence);
+      
+      // Apply personality-based suppression
+      const shouldSuggest = !(profile.proactive_help === 'low' && confidence < 0.85) && confidence >= threshold;
       
       logger.info(`[Node:GatherContext] Agent recommendation evaluated: domain=${domain}, visits=${visitStats.count}, confidence=${confidence.toFixed(2)}, threshold=${threshold.toFixed(2)}, suggest=${shouldSuggest}`);
       
@@ -450,7 +509,7 @@ Respond with ONLY valid JSON, no explanation, no markdown:
             reason: visitStats.count >= 3 
               ? `You've visited ${domain} ${visitStats.count} times recently for similar tasks`
               : `This looks like a recurring task on ${domain}`,
-            automationPreference: automationProfile.automation_preference
+            automationPreference: profile.automation_preference
           },
           agentRecommendationChecked: true
         };

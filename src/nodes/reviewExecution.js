@@ -260,7 +260,35 @@ module.exports = async function reviewExecution(state) {
     }
 
     if (isHollow) {
-      logger.warn(`[Node:ReviewExecution] Task not fulfilled — routing to ASK_USER: ${hollowReason}`);
+      if (reviewRetryCount === 0) {
+        // First pass: give recoverSkill a chance to REPLAN with a better strategy.
+        // Build a synthetic failedStep from the last browser/agent step so recoverSkill
+        // has enough context to produce a useful REPLAN suggestion.
+        const lastBrowserStep = skillResults.slice().reverse().find(
+          r => r.skill === 'playwright.agent' || r.skill === 'browser.agent' || r.skill === 'browser.act'
+        ) || skillResults[skillResults.length - 1];
+
+        const syntheticFailedStep = {
+          step: lastBrowserStep?.step || skillResults.length,
+          skill: lastBrowserStep?.skill || 'playwright.agent',
+          args: lastBrowserStep?.args || {},
+          error: hollowReason,
+          exitCode: 0,
+          stderr: '',
+          _hollowResult: true,
+        };
+
+        logger.warn(`[Node:ReviewExecution] Hollow result (pass 1) — routing to recoverSkill for REPLAN: ${hollowReason}`);
+        return {
+          ...state,
+          reviewVerdict: 'FAILED',
+          reviewRetryCount: 1,
+          failedStep: syntheticFailedStep,
+        };
+      }
+
+      // Second pass: still hollow after retry — surface to user
+      logger.warn(`[Node:ReviewExecution] Task not fulfilled after retry — routing to ASK_USER: ${hollowReason}`);
       const synthIdx = skillResults.findIndex(r => r.skill === 'synthesize');
       const answer = buildPartialSummary(userMessage, skillResults, [{
         stepIndex: synthIdx >= 0 ? synthIdx : skillResults.length - 1,
