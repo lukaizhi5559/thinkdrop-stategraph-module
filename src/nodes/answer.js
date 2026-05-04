@@ -207,7 +207,17 @@ module.exports = async function answer(state) {
     } else if (intentType === 'command_automate') {
       systemInstructions += '\n- Summarize what was automated and the outcome of each step\n- If any step failed or was skipped, explain clearly\n- Be concise — one line per step';
     } else if (intentType === 'memory_store' || intentType === 'memory_retrieve') {
-      systemInstructions += '\n- Answer using the provided Conversation History and Screen Activity & User Memories\n- The Conversation History contains the actual chat messages — use these to answer questions about past conversations\n- The Memories contain screen captures and activity — use these to answer questions about what the user was doing\n- Be specific: quote or summarize actual messages/topics from the history\n- Do NOT say you lack information if Conversation History or Memories are present in the prompt';
+      systemInstructions += '\n- Answer using the provided Conversation History and Screen Activity & User Memories\n- The Conversation History contains the actual chat messages — use these to answer questions about past conversations\n- The Memories contain screen captures and activity — use these to answer questions about what the user was doing\n- Be specific: quote or summarize actual messages/topics from the history\n- Do NOT say you lack information if Conversation History or Memories are present in the prompt\n- When referencing specific memories, ALWAYS cite the date using the formattedDate field (e.g., "On March 8, 2026 at 7:04 PM (two days ago), you viewed...")\n- Each memory has a formattedDate with "absolute" (human-readable) and "relative" (e.g., "2 days ago") - use both for temporal context\n- IMPORTANT: Cite EACH memory individually with its specific timestamp. Do NOT aggregate multiple memories into time ranges like "between 5:24-7:35 PM".';
+      
+      // Inject formatted memories directly into system instructions so LLM sees them
+      if (filteredMemories && filteredMemories.length > 0) {
+        const memoryBlock = filteredMemories.map((mem, i) => {
+          const date = mem.formattedDate?.absolute || mem.created_at || 'Unknown date';
+          const rel = mem.formattedDate?.relative || '';
+          return `[${i + 1}] ${date}${rel ? ' ' + rel : ''}: ${mem.text?.substring(0, 200) || 'No text'}`;
+        }).join('\n');
+        systemInstructions += `\n\n=== SCREEN ACTIVITY & MEMORIES ===\n${memoryBlock}\n=== END MEMORIES ===`;
+      }
     } else {
       systemInstructions += '\n- Use the provided context\n- Be helpful and concise';
     }

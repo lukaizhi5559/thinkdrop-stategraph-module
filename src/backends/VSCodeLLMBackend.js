@@ -84,11 +84,15 @@ class VSCodeLLMBackend extends LLMBackend {
           recentContext: (context.conversationHistory || []).map(msg => ({
             role: msg.role,
             content: msg.content,
-            timestamp: new Date().toISOString()
+            timestamp: msg.timestamp,
+            formattedDate: msg.formattedDate || { absolute: msg.timestamp, relative: '' }
           })),
           sessionFacts: context.sessionFacts || [],
           sessionEntities: context.sessionEntities || [],
-          memories: context.memories || [],
+          memories: (context.memories || []).map(mem => ({
+            ...mem,
+            formattedDate: mem.formattedDate || { absolute: mem.created_at, relative: '', iso: mem.created_at }
+          })),
           webSearchResults: context.webSearchResults || [],
           systemInstructions: context.systemInstructions || ''
         }

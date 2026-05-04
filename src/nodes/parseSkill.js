@@ -223,6 +223,134 @@ module.exports = async function parseSkill(state) {
     }
   }
 
+  // ── Strategy 5: Domain + source_action match ──────────────────────────────────
+  // Matches skills that have source_domain and source_action metadata (set by explore.agent).
+  // Detects the target service from the message by checking if any source_domain keyword
+  // (e.g. "perplexity", "krea") appears in the message, then scores source_action tokens
+  // against the message words.
+  // e.g. "goto history on perplexity" → source_domain=perplexity.ai, source_action=history → HIGH match
+  {
+    const domainSkills = installedSkills.filter(s => s.sourceDomain && s.sourceAction);
+    if (domainSkills.length > 0 && !userWantsToCreate) {
+      // Build a set of unique domains present in installed skills
+      const uniqueDomains = [...new Set(domainSkills.map(s => s.sourceDomain))];
+      let detectedDomain = null;
+      for (const domain of uniqueDomains) {
+        // Extract the base service name from the hostname: "perplexity.ai" → "perplexity"
+        const serviceKeyword = domain.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+        if (serviceKeyword.length >= 3 && msgLower.includes(serviceKeyword)) {
+          detectedDomain = domain;
+          break;
+        }
+      }
+
+      if (detectedDomain) {
+        const candidates = domainSkills.filter(s => s.sourceDomain === detectedDomain);
+        // Score each candidate: tokenize source_action and count how many tokens appear in message
+        const stopWords = new Set(['the', 'to', 'a', 'an', 'and', 'or', 'on', 'in', 'at', 'for', 'with', 'of']);
+        const msgTokens = new Set(msgLower.split(/\W+/).filter(w => w.length > 2 && !stopWords.has(w)));
+
+        let best = null;
+        let bestScore = 0;
+        for (const skill of candidates) {
+          const actionTokens = skill.sourceAction.toLowerCase().split(/[_\s]+/).filter(w => w.length > 2 && !stopWords.has(w));
+          if (actionTokens.length === 0) continue;
+          const matches = actionTokens.filter(t => msgTokens.has(t)).length;
+          const score = matches / actionTokens.length;
+          // Prefer skills with parameters when the message has extra context beyond the domain keyword
+          const fs = require('fs');
+          const os = require('os');
+          let skillPath = skill.execPath?.startsWith('~/') ? require('path').join(os.homedir(), skill.execPath.slice(2)) : skill.execPath;
+          // Underscore fallback for stale dot-notation exec_path
+          if (skillPath && !fs.existsSync(skillPath)) {
+            const _d = require('path').basename(require('path').dirname(skillPath));
+            const _u = _d.replace(/\./g, '_');
+            if (_u !== _d) {
+              const _alt = require('path').join(require('path').dirname(require('path').dirname(skillPath)), _u, require('path').basename(skillPath));
+              if (fs.existsSync(_alt)) skillPath = _alt;
+            }
+          }
+          let hasParams = false;
+          let hasRequiredParams = false;
+          let _skillMod = null;
+          if (skillPath && fs.existsSync(skillPath)) {
+            try {
+              delete require.cache[require.resolve(skillPath)];
+              _skillMod = require(skillPath);
+              const _paramKeys = Object.keys(_skillMod?.parameters || {});
+              hasParams = _paramKeys.length > 0;
+              hasRequiredParams = _paramKeys.some(k => _skillMod.parameters[k]?.required === true);
+            } catch (_) {}
+          }
+          // Boost score if skill has params and msg has tokens beyond just the domain keyword
+          const adjustedScore = score + (hasParams && msgTokens.size > 2 ? 0.1 : 0);
+          if (adjustedScore > bestScore) {
+            bestScore = adjustedScore;
+            best = skill;
+            best._hasRequiredParams = hasRequiredParams;
+            best._skillMod = _skillMod;
+          }
+        }
+
+        if (best && bestScore >= 0.3) {
+          // ── Required-params guard ─────────────────────────────────────────────
+          // If the best match requires parameters (e.g. navigate_history requires
+          // `query`), verify the message contains extractable content beyond the
+          // bare domain keyword. A sub-prompt like "navigate to my perplexity
+          // account" has no search content — matching navigate_history here causes
+          // the plan step to fire with no `query` arg and throw immediately.
+          // When this guard fires, fall through to LLM planning which will
+          // correctly route to browser.agent instead.
+          if (best._hasRequiredParams) {
+            const _serviceKeyword = detectedDomain.replace(/\.[^.]+$/, '').replace(/[^a-z0-9]/gi, '').toLowerCase();
+            const _actionTokens = new Set(
+              (best.sourceAction || '').toLowerCase().split(/[_\s]+/).filter(w => w.length > 2)
+            );
+            // UI/navigation words that appear in account-navigation sub-prompts but carry
+            // no search-query content (e.g. "account", "profile", "page", "login").
+            // Excluding them prevents "navigate to my perplexity account" from passing
+            // the guard via the bare word "account".
+            const _navUiWords = new Set([
+              'navigate', 'navigation', 'goto', 'open', 'visit', 'access',
+              'account', 'profile', 'page', 'site', 'website',
+              'login', 'signin', 'logout', 'signout',
+              'click', 'home', 'dashboard', 'menu', 'settings', 'setting',
+              'section', 'tab', 'panel', 'link', 'button',
+            ]);
+            // Tokens that are just the domain keyword, shared action tokens, or generic
+            // UI/navigation words carry no extractable search content
+            const _contentTokens = [...msgTokens].filter(
+              t => t !== _serviceKeyword && !_actionTokens.has(t) && !_navUiWords.has(t)
+            );
+            if (_contentTokens.length === 0) {
+              logger.info(`[Node:ParseSkill] Required-params guard: skipping "${best.name}" — message has no content tokens beyond domain/action keywords (msg: "${classifyMessage.substring(0, 60)}")`);
+              // fall through to LLM planning
+            } else {
+              logger.info(`[Node:ParseSkill] Domain+action match: "${classifyMessage.substring(0, 60)}" → skill "${best.name}" (domain=${detectedDomain}, action=${best.sourceAction}, score=${bestScore.toFixed(2)})`);
+              return _matchedState(state, best.name, false, detectedDomain, best.sourceAction);
+            }
+          } else {
+            logger.info(`[Node:ParseSkill] Domain+action match: "${classifyMessage.substring(0, 60)}" → skill "${best.name}" (domain=${detectedDomain}, action=${best.sourceAction}, score=${bestScore.toFixed(2)})`);
+            return _matchedState(state, best.name, false, detectedDomain, best.sourceAction);
+          }
+        } else if (candidates.length > 0 && bestScore === 0) {
+          // Domain matched but no action token overlap — pick highest-priority candidate
+          // (prefer skills with no params — simpler, more likely correct for vague requests)
+          // Do NOT fall back to param-requiring skills: without content tokens we cannot
+          // satisfy their required args, which would cause the same missing-param failure.
+          const simple = candidates.find(s => !s.sourceAction.includes('navigate') && !s._hasRequiredParams) || candidates[0];
+          if (simple._hasRequiredParams) {
+            logger.info(`[Node:ParseSkill] Domain match (no action overlap): skipping "${simple.name}" — skill has required params but message has no extractable content (msg: "${classifyMessage.substring(0, 60)}")`);
+            // fall through to LLM planning
+          } else {
+            logger.info(`[Node:ParseSkill] Domain match (no action overlap): "${classifyMessage.substring(0, 60)}" → skill "${simple.name}" (domain=${detectedDomain})`);
+            return _matchedState(state, simple.name, false, detectedDomain, simple.sourceAction);
+          }
+        }
+      }
+    }
+  }
+
   // ── Strategy 3: LLM semantic match ──────────────────────────────────────────
   // Only fires when intent is confirmed command_automate with high confidence AND we have an LLM backend.
   // Builds a compact skill menu (name + description) and asks the LLM for a
@@ -246,7 +374,15 @@ module.exports = async function parseSkill(state) {
       const execPath = s.execPath || s.exec_path;
       if (!execPath) return false;
       const resolved = execPath.startsWith('~/') ? require('path').join(os.homedir(), execPath.slice(2)) : execPath;
-      return fs.existsSync(resolved);
+      if (fs.existsSync(resolved)) return true;
+      // Underscore fallback: dot-notation dir in DB → underscore dir on disk
+      const _dir = require('path').basename(require('path').dirname(resolved));
+      const _uDir = _dir.replace(/\./g, '_');
+      if (_uDir !== _dir) {
+        const alt = require('path').join(require('path').dirname(require('path').dirname(resolved)), _uDir, require('path').basename(resolved));
+        return fs.existsSync(alt);
+      }
+      return false;
     });
     if (executableSkills.length === 0) {
       logger.debug(`[Node:ParseSkill] Strategy 3 skipped — all ${installedSkills.length} skill(s) have invalid exec_path (no runnable skills): "${classifyMessage.substring(0, 80)}"`);
@@ -329,11 +465,13 @@ Examples: "gcal.event|HIGH" or "null"`;
   return state;
 };
 
-function _matchedState(state, skillName, userWantsToCreate = false) {
+function _matchedState(state, skillName, userWantsToCreate = false, matchedSkillDomain = null, matchedSkillAction = null) {
   return {
     ...state,
     matchedSkillName: skillName,
     matchedSkillUserWantsToCreate: userWantsToCreate,
+    matchedSkillDomain,
+    matchedSkillAction,
     intent: {
       type: 'command_automate',
       confidence: 1.0,

@@ -147,6 +147,28 @@ module.exports = async function parseIntent(state) {
   const { mcpAdapter, message, resolvedMessage, carriedIntent, context, llmBackend, conversationHistory, activeBrowserSessionId, activeBrowserUrl } = state;
   const logger = state.logger || console;
 
+  // ── Recall plan fast-path: detect dot-syntax name in prompt → recall_plan ──
+  // Patterns: "run perplexity.history.vegan", "repeat gmail.send.weekly",
+  // "do perplexity.history.vegan again", etc.
+  // Exact name match in planCacheHelpers → skip LLM planning entirely.
+  if (state.message && typeof state.message === 'string') {
+    const _recallRe = /(?:^|\s)(?:run|repeat|redo|replay|recall|do)\s+([a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*){1,4})(?:\s|$)/i;
+    const _recallMatch = state.message.match(_recallRe);
+    if (_recallMatch) {
+      const { isValidDotName } = require('../utils/planCacheHelpers');
+      const _candidateName = _recallMatch[1].toLowerCase();
+      if (isValidDotName(_candidateName)) {
+        logger.info(`[Node:ParseIntent] recall_plan fast-path detected: "${_candidateName}"`);
+        return {
+          ...state,
+          _recallPlanName: _candidateName,
+          intent: { type: 'command_automate', confidence: 1.0, entities: [], requiresMemoryAccess: false },
+          metadata: { parser: 'recall-plan-passthrough', processingTimeMs: 0 },
+        };
+      }
+    }
+  }
+
   // ── Plan execution fast-path: skip all classification for plan:approve re-runs ─
   // When main.js re-injects a stategraph execute() with _planFile set, we skip
   // all intent classification — planExecutor handles routing from the plan file.

@@ -174,6 +174,18 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };
   }
 
+  // ── external.skill short-circuit ────────────────────────────────────────────
+  // external.skill returns a structured object (e.g. { success: true, navigatedTo: "..." }).
+  // It does NOT produce page text — content-based hollow checks must never fire on these
+  // results. If any external.skill step succeeded, treat the plan as VERIFIED.
+  const _hasExternalSkillSuccess = skillResults.some(r =>
+    r.skill === 'external.skill' && (r.success === true || r.ok === true)
+  );
+  if (_hasExternalSkillSuccess) {
+    logger.info('[Node:ReviewExecution] external.skill step succeeded — skipping hollow check (structured result, no page text)');
+    return { ...state, reviewVerdict: 'VERIFIED' };
+  }
+
   // Second pass — a patch was applied last time but re-verification still failed.
   // Don't loop: surface what we know to the user.
   if (reviewRetryCount > 0) {

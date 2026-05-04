@@ -91,6 +91,8 @@ const MULTI_GOAL_CONNECTOR_RE = /\b(and (?:also|then)|after that|also|additional
 // Patterns that reliably indicate a single intent (no multi-step):
 const SINGLE_QUESTION_RE   = /^(what|who|when|where|why|how|which|is|are|was|were|do|does|did|can|could|will|would|should|have|has|had|tell me|show me|explain|give me|find me|what'?s|who'?s|what is|what are|what was)\b/i;
 const SINGLE_MEMORY_RE     = /^(remember|my name|what'?s my|what is my|who am i|remind me|what did i|do you know my|what do you know|recall|look up my|retrieve my)\b/i;
+// Temporal/elliptical memory queries — e.g., "anything in march", "what about last week"
+const SINGLE_TEMPORAL_MEMORY_RE = /^(anything|something|what)\s+(about|in|from|during)\s+(the\s+)?(month\s+of\s+|week\s+of\s+|day\s+of\s+)?(january|february|march|april|may|june|july|august|september|october|november|december|last\s+week|last\s+month|last\s+year|yesterday|today|this\s+week|this\s+month)\b/i;
 // Conservative fast-path for short, unambiguous navigation commands.
 // Only fires when: (1) starts with a clear browse verb, (2) task remainder after site
 // name is short (≤40 chars), (3) no multi-step connectors present.
@@ -99,6 +101,14 @@ const SINGLE_MEMORY_RE     = /^(remember|my name|what'?s my|what is my|who am i|
 const SINGLE_COMMAND_RE    = /^(goto|go\s+to|navigate\s+to|visit)\s+\S+/i;
 // Multi-step connectors that REQUIRE LLM decomposition (fast-path must not fire if present)
 const MULTI_STEP_SIGNAL_RE = /\b(and then|after that|after you|followed by|then (?:also|after|open|go|send|email|text|search|find|create|navigate|check|make)|also (?:send|text|email|open|go|search|find|check)|additionally|first .{0,60} then|step 1|step one|part 1|part one)\b/i;
+
+// Action verbs that indicate the user wants to DO something (not retrieve memory)
+// These disqualify a query from temporal memory fast-path
+const ACTION_VERBS_RE = /\b(go|goto|navigate|open|visit|search|find|look\s+up|check|create|make|build|write|send|email|text|call|schedule|plan|book|reserve|download|install|run|execute|start|launch|switch|get\s+me|show\s+me|bring\s+up|pull\s+up|ask|query|summarize|compile|gather)\b/i;
+
+// Maximum length for elliptical temporal memory queries
+// Longer queries likely have additional context that needs LLM decomposition
+const ELLIPTICAL_MAX_LENGTH = 80;
 
 // ── Linear CA-chain collapse (Layer 2) ───────────────────────────────────────
 // After LLM decomposes, detect and collapse command_automate steps that form a
@@ -275,8 +285,30 @@ module.exports = async function decomposePrompt(state) {
   // ── Layer 4: single-intent fast-path ────────────────────────────────────
   // Skip the LLM call for prompts that are obviously a single intent with no
   // multi-step connectors. The LLM always collapses these to 1 sub-prompt anyway.
-  if (!MULTI_STEP_SIGNAL_RE.test(message) && (SINGLE_QUESTION_RE.test(message) || SINGLE_MEMORY_RE.test(message))) {
-    const fastIntent = classifyHeuristicIntent(message);
+  if (!MULTI_STEP_SIGNAL_RE.test(message) && (SINGLE_QUESTION_RE.test(message) || SINGLE_MEMORY_RE.test(message) || SINGLE_TEMPORAL_MEMORY_RE.test(message))) {
+    // Temporal memory queries need extra validation to avoid false positives
+    let fastIntent;
+    if (SINGLE_TEMPORAL_MEMORY_RE.test(message)) {
+      // Hardening: must be short (elliptical) AND not contain action verbs
+      const isShortEnough = message.length <= ELLIPTICAL_MAX_LENGTH;
+      const hasNoActionVerbs = !ACTION_VERBS_RE.test(message);
+      
+      if (isShortEnough && hasNoActionVerbs) {
+        fastIntent = 'memory_retrieve';
+        logger.debug(`[Node:DecomposePrompt] Temporal memory fast-path — validated (short=${isShortEnough}, noActions=${hasNoActionVerbs})`);
+      } else {
+        // Failed validation — let LLM decompose this one
+        logger.debug(`[Node:DecomposePrompt] Temporal pattern matched but failed validation (short=${isShortEnough}, noActions=${hasNoActionVerbs}) — using LLM decomposition`);
+        // Continue to LLM decomposition below (don't return here)
+        // Fall through to regular processing
+      }
+    }
+    
+    // If we determined a fast intent above, use it; otherwise use heuristic classifier
+    if (!fastIntent) {
+      fastIntent = classifyHeuristicIntent(message);
+    }
+    
     logger.debug(`[Node:DecomposePrompt] Single-intent fast-path — skipping LLM (intent=${fastIntent}): "${message.slice(0, 60)}"`);
     writeDecomposeLog({ ts: new Date().toISOString(), message, parser: 'fast-path', intent: fastIntent, subPromptCount: 1, durationMs: 0, subPrompts: [] });
     if (fastIntent && fastIntent !== 'general_knowledge') {

@@ -55,3 +55,13 @@ navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|
 | ChatGPT | `https://chat.openai.com` |
 | Perplexity | `https://www.perplexity.ai` |
 | Claude | `https://claude.ai` |
+
+## external.skill — user-installed skills
+
+When a matched skill name is in context, use `external.skill` as the ONLY step:
+
+```json
+{ "skill": "external.skill", "args": { "name": "<skill-name>", "args": { ...skill_params } } }
+```
+
+**CRITICAL:** skill parameters go inside the inner `"args"` object. NEVER spread them at the top level alongside `"name"`.

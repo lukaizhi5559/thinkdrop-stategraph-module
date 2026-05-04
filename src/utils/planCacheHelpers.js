@@ -129,6 +129,95 @@ function anchorSetsMatch(anchorsA, anchorsB) {
   return true;
 }
 
+// ── Dot-syntax plan name helpers ────────────────────────────────────────────
+
+const DOT_NAME_RE = /^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$/;
+const MAX_DOT_SEGMENTS = 5;
+
+/**
+ * Returns true if a string is a valid dot-syntax plan name.
+ * Rules: lowercase letters/digits + dots only, 2-5 segments, no spaces/dashes/underscores.
+ */
+function isValidDotName(name) {
+  if (!name || typeof name !== 'string') return false;
+  if (!DOT_NAME_RE.test(name)) return false;
+  const segments = name.split('.');
+  return segments.length >= 2 && segments.length <= MAX_DOT_SEGMENTS;
+}
+
+/**
+ * Derive a dot-syntax plan name suggestion from a plan title string.
+ * e.g. "Check Perplexity History for vegan" → "perplexity.history.vegan"
+ */
+function deriveDotName(title) {
+  const stopWords = new Set(['a','an','the','for','to','in','on','at','of','and','or','with','from','by','check','find','get','run','go']);
+  const words = (title || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length >= 3 && !stopWords.has(w))
+    .slice(0, 5);
+  if (words.length < 2) return '';
+  const candidate = words.join('.');
+  return isValidDotName(candidate) ? candidate : '';
+}
+
+/**
+ * Extract a dot-syntax plan name token from a user prompt.
+ * Matches patterns like "run perplexity.history.vegan", "repeat gmail.send.weekly", etc.
+ */
+function extractDotNameFromPrompt(prompt) {
+  // Match explicit dot-syntax token in the prompt
+  const match = (prompt || '').match(/\b([a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*){1,4})\b/);
+  if (match && isValidDotName(match[1])) return match[1];
+  return null;
+}
+
+/**
+ * Find a completed plan by its user-assigned dot-syntax name.
+ * Exact match only — returns same shape as findSimilarCompletePlan.
+ */
+function findPlanByName(planName, logger) {
+  if (!isValidDotName(planName)) return null;
+  try {
+    if (!fs.existsSync(PLANS_DIR)) return null;
+    const files = fs.readdirSync(PLANS_DIR)
+      .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
+      .sort().reverse()
+      .slice(0, 50);
+
+    for (const file of files) {
+      const planPath = path.join(PLANS_DIR, file);
+      try {
+        const content = fs.readFileSync(planPath, 'utf8');
+        const statusMatch = content.match(/^status:\s*(.+)/m);
+        if (!statusMatch || statusMatch[1].trim() !== 'complete') continue;
+        const nameMatch = content.match(/^name:\s*([^\s]+)/m);
+        if (!nameMatch || nameMatch[1].trim() !== planName) continue;
+        const jsonMatch = content.match(/^skill_plan_json:\s*'([^']+)'/m);
+        if (!jsonMatch) continue;
+        const titleMatch = content.match(/^# Plan:\s*(.+)/m);
+        const decoded = Buffer.from(jsonMatch[1], 'base64').toString('utf8');
+        const skillPlan = JSON.parse(decoded);
+        logger && logger.info(`[PlanCache] Exact name match found: ${planName} → ${file}`);
+        return {
+          planFile: planPath,
+          title: titleMatch?.[1]?.trim() || planName,
+          file,
+          similarity: 1.0,
+          skillPlan,
+          autoExecute: true,
+          anchors: new Set(),
+          planName,
+        };
+      } catch (_) { continue; }
+    }
+  } catch (err) {
+    logger && logger.warn(`[PlanCache] findPlanByName error: ${err.message}`);
+  }
+  return null;
+}
+
 // ── Disk-based plan similarity search ────────────────────────────────────────
 
 /**
@@ -142,6 +231,13 @@ function anchorSetsMatch(anchorsA, anchorsB) {
  * @returns {{ planFile, title, file, similarity, skillPlan, autoExecute, anchors } | null}
  */
 function findSimilarCompletePlan(prompt, logger) {
+  // Fast path: check for exact dot-syntax name in the prompt first
+  const _dotName = extractDotNameFromPrompt(prompt);
+  if (_dotName) {
+    const _byName = findPlanByName(_dotName, logger);
+    if (_byName) return _byName;
+  }
+
   try {
     if (!fs.existsSync(PLANS_DIR)) return null;
     const files = fs.readdirSync(PLANS_DIR)
@@ -213,6 +309,10 @@ module.exports = {
   extractEntityAnchors,
   anchorSetsMatch,
   findSimilarCompletePlan,
+  findPlanByName,
+  isValidDotName,
+  deriveDotName,
+  extractDotNameFromPrompt,
   _SESSION_CACHE,
   _sessionCacheKey,
   _sessionCacheGet,

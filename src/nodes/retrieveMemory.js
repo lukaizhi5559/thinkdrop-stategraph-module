@@ -10,6 +10,62 @@
 const { parseDateRange } = require('../utils/parseDateRange');
 
 /**
+ * Format an ISO timestamp into human-readable absolute + relative date
+ * - Absolute: "March 8, 2026 at 7:04 PM"
+ * - Relative: "(2 days ago)" or "(last Tuesday)"
+ */
+function formatTimestamp(isoTimestamp) {
+  if (!isoTimestamp) return { absolute: 'Unknown date', relative: '' };
+  
+  const date = new Date(isoTimestamp);
+  if (isNaN(date.getTime())) return { absolute: String(isoTimestamp), relative: '' };
+  
+  // Format absolute: "March 8, 2026 at 7:04 PM"
+  const absolute = date.toLocaleString('en-US', {
+    month: 'long',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  });
+  
+  // Calculate relative time
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffSec = Math.floor(diffMs / 1000);
+  const diffMin = Math.floor(diffSec / 60);
+  const diffHour = Math.floor(diffMin / 60);
+  const diffDay = Math.floor(diffHour / 24);
+  const diffWeek = Math.floor(diffDay / 7);
+  const diffMonth = Math.floor(diffDay / 30);
+  const diffYear = Math.floor(diffDay / 365);
+  
+  let relative = '';
+  if (diffSec < 60) {
+    relative = '(just now)';
+  } else if (diffMin < 60) {
+    relative = `(${diffMin} minute${diffMin > 1 ? 's' : ''} ago)`;
+  } else if (diffHour < 24) {
+    relative = `(${diffHour} hour${diffHour > 1 ? 's' : ''} ago)`;
+  } else if (diffDay < 7) {
+    // Show day name for recent dates
+    const dayName = date.toLocaleDateString('en-US', { weekday: 'long' });
+    if (diffDay === 1) relative = '(yesterday)';
+    else if (diffDay === 2) relative = `(two days ago, ${dayName})`;
+    else relative = `(${diffDay} days ago, ${dayName})`;
+  } else if (diffWeek < 4) {
+    relative = `(${diffWeek} week${diffWeek > 1 ? 's' : ''} ago)`;
+  } else if (diffMonth < 12) {
+    relative = `(${diffMonth} month${diffMonth > 1 ? 's' : ''} ago)`;
+  } else {
+    relative = `(${diffYear} year${diffYear > 1 ? 's' : ''} ago)`;
+  }
+  
+  return { absolute, relative, iso: isoTimestamp };
+}
+
+/**
  * Build a clean semantic search query from the message.
  * For short elliptical follow-ups ("what about yesterday", "anything today"),
  * strip temporal noise and use a generic activity query so the date filter
@@ -171,27 +227,35 @@ module.exports = async function retrieveMemory(state) {
           });
         })();
 
-    // Process conversation history (sort chronologically)
+    // Process conversation history with formatted timestamps
     // Preserve role:'system' for system-injected messages (e.g. skill deletions)
     // so downstream nodes (answer, planSkills) can surface them at highest priority.
     const conversationHistory = primaryMessages
-      .map(msg => ({
-        role: msg.sender === 'user' ? 'user' : (msg.sender === 'system' ? 'system' : 'assistant'),
-        content: msg.text,
-        timestamp: msg.timestamp
-      }))
+      .map(msg => {
+        const formattedDate = formatTimestamp(msg.timestamp);
+        return {
+          role: msg.sender === 'user' ? 'user' : (msg.sender === 'system' ? 'system' : 'assistant'),
+          content: msg.text,
+          timestamp: msg.timestamp,
+          formattedDate
+        };
+      })
       .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
       .slice(-30); // keep last 30 for date-range queries (more history needed)
 
-    // Process memories
-    const memories = (memoriesData.results || []).map(mem => ({
-      id: mem.id,
-      text: mem.text,
-      similarity: mem.similarity,
-      entities: mem.entities || [],
-      metadata: mem.metadata || {},
-      created_at: mem.created_at
-    }));
+    // Process memories with formatted timestamps
+    const memories = (memoriesData.results || []).map(mem => {
+      const formattedDate = formatTimestamp(mem.created_at);
+      return {
+        id: mem.id,
+        text: mem.text,
+        similarity: mem.similarity,
+        entities: mem.entities || [],
+        metadata: mem.metadata || {},
+        created_at: mem.created_at,
+        formattedDate
+      };
+    });
 
     logger.debug(`[Node:RetrieveMemory] Loaded ${conversationHistory.length} messages, ${memories.length} memories`);
 

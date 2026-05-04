@@ -314,15 +314,23 @@ class StateGraphBuilder {
             const _os = require('os');
             const _path = require('path');
             const _dotName = state.matchedSkillName;
-            const _skillDir = _path.join(_os.homedir(), '.thinkdrop', 'skills', _dotName);
-            const _skillExec = _path.join(_skillDir, 'index.cjs');
-            const _skillMd   = _path.join(_skillDir, 'skill.md');
-            const _apiJson   = _path.join(_skillDir, 'api.json');
-            const _cliJson   = _path.join(_skillDir, 'cli.json');
-            if (_fs.existsSync(_skillExec) || _fs.existsSync(_skillMd) || _fs.existsSync(_apiJson) || _fs.existsSync(_cliJson)) {
-              logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is installed — skipping to resolveUserContext`);
-              return 'resolveUserContext';
+            const _underscoreName = _dotName.replace(/\./g, '_');
+            // Check both dot-notation and underscore directories
+            const _candidates = [_dotName, _underscoreName].filter((v, i, a) => a.indexOf(v) === i);
+            let _found = false;
+            for (const _dirName of _candidates) {
+              const _skillDir = _path.join(_os.homedir(), '.thinkdrop', 'skills', _dirName);
+              const _skillExec = _path.join(_skillDir, 'index.cjs');
+              const _skillMd   = _path.join(_skillDir, 'skill.md');
+              const _apiJson   = _path.join(_skillDir, 'api.json');
+              const _cliJson   = _path.join(_skillDir, 'cli.json');
+              if (_fs.existsSync(_skillExec) || _fs.existsSync(_skillMd) || _fs.existsSync(_apiJson) || _fs.existsSync(_cliJson)) {
+                logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is installed (dir=${_dirName}) — skipping to resolveUserContext`);
+                _found = true;
+                break;
+              }
             }
+            if (_found) return 'resolveUserContext';
             // Stub-only: no index.cjs on disk — fall through to resolveUserContext which handles it
             logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub — routing to resolveUserContext`);
             state.matchedSkillName = null;
