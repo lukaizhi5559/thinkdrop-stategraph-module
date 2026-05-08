@@ -192,6 +192,76 @@ module.exports = async function gatherPlanContext(state) {
     return { ...state, planGatheringComplete: true };
   }
 
+  // ── Check for references to recently created files ────────────────────────────
+  const refersToCreation = /\b(newly created|just created|that file|those files|it|them|the directory|the folder|(?:first|second|third|last|latest|earlier|previous)(?:\s+created)?)\b/i.test(userMsg);
+  
+  if (refersToCreation && state.sessionFileCreations?.length > 0) {
+    // Filter to recent creations (within 30 minutes)
+    const now = Date.now();
+    const recentCreations = state.sessionFileCreations.filter(op => {
+      const ageMs = now - new Date(op.timestamp).getTime();
+      return ageMs < 30 * 60 * 1000; // 30 minutes
+    });
+    
+    if (recentCreations.length === 1) {
+      // Single recent creation - use it directly
+      const op = recentCreations[0];
+      logger.info(`[Node:GatherPlanContext] Resolved "${userMsg.slice(0, 40)}..." to single creation: ${op.description}`);
+      const enriched = `${resolvedMessage || message || ''}\n\n(Referenced file: ${op.primaryPath})`;
+      return {
+        ...state,
+        planGatheringComplete: true,
+        planGatheringSkipped: true,
+        resolvedMessage: enriched,
+        _creationContext: op
+      };
+    } else if (recentCreations.length > 1) {
+      // Multiple creations - check for ordinal references
+      const ordinalMatch = userMsg.match(/\b(first|second|third|last|latest|earlier|previous)\b/i);
+      
+      if (ordinalMatch) {
+        const ordinal = ordinalMatch[1].toLowerCase();
+        let selectedOp = null;
+        
+        if ((ordinal === 'last' || ordinal === 'latest') && recentCreations.length > 0) {
+          selectedOp = recentCreations[recentCreations.length - 1];
+        } else if (ordinal === 'first' && recentCreations.length > 0) {
+          selectedOp = recentCreations[0];
+        } else if (ordinal === 'second' && recentCreations.length >= 2) {
+          selectedOp = recentCreations[1];
+        } else if (ordinal === 'third' && recentCreations.length >= 3) {
+          selectedOp = recentCreations[2];
+        } else if ((ordinal === 'earlier' || ordinal === 'previous') && recentCreations.length >= 2) {
+          selectedOp = recentCreations[recentCreations.length - 2];
+        }
+        
+        if (selectedOp) {
+          logger.info(`[Node:GatherPlanContext] Resolved "${ordinal}" to: ${selectedOp.description}`);
+          const enriched = `${resolvedMessage || message || ''}\n\n(Referenced: ${selectedOp.primaryPath})`;
+          return {
+            ...state,
+            planGatheringComplete: true,
+            planGatheringSkipped: true,
+            resolvedMessage: enriched,
+            _creationContext: selectedOp
+          };
+        }
+      }
+      
+      // No ordinal match - enrich with all recent creations for context
+      logger.info(`[Node:GatherPlanContext] Multiple recent creations (${recentCreations.length}), enriching context`);
+      const creationList = recentCreations.map((op, i) => `${i + 1}. ${op.description}`).join('\n');
+      const enriched = `${resolvedMessage || message || ''}\n\n(Recent file creations:\n${creationList})`;
+      return {
+        ...state,
+        planGatheringComplete: true,
+        planGatheringSkipped: true,
+        resolvedMessage: enriched,
+        _creationContext: recentCreations
+      };
+    }
+  }
+
   // ── LLM clarity check ─────────────────────────────────────────────────────────
   if (progressCallback) {
     progressCallback({ type: 'thinking', message: 'Checking task details…' });

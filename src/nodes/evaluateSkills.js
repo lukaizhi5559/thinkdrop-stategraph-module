@@ -331,7 +331,14 @@ Output ONLY valid JSON.`;
 
   // FIX: store context rule + trigger replan
   if (verdict.verdict === 'FIX' && verdict.contextKey && verdict.ruleText) {
-    if (mcpAdapter) {
+    // Gate: never write a context rule when the failure was a hollow-detection artifact.
+    // The _hollowResult flag is set by reviewExecution when it falsely detects hollow
+    // (e.g., browser.agent succeeded but page snapshot was unavailable). Writing a rule
+    // based on this artifact poisons the context for future runs.
+    const isHollowArtifact = state.failedStep?._hollowResult === true;
+    if (isHollowArtifact) {
+      logger.info(`[Node:EvaluateSkills] Skipping context rule write — failure was a hollow-detection artifact (not a real execution failure)`);
+    } else if (mcpAdapter) {
       // Collect ALL hostnames touched during this run (planned + actual redirects).
       // Write the rule under every hostname so planSkills finds it regardless of
       // which domain it searches — this is the dynamic alias solution.

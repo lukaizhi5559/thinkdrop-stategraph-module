@@ -186,6 +186,19 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'VERIFIED' };
   }
 
+  // ── browser.agent short-circuit ───────────────────────────────────────────
+  // If browser.agent reports success with action-completion signals in the result,
+  // trust it without requiring page snapshot verification. This prevents false-hollow
+  // detection when the agent completed its task but the page snapshot is unavailable.
+  const _hasBrowserAgentSuccess = skillResults.some(r =>
+    r.skill === 'browser.agent' && r.ok !== false &&
+    /\b(sent|submitted|saved|completed|done|confirmed|created|updated|deleted|navigated|opened|filled|clicked|sent successfully|message sent|email sent|task completed)\b/i.test(String(r.result || ''))
+  );
+  if (_hasBrowserAgentSuccess) {
+    logger.info('[Node:ReviewExecution] browser.agent reported action-completion — skipping hollow check (result-based verification)');
+    return { ...state, reviewVerdict: 'VERIFIED' };
+  }
+
   // Second pass — a patch was applied last time but re-verification still failed.
   // Don't loop: surface what we know to the user.
   if (reviewRetryCount > 0) {
@@ -230,9 +243,14 @@ module.exports = async function reviewExecution(state) {
 
     // LLM + snapshot — primary judge when backend is available
     if (mcpAdapter && llmBackend) {
-      // Derive sessionId from the last browser.act step
+      // Derive sessionId from the last browser.act step, or from browser.agent as fallback
       const browserSessionId = state.activeBrowserSessionId
-        || skillResults.slice().reverse().find(r => r.skill === 'browser.act' && r.args?.sessionId)?.args?.sessionId;
+        || skillResults.slice().reverse().find(r => r.skill === 'browser.act' && r.args?.sessionId)?.args?.sessionId
+        || (() => {
+          // Fallback: browser.agent steps don't have sessionId in args, but we can derive from agentId
+          const r = skillResults.slice().reverse().find(s => s.skill === 'browser.agent' && s.args?.agentId);
+          return r ? `${r.args.agentId.replace('.agent', '')}_agent` : null;
+        })();
 
       // Capture current page text for fulfillment judgment.
       // getPageText returns visible page content (vs. ARIA tree from scanCurrentPage which

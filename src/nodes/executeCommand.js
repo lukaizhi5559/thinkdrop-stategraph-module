@@ -690,6 +690,44 @@ module.exports = async function executeCommand(state) {
     const lastBrowserStep = [...skillResults].reverse().find(r => r.skill === 'browser.act' && r.ok);
     const activeBrowserSessionId = lastBrowserStep?.args?.sessionId || state.activeBrowserSessionId || null;
 
+    // Collect sessionFileCreations from skill results (for "newly created file" references)
+    let sessionFileCreations = skillResults
+      .filter(r => r.ok && r.sessionFileCreations?.length > 0)
+      .flatMap(r => r.sessionFileCreations);
+    
+    // Also generate sessionFileCreations from shell skills that create files
+    // This handles synthesize skills and other shell-based file creators
+    const shellCreatedFiles = [];
+    skillResults.forEach((r, idx) => {
+      if (r.skill === 'shell.run' && r.ok && r.args?.cmd === 'bash') {
+        const argv = r.args?.argv || [];
+        const script = argv[1] || argv.find(a => typeof a === 'string' && a !== '-c') || '';
+        const writeMatch = script.match(/(?:echo\s[^>]*>+|printf\s[^>]*>+|cat\s*>+|tee\s+|cp\s+\S+\s+|mv\s+\S+\s+)\s*['"]?((?:~|\/)[^\s'"]+\.[a-zA-Z0-9]+)['"]?/);
+        if (writeMatch && writeMatch[1]) {
+          const rawPath = writeMatch[1];
+          const absPath = rawPath.startsWith('~/') ? rawPath.replace('~', homeDir) : rawPath;
+          shellCreatedFiles.push({
+            timestamp: new Date().toISOString(),
+            operationId: `shell_${idx}_${Date.now()}`,
+            type: 'single_file',
+            description: `Created file via shell command`,
+            primaryPath: absPath,
+            allPaths: [absPath],
+            fileCount: 1
+          });
+        }
+      }
+    });
+    
+    // Merge shell-created files with skill-reported creations
+    if (shellCreatedFiles.length > 0) {
+      sessionFileCreations = [...sessionFileCreations, ...shellCreatedFiles];
+    }
+    
+    if (sessionFileCreations.length > 0) {
+      logger.info(`[Node:ExecuteCommand] Collected ${sessionFileCreations.length} file creation operation(s) from skill results`);
+    }
+
     // Stream the answer to the UI — answer node is bypassed for command_automate,
     // so we push the execution result here via streamCallback for the Results window.
     // Guard: skip if answer node already streamed tokens (_answerStreamed=true) to
@@ -706,7 +744,8 @@ module.exports = async function executeCommand(state) {
       failedStep: null,
       commandOutput: stepSummaries,
       activeBrowserSessionId,
-      answer
+      answer,
+      sessionFileCreations
     };
   }
 
@@ -4369,9 +4408,13 @@ module.exports = async function executeCommand(state) {
     }
 
     // Track the active browser sessionId and URL for follow-up tasks
-    const activeBrowserSessionId = skill === 'browser.act' && stepResult.ok && args.sessionId
-      ? args.sessionId
-      : state.activeBrowserSessionId || null;
+    // Extend tracking to browser.agent steps: derive sessionId from agentId
+    const activeBrowserSessionId =
+      (skill === 'browser.act' && stepResult.ok && args.sessionId)
+        ? args.sessionId
+      : (skill === 'browser.agent' && stepResult.ok && args.agentId)
+        ? `${args.agentId.replace('.agent', '')}_agent`
+        : state.activeBrowserSessionId || null;
     const activeBrowserUrl = skill === 'browser.act' && stepResult.ok && raw.url
       ? raw.url
       : state.activeBrowserUrl || null;

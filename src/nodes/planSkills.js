@@ -560,7 +560,7 @@ module.exports = async function planSkills(state) {
     };
   }
 
-  const os = process.platform;
+  const _osPlatform = process.platform;
 
   // ── Creator planning context (injected by creatorPlanning node) ────────────
   // When creator.agent ran before us, inject its structured plan.md + agents.md
@@ -803,7 +803,14 @@ Apply this correction directly to the previous plan intent. Keep the same overal
     /^(text|send|email|message|forward|share|ping|tell|notify)/i.test(userMessage.trim()) ||
     /\b(text|sms|send.*message|email.*me|message.*me)\b/i.test(userMessage)
   );
-  if (isMessagingTask && priorSynthesizedContent) {
+  // Guard: when the user explicitly states what to send ("saying hello", "with message X",
+  // "body: ...", or quoted text), skip the prior-content injection — the user's own words
+  // are the body, not whatever the previous task produced.
+  const _hasExplicitBody = /\b(say|saying|with\s+message|body\s*:|message\s*:|tell\s+(?:them|him|her|me)\s+(?:that\s+)?")/i.test(userMessage)
+    || /"[^"]{2,}"/.test(userMessage)   // quoted content e.g. send ... "hello there"
+    || /'[^']{2,}'/.test(userMessage);  // single-quoted content
+
+  if (isMessagingTask && priorSynthesizedContent && !_hasExplicitBody) {
     // Sanitize: if the prior content is a raw JSON fallback (from the synthesis apology
     // path), extract a human-readable summary from the calendar/API items so we don't
     // inject broken JSON as a message body.
@@ -1257,7 +1264,7 @@ Task: "${userMessage}"`;
             const noteParts = [];
             if (nodeSkills.length > 0) {
               const lines = nodeSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
-              noteParts.push(`INSTALLED SKILLS (use external.skill ONLY when the skill's purpose DIRECTLY matches the task — do NOT use as a fallback for vaguely related tasks):\n${lines}\n  Usage: { "skill": "external.skill", "args": { "name": "<skill-name>", "args": { ...skill_params } } }\n  CRITICAL: skill parameters MUST be nested inside the inner "args" object — NEVER spread them at the top level alongside "name".\n  RULE: If the task cannot be fulfilled by one of these skills exactly, use shell.run or needs_skill instead. Never pick an installed skill just because it seems related.`);
+              noteParts.push(`INSTALLED SKILLS — prefer these over agents to save tokens:\n${lines}\n\nHYBRID PLANNING RULES:\n1. PREFER external.skill for any sub-task a skill covers exactly — it runs deterministically and costs zero LLM turns.\n2. For sub-tasks NO skill covers, use browser.agent (OAuth/web services), cli.agent (CLI services), or shell.run (local ops).\n3. You MAY mix external.skill and browser.agent/cli.agent/shell.run steps in the SAME plan.\n4. A skill is a match ONLY if its name/description indicates it performs EXACTLY that atomic action — NOT just because it shares a domain or keyword with the task.\n   - WRONG: matching "mail_google_com_more_email_options" for "send email" because both contain "email"\n   - RIGHT: matching "mail_google_com_compose" only if the task is literally just clicking Compose\n5. When a task requires multiple browser steps (navigate + fill + click + send), NO single atomic skill covers it → use browser.agent for that sub-task.\n\nExample — "check inbox then send a reply to the first email":\n  Step 1: external.skill "mail_google_com_inbox_4157_unread" (atomic: opens inbox)\n  Step 2: browser.agent { action: "run", agentId: "gmail.agent", task: "reply to the first unread email with: ..." }\n\nUsage: { "skill": "external.skill", "args": { "name": "<skill-name>", "args": { ...skill_params } } }\nCRITICAL: skill parameters MUST be nested inside the inner "args" object — NEVER spread them at the top level alongside "name".`);
             }
             if (shellSkills.length > 0) {
               const lines = shellSkills.map(s => `  - ${s.name}: ${s.description || 'no description'}`).join('\n');
@@ -1336,10 +1343,42 @@ Task: "${userMessage}"`;
       }
       const _hasParams = Object.keys(_skillParams).length > 0;
 
+      // Read skill.json for agent_id (most reliable sessionId source) and source_url
+      let _skillJsonAgentId = null;
+      let _skillSourceUrl = null;
+      const _skillJsonPath = path.join(SKILLS_DIR, _skillDirName, 'skill.json');
+      if (fs.existsSync(_skillJsonPath)) {
+        try {
+          const _skillMeta = JSON.parse(fs.readFileSync(_skillJsonPath, 'utf8'));
+          // goal_tied skills are sub-step atomics meant to be used inside browser.agent,
+          // not as standalone plan steps. Skip fast-path and fall through to LLM planning
+          // which will route the task to browser.agent instead.
+          if (_skillMeta.goal_tied === true) {
+            logger.info(`[Node:PlanSkills] Domain fast-path: skipping goal_tied skill "${_skillName}" — deferring to browser.agent via LLM planning`);
+            throw new Error(`goal_tied skill — skip fast-path`);
+          }
+          if (_skillMeta.agent_id) _skillJsonAgentId = _skillMeta.agent_id;
+          if (_skillMeta.source_url) _skillSourceUrl = _skillMeta.source_url;
+        } catch (_sjErr) {
+          if (_sjErr.message === 'goal_tied skill — skip fast-path') throw _sjErr;
+          logger.debug(`[Node:PlanSkills] Domain fast-path: could not read skill.json: ${_sjErr.message}`);
+        }
+      }
+
+      // Resolve sessionId: prefer skill.json agent_id over domain-derived name.
+      // mail.google.com → agentBase="mail" → mail_agent is WRONG; agent_id="gmail" → gmail_agent is correct.
+      const _resolvedAgentBase = _skillJsonAgentId
+        ? _skillJsonAgentId.replace(/[^a-z0-9]/gi, '_').toLowerCase()
+        : _agentBase;
+      const _resolvedSessionId = `${_resolvedAgentBase}_agent`;
+      const _resolvedAgentId = `${_resolvedAgentBase}.agent`;
+
       // Try to read agent descriptor for start_url
-      let _startUrl = null;
-      const _agentFile = path.join(AGENTS_DIR, `${_agentId}.md`);
-      if (fs.existsSync(_agentFile)) {
+      let _startUrl = _skillSourceUrl || null; // prefer exact source URL from skill.json
+      const _agentFileResolved = path.join(AGENTS_DIR, `${_resolvedAgentId}.md`);
+      const _agentFileFallback = path.join(AGENTS_DIR, `${_agentId}.md`);
+      const _agentFile = fs.existsSync(_agentFileResolved) ? _agentFileResolved : _agentFileFallback;
+      if (!_startUrl && fs.existsSync(_agentFile)) {
         try {
           const _agentMd = fs.readFileSync(_agentFile, 'utf8');
           const _startUrlMatch = _agentMd.match(/start_url\s*:\s*([^\s\n]+)/i);
@@ -1359,7 +1398,7 @@ Task: "${userMessage}"`;
       if (_startUrl) {
         _fastPlan.push({
           skill: 'browser.act',
-          args: { action: 'navigate', url: _startUrl, sessionId: _sessionId },
+          args: { action: 'navigate', url: _startUrl, sessionId: _resolvedSessionId },
           description: `Open ${_domain} in persistent session`,
         });
       }
@@ -1398,15 +1437,32 @@ Task: "${userMessage}"`;
       // external.skill.run() destructures: const { name, args: skillArgs } = args
       // so skill params must be nested under args.args, not spread at the top level.
       const _skillCallArgs = Object.keys(_extractedArgs).length > 0
-        ? { ..._extractedArgs, sessionId: _sessionId }
-        : (_sessionId ? { sessionId: _sessionId } : undefined);
+        ? { ..._extractedArgs, sessionId: _resolvedSessionId }
+        : (_resolvedSessionId ? { sessionId: _resolvedSessionId } : undefined);
       _fastPlan.push({
         skill: 'external.skill',
         args: { name: _skillName, ...(  _skillCallArgs ? { args: _skillCallArgs } : {}) },
         description: `Run skill: ${_skillName}${Object.keys(_extractedArgs).length > 0 ? ' (' + Object.values(_extractedArgs).join(', ') + ')' : ''}`,
       });
 
-      logger.info(`[Node:PlanSkills] Domain skill fast-path: ${_agentId} → skill:${_skillName} (${_fastPlan.length} step(s), sessionId=${_sessionId})`);
+      logger.info(`[Node:PlanSkills] Domain skill fast-path: ${_resolvedAgentId} → skill:${_skillName} (${_fastPlan.length} step(s), sessionId=${_resolvedSessionId})`);
+
+      // Write a plan .md file so executeCommand can mark it complete and
+      // the Save Plan card can reference a real file path.
+      let _fastPlanFile = null;
+      try {
+        const _ts = Date.now();
+        const _planId = `plan-${_ts}`;
+        _fastPlanFile = path.join(PLANS_DIR, `${_planId}.md`);
+        const _mdContent = serializeSkillPlanToMd(_fastPlan, state.message || userMessage, _planId, state.context?.sessionId);
+        fs.mkdirSync(PLANS_DIR, { recursive: true });
+        fs.writeFileSync(_fastPlanFile, _mdContent, 'utf8');
+        logger.info(`[Node:PlanSkills] Domain fast-path: plan written to ${_fastPlanFile}`);
+      } catch (_writeErr) {
+        logger.warn(`[Node:PlanSkills] Domain fast-path: could not write plan file: ${_writeErr.message}`);
+        _fastPlanFile = null;
+      }
+
       if (progressCallback) progressCallback({
         type: 'plan_ready',
         steps: _fastPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })),
@@ -1421,6 +1477,7 @@ Task: "${userMessage}"`;
         planError: null,
         recoveryContext: null,
         domainSkillFastPath: true,
+        _skillPlanFile: _fastPlanFile,
       };
     } catch (_fastPathErr) {
       logger.warn(`[Node:PlanSkills] Domain skill fast-path failed (${_fastPathErr.message}) — falling through to LLM planning`);
@@ -1557,7 +1614,13 @@ Task: "${userMessage}"`;
               _registeredAgentServiceMap[_svc] = _a.id;
               const _idBase = _a.id.replace(/\.agent$/, '').toLowerCase();
               if (_idBase !== _svc) _registeredAgentServiceMap[_idBase] = _a.id;
+              // Also key underscore-normalized variants (e.g. "gmail_agent" → "gmail")
+              const _idBaseUnderscore = _idBase.replace(/[^a-z0-9]/g, '_');
+              if (_idBaseUnderscore !== _idBase) _registeredAgentServiceMap[_idBaseUnderscore] = _a.id;
+              const _svcUnderscore = _svc.replace(/[^a-z0-9]/g, '_');
+              if (_svcUnderscore !== _svc) _registeredAgentServiceMap[_svcUnderscore] = _a.id;
             }
+            logger.debug(`[Node:PlanSkills] Registered agent session map: ${JSON.stringify(Object.keys(_registeredAgentServiceMap))}`);
           }
 
           // ── Discovery note: guide LLM to plan build_agent when service has no agent ──
@@ -2798,11 +2861,24 @@ CRITICAL rules for skill.md:
         const isSingleSession = sessionIdsUsed.size === 1;
         const [onlySession] = [...sessionIdsUsed];
         if (isSingleSession && onlySession && onlySession !== 'browser') {
-          skillPlan = skillPlan.map(step => {
-            if (step.skill !== 'browser.act') return step;
-            return { ...step, args: { ...step.args, sessionId: 'browser' } };
-          });
-          logger.info(`[Node:PlanSkills] Normalized sessionId "${onlySession}" → "browser" (canonical single-session)`);
+          // Skip normalization if this sessionId belongs to a registered agent —
+          // their auth cookies live in browser-profiles/<agentId>_agent/ and rewriting
+          // to 'browser' opens a fresh unauthenticated window instead.
+          const _isRegisteredAgentSession = !!_registeredAgentServiceMap[onlySession.toLowerCase()];
+          // Filesystem fallback: also protect sessions that have a persisted browser-profiles/<session>_agent dir
+          // (e.g. gmail_agent) even when not registered in the agents DuckDB table.
+          const BROWSER_PROFILES_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-profiles');
+          const _profileDirName = onlySession.endsWith('_agent') ? onlySession : `${onlySession}_agent`;
+          const _hasPersistedProfile = fs.existsSync(path.join(BROWSER_PROFILES_DIR, _profileDirName));
+          if (_isRegisteredAgentSession || _hasPersistedProfile) {
+            logger.info(`[Node:PlanSkills] Skipping sessionId normalization — "${onlySession}" is a ${_isRegisteredAgentSession ? 'registered agent session' : 'persisted browser profile'} (preserving auth)`);
+          } else {
+            skillPlan = skillPlan.map(step => {
+              if (step.skill !== 'browser.act') return step;
+              return { ...step, args: { ...step.args, sessionId: 'browser' } };
+            });
+            logger.info(`[Node:PlanSkills] Normalized sessionId "${onlySession}" → "browser" (canonical single-session)`);
+          }
         }
       }
     }

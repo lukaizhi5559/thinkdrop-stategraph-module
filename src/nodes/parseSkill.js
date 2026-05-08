@@ -88,6 +88,48 @@ module.exports = async function parseSkill(state) {
     return state;
   }
 
+  // ── Merge filesystem skill dirs as canonical source of truth ──────────────────
+  // User-memory DB names may diverge from actual directory names on disk (truncation,
+  // prefix differences). Read ~/.thinkdrop/skills/ directly and add any dir that has
+  // an index.cjs but isn't already in the DB list so substring rescue always hits
+  // the exact on-disk name.
+  {
+    const _fsModule = require('fs');
+    const _pathModule = require('path');
+    const _osModule = require('os');
+    const SKILLS_BASE = _pathModule.join(_osModule.homedir(), '.thinkdrop', 'skills');
+    try {
+      const _fsDirs = _fsModule.readdirSync(SKILLS_BASE).filter(d =>
+        _fsModule.existsSync(_pathModule.join(SKILLS_BASE, d, 'index.cjs'))
+      );
+      const _dbNames = new Set(installedSkills.map(s => s.name));
+      let _fsAdded = 0;
+      for (const dirName of _fsDirs) {
+        if (!_dbNames.has(dirName)) {
+          // Read skill.json for metadata if available
+          let _fsMeta = { name: dirName, description: dirName.replace(/_/g, ' '), sourceDomain: null, sourceAction: null };
+          const _skillJsonPath = _pathModule.join(SKILLS_BASE, dirName, 'skill.json');
+          if (_fsModule.existsSync(_skillJsonPath)) {
+            try {
+              const _sj = JSON.parse(_fsModule.readFileSync(_skillJsonPath, 'utf8'));
+              _fsMeta.sourceDomain = _sj.source_domain || _sj.agent_id?.replace('.agent', '') || null;
+              _fsMeta.sourceAction = _sj.source_action || null;
+              if (_sj.description) _fsMeta.description = _sj.description;
+              _fsMeta.goalTied = _sj.goal_tied || false;
+            } catch (_) {}
+          }
+          installedSkills.push(_fsMeta);
+          _fsAdded++;
+        }
+      }
+      if (_fsAdded > 0) {
+        logger.debug(`[Node:ParseSkill] Merged ${_fsAdded} filesystem skill dir(s) not in DB into candidate list`);
+      }
+    } catch (_fsErr) {
+      logger.debug(`[Node:ParseSkill] Could not read skills dir for fs merge: ${_fsErr.message}`);
+    }
+  }
+
   const msgLower = classifyMessage.toLowerCase();
 
   for (const skill of installedSkills) {
@@ -124,28 +166,7 @@ module.exports = async function parseSkill(state) {
     }
   }
 
-  // ── Strategy 2.5: capability-keyword match ───────────────────────────────────
-  // Catches "send me a text", "send an email", etc. when an installed skill covers
-  // that capability. parseIntent runs BEFORE parseSkill in the pipeline — gating on
-  // command_automate with high confidence (>= 0.75) ensures borderline DistilBERT
-  // guesses don't unlock skill execution. Hard overrides emit 0.97-0.99; confident
-  // DistilBERT emits 0.85+. Uncertain path (< 0.75) skips to no-match passthrough.
   const intentConf = state.intent?.confidence ?? 0;
-  if (state.intent?.type === 'command_automate' && intentConf >= 0.75) {
-    const CAPABILITY_PATTERNS = [
-      { keywords: /\b(send|text|sms|message)\b.*\b(text|sms|message)\b|\b(send|text)\b.*\b\d{10,11}\b|\btext (me|him|her|them|us)\b|\btext (this|that|it) to (me|him|her|them|us|\d{7,})\b/i, capability: 'sms' },
-      { keywords: /\b(send|compose|write)\b.*\b(email|mail)\b/i,                                                                capability: 'email' },
-    ];
-    for (const pattern of CAPABILITY_PATTERNS) {
-      if (pattern.keywords.test(classifyMessage)) {
-        const capSkill = installedSkills.find(s => s.name.toLowerCase().includes(pattern.capability));
-        if (capSkill) {
-          logger.info(`[Node:ParseSkill] Capability-keyword match: "${classifyMessage.substring(0,60)}" → skill "${capSkill.name}"`);
-          return _matchedState(state, capSkill.name);
-        }
-      }
-    }
-  }
 
   // ── Strategy 2.7: description-keyword overlap match ─────────────────────────
   // Deterministic fallback before the LLM: extract meaningful capability words
@@ -230,7 +251,9 @@ module.exports = async function parseSkill(state) {
   // against the message words.
   // e.g. "goto history on perplexity" → source_domain=perplexity.ai, source_action=history → HIGH match
   {
-    const domainSkills = installedSkills.filter(s => s.sourceDomain && s.sourceAction);
+    // Exclude goal_tied skills — sub-step atomics must not be matched as standalone tasks.
+    // They are surfaced internally by browser.agent after it reads the agent context.
+    const domainSkills = installedSkills.filter(s => s.sourceDomain && s.sourceAction && !s.goalTied);
     if (domainSkills.length > 0 && !userWantsToCreate) {
       // Build a set of unique domains present in installed skills
       const uniqueDomains = [...new Set(domainSkills.map(s => s.sourceDomain))];
@@ -334,18 +357,9 @@ module.exports = async function parseSkill(state) {
             return _matchedState(state, best.name, false, detectedDomain, best.sourceAction);
           }
         } else if (candidates.length > 0 && bestScore === 0) {
-          // Domain matched but no action token overlap — pick highest-priority candidate
-          // (prefer skills with no params — simpler, more likely correct for vague requests)
-          // Do NOT fall back to param-requiring skills: without content tokens we cannot
-          // satisfy their required args, which would cause the same missing-param failure.
-          const simple = candidates.find(s => !s.sourceAction.includes('navigate') && !s._hasRequiredParams) || candidates[0];
-          if (simple._hasRequiredParams) {
-            logger.info(`[Node:ParseSkill] Domain match (no action overlap): skipping "${simple.name}" — skill has required params but message has no extractable content (msg: "${classifyMessage.substring(0, 60)}")`);
-            // fall through to LLM planning
-          } else {
-            logger.info(`[Node:ParseSkill] Domain match (no action overlap): "${classifyMessage.substring(0, 60)}" → skill "${simple.name}" (domain=${detectedDomain})`);
-            return _matchedState(state, simple.name, false, detectedDomain, simple.sourceAction);
-          }
+          // Domain matched but zero action-token overlap — no evidence to pick any skill.
+          // Fall through to Strategy 3 (LLM semantic) or planSkills + browser.agent.
+          logger.debug(`[Node:ParseSkill] Domain match (no action overlap): skipping all ${candidates.length} candidate(s) — zero score, falling through to LLM planning (msg: "${classifyMessage.substring(0, 60)}")`);
         }
       }
     }
@@ -392,7 +406,11 @@ module.exports = async function parseSkill(state) {
 
   // Only attempt if at least some skills have descriptions — otherwise the LLM
   // has nothing useful to compare against.
-  let skillsWithDesc = installedSkills.filter(s => s.description || s.summary);
+  // Exclude goal_tied skills — they are sub-step atomics recorded by explore.agent,
+  // intended to be invoked internally by browser.agent, not matched as standalone tasks.
+  // Semantic match on these causes a domain fast-path to fire a broken single-step plan
+  // instead of delegating the full task to browser.agent.
+  let skillsWithDesc = installedSkills.filter(s => (s.description || s.summary) && !s.goalTied);
   if (skillsWithDesc.length === 0) {
     logger.debug(`[Node:ParseSkill] No skill match (no descriptions for semantic match): "${classifyMessage.substring(0, 80)}"`);
     return state;
@@ -447,10 +465,58 @@ Examples: "gcal.event|HIGH" or "null"`;
       logger.debug(`[Node:ParseSkill] Semantic LLM returned confidence "${confidence}" — skipping (only HIGH accepted)`);
     } else if (candidate && candidate !== 'null' && candidate !== 'none' && candidate !== '') {
       // Verify the returned name is actually an ALLOWED candidate (not filtered out by recurring guard)
-      const confirmed = skillsWithDesc.find(s => s.name.toLowerCase() === candidate);
+      let confirmed = skillsWithDesc.find(s => s.name.toLowerCase() === candidate);
+      if (!confirmed) {
+        // Substring rescue: LLM wrapped the skill name in prose instead of bare format.
+        // Scan the entire raw response for any installed skill name appearing verbatim.
+        // Prefer the LONGEST matching name — shorter names are often prefixes of more
+        // specific ones (e.g. "mail_google_com_settings" ⊂ "mail_google_com_gmail_settings_general_l_...").
+        const rawLower = rawTrimmed.toLowerCase();
+        
+        // Guard 1: Check for explicit rejection patterns (LLM said no match)
+        const rejectionPatterns = [
+          /\bno\s+match\b/, /\bnone\b/, /\bnull\b/, /\bdoesn'?t\s+match\b/,
+          /\bnot\s+(?:a\s+)?match\b/, /\bavailable\s+skills\s+are\b/,
+          /\bno\s+skill\s+(?:for|matches)\b/
+        ];
+        const hasRejection = rejectionPatterns.some(p => p.test(rawLower));
+        
+        // Guard 2: Check position - skill name should be early or response short
+        // Find the earliest skill name match
+        const skillPositions = skillsWithDesc.map(s => ({
+          skill: s,
+          position: rawLower.indexOf(s.name.toLowerCase())
+        })).filter(sp => sp.position >= 0);
+        
+        const earliestSkill = skillPositions.sort((a, b) => a.position - b.position)[0];
+        const earliestPosition = earliestSkill ? earliestSkill.position : -1;
+        const isEarlyPosition = earliestPosition >= 0 && earliestPosition < 30;
+        const isShortResponse = rawTrimmed.length < 80;
+        
+        // Guard 3: Check for contradiction context before the earliest skill name
+        let hasContradiction = false;
+        if (earliestPosition > 20) {
+          const beforeSkill = rawLower.substring(earliestPosition - 20, earliestPosition);
+          hasContradiction = /\b(but|however|instead|rather)\b/.test(beforeSkill);
+        }
+        
+        // Only rescue if all guards pass
+        if (!hasRejection && (isEarlyPosition || isShortResponse) && !hasContradiction) {
+          const subMatches = skillsWithDesc.filter(s => rawLower.includes(s.name.toLowerCase()));
+          confirmed = subMatches.sort((a, b) => b.name.length - a.name.length)[0] || null;
+          if (confirmed) {
+            logger.info(`[Node:ParseSkill] Semantic LLM substring rescue: extracted "${confirmed.name}" from prose response (${subMatches.length} candidate(s))`);
+          }
+        } else {
+          logger.debug(`[Node:ParseSkill] Substring rescue blocked - hasRejection:${hasRejection}, early:${isEarlyPosition}, short:${isShortResponse}, contradiction:${hasContradiction}, earliestPos:${earliestPosition}`);
+        }
+      }
       if (confirmed) {
         logger.info(`[Node:ParseSkill] Semantic match: "${classifyMessage.substring(0, 60)}" → skill "${confirmed.name}"${userWantsToCreate ? ' (userWantsToCreate)' : ''}`);
-        return _matchedState(state, confirmed.name, userWantsToCreate);
+        // Pass sourceDomain/sourceAction so planSkills domain fast-path fires and prepends navigate step
+        const _confirmedDomain = confirmed.sourceDomain || null;
+        const _confirmedAction = confirmed.sourceAction || null;
+        return _matchedState(state, confirmed.name, userWantsToCreate, _confirmedDomain, _confirmedAction);
       } else {
         logger.debug(`[Node:ParseSkill] Semantic LLM returned unknown skill "${candidate}" — ignoring`);
       }
