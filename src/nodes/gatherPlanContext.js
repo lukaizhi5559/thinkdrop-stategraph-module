@@ -10,25 +10,23 @@
  *   1. Skip if not command_automate, already complete, or bypass flag set.
  *   2. Call LLM: "Is this task clear enough? If not, what is the one most important question?"
  *   3. LLM says complete  → enrich resolvedMessage, set planGatheringComplete=true → planSkills
- *   4. LLM says question  → set pendingQuestion._isGatherPlanQuestion → logConversation (pause)
- *   5. On resume: answer merged into planGatheringAnswers → loop back to step 2 (max 3 rounds)
+ *   4. LLM says question  → emit ask_user via progressCallback, await answer inline via
+ *      gatherAnswerCallback (graph stays alive — no pause/resume needed)
+ *   5. Answer merged into planGatheringAnswers → loop back to step 2 (max 3 rounds)
  *
  * State inputs:
  *   state.intent.type            — must be 'command_automate' to activate
  *   state.message                — original user request
  *   state.resolvedMessage        — entity-resolved request
- *   state.planGatheringRound     — how many questions asked so far (0 on first entry)
- *   state.planGatheringAnswers   — [{question, answer}] from prior rounds
+ *   state.gatherAnswerCallback   — async fn(question) that awaits user reply inline
  *   state._bypassGatherPlan      — if true, skip entirely (user said "just do it")
  *
  * State outputs:
- *   state.planGatheringComplete  — true when ready for planSkills
+ *   state.planGatheringComplete  — true when ready for planSkills (always set on exit)
  *   state.planGatheringSkipped   — true when node was a no-op
- *   state.planGatheringRound     — incremented each Q&A round
- *   state.planGatheringAnswers   — accumulated answers (unchanged here; answer appended by main.js)
+ *   state.planGatheringRound     — final round count
+ *   state.planGatheringAnswers   — accumulated [{question, answer}] pairs
  *   state.resolvedMessage        — enriched with gathered answers when complete
- *   state.pendingQuestion        — { question, _isGatherPlanQuestion } when waiting for user
- *   state.answer                 — question text (displayed to user via logConversation)
  */
 
 'use strict';
@@ -162,6 +160,18 @@ module.exports = async function gatherPlanContext(state) {
   // Get original full message for context — this is the complete user request before decomposition
   const originalMsg = state.originalMessage || state.message || userMsg;
 
+  // ── Skip: plan correction mode — user is refining an existing plan ──────────
+  if (state._planCorrectionMode) {
+    logger.info('[Node:GatherPlanContext] Plan correction mode — skipping clarification');
+    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  }
+
+  // ── Skip: pre-built skill plan (post-approval) — plan already decided ──────
+  if (state._skillPlan) {
+    logger.info('[Node:GatherPlanContext] _skillPlan pre-built — skipping clarification');
+    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  }
+
   // ── Skip: user asked to bypass ───────────────────────────────────────────────
   if (state._bypassGatherPlan || _wantsToBypass(userMsg)) {
     logger.info('[Node:GatherPlanContext] Bypass detected — passing through to planSkills');
@@ -174,6 +184,20 @@ module.exports = async function gatherPlanContext(state) {
   const _BROWSE_VERBS     = /\b(go\s+to|goto|open|navigate|look\s+up|search|find|browse|check|visit|look\s+on|search\s+on|search\s+for|look\s+for)\b/i;
   if (_BROWSER_SERVICES.test(userMsg) && _BROWSE_VERBS.test(userMsg)) {
     logger.info(`[Node:GatherPlanContext] Self-contained browser task — skipping clarification for: "${userMsg.slice(0, 80)}"`);
+    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  }
+
+  // ── Skip: self-contained local filesystem task ───────────────────────────────
+  // Local file/folder operations are always fully specified — they need no recipient,
+  // no service selection, and no schedule. The LLM would return {"complete":true}
+  // every time, so skip it entirely and save ~1s.
+  // Guard: must have a local-action verb + a local-location reference, AND must have
+  // no external-service/recipient markers (which would make it non-local).
+  const _LOCAL_ACTION_VERBS = /\b(remove|delete|rename|move|copy|clear|clean|cleanup|clean\s+up|empty|list|find|scan|compress|zip|unzip|extract|backup|restore|show|sort|reset|organize|archive|eject|mount|unmount|chmod|chown|touch|mkdir|rmdir)\b/i;
+  const _LOCAL_LOCATION_RE  = /\b(desktop|downloads|documents|trash|home\s+folder|home\s+dir|disk|drive|volume|folder|directory|file|files|folders|~\/|\/Users\/|\/tmp\/|\.[a-zA-Z]{2,5}\b)/i;
+  const _EXTERNAL_SIGNAL_RE = /\b(send|email|text\s+me|sms|message|notify|post|tweet|upload|api|slack|discord|telegram|whatsapp|to\s+@|\bcc\b|http|https|ftp|s3|dropbox|icloud|google\s+drive|onedrive)\b/i;
+  if (_LOCAL_ACTION_VERBS.test(userMsg) && _LOCAL_LOCATION_RE.test(userMsg) && !_EXTERNAL_SIGNAL_RE.test(userMsg)) {
+    logger.info(`[Node:GatherPlanContext] Local filesystem task — skipping clarification for: "${userMsg.slice(0, 80)}"`);
     return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
   }
 
@@ -262,56 +286,85 @@ module.exports = async function gatherPlanContext(state) {
     }
   }
 
-  // ── LLM clarity check ─────────────────────────────────────────────────────────
-  if (progressCallback) {
-    progressCallback({ type: 'thinking', message: 'Checking task details…' });
-  }
-  logger.info(`[Node:GatherPlanContext] Round ${currentRound + 1}/${MAX_ROUNDS} — checking task clarity for: "${userMsg.slice(0, 80)}"`);
+  // ── Inline await Q&A loop ────────────────────────────────────────────────────
+  // Uses gatherAnswerCallback to wait for user input inline (graph stays alive).
+  // This eliminates the fragile pause/resume semantic classifier that misclassified
+  // short answers like "by name" as fresh tasks.
+  const gatherAnswerCallback = state.gatherAnswerCallback || null;
+  const answers = [...priorAnswers];
+  let round = currentRound;
 
-  const result = await _askLLM(llmBackend, userMsg, originalMsg, priorAnswers, logger);
-
-  // ── Task is clear — enrich resolvedMessage with any gathered context and proceed ──
-  if (result.complete) {
-    let enriched = resolvedMessage || message || '';
-    if (priorAnswers.length > 0) {
-      const contextLines = priorAnswers.map(qa => `${qa.question}: ${qa.answer}`).join('; ');
-      enriched = `${enriched}\n[Additional context: ${contextLines}]`;
-      logger.info(`[Node:GatherPlanContext] Complete — enriched resolvedMessage with ${priorAnswers.length} answer(s)`);
-    } else {
-      logger.info('[Node:GatherPlanContext] Task is already fully specified — passing through');
+  while (round < MAX_ROUNDS) {
+    if (progressCallback) {
+      progressCallback({ type: 'thinking', message: 'Checking task details…' });
     }
-    return {
-      ...state,
-      resolvedMessage: enriched,
-      planGatheringComplete: true,
-      planGatheringRound: currentRound,
-      // Clear gather resume flags — task is complete
-      _gatherQuestionPending: false,
-      _pendingIntent: undefined,
-    };
+    logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking task clarity for: "${userMsg.slice(0, 80)}"`);
+
+    const result = await _askLLM(llmBackend, userMsg, originalMsg, answers, logger);
+
+    // ── Task is clear — done ──────────────────────────────────────────────────
+    if (result.complete) {
+      let enriched = resolvedMessage || message || '';
+      if (answers.length > 0) {
+        const contextLines = answers.map(qa => `${qa.question}: ${qa.answer}`).join('; ');
+        enriched = `${enriched}\n[Additional context: ${contextLines}]`;
+        logger.info(`[Node:GatherPlanContext] Complete — enriched resolvedMessage with ${answers.length} answer(s)`);
+      } else {
+        logger.info('[Node:GatherPlanContext] Task is already fully specified — passing through');
+      }
+      return {
+        ...state,
+        resolvedMessage: enriched,
+        planGatheringComplete: true,
+        planGatheringRound: round,
+        planGatheringAnswers: answers,
+      };
+    }
+
+    // ── Ask clarifying question inline ────────────────────────────────────────
+    const question = result.question || 'Could you provide more details about this task?';
+    logger.info(`[Node:GatherPlanContext] Asking Q${round + 1}: "${question}"`);
+
+    if (progressCallback) {
+      progressCallback({ type: 'ask_user', question, source: 'gatherPlanContext' });
+    }
+
+    // If no callback available, bail out — cannot gather inline
+    if (!gatherAnswerCallback) {
+      logger.warn('[Node:GatherPlanContext] No gatherAnswerCallback — cannot gather inline, passing through');
+      return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+    }
+
+    // Await user answer inline — graph stays alive
+    try {
+      const answer = await gatherAnswerCallback(question);
+      if (answer) {
+        answers.push({ question, answer });
+        logger.info(`[Node:GatherPlanContext] Answer received for Q${round + 1}: "${String(answer).slice(0, 80)}"`);
+      } else {
+        // Timeout or null answer — proceed with what we have
+        logger.warn(`[Node:GatherPlanContext] No answer received for Q${round + 1} — proceeding without`);
+        break;
+      }
+    } catch (err) {
+      logger.warn(`[Node:GatherPlanContext] gatherAnswerCallback threw: ${err.message} — proceeding`);
+      break;
+    }
+
+    round++;
   }
 
-  // ── Ask clarifying question ───────────────────────────────────────────────────
-  const question = result.question || 'Could you provide more details about this task?';
-  logger.info(`[Node:GatherPlanContext] Asking Q${currentRound + 1}: "${question}"`);
-
-  if (progressCallback) {
-    progressCallback({ type: 'ask_user', question, source: 'gatherPlanContext' });
+  // ── Exited loop (max rounds or break) — proceed with gathered context ───────
+  let enriched = resolvedMessage || message || '';
+  if (answers.length > 0) {
+    const contextLines = answers.map(qa => `${qa.question}: ${qa.answer}`).join('; ');
+    enriched = `${enriched}\n[Additional context: ${contextLines}]`;
   }
-
   return {
     ...state,
-    planGatheringRound: currentRound + 1,
-    planGatheringAnswers: priorAnswers,
-    planGatheringComplete: false,
-    answer: question,           // displayed to user via logConversation → UI
-    pendingQuestion: {
-      question,
-      _isGatherPlanQuestion: true,
-      source: 'gatherPlanContext',
-    },
-    // NEW: Flags to signal this is a gather answer awaiting response
-    _gatherQuestionPending: true,
-    _pendingIntent: state.intent,
+    resolvedMessage: enriched,
+    planGatheringComplete: true,
+    planGatheringRound: round,
+    planGatheringAnswers: answers,
   };
 };

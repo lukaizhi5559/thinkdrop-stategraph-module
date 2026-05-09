@@ -1187,7 +1187,22 @@ module.exports = async function executeCommand(state) {
 
     let continued = false;
 
-    if (guideSessionId && mcpAdapter) {
+    // ── Session validation guard ──────────────────────────────────────────────
+    // Only use page-event mode if a preceding browser.act step actually opened
+    // a browser session (navigate/goto). If the sessionId was invented by the LLM
+    // (e.g. "desktop_prefs" for System Settings) without a real browser.act navigate,
+    // there is no Playwright session to poll — fall back to IPC mode immediately.
+    const hasRealBrowserSession = skillResults.some(
+      r => r.skill === 'browser.act' && r.ok && r.args?.sessionId &&
+        (r.args.action === 'navigate' || r.args.action === 'goto' || r.args.url)
+    );
+    const usePageEventMode = guideSessionId && mcpAdapter && hasRealBrowserSession;
+
+    if (!hasRealBrowserSession && guideSessionId) {
+      logger.warn(`[Node:ExecuteCommand] guide.step: sessionId="${guideSessionId}" has no matching browser.act navigate — falling back to IPC mode`);
+    }
+
+    if (usePageEventMode) {
       // ── MODE 1: waitForTrigger — CDP exposeBinding, CSP-safe, event-driven ──
       // The highlight overlay attaches blur/change/click listener per element type.
       // When the user interacts, listener calls window.__tdTrigger() — a CDP binding
@@ -1204,8 +1219,17 @@ module.exports = async function executeCommand(state) {
         waitTriggerRaw = waitTriggerRes?.data || waitTriggerRes;
         triggered = true;
       } catch (err) {
-        triggered = true;
-        logger.info(`[Node:ExecuteCommand] guide.step: waitForTrigger ended (${err.message?.slice(0, 60)}) — auto-continuing`);
+        const errMsg = err.message || '';
+        // If the session doesn't exist or playwright-cli is not running, do NOT
+        // auto-approve. Fall back to IPC mode so user must explicitly continue.
+        if (/no active browser session|playwright-cli is not running|session was never opened/i.test(errMsg)) {
+          logger.warn(`[Node:ExecuteCommand] guide.step: waitForTrigger failed — no browser session "${guideSessionId}" — falling back to IPC mode`);
+          triggered = false;
+        } else {
+          // Genuine timeout or expected error (e.g. page closed) — auto-continue
+          triggered = true;
+          logger.info(`[Node:ExecuteCommand] guide.step: waitForTrigger ended (${errMsg.slice(0, 60)}) — auto-continuing`);
+        }
       }
 
       // ── Auth wall detection ─────────────────────────────────────────────────
@@ -1214,7 +1238,7 @@ module.exports = async function executeCommand(state) {
       // quickly with authRequired:true (stable login-page text). This is NOT
       // a real user interaction — surface it to the user immediately instead of
       // continuing through guide steps that do nothing.
-      if (waitTriggerRaw?.authRequired) {
+      if (triggered && waitTriggerRaw?.authRequired) {
         let friendlyHost = 'the site';
         try {
           friendlyHost = new URL(state.activeBrowserUrl || guideUrl || '').hostname.replace(/^www\./, '');
@@ -1232,8 +1256,15 @@ module.exports = async function executeCommand(state) {
         };
       }
 
-      continued = true;
-      logger.info(`[Node:ExecuteCommand] guide.step: page trigger fired — continuing`);
+      if (!triggered) {
+        // waitForTrigger failed due to non-existent session — fall through to IPC mode below
+        logger.info(`[Node:ExecuteCommand] guide.step: page-event mode failed — falling through to IPC mode`);
+      }
+
+      if (triggered) {
+        continued = true;
+        logger.info(`[Node:ExecuteCommand] guide.step: page trigger fired — continuing`);
+      }
 
       // Check if user clicked "Stop Guide" — if so, abort cleanly instead of continuing.
       const isGuideCancelled = typeof state.isGuideCancelled === 'function' ? state.isGuideCancelled : () => false;
@@ -1250,6 +1281,12 @@ module.exports = async function executeCommand(state) {
           activeBrowserUrl: null
         };
       }
+
+      // Only do post-trigger navigation/rescan when the page-event actually fired.
+      // If triggered=false, we're falling through to IPC mode — no browser interaction happened.
+      if (!triggered) {
+        // Skip nav wait + rescan — fall through to IPC fallback below
+      } else {
 
       // Wait for navigation to settle — user click likely triggered a page change.
       // Use waitForNavigation (load state) which handles the new page properly.
@@ -1343,10 +1380,16 @@ module.exports = async function executeCommand(state) {
         }
       }
 
-    } else {
-      // ── MODE 2: IPC fallback — wait for guide:continue from ResultsWindow ──
+      } // end else (triggered=true post-trigger logic)
+    } // end if (usePageEventMode)
+
+    // ── MODE 2: IPC fallback — wait for guide:continue from ResultsWindow ──
+    // Falls through here if: (a) usePageEventMode is false, or (b) page-event
+    // mode failed (triggered=false → continued still false).
+    if (!continued) {
       const confirmGuideCallback = state.confirmGuideCallback || null;
       if (typeof confirmGuideCallback === 'function') {
+        logger.info(`[Node:ExecuteCommand] guide.step: IPC mode — waiting for user to click Continue`);
         try {
           continued = await confirmGuideCallback();
         } catch (err) {
@@ -1932,7 +1975,7 @@ module.exports = async function executeCommand(state) {
     logger.debug(`[Node:ExecuteCommand] synthesize: scoping to results after step ${lastSynthesizeStep} (last synthesize)`);
     const pageTextResults = skillResults
       .filter(r => (
-        (r.skill === 'browser.act' && r.args?.action === 'getPageText') ||
+        (r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText')) ||
         (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:'))
       ) && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0
         && r.step > lastSynthesizeStep)
@@ -2156,9 +2199,15 @@ module.exports = async function executeCommand(state) {
 
     // If no within-run context, check conversationHistory for prior image.analyze / skill output
     // This handles cross-turn synthesis: "put this in a text document" after a previous analysis run.
+    // GUARD: Do NOT fall back to conversation history when the current run has browser/agent results
+    // that simply weren't captured by the filters above — prevents cross-turn context pollution
+    // (e.g. BibleGateway results leaking into a DuckDuckGo synthesis after recovery replan).
     const conversationHistory = state.conversationHistory || [];
+    const hasBrowserResults = skillResults.some(r =>
+      (r.skill === 'browser.act' || r.skill === 'browser.agent') && r.ok && r.step > lastSynthesizeStep
+    );
     let crossTurnContext = '';
-    if (allContextParts.length === 0 && conversationHistory.length > 0) {
+    if (allContextParts.length === 0 && !hasBrowserResults && conversationHistory.length > 0) {
       // Find the most recent assistant message that contains step outputs
       const recentOutputMsg = [...conversationHistory].reverse()
         .find(m => m.role === 'assistant' && m.content && m.content.includes('Step outputs:'));
@@ -3074,13 +3123,6 @@ module.exports = async function executeCommand(state) {
   if (skill === 'browser.agent' || skill === 'cli.agent') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 300000); // 5 min
   }
-  // agentbrowser.agent: waitForAuth alone needs 120s (user must log in manually) + agent
-  // execution. Without a long enough HTTP timeout the MCP client fires 3 concurrent retries
-  // that each call close-all, killing the Chrome window the user is mid-login on.
-  if (skill === 'agentbrowser.agent') {
-    stepTimeoutMs = Math.max(stepTimeoutMs, 300000); // 5 min: 120s auth + agent execution
-  }
-
   // ── project_build: route to project.builder MCP skill ──────────────────────
   if (skill === 'project_build') {
     if (progressCallback) progressCallback({
@@ -3386,7 +3428,7 @@ module.exports = async function executeCommand(state) {
   try {
     // For cli.agent / browser.agent: inject _progressCallbackUrl so the agent can POST
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
-    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent' || skill === 'agentbrowser.agent';
+    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent';
     const _callArgs = _isAgentSkill
       ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
       : resolvedArgs;
@@ -4801,6 +4843,19 @@ module.exports = async function executeCommand(state) {
       }
 
       logger.info(`[Node:ExecuteCommand] last-step all_done: savedFilePaths=${JSON.stringify(finalSavedPaths)}`);
+      // Update skill plan file status on completion (mirrors early-exit path at line ~550)
+      if (state._skillPlanFile) {
+        try {
+          const _planMd2 = fs.readFileSync(state._skillPlanFile, 'utf8');
+          const _allOk2 = updatedResults.every(r => r.ok);
+          const _newStatus2 = _allOk2 ? 'complete' : 'failed';
+          const _updatedMd2 = _planMd2.replace(/^(status:\s*)(pending|failed)(\s*)$/m, `$1${_newStatus2}$3`);
+          fs.writeFileSync(state._skillPlanFile, _updatedMd2, 'utf8');
+          logger.info(`[Node:ExecuteCommand] Plan file status updated to ${_newStatus2}: ${state._skillPlanFile}`);
+        } catch (_planErr2) {
+          logger.warn(`[Node:ExecuteCommand] Could not update plan file status: ${_planErr2.message}`);
+        }
+      }
       if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults: updatedResults, savedFilePaths: finalSavedPaths, planFile: state._skillPlanFile || null });
 
       // Translate last-step answer to sessionLanguage if non-English.

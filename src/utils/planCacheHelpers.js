@@ -24,6 +24,20 @@ const PLANS_DIR = path.join(os.homedir(), '.thinkdrop', 'plans');
 /** Jaccard similarity threshold above which a plan auto-executes (no modal). */
 const HIGH_CONFIDENCE_THRESHOLD = 0.8;
 
+// ── Cache invalidation: deprecated browser.act plans for named services ───────
+// If a cached plan uses ONLY browser.act (no browser.agent) and the prompt
+// mentions a recognizable named service, the plan is stale — it was generated
+// before the prompt was updated to route named sites through browser.agent.
+const _NAMED_SERVICE_RE = /\b(google|biblegateway|wikipedia|duckduckgo|reddit|youtube|stackoverflow|amazon|ebay|twitter|x\.com|facebook|instagram|pinterest|linkedin|yelp|tripadvisor|imdb|spotify|netflix|hulu|twitch|tiktok|chatgpt|gemini|perplexity|claude|grok|deepseek|mistral|copilot|midjourney|suno|notion|slack|discord|telegram|whatsapp|github|gitlab|bitbucket)\b/i;
+
+function _isStaleBrowserActPlan(skillPlan, prompt) {
+  if (!Array.isArray(skillPlan) || skillPlan.length === 0) return false;
+  if (!_NAMED_SERVICE_RE.test(prompt)) return false;
+  const hasBrowserAgent = skillPlan.some(s => s.skill === 'browser.agent');
+  const hasOnlyBrowserAct = !hasBrowserAgent && skillPlan.some(s => s.skill === 'browser.act');
+  return hasOnlyBrowserAct;
+}
+
 // ── In-memory session cache ───────────────────────────────────────────────────
 // Shared singleton Map — because Node caches module instances, both planSkills
 // and checkPlanCache reference the same Map object.
@@ -279,6 +293,11 @@ function findSimilarCompletePlan(prompt, logger) {
           try {
             const decoded  = Buffer.from(jsonMatch[1], 'base64').toString('utf8');
             const skillPlan = JSON.parse(decoded);
+            // Invalidate stale plans that use browser.act for named-service tasks
+            if (_isStaleBrowserActPlan(skillPlan, prompt)) {
+              logger.info(`[PlanCache] Invalidating stale browser.act plan for named service: ${file}`);
+              continue;
+            }
             const anchorsOk   = anchorSetsMatch(promptAnchors, planAnchors);
             const autoExecute = similarity >= HIGH_CONFIDENCE_THRESHOLD && anchorsOk;
             logger.info(
@@ -317,4 +336,5 @@ module.exports = {
   _sessionCacheKey,
   _sessionCacheGet,
   _sessionCacheSet,
+  _isStaleBrowserActPlan,
 };

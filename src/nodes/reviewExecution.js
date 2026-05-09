@@ -336,6 +336,27 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };
   }
 
+  // ── Fast-pass: shell-only plan where every step exited cleanly ───────────────
+  // When all steps are shell.run/cli.agent and every step: ok !== false, exitCode 0,
+  // and produced non-empty stdout — the LLM review would return PASS 100% of the time.
+  // Skip the ~2s roundtrip. The LLM path still runs if any step failed, exited non-zero,
+  // or produced empty/suspiciously-short stdout (possible silent failure).
+  const _allShellOrCli = skillResults.every(r => r.skill === 'shell.run' || r.skill === 'cli.agent' || r.skill === 'synthesize');
+  const _hasRealShell  = skillResults.some(r => r.skill === 'shell.run' || r.skill === 'cli.agent');
+  if (_allShellOrCli && _hasRealShell) {
+    const _allClean = skillResults
+      .filter(r => r.skill === 'shell.run' || r.skill === 'cli.agent')
+      .every(r => {
+        const exitOk  = r.ok !== false && (r.exitCode == null || r.exitCode === 0);
+        const hasOut  = String(r.stdout || r.result || '').trim().length > 0;
+        return exitOk && hasOut;
+      });
+    if (_allClean) {
+      logger.info('[Node:ReviewExecution] Shell-only plan — all steps exited cleanly, skipping LLM review');
+      return { ...state, reviewVerdict: 'UNVERIFIABLE' };
+    }
+  }
+
   if (progressCallback) progressCallback({ type: 'reviewing', message: 'Verifying step outcomes...' });
 
   // ── Phase 1: LLM analysis ────────────────────────────────────────────────────
@@ -368,7 +389,7 @@ Output ONLY valid JSON.`;
         sessionId: context?.sessionId,
         userId: context?.userId || 'default_user',
       }
-    }, { maxTokens: 600, temperature: 0.1, fastMode: false });
+    }, { maxTokens: 300, temperature: 0.1, fastMode: false });
   } catch (llmErr) {
     logger.warn(`[Node:ReviewExecution] LLM call failed (non-fatal): ${llmErr.message} — skipping`);
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };

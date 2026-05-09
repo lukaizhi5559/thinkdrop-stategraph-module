@@ -309,6 +309,14 @@ module.exports = async function enrichIntent(state) {
   // ── MODE A: Enrich a command_automate request ─────────────────────────────
   if (intent?.type !== 'command_automate') return state;
 
+  // Fast-path: skill plan already built (post-approval re-entry).
+  // domain.extract feeds planSkills, but planSkills skips LLM when _skillPlan is set —
+  // so running domain.extract here is wasted ~2s. Skip it entirely.
+  if (state._skillPlan && Array.isArray(state._skillPlan) && state._skillPlan.length > 0) {
+    logger.debug('[Node:EnrichIntent] _skillPlan pre-built — skipping domain.extract');
+    return state;
+  }
+
   const commandMessage = resolvedMessage || message || '';
 
   if (!mcpAdapter) {

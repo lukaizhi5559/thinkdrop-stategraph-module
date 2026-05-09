@@ -383,14 +383,10 @@ class StateGraphBuilder {
       // gatherPlanContext asks up to 3 clarifying questions for ambiguous command_automate tasks.
       resolveUserContext: 'gatherPlanContext',
 
-      // gatherPlanContext: proceed to planSkills when complete/skipped, or pause for user answer
-      gatherPlanContext: (state) => {
-        if (state.planGatheringComplete || state.planGatheringSkipped) {
-          logger.debug('[StateGraph:Router] gatherPlanContext: complete/skipped — proceeding to planSkills');
-          return 'planSkills';
-        }
-        logger.debug('[StateGraph:Router] gatherPlanContext: awaiting user clarification — logConversation');
-        return 'logConversation';
+      // gatherPlanContext: always proceeds to planSkills (Q&A handled inline via gatherAnswerCallback)
+      gatherPlanContext: () => {
+        logger.debug('[StateGraph:Router] gatherPlanContext → planSkills');
+        return 'planSkills';
       },
 
       // gatherContext bypassed — kept for future re-enable

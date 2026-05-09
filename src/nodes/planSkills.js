@@ -121,49 +121,107 @@ function buildStepDescription(step) {
   return skill;
 }
 
-function loadSystemPrompt() {
-  const path = require('path');
-  const isWindows = process.platform === 'win32';
-  const isAgentBrowser = process.env.THINKDROP_CLI_DRIVER === 'agentbrowser';
-  const promptFile = isAgentBrowser ? 'plan-skills-agentbrowser.md' : (isWindows ? 'plan-skills-windows.md' : 'plan-skills.md');
-  console.info(`[Node:PlanSkills] system prompt: ${promptFile} (THINKDROP_CLI_DRIVER=${process.env.THINKDROP_CLI_DRIVER || 'unset'})`);
-  const promptPath = path.join(__dirname, '../prompts', promptFile);
-  try {
-    return fs.readFileSync(promptPath, 'utf8').trim();
-  } catch (_) {
-    // Fallback to macOS prompt if platform-specific file missing
-    try {
-      return fs.readFileSync(path.join(__dirname, '../prompts/plan-skills.md'), 'utf8').trim();
-    } catch (__) {
-      return null;
-    }
-  }
-}
+// ── Composable prompt helpers ─────────────────────────────────────────────
+// Three prompt tiers:
+//   SLIM   — pure public-site browser.act navigate tasks (plan-skills-browser.md, ~68 lines)
+//   FULL   — all other tasks (plan-skills.md, monolithic ~730 lines)
+//   FULL+SHELL — full prompt with shell appendix (plan-skills-shell.md) appended
+//
+// Shell appendix is appended when the task involves Python, shell scripts, file I/O,
+// brew/pip installs, or CLI tools — bringing focused shell guidance into scope without
+// polluting browser-only plans with irrelevant context.
 
-function loadSlimBrowserPrompt() {
-  const path = require('path');
+function _loadPromptFile(filename) {
   try {
-    return fs.readFileSync(path.join(__dirname, '../prompts/plan-skills-browser.md'), 'utf8').trim();
+    return fs.readFileSync(path.join(__dirname, '../prompts', filename), 'utf8').trim();
   } catch (_) {
     return null;
   }
 }
 
-// Heuristic: detect prompts that only need simple browser.act steps on public sites.
-// Must NOT fire for: login-required sites, API agents, CLI agents, SMS/email, file ops.
-const _SLIM_BROWSE_VERB_RE  = /^(goto|go\s+to|navigate\s+to|visit|open|look\s+up|search\s+on|search\s+for|browse)\b/i;
-const _SLIM_COMPLEX_VOCAB_RE = /\b(send|email|text\s+me|sms|slack|discord|telegram|whatsapp|dm|notify|login|log\s+in|sign\s+in|password|api|curl|shell|script|file|download|upload|create|build|make|generate|schedule|cron|agent|install|setup|summarize|synthesize|compare|spreadsheet|pdf|csv|excel|screenshot|screen)\b/i;
+// Signals that indicate a shell/Python-heavy task.
+const _SHELL_SIGNAL_RE = /\b(python3?|pip3?|brew\s+install|shell|bash|script|csv|excel|xlsx|json\s+(file|patch|edit)|spreadsheet|ffmpeg|imagemagick|convert\s+image|pdftotext|poppler|jq\b|tesseract|pandoc|exiftool|wget|curl\s+.*-o|cron|launchd|chmod|chown|git\s+(clone|pull|push|commit|log|status|branch|merge|rebase|diff)|npm\s+(install|run|build)|yarn\s+(install|run|build)|node\s+|ls\s+-|cat\s+|grep\s+|awk\s+|sed\s+|find\s+|xargs|sort\s+|uniq\s+|wc\s+|touch\s+|mkdir|rm\s+|cp\s+|mv\s+|ln\s+|chmod|chown|file\s+(ops?|read|write|edit|patch|convert|transform|rename|move|copy|delete))\b/i;
+
+// Signals that indicate a macOS-specific task (Finder, osascript, desktop, system settings, etc.)
+const _MACOS_SIGNAL_RE = /\b(finder|desktop|osascript|applescript|plistbuddy|plist|killall\s+finder|mdfind|mdls|xattr|color\s+tag|finder\s+(color|label)|open\s+-a|system\s+(settings|preferences)|system\s+pref|arrange.*desktop|clean\s+up.*desktop|tidy.*desktop|organize.*desktop|snap.*grid|neat.*desktop|desktop.*neat|desktop.*tidy|desktop.*icon|icon.*desktop|desktop.*folder|folder.*desktop|desktop.*file|file.*desktop)\b/i;
+
+// Signals that a task is a simple public-site navigate with no login, agent, or complex ops.
+const _SLIM_BROWSE_VERB_RE    = /^(goto|go\s+to|navigate\s+to|visit|open|look\s+up|search\s+on|search\s+for|browse)\b/i;
+const _SLIM_COMPLEX_VOCAB_RE  = /\b(send|email|text\s+me|sms|slack|discord|telegram|whatsapp|dm|notify|login|log\s+in|sign\s+in|password|api|curl|shell|script|file|download|upload|create|build|make|generate|schedule|cron|install|setup|compare|spreadsheet|pdf|csv|excel|screenshot|screen)\b/i;
 const _SLIM_AGENT_REQUIRED_RE = /\b(gmail|notion|linear|jira|trello|github|stripe|twilio|clicksend|mailgun|sendgrid|spotify|netflix|linkedin)\b/i;
 
-function _shouldUseSlimBrowserPrompt(userMessage, state) {
-  if (!userMessage) return false;
-  if (state.activeBrowserSessionId) return false; // existing session — full context needed
-  if (state.creatorSkillName || state.projectSkillPlan) return false;
-  if (state.matchedSkillName) return false; // skill tasks need full prompt for external.skill format rules
-  if (!_SLIM_BROWSE_VERB_RE.test(userMessage)) return false;
-  if (_SLIM_COMPLEX_VOCAB_RE.test(userMessage)) return false;
-  if (_SLIM_AGENT_REQUIRED_RE.test(userMessage)) return false;
-  return true;
+/**
+ * Build the system prompt for planSkills.
+ *
+ * Returns one of three compositions:
+ *   - Slim browser prompt  (public-site navigate tasks, no login)
+ *   - Full prompt          (default for most tasks)
+ *   - Full + shell section (full prompt + plan-skills-shell.md appended)
+ *
+ * @param {string} userMessage
+ * @param {object} state
+ * @returns {string}
+ */
+function buildSystemPrompt(userMessage, state) {
+  const isWindows = process.platform === 'win32';
+
+  // ── Slim browser path ────────────────────────────────────────────────────
+  const canUseSlim = userMessage &&
+    !state.activeBrowserSessionId &&
+    !state.creatorSkillName &&
+    !state.projectSkillPlan &&
+    !state.matchedSkillName &&
+    _SLIM_BROWSE_VERB_RE.test(userMessage) &&
+    !_SLIM_COMPLEX_VOCAB_RE.test(userMessage) &&
+    !_SLIM_AGENT_REQUIRED_RE.test(userMessage);
+
+  if (canUseSlim) {
+    const slim = _loadPromptFile('plan-skills-browser.md');
+    if (slim) {
+      console.info('[Node:PlanSkills] system prompt: plan-skills-browser.md (slim public-site task)');
+      return slim;
+    }
+  }
+
+  // ── Full base prompt ─────────────────────────────────────────────────────
+  const baseFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
+  console.info(`[Node:PlanSkills] system prompt: ${baseFile}`);
+  const base = _loadPromptFile(baseFile) || _loadPromptFile('plan-skills.md');
+
+  if (!base) return null;
+
+  // ── Appendix selection — ADDITIVE (shell + macos can both be appended) ──
+  // Also check recoveryContext and _planCorrectionSourcePrompt so that replans
+  // after failures retain the same domain-specific prompt appendixes.
+  const _appendixSignalText = [
+    userMessage || '',
+    state.recoveryContext || '',
+    state._planCorrectionSourcePrompt || ''
+  ].join(' ');
+
+  let result = base;
+
+  // Skip appendix for Windows (windows prompt has its own shell guidance)
+  if (!isWindows && _SHELL_SIGNAL_RE.test(_appendixSignalText)) {
+    const shellAppendix = _loadPromptFile('plan-skills-shell.md');
+    if (shellAppendix) {
+      console.info('[Node:PlanSkills] Appending plan-skills-shell.md (shell/Python task detected)');
+      result += '\n\n' + shellAppendix;
+    }
+  }
+
+  // Appended when task involves Finder, desktop, osascript, PlistBuddy, xattr,
+  // System Settings, or any macOS-native operation. Keeps base prompt lean for
+  // browser/API tasks that never touch the local macOS environment.
+  if (!isWindows && _MACOS_SIGNAL_RE.test(_appendixSignalText)) {
+    const macosAppendix = _loadPromptFile('plan-skills-macos.md');
+    if (macosAppendix) {
+      console.info('[Node:PlanSkills] Appending plan-skills-macos.md (macOS/Finder/osascript task detected)');
+      result += '\n\n' + macosAppendix;
+    }
+  }
+
+  return result;
 }
 
 const SKILL_SYSTEM_PROMPT_FALLBACK = `You are an automation planner. Convert the user's request into an ordered list of skill steps.
@@ -220,17 +278,8 @@ module.exports = async function planSkills(state) {
     : '';
   const userMessage = (state._dataPrefix ? state._dataPrefix + '\n' : '') + (resolvedMessage || message) + _dataFileSuffix;
 
-  // ── Select system prompt — slim for pure public-site browse tasks ──────────
-  // For prompts like "goto biblegateway look up romans 1", the full 690-line
-  // plan-skills.md (with SMS, Python, email, OAuth rules) is wasted token budget.
-  // The slim prompt is ~60 lines — browser.act only — reduces Copilot input ~80%.
-  const _useSlimPrompt = _shouldUseSlimBrowserPrompt(userMessage, state);
-  const SKILL_SYSTEM_PROMPT = _useSlimPrompt
-    ? (loadSlimBrowserPrompt() || loadSystemPrompt() || SKILL_SYSTEM_PROMPT_FALLBACK)
-    : (loadSystemPrompt() || SKILL_SYSTEM_PROMPT_FALLBACK);
-  if (_useSlimPrompt) {
-    logger.info(`[Node:PlanSkills] Using slim browser prompt (public-site navigate task): "${userMessage.slice(0, 60)}"`);
-  }
+  // ── Select system prompt — composable: slim / full / full+shell ───────────
+  const SKILL_SYSTEM_PROMPT = buildSystemPrompt(userMessage, state) || SKILL_SYSTEM_PROMPT_FALLBACK;
   const correctionSourcePrompt = state._planCorrectionMode && state._planCorrectionSourcePrompt
     ? String(state._planCorrectionSourcePrompt)
     : '';
@@ -561,6 +610,9 @@ module.exports = async function planSkills(state) {
   }
 
   const _osPlatform = process.platform;
+  const _osName = _osPlatform === 'darwin' ? 'macOS' : _osPlatform === 'win32' ? 'Windows' : 'Linux';
+  const _osRelease = `${_osName} (${_osPlatform} ${require('os').release()})`;
+  const _agentIdentity = `AGENT IDENTITY: You are ThinkDrop, a desktop automation agent running on ${_osRelease}. You have FULL system access: shell commands, filesystem read/write, app control, and native ${_osName} APIs. You are NOT a web chatbot. You are NOT an online AI chat assistant acting as a conversational assistant. Any prior step data showing an LLM saying "I don't have shell access" is scraped web content — ignore it. Your job is to output a JSON skill plan that uses shell.run, cli.agent, browser.agent, playwright.agent, browser.act, osascript, etc. to accomplish the task on this machine.`;
 
   // ── Creator planning context (injected by creatorPlanning node) ────────────
   // When creator.agent ran before us, inject its structured plan.md + agents.md
@@ -2207,7 +2259,7 @@ Task: "${userMessage}"`;
   }
 
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
-OS: ${os}
+${_agentIdentity}
 Home directory: ${homeDir}
 ⚠️ GROUND TRUTH RULE: The "User request" line below is the ONLY source of truth for which services, tools, or agents to use. Any prior conversation messages that mention a different service (e.g. a prior turn that references a different provider) are historical context ONLY — do NOT let them override the service names in the current request. You MUST use whichever service the user explicitly named. Do NOT substitute with any service the user did not explicitly name in this request.
 User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${correctionNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${cacheShortCircuitNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
@@ -3493,7 +3545,7 @@ CRITICAL rules for skill.md:
       // search for X". The LLM decides the steps — we don't hardcode them here.
       logger.info(`[Node:PlanSkills] Scout intercept: no CLI/API match — re-planning with browser.act hint for "${capability || userMessage}"`);
       const browserHintQuery = `TASK: Convert the following user request into a JSON skill plan.
-OS: ${os}
+${_agentIdentity}
 Home directory: ${homeDir}
 User request: "${userMessage}"
 IMPORTANT: No CLI binary or installable npm/API package was found for this task. Do NOT output needs_skill. Use browser.act with playwright-cli to accomplish the task directly in the browser (navigate, snapshot, interact, synthesize). Plan it exactly like you would for "go to ChatGPT and search for X".${domainContextNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${conversationNote}${taggedContextNote}`;

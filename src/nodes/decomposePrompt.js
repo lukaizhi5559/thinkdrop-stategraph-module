@@ -317,6 +317,19 @@ module.exports = async function decomposePrompt(state) {
     return state;
   };
 
+  // ── Layer 4c: pure greeting/acknowledgement fast-path ─────────────────────
+  // Greetings and short acknowledgements ("hello", "thanks", "ok", "sounds good")
+  // always decompose to exactly 1 sub-prompt equal to the original — the LLM call
+  // (3–4s) adds zero value. Detect them upfront with a tight regex and skip entirely.
+  // Guard: no action verbs present (catches "ok go ahead" / "yes do that now" correctly —
+  // those contain action verbs and fall through to Layer 4b or the LLM).
+  const GREETING_FAST_PATH_RE = /^(hi+|hello+|hey+|howdy|yo|sup|good\s+(morning|afternoon|evening|night)|thanks?|thank\s+you|ok|okay|sure|great|got\s+it|sounds\s+good|perfect|cool|awesome|nice|alright|yep|yup|no+|nope)[\s!.?]*$/i;
+  if (GREETING_FAST_PATH_RE.test(message.trim())) {
+    logger.debug(`[Node:DecomposePrompt] Greeting fast-path — skipping LLM: "${message.slice(0, 40)}"`);
+    writeDecomposeLog({ ts: new Date().toISOString(), message, parser: 'greeting-fast-path', intent: 'greeting', subPromptCount: 1, durationMs: 0, subPrompts: [] });
+    return { ...state, _decomposedIntent: 'greeting' };
+  }
+
   // ── Layer 4b: conservative navigation fast-path ───────────────────────────
   // Short browse-verb prompts (goto/go to/navigate to/visit + site) with no
   // multi-step connectors are always single-intent command_automate.

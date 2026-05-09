@@ -462,6 +462,48 @@ module.exports = async function parseIntent(state) {
     return { ...state, intent: { type: 'set_constraint', confidence: 0.98, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'set-constraint-override', processingTimeMs: 0 } };
   }
 
+  // ── Behavioral correction auto-capture ────────────────────────────────────
+  // Detects "I didn't want you to X", "you shouldn't have Y", "don't ever Z again"
+  // style corrections and persists them as global hard user constraints so the
+  // LLM never repeats the behaviour. Fires BEFORE normal constraint overrides
+  // to capture implicit corrections that don't use "never let me" phrasing.
+  //
+  // Pattern strategy: two-tier match
+  //   Tier 1 (strong past-tense correction): "I didn't want you to", "you shouldn't have",
+  //           "you weren't supposed to", "that wasn't what I wanted"
+  //   Tier 2 (forward imperative correction): "don't ever X again", "never X again",
+  //           "stop X-ing", "don't X files/folders/anything"
+  //
+  // After match: immediately call constraint.add (fire-and-forget, non-blocking)
+  // then route as set_constraint so storeConstraint still builds the confirmation reply.
+  {
+    const _CORRECTION_TIER1_RE = /\b(i\s+(didn'?t|did\s+not)\s+want\s+(you|it)\s+to|you\s+shouldn'?t\s+(have|of)\s+|you\s+weren'?t\s+supposed\s+to|that\s+wasn'?t\s+what\s+i\s+(wanted|asked\s+for|meant)|i\s+(never|didn'?t)\s+asked\s+(you|it)\s+to|you\s+should(n'?t|'?ve\s+not)\s+have\s+|i\s+wanted\s+you\s+to\s+NOT|i\s+told\s+you\s+(not\s+to|to\s+never))\b/i;
+    const _CORRECTION_TIER2_RE = /\b(don'?t\s+ever|never\s+again)\s+\w.{0,60}\b(files?|folders?|anything|it|them|those|that)\b|\b(stop|quit|cease)\s+(renaming|adding|prefixing|numbering|modifying|changing|deleting|removing|overwriting)\b|\bdon'?t\s+(rename|add\s+(numbers?|prefixes?|numeric)|modify|overwrite|delete)\b.{0,50}\b(files?|folders?|anything)\b/i;
+
+    if (_CORRECTION_TIER1_RE.test(classifyMessage) || _CORRECTION_TIER2_RE.test(classifyMessage)) {
+      logger.info(`[Node:ParseIntent] Behavioral correction detected — capturing as global constraint: "${classifyMessage.slice(0, 80)}"`);
+
+      // Fire-and-forget: persist constraint immediately without blocking routing
+      if (mcpAdapter) {
+        const _correctionBlocks = ['shell.fs.*', 'shell.run.*', 'browser.act.*'];
+        mcpAdapter.callService('user-memory', 'constraint.add', {
+          rule:     classifyMessage,
+          scope:    'global',
+          blocks:   _correctionBlocks,
+          severity: 'hard',
+          source:   'user_correction',
+        }).catch(err => logger.warn(`[Node:ParseIntent] captureCorrection: constraint.add failed (non-fatal): ${err.message}`));
+      }
+
+      return {
+        ...state,
+        intent: { type: 'set_constraint', confidence: 0.97, entities: [], requiresMemoryAccess: false },
+        metadata: { parser: 'capture-correction-override', processingTimeMs: 0 },
+        _capturedCorrection: classifyMessage,
+      };
+    }
+  }
+
   // Build/create/make app override — ALWAYS command_automate, never web_search.
   // "build a tic tac toe game", "create a todo app", "make me a calculator",
   // "build a script that X", "create a tool to X", "make a dashboard for X"
@@ -870,6 +912,28 @@ if ((/\b(scan|read|list|analyze|summarize|go through|look (at|through)|check|ope
         factDeclaration: true,
       },
       metadata: { parser: 'personal-fact-override', processingTimeMs: 0 }
+    };
+  }
+
+  // ── Continuation phrase hard-guards ──────────────────────────────────────
+  // Short affirmative / "go ahead" phrases that follow a prior automation intent are
+  // always continuations of that intent.  Without this guard, phi4 classifies them as
+  // `greeting` or `general_knowledge` (both incorrect).
+  //
+  // Guard fires ONLY when:
+  //   1. carriedIntent === 'command_automate'  (most common continuation context)
+  //   2. The message matches a tight continuation pattern  (avoids false positives)
+  //   3. No other hard override fired above (we've already passed all overrides)
+  //
+  // Note: "ok", "sure", "yes" alone are too broad — they also precede memory/question
+  // continuations. We restrict to patterns that are unambiguous forward-action signals.
+  const CONTINUATION_PHRASE_RE = /^(go\s+ahead|proceed|do\s+it|run\s+it|execute|yes\s+(go\s+ahead|do\s+it|proceed|please|that'?s\s+(right|correct|fine|good)|run\s+it)|yeah\s+(go\s+ahead|do\s+it|proceed|please)|let'?s\s+(go|do\s+it|proceed)|fire\s+it\s+up|do\s+that|run\s+that|run\s+it\s+now|execute\s+it|start\s+it|kick\s+it\s+off|launch\s+it|start\s+the\s+plan|approve|confirm|approve\s+it|yes,?\s*please\s+(run|do|proceed|go|execute)|looks?\s+good[,.]?\s*(go\s+ahead|proceed|run\s+it)?|that'?s\s+(correct|right|fine)[,.]?\s*(go\s+ahead|proceed)?|good,?\s*proceed)\s*[!.?]*$/i;
+  if (carriedIntent === 'command_automate' && CONTINUATION_PHRASE_RE.test(classifyMessage.trim())) {
+    logger.info(`[Node:ParseIntent] Continuation phrase hard-guard → command_automate (carriedIntent): "${classifyMessage.slice(0, 60)}"`);
+    return {
+      ...state,
+      intent: { type: 'command_automate', confidence: 0.97, entities: [], requiresMemoryAccess: false },
+      metadata: { parser: 'continuation-phrase-guard', processingTimeMs: 0 },
     };
   }
 

@@ -31,6 +31,7 @@ const {
   _sessionCacheGet,
   extractEntityAnchors,
   _sessionCacheSet,
+  _isStaleBrowserActPlan,
   HIGH_CONFIDENCE_THRESHOLD,
 } = require('../utils/planCacheHelpers');
 
@@ -59,13 +60,18 @@ module.exports = async function checkPlanCache(state) {
   const cacheKey = _sessionCacheKey(userMessage);
   const cached   = _sessionCacheGet(cacheKey);
   if (cached) {
-    logger.info(`[Node:CheckPlanCache] Session cache hit — injecting _skillPlan instantly`);
-    return {
-      ...state,
-      _skillPlan:          cached.skillPlan,
-      _checkPlanCacheHit:  true,
-      _cacheSource:        'session',
-    };
+    // Invalidate stale browser.act plans for named-service tasks
+    if (_isStaleBrowserActPlan(cached.skillPlan, userMessage)) {
+      logger.info(`[Node:CheckPlanCache] Session cache invalidated — stale browser.act plan for named service`);
+    } else {
+      logger.info(`[Node:CheckPlanCache] Session cache hit — injecting _skillPlan instantly`);
+      return {
+        ...state,
+        _skillPlan:          cached.skillPlan,
+        _checkPlanCacheHit:  true,
+        _cacheSource:        'session',
+      };
+    }
   }
 
   // ── 2. Disk-based plan match with entity-anchor guard ─────────────────────

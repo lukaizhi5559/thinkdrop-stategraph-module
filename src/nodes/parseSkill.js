@@ -63,6 +63,12 @@ module.exports = async function parseSkill(state) {
   const { mcpAdapter, message, resolvedMessage, llmBackend } = state;
   const logger = state.logger || console;
 
+  // Fast-path: skill plan already built (post-approval re-entry) — nothing to match
+  if (state._skillPlan && Array.isArray(state._skillPlan) && state._skillPlan.length > 0) {
+    logger.info('[Node:ParseSkill] _skillPlan pre-built — skipping (post-approval fast-path)');
+    return state;
+  }
+
   const classifyMessage = (resolvedMessage || message || '').trim();
 
   if (!classifyMessage) return state;

@@ -80,6 +80,7 @@ function extractRuleCore(text) {
 // ---------------------------------------------------------------------------
 module.exports = async function storeConstraintNode(state) {
   const { mcpAdapter, message, resolvedMessage, logger } = state;
+  const isCapturedCorrection = !!state._capturedCorrection;
   const text = (resolvedMessage || message || '').trim();
 
   // Extract optional PIN: "... unless (the) secret/password/pin/code (is) ABC123"
@@ -114,12 +115,14 @@ module.exports = async function storeConstraintNode(state) {
 
     if (result?.data?.id || result?.id) {
       const ruleId = result?.data?.id || result?.id;
-      logger.info(`[Node:StoreConstraint] Constraint stored with id=${ruleId} pin=${pin ? 'yes' : 'no'}`);
+      logger.info(`[Node:StoreConstraint] Constraint stored with id=${ruleId} pin=${pin ? 'yes' : 'no'} correction=${isCapturedCorrection}`);
       return {
         ...state,
-        answer: pin
-          ? `Got it — I've set a PIN-protected rule. I'll block any attempt to ${ruleCore} unless you include the correct secret in your message.`
-          : `Got it — I've set a rule to prevent that. I'll block any attempt to ${ruleCore} going forward.`,
+        answer: isCapturedCorrection
+          ? `Understood — I've noted that and saved it as a permanent rule so I won't repeat that behaviour.`
+          : pin
+            ? `Got it — I've set a PIN-protected rule. I'll block any attempt to ${ruleCore} unless you include the correct secret in your message.`
+            : `Got it — I've set a rule to prevent that. I'll block any attempt to ${ruleCore} going forward.`,
       };
     }
 
@@ -127,7 +130,9 @@ module.exports = async function storeConstraintNode(state) {
     logger.warn('[Node:StoreConstraint] Constraint.add returned unexpected shape:', JSON.stringify(result));
     return {
       ...state,
-      answer: `Got it — I've stored that as a rule. I'll refuse any attempt to ${ruleCore} from now on.`,
+      answer: isCapturedCorrection
+        ? `Understood — I've noted that as a rule for future tasks.`
+        : `Got it — I've stored that as a rule. I'll refuse any attempt to ${ruleCore} from now on.`,
     };
 
   } catch (err) {

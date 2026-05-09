@@ -688,7 +688,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   // correction existed. Surface the exact question the resolver built so the user can
   // pick the right endpoint. On resume, browser.agent injects the answer as resume context
   // and re-runs without prompting again.
-  if ((skill === 'browser.agent' || skill === 'agentbrowser.agent') && failedStep.wrongDestination) {
+  if (skill === 'browser.agent' && failedStep.wrongDestination) {
     const agentId     = args?.agentId || '';
     const question    = failedStep.question || `Which version of ${agentId.replace(/\.agent$/, '')} would you like to open?`;
     const options     = Array.isArray(failedStep.options) ? failedStep.options : [];
@@ -710,7 +710,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   //   1. Any service other than googleaimode/duckduckgo → try Google AI Mode first
   //   2. googleaimode.agent failed           → try DuckDuckGo
   //   3. duckduckgo.agent failed             → ASK_USER (all auto-fallbacks done)
-  if ((skill === 'browser.agent' || skill === 'agentbrowser.agent') && failedStep.researchContentEmpty) {
+  if (skill === 'browser.agent' && failedStep.researchContentEmpty) {
     const agentId     = args?.agentId || '';
     const agentBase   = agentId.replace(/\.agent$/, '').toLowerCase();
     const serviceName = agentId.replace(/\.agent$/, '') || 'this service';
@@ -750,7 +750,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   // user-correctable (they need to sign in) — NOT plan-correctable. Falling
   // through to the LLM causes a REPLAN → same step → 120s timeout → REPLAN
   // loop (up to MAX_REPLANS=10, ~20 min). Surface as ASK_USER immediately.
-  if ((skill === 'browser.agent' || skill === 'agentbrowser.agent') && (
+  if (skill === 'browser.agent' && (
     failedStep.loginWallDetected ||
     /auth failed|waitforauth.*timed out|auth.*timed out|authentication not completed/i.test(combinedError)
   )) {

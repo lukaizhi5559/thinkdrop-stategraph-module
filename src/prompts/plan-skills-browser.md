@@ -1,4 +1,6 @@
-browser.act|args:{action:string,url?:string,selector?:string,text?:string,key?:string,sessionId?:string,timeoutMs?:number,intent?:string,nextActions?:string[]}|playwright-cli browser automation
+browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|domain agent factory+runner — handles auth, CAPTCHA, playbook caching, content extraction, service unavailability detection
+browser.act|args:{action:string,url?:string,selector?:string,text?:string,key?:string,sessionId?:string,timeoutMs?:number}|raw playwright-cli — ONLY for anonymous raw-URL reads with no named service
+synthesize|args:{prompt:string}|LLM synthesis of retrieved content — required after every data-retrieval step
 
 ## Output Format Requirements
 
@@ -6,55 +8,80 @@ browser.act|args:{action:string,url?:string,selector?:string,text?:string,key?:s
 
 Output ONLY a valid JSON array of skill steps. No markdown fences, no explanation, no prose.
 
-## browser.act key actions
+## Skill routing — CRITICAL
 
-navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|select|check|uncheck|press|keyboard|scroll|screenshot|pdf|getText|getPageText|evaluate|waitForSelector|waitForContent|waitForStableText|newPage|tab-new|tab-list|tab-close|tab-select|state-save|state-load|resize|examine|paste|pasteAttachment
+| Task | Correct skill |
+|------|---------------|
+| **Any named site/service** (google, biblegateway, wikipedia, duckduckgo, reddit, youtube, etc.) | `browser.agent { action: "run", agentId: "<service>.agent", task: "..." }` |
+| AI chatbot (ChatGPT, Gemini, Perplexity, Claude, Grok, DeepSeek, etc.) | `browser.agent { action: "run", agentId: "<service>.agent", task: "..." }` |
+| Raw URL with NO identifiable service name (user pastes a link) | `browser.act` navigate + getPageText |
+| Data retrieval task (lookup, search, read, "what is", "find") | append `synthesize` step AFTER the agent/browser step |
 
-**browser.act is a pure playwright-cli terminal skill** — every action spawns a `playwright-cli` subprocess. Sessions managed via `-s=<sessionId>`. Use `sessionId: "browser"` for all steps.
+**RULE: If you can identify the site/service by name from the user's request, ALWAYS use `browser.agent`.** browser.agent handles auth detection, CAPTCHA fallback, playbook caching, session persistence, service unavailability detection, and intelligent content extraction. Raw `browser.act` misses all of these.
 
-## Standard pattern for navigate + search
+## browser.agent — primary skill for named sites
 
-1. `navigate` → URL
-2. `examine` → add after navigate when filling/clicking is needed (detects not-logged-in, wrong page, modals)
-3. `fill` → selector=visible label or placeholder, text=query
-4. `press` → key=`Enter`
-5. `waitForStableText` → wait for content to load
+`browser.agent` with `action: "run"` delegates the ENTIRE task to a domain-specific agent. The agent:
+- Auto-builds itself if it doesn't exist yet (no `build_agent` step needed for simple tasks)
+- Navigates to the correct URL for the service
+- Detects and handles auth walls (login, OAuth, CAPTCHA)
+- Uses playbooks for known task patterns (search, read, compose)
+- Extracts content intelligently via CSS selectors and page.evaluate
+- Returns substantive text that synthesize can process
 
-**Selector rules:**
-- When no element refs: use visible label or aria-name (e.g. `"Search"`, `"Email"`)
-- NEVER click a search button — always submit with `press Enter`
-- `fill` handles contenteditable divs automatically — no separate `click` before `fill`
+**agentId naming:** lowercase service name + `.agent` suffix. Examples: `biblegateway.agent`, `google.agent`, `duckduckgo.agent`, `wikipedia.agent`, `reddit.agent`, `chatgpt.agent`, `gemini.agent`, `perplexity.agent`
 
-**Reading page content:**
-- Static public pages: `getPageText` after `navigate`
-- Dynamic/JS-rendered: `waitForStableText`
-- After search submit: `waitForStableText` with `timeoutMs: 15000`
-
-**`examine` args:** `intent` (what you are trying to do), `nextActions` (upcoming step descriptions), `sessionId`
-
-**Session rule:** Use `sessionId: "browser"` for ALL steps. NEVER use site names as sessionIds for public site tasks.
-
-**NEVER use a fixed sleep before reading content.**
-**NEVER navigate to hash-fragment URLs — use navigate + fill + press Enter.**
-
-## Example — navigate and search a public site
+### Example — search a named site
 
 ```json
 [
-  { "skill": "browser.act", "args": { "action": "navigate", "url": "https://www.biblegateway.com", "sessionId": "browser" }, "description": "Navigate to Bible Gateway" },
-  { "skill": "browser.act", "args": { "action": "fill", "selector": "Search", "text": "romans 1", "sessionId": "browser" }, "description": "Enter search query" },
-  { "skill": "browser.act", "args": { "action": "press", "key": "Enter", "sessionId": "browser" }, "description": "Submit search" },
-  { "skill": "browser.act", "args": { "action": "waitForStableText", "timeoutMs": 15000, "sessionId": "browser" }, "description": "Wait for results to load" }
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "biblegateway.agent", "task": "look up john 3:16" }, "description": "Look up John 3:16 on Bible Gateway" },
+  { "skill": "synthesize", "args": { "prompt": "Present the Bible verse text clearly to the user" }, "description": "Summarize the Bible Gateway results" }
 ]
 ```
 
-**CRITICAL — AI chatbot URLs:**
-| Name | Correct URL |
-|------|-------------|
-| Google Gemini | `https://gemini.google.com` |
-| ChatGPT | `https://chat.openai.com` |
-| Perplexity | `https://www.perplexity.ai` |
-| Claude | `https://claude.ai` |
+### Example — search Google
+
+```json
+[
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "google.agent", "task": "search for stoic philosophy" }, "description": "Search Google for stoic philosophy" },
+  { "skill": "synthesize", "args": { "prompt": "Summarize the top search results about stoic philosophy" }, "description": "Summarize search results" }
+]
+```
+
+### Example — ask an AI chatbot
+
+```json
+[
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "chatgpt.agent", "task": "ask what the benefits of meditation are" }, "description": "Ask ChatGPT about meditation benefits" },
+  { "skill": "synthesize", "args": { "prompt": "Present the AI's answer clearly" }, "description": "Present ChatGPT's response" }
+]
+```
+
+## browser.act — raw URL fallback ONLY
+
+Use browser.act ONLY when the user provides a raw URL with no identifiable service name.
+
+**browser.act key actions:** navigate|getPageText|waitForStableText|examine|fill|press|screenshot
+
+**Session rule:** Use `sessionId: "browser"` for ALL browser.act steps.
+
+### Example — read a raw URL (no named service)
+
+```json
+[
+  { "skill": "browser.act", "args": { "action": "navigate", "url": "https://some-random-site.com/page", "sessionId": "browser" }, "description": "Navigate to the URL" },
+  { "skill": "browser.act", "args": { "action": "getPageText", "sessionId": "browser" }, "description": "Read page content" },
+  { "skill": "synthesize", "args": { "prompt": "Summarize the page content for the user" }, "description": "Summarize page content" }
+]
+```
+
+## synthesize — REQUIRED after data retrieval
+
+**Agent synthesize rule:** When `browser.agent` is used to **retrieve information** the user needs to read, you MUST append a `synthesize` step immediately after. The `args.prompt` must describe what to extract and present.
+
+- Retrieval signals (synthesize required): "what is", "look up", "search for", "find", "show me", "read", "get", asking an AI a question
+- Action-only signals (no synthesize needed): "send", "post", "create", "delete", "submit"
 
 ## external.skill — user-installed skills
 
