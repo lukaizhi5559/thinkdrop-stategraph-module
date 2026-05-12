@@ -1,5 +1,6 @@
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|domain agent factory+runner — handles auth, CAPTCHA, playbook caching, content extraction, service unavailability detection
 browser.act|args:{action:string,url?:string,selector?:string,text?:string,key?:string,sessionId?:string,timeoutMs?:number}|raw playwright-cli — ONLY for anonymous raw-URL reads with no named service
+web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,maxResults?:number}|web search agent — use when: (1) site blocks bots/CAPTCHA and you need to find a direct article URL, (2) LLM-generated URL may be wrong (unknown service), (3) need navigation hints for a complex site. actions: search_and_navigate (returns bestUrl), research_domain (returns insights+bestUrl), get_tutorial_steps
 synthesize|args:{prompt:string}|LLM synthesis of retrieved content — required after every data-retrieval step
 
 ## Output Format Requirements
@@ -11,13 +12,17 @@ Output ONLY a valid JSON array of skill steps. No markdown fences, no explanatio
 ## Skill routing — CRITICAL
 
 | Task | Correct skill |
-|------|---------------|
+|------|--------------|
 | **Any named site/service** (google, biblegateway, wikipedia, duckduckgo, reddit, youtube, etc.) | `browser.agent { action: "run", agentId: "<service>.agent", task: "..." }` |
 | AI chatbot (ChatGPT, Gemini, Perplexity, Claude, Grok, DeepSeek, etc.) | `browser.agent { action: "run", agentId: "<service>.agent", task: "..." }` |
 | Raw URL with NO identifiable service name (user pastes a link) | `browser.act` navigate + getPageText |
+| **Site known to block bots** (stackoverflow, reddit, twitter/X, paywalled news) OR prior CAPTCHA detected | `web.agent { action: "search_and_navigate", query: "<task> site:<domain>" }` → `browser.act navigate(bestUrl)` → `getPageText` → `synthesize` |
+| **Unknown service / LLM may guess wrong domain** (service not in known list, novel tool) | `web.agent { action: "search_and_navigate", query: "<service> official website", preferDomain: "<service>" }` → use `bestUrl` to navigate |
 | Data retrieval task (lookup, search, read, "what is", "find") | append `synthesize` step AFTER the agent/browser step |
 
 **RULE: If you can identify the site/service by name from the user's request, ALWAYS use `browser.agent`.** browser.agent handles auth detection, CAPTCHA fallback, playbook caching, session persistence, service unavailability detection, and intelligent content extraction. Raw `browser.act` misses all of these.
+
+**EXCEPTION: Use `web.agent` first when the site is known to aggressively block bots** (stackoverflow, reddit, twitter/X, news sites with paywalls). `web.agent` finds a specific article URL via search, then `browser.act` navigates directly to it — bypassing CAPTCHA-triggering search forms entirely. Pattern: `web.agent search_and_navigate` → `browser.act navigate(bestUrl)` → `browser.act getPageText` → `synthesize`.
 
 ## browser.agent — primary skill for named sites
 

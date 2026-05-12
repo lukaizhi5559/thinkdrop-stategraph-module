@@ -448,9 +448,10 @@ module.exports = async function executeCommand(state) {
   const progressCallback = (_rawProgressCallback && state._skillPlanFile)
     ? (event) => {
         _rawProgressCallback(event);
-        if (event.type === 'step_done')   _rawProgressCallback({ ...event, type: 'plan:step_done' });
-        if (event.type === 'step_failed') _rawProgressCallback({ ...event, type: 'plan:step_failed' });
-        if (event.type === 'all_done')    _rawProgressCallback({ ...event, type: 'plan:complete' });
+        if (event.type === 'step_done')    _rawProgressCallback({ ...event, type: 'plan:step_done' });
+        if (event.type === 'step_skipped') _rawProgressCallback({ ...event, type: 'plan:step_done' });
+        if (event.type === 'step_failed')  _rawProgressCallback({ ...event, type: 'plan:step_failed' });
+        if (event.type === 'all_done')     _rawProgressCallback({ ...event, type: 'plan:complete' });
       }
     : _rawProgressCallback;
 
@@ -2712,6 +2713,7 @@ module.exports = async function executeCommand(state) {
   //   {{synthesisAnswerFile}} — temp file path containing synthesisAnswer
   //   {{prev_stdout}}         — stdout of the immediately preceding step (enables find→read→write chains)
   //   {{prev_watchId}}        — watchId from the last file.watch start step
+  //   {{bestUrl}}             — bestUrl returned by the last web.agent search_and_navigate step
   const synthesisAnswer = state.synthesisAnswer || '';
   const synthesisAnswerFile = state.synthesisAnswerFile || '';
   const prevStdout = skillResults.length > 0 ? (skillResults[skillResults.length - 1].stdout || '').trim() : '';
@@ -2723,8 +2725,10 @@ module.exports = async function executeCommand(state) {
     }
     return '';
   })();
+  // Resolve bestUrl: URL returned by the last successful web.agent search_and_navigate step
+  const webAgentBestUrl = state.webAgentBestUrl || '';
   let resolvedArgs = args;
-  if (synthesisAnswer || synthesisAnswerFile || prevStdout || prevWatchId) {
+  if (synthesisAnswer || synthesisAnswerFile || prevStdout || prevWatchId || webAgentBestUrl) {
     let argsJson = JSON.stringify(args);
     if (synthesisAnswer) {
       argsJson = argsJson.replace(/\{\{synthesisAnswer\}\}/g, synthesisAnswer.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
@@ -2738,7 +2742,18 @@ module.exports = async function executeCommand(state) {
     if (prevWatchId) {
       argsJson = argsJson.replace(/\{\{prev_watchId\}\}/g, prevWatchId.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
     }
+    if (webAgentBestUrl) {
+      argsJson = argsJson.replace(/\{\{bestUrl\}\}/gi, webAgentBestUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
+    }
     resolvedArgs = JSON.parse(argsJson);
+  }
+
+  // ── Guard: fail fast if a URL arg still contains an unresolved template token ─────────────
+  // Prevents navigating to literal "{{prev_stdout}}" when the prior step returned nothing.
+  // Regex catches template variables including dot notation (e.g., {{prev_stdout.besturl}})
+  if (typeof resolvedArgs.url === 'string' && /\{\{[a-zA-Z_0-9.]+\}\}/.test(resolvedArgs.url)) {
+    const unresolvedToken = (resolvedArgs.url.match(/\{\{[a-zA-Z_0-9.]+\}\}/) || [])[0];
+    throw new Error(`Unresolved template variable ${unresolvedToken} in URL — prior step returned no output. Check that the preceding step succeeded and produced a URL.`);
   }
 
   // ── browser.agent task-description cap ───────────────────────────────────────
@@ -4386,6 +4401,19 @@ module.exports = async function executeCommand(state) {
         stepResult.stdout = `Crawled ${crawlTitle}${crawlChars}${crawlTrunc}\n\n${raw.content || ''}`;
         logger.info(`[Node:ExecuteCommand] web.crawl done: ${crawlTitle}${crawlChars}${crawlTrunc}`);
       }
+      // web.agent: synthesize a human-readable stdout so synthesize/reviewExecution can read the result
+      if (skill === 'web.agent' && raw.ok && raw.bestUrl) {
+        const webAgentTitle = raw.title ? ` — "${raw.title}"` : '';
+        stepResult.stdout = `Best URL: ${raw.bestUrl}${webAgentTitle}`;
+        if (raw.snippet) stepResult.stdout += `\n${raw.snippet}`;
+        logger.info(`[Node:ExecuteCommand] web.agent search_and_navigate: bestUrl=${raw.bestUrl}`);
+      } else if (skill === 'web.agent' && raw.ok && !raw.bestUrl) {
+        // web.agent succeeded but found no URL (score=0) — still set stdout so {{prev_stdout}}
+        // is never empty, preventing downstream steps from navigating to a literal token.
+        const fallbackText = raw.snippet || raw.query || resolvedArgs.query || 'No URL found';
+        stepResult.stdout = `web.agent: no URL found. Query: ${fallbackText}`;
+        logger.info(`[Node:ExecuteCommand] web.agent search_and_navigate: no bestUrl — stdout set to fallback`);
+      }
       const resolvedSkillName = skill === 'external.skill'
         ? (stepResult.skillName || resolvedArgs.name || 'external.skill')
         : null;
@@ -4897,6 +4925,10 @@ module.exports = async function executeCommand(state) {
     }
 
     // Step succeeded (or was optional) — advance cursor
+    // Capture bestUrl from web.agent so {{bestUrl}} resolves in subsequent steps
+    const newWebAgentBestUrl = (skill === 'web.agent' && stepResult.ok && raw.bestUrl)
+      ? raw.bestUrl
+      : (state.webAgentBestUrl || null);
     return {
       ...state,
       skillPlan: patchedSkillPlan,   // carry forward the (possibly patched) plan with real image paths
@@ -4906,6 +4938,7 @@ module.exports = async function executeCommand(state) {
       activeBrowserSessionId,
       activeBrowserUrl,
       lastOpenedFilePath,
+      webAgentBestUrl: newWebAgentBestUrl,
       commandExecuted: isLastStep,
       answer: lastStepAnswer  // set so voice service _stategraphLaneResponse gets it for TTS
     };

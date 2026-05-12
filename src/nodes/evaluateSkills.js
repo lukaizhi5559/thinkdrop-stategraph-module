@@ -365,7 +365,10 @@ Output ONLY valid JSON.`;
 
     if (progressCallback) progressCallback({
       type: 'retrying_with_fix',
-      message: `Adjusting approach for ${verdict.contextKey} and retrying...`
+      message: `Adjusting approach for ${verdict.contextKey} and retrying...`,
+      ruleText: verdict.ruleText,
+      contextKey: verdict.contextKey,
+      category: verdict.category || 'general',
     });
 
     // Reset plan state for replan — planSkills will pick up new context rule

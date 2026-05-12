@@ -303,7 +303,7 @@ module.exports = async function recoverSkill(state) {
   }
 
   // ── Fast-path: known recoverable patterns (no LLM call needed) ──────────────
-  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl, replanCount, state.creatorSkillPath);
+  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl, replanCount, state.creatorSkillPath, state.webAgentBestUrl || null);
   if (fastRecovery) {
     return applyRecovery(fastRecovery, state, skillPlan, skillCursor, stepRetryCount, replanCount, logger);
   }
@@ -678,7 +678,7 @@ Decide the recovery strategy.`;
 // Fast-path recovery: handle well-known failure patterns without an LLM call
 // ---------------------------------------------------------------------------
 
-function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0, creatorSkillPath = null) {
+function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0, creatorSkillPath = null, webAgentBestUrl = null) {
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
 
@@ -702,27 +702,56 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     };
   }
 
+  // ── browser.agent run: wrong domain (squatter/parking page self-heal failed) ─
+  // browser.agent landed on a domain squatter and web.agent could not find the
+  // correct URL internally. Replan using web.agent at the plan level to find
+  // a direct URL and navigate to it, bypassing the incorrect agent altogether.
+  if (skill === 'browser.agent' && failedStep.wrongDomain) {
+    const agentId      = args?.agentId || '';
+    const serviceName  = failedStep.expectedService?.replace(/\.agent$/, '') || agentId.replace(/\.agent$/, '') || 'this service';
+    const taskDesc     = args?.task || '';
+    const landedUrl    = failedStep.landedUrl || 'unknown';
+    logger.info(`[Node:RecoverSkill] Fast-path: ${skill} wrongDomain for "${agentId}" (landed=${landedUrl}) → REPLAN via web.agent`);
+    return {
+      action: 'REPLAN',
+      suggestion: `${agentId} navigated to a domain parking/squatter page (${landedUrl}). Use web.agent to find the correct URL for "${serviceName}", then navigate directly.`,
+      constraint: `MUST replace the failing ${agentId} step with these steps in order:
+1. { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "${serviceName} official website ${taskDesc.replace(/"/g, '').slice(0, 60)}", "preferDomain": "${serviceName}" }, "description": "Find correct URL for ${serviceName} via web search" }
+2. { "skill": "browser.act", "args": { "action": "navigate", "url": "{{bestUrl}}", "sessionId": "browser" }, "description": "Navigate directly to correct URL" }
+3. { "skill": "browser.act", "args": { "action": "getPageText", "sessionId": "browser" }, "description": "Read page content" }
+Then keep any synthesize step that follows. Do NOT use browser.agent for this — navigate directly via browser.act.`,
+    };
+  }
+
   // ── browser.agent run: research content empty (login/nav page) ──────────
   // browser.agent returned {researchContentEmpty:true} when the page loaded but
   // contained only navigation/welcome content instead of actual research data.
   //
   // Auto-fallback chain (transparent to the user until all options are exhausted):
-  //   1. Any service other than googleaimode/duckduckgo → try Google AI Mode first
-  //   2. googleaimode.agent failed           → try DuckDuckGo
-  //   3. duckduckgo.agent failed             → ASK_USER (all auto-fallbacks done)
+  //   0. Any service other than web/googleaimode/duckduckgo → try web.agent first
+  //      (finds a direct article URL, bypasses CAPTCHA-triggering search forms)
+  //   1. web.agent failed/unavailable → try Google AI Mode
+  //   2. googleaimode.agent failed    → try DuckDuckGo
+  //   3. duckduckgo.agent failed      → ASK_USER (all auto-fallbacks done)
   if (skill === 'browser.agent' && failedStep.researchContentEmpty) {
     const agentId     = args?.agentId || '';
     const agentBase   = agentId.replace(/\.agent$/, '').toLowerCase();
     const serviceName = agentId.replace(/\.agent$/, '') || 'this service';
     const taskDesc    = args?.task || '';
 
-    if (agentBase !== 'googleaimode' && agentBase !== 'duckduckgo') {
-      // First fallback: try Google AI Mode automatically
-      logger.info(`[Node:RecoverSkill] Fast-path: ${skill} research-content-empty for "${agentId}" → auto-REPLAN googleaimode.agent`);
+    if (agentBase !== 'webagent' && agentBase !== 'googleaimode' && agentBase !== 'duckduckgo') {
+      // First fallback: use web.agent to find a direct URL to the content
+      // (like a human Googling to find the specific article URL, bypassing bot-blocking search forms)
+      logger.info(`[Node:RecoverSkill] Fast-path: ${skill} research-content-empty for "${agentId}" → auto-REPLAN web.agent search_and_navigate`);
+      const _escapedTask = taskDesc.replace(/"/g, '').slice(0, 80);
       return {
         action: 'REPLAN',
-        suggestion: `${serviceName} returned a navigation/welcome page. Automatically retrying with Google AI Mode (google.com).`,
-        constraint: `Replace the failing ${agentId} step with a googleaimode.agent step: { "skill": "browser.agent", "args": { "action": "run", "agentId": "googleaimode.agent", "task": "${taskDesc.replace(/"/g, '\\"')}" } }. Keep all other plan steps unchanged.`,
+        suggestion: `${serviceName} returned a navigation/welcome page (likely CAPTCHA or bot detection). Using web.agent to find a direct article URL, then navigating to it directly to bypass the search form.`,
+        constraint: `MUST replace the failing ${agentId} step with these steps in order:
+1. { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "${_escapedTask} site:${serviceName.toLowerCase()}.com", "preferDomain": "${serviceName.toLowerCase()}" }, "description": "Find direct URL for the content via web search" }
+2. { "skill": "browser.act", "args": { "action": "navigate", "url": "{{bestUrl}}", "sessionId": "browser" }, "description": "Navigate directly to content URL (no CAPTCHA)" }
+3. { "skill": "browser.act", "args": { "action": "getPageText", "sessionId": "browser" }, "description": "Read page content" }
+Then keep any synthesize step that follows. The {{bestUrl}} token in the navigate step will be automatically resolved to the URL returned by web.agent.`,
       };
     }
 
@@ -740,7 +769,7 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     logger.info(`[Node:RecoverSkill] Fast-path: duckduckgo.agent research-content-empty → ASK_USER (all fallbacks exhausted)`);
     return {
       action: 'ASK_USER',
-      question: `All automatic search fallbacks failed (tried ${serviceName}, Google AI Mode, and DuckDuckGo) — each returned a navigation/welcome page instead of results.\n\nHow would you like to proceed?`,
+      question: `All automatic search fallbacks failed (tried ${serviceName}, web.agent, Google AI Mode, and DuckDuckGo) — each returned a navigation/welcome page instead of results.\n\nHow would you like to proceed?`,
       options: ['Try a different source (specify below)', 'Skip this research step', 'Cancel task'],
     };
   }
@@ -1118,6 +1147,31 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   // browser.act failures
   if (skill === 'browser.act') {
     const action = args.action || '';
+
+    // ── Unresolved {{bestUrl}} template in navigate url ────────────────────────
+    // web.agent returned a bestUrl but it was never substituted because the LLM
+    // used {{bestUrl}} as a literal template placeholder in the plan step args.
+    // If we have the real URL in state, AUTO_PATCH it directly — no LLM round-trip needed.
+    if (action === 'navigate' && /\{\{best\.?url\}\}/i.test(args.url || '')) {
+      if (webAgentBestUrl) {
+        logger.info(`[Node:RecoverSkill] Fast-path: browser.act navigate has unresolved {{bestUrl}} — AUTO_PATCH with ${webAgentBestUrl}`);
+        return {
+          action: 'AUTO_PATCH',
+          patchedArgs: { url: webAgentBestUrl },
+          note: `Resolved {{bestUrl}} placeholder to ${webAgentBestUrl} from prior web.agent result`,
+        };
+      }
+      // No bestUrl in state — the web.agent step likely failed or was skipped.
+      // Replan: run web.agent first, then navigate using {{bestUrl}}.
+      logger.info(`[Node:RecoverSkill] Fast-path: browser.act navigate has unresolved {{bestUrl}} but no webAgentBestUrl in state → REPLAN`);
+      const sessionId = args.sessionId || 'browser';
+      const taskHint = (skillPlan[cursor] || {}).description || 'the required content';
+      return {
+        action: 'REPLAN',
+        suggestion: `The browser.act navigate step used {{bestUrl}} as the URL but no web.agent search_and_navigate step produced a real URL. Add a web.agent step first to find the correct URL, then navigate to it.`,
+        constraint: `MUST add a web.agent step before the failing navigate step: { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "${taskHint.replace(/"/g, '').slice(0, 80)}" }, "description": "Find correct URL" }. Then the browser.act navigate step MUST use {{bestUrl}} as its url — it will be auto-resolved at runtime.`,
+      };
+    }
 
     // Element not found on click — the selector didn't match any link/button on the page.
     // Fast-path: take a fresh snapshot, then replan with examine + click using the exact snapshot label.

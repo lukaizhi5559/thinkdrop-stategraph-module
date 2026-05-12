@@ -11,12 +11,16 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string,en
 playwright.agent|args:{goal:string,sessionId?:string,url?:string,maxTurns?:number,headed?:boolean,timeoutMs?:number}|[sub-agent]_agentic_browser_loop__LLM_drives_snapshot→action→repeat_until_goal_done__use_for_complex_open_ended_tasks_on_PUBLIC_or_ANONYMOUS_sites_only__(scraping,_read-only_research,_AI_chatbots_with_no_API).__⚠️_NEVER_use_for_any_service_in_AVAILABLE_AGENTS_or_any_registered_OAuth_service_(Gmail,_Slack,_Notion,_etc.)—those_MUST_use_browser.agent_{action:run}.
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI_agent_factory+runner.__Takes_ONE_high-level_task,_reads_agent_descriptor_from_DuckDB,_infers_correct_CLI_commands_via_LLM,_executes,_returns_result.__actions:_run_(delegate_task),_build_agent_(discover+install+register_CLI_service),_list_agents,_validate_agent,_preflight_check.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists;_use_action:build_agent_to_create_new_agents.
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_Browser/REST_API_agent_factory+runner.__Handles_OAuth_browser_services_AND_REST_API/API-key_services_(ClickSend,_Mailgun,_Twilio,_etc.).__Takes_ONE_task,_reads_descriptor,_handles_all_auth,_infers+executes_curl_or_browser_steps.__actions:_run_(delegate_task),_build_agent_(crawl_docs+create_descriptor),_list_agents.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists.
+web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,maxResults?:number}|[web_search_agent]_Searches_the_web_via_MCP_web-search_service_and_returns_structured_results.__Use_when:_(1)_target_site_blocks_bots/CAPTCHA_and_you_need_a_direct_article_URL_without_triggering_a_search_form,_(2)_service_URL_is_unknown_or_LLM_may_guess_wrong_domain,_(3)_need_navigation_hints_for_complex_SaaS_before_browser_automation.__actions:_search_and_navigate_(returns_{bestUrl,title,snippet}),_research_domain_(returns_{insights,insightsText,bestUrl,confidence}),_get_tutorial_steps.__After_search_and_navigate,_use_browser.act_navigate(bestUrl)_to_go_directly_to_content._NEVER_use_web.agent_for_services_in_AVAILABLE_AGENTS—those_already_handle_auth_correctly.
 
 ## Template variables
 
 - `{{synthesisAnswer}}` — full text output of the last `synthesize` step
 - `{{synthesisAnswerFile}}` — temp file path containing the synthesis output
-- `{{prev_stdout}}` — stdout of the immediately preceding step
+- `{{prev_stdout}}` — stdout of the immediately preceding step (full string, not an object)
+- `{{bestUrl}}` — best URL returned by `web.agent search_and_navigate` (use this for navigation, not {{prev_stdout}})
+
+**IMPORTANT**: Templates are simple string substitution. `{{prev_stdout}}` returns the entire stdout string (e.g., "Best URL: https://..."), NOT an object you can access with dots. To get just the URL from web.agent, use `{{bestUrl}}`.
 
 ## Output Format Requirements
 
@@ -45,7 +49,44 @@ browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|
 | **Any web app that requires a login/account** — AI chatbots (ChatGPT, Claude, Perplexity, Gemini, Grok, etc.), productivity tools, social platforms, SaaS apps — **even if no open API exists** | Check AVAILABLE AGENTS first; if not found → `browser.agent { action: 'build_agent', service: '<name>' }` then `{ action: 'run', agentId: '...', task: '...' }`. Each service gets its own isolated browser session with persistent auth — no shared session, no re-login. **NEVER use `playwright.agent` or raw `browser.act` steps for services requiring login.** |
 | **Discovery task on a known agent** — "find", "browse", "show me what's on", "explore", "discover", "look for", "search for" something on a site where the navigation path is UNKNOWN | `browser.agent { action: 'explore', agentId: '<id>', goal: '<discovery goal>' }` — explore navigates, detects auth, iterates nav items until goal is met. Use `explore` when steps are NOT predetermined. Use `run` when specific actions are known (compose, send, fill, create). |
 | Truly public / anonymous content — no login required (Wikipedia, news articles, public docs, weather, open-access pages) | `playwright.agent` with `goal` and `url` — or `browser.act` for simple navigate + read |
+| **Site known to block bots/CAPTCHA** (stackoverflow, reddit, twitter/X, paywalled news) OR service URL is uncertain | `web.agent { action: "search_and_navigate", query: "<task> site:<domain>", preferDomain: "<domain>" }` → `browser.act navigate(bestUrl)` → `browser.act getPageText` → `synthesize` |
+| **Novel/unknown service** where LLM might guess the wrong URL | `web.agent { action: "search_and_navigate", query: "<service> official website" }` → use `bestUrl` to navigate directly |
 | **Local system only**: file ops, grep, ffmpeg, local git, run local scripts, open apps | `shell.run` bash |
+| **Search for videos on a video platform** — "search YouTube for X", "find videos about X on Vimeo/TikTok/Rumble/Facebook", "look up X on YouTube" | `browser.agent { action: 'run', agentId: 'youtube.agent' (or vimeo.agent etc.), task: '<full request>' }` → `synthesize` — the agent's Search Videos playbook navigates directly to `/results?search_query=`, calls `waitForStableText` + `getPageText` to capture results, then synthesize presents them. **Do NOT use `video.agent` for search-only tasks.** |
+| **Watch, summarize, or learn from a specific video** — "watch this YouTube video and give me the steps", "summarize this tutorial", "what does this video teach?" with a **verified URL from a prior step** | `video.agent { action: 'watch_video', videoUrl: '<verified_url>', goal: '<what to extract>' }` — ⚠️ **NEVER invent or guess a videoUrl.** Only call `watch_video` if you have a real URL obtained from a prior `find_and_watch_tutorial` or `web.agent` step. YouTube video IDs are exactly 11 characters (e.g. `dQw4w9WgXcQ`). If you only have a title/name, use `find_and_watch_tutorial` instead. |
+| **Find and watch a tutorial video** — "find a YouTube tutorial about sourdough and tell me the steps", "find a Vimeo tutorial about X and summarize it", OR any video request where you don't have a verified URL | `video.agent { action: 'find_and_watch_tutorial', platform: 'youtube' (or vimeo/rumble/facebook/tiktok), query: '<search terms>', goal: '<what to extract>' }` — searches the platform, picks a suitable tutorial-length video, OCR-samples it, and returns actionable steps. **QUERY CONSTRUCTION RULES — follow exactly:** (1) NEVER use a person/channel name alone as the query — always include the topic (e.g. "watch natasha sourdough" → `query: "Natasha Kitchen sourdough bread tutorial"`, NOT `"Natasha"`). (2) Strip possessive apostrophes: `"Natasha's Kitchen"` → `"Natasha Kitchen"`. (3) Add intent keyword when the user's goal implies learning: append `tutorial`, `recipe`, `how to`, or `guide` if not already present. (4) Keep query under 8 words — remove filler words like "video", "watch", "find me". (5) Examples: "watch joshua weissman pasta video" → `"Joshua Weissman pasta recipe"` · "find babish sourdough tutorial" → `"Binging with Babish sourdough bread tutorial"` · "natasha sourdough bread" → `"Natasha Kitchen sourdough bread tutorial"` |
+
+## Priority Hierarchy — CLI → API → Browser
+
+When deciding how to handle a user request, follow this priority order:
+
+**Step 1: Can CLI do this?** (Most reliable — no auth needed, works offline)
+- Check AVAILABLE_AGENTS for a CLI agent matching the task
+- If found: `cli.agent { action: 'run', agentId: '<cli_agent>', task: '...' }`
+- If NOT found: Use `cli.agent { action: 'build_agent', service: '<name>' }` to discover/install
+- Examples: transcribe videos (`transcribe-anything`), convert files (`ffmpeg`), git operations (`gh`)
+
+**Step 2: Can API/Curl do this?** (Fast, but may need auth)
+- Check AVAILABLE_AGENTS for API_KEY agents
+- Use `browser.agent` for API-key services (it handles curl internally)
+- Only if NO agent exists and task is simple: consider direct API call
+
+**Step 3: Browser Automation** (Slowest, but captures visual context)
+- Use `browser.agent` for OAuth services requiring login
+- Use `playwright.agent` for public/anonymous sites
+- Use `video.agent` for "watching" videos (internally uses CLI transcribe + OCR)
+
+**Fast-Path Pattern Matching (1ms check before full decision):**
+- Words like "transcribe", "convert", "download", "extract", "process file" → Try CLI first
+- Words like "goto", "visit", "open site", "check website" → Browser directly
+- Words like "api", "curl", "post to" → API directly
+
+**Hybrid Video Intelligence:**
+When user says "watch this video", `video.agent` automatically:
+1. Tries CLI transcription first (10s, full transcript)
+2. Extracts key moments from transcript
+3. Does targeted OCR at those moments (visual context)
+4. Combines for complete understanding
 
 **FORBIDDEN — never use `shell.run curl` to call external API services** (Mailgun, Gmail API, Slack API, Stripe, Twilio, etc.). `shell.run` has no credential management, no keychain access, no token refresh, and no retry on 401 — it always fails when tokens expire or keys are unset. Use `browser.agent` or `cli.agent` for ALL external services. `shell.run` is for local system commands only.
 

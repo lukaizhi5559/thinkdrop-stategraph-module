@@ -19,6 +19,8 @@ command not found → ASK_USER: offer to install via brew
 timeout → AUTO_PATCH: increase timeoutMs (fast-path handles this automatically — do NOT ASK_USER for timeouts)
 wrong cwd → AUTO_PATCH: correct the cwd in args
 missing parent dir → AUTO_PATCH: add -p flag to mkdir argv
+browser.agent returned researchContentEmpty (CAPTCHA or bot block) → REPLAN: use web.agent { action: "search_and_navigate", query: "<task> site:<domain>" } to find a direct article URL, then browser.act navigate to that URL + getPageText. Do NOT retry the same browser.agent step — direct URL navigation bypasses bot-blocking search forms.
+browser.agent wrongDomain (landed on parking/squatter page) → REPLAN: use web.agent { action: "search_and_navigate", query: "<service> official website <task>", preferDomain: "<service>" } to find the correct URL, then browser.act navigate directly. Do NOT use browser.agent again for this service without a verified correct URL.
 browser selector not found → REPLAN: try different selector strategy
 app not active → REPLAN: add ui.waitFor step before ui.axClick or ui.findAndClick
 ui.axClick element not found (axError contains "Element not found") → AUTO_PATCH: try with role="any" and a shorter/simpler label (e.g. "Send" instead of "Send Message button"). If still failing after 1 retry → REPLAN: switch to keyboard shortcut (ui.typeText with CMD+key) if one exists for this action, otherwise fall back to ui.moveMouse + ui.click as last resort.
