@@ -53,8 +53,8 @@ web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,
 | **Novel/unknown service** where LLM might guess the wrong URL | `web.agent { action: "search_and_navigate", query: "<service> official website" }` → use `bestUrl` to navigate directly |
 | **Local system only**: file ops, grep, ffmpeg, local git, run local scripts, open apps | `shell.run` bash |
 | **Search for videos on a video platform** — "search YouTube for X", "find videos about X on Vimeo/TikTok/Rumble/Facebook", "look up X on YouTube" | `browser.agent { action: 'run', agentId: 'youtube.agent' (or vimeo.agent etc.), task: '<full request>' }` → `synthesize` — the agent's Search Videos playbook navigates directly to `/results?search_query=`, calls `waitForStableText` + `getPageText` to capture results, then synthesize presents them. **Do NOT use `video.agent` for search-only tasks.** |
-| **Watch, summarize, or learn from a specific video** — "watch this YouTube video and give me the steps", "summarize this tutorial", "what does this video teach?" with a **verified URL from a prior step** | `video.agent { action: 'watch_video', videoUrl: '<verified_url>', goal: '<what to extract>' }` — ⚠️ **NEVER invent or guess a videoUrl.** Only call `watch_video` if you have a real URL obtained from a prior `find_and_watch_tutorial` or `web.agent` step. YouTube video IDs are exactly 11 characters (e.g. `dQw4w9WgXcQ`). If you only have a title/name, use `find_and_watch_tutorial` instead. |
-| **Find and watch a tutorial video** — "find a YouTube tutorial about sourdough and tell me the steps", "find a Vimeo tutorial about X and summarize it", OR any video request where you don't have a verified URL | `video.agent { action: 'find_and_watch_tutorial', platform: 'youtube' (or vimeo/rumble/facebook/tiktok), query: '<search terms>', goal: '<what to extract>' }` — searches the platform, picks a suitable tutorial-length video, OCR-samples it, and returns actionable steps. **QUERY CONSTRUCTION RULES — follow exactly:** (1) NEVER use a person/channel name alone as the query — always include the topic (e.g. "watch natasha sourdough" → `query: "Natasha Kitchen sourdough bread tutorial"`, NOT `"Natasha"`). (2) Strip possessive apostrophes: `"Natasha's Kitchen"` → `"Natasha Kitchen"`. (3) Add intent keyword when the user's goal implies learning: append `tutorial`, `recipe`, `how to`, or `guide` if not already present. (4) Keep query under 8 words — remove filler words like "video", "watch", "find me". (5) Examples: "watch joshua weissman pasta video" → `"Joshua Weissman pasta recipe"` · "find babish sourdough tutorial" → `"Binging with Babish sourdough bread tutorial"` · "natasha sourdough bread" → `"Natasha Kitchen sourdough bread tutorial"` |
+| **Watch, extract, summarize, or transcribe a specific video** — "watch this YouTube video and give me the steps", "summarize this tutorial", "what does this video teach?", "get transcript of this video" | **CLI-first:** `cli.agent { action: 'build_agent', service: 'yt-dlp' }` → `cli.agent { action: 'run', agentId: 'yt-dlp.agent', task: '<full request>' }` — yt-dlp.agent discovers and resolves the URL via web.agent pre_step automatically. **Fallback if CLI unavailable:** `browser.agent { action: 'run', agentId: 'youtube.agent', task: 'watch video <url> and extract <goal>' }` |
+| **Find and watch a tutorial video** — "find a YouTube tutorial about sourdough and tell me the steps", OR any video request without a verified URL | **CLI-first:** `cli.agent { action: 'build_agent', service: 'yt-dlp' }` → `cli.agent { action: 'run', agentId: 'yt-dlp.agent', task: 'find and extract: <description>' }` — yt-dlp.agent uses web.agent pre_step to discover the URL. **Fallback:** `browser.agent { action: 'run', agentId: 'youtube.agent', task: 'find and watch tutorial: <description>' }` |
 
 ## Priority Hierarchy — CLI → API → Browser
 
@@ -73,20 +73,32 @@ When deciding how to handle a user request, follow this priority order:
 
 **Step 3: Browser Automation** (Slowest, but captures visual context)
 - Use `browser.agent` for OAuth services requiring login
-- Use `playwright.agent` for public/anonymous sites
-- Use `video.agent` for "watching" videos (internally uses CLI transcribe + OCR)
+- Use `playwright.agent` for public/anonymous sites (no CLI equivalent)
+- **Video fallback:** When no CLI agent is available for a video task, use `browser.agent` with the appropriate domain agent (youtube.agent, vimeo.agent, etc.) — domain playbooks auto-delegate to `video.agent` internally
 
 **Fast-Path Pattern Matching (1ms check before full decision):**
+- Words like "watch", "extract steps from video", "transcribe video", "download video", "get video transcript" → **CLI-first**: build yt-dlp.agent → run
+- Words like "search YouTube for X", "find videos about X" (search-only, no extraction) → `browser.agent` with domain agent (youtube.agent, etc.)
 - Words like "transcribe", "convert", "download", "extract", "process file" → Try CLI first
 - Words like "goto", "visit", "open site", "check website" → Browser directly
 - Words like "api", "curl", "post to" → API directly
 
-**Hybrid Video Intelligence:**
-When user says "watch this video", `video.agent` automatically:
-1. Tries CLI transcription first (10s, full transcript)
-2. Extracts key moments from transcript
-3. Does targeted OCR at those moments (visual context)
-4. Combines for complete understanding
+**Video Task Architecture — CLI-first with browser fallback:**
+
+**Preferred path (CLI):**
+1. `cli.agent { action: 'build_agent', service: 'yt-dlp' }` — discovers, installs, and configures yt-dlp at runtime
+2. `cli.agent { action: 'run', agentId: 'yt-dlp.agent', task: '<user goal>' }` — pre_steps resolve URL via web.agent automatically
+3. `synthesize` — present extracted content
+
+**Fallback path (browser) — use only when yt-dlp/CLI unavailable:**
+1. `browser.agent { action: 'run', agentId: 'youtube.agent', task: '...' }` — domain playbook delegates to `video.agent` internally
+
+**Available video domain agents (browser fallback)**: youtube.agent, vimeo.agent, rumble.agent, tiktok.agent, facebook.agent
+
+**CRITICAL**: 
+- `video.agent` is an INTERNAL sub-skill, NOT a planner-callable skill
+- NEVER call `video.agent` directly from planner — use CLI-first or `browser.agent` + domain agent
+- Domain agents have built-in playbooks that auto-delegate to `video.agent` for extraction tasks
 
 **FORBIDDEN — never use `shell.run curl` to call external API services** (Mailgun, Gmail API, Slack API, Stripe, Twilio, etc.). `shell.run` has no credential management, no keychain access, no token refresh, and no retry on 401 — it always fails when tokens expire or keys are unset. Use `browser.agent` or `cli.agent` for ALL external services. `shell.run` is for local system commands only.
 

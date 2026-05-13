@@ -145,6 +145,10 @@ const _SHELL_SIGNAL_RE = /\b(python3?|pip3?|brew\s+install|shell|bash|script|csv
 // Signals that indicate a macOS-specific task (Finder, osascript, desktop, system settings, etc.)
 const _MACOS_SIGNAL_RE = /\b(finder|desktop|osascript|applescript|plistbuddy|plist|killall\s+finder|mdfind|mdls|xattr|color\s+tag|finder\s+(color|label)|open\s+-a|system\s+(settings|preferences)|system\s+pref|arrange.*desktop|clean\s+up.*desktop|tidy.*desktop|organize.*desktop|snap.*grid|neat.*desktop|desktop.*neat|desktop.*tidy|desktop.*icon|icon.*desktop|desktop.*folder|folder.*desktop|desktop.*file|file.*desktop)\b/i;
 
+// Tasks that are ONLY pure browser navigation — skip cli-first appendix for these.
+// Pattern: message starts with or leads with a navigation verb and nothing more complex.
+const _BROWSER_ONLY_RE = /^(go\s+to|goto|navigate\s+to|visit|open\s+(?:the\s+)?(?:website|page|url|site)?\s*https?|log\s+in\s+to|login\s+to|sign\s+in\s+to|connect\s+to)\b/i;
+
 // Signals that a task is a simple public-site navigate with no login, agent, or complex ops.
 const _SLIM_BROWSE_VERB_RE    = /^(goto|go\s+to|navigate\s+to|visit|open|look\s+up|search\s+on|search\s+for|browse)\b/i;
 const _SLIM_COMPLEX_VOCAB_RE  = /\b(send|email|text\s+me|sms|slack|discord|telegram|whatsapp|dm|notify|login|log\s+in|sign\s+in|password|api|curl|shell|script|file|download|upload|create|build|make|generate|schedule|cron|install|setup|compare|spreadsheet|pdf|csv|excel|screenshot|screen)\b/i;
@@ -279,7 +283,7 @@ module.exports = async function planSkills(state) {
   const userMessage = (state._dataPrefix ? state._dataPrefix + '\n' : '') + (resolvedMessage || message) + _dataFileSuffix;
 
   // ── Select system prompt — composable: slim / full / full+shell ───────────
-  const SKILL_SYSTEM_PROMPT = buildSystemPrompt(userMessage, state) || SKILL_SYSTEM_PROMPT_FALLBACK;
+  let SKILL_SYSTEM_PROMPT = buildSystemPrompt(userMessage, state) || SKILL_SYSTEM_PROMPT_FALLBACK;
   const correctionSourcePrompt = state._planCorrectionMode && state._planCorrectionSourcePrompt
     ? String(state._planCorrectionSourcePrompt)
     : '';
@@ -1673,6 +1677,32 @@ Task: "${userMessage}"`;
               if (_svcUnderscore !== _svc) _registeredAgentServiceMap[_svcUnderscore] = _a.id;
             }
             logger.debug(`[Node:PlanSkills] Registered agent session map: ${JSON.stringify(Object.keys(_registeredAgentServiceMap))}`);
+
+            // ── CLI-first appendix: append plan-skills-cli-first.md unless bypassed ──
+            // Bypass conditions:
+            //   1. Pure browser navigation task (_BROWSER_ONLY_RE matches)
+            //   2. User explicitly named a registered agent (e.g. "using my gmail.agent")
+            // For all other command_automate tasks, append CLI-first guidance.
+            const _cliFirstRaw = userMessage || '';
+            const _isBrowserOnlyTask = _BROWSER_ONLY_RE.test(_cliFirstRaw);
+            // Detect explicit agent reference: "my gmail.agent", "using youtube.agent", "via github.agent"
+            const _AGENT_EXPLICIT_RE = /\b(?:my|using|via|with|through)\s+(\w+)\.agent\b|\b(\w+)\.agent\b/i;
+            const _agentExplicitMatch = _AGENT_EXPLICIT_RE.exec(_cliFirstRaw);
+            const _agentExplicitService = _agentExplicitMatch
+              ? (_agentExplicitMatch[1] || _agentExplicitMatch[2] || '').toLowerCase()
+              : null;
+            const _hasExplicitAgent = !!(  _agentExplicitService && _registeredAgentServiceMap[_agentExplicitService]);
+
+            const _skipCliFirst = _isBrowserOnlyTask || _hasExplicitAgent || isRecoveryReplan;
+            if (!_skipCliFirst && process.platform !== 'win32') {
+              const _cliFirstAppendix = _loadPromptFile('plan-skills-cli-first.md');
+              if (_cliFirstAppendix) {
+                SKILL_SYSTEM_PROMPT += '\n\n' + _cliFirstAppendix;
+                logger.info(`[Node:PlanSkills] Appending plan-skills-cli-first.md (CLI-first task, browserOnly=${_isBrowserOnlyTask}, explicitAgent=${_hasExplicitAgent})`);
+              }
+            } else {
+              logger.debug(`[Node:PlanSkills] Skipping plan-skills-cli-first.md (browserOnly=${_isBrowserOnlyTask}, explicitAgent=${_hasExplicitAgent}, recoveryReplan=${isRecoveryReplan})`);
+            }
           }
 
           // ── Discovery note: guide LLM to plan build_agent when service has no agent ──
