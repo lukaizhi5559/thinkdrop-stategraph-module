@@ -74,31 +74,29 @@ When deciding how to handle a user request, follow this priority order:
 **Step 3: Browser Automation** (Slowest, but captures visual context)
 - Use `browser.agent` for OAuth services requiring login
 - Use `playwright.agent` for public/anonymous sites (no CLI equivalent)
-- **Video fallback:** When no CLI agent is available for a video task, use `browser.agent` with the appropriate domain agent (youtube.agent, vimeo.agent, etc.) — domain playbooks auto-delegate to `video.agent` internally
 
 **Fast-Path Pattern Matching (1ms check before full decision):**
-- Words like "watch", "extract steps from video", "transcribe video", "download video", "get video transcript" → **CLI-first**: build yt-dlp.agent → run
-- Words like "search YouTube for X", "find videos about X" (search-only, no extraction) → `browser.agent` with domain agent (youtube.agent, etc.)
+- Words like "watch", "see", "look at", "transcribe", "get transcript", "extract from video", "extract steps from video" → `video.agent` directly (see Video Task Architecture below)
+- Words like "download video", "save video", "extract audio file", "convert to mp3", "download as mp3" → `cli.agent { action: 'run', agentId: 'ytdlp.agent', task: '...' }`
+- Words like "search YouTube for X", "find videos about X" (search-only, no extraction) → `playwright.agent` navigate + getPageText
 - Words like "transcribe", "convert", "download", "extract", "process file" → Try CLI first
 - Words like "goto", "visit", "open site", "check website" → Browser directly
 - Words like "api", "curl", "post to" → API directly
 
-**Video Task Architecture — CLI-first with browser fallback:**
+**Video Task Architecture — video.agent is the primary planner-callable skill:**
 
-**Preferred path (CLI):**
-1. `cli.agent { action: 'build_agent', service: 'yt-dlp' }` — discovers, installs, and configures yt-dlp at runtime
-2. `cli.agent { action: 'run', agentId: 'yt-dlp.agent', task: '<user goal>' }` — pre_steps resolve URL via web.agent automatically
-3. `synthesize` — present extracted content
+`video.agent` sits under `cli.agent` the same way `playwright.agent` / `web.agent` sit under `browser.agent`. It uses `yt-dlp` as primary tool (subtitle extraction, ~2s) with transcribe-anything Whisper as fallback.
 
-**Fallback path (browser) — use only when yt-dlp/CLI unavailable:**
-1. `browser.agent { action: 'run', agentId: 'youtube.agent', task: '...' }` — domain playbook delegates to `video.agent` internally
+**When videoUrl is known:**
+`video.agent { action: "watch_video", videoUrl: "<url>", goal: "<user goal>" }`
 
-**Available video domain agents (browser fallback)**: youtube.agent, vimeo.agent, rumble.agent, tiktok.agent, facebook.agent
+**When only title/creator is known (no URL):**
+`video.agent { action: "find_and_watch_tutorial", platform: "youtube", query: "<title + creator>", goal: "<user goal>" }`
 
-**CRITICAL**: 
-- `video.agent` is an INTERNAL sub-skill, NOT a planner-callable skill
-- NEVER call `video.agent` directly from planner — use CLI-first or `browser.agent` + domain agent
-- Domain agents have built-in playbooks that auto-delegate to `video.agent` for extraction tasks
+No URL-resolution pre-step needed — `find_and_watch_tutorial` handles the search internally.
+
+**For explicit download/save tasks only:**
+`cli.agent { action: 'run', agentId: 'ytdlp.agent', task: '<download goal with URL>' }`
 
 **FORBIDDEN — never use `shell.run curl` to call external API services** (Mailgun, Gmail API, Slack API, Stripe, Twilio, etc.). `shell.run` has no credential management, no keychain access, no token refresh, and no retry on 401 — it always fails when tokens expire or keys are unset. Use `browser.agent` or `cli.agent` for ALL external services. `shell.run` is for local system commands only.
 

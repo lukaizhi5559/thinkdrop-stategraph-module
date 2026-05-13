@@ -3458,25 +3458,31 @@ module.exports = async function executeCommand(state) {
     // ── Sub-agent turn visibility ─────────────────────────────────────────────
     // cli.agent { action: run, agentId } and browser.agent { action: run } both return
     // { agentId, task, transcript: [...], turns } when running agentically.
-    // Emit post-hoc agent:turn events so the UI shows what each sub-agent did.
-    // Reset first so that a retry of the same step (same skillCursor) does not duplicate bubbles.
+    // playwright.agent self-emits agent:turn_live + agent:turn live inside its step loop,
+    // so post-hoc replay would wipe live turns (via turns_reset) and replace them with
+    // a burst at the end. Skip reset+replay for self-emitting agents; only emit agent:complete.
     if (progressCallback && raw.agentId) {
-      progressCallback({
-        type:      'agent:turns_reset',
-        stepIndex: skillCursor,
-      });
-      if (Array.isArray(raw.transcript) && raw.transcript.length > 0) {
-        for (const entry of raw.transcript) {
-          progressCallback({
-            type:       'agent:turn',
-            agentId:    raw.agentId,
-            turn:       entry.turn || 0,
-            maxTurns:   raw.turns || raw.transcript.length,
-            action:     entry.action,
-            outcome:    entry.outcome,
-            thoughts:   entry.thoughts,
-            stepIndex:  skillCursor,
-          });
+      const selfEmitsLive = raw.agentId === 'playwright.agent';
+      if (!selfEmitsLive) {
+        // cli.agent and others: post-hoc replay is the only source of turn data
+        progressCallback({
+          type:      'agent:turns_reset',
+          stepIndex: skillCursor,
+        });
+        if (Array.isArray(raw.transcript) && raw.transcript.length > 0) {
+          for (const entry of raw.transcript) {
+            progressCallback({
+              type:        'agent:turn',
+              agentId:     raw.agentId,
+              turn:        entry.turn || 0,
+              maxTurns:    raw.turns || raw.transcript.length,
+              action:      entry.action,
+              outcome:     entry.outcome,
+              observation: entry.observation,
+              thoughts:    entry.thoughts,
+              stepIndex:   skillCursor,
+            });
+          }
         }
       }
       progressCallback({

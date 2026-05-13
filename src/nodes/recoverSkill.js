@@ -533,32 +533,22 @@ module.exports = async function recoverSkill(state) {
     logger.debug(`[Node:RecoverSkill] skill.install context injected (skillPath: ${skillPath})`);
   }
 
-  // ── ui.findAndClick / ui.click / ui.typeText / ui.waitFor ────────────────
-  // Inject the last successful step's stdout (often contains what was visible
-  // on screen) and the prior ui step results for context.
-  if (['ui.findAndClick', 'ui.click', 'ui.typeText', 'ui.waitFor', 'ui.moveMouse', 'ui.screen.verify'].includes(failedStep.skill)) {
+  // ── browser.agent: inject failure context for recovery LLM ──────────────────
+  // Without this, the LLM only sees "playwright.agent delegation failed: X" with no
+  // evidence about why — login wall, bot block, wrong domain, etc.
+  if (failedStep.skill === 'browser.agent') {
     const lines = [];
-
-    // What the prior ui step saw/did
-    const priorUiSteps = skillResults
-      .filter(r => r.skill?.startsWith('ui.') && r.ok)
-      .slice(-3)
-      .map(r => `  Step ${r.step} (${r.skill}): ${r.args?.label || r.args?.text || r.args?.condition || JSON.stringify(r.args).substring(0, 80)} → ${r.stdout ? String(r.stdout).trim().substring(0, 120) : 'ok'}`);
-    if (priorUiSteps.length) lines.push(`Prior ui.* steps:\n${priorUiSteps.join('\n')}`);
-
-    // Stderr from the failed step (OmniParser/vision errors often appear here)
-    const stderr = (failedStep.stderr || '').trim();
-    if (stderr) lines.push(`stderr: ${stderr.substring(0, 400)}`);
-
-    // Specific context for findAndClick
-    if (failedStep.skill === 'ui.findAndClick' && failedStep.args?.label) {
-      lines.push(`Attempted to click label: "${failedStep.args.label}"`);
-      lines.push(`Hint: if this label is not visible, the window may be minimized, behind another window, or the label text may differ from what is shown on screen.`);
-    }
-
+    const result = failedStep.result || {};
+    if (result.agentId)              lines.push(`agentId: ${result.agentId}`);
+    if (failedStep.args?.url)        lines.push(`URL attempted: ${failedStep.args.url}`);
+    if (result.loginWall)            lines.push(`Login wall detected — agent blocked by auth`);
+    if (result.botBlock)             lines.push(`Bot block / CAPTCHA detected`);
+    if (result.wrongDomain)          lines.push(`Wrong domain / parking page`);
+    if (result.researchContentEmpty) lines.push(`Content extraction empty — likely CAPTCHA or bot block`);
+    if (failedStep.error)            lines.push(`Error: ${failedStep.error}`);
     if (lines.length) {
-      skillContextSection = `\nui skill diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
-      logger.debug(`[Node:RecoverSkill] ui.* context injected (${failedStep.skill})`);
+      skillContextSection = `\nbrowser.agent diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
+      logger.debug(`[Node:RecoverSkill] browser.agent diagnostic context injected`);
     }
   }
 
@@ -899,57 +889,6 @@ Then keep any synthesize step that follows. The {{bestUrl}} token in the navigat
         ],
       };
     }
-  }
-
-  // ui.screen.verify: failed for any reason (vision LLM said verified=false, or the call itself failed)
-  if (skill === 'ui.screen.verify') {
-    const reasoning  = failedStep.reasoning  || (failedStep.error ? `Vision check error: ${failedStep.error}` : 'Visual verification could not confirm success.');
-    const visionSuggestion = failedStep.suggestion || '';
-
-    // Look back at the preceding ui.findAndClick step to build a specific constraint
-    const precedingClick = (skillResults || []).slice().reverse().find(r => r.skill === 'ui.findAndClick');
-    let clickContext = '';
-    if (precedingClick) {
-      clickContext = ` The preceding click was ui.findAndClick with label="${precedingClick.args?.label}" — this click did NOT produce the expected result.`;
-    }
-
-    // Detect if the failing click was a DM/messaging sidebar click — suggest keyboard shortcut
-    const precedingLabel = (precedingClick?.args?.label || '').toLowerCase();
-    const isDmClick = precedingLabel.includes('dm') || precedingLabel.includes('direct message') ||
-      precedingLabel.includes('conversation') || precedingLabel.includes('sidebar');
-
-    let constraint;
-    let suggestion;
-    if (isDmClick) {
-      const nameMatch = (precedingClick?.args?.label || '').match(/^(\w+)/);
-      const personName = nameMatch ? nameMatch[1] : 'the person';
-      constraint = `Visual verification failed after clicking a DM/sidebar row.${clickContext} Vision LLM reported: "${reasoning}". Clicking sidebar rows in messaging apps opens profile cards, NOT DM threads. Use the keyboard shortcut instead: (1) ui.typeText {CMD+K} to open the quick switcher, (2) ui.typeText the person's name, (3) ui.typeText {ENTER} to open the DM. Do NOT use ui.findAndClick on the sidebar for DMs.`;
-      suggestion = `Use keyboard shortcut to open DM: ui.typeText {CMD+K}, then type "${personName}", then {ENTER}. Do NOT click the sidebar row.`;
-    } else {
-      constraint = `Visual verification failed after the click step.${clickContext} Vision LLM reported: "${reasoning}"${visionSuggestion ? ` Suggestion: ${visionSuggestion}` : ''}. Try a DIFFERENT approach — use a more specific label, a different element, or add a settleMs delay. Do NOT repeat the same label that just failed.`;
-      suggestion = visionSuggestion || `The click on "${precedingClick?.args?.label || 'the element'}" did not produce the expected result. Try a different label or approach.`;
-    }
-
-    logger.debug(`[Node:RecoverSkill] Fast-path: ui.screen.verify failed → REPLAN`, { verified: failedStep.verified, error: failedStep.error, precedingLabel: precedingClick?.args?.label, isDmClick });
-    return {
-      action: 'REPLAN',
-      constraint,
-      suggestion,
-      note: `ui.screen.verify: ${reasoning}`
-    };
-  }
-
-  // ui.findAndClick: OmniParser unavailable or low confidence — ask user to do it manually
-  // The ResultsWindow confirm button lets the user signal "done" and resume the plan
-  if (skill === 'ui.findAndClick' && failedStep.needsManualStep) {
-    const instruction = failedStep.instruction || `Please click "${args.label}" on screen, then confirm when done.`;
-    const reason = failedStep.reason ? ` (${failedStep.reason})` : '';
-    logger.debug(`[Node:RecoverSkill] Fast-path: ui.findAndClick needsManualStep → ASK_USER`);
-    return {
-      action: 'ASK_USER',
-      question: `${instruction}${reason}`,
-      options: ['Done, I clicked it', 'Skip this step', 'Cancel']
-    };
   }
 
   // Cannot find module '<pkg>' on external.skill — auto-install the missing package
