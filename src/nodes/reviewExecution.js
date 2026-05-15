@@ -186,6 +186,18 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'VERIFIED' };
   }
 
+  // ── video.agent short-circuit ─────────────────────────────────────────────
+  // video.agent returns a structured result (transcript, steps, stdout) — not browser
+  // page text. Content-based hollow checks must never fire on these results.
+  // A successful run with non-empty stdout is sufficient to treat as VERIFIED.
+  const _hasVideoAgentSuccess = skillResults.some(r =>
+    r.skill === 'video.agent' && r.ok === true && String(r.stdout || '').trim().length > 0
+  );
+  if (_hasVideoAgentSuccess) {
+    logger.info('[Node:ReviewExecution] video.agent step succeeded — skipping hollow check (structured transcript result, no page text)');
+    return { ...state, reviewVerdict: 'VERIFIED' };
+  }
+
   // ── browser.agent short-circuit ───────────────────────────────────────────
   // If browser.agent reports success with action-completion signals in the result,
   // trust it without requiring page snapshot verification. This prevents false-hollow
@@ -349,7 +361,10 @@ module.exports = async function reviewExecution(state) {
       .every(r => {
         const exitOk  = r.ok !== false && (r.exitCode == null || r.exitCode === 0);
         const hasOut  = String(r.stdout || r.result || '').trim().length > 0;
-        return exitOk && hasOut;
+        // File operations (mv, cp, mkdir, etc.) succeed silently with exitCode 0
+        const cmd     = String(r.args?.command || r.args?.argv?.join(' ') || '');
+        const isFileOp = /\b(mv|cp|mkdir|rmdir|rm|touch|chmod|chown|ln|rsync|scp|find)\b/.test(cmd);
+        return exitOk && (hasOut || isFileOp);
       });
     if (_allClean) {
       logger.info('[Node:ReviewExecution] Shell-only plan — all steps exited cleanly, skipping LLM review');

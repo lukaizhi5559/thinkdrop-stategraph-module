@@ -227,6 +227,32 @@ module.exports = async function parseIntent(state) {
     return state;
   }
 
+  // ── Save skill fast-path: detect "save this as a skill" patterns ─────────────
+  // User says "save this as a skill", "make this reusable", etc. after successful execution
+  if (state.message && typeof state.message === 'string') {
+    const saveSkillPatterns = [
+      /save this (as|for) (a skill|later)/i,
+      /make this (reusable|a skill)/i,
+      /remember this (script|command|automation)/i,
+      /turn this into (a skill|something reusable)/i,
+      /create (a|this) skill from (this|that|it)/i,
+      /store this (script|command|automation)/i,
+    ];
+    
+    if (saveSkillPatterns.some(p => p.test(state.message))) {
+      // Check if there's a recent shell.run execution to save
+      if (state._lastShellRun && state._lastShellRun.skill === 'shell.run') {
+        logger.info('[Node:ParseIntent] save_skill pattern detected — routing to skill creation');
+        return {
+          ...state,
+          intent: { type: 'save_skill', confidence: 0.95, entities: [], requiresMemoryAccess: false },
+          _skillToSave: state._lastShellRun,
+          metadata: { parser: 'save-skill-pattern', processingTimeMs: 0 },
+        };
+      }
+    }
+  }
+
   // ── Multi-intent plan: process sub-prompts produced by decomposePrompt ──────
   // When decomposePrompt detected a complex/multi-intent message and produced an
   // intentPlan, we classify each sub-prompt independently:

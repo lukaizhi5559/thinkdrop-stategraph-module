@@ -139,6 +139,16 @@ function _loadPromptFile(filename) {
   }
 }
 
+// Reference files for discovery fallback - loaded only when needed
+function _loadReferenceFile(language) {
+  const filename = `${language}-tools-reference.md`;
+  try {
+    return fs.readFileSync(path.join(__dirname, '../prompts', filename), 'utf8').trim();
+  } catch (_) {
+    return null;
+  }
+}
+
 // Signals that indicate a shell/Python-heavy task.
 const _SHELL_SIGNAL_RE = /\b(python3?|pip3?|brew\s+install|shell|bash|script|csv|excel|xlsx|json\s+(file|patch|edit)|spreadsheet|ffmpeg|imagemagick|convert\s+image|pdftotext|poppler|jq\b|tesseract|pandoc|exiftool|wget|curl\s+.*-o|cron|launchd|chmod|chown|git\s+(clone|pull|push|commit|log|status|branch|merge|rebase|diff)|npm\s+(install|run|build)|yarn\s+(install|run|build)|node\s+|ls\s+-|cat\s+|grep\s+|awk\s+|sed\s+|find\s+|xargs|sort\s+|uniq\s+|wc\s+|touch\s+|mkdir|rm\s+|cp\s+|mv\s+|ln\s+|chmod|chown|file\s+(ops?|read|write|edit|patch|convert|transform|rename|move|copy|delete))\b/i;
 
@@ -225,6 +235,13 @@ function buildSystemPrompt(userMessage, state) {
     }
   }
 
+  // ── Inject grilled constraints from gatherContext grill mode ──────────────
+  // These are user-confirmed constraints from high-risk operation analysis
+  if (state.grilledConstraints) {
+    const grillConstraints = `\n\n## GRILLED CONSTRAINTS (User Confirmed)\n\nThese constraints were confirmed through detailed questioning. You MUST follow them:\n\n\`\`\`json\n${JSON.stringify(state.grilledConstraints, null, 2)}\n\`\`\``;
+    result += grillConstraints;
+  }
+
   return result;
 }
 
@@ -253,7 +270,7 @@ Output ONLY a valid JSON array. No explanation, no markdown fences.
 For synthesize steps: keep prompt strings UNDER 200 chars. If the prompt needs to be longer, write "{{EXPAND:<brief intent>}}" (e.g. "{{EXPAND:write skill.md for github from crawled docs}}") and the system will expand it in a follow-up call.
 If the request cannot be safely automated, output: { "error": "explain why it cannot be done" }`;
 
-module.exports = async function planSkills(state) {
+async function planSkills(state) {
   const {
     mcpAdapter,
     llmBackend,
@@ -2291,7 +2308,7 @@ Task: "${userMessage}"`;
   const planningQuery = `TASK: Convert the following user request into a JSON skill plan.
 ${_agentIdentity}
 Home directory: ${homeDir}
-⚠️ GROUND TRUTH RULE: The "User request" line below is the ONLY source of truth for which services, tools, or agents to use. Any prior conversation messages that mention a different service (e.g. a prior turn that references a different provider) are historical context ONLY — do NOT let them override the service names in the current request. You MUST use whichever service the user explicitly named. Do NOT substitute with any service the user did not explicitly name in this request.
+⚠️ GROUND TRUTH RULE: The "User request" line below is the ONLY source of truth for which services, tools, or agents to use. Any prior conversation messages that mention a different service (e.g. a prior turn that references a different provider) are historical context ONLY — do NOT let them override the service names in the current request. You MUST use whichever service the user explicitly named. Do NOT substitute with any service the user did not explicitly name in this request. USE conversation history to resolve references ("that folder", "those files", "it", "them", "the files you just moved") to their concrete values from prior turns — including exact file paths, folder names, and filenames mentioned in previous steps.
 User request: "${userMessage}"${domainContextNote}${skillContractNote}${installedSkillsNote}${cliPreflightNote}${agentContextNote}${discoveryNote}${siteRulesBlock}${recoveryNote}${correctionNote}${profileContextNote}${credentialContextNote}${browserSessionNote}${priorResultsNote}${messagingBodyNote}${closeFileContextNote}${cacheShortCircuitNote}${conversationNote}${taggedContextNote}${creatorContextNote}`;
 
   // ── Contract-driven fast path ───────────────────────────────────────────────
@@ -2405,7 +2422,7 @@ User request: "${userMessage}"${domainContextNote}${skillContractNote}${installe
     query: planningQuery,
     context: {
       systemInstructions: effectiveSystemPrompt,
-      conversationHistory: [],
+      conversationHistory: (conversationHistory || []).slice(-10),
       sessionId: context?.sessionId,
       userId: context?.userId,
       intent: 'command_automate'
@@ -4362,3 +4379,78 @@ function parsePlan(raw, logger) {
     return null;
   }
 }
+
+/**
+ * Detect if user wants to save a Python script as a skill
+ * Pattern matching for voice/text prompts like "save this as a skill"
+ */
+function detectSaveSkillIntent(message) {
+  const saveSkillPatterns = [
+    /save this (as|for) (a skill|later)/i,
+    /make this (reusable|a skill)/i,
+    /remember this (script|command|automation)/i,
+    /turn this into (a skill|something reusable)/i,
+    /create (a|this) skill from (this|that|it)/i,
+    /store this (script|command|automation)/i,
+  ];
+  
+  return saveSkillPatterns.some(pattern => pattern.test(message || ''));
+}
+
+/**
+ * Derive a skill name from description
+ */
+function deriveSkillName(description) {
+  if (!description) return 'custom_skill';
+  
+  // Convert to snake_case
+  return description
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, '')
+    .trim()
+    .replace(/\s+/g, '_')
+    .substring(0, 30) || 'custom_skill';
+}
+
+/**
+ * Generate external.skill plan for saving a Python script
+ */
+function generateSkillSavePlan(state) {
+  const lastExecution = state._lastShellRun;
+  if (!lastExecution || lastExecution.skill !== 'shell.run') {
+    return null;
+  }
+  
+  const skillName = state._proposedSkillName || deriveSkillName(lastExecution.description);
+  const description = lastExecution.description || 'Custom automation skill';
+  const pythonCode = lastExecution.args?.command || '';
+  
+  // Extract just the Python code if wrapped in python3 -c
+  let cleanCode = pythonCode;
+  if (pythonCode.includes('python3 -c "')) {
+    const match = pythonCode.match(/python3 -c "(.+)"/s);
+    if (match) {
+      cleanCode = match[1].replace(/\\"/g, '"').replace(/\\n/g, '\n');
+    }
+  }
+  
+  return [
+    {
+      skill: 'skillCreator.skill',
+      args: {
+        name: skillName,
+        description: description,
+        type: 'external',
+        code: cleanCode,
+        language: 'python',
+        source: 'shell.run execution'
+      }
+    }
+  ];
+}
+
+// Export main function as default, attach helpers for backward compatibility
+module.exports = planSkills;
+module.exports.detectSaveSkillIntent = detectSaveSkillIntent;
+module.exports.deriveSkillName = deriveSkillName;
+module.exports.generateSkillSavePlan = generateSkillSavePlan;

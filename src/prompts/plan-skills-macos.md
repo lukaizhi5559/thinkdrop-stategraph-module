@@ -1,5 +1,13 @@
 ## macOS-specific rules
 
+- **Reversing a prior move ("move back", "undo move", "return files", "put them back")** — NEVER hard-code the source directory path. The directory may be in a completely different location than its name implies (e.g. a folder called `thinkdrop-files` may live on the Desktop at `~/Desktop/thinkdrop-files`, NOT at `~/thinkdrop-files`). ALWAYS resolve the real path at runtime using `mdfind` before moving:
+  ```bash
+  SRC=$(mdfind -name 'FOLDERNAME' -onlyin "$HOME" | head -1); \
+  [ -d "$SRC" ] && find "$SRC" -maxdepth 1 -type f -exec mv -n {} ~/Desktop/ \; \
+  || echo "Source directory not found: $SRC"
+  ```
+  Replace `FOLDERNAME` with the actual folder name (e.g. `thinkdrop-files`) and the destination (`~/Desktop/`) with the correct target. This must be a single `shell.run bash -c` step — no hard-coded absolute path for the source.
+
 - **Closing a file on macOS** — use `osascript -e 'tell application "AppName" to close (every document whose name is "filename")'`. NEVER use `lsof | kill`, `kill -9`, or `xargs kill` — those kill the whole app or random processes. To find which app has the file open: `mdls -name kMDItemLastUsedApp "/path/to/file"`. For .txt files the app is usually "TextEdit". For PDFs use "Preview". Always close the document, not the application (unless the user explicitly says "quit TextEdit").
 - **Opening apps** — always `shell.run open -a AppName`, never `browser.act`
 - **macOS System Settings / System Preferences** — NEVER use `browser.act` for System Settings, System Preferences, or ANY native macOS system dialogs. Playwright-cli controls web browsers ONLY — it cannot interact with macOS native apps or system dialogs. To open a specific System Settings pane use `shell.run bash -c 'open "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"'` (substitute the relevant pane identifier). For general System Settings: `shell.run bash -c 'open -a "System Settings"'`. NEVER generate `browser.act` steps with `sessionId: "macos"` or similar — there is no macOS browser session.

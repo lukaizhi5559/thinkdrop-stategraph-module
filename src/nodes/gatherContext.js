@@ -287,8 +287,6 @@ function parseJson(raw) {
 // Providers that authenticate via OAuth rather than raw API keys.
 // Loaded from shared constants — single source of truth for all nodes.
 const { OAUTH_PROVIDERS } = require('./oauthProviders');
-
-
 module.exports = async function gatherContext(state) {
   const { intent, message, resolvedMessage, llmBackend, progressCallback,
     gatherAnswerCallback, gatherCredentialCallback, keytarCheckCallback,
@@ -319,6 +317,26 @@ module.exports = async function gatherContext(state) {
   }
 
   const userMessage = resolvedMessage || message || '';
+
+  // ── RISK ASSESSMENT for Grill Mode ─────────────────────────────────────────
+  // _grillMode is now set by the router (StateGraphBuilder) before mcpFillGaps runs
+  // This ensures MCP pre-fill happens before we ask the user
+  const needsGrill = state._grillMode === true;
+  const riskLevel = state._riskLevel || 'LOW';
+  
+  if (needsGrill) {
+    logger.info(`[Node:GatherContext] Grill mode active (${riskLevel}) — proceeding with thorough Q&A`);
+    
+    // Emit grill_start event for UI (router may have already emitted, but ensure it's here too)
+    if (progressCallback) {
+      progressCallback({ 
+        type: 'gather:grill_start', 
+        message: `Deep analysis needed for this ${riskLevel.toLowerCase()} risk operation...`,
+        riskLevel,
+        riskContext: state._riskContext
+      });
+    }
+  }
 
   // ── CLASSIFIER: single LLM call — no regex, full natural language understanding ─
   // Decides EXECUTE (run now) vs BUILD (needs a persistent background skill).
@@ -797,14 +815,17 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
   if (scoutProviderPreselect && !scoutProviderPreselect.autoSelected) {
     const { capability, providers, defaultProvider } = scoutProviderPreselect;
     logger.info(`[Node:GatherContext] Provider choice: ${providers.length} options for "${capability}" — asking user`);
+    const GATHER_TIMEOUT_MS = 30 * 1000; // 30 seconds (reduced from 10 min for better UX)
     emit('gather_question', {
       id: `service_${capability}`,
       question: `Which provider would you like to use for ${capability}?`,
-      hint: `Recommended: ${defaultProvider}`,
-      inputType: 'choice',
+      hint: `Recommended: ${defaultProvider} (auto-selecting in 30s if no response)`,
       options: providers,
+      default: defaultProvider,
+      type: 'provider_choice',
       links: [],
     });
+    logger.info(`[Node:GatherContext] Provider choice: ${providers.length} options for "${capability}" — asking user (30s timeout)`);
     if (gatherAnswerCallback) {
       try {
         const chosen = await Promise.race([
@@ -825,6 +846,7 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
     } else {
       resolvedFacts[`service_${capability}`] = defaultProvider;
       resolvedFacts['service_provider'] = defaultProvider;
+      logger.info(`[Node:GatherContext] Provider choice timed out — defaulting to "${defaultProvider}"`);
     }
   } else if (scoutProviderPreselect?.autoSelected) {
     // Single provider — pre-seed silently so LLM extractor doesn't ask about it
@@ -1243,6 +1265,24 @@ Respond with ONLY the skill name (e.g. "gmail.daily.summary") or the word null.`
     }
     if (allResolvedKeys.has('schedule_frequency')) {
       ['schedule_frequency', 'frequency'].forEach(k => BANNED_UNKNOWN_IDS.add(k));
+    }
+
+    // ── Integrate MCP-filled answers ────────────────────────────────────────────
+    // Check if MCP pre-fill found answers for any unknowns, auto-resolve them
+    const mcpFilledAnswers = state.mcpFilledAnswers || {};
+    for (const [key, mcpAnswer] of Object.entries(mcpFilledAnswers)) {
+      if (mcpAnswer.value && !resolvedAnswers[key]) {
+        resolvedAnswers[key] = mcpAnswer.value;
+        logger.info(`[Node:GatherContext] Auto-resolved "${key}" from MCP (${mcpAnswer.source})`);
+        
+        // Emit event for UI
+        emit('gather_answer_received', { 
+          id: key, 
+          answer: mcpAnswer.value,
+          source: mcpAnswer.source,
+          autoFilled: true
+        });
+      }
     }
 
     const unresolvedUnknowns = (analysis.unknowns || []).filter(u => {

@@ -1,20 +1,24 @@
-## Python scripts for data and file tasks
+## MANDATORY: Python-First for ALL File Operations
 
-Python is the preferred tool for: file patching, JSON/CSV/Excel mutation, data analysis, complex conditional logic, and any task requiring packages. Use bash only for simple single-command system ops.
+**YOU MUST USE PYTHON for ALL file system operations.** Bash is ONLY for simple one-liners (echo, pwd, cd) or when Python is explicitly unavailable.
 
-### Bash vs Python decision guide
+### CRITICAL RULE: File Operations = Python ONLY
 
-| Task type | Use |
-|-----------|-----|
-| Open app, move file, list directory | `shell.run` bash |
-| Simple pipeline (`grep \| sort \| uniq`) | `shell.run` bash |
-| Edit a file in-place (replace text, add line) | `python3 -c` inline or temp script |
-| JSON key mutation / schema update | `python3 -c 'import json...'` |
-| CSV → Excel, data formatting, pivot tables | `synthesize(saveToFile)` Python script + `shell.run` |
-| Nested if/for logic, multiple file mutations | Python temp script at `/tmp/thinkdrop_task.py` |
-| Web scrape results → structured spreadsheet | `browser.act` collect → Python script → Excel |
+| Task type | MUST Use |
+|-----------|----------|
+| **Move files** | `python3 -c "import shutil, pathlib; ..."` |
+| **Copy files** | `python3 -c "import shutil; shutil.copy2(...)"` |
+| **Create directories** | `python3 -c "import pathlib; pathlib.Path(...).mkdir(parents=True)"` |
+| **List directories** | `python3 -c "import pathlib; [print(p) for p in pathlib.Path(...).iterdir()]"` |
+| **Delete files** | `python3 -c "import pathlib; pathlib.Path(...).unlink()"` |
+| **File existence check** | `python3 -c "import pathlib; exit(0 if pathlib.Path(...).exists() else 1)"` |
+| Edit file in-place | `python3 -c` inline script |
+| JSON mutation | `python3 -c 'import json...'` |
+| CSV/Excel processing | Python temp script |
+| Simple pipeline (`grep \| sort`) | `shell.run` bash (exception) |
+| Open app | `shell.run` bash (exception) |
 
-### Python temp script pattern (preferred for anything > 3 lines of logic)
+### Python Temp Script Pattern (for complex logic)
 
 ```json
 [
@@ -23,7 +27,7 @@ Python is the preferred tool for: file patching, JSON/CSV/Excel mutation, data a
 ]
 ```
 
-### Python inline pattern (≤3 lines of logic)
+### Python Inline Pattern (≤3 lines of logic)
 
 ```json
 { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "python3 -c \"import pathlib,json; p=pathlib.Path('/path/file.json'); d=json.loads(p.read_text()); d['version']='2.0.0'; p.write_text(json.dumps(d,indent=2))\""] } }
@@ -58,19 +62,11 @@ When a `shell.run` step depends on a CLI tool that may not be installed, guard w
 { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "command -v ffmpeg >/dev/null 2>&1 || brew install ffmpeg && ffmpeg -i input.mp4 output.mp3"] } }
 ```
 
-**Common tool → brew formula mapping:**
-
-| Tool needed | brew install |
-|-------------|--------------|
-| `pdftotext` | `brew install poppler` |
-| `ffmpeg` | `brew install ffmpeg` |
-| `jq` | `brew install jq` |
-| `imagemagick` / `convert` | `brew install imagemagick` |
-| `gh` (GitHub CLI) | `brew install gh` |
-| `wget` | `brew install wget` |
-| `tesseract` (OCR) | `brew install tesseract` |
-| `exiftool` | `brew install exiftool` |
-| `pandoc` | `brew install pandoc` |
+**Tool Installation:**
+- Use `brew install [tool]` for macOS CLI tools
+- Use `pip3 install --user` (with pip-audit check) for Python packages
+- Always check with `command -v TOOL` before installing — never unconditionally install
+- Chain the guard inline: `command -v ffmpeg >/dev/null 2>&1 || brew install ffmpeg && ffmpeg [args]`
 
 **NEVER use `sudo brew install`** — brew on macOS never requires sudo.
 **NEVER use `apt-get` or `yum`** — macOS only; use brew for all system package installs.
@@ -98,6 +94,93 @@ Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prom
 git remote get-url origin | sed 's/.*github.com[:/]//' | sed 's/\.git$//'
 ```
 
+## Python-First Shell Execution
+
+**DEFAULT TO PYTHON for ALL shell.run operations.** Only fall back to Node.js or Bash when Python explicitly fails or isn't available.
+
+### Discovery Process
+
+When you need a tool or package, follow this order:
+
+1. **Check existing skills** - Look for `external.skill` that already handles this task
+2. **Search for best solution** - Use `web.search` to discover current recommendations:
+   - "best python library for [task] recent"
+   - "[task] python package comparison"
+   - "how to [task] with python 2024"
+3. **Test and save** - Try the discovered solution, save successful ones as `external.skill`
+4. **Fallback to reference** - If search fails, consult the tool reference files
+
+**Principles:**
+- The Python ecosystem has 400,000+ packages - search to find the best fit
+- Use `web.search` proactively for unfamiliar tasks
+- Save working solutions as skills for instant reuse next time
+
+### Graceful Degradation Pattern
+
+When using external packages, write code that discovers and falls back gracefully:
+
+```python
+python3 -c "
+import sys
+
+# Try the best-fit package for this specific task
+try:
+    import best_package
+    # Use best_package for the task
+    result = best_package.do_something()
+    print('Success with best_package')
+    sys.exit(0)
+except ImportError:
+    pass
+
+# Fallback to alternative that achieves similar results
+try:
+    import alternative_package
+    result = alternative_package.do_something()
+    print('Success with alternative_package')
+    sys.exit(0)
+except ImportError:
+    pass
+
+# Final fallback: stdlib, subprocess, or CLI tool
+import subprocess
+subprocess.run(['cli_tool', 'args'])
+print('Success with cli_tool')
+"
+```
+
+**Key principles:**
+- Let the LLM choose packages based on task requirements, not from a fixed list
+- Always have a working fallback (stdlib, subprocess, or CLI)
+- Prefer stdlib solutions when they meet the needs
+
+### Language Priority
+```
+1. Python (ALWAYS try first)
+   ↓ If needed: search web for best package → test → save as skill
+   ↓ Python completely fails
+2. Node.js (if Node ecosystem needed)
+   ↓ fails
+3. Bash (simple commands only)
+```
+
+**For system CLI tools (ffmpeg, imagemagick, etc.):**
+- Use `brew install [tool]` when needed
+- Search "brew install [tool]" to confirm correct formula name
+- Chain check: `command -v [tool] >/dev/null 2>&1 || brew install [tool] && [tool] [args]`
+
+### When to Use Node.js
+- Python is not installed or all Python approaches failed
+- Package requires Node ecosystem (npm packages, webpack, etc.)
+- React/Next.js project operations (next build, npm install)
+- Existing Node scripts that can't be ported
+
+### When to Use Bash
+- Simple one-liners (cd, pwd, echo, mkdir -p)
+- Command piping (ps aux | grep, cat file | wc -l)
+- Tool invocations (npm install, git status, brew list)
+- OS-specific commands with no Python equivalent
+
 - **shell.run JSON body quoting — CRITICAL when user message text may contain apostrophes:**
 Always assign user-provided text to a shell variable, then expand inside double-quoted `-d "..."`. Never put user text directly inside single-quoted JSON.
 
@@ -119,3 +202,16 @@ MSG='what'"'"'s up'; curl -X POST https://api.example.com/send -u "$U:$K" -H 'Co
   Single item: `xattr -d com.apple.FinderInfo /path 2>/dev/null; xattr -d com.apple.metadata:_kMDItemUserTags /path 2>/dev/null`. NEVER target only `_kMDItemUserTags` — Finder colored dots come from `FinderInfo`, not from that key. NEVER `find ... -exec xattr -d {} \;` — recurses + hangs.
 - **`synthesize` with `saveToFile`** — ONLY when user explicitly asks to save/write/create a file.
 - **NEVER use `shell.run curl` to call external API services** — use `browser.agent` or `cli.agent` for ALL external services.
+- **Safe file move/copy — NEVER use wildcards that include the destination:** When moving files from a directory to a subfolder (e.g., `mv ~/Desktop/* ~/Desktop/dest/`), the `*` wildcard includes the destination folder itself, causing "cannot move a directory into itself" error. Use specific file patterns OR exclude the destination:
+  - CORRECT: `bash -c "mv ~/Desktop/*.txt ~/Desktop/dest/"` (specific extension)
+  - CORRECT: `bash -c "find ~/Desktop -maxdepth 1 -type f ! -path '*thinkdrop-files*' -exec mv {} ~/Desktop/thinkdrop-files/ +"` (exclude dest)
+  - WRONG: `mv ~/Desktop/* ~/Desktop/thinkdrop-files/` (includes dest folder in wildcard)
+
+- **NEVER hard-code source directory paths in move operations when path is uncertain:** If the exact absolute path of the source directory was NOT explicitly provided by the user in this prompt (e.g. moving files "back", reversing a prior move, or moving from a named folder), you MUST resolve the path at runtime with `mdfind`. Do NOT guess or derive paths from directory names — folder names do not imply location:
+  - WRONG: `mv /Users/lukaizhi/thinkdrop-files/* ~/Desktop/` (guessed path — may not exist)
+  - WRONG: `mv ~/thinkdrop-files/* ~/Desktop/` (assumed home dir — folder may be on Desktop)
+  - CORRECT (single atomic step — locate, verify, move):
+    ```bash
+    bash -c 'SRC=$(mdfind -name "thinkdrop-files" -onlyin "$HOME" | head -1); [ -d "$SRC" ] && find "$SRC" -maxdepth 1 -type f -exec mv -n {} ~/Desktop/ \; || echo "Source not found: $SRC"'
+    ```
+  Use `mdfind -name 'FOLDERNAME' -onlyin "$HOME"` to find the real path, store in `$SRC`, verify with `[ -d "$SRC" ]`, then move. This pattern handles any location the folder may actually be in.

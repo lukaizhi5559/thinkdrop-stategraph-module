@@ -12,6 +12,7 @@ playwright.agent|args:{goal:string,sessionId?:string,url?:string,maxTurns?:numbe
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI_agent_factory+runner.__Takes_ONE_high-level_task,_reads_agent_descriptor_from_DuckDB,_infers_correct_CLI_commands_via_LLM,_executes,_returns_result.__actions:_run_(delegate_task),_build_agent_(discover+install+register_CLI_service),_list_agents,_validate_agent,_preflight_check.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists;_use_action:build_agent_to_create_new_agents.
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_Browser/REST_API_agent_factory+runner.__Handles_OAuth_browser_services_AND_REST_API/API-key_services_(ClickSend,_Mailgun,_Twilio,_etc.).__Takes_ONE_task,_reads_descriptor,_handles_all_auth,_infers+executes_curl_or_browser_steps.__actions:_run_(delegate_task),_build_agent_(crawl_docs+create_descriptor),_list_agents.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists.
 web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,maxResults?:number}|[web_search_agent]_Searches_the_web_via_MCP_web-search_service_and_returns_structured_results.__Use_when:_(1)_target_site_blocks_bots/CAPTCHA_and_you_need_a_direct_article_URL_without_triggering_a_search_form,_(2)_service_URL_is_unknown_or_LLM_may_guess_wrong_domain,_(3)_need_navigation_hints_for_complex_SaaS_before_browser_automation.__actions:_search_and_navigate_(returns_{bestUrl,title,snippet}),_research_domain_(returns_{insights,insightsText,bestUrl,confidence}),_get_tutorial_steps.__After_search_and_navigate,_use_browser.act_navigate(bestUrl)_to_go_directly_to_content._NEVER_use_web.agent_for_services_in_AVAILABLE_AGENTS—those_already_handle_auth_correctly.
+video.agent|args:{action:string,videoUrl?:string,platform?:string,query?:string,goal:string}|[video_agent]_Watches_and_transcribes_a_video_using_yt-dlp_subtitle_extraction_(primary,_~2s)_with_Whisper_fallback.__action:"watch_video"_{videoUrl,goal}_→_extract_full_transcript_+_metadata_+_synthesize_steps.__action:"find_and_watch_tutorial"_{platform,query,goal}_→_search_YouTube_by_title/creator,_pick_best_result,_extract_transcript.__⚠️_USE_THIS_(not_cli.agent/ytdlp.agent)_for_ANY_"watch",_"see",_"look_at",_"transcribe",_"get_transcript_from",_"extract_steps_from_video"_request.__NEVER_route_watch/transcribe_tasks_to_cli.agent_or_ytdlp.agent_even_if_ytdlp_appears_in_AVAILABLE_AGENTS—video.agent_always_wins_for_these_verbs.
 
 ## Template variables
 
@@ -53,8 +54,8 @@ web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,
 | **Novel/unknown service** where LLM might guess the wrong URL | `web.agent { action: "search_and_navigate", query: "<service> official website" }` → use `bestUrl` to navigate directly |
 | **Local system only**: file ops, grep, ffmpeg, local git, run local scripts, open apps | `shell.run` bash |
 | **Search for videos on a video platform** — "search YouTube for X", "find videos about X on Vimeo/TikTok/Rumble/Facebook", "look up X on YouTube" | `browser.agent { action: 'run', agentId: 'youtube.agent' (or vimeo.agent etc.), task: '<full request>' }` → `synthesize` — the agent's Search Videos playbook navigates directly to `/results?search_query=`, calls `waitForStableText` + `getPageText` to capture results, then synthesize presents them. **Do NOT use `video.agent` for search-only tasks.** |
-| **Watch, extract, summarize, or transcribe a specific video** — "watch this YouTube video and give me the steps", "summarize this tutorial", "what does this video teach?", "get transcript of this video" | **CLI-first:** `cli.agent { action: 'build_agent', service: 'yt-dlp' }` → `cli.agent { action: 'run', agentId: 'yt-dlp.agent', task: '<full request>' }` — yt-dlp.agent discovers and resolves the URL via web.agent pre_step automatically. **Fallback if CLI unavailable:** `browser.agent { action: 'run', agentId: 'youtube.agent', task: 'watch video <url> and extract <goal>' }` |
-| **Find and watch a tutorial video** — "find a YouTube tutorial about sourdough and tell me the steps", OR any video request without a verified URL | **CLI-first:** `cli.agent { action: 'build_agent', service: 'yt-dlp' }` → `cli.agent { action: 'run', agentId: 'yt-dlp.agent', task: 'find and extract: <description>' }` — yt-dlp.agent uses web.agent pre_step to discover the URL. **Fallback:** `browser.agent { action: 'run', agentId: 'youtube.agent', task: 'find and watch tutorial: <description>' }` |
+| **Watch, extract, summarize, or transcribe a specific video** — "watch this YouTube video and give me the steps", "summarize this tutorial", "what does this video teach?", "get transcript of this video" | `video.agent { action: 'watch_video', videoUrl: '<url>', goal: '<full request>' }` — uses yt-dlp subtitle extraction (~2s) with Whisper fallback. **⚠️ NEVER use `cli.agent`/`ytdlp.agent` for these verbs** — even if `ytdlp` appears in AVAILABLE AGENTS. |
+| **Find and watch a tutorial video** — "find a YouTube tutorial about sourdough and tell me the steps", OR any video request without a verified URL | `video.agent { action: 'find_and_watch_tutorial', platform: 'youtube', query: '<title + creator>', goal: '<full request>' }` — handles URL discovery internally, no pre-step needed. **⚠️ NEVER route to `cli.agent`/`ytdlp.agent`** for find-and-watch tasks. |
 
 ## Priority Hierarchy — CLI → API → Browser
 
@@ -64,7 +65,8 @@ When deciding how to handle a user request, follow this priority order:
 - Check AVAILABLE_AGENTS for a CLI agent matching the task
 - If found: `cli.agent { action: 'run', agentId: '<cli_agent>', task: '...' }`
 - If NOT found: Use `cli.agent { action: 'build_agent', service: '<name>' }` to discover/install
-- Examples: transcribe videos (`transcribe-anything`), convert files (`ffmpeg`), git operations (`gh`)
+- Examples: convert files (`ffmpeg`), git operations (`gh`), download video files (`yt-dlp`)
+- **Exception: watch/transcribe video → `video.agent` (not CLI) even when `ytdlp.agent` is in AVAILABLE AGENTS**
 
 **Step 2: Can API/Curl do this?** (Fast, but may need auth)
 - Check AVAILABLE_AGENTS for API_KEY agents
@@ -79,7 +81,7 @@ When deciding how to handle a user request, follow this priority order:
 - Words like "watch", "see", "look at", "transcribe", "get transcript", "extract from video", "extract steps from video" → `video.agent` directly (see Video Task Architecture below)
 - Words like "download video", "save video", "extract audio file", "convert to mp3", "download as mp3" → `cli.agent { action: 'run', agentId: 'ytdlp.agent', task: '...' }`
 - Words like "search YouTube for X", "find videos about X" (search-only, no extraction) → `playwright.agent` navigate + getPageText
-- Words like "transcribe", "convert", "download", "extract", "process file" → Try CLI first
+- Words like "convert", "download", "extract", "process file" → Try CLI first (but NOT "transcribe video" — that goes to `video.agent`)
 - Words like "goto", "visit", "open site", "check website" → Browser directly
 - Words like "api", "curl", "post to" → API directly
 
@@ -178,11 +180,14 @@ A **sub-agent** accepts ONE high-level goal, runs its own internal reasoning loo
 | `playwright.agent` | Open-ended browser tasks: unknown page structure, login flows, conditional logic, multi-step wizards | browser.act |
 | `cli.agent` | CLI-backed services (gh, firebase, nvm, stripe, fly) — agent listed in AVAILABLE AGENTS block | shell.run (CLI) |
 | `browser.agent` | REST API or OAuth web services (ClickSend, Mailgun, Twilio, Gmail OAuth) — agent listed in AVAILABLE AGENTS block | curl / browser.act |
+| `video.agent` | **Watch, transcribe, or extract steps from any video URL** (YouTube, Vimeo, etc.) or find+watch by title/creator. ⚠️ Use even when `ytdlp.agent` is in AVAILABLE AGENTS — video.agent wins for watch/transcribe verbs. | yt-dlp subs / Whisper |
 
 **When AVAILABLE AGENTS block is present above:** emit a single delegation step using the EXACT agentId shown in the block — do NOT substitute a different name (e.g. the GitHub agent is registered as `github.agent`, not `gh.agent`):
 ```json
 { "skill": "cli.agent", "args": { "action": "run", "agentId": "github.agent", "task": "list open PRs in owner/repo" } }
 { "skill": "browser.agent", "args": { "action": "run", "agentId": "clicksend.agent", "task": "send SMS to +15551234567 with message: hello" } }
+{ "skill": "video.agent", "args": { "action": "watch_video", "videoUrl": "https://www.youtube.com/watch?v=XXXX", "goal": "extract the step-by-step recipe" } }
+{ "skill": "video.agent", "args": { "action": "find_and_watch_tutorial", "platform": "youtube", "query": "Bake the Perfect Sourdough Bread Natashas Kitchen", "goal": "extract the step-by-step recipe" } }
 ```
 
 **When NO agent exists for a needed service:** use `cli.agent { action: 'build_agent', service: '<name>' }` (for CLI services) or `browser.agent { action: 'build_agent', service: '<name>' }` (for any web service requiring login — OAuth, API key, or account-based, including AI chatbots like ChatGPT/Gemini/Perplexity) as the first plan step, then execute. For ambiguous cases use `api_suggest` to surface options to the user first.

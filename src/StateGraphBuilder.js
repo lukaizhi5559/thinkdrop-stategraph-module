@@ -37,9 +37,84 @@ const parseProjectNode = require('./nodes/parseProject');
 const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
 const resolveUserContextNode = require('./nodes/resolveUserContext');
 const gatherPlanContextNode = require('./nodes/gatherPlanContext');
+const mcpFillGapsNode = require('./nodes/mcpFillGaps');
 
+/**
+ * Assess risk level of a user request using LLM classification
+ * Returns: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
+ */
+async function assessRisk(message, intent, llmBackend) {
+  // Fast-path: not command_automate = low risk
+  if (intent !== 'command_automate') return 'LOW';
+  
+  // Fast-path: obvious safe queries
+  const safePatterns = [
+    /\b(who|what|when|where|why|how)\b/i,
+    /\b(find|search|look up|check|get info about)\b/i,
+    /\b(what is|what's|tell me about)\b/i,
+  ];
+  if (safePatterns.some(p => p.test(message))) return 'LOW';
+  
+  const riskPrompt = `Classify the risk level of this user request:
 
+User request: "${message}"
 
+Risk definitions:
+- CRITICAL: File deletion, irreversible changes, mass data loss, system-level modifications
+- HIGH: File moves/copies with potential conflicts, installations, browser automation requiring auth, external API calls with side effects
+- MEDIUM: Read-only operations, simple navigation, queries, single-file operations with clear scope
+- LOW: Questions, information lookup, browsing, "what is" type queries
+
+Consider:
+1. Could this delete, corrupt, or overwrite data?
+2. Does it modify system state (files, installs, configs)?
+3. Does it require authentication or credentials?
+4. Are there ambiguous terms that could lead to unintended scope ("everything", "all files")?
+
+Output ONLY one word: CRITICAL | HIGH | MEDIUM | LOW`;
+
+  try {
+    const risk = await llmBackend.generateAnswer(riskPrompt, { temperature: 0, maxTokens: 10 });
+    const riskLevel = (risk || '').trim().toUpperCase();
+    
+    if (['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].includes(riskLevel)) {
+      return riskLevel;
+    }
+  } catch (e) {
+    // If LLM fails, use fallback heuristic
+    console.warn(`[StateGraphBuilder] Risk assessment LLM failed: ${e.message}`);
+  }
+  
+  // Fallback: check for high-risk keywords
+  const highRiskKeywords = /\b(mv|cp|rm|move|copy|delete|remove|install|uninstall|purge)\b.*\b(file|folder|directory)\b/i;
+  const criticalRiskKeywords = /\b(rm -rf|delete all|remove everything|format|wipe)\b/i;
+  
+  if (criticalRiskKeywords.test(message)) return 'CRITICAL';
+  if (highRiskKeywords.test(message)) return 'HIGH';
+  
+  return 'MEDIUM';
+}
+
+/**
+ * Detect operation type for grill mode context
+ */
+function detectOperationType(message) {
+  const msg = message.toLowerCase();
+  
+  if (/\b(mv|cp|rm|move|copy|delete|install|uninstall)\b/i.test(msg)) {
+    return 'file';
+  }
+  if (/\b(browser|navigate|click|fill|form|login|screenshot)\b/i.test(msg)) {
+    return 'browser';
+  }
+  if (/\b(api|webhook|curl|post|get|request)\b/i.test(msg)) {
+    return 'api';
+  }
+  if (/\b(sudo|brew|npm|system|config|permission)\b/i.test(msg)) {
+    return 'system';
+  }
+  return 'general';
+}
 
 /**
  * Extract the most useful short result string from a completed intent step.
@@ -256,6 +331,7 @@ class StateGraphBuilder {
       storeConstraint: (state) => storeConstraintNode({ ...state, logger, mcpAdapter }),
       liftConstraint:  (state) => liftConstraintNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
+      mcpFillGaps: (state) => mcpFillGapsNode({ ...state, logger, mcpAdapter, llmBackend }),
       gatherContext: (state) => gatherContextNode({ ...state, logger, mcpAdapter, llmBackend }),
       creatorPlanning: (state) => creatorPlanningNode({ ...state, logger, mcpAdapter }),
       planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -292,7 +368,7 @@ class StateGraphBuilder {
       },
 
       // enrichIntent router: handles MODE B re-routing + MODE A gap/resolve routing
-      enrichIntent: (state) => {
+      enrichIntent: async (state) => {
         const intentType = state.intent?.type || 'general_query';
         logger.info(`[StateGraph:Router] enrichIntent exit — intent: ${intentType} | _planFile: ${!!state._planFile} | _planMode: ${!!state._planMode}`);
 
@@ -305,6 +381,44 @@ class StateGraphBuilder {
         // MODE B re-route: enrichIntent stored answers and set intent=command_automate
         // or MODE A success: command_automate with profile complete — proceed to plan
         if (intentType === 'command_automate') {
+          // ── Risk Assessment for Grill Mode ─────────────────────────────────
+          // Run LLM-based risk assessment BEFORE routing to mcpFillGaps
+          let riskLevel = 'LOW';
+          let needsGrill = false;
+          
+          if (state.llmBackend && !state.matchedSkillName) {
+            riskLevel = await assessRisk(state.message || '', intentType, state.llmBackend);
+            needsGrill = ['CRITICAL', 'HIGH'].includes(riskLevel);
+            
+            if (needsGrill) {
+              logger.info(`[StateGraph:Router] Grill mode enabled (${riskLevel}) for: ${state.message}`);
+              // Set grill mode flag so mcpFillGaps will run
+              state._grillMode = true;
+              state._riskLevel = riskLevel;
+              state._riskContext = {
+                level: riskLevel,
+                operationType: detectOperationType(state.message || '')
+              };
+              
+              // Emit progress event for UI
+              if (state.progressCallback) {
+                state.progressCallback({
+                  type: 'gather:grill_start',
+                  message: `Deep analysis needed for this ${riskLevel.toLowerCase()} risk operation...`,
+                  riskLevel,
+                  riskContext: state._riskContext
+                });
+              }
+            }
+          }
+          
+          // For high-risk operations, enable grill mode with MCP pre-fill
+          // Route through mcpFillGaps → gatherContext for thorough Q&A
+          if (needsGrill && !state.matchedSkillName) {
+            logger.info('[StateGraph:Router] enrichIntent: High-risk operation detected — routing to mcpFillGaps → gatherContext');
+            return 'mcpFillGaps';
+          }
+          
           // Skill already installed (parseSkill matched) — skip gatherContext + creatorPlanning,
           // go straight to resolveUserContext → planSkills.
           // BUT: if the skill is a stub (no index.cjs on disk), we must go through gatherContext
@@ -358,6 +472,25 @@ class StateGraphBuilder {
           return 'executeCommand';
         }
         if (intentType === 'screen_intelligence') {
+          // Check for ambiguous follow-up queries that need conversation context
+          // These should go to answer node where LLM can interpret context naturally
+          const ambiguousPatterns = [
+            /\b(analysis|analyze|tell me about|what are)\s+(them|those|these|the|that|it|they)\b/i,
+            /\b(what about|what's with|what is with)\s+(them|those|these|the|that|it|they)\b/i,
+            /\b(what are the|tell me about the)\s+(screenshots?|pictures?|images?|files?)\b/i,
+            /\b(what|tell me|explain)\s+(about|regarding|concerning)?\s*(them|those|these)\b/i,
+            /\b(it|they|them|those)\s+(are|is|look|seem)\b/i,
+          ];
+          
+          const isAmbiguousFollowup = ambiguousPatterns.some(p => p.test(state.message || ''));
+          
+          if (isAmbiguousFollowup) {
+            logger.info(`[StateGraph:Router] Ambiguous follow-up detected for screen_intelligence — routing to answer node for context interpretation`);
+            // Mark this as needing context interpretation so answer node can include conversation history
+            state._needsContextInterpretation = true;
+            return 'answer';
+          }
+          
           return 'screenIntelligence';
         }
         if (intentType === 'app_control_start') {
@@ -378,6 +511,9 @@ class StateGraphBuilder {
       storeConstraint: 'logConversation',
       // Constraint lift path: liftConstraint → logConversation → end
       liftConstraint: 'logConversation',
+
+      // mcpFillGaps → gatherContext for grill mode operations
+      mcpFillGaps: 'gatherContext',
 
       // resolveUserContext → gatherPlanContext → planSkills
       // gatherPlanContext asks up to 3 clarifying questions for ambiguous command_automate tasks.

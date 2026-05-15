@@ -188,6 +188,18 @@ module.exports = async function answer(state) {
     ? '\n' + contextSources.join('\n')
     : '\n- No additional context';
 
+  // ── Inject conversation history for ambiguous follow-up interpretation ─────────
+  // When _needsContextInterpretation is set (e.g., "what about them?" after file analysis),
+  // include the actual conversation history so LLM can resolve ambiguous references
+  if (state._needsContextInterpretation && conversationHistory.length > 0) {
+    const recentHistory = conversationHistory.slice(-5); // Last 5 messages
+    const historyBlock = recentHistory.map((msg, i) => {
+      const role = msg.role === 'assistant' ? 'ThinkDrop' : 'User';
+      return `[${i + 1}] ${role}: ${msg.content?.substring(0, 300) || 'No content'}`;
+    }).join('\n');
+    systemInstructions += `\n\n=== RECENT CONVERSATION HISTORY ===\n${historyBlock}\n=== END HISTORY ===`;
+  }
+
   systemInstructions += '\n\nRules:';
 
   // Load intent-specific rules from answer.md, fall back to inline defaults

@@ -135,3 +135,62 @@ Example — task with missing SMS provider and credentials:
 - For credentials already in keytar, set `storedInKeytar: true` and prompt for confirmation rather than re-entry.
 - Never include actual secret values in the JSON output. Only key names.
 - When a user answers "Other" for a service choice, add a follow-up `text` unknown in the SAME response asking them to specify the service name.
+
+## Grill Mode (High-Risk Operation)
+
+When the system has detected a high-risk operation (file moves, deletions, installations, browser automation with auth, external API calls), you must walk down the decision tree for the relevant domain:
+
+### File/Directory Operations
+- **Scope**: Just files, or folders too? [Recommended: Files only]
+- **Types**: Specific extensions or all? Hidden files included? [Recommended: All files, include hidden]
+- **Destination**: Does it exist? Inside source folder? [Recommended: Must exist, exclude if inside source]
+- **Conflicts**: Overwrite existing? Skip? Ask? [Recommended: Skip existing]
+- **Recursion**: Top-level only or subdirectories? [Recommended: Top-level only]
+
+### Browser/Internet Operations
+- **Navigation**: Direct URL or search first? [Recommended: Search if URL uncertain]
+- **Auth**: Login required? Credentials known? [Recommended: Check keychain first]
+- **Selectors**: Specific element or generic? Dynamic content? [Recommended: Multiple fallback selectors]
+- **Rate limits**: Wait between actions? [Recommended: 500ms between, 2s after heavy ops]
+- **Captcha**: Bot detection likely? Alternative approach? [Recommended: Direct URL if search form blocked]
+
+### External API/Service Operations
+- **Auth**: OAuth token exists? Scopes sufficient? [Recommended: Repair if 403]
+- **Rate limits**: Calls per minute? Burst allowed? [Recommended: Check docs, default 60/min]
+- **Data scope**: Read-only or mutation? Production vs test? [Recommended: Read-only first]
+- **Error handling**: Retry on 5xx? Backoff strategy? [Recommended: 3 retries, exponential backoff]
+
+### System Operations
+- **Permissions**: Admin/sudo needed? [Recommended: Check before executing]
+- **Dependencies**: Prerequisites installed? Versions compatible? [Recommended: Check first, install if missing]
+- **Rollback**: Can this be undone? Backup first? [Recommended: Backup before destructive ops]
+
+For each question, provide your recommended answer. Ask relentlessly until ALL ambiguity is resolved.
+
+### Output structured constraints:
+```json
+{
+  "grilledConstraints": {
+    "domain": "file|browser|api|system",
+    "fileOps": {
+      "includeFolders": true/false,
+      "fileTypes": ["*" or ".txt,.md"],
+      "includeHidden": true/false,
+      "recursionDepth": 0 or N,
+      "overwritePolicy": "skip|replace|ask",
+      "exclusions": ["node_modules", ".git", "thinkdrop-files"]
+    },
+    "browserOps": {
+      "authRequired": true/false,
+      "fallbackSelectors": ["primary", "fallback_1", "fallback_2"],
+      "rateLimitMs": 500,
+      "handleCaptcha": true/false
+    },
+    "apiOps": {
+      "rateLimitPerMin": 60,
+      "retryCount": 3,
+      "scopeCheck": true/false
+    }
+  }
+}
+```

@@ -91,9 +91,9 @@ async function searchForLoginUrl(service, fallbackUrl, mcpAdapter, logger) {
  */
 
 const fs = require('fs');
+const path = require('path');
 
 function loadRecoveryPrompt() {
-  const path = require('path');
   const isWindows = process.platform === 'win32';
   const promptFile = isWindows ? 'recover-skill-windows.md' : 'recover-skill.md';
   const promptPath = path.join(__dirname, '../prompts', promptFile);
@@ -1456,6 +1456,29 @@ Then keep any synthesize step that follows. The {{bestUrl}} token in the navigat
         question: `I don't have permission to create a folder there (${args.cwd || 'that location'}). Would you like me to create it on your Desktop instead?`,
         options: [`Yes, use Desktop (${desktopPath})`, 'Choose a different location', 'Cancel']
       };
+    }
+  }
+
+  // mv/cp with wildcards that include the destination directory → REPLAN with safe find command
+  if (skill === 'shell.run' && failedStep.exitCode === 1) {
+    const bashScript = args.cmd === 'bash' ? (Array.isArray(args.argv) ? args.argv.join(' ') : '') : '';
+    const isMvOrCp = /\b(mv|cp)\b/.test(bashScript);
+    const hasWildcard = bashScript.includes('/* ') || bashScript.includes('/*\t');
+    const hasDirIntoItselfError = combinedError.includes('into itself') || combinedError.includes('cannot move') || combinedError.includes('cannot copy');
+    
+    if (isMvOrCp && hasWildcard && hasDirIntoItselfError) {
+      // Extract source and dest paths from the command
+      const match = bashScript.match(/(mv|cp)\s+(.+?)\s+(.+)$/);
+      if (match) {
+        const srcDir = match[2].replace(/\/\*$/, '').replace(/\*$/, '');
+        const destDir = match[3].trim();
+        logger.info(`[Node:RecoverSkill] Fast-path: mv/cp wildcard includes destination → REPLAN with find command`);
+        return {
+          action: 'REPLAN',
+          suggestion: `The command tried to move/copy files using a wildcard (*) that includes the destination directory, causing "cannot move a directory into itself". Use find with -type f and -not -path to exclude the destination: bash -c "find ${srcDir} -maxdepth 1 -type f ! -path '*${path.basename(destDir)}*' -exec mv {} ${destDir} +"`,
+          constraint: `NEVER use wildcards like "*" that include the destination directory in mv/cp commands. Use find with file type filter and exclusion.`
+        };
+      }
     }
   }
 

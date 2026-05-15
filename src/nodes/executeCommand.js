@@ -2804,6 +2804,13 @@ module.exports = async function executeCommand(state) {
     );
   }
 
+  // Normalize shell.run args: LLM sometimes generates 'command' instead of 'cmd'.
+  // The validator rejects anything without 'cmd', so remap before it reaches MCP.
+  if (skill === 'shell.run' && resolvedArgs.command && !resolvedArgs.cmd) {
+    resolvedArgs = { ...resolvedArgs, cmd: resolvedArgs.command };
+    delete resolvedArgs.command;
+  }
+
   // Expand ~ in shell.run argv — the LLM may generate paths with single-quoted tilde
   // (e.g. '~/.thinkdrop/...') which bash cannot expand. Pre-expand here unconditionally.
   if (skill === 'shell.run' && Array.isArray(resolvedArgs.argv)) {
@@ -4381,7 +4388,16 @@ module.exports = async function executeCommand(state) {
 
       // Step failed and is not optional — hand off to recoverSkill
       logger.warn(`[Node:ExecuteCommand] Step ${skillCursor + 1} failed: ${enrichedStepResult.error}`);
-      if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: enrichedStepResult.error, stderr: enrichedStepResult.stderr });
+      if (progressCallback) progressCallback({
+        type: 'step_failed',
+        stepIndex: skillCursor,
+        skill,
+        description: description || skill,
+        error: enrichedStepResult.error,
+        stderr: enrichedStepResult.stderr,
+        userAllowlistHint: enrichedStepResult.userAllowlistHint || false,
+        commandName: enrichedStepResult.commandName || null,
+      });
       return {
         ...state,
         skillResults: updatedResults,
