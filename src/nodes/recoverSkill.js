@@ -117,6 +117,8 @@ AUTO_PATCH: { "action": "AUTO_PATCH", "patchedArgs": {...}, "note": "one-line ex
 REPLAN: { "action": "REPLAN", "suggestion": "what to do differently", "alternativeCwd": "/path", "constraint": "what to avoid" }
 ASK_USER: { "action": "ASK_USER", "question": "clear question", "options": ["option A", "option B"] }
 
+ESCALATION RULE: If the "Previous recovery attempts" list shows 2 or more entries with the same error class (same keyword repeating — e.g. "No such file or directory", "exit code 1", "ENOENT", "permission denied"), and your new suggestion would NOT fix the root cause (e.g. you don't know the correct path, or the fix requires user input), output ASK_USER — not REPLAN. REPLAN is only appropriate when you have a genuinely different strategy. Repeating REPLAN with minor variations while the same error recurs is always wrong.
+
 Output ONLY valid JSON. No explanation, no markdown fences.`;
 
 module.exports = async function recoverSkill(state) {
@@ -303,9 +305,22 @@ module.exports = async function recoverSkill(state) {
   }
 
   // ── Fast-path: known recoverable patterns (no LLM call needed) ──────────────
-  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl, replanCount, state.creatorSkillPath, state.webAgentBestUrl || null);
+  const fastRecovery = tryFastRecovery(failedStep, skillPlan, skillCursor, stepRetryCount, logger, skillResults, state.activeBrowserUrl, replanCount, state.creatorSkillPath, state.webAgentBestUrl || null, patchHistory);
   if (fastRecovery) {
     return applyRecovery(fastRecovery, state, skillPlan, skillCursor, stepRetryCount, replanCount, logger);
+  }
+
+  // ── Emit progress event so UI reflects recovery state ───────────────────────
+  if (typeof state.progressCallback === 'function') {
+    try {
+      state.progressCallback({
+        type: 'recovering',
+        skill: failedStep.skill,
+        attempt: replanCount + 1,
+        error: failedStep.error || 'unknown error',
+        description: `Attempt ${replanCount + 1}: recovering from ${failedStep.skill} failure`,
+      });
+    } catch (_) { /* never block recovery on progress callback errors */ }
   }
 
   // ── LLM-based recovery ───────────────────────────────────────────────────────
@@ -421,7 +436,9 @@ module.exports = async function recoverSkill(state) {
     const _isBashFileOp = _bashScript.length > 0 && (
       /\bsed\b/.test(_bashScript) || /\bawk\b/.test(_bashScript) ||
       /\bjq\b/.test(_bashScript)  || /echo\s+.*>/.test(_bashScript) ||
-      /\btee\b/.test(_bashScript) || /cat\s*>/.test(_bashScript)
+      /\btee\b/.test(_bashScript) || /cat\s*>/.test(_bashScript) ||
+      /\bwhile\b.*\b(mv|cp)\b/.test(_bashScript) ||
+      /\bfind\b.*-exec\s+(mv|cp)\b/.test(_bashScript)
     );
     const _isQuotingError = (exitCode === 2) && (failedStep.args?.cmd === 'bash');
     if (_isBashFileOp || _isQuotingError) {
@@ -569,7 +586,17 @@ ${failedStep.result.debugContext.devToolsData.consoleLogs.slice(-3).map(l =>
 `
     : '';
 
-  const recoveryQuery = `Original user request: "${resolvedMessage || message}"
+  // Include recent conversation history so the LLM knows what was completed in prior turns
+  const recentHistory = (state.conversationHistory || [])
+    .filter(m => m.role === 'assistant')
+    .slice(-3)
+    .map(m => `- ${String(m.content || '').slice(0, 200)}`)
+    .join('\n');
+  const conversationContextSection = recentHistory
+    ? `\nRecent conversation (what was already accomplished):\n${recentHistory}\n`
+    : '';
+
+  const recoveryQuery = `${conversationContextSection}Original user request: "${resolvedMessage || message}"
 
 Failed step:
   Step number: ${failedStep.step}
@@ -594,6 +621,7 @@ Decide the recovery strategy.`;
     query: recoveryQuery,
     context: {
       systemInstructions: RECOVERY_SYSTEM_PROMPT,
+      conversationHistory: (state.conversationHistory || []).slice(-6),
       sessionId: context?.sessionId,
       userId: context?.userId,
       intent: 'command_automate'
@@ -668,9 +696,148 @@ Decide the recovery strategy.`;
 // Fast-path recovery: handle well-known failure patterns without an LLM call
 // ---------------------------------------------------------------------------
 
-function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0, creatorSkillPath = null, webAgentBestUrl = null) {
+// Extract a normalised error class fingerprint from an error string.
+// Returns a short keyword used to detect repeated identical failures in patchHistory.
+// Returns null for unknown error classes — those are left to MAX_REPLANS.
+function _errorFingerprint(error) {
+  const e = (error || '').toLowerCase();
+  if (/no such file|not found|does not exist/.test(e)) return 'no such file';
+  if (/permission denied/.test(e))                     return 'permission denied';
+  if (/enoent/.test(e))                                return 'enoent';
+  if (/cannot move.*into itself/.test(e))              return 'cannot move into itself';
+  if (/invalid argument/.test(e))                      return 'invalid argument';
+  if (/agentic loop reached max_turns|max_turns.*without completing|reached max_turns/i.test(e)) return 'max_turns_exhausted';
+  return null;
+}
+
+function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0, creatorSkillPath = null, webAgentBestUrl = null, patchHistory = []) {
   const { skill, args, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
+
+  // ── Progress-aware stuck detection ──────────────────────────────────────────
+  // If patchHistory already contains 2+ entries matching the same error fingerprint,
+  // recovery is cycling without progress — escalate to ASK_USER immediately.
+  // This is NOT a fixed replan count: different errors on each attempt → fingerprints
+  // differ → no escalation. Same error every time → escalate.
+  const fingerprint = _errorFingerprint(error);
+  // MAX_TURNS exhaustion special case: escalate after just 1 prior match.
+  // Hitting MAX_TURNS twice is definitively unrecoverable without user input —
+  // the agent will keep exhausting turns on every retry.
+  if (fingerprint === 'max_turns_exhausted' && patchHistory.length >= 1) {
+    const exhaustedCount = patchHistory.filter(p => p.toLowerCase().includes('max_turns_exhausted')).length;
+    if (exhaustedCount >= 1) {
+      logger.info(`[Node:RecoverSkill] MAX_TURNS exhausted twice — escalating to ASK_USER immediately`);
+      return {
+        action: 'ASK_USER',
+        question: `The agent ran out of steps (MAX_TURNS) twice trying to complete this task. It may need to be broken into smaller pieces. What would you like to do?`,
+        options: ['Break it into smaller steps', 'Try a different approach', 'Cancel this task'],
+      };
+    }
+  }
+  if (fingerprint && fingerprint !== 'max_turns_exhausted' && patchHistory.length >= 2) {
+    const sameErrorCount = patchHistory.filter(p => p.toLowerCase().includes(fingerprint)).length;
+    if (sameErrorCount >= 2) {
+      logger.info(`[Node:RecoverSkill] Stuck detection: error fingerprint "${fingerprint}" found in ${sameErrorCount}/${patchHistory.length} prior attempts — escalating to ASK_USER`);
+      return {
+        action: 'ASK_USER',
+        question: `I've tried ${patchHistory.length} approaches but keep hitting the same issue: "${(error || '').slice(0, 120)}". I need your input to proceed — what would you like to do?`,
+        options: ['Give me the correct path or value', 'Skip this step', 'Cancel this task'],
+      };
+    }
+  }
+
+  // ── shell.run exit 1: path not found → search common locations → AUTO_PATCH ──
+  // When the command fails because a folder/file path doesn't exist, extract the bad
+  // path from the command, search Desktop/Documents/Downloads/home for the name, and
+  // AUTO_PATCH the step with the real path — no LLM call needed, no user prompt.
+  if (skill === 'shell.run' && failedStep.exitCode === 1) {
+    const _combinedOut = ((failedStep.stdout || '') + ' ' + (failedStep.stderr || '')).toLowerCase();
+    const _isPathMissing = _combinedOut.includes('no such file or directory') || _combinedOut.includes('does not exist');
+    if (_isPathMissing) {
+      // Extract all absolute paths from the bash script
+      const _bashScript = args.cmd === 'bash' ? (Array.isArray(args.argv) ? args.argv.join(' ') : (args.argv || '')) : '';
+      const _goalStr = args.goal || '';
+      const _allText = _bashScript + ' ' + _goalStr;
+      // Match /Users/... or ~/... paths, grab the leaf folder name
+      const _pathMatches = _allText.match(/(?:\/Users\/[^\s"'\\]+|~\/[^\s"'\\]+)/g) || [];
+      const _badPaths = _pathMatches.filter(p => {
+        try {
+          const _resolved = p.replace(/^~/, process.env.HOME || '/Users/' + (process.env.USER || 'unknown'));
+          return !require('fs').existsSync(_resolved);
+        } catch (_) { return false; }
+      });
+      if (_badPaths.length > 0) {
+        const _badPath = _badPaths[0];
+        const _folderName = require('path').basename(_badPath);
+        const _homeDir = process.env.HOME || ('/Users/' + (process.env.USER || 'unknown'));
+        // Search Desktop, Documents, Downloads, home (maxdepth 2)
+        try {
+          const { execSync } = require('child_process');
+          const _searchCmd = `find "${_homeDir}/Desktop" "${_homeDir}/Documents" "${_homeDir}/Downloads" "${_homeDir}" -maxdepth 2 -name "${_folderName}" -type d 2>/dev/null | head -5`;
+          const _found = execSync(_searchCmd, { timeout: 3000, encoding: 'utf8' }).trim();
+          const _candidates = _found ? _found.split('\n').filter(Boolean) : [];
+          if (_candidates.length === 1) {
+            const _realPath = _candidates[0];
+            const _resolved = _badPath.replace(/^~/, _homeDir);
+            const _newGoal = _goalStr
+              ? _goalStr.replace(new RegExp(_folderName, 'g'), _realPath)
+              : null;
+            const _patchedArgs = _newGoal
+              ? { goal: _newGoal }
+              : {
+                  argv: Array.isArray(args.argv)
+                    ? args.argv.map(a => a.split(_resolved).join(_realPath))
+                    : args.argv
+                };
+            logger.info(`[Node:RecoverSkill] Fast-path: folder "${_folderName}" not at "${_resolved}" — found at "${_realPath}" → AUTO_PATCH`);
+            return {
+              action: 'AUTO_PATCH',
+              patchedArgs: _patchedArgs,
+              note: `Folder "${_folderName}" is at "${_realPath}", not "${_resolved}" — corrected path`,
+            };
+          } else if (_candidates.length > 1) {
+            const _opts = _candidates.slice(0, 4).map(c => `Use "${c}"`);
+            logger.info(`[Node:RecoverSkill] Fast-path: folder "${_folderName}" found in ${_candidates.length} locations → ASK_USER`);
+            return {
+              action: 'ASK_USER',
+              question: `I found "${_folderName}" in multiple locations. Which one did you mean?`,
+              options: [..._opts, 'Cancel'],
+            };
+          } else {
+            logger.info(`[Node:RecoverSkill] Fast-path: folder "${_folderName}" not found anywhere under Desktop/Documents/Downloads/home → ASK_USER`);
+            return {
+              action: 'ASK_USER',
+              question: `I couldn't find a folder named "${_folderName}" on your Mac. Would you like to:`,
+              options: [
+                `Search your entire home folder for "${_folderName}"`,
+                `Enter the full path manually`,
+                'Cancel',
+              ],
+            };
+          }
+        } catch (_searchErr) {
+          logger.debug(`[Node:RecoverSkill] Fast-path: path-search execSync failed (non-fatal): ${_searchErr.message}`);
+        }
+      }
+    }
+  }
+
+  // ── shell.run bash exit 1 after prior attempt → switch to goal mode ───────
+  // When bash generates exit code 1 and has already been attempted/patched once,
+  // escalate to REPLAN using args.goal. The shell executor's expert LLM (SHELL_RUN_SYSTEM)
+  // will then pick the correct tool (python3/bash/osascript) rather than planSkills
+  // generating raw argv that bypasses all safety rules.
+  if (skill === 'shell.run' && failedStep.exitCode === 1) {
+    const priorAttempts = patchHistory.filter(p => /AUTO_PATCH|REPLAN/i.test(p)).length;
+    if (priorAttempts >= 1) {
+      logger.info(`[Node:RecoverSkill] Fast-path: shell.run bash exit 1 after ${priorAttempts} prior attempt(s) — escalating to goal-mode REPLAN`);
+      return {
+        action: 'REPLAN',
+        suggestion: `Bash command failed ${priorAttempts + 1} times. Switch to args.goal mode — describe the task in plain English and let the shell executor pick the correct tool (python3, bash, osascript, etc.).`,
+        constraint: 'USE GOAL MODE: Do NOT generate args.cmd or args.argv. Emit { "skill": "shell.run", "args": { "goal": "<plain English description of the task>" } } only. The executor will generate a safe, correct command.',
+      };
+    }
+  }
 
   // ── browser.agent run: wrong destination — auto-correct surfaced as ASK_USER ──
   // browser.agent returned {wrongDestination:true} when the pre-navigation resolver
@@ -817,6 +984,33 @@ Then keep any synthesize step that follows. The {{bestUrl}} token in the navigat
       action: 'REPLAN',
       reason: explanation,
     };
+  }
+
+  // shell.run: full shell string passed as cmd instead of splitting cmd + argv.
+  // Caught either early by validate() (_shellStringInCmd) or at spawn time (ENOENT on spaces/globs).
+  // AUTO_PATCH: globs/operators → bash -c; plain spaces → split into cmd + argv (no bash wrapper).
+  const isShellStringError = failedStep._shellStringInCmd ||
+    (skill === 'shell.run' && /spawn .+ ENOENT/i.test(error));
+  if (isShellStringError) {
+    const rawCmd = (args?.cmd || '').trim();
+    if (rawCmd && /\s/.test(rawCmd)) {
+      const needsShell = /[*?|;&$`"']/.test(rawCmd);
+      logger.info(`[Node:RecoverSkill] Fast-path: shell.run shell string in cmd (needsShell=${needsShell}) → AUTO_PATCH`);
+      if (needsShell) {
+        return {
+          action: 'AUTO_PATCH',
+          patchedArgs: { cmd: 'bash', argv: ['-c', rawCmd] },
+          note: `Rewrote shell string with globs/operators as bash -c: "${rawCmd.slice(0, 60)}..."`,
+        };
+      } else {
+        const parts = rawCmd.split(/\s+/);
+        return {
+          action: 'AUTO_PATCH',
+          patchedArgs: { cmd: parts[0], argv: parts.slice(1) },
+          note: `Split full shell string into cmd + argv: cmd="${parts[0]}", argv=${JSON.stringify(parts.slice(1))}`,
+        };
+      }
+    }
   }
 
   // shell.run: command not allowlisted yet — ask user to allow and retry.

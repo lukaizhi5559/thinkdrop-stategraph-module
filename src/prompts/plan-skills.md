@@ -14,6 +14,28 @@ browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|
 web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,maxResults?:number}|[web_search_agent]_Searches_the_web_via_MCP_web-search_service_and_returns_structured_results.__Use_when:_(1)_target_site_blocks_bots/CAPTCHA_and_you_need_a_direct_article_URL_without_triggering_a_search_form,_(2)_service_URL_is_unknown_or_LLM_may_guess_wrong_domain,_(3)_need_navigation_hints_for_complex_SaaS_before_browser_automation.__actions:_search_and_navigate_(returns_{bestUrl,title,snippet}),_research_domain_(returns_{insights,insightsText,bestUrl,confidence}),_get_tutorial_steps.__After_search_and_navigate,_use_browser.act_navigate(bestUrl)_to_go_directly_to_content._NEVER_use_web.agent_for_services_in_AVAILABLE_AGENTS—those_already_handle_auth_correctly.
 video.agent|args:{action:string,videoUrl?:string,platform?:string,query?:string,goal:string}|[video_agent]_Watches_and_transcribes_a_video_using_yt-dlp_subtitle_extraction_(primary,_~2s)_with_Whisper_fallback.__action:"watch_video"_{videoUrl,goal}_→_extract_full_transcript_+_metadata_+_synthesize_steps.__action:"find_and_watch_tutorial"_{platform,query,goal}_→_search_YouTube_by_title/creator,_pick_best_result,_extract_transcript.__⚠️_USE_THIS_(not_cli.agent/ytdlp.agent)_for_ANY_"watch",_"see",_"look_at",_"transcribe",_"get_transcript_from",_"extract_steps_from_video"_request.__NEVER_route_watch/transcribe_tasks_to_cli.agent_or_ytdlp.agent_even_if_ytdlp_appears_in_AVAILABLE_AGENTS—video.agent_always_wins_for_these_verbs.
 
+## CLI-First Routing
+
+For ANY task that could be served by a CLI tool, REST API, or Python script — try those paths FIRST before `browser.agent`.
+
+**Priority order:** `cli.agent` → `shell.run` (local/Python) → `browser.agent` (only when no CLI/API path or OAuth required)
+
+**Check AVAILABLE AGENTS first** — if a `[cli]` agent exists, run it directly. If not: `cli.agent { action: 'build_agent', service: '<best-cli-name>' }` then run.
+
+**Skip CLI-first for:** pure navigation ("go to", "visit", "navigate to"), explicit browser agent reference ("using my gmail.agent"), OAuth-only tasks.
+
+| Domain | Best CLI |
+|---|---|
+| Video/audio extract, transcript, subtitles | `yt-dlp` (brew) |
+| Audio/video convert/encode/merge | `ffmpeg` (brew) |
+| Image resize, convert, watermark | `imagemagick` (brew) |
+| Document convert (docx, pdf, epub, md) | `pandoc` (brew) |
+| CSV/spreadsheet processing | `csvkit` or `miller` (pip/brew) |
+| GitHub operations | `gh` (brew) |
+| AWS operations | `aws` (brew) |
+| Screen capture to file | `screencapture` (macOS built-in) |
+| REST API with API key | `curl` via `cli.agent build_agent` |
+
 ## Template variables
 
 - `{{synthesisAnswer}}` — full text output of the last `synthesize` step
@@ -165,7 +187,13 @@ It must NOT reproduce the attachment's full content. The full content belongs in
 ## Critical skill selection rules
 
 - **Stopping/closing a ThinkDrop project app** — use `project.stopper` with the projectName. NEVER use `needs_skill` or `shell.run kill` for this. Example: user says "close it", "stop the app", "shut down the cold plunge project" → `project.stopper { "projectName": "schedule-daily-cold-plunge-sessions-at-6" }`. Use partial name matching — "cold plunge" matches "schedule-daily-cold-plunge-sessions-at-6".
-- **Reading/writing files** — always `shell.run bash -c`, never open a GUI app
+- **Reading/writing files** — use `shell.run` with `args.goal`, never open a GUI app
+- **`shell.run` USAGE — use `args.goal` for all file operations and multi-step logic.** The shell executor has a dedicated expert LLM (`SHELL_RUN_SYSTEM`) that picks the correct tool (bash, python3, node, osascript) and generates safe commands.
+  - CORRECT: `{ "skill": "shell.run", "args": { "goal": "Move all files from ~/Desktop/some-folder back to ~/Desktop, skipping existing files" } }`
+  - WRONG: `{ "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "mv -n ..."] } }`
+  - **CRITICAL: NEVER emit both `goal` AND `cmd`/`argv` in the same step.** If `goal` is set, omit `cmd` and `argv` entirely — the executor's LLM generates the command. Emitting both causes `goal` to be silently ignored and the pre-built `argv` to run directly, bypassing all safe-path and mdfind logic.
+  - Exceptions where `cmd`+`argv` is still fine (simple single-binary, no logic): `open`, `osascript` (1-liner), `npm`, `yarn`, `git`, `brew`, `pip3`, `python3 /path/to/script.py`
+- **FOLDER PATH RULE — bare folder name with no explicit path:** When the user refers to a folder by name only (e.g. "the gongzuo folder", "my projects folder", "list files in downloads") with NO absolute path provided, NEVER assume `~/<name>`. ALWAYS use a `shell.run` goal that searches in order: `~/Desktop/<name>` → `~/Documents/<name>` → `~/Downloads/<name>` → `~/<name>`. Generate the goal as: `"Find the folder named <name> (check ~/Desktop first, then ~/Documents, ~/Downloads, then ~/) and <do the task>"`. The shell executor will locate it correctly. NEVER hard-code a bare `~/folderName` path when the user has not provided the full path.
 - **Editing an existing file** — read it first, then synthesize, then write
 - **`synthesize` with `saveToFile` — ONLY when user explicitly asks to save/write/create a file.** If the task is just reading, analyzing, or summarizing an existing file, the `synthesize` step MUST NOT include `saveToFile`. Never auto-generate a new file just to hold the analysis — stream it as the answer instead.
 - **`image.analyze`** — for local image files only (tagged file path). Never use for live screenshots.
@@ -223,61 +251,10 @@ navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|
 
 **browser.act is a pure playwright-cli terminal skill** — every action spawns a `playwright-cli` subprocess. No Node API, no npm packages. Sessions are managed by playwright-cli daemon via `-s=<sessionId>`. The `snapshot` command captures the accessibility tree and returns numbered element refs (`e1`, `e21`, etc.) used for click/fill/hover.
 
-### snapshot + ref flow (the correct pattern for clicking/filling any element)
-
-click/fill/hover automatically take a fresh snapshot and resolve the `selector` label to a ref. You only need to call `snapshot` explicitly when you need to see the accessibility tree output in the plan result.
-
-### file attachments — copy + paste-into-body method (human workflow)
-Mimic exactly what a human does: copy the file to the OS clipboard with Finder, focus the email compose **body**, then paste. Gmail/most chat apps detect the clipboard File and auto-attach it. **Do NOT click the paperclip / "Attach files" button** — that opens a native file chooser modal that blocks keyboard events in playwright-cli.
-
-**Step 1 — Copy the file to the clipboard (macOS osascript):**
-```json
-{ "skill": "shell.run", "args": { "command": "osascript -e 'tell application \"Finder\" to set the clipboard to (POSIX file \"/path/to/file.pdf\")'" } }
-```
-Multiple files:
-```json
-{ "skill": "shell.run", "args": { "command": "osascript -e 'tell application \"Finder\" to set the clipboard to {POSIX file \"/a.pdf\", POSIX file \"/b.pdf\"}'" } }
-```
-
-**Step 2 — Paste into the compose body (preferred):** use `pasteAttachment`. It finds the compose body textbox, focuses it, then presses `Meta+V` on macOS / `Ctrl+V` elsewhere:
-```json
-{ "skill": "browser.act", "args": { "action": "pasteAttachment", "sessionId": "gmail_agent" } }
-```
-You may optionally pin the body by label (only if the default scanner picks the wrong textbox):
-```json
-{ "skill": "browser.act", "args": { "action": "pasteAttachment", "selector": "Message Body", "sessionId": "gmail_agent" } }
-```
-
-**Canonical order in a send-with-attachment plan:**
-1. `synthesize(saveToFile)` → produce the file (PDF, DOCX, etc.) — this step MUST succeed before any clipboard copy
-2. `shell.run` osascript → copy the **exact path returned by step 1** to the clipboard — NEVER reference a path that was not explicitly produced by a prior `synthesize(saveToFile)` step
-3. browser.act navigate + click Compose + fill To/Subject + type SHORT email body (cover note only)
-4. `browser.act pasteAttachment` — **after** the body is typed, **before** Send
-5. click Send
-
-**File existence rule — CRITICAL:** NEVER put a file path in a `shell.run` osascript clipboard copy step unless that **exact path** was explicitly written by a prior `synthesize(saveToFile)` step in the same plan. If the prior synthesize used a different extension (e.g. `.txt` instead of `.pdf`), use the `.txt` path in the clipboard step — do not reference the original `.pdf` path. The runtime will auto-substitute when possible, but the plan MUST use the confirmed real path.
-
-**Things to AVOID:**
-- Clicking the paperclip / "Attach" button before paste — opens a file chooser modal and blocks keys.
-- Emitting `press Ctrl+v` on macOS — use `Meta+v` (or better: use `pasteAttachment` so the key is chosen for you).
-- Using the low-level `paste` action on an un-focused page — it pastes into whatever happens to have focus.
-
-Cross-platform: macOS uses `osascript`, Windows uses `Set-Clipboard -Path` (PowerShell), Linux uses `xclip -selection clipboard -t <mime> -i <file>`. `pasteAttachment` picks the right modifier key automatically.
-
-```json
-[
-  { "skill": "browser.act", "args": { "action": "navigate", "url": "https://example.com" } },
-  { "skill": "browser.act", "args": { "action": "click", "selector": "Sign in" } },
-  { "skill": "browser.act", "args": { "action": "fill", "selector": "Email", "text": "user@example.com" } },
-  { "skill": "browser.act", "args": { "action": "press", "key": "Enter" } }
-]
-```
-
 **Selector rules:**
-- **When CURRENT PAGE ELEMENTS are provided above with `[eN]` refs: use the `eN` ref as the `selector` value — do NOT use the label text.** e.g. `"selector": "e42"` not `"selector": "Bible Study"`
-- **When `[eN]` refs are provided, NEVER add an `examine` step** — the refs are already known and up-to-date.
-- When no refs are provided (fresh navigate with no pre-scan): pass the **visible label or aria-name** as `selector` (e.g. `"Sign in"`, `"Email"`, `"Search"`)
-- For typing into a search box without a known label: use `fill` with `selector` set to the placeholder text or visible label
+- `[eN]` refs provided above → use `"selector": "e42"`, never label text, never add `examine`.
+- No refs (fresh navigate) → pass visible label/aria-name (e.g. `"Sign in"`, `"Email"`).
+- File attachments: `synthesize(saveToFile)` → `shell.run` osascript clipboard copy (exact path from prior step) → `browser.act pasteAttachment`. Never click the paperclip button.
 
 **CRITICAL — AI chatbot URLs (use these exact URLs, NOT the wrong ones):**
 | Name | Correct URL | WRONG URL (do NOT use) |
@@ -291,125 +268,21 @@ Cross-platform: macOS uses `osascript`, Windows uses `Set-Clipboard -Path` (Powe
 `fill` will fail with "Element is not an input/textarea" on most AI chat UIs.
 Use `fill` as normal; the skill handles the fallback. Do NOT add a separate `click` step before `fill`.
 
-**CRITICAL — Multi-site tasks: use ONE sessionId + tabs, NOT multiple sessionIds.**
-Multiple `sessionId`s open SEPARATE browser windows. Use `tab-new` within ONE session instead.
-**NEVER use site names as sessionIds** (e.g. `"perplexity"`, `"chatgpt"`, `"gemini"`) when visiting multiple sites — always use a single generic name like `"browser"` for ALL steps in the plan.
+**CRITICAL — Multi-site tasks:** use ONE `sessionId` + `tab-new` for additional sites. NEVER use site names as sessionIds — use a single generic name like `"browser"`. Always `snapshot` after `navigate` or `tab-new` before `fill`.
 
-**Multi-site pattern (visiting multiple sites to collect data):**
-```json
-[
-  { "skill": "browser.act", "args": { "action": "navigate", "url": "<site1-url>", "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "snapshot", "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "fill", "selector": "<visible input label or placeholder>", "text": "<query>", "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "press", "key": "Enter", "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "waitForStableText", "timeoutMs": 60000, "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "tab-new", "url": "<site2-url>", "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "snapshot", "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "fill", "selector": "<visible input label or placeholder>", "text": "<query>", "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "press", "key": "Enter", "sessionId": "browser" } },
-  { "skill": "browser.act", "args": { "action": "waitForStableText", "timeoutMs": 60000, "sessionId": "browser" } }
-]
-```
+**Reading page content:** static pages → `getPageText`; dynamic/JS-rendered → `waitForStableText`; after AI chatbot submit → `waitForStableText` with `timeoutMs:60000`. NEVER use `sleep`. NEVER use `waitForSelector` for inputs — use `fill` with label. NEVER click a search button — use `press Enter`. NEVER navigate to hash-fragment URLs — use `navigate` + `fill` + `press Enter`.
 
-Rules:
-- **ALWAYS add a `snapshot` step immediately after `navigate` or `tab-new` and before `fill`** — this ensures the element tree is fresh for the new page so `fill` targets the correct input
-- **ALL steps use the same `sessionId`** (e.g. `"browser"`) — never switch sessionId mid-plan for multi-site tasks
-- `tab-new` with `url` opens a new tab AND navigates to the URL in one step — no separate `navigate` needed after `tab-new`
-- After `tab-new`, all subsequent actions automatically target the newest tab
-- `tab-select` with `tabIndex: 0` (first tab), `tabIndex: 1` (second), etc. — use to go back to a previous tab
-- `tab-list` — use to check what tabs are open and their indices
-- **Check SITE/APP-SPECIFIC RULES (injected below) before choosing a URL** — learned corrections for specific sites take priority over your defaults
+**`examine`** — add after `navigate` when clicking/filling specific elements. Returns `OK` / `RECOVERABLE` / `NEEDS_USER` / `BLOCKED`. If status ≠ `OK`, plan stops with user-friendly message.
 
-**CRITICAL — General pattern for any interactive site:**
-1. `navigate` → URL — always first
-2. `examine` → **ALWAYS add after `navigate` when the task requires clicking, filling, or finding specific elements** — scans the page against your intent and detects: not logged in, wrong page/section, missing elements, modals blocking content, paywall, etc. If `examine` returns `status !== "OK"`, the plan is aborted with a user-friendly message — no wasted steps.
-3. `fill` → selector=input label, text=query
-4. `press` → key=`Enter`
-5. `waitForStableText` → wait for content to stabilise, returns page text
+**screen vs browser tab:** "what's on my screen" → `screen.capture` (OCR). "extract from web page" → `browser.act getPageText`.
 
-**`examine` args:**
-- `intent` — what you are trying to do (e.g. `"click the Bible Study project"`)
-- `nextActions` — array of the upcoming step descriptions (e.g. `["click Bible Study", "waitForStableText"]`)
-- `sessionId` — same as other steps
+**state-save / state-load:** saves/restores cookies + localStorage to `~/.thinkdrop/browser-sessions/<sessionId>.json`.
 
-**`examine` status values:**
-- `OK` — page is ready, proceed
-- `RECOVERABLE` — automation can fix it (auto-replans with context_rule written)
-- `NEEDS_USER` — user must act first (not logged in, paywall, item doesn't exist) — **plan stops with clear message**
-- `BLOCKED` — page broken/404
+## guide.step — routing rules
 
-```json
-[
-  { "skill": "browser.act", "args": { "action": "navigate", "url": "https://chat.openai.com", "sessionId": "chatgpt" } },
-  { "skill": "browser.act", "args": { "action": "examine", "intent": "click the Bible Study project", "nextActions": ["click Bible Study"], "sessionId": "chatgpt" } },
-  { "skill": "browser.act", "args": { "action": "click", "selector": "Bible Study", "sessionId": "chatgpt" } }
-]
-```
+**Use ONLY when automation cannot complete the action:** CAPTCHAs, TOTP/2FA prompts, tasks explicitly requesting "walk me through" / "guide me".
 
-**Reading page content (no interaction needed):**
-- **Static pages (Wikipedia, news, docs, product pages):** use `getPageText` — returns `document.body.innerText` immediately after `navigate`
-- **Dynamic/JS-rendered pages:** use `waitForStableText` — polls until text stops changing
-- **After AI chatbot submit:** use `waitForStableText` with `timeoutMs:60000`
-
-`waitForStableText` behaviour: polls page text every 1.2s, exits when 2 consecutive polls are equal OR `timeoutMs` reached. Returns best text captured so far — never hangs.
-
-`waitForContent` behaviour: polls until a specific string appears in page text. Args: `text` (required), `timeoutMs` (default 15000).
-
-**NEVER use a fixed `sleep` before reading content.**
-**NEVER use `waitForSelector` to find an input — use `fill` with the label instead.**
-**NEVER navigate to hash-fragment URLs like `#search/query` — use `navigate` + `fill` + `press Enter`.**
-**NEVER click a search button by label (e.g. `click "Search button"`, `click "Go"`, `click "Search"` after fill) — always submit search forms with `press Enter`. Clicking a search button by label is unreliable; `press Enter` always works.**
-
-**Browser tab routing — automatic, session-based:**
-- `sessionId` defaults to the URL hostname (e.g. `en.wikipedia.org`)
-- Reusing the same `sessionId` reuses the existing tab
-- **Always use the same `sessionId` on ALL steps for the same site**
-- To open a second tab on the same site, use an explicit unique `sessionId`
-
-**state-save / state-load — auth persistence:**
-- `state-save` saves cookies + localStorage to `~/.thinkdrop/browser-sessions/<sessionId>.json`
-- `state-load` restores it on next session start — use before `navigate` to skip login
-
-**IMPORTANT — screen vs browser tab:**
-- "What's on my screen" / "save what you see" → `screen.capture` (OCR), NOT `browser.act`
-- "Extract info from this web page" → `browser.act getPageText` (no navigate needed if already open)
-
-**Screen-to-file pattern (the only correct approach):**
-```json
-[
-  { "skill": "screen.capture", "args": {} },
-  { "skill": "synthesize", "args": { "prompt": "Format the screen text for saving.", "saveToFile": "/Users/lukaizhi/Desktop/filename.txt" } }
-]
-```
-
-## guide.step — interactive walkthroughs
-
-**ONLY use `guide.step` when automation genuinely cannot complete the action:**
-- Government sites, CAPTCHAs, reCAPTCHA challenges
-- TOTP / two-factor authentication prompts (the system will ask_user automatically)
-- Tasks that explicitly say "show me how" / "walk me through" / "guide me"
-
-**DO NOT use `guide.step` for:**
-- Clicking a button (use `browser.act → click` instead)
-- Playing audio/video (use `browser.act → click` on the play/listen button)
-- Submitting a form you can fill automatically
-- Any action where `browser.act` can do it directly
-- **OAuth login walls (Gmail, GitHub, Notion, etc.)** — the system handles login automatically via sub-plans using `{{service:username}}` / `{{service:password}}` credential tokens. NEVER add guide.step for login.
-- **Setting up API credentials, API keys, or account registration** — use `browser.agent { action: 'build_agent', service: '<name>' }` to register the agent (credentials handled automatically via keychain), then `browser.agent { action: 'run' }` to execute
-- **"Sign up for X", "log in to X", "copy your API key from X dashboard"** — these are credential setup steps, never guide.step
-- **Testing a curl command in the terminal** — execute it directly via `shell.run`
-
-**PREFERRED automation pattern for button clicks:**
-```json
-{ "skill": "browser.act", "args": { "action": "click", "selector": "#listen-button", "sessionId": "..." } }
-```
-
-When `guide.step` IS appropriate:
-1. `browser.act navigate` — open URL in visible Playwright browser
-2. `guide.step` — show instruction card, poll `window.__tdGuideTriggered`, auto-advance on click
-3. Repeat per step
-
-**Form-filling rule:** Create one `guide.step` pair PER FORM FIELD only when the form cannot be auto-filled. Never collapse a full form into a single step.
+**NEVER use for:** button clicks, form fills, OAuth logins (handled via credential tokens), API key setup (use `browser.agent build_agent`), curl commands (use `shell.run`).
 
 ## api_suggest — when to use
 
@@ -452,192 +325,30 @@ The skill contract's "What this skill does" section describes inputs — extract
 
 **NOTE — REST API and CLI services:** Use `cli.agent { action: 'build_agent' }` or `browser.agent { action: 'build_agent' }` to set up an agent for a service for the first time. These replace the manual skill.bootstrap pattern. Use `api_suggest` if you need to surface service options to the user before building.
 
-## Local scheduled skills — three tiers
+## Local scheduled skills — routing decision
 
-ThinkDrop runs a SkillScheduler daemon (node-cron) inside command-service. Any installed skill with a `schedule:` field gets a registered cron job automatically. **Never use launchd, never use `needs_skill` for local scheduled work.**
+SkillScheduler (node-cron in command-service) fires automatically for any installed skill with a `schedule:` field. **Never use launchd. Never use `needs_skill` for local-only scheduled work.**
 
-### Decision table
+| Trigger | Type | Mechanism |
+|---------|------|-----------|
+| "remind me to X" / pure nudge / alarm | `notify` | SkillScheduler calls osascript — no index.cjs needed |
+| "review / check / summarize / go through" on schedule | `bridge` | SkillScheduler writes WS:INSTRUCTION → AI session |
+| Screen-check / screenshot / app-state tasks | `bridge` | Always bridge — notify cannot see the screen |
+| SMS via free carrier gateway (`smsGatewayTarget` resolved) | `bridge` | gmail.agent sends email-to-SMS |
+| Recurring task requiring external API (Twilio, Gmail API, etc.) | `needs_skill` | Persistent daemon with credentials |
 
-| User says | Tier | `type:` field | How it fires |
-|-----------|------|---------------|--------------|
-| "Remind me to cold plunge at 6am" | **notify** | `type: notify` | SkillScheduler calls osascript directly — no index.cjs |
-| "Set a daily workout alarm at 7am" | **notify** | `type: notify` | SkillScheduler calls osascript directly |
-| "Remind me to drink water every hour" | **notify** | `type: notify` | Pure nudge — no execution |
-| "Review my expenses every Friday at 5pm" | **bridge** | `type: bridge` | SkillScheduler writes WS:INSTRUCTION → Electron AI session |
-| "Go through my Notion tasks every Monday" | **bridge** | `type: bridge` | SkillScheduler writes WS:INSTRUCTION → Electron AI session |
-| "Check if my app is running at 9am" | **bridge** | `type: bridge` | Requires screen-check execution — NOT a nudge |
-| "Every morning, look at my screen and summarize what's open" | **bridge** | `type: bridge` | Uses screen.capture + synthesize — needs AI session |
-| "Summarize my browser tabs every evening" | **bridge** | `type: bridge` | Agentic task — requires skill execution |
-| "Send me a daily SMS at 9pm" | **bridge** (if `smsGatewayTarget` resolved) OR **needs_skill** (if not) | `type: bridge` with gmail.agent instruction, OR external Twilio/ClickSend | When the pipeline resolves `smsGatewayTarget.email`, use `bridge` — SkillScheduler writes WS:INSTRUCTION → AI sends email-to-SMS via gmail.agent. Only fall back to `needs_skill` when `smsGatewayTarget` is NOT present |
+Steps for both `notify` and `bridge` skills: `shell.run` (write skill.md) → `skill.install` → `shell.run` (POST `/skill.schedule/sync`). No index.cjs required.
 
-**"remind me to X" always → `notify`**, even if X contains action words. The word "remind" means nudge, not execution.
+## needs_skill — routing rules
 
-**Action verb without "remind" → `bridge`**: update, review, check, go through, organize, summarize, draft, process, clean up, analyze, categorize, compile, go over.
+Use as the **FIRST AND ONLY step** when the task requires ongoing background automation via an external service (Gmail API, Twilio, Slack, Google Calendar API, etc.).
 
-**Critical: screen-check tasks → always `bridge`** — any scheduled task that needs to *look at the screen*, *check app state*, *read what's visible*, or *capture/analyze a screenshot* requires an AI execution session. Never use `notify` for these — a macOS notification cannot see the screen.
+**Use `needs_skill` for:** watch/monitor/track/poll inbox or messages, scheduled SMS via Twilio/ClickSend, calendar monitoring, OAuth-gated background daemons.
 
-**Decision flowchart:**
-```
-Is this a recurring SMS task AND smsGatewayTarget.email is resolved (free carrier gateway)?
-  YES → bridge (type: bridge, instruction sends email to gateway address via gmail.agent)
-Does the task require looking at the screen, reading data, or executing steps?
-  YES → bridge (type: bridge)
-Does the task only need to pop up a reminder message to the user?
-  YES → notify (type: notify)
-Does the task require an external API (SMS without gateway, email OAuth, other service)?
-  YES → needs_skill
-```
+**Do NOT use for:** one-off actions (just do them), local notify/bridge reminders (use SkillScheduler tiers above), tasks `browser.agent` or `cli.agent` can handle directly.
 
----
+## skill.install — installing and listing skills
 
-### Tier 1 — notify (pure nudge)
-
-SkillScheduler fires osascript **directly** using `title:` and `message:` from skill.md frontmatter. **No index.cjs required.**
-
-Substitute: `NAME` = dotted skill name (e.g. `reminder.cold.plunge`), `CRON` = cron expression, `MESSAGE` = short reminder text, `TITLE` = display title.
-
-```json
-[
-  {
-    "skill": "shell.run",
-    "args": {
-      "cmd": "bash",
-      "argv": ["-c", "mkdir -p \"$HOME/.thinkdrop/skills/NAME\" && cat > \"$HOME/.thinkdrop/skills/NAME/skill.md\" << 'SKILLEOF'\n---\nname: NAME\nschedule: \"CRON\"\ntype: notify\ntitle: ThinkDrop Reminder\nmessage: MESSAGE\ndescription: Daily reminder — MESSAGE\n---\n## Plan\nFire a macOS notification on schedule.\nSKILLEOF\necho 'Notify skill written'"]
-    },
-    "description": "Write notify skill.md (no index.cjs needed)"
-  },
-  {
-    "skill": "skill.install",
-    "args": { "skillPath": "~/.thinkdrop/skills/NAME/skill.md" },
-    "description": "Register skill so SkillScheduler picks up the cron"
-  },
-  {
-    "skill": "shell.run",
-    "args": {
-      "cmd": "bash",
-      "argv": ["-c", "curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo 'node-cron activated'"]
-    },
-    "description": "Sync SkillScheduler to activate the cron immediately"
-  }
-]
-```
-
----
-
-### Tier 2 — bridge (agentic task)
-
-SkillScheduler checks if the user is active (via `GET http://127.0.0.1:3010/activity`). If active, it defers up to 3 times at 10-min intervals with a soft notification. When idle, it appends a `WS:INSTRUCTION` block to `~/.thinkdrop/bridge.md` — Electron's bridge watcher picks this up and fires a full AI stategraph session. **No index.cjs required.** The `instruction:` field becomes the AI prompt.
-
-Substitute: `NAME` = dotted skill name, `CRON` = cron expression, `LABEL` = short label, `INSTRUCTION` = full task description (this becomes the AI prompt at fire time).
-
-```json
-[
-  {
-    "skill": "shell.run",
-    "args": {
-      "cmd": "bash",
-      "argv": ["-c", "mkdir -p \"$HOME/.thinkdrop/skills/NAME\" && cat > \"$HOME/.thinkdrop/skills/NAME/skill.md\" << 'SKILLEOF'\n---\nname: NAME\nschedule: \"CRON\"\ntype: bridge\ntitle: LABEL\ninstruction: INSTRUCTION\ndescription: Scheduled task — LABEL\n---\n## Plan\nAt fire time, ThinkDrop executes: INSTRUCTION\nSKILLEOF\necho 'Bridge skill written'"]
-    },
-    "description": "Write bridge skill.md (AI executes instruction at fire time)"
-  },
-  {
-    "skill": "skill.install",
-    "args": { "skillPath": "~/.thinkdrop/skills/NAME/skill.md" },
-    "description": "Register skill so SkillScheduler picks up the cron"
-  },
-  {
-    "skill": "shell.run",
-    "args": {
-      "cmd": "bash",
-      "argv": ["-c", "curl -s -X POST http://127.0.0.1:3007/skill.schedule/sync && echo 'node-cron activated'"]
-    },
-    "description": "Sync SkillScheduler to activate the cron immediately"
-  }
-]
-```
-
-## needs_skill — capability gap
-
-**Use `needs_skill` as the FIRST AND ONLY step (no browser.act, no shell.run, no api_suggest before it) when the request requires ongoing background automation that ThinkDrop cannot do natively.**
-
-ThinkDrop will automatically build, install, and configure the skill — including resolving any API credentials. You do NOT need to scaffold files or add a `shell.run` step after `needs_skill`.
-
-### Always use `needs_skill` immediately for these task types — do NOT attempt browser.act or api_suggest first:
-
-| Task type | Example |
-|-----------|---------|
-| Email / inbox monitoring | "watch my Gmail and summarize daily", "alert me when I get mail from X" |
-| Scheduled SMS / text notifications | "send me a daily text summary at 9pm", "text me my schedule every morning" |
-| Calendar monitoring & reminders | "check my Google Calendar and remind me of events", "daily calendar briefing" |
-| Slack / Discord / messaging monitoring | "watch my Slack and summarize daily", "alert me on new Discord messages" |
-| Any recurring/scheduled background task **requiring an external service** | "send me a daily text at 9pm" (Twilio), "daily calendar briefing" (Google Calendar API), "weekly Slack digest" |
-| Third-party service sync | "sync Notion", "poll Airtable", "monitor my Jira issues" |
-| OAuth-gated data access requiring a long-running daemon | Gmail API, Google Calendar API, Twilio SMS, etc. |
-
-**Why:** These tasks require a persistent background process (cron job, daemon, or webhook) with API credentials. ThinkDrop's browser.act is session-based and cannot run in the background. A custom skill (installed at `~/.thinkdrop/skills/`) is the correct mechanism. ThinkDrop's agent pipeline handles credential setup automatically.
-
-**Rule:** If the user asks to **watch / monitor / track / poll / summarize on a schedule / send daily/weekly/nightly notifications** involving any external service (Gmail, Twilio, Slack, Google Calendar API, etc.) → emit `needs_skill` immediately. Never navigate to the service's website, never add a `shell.run` scaffold step, and never suggest an API setup as a substitute.
-
-**EXCEPTION — local scheduled skills:** If the user wants a local notification/alarm (`type: notify`) or a local agentic task with no external API needed (`type: bridge`), use the three-tier patterns from `## Local scheduled skills` above. Do NOT emit `needs_skill` for these.
-
-`capability` should be a concise description of what the skill will do (max 10 words). `suggestion` should name the service(s) involved.
-
-```json
-[
-  {
-    "skill": "needs_skill",
-    "args": {
-      "capability": "send daily SMS weather alerts at 9pm",
-      "suggestion": "twilio + openweathermap"
-    }
-  }
-]
-```
-
-```json
-[
-  {
-    "skill": "needs_skill",
-    "args": {
-      "capability": "watch Gmail inbox and send daily SMS summary",
-      "suggestion": "gmail + twilio"
-    }
-  }
-]
-```
-
-## Installing and removing skills
-
-User-memory service is at `http://localhost:3001`.
-
-**Install** — "install skill at \<path\>":
-```json
-[
-  {
-    "skill": "shell.run",
-    "args": { "cmd": "bash", "argv": ["-c", "cat '<path>'"] },
-    "description": "Read skill contract"
-  },
-  {
-    "skill": "shell.run",
-    "args": {
-      "cmd": "bash",
-      "argv": ["-c", "curl -s -X POST http://localhost:3001/skill.install -H 'Content-Type: application/json' -d \"{\\\"payload\\\":{\\\"contractMd\\\":$(cat '<path>' | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')},\\\"requestId\\\":\\\"install-$(date +%s)\\\"}\""]
-    },
-    "description": "Register skill in DB"
-  }
-]
-```
-
-**Remove** — "remove skill \<name\>":
-```json
-{ "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "curl -s -X POST http://localhost:3001/skill.remove -H 'Content-Type: application/json' -d '{\"payload\":{\"name\":\"<name>\"},\"requestId\":\"remove-1\"}'"] } }
-```
-
-**List** — "list my skills" / "what skills do I have":
-```json
-[
-  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "curl -s -X POST http://localhost:3001/skill.list -H 'Content-Type: application/json' -d '{\"payload\":{},\"requestId\":\"list-1\"}'"] } },
-  { "skill": "synthesize", "args": { "prompt": "List the installed skills from this JSON, showing name and description for each." } }
-]
-```
+- **Install:** `skill.install { skillPath: '<absolute-path>/skill.md' }` — always use this, never `shell.run curl`.
+- **List:** `list_skills {}` — returns all installed skills.
+- **Remove:** `shell.run` POST `http://localhost:3001/skill.remove` with `{ name: '<name>' }`.

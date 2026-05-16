@@ -2811,6 +2811,16 @@ module.exports = async function executeCommand(state) {
     delete resolvedArgs.command;
   }
 
+  // If shell.run has both goal and cmd/argv, strip cmd/argv — goal mode always wins.
+  // planSkills LLM sometimes emits both in the same step. When cmd is present,
+  // _isGoalModeStep is false and the pre-built (potentially wrong-path) argv runs directly,
+  // bypassing SHELL_RUN_SYSTEM and its mdfind / safe-path logic entirely.
+  if (skill === 'shell.run' && resolvedArgs.goal && resolvedArgs.cmd) {
+    const { cmd: _dropCmd, argv: _dropArgv, ...goalOnlyArgs } = resolvedArgs;
+    resolvedArgs = goalOnlyArgs;
+    logger.debug('[Node:ExecuteCommand] shell.run: stripped cmd/argv — goal mode takes precedence');
+  }
+
   // Expand ~ in shell.run argv — the LLM may generate paths with single-quoted tilde
   // (e.g. '~/.thinkdrop/...') which bash cannot expand. Pre-expand here unconditionally.
   if (skill === 'shell.run' && Array.isArray(resolvedArgs.argv)) {
@@ -3451,9 +3461,22 @@ module.exports = async function executeCommand(state) {
     // For cli.agent / browser.agent: inject _progressCallbackUrl so the agent can POST
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
     const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent';
+    // For shell.run goal-mode steps: inject _progressCallback so goal resolution
+    // can surface thinking events ('Generating shell command…') to the UI.
+    const _isGoalModeStep = skill === 'shell.run' && !!resolvedArgs.goal && !resolvedArgs.cmd;
     const _callArgs = _isAgentSkill
       ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
-      : resolvedArgs;
+      : _isGoalModeStep
+        ? { ...resolvedArgs, _progressCallback: (evt) => {
+            if (!progressCallback) return;
+            if (evt.type === 'shell:goal_resolving') {
+              const thinking = evt.attempt > 1
+                ? `Retrying command generation (${evt.attempt}/${evt.maxAttempts})…`
+                : 'Generating shell command…';
+              progressCallback({ type: 'step_thinking', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'shell.run', thinking });
+            }
+          }}
+        : resolvedArgs;
 
     const result = await mcpAdapter.callService('command', 'command.automate', {
       skill,
@@ -3807,6 +3830,7 @@ module.exports = async function executeCommand(state) {
       userAllowlistHint: !!raw.userAllowlistHint,
       commandName: raw.commandName || null,
       userAllowlistPath: raw.userAllowlistPath || null,
+      cmd: raw.cmd || null,
     };
 
     // Detect shell.run search commands that returned no results — treat as soft failure
@@ -3817,13 +3841,14 @@ module.exports = async function executeCommand(state) {
     const SEARCH_CMDS = ['mdfind', 'find', 'grep', 'locate'];
     const WRITE_OPS = ['sed -i', 'sed -E -i', 'cp ', 'mv ', 'echo ', 'tee ', 'cat >', 'cat>',
                        'printf ', 'write ', 'rm ', 'mkdir ', 'touch ', 'chmod ', 'chown '];
-    const bashScript = args.cmd === 'bash' && Array.isArray(args.argv)
+    const isGoalMode = skill === 'shell.run' && !!args.goal && !args.cmd;
+    const bashScript = !isGoalMode && args.cmd === 'bash' && Array.isArray(args.argv)
       ? args.argv.find(a => typeof a === 'string') || ''
       : '';
     const isBashSearchScript = bashScript.length > 0 &&
       SEARCH_CMDS.some(sc => bashScript.includes(sc)) &&
       !WRITE_OPS.some(wo => bashScript.includes(wo));
-    const isSearchCmd = skill === 'shell.run' && (SEARCH_CMDS.includes(args.cmd) || isBashSearchScript);
+    const isSearchCmd = !isGoalMode && skill === 'shell.run' && (SEARCH_CMDS.includes(args.cmd) || isBashSearchScript);
     const noOutput = !stepResult.stdout || stepResult.stdout.trim().length === 0;
 
     if (isSearchCmd && noOutput && (stepResult.ok || stepResult.exitCode === 1)) {
@@ -3838,8 +3863,8 @@ module.exports = async function executeCommand(state) {
     // common API error patterns so we don't report false success to the user.
     if (skill === 'shell.run' && stepResult.ok && stepResult.stdout) {
       const out = stepResult.stdout.trim();
-      const isCurlStep = (args.cmd === 'curl') ||
-        (args.cmd === 'bash' && Array.isArray(args.argv) && args.argv.some(a => typeof a === 'string' && a.includes('curl ')));
+      const isCurlStep = !isGoalMode && ((args.cmd === 'curl') ||
+        (args.cmd === 'bash' && Array.isArray(args.argv) && args.argv.some(a => typeof a === 'string' && a.includes('curl '))));
       if (isCurlStep) {
         // Match JSON error responses: {"http_code":401,...}, {"error":...}, {"response_code":"UNAUTHORIZED",...}
         const httpCodeMatch = out.match(/"http_code"\s*:\s*(\d+)/);
@@ -3881,7 +3906,7 @@ module.exports = async function executeCommand(state) {
     // catches application-level failures (e.g. INVALID_RECIPIENT nested inside messages[])
     // that the HTTP-level curl guard above cannot see.
     {
-      const _isCurlForPayload = skill === 'shell.run' && stepResult.ok && stepResult.stdout &&
+      const _isCurlForPayload = !isGoalMode && skill === 'shell.run' && stepResult.ok && stepResult.stdout &&
         ((args.cmd === 'curl') ||
          (args.cmd === 'bash' && Array.isArray(args.argv) && args.argv.some(a => typeof a === 'string' && a.includes('curl '))));
 
@@ -4968,9 +4993,10 @@ module.exports = async function executeCommand(state) {
   } catch (error) {
     // Check if this is a search command that exited with code 1 (no results) — treat as soft failure
     const SEARCH_CMDS_CATCH = ['mdfind', 'find', 'grep', 'locate'];
-    const isBashSearchCatch = args.cmd === 'bash' && Array.isArray(args.argv) &&
+    const _isGoalModeCatch = skill === 'shell.run' && !!args.goal && !args.cmd;
+    const isBashSearchCatch = !_isGoalModeCatch && args.cmd === 'bash' && Array.isArray(args.argv) &&
       args.argv.some(a => typeof a === 'string' && SEARCH_CMDS_CATCH.some(sc => a.includes(sc)));
-    const isSearchExit1 = (SEARCH_CMDS_CATCH.includes(args.cmd) || isBashSearchCatch) &&
+    const isSearchExit1 = !_isGoalModeCatch && (SEARCH_CMDS_CATCH.includes(args.cmd) || isBashSearchCatch) &&
       error.message && error.message.includes('code 1');
 
     // ── Catch path: open <file> wrong extension → glob for real file ──────────

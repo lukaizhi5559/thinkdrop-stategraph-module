@@ -511,7 +511,7 @@ module.exports = async function parseIntent(state) {
 
       // Fire-and-forget: persist constraint immediately without blocking routing
       if (mcpAdapter) {
-        const _correctionBlocks = ['shell.fs.*', 'shell.run.*', 'browser.act.*'];
+        const _correctionBlocks = ['shell.run.*', 'browser.act.*'];
         mcpAdapter.callService('user-memory', 'constraint.add', {
           rule:     classifyMessage,
           scope:    'global',

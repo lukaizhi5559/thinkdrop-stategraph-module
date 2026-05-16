@@ -117,7 +117,12 @@ module.exports = async function logConversation(state) {
       })();
       const synthAnswer = _stateAnswer || _synthStepStdout;
       const keyOutputs = skillResults
-        .filter(r => r.ok && r.stdout && r.stdout.trim().length > 0)
+        .filter(r => r.ok && (
+          (r.stdout && r.stdout.trim().length > 0) ||
+          // shell.run with empty stdout (e.g. mv, mkdir, cp): include resolved cmd string
+          // so the next turn's planner knows the exact paths used
+          (r.skill === 'shell.run' && r.cmd && typeof r.cmd === 'string')
+        ))
         .map((r, idx, arr) => {
           const label = r.description || r.skill;
           // Last synthesize step: store the LLM-generated answer (formatted, readable)
@@ -125,12 +130,14 @@ module.exports = async function logConversation(state) {
           if (r.skill === 'synthesize' && idx === arr.length - 1 && synthAnswer) {
             return `[${label}]:\n${synthAnswer.slice(0, 2000)}`;
           }
+          const out = (r.stdout || '').trim();
+          // shell.run with empty stdout: log the resolved cmd so planner sees exact paths
+          if (!out && r.skill === 'shell.run' && r.cmd && typeof r.cmd === 'string') {
+            return `[${label}]:\n(ran: ${r.cmd.trim().slice(0, 300)})`;
+          }
           // For fs.read: include full tree output (filenames are critical for follow-ups)
           // For others: truncate to 500 chars
-          const out = r.skill === 'fs.read'
-            ? r.stdout.trim()
-            : r.stdout.trim().slice(0, 500);
-          return `[${label}]:\n${out}`;
+          return `[${label}]:\n${r.skill === 'fs.read' ? r.stdout.trim() : out.slice(0, 500)}`;
         });
       if (keyOutputs.length > 0) {
         // Always append the LLM-generated synthesized answer as a dedicated [synthesize]

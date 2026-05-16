@@ -421,48 +421,66 @@ module.exports = async function answer(state) {
 
     // ── Intent correction detection ───────────────────────────────────────────
     // If the user's current message is correcting a previous misclassification,
-    // extract the wrong intent + correct intent and store an intent_override so
+    // use the LLM to infer the correct intent and store an intent_override so
     // the same phrasing never misclassifies again.
-    // Patterns: "no I meant command", "not a web search, go to the webpage",
-    //           "I wanted you to open the browser", "that should have been automate"
-    const CORRECTION_PATTERNS = /\b(no[,\s]+(i meant|i wanted|that should|that was supposed|it should|you should have)|not (a |an )?(web.?search|memory|search|lookup|look.?up)|i (meant|wanted you to|need you to)\s+(go to|open|navigate|automate|do it as|run it as)|that (should|was supposed to) (be|have been)\s+(a\s+)?(command|automate|browser|navigate))\b/i;
+    // Fire-and-forget — never blocks the answer from returning.
+    const _CORRECTION_SIGNAL = /\b(no[,\s]+(i meant|i wanted|that should|that was supposed)|not (a |an )?(web.?search|memory|search|lookup)|i (meant|wanted you to|need you to)\s+\w|that (should|was supposed to) (be|have been))\b/i;
 
-    if (CORRECTION_PATTERNS.test(queryMessage) && mcpAdapter && conversationHistory.length >= 2) {
+    if (_CORRECTION_SIGNAL.test(queryMessage) && mcpAdapter && backend && conversationHistory.length >= 2) {
       try {
-        // Find the last user message before this one — that's the misclassified prompt
         const prevUserMsgs = conversationHistory.filter(m => m.role === 'user');
         const prevPrompt = prevUserMsgs.length > 0 ? prevUserMsgs[prevUserMsgs.length - 1]?.content : null;
 
         if (prevPrompt && prevPrompt !== queryMessage) {
-          // Determine the correct intent from the correction text
-          const correctionText = queryMessage.toLowerCase();
-          let correctIntent = null;
-          let wrongIntent = intent?.type || null;
+          const wrongIntent = intent?.type || null;
+          // Fire-and-forget LLM call — does not block answer
+          (async () => {
+            try {
+              const correctionPrompt = `The user is correcting a previous AI misclassification.
 
-          if (/\b(go to|open|navigate|browser|webpage|web page|automate|command|run it|do it)\b/.test(correctionText)) {
-            correctIntent = 'command_automate';
-          } else if (/\b(memory|remember|recall|history|what i did|what i was)\b/.test(correctionText)) {
-            correctIntent = 'memory_retrieve';
-          } else if (/\b(search|look up|web search|find online)\b/.test(correctionText)) {
-            correctIntent = 'web_search';
-          }
+Previous user message: "${prevPrompt}"
+Current correction: "${queryMessage}"
+Previous intent classification: "${wrongIntent}"
 
-          if (correctIntent && correctIntent !== wrongIntent) {
-            logger.info(`[Node:Answer] Intent correction detected: "${prevPrompt.slice(0, 60)}" was ${wrongIntent} → should be ${correctIntent}`);
-            mcpAdapter.callService('user-memory', 'intent_override.upsert', {
-              examplePrompt: prevPrompt,
-              correctIntent,
-              wrongIntent,
-              source: 'user_correction'
-            }).then(() => {
-              logger.info(`[Node:Answer] Intent override stored for future: "${prevPrompt.slice(0, 60)}" → ${correctIntent}`);
-            }).catch(e => {
-              logger.debug(`[Node:Answer] intent_override.upsert failed (non-fatal): ${e.message}`);
-            });
-          }
+What is the CORRECT intent for the previous message? Choose one:
+- command_automate (browse, navigate, open app, run command, file operation)
+- memory_retrieve (recall stored info, what did I, look up my records)
+- memory_store (remember this, save this fact)
+- web_search (search online, look up on web)
+- general_knowledge (question, explain, what is)
+
+Respond with ONLY valid JSON: {"correctIntent":"<intent>"}`;
+
+              const raw = await backend.generateAnswer(correctionPrompt, {
+                context: { systemInstructions: 'You are an intent classifier. Respond with ONLY valid JSON.' },
+              }, { maxTokens: 30, temperature: 0, fastMode: true });
+
+              const cleaned = (raw || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+              const jsonMatch = cleaned.match(/\{[\s\S]*?\}/);
+              if (!jsonMatch) return;
+              const parsed = JSON.parse(jsonMatch[0]);
+              const correctIntent = parsed.correctIntent;
+
+              if (correctIntent && correctIntent !== wrongIntent) {
+                logger.info(`[Node:Answer] LLM correction: "${prevPrompt.slice(0, 60)}" was ${wrongIntent} → ${correctIntent}`);
+                mcpAdapter.callService('user-memory', 'intent_override.upsert', {
+                  examplePrompt: prevPrompt,
+                  correctIntent,
+                  wrongIntent,
+                  source: 'user_correction',
+                }).then(() => {
+                  logger.info(`[Node:Answer] Intent override stored: "${prevPrompt.slice(0, 60)}" → ${correctIntent}`);
+                }).catch(e => {
+                  logger.debug(`[Node:Answer] intent_override.upsert failed (non-fatal): ${e.message}`);
+                });
+              }
+            } catch (e) {
+              logger.debug(`[Node:Answer] LLM correction detection failed (non-fatal): ${e.message}`);
+            }
+          })();
         }
       } catch (e) {
-        logger.debug(`[Node:Answer] Correction detection failed (non-fatal): ${e.message}`);
+        logger.debug(`[Node:Answer] Correction detection setup failed (non-fatal): ${e.message}`);
       }
     }
 

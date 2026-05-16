@@ -122,14 +122,13 @@ function buildStepDescription(step) {
 }
 
 // ── Composable prompt helpers ─────────────────────────────────────────────
-// Three prompt tiers:
+// Two prompt tiers:
 //   SLIM   — pure public-site browser.act navigate tasks (plan-skills-browser.md, ~68 lines)
-//   FULL   — all other tasks (plan-skills.md, monolithic ~730 lines)
-//   FULL+SHELL — full prompt with shell appendix (plan-skills-shell.md) appended
+//   FULL   — all other tasks (plan-skills.md, routing-only ~200 lines)
 //
-// Shell appendix is appended when the task involves Python, shell scripts, file I/O,
-// brew/pip installs, or CLI tools — bringing focused shell guidance into scope without
-// polluting browser-only plans with irrelevant context.
+// Shell/Python how-to knowledge now lives inside shell.run.cjs (SHELL_RUN_SYSTEM prompt).
+// plan-skills-shell.md and plan-skills-macos.md are kept on disk as documentation
+// but are no longer appended to the planning prompt.
 
 function _loadPromptFile(filename) {
   try {
@@ -139,25 +138,11 @@ function _loadPromptFile(filename) {
   }
 }
 
-// Reference files for discovery fallback - loaded only when needed
-function _loadReferenceFile(language) {
-  const filename = `${language}-tools-reference.md`;
-  try {
-    return fs.readFileSync(path.join(__dirname, '../prompts', filename), 'utf8').trim();
-  } catch (_) {
-    return null;
-  }
-}
-
-// Signals that indicate a shell/Python-heavy task.
+// Signals that indicate a shell/Python-heavy task (kept for signal detection in other logic).
 const _SHELL_SIGNAL_RE = /\b(python3?|pip3?|brew\s+install|shell|bash|script|csv|excel|xlsx|json\s+(file|patch|edit)|spreadsheet|ffmpeg|imagemagick|convert\s+image|pdftotext|poppler|jq\b|tesseract|pandoc|exiftool|wget|curl\s+.*-o|cron|launchd|chmod|chown|git\s+(clone|pull|push|commit|log|status|branch|merge|rebase|diff)|npm\s+(install|run|build)|yarn\s+(install|run|build)|node\s+|ls\s+-|cat\s+|grep\s+|awk\s+|sed\s+|find\s+|xargs|sort\s+|uniq\s+|wc\s+|touch\s+|mkdir|rm\s+|cp\s+|mv\s+|ln\s+|chmod|chown|file\s+(ops?|read|write|edit|patch|convert|transform|rename|move|copy|delete))\b/i;
 
 // Signals that indicate a macOS-specific task (Finder, osascript, desktop, system settings, etc.)
 const _MACOS_SIGNAL_RE = /\b(finder|desktop|osascript|applescript|plistbuddy|plist|killall\s+finder|mdfind|mdls|xattr|color\s+tag|finder\s+(color|label)|open\s+-a|system\s+(settings|preferences)|system\s+pref|arrange.*desktop|clean\s+up.*desktop|tidy.*desktop|organize.*desktop|snap.*grid|neat.*desktop|desktop.*neat|desktop.*tidy|desktop.*icon|icon.*desktop|desktop.*folder|folder.*desktop|desktop.*file|file.*desktop)\b/i;
-
-// Tasks that are ONLY pure browser navigation — skip cli-first appendix for these.
-// Pattern: message starts with or leads with a navigation verb and nothing more complex.
-const _BROWSER_ONLY_RE = /^(go\s+to|goto|navigate\s+to|visit|open\s+(?:the\s+)?(?:website|page|url|site)?\s*https?|log\s+in\s+to|login\s+to|sign\s+in\s+to|connect\s+to)\b/i;
 
 // Signals that a task is a simple public-site navigate with no login, agent, or complex ops.
 const _SLIM_BROWSE_VERB_RE    = /^(goto|go\s+to|navigate\s+to|visit|open|look\s+up|search\s+on|search\s+for|browse)\b/i;
@@ -215,31 +200,26 @@ function buildSystemPrompt(userMessage, state) {
 
   let result = base;
 
-  // Skip appendix for Windows (windows prompt has its own shell guidance)
-  if (!isWindows && _SHELL_SIGNAL_RE.test(_appendixSignalText)) {
-    const shellAppendix = _loadPromptFile('plan-skills-shell.md');
-    if (shellAppendix) {
-      console.info('[Node:PlanSkills] Appending plan-skills-shell.md (shell/Python task detected)');
-      result += '\n\n' + shellAppendix;
-    }
-  }
-
-  // Appended when task involves Finder, desktop, osascript, PlistBuddy, xattr,
-  // System Settings, or any macOS-native operation. Keeps base prompt lean for
-  // browser/API tasks that never touch the local macOS environment.
-  if (!isWindows && _MACOS_SIGNAL_RE.test(_appendixSignalText)) {
-    const macosAppendix = _loadPromptFile('plan-skills-macos.md');
-    if (macosAppendix) {
-      console.info('[Node:PlanSkills] Appending plan-skills-macos.md (macOS/Finder/osascript task detected)');
-      result += '\n\n' + macosAppendix;
-    }
-  }
+  // Shell/macOS how-to appendixes deprecated — execution-time knowledge now lives inside
+  // shell.run.cjs (SHELL_RUN_SYSTEM inline prompt). The planner stays routing-only.
+  // plan-skills-shell.md and plan-skills-macos.md are kept on disk for reference.
 
   // ── Inject grilled constraints from gatherContext grill mode ──────────────
   // These are user-confirmed constraints from high-risk operation analysis
   if (state.grilledConstraints) {
     const grillConstraints = `\n\n## GRILLED CONSTRAINTS (User Confirmed)\n\nThese constraints were confirmed through detailed questioning. You MUST follow them:\n\n\`\`\`json\n${JSON.stringify(state.grilledConstraints, null, 2)}\n\`\`\``;
     result += grillConstraints;
+  }
+
+  // ── Inject gatheredContext resolved answers (from EXECUTE grill pass) ──────
+  // If gatherContext ran a grill pass for an EXECUTE task (e.g. bare folder name
+  // resolution), inject those resolved facts so the LLM uses the confirmed paths.
+  const _grillAnswers = state.gatheredContext?.resolvedAnswers;
+  if (_grillAnswers && Object.keys(_grillAnswers).length > 0) {
+    const _lines = Object.entries(_grillAnswers)
+      .map(([k, v]) => `- ${k}: ${v}`)
+      .join('\n');
+    result += `\n\n## PRE-FLIGHT RESOLVED FACTS (user confirmed — use these exact values)\n\n${_lines}`;
   }
 
   return result;
@@ -472,7 +452,7 @@ async function planSkills(state) {
     // matching works alongside text-keyword matching in the constraint service.
     const _actionHints = (() => {
       const v = (userMessage || '').toLowerCase();
-      if (/\bdelete\b|\btrashe?s?\b|\brm\b|\bunlink\b|\berase\b|\bwipe\b/.test(v)) return ['delete.*', 'shell.fs.*', 'shell.run.*'];
+      if (/\bdelete\b|\btrashe?s?\b|\brm\b|\bunlink\b|\berase\b|\bwipe\b/.test(v)) return ['shell.run.*'];
       if (/\bsend\b|\bpost\b|\bpublish\b|\bshare\b|\bupload\b/.test(v))           return ['send.*', 'post.*', 'share.*', 'publish.*'];
       if (/\binstall\b|\bsetup\b|\bexecute\b|\brun\b|\blaunch\b/.test(v))         return ['shell.run.*', 'install.*'];
       return [];
@@ -666,6 +646,9 @@ RECOVERY CONTEXT (previous attempt failed — DO NOT repeat the same plan):
 ${recoveryContext.alternativeCwd ? `- Use cwd: "${recoveryContext.alternativeCwd}" instead` : ''}
 You MUST produce a DIFFERENT plan than the one that just failed. Use the actual URL above to understand what page is currently loaded. If the search failed, try a different selector, use examine first to identify the correct input, or navigate to a specific search URL directly.
 RECOVERY TOOL CONSTRAINT: "DIFFERENT plan" means a different task decomposition, different selectors, or a different URL — NOT switching the skill type for registered agents. Any step that previously used browser.agent { action: "run" } for a registered agent MUST continue to use browser.agent { action: "run" } in the recovery plan. NEVER replace a browser.agent step with browser.act navigation steps, playwright.agent direct calls, or shell.run curl commands for a registered agent. If a browser.agent step failed, change only the "task" string (make it more specific or retry with a clearer goal) — never decompose it into raw browser steps.`;
+    if (recoveryContext.constraint?.includes('USE GOAL MODE')) {
+      recoveryNote += '\n⚠️ GOAL MODE REQUIRED: For any shell.run step in the new plan, you MUST emit { "skill": "shell.run", "args": { "goal": "<plain English description of what to do>" } }. Do NOT write args.cmd or args.argv — the executor generates the correct command from the goal description.';
+    }
   }
 
   let correctionNote = '';
@@ -839,6 +822,15 @@ Apply this correction directly to the previous plan intent. Keep the same overal
       if (_cacheAgeMin < _CACHE_TTL_MIN && !isRecurring) {
         const _cachePreview = priorSynthesizedContent.slice(0, 1500).replace(/\n/g, ' ');
         const _cacheAgeLabel = _cacheAgeMin < 60 ? `${_cacheAgeMin} min ago` : `${Math.round(_cacheAgeMin / 60 * 10) / 10} hr ago`;
+
+        // Guard: cache short-circuit is only valid for DATA RETRIEVAL (browser scraping).
+        // If the prior synthesis describes a completed action (file moved, email sent, etc.)
+        // the content is a past-tense confirmation — NOT reusable data for a new action.
+        // Injecting it causes the LLM to plan a [cached] summarize step instead of acting.
+        const _isActionResult = /\b(were|was|has been|have been)\s+(moved|copied|deleted|created|sent|posted|installed|removed|written|saved|renamed)\b/i.test(priorSynthesizedContent);
+        if (_isActionResult) {
+          logger.info(`[Node:PlanSkills] Cache short-circuit suppressed — prior synthesis is an action result, not reusable data`);
+        } else {
         cacheShortCircuitNote = `\n\n💾 PRIOR SYNTHESIS CACHE (${_cacheAgeLabel}):\nThe following data was synthesized ${_cacheAgeLabel} from browser agent results for a prior run:\n---\n${_cachePreview}${priorSynthesizedContent.length > 1500 ? '...(truncated)' : ''}\n---\nINSTRUCTION: If the cached content above clearly covers the data needed for the CURRENT request (same topic, same entities, same scope), you MAY replace browser.agent scraping steps with a synthesize step whose description starts with "[cached]". The synthesize engine will automatically use this cached content. Only skip browser.agent steps when the cache is clearly applicable — do NOT skip when the user explicitly asks for a fresh lookup, live data, news, real-time info, or when the topic differs materially.`;
         logger.info(`[Node:PlanSkills] Cache short-circuit available: ${_cacheAgeLabel} old, ${priorSynthesizedContent.length} chars`);
 
@@ -860,6 +852,7 @@ Apply this correction directly to the previous plan intent. Keep the same overal
           cacheShortCircuitNote += `\n\n⚠️ SERVICE MISMATCH — CACHE NOT APPLICABLE FOR AGENT SELECTION:\nThe user explicitly named: ${_userServices.join(', ')}. The cached data is from: ${_cacheServices.length > 0 ? _cacheServices.join(', ') : 'different services'}. These are DIFFERENT services — do NOT inherit agent IDs from the cache. You MUST plan fresh browser.agent steps using: ${_requiredAgents}. The cache content above is irrelevant for choosing which agents to call.`;
           logger.info(`[Node:PlanSkills] Service mismatch detected: user=[${_userServices.join(',')}] cache=[${_cacheServices.join(',')}] — cache note flagged as non-applicable`);
         }
+        } // end else (_isActionResult guard)
       }
     }
   }
@@ -1695,31 +1688,6 @@ Task: "${userMessage}"`;
             }
             logger.debug(`[Node:PlanSkills] Registered agent session map: ${JSON.stringify(Object.keys(_registeredAgentServiceMap))}`);
 
-            // ── CLI-first appendix: append plan-skills-cli-first.md unless bypassed ──
-            // Bypass conditions:
-            //   1. Pure browser navigation task (_BROWSER_ONLY_RE matches)
-            //   2. User explicitly named a registered agent (e.g. "using my gmail.agent")
-            // For all other command_automate tasks, append CLI-first guidance.
-            const _cliFirstRaw = userMessage || '';
-            const _isBrowserOnlyTask = _BROWSER_ONLY_RE.test(_cliFirstRaw);
-            // Detect explicit agent reference: "my gmail.agent", "using youtube.agent", "via github.agent"
-            const _AGENT_EXPLICIT_RE = /\b(?:my|using|via|with|through)\s+(\w+)\.agent\b|\b(\w+)\.agent\b/i;
-            const _agentExplicitMatch = _AGENT_EXPLICIT_RE.exec(_cliFirstRaw);
-            const _agentExplicitService = _agentExplicitMatch
-              ? (_agentExplicitMatch[1] || _agentExplicitMatch[2] || '').toLowerCase()
-              : null;
-            const _hasExplicitAgent = !!(  _agentExplicitService && _registeredAgentServiceMap[_agentExplicitService]);
-
-            const _skipCliFirst = _isBrowserOnlyTask || _hasExplicitAgent || isRecoveryReplan;
-            if (!_skipCliFirst && process.platform !== 'win32') {
-              const _cliFirstAppendix = _loadPromptFile('plan-skills-cli-first.md');
-              if (_cliFirstAppendix) {
-                SKILL_SYSTEM_PROMPT += '\n\n' + _cliFirstAppendix;
-                logger.info(`[Node:PlanSkills] Appending plan-skills-cli-first.md (CLI-first task, browserOnly=${_isBrowserOnlyTask}, explicitAgent=${_hasExplicitAgent})`);
-              }
-            } else {
-              logger.debug(`[Node:PlanSkills] Skipping plan-skills-cli-first.md (browserOnly=${_isBrowserOnlyTask}, explicitAgent=${_hasExplicitAgent}, recoveryReplan=${isRecoveryReplan})`);
-            }
           }
 
           // ── Discovery note: guide LLM to plan build_agent when service has no agent ──
@@ -1737,6 +1705,7 @@ Task: "${userMessage}"`;
 
           const missingService = wantedServices.find(svc =>
             !coveredServiceIds.has(svc) &&
+            !coveredServiceIds.has(svc.replace(/-/g, '')) &&
             !agentRows.some(a => (a.id || '').toLowerCase().includes(svc))
           );
 

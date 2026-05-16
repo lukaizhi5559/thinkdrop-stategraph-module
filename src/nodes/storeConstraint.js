@@ -20,9 +20,9 @@
 // ---------------------------------------------------------------------------
 const VERB_PATTERNS = [
   { verbs: /\b(delete|rm|remove|del|unlink|wipe|erase|purge|trash|clear\s+all|unlink)\b/i,
-    patterns: ['delete.*', 'shell.fs.*', 'shell.run.*'] },
+    patterns: ['shell.run.*'] },
   { verbs: /\b(format|fdisk|mkfs)\b/i,
-    patterns: ['format.*', 'shell.fs.*', 'shell.run.*'] },
+    patterns: ['format.*', 'shell.run.*'] },
   { verbs: /\b(git.{0,10}push|force.{0,6}push|push\s+to)\b/i,
     patterns: ['git.push.*', 'shell.run.*'] },
   { verbs: /\b(install|brew\s+install|npm\s+install|pip\s+install|apt\s+install)\b/i,
@@ -55,7 +55,6 @@ function deriveBlockPatterns(text) {
   if (found.size === 0) {
     // Broad fallback — any shell or browser action
     found.add('shell.run.*');
-    found.add('shell.fs.*');
   }
   return [...found];
 }

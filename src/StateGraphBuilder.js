@@ -10,8 +10,8 @@
 
 const StateGraph = require('./core/StateGraph');
 const MockMCPAdapter = require('./adapters/MockMCPAdapter');
-const decomposePromptNode = require('./nodes/decomposePrompt');
-const parseIntentNode = require('./nodes/parseIntent');
+const decomposePromptNode = require('./nodes/decomposePromptV2');
+const parseIntentNode = require('./nodes/parseIntentV2');
 const answerNode = require('./nodes/answer');
 const retrieveMemoryNode = require('./nodes/retrieveMemory');
 const storeMemoryNode = require('./nodes/storeMemory');
@@ -21,15 +21,15 @@ const planSkillsNode = require('./nodes/planSkills');
 const recoverSkillNode = require('./nodes/recoverSkill');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
-const resolveReferencesNode = require('./nodes/resolveReferences');
+const resolveReferencesNode = require('./nodes/resolveReferencesV2');
 const parseSkillNode = require('./nodes/parseSkill');
 const checkPlanCacheNode = require('./nodes/checkPlanCache');
 const synthesizeNode = require('./nodes/synthesize');
-const enrichIntentNode = require('./nodes/enrichIntent');
+const enrichIntentNode = require('./nodes/enrichIntentV2');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
 const reviewExecutionNode = require('./nodes/reviewExecution');
 const creatorPlanningNode = require('./nodes/creatorPlanning');
-const gatherContextNode = require('./nodes/gatherContext');
+const gatherContextNode = require('./nodes/gatherContextV2');
 const appControlNode = require('./nodes/appControl');
 const storeConstraintNode = require('./nodes/storeConstraint');
 const liftConstraintNode  = require('./nodes/liftConstraint');
@@ -43,7 +43,7 @@ const mcpFillGapsNode = require('./nodes/mcpFillGaps');
  * Assess risk level of a user request using LLM classification
  * Returns: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
  */
-async function assessRisk(message, intent, llmBackend) {
+async function assessRisk(message, intent, llmBackend, conversationHistory = []) {
   // Fast-path: not command_automate = low risk
   if (intent !== 'command_automate') return 'LOW';
   
@@ -54,22 +54,32 @@ async function assessRisk(message, intent, llmBackend) {
     /\b(what is|what's|tell me about)\b/i,
   ];
   if (safePatterns.some(p => p.test(message))) return 'LOW';
-  
+
+  // Build recent context from last 3 exchanges (user + assistant interleaved) so the
+  // LLM can see what was just requested AND completed — critical for follow-up detection.
+  const recentTurns = (conversationHistory || [])
+    .slice(-6)
+    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 200)}`)
+    .join('\n');
+  const contextSection = recentTurns
+    ? `\n\nRecent conversation:\n${recentTurns}\n\nIMPORTANT: If the current request is clearly a follow-up or continuation of a task shown above (e.g. "open that folder", "now do it", "move it back", "undo that"), the target is already established — rate it LOW.`
+    : '';
+
   const riskPrompt = `Classify the risk level of this user request:
 
-User request: "${message}"
+User request: "${message}"${contextSection}
 
 Risk definitions:
-- CRITICAL: File deletion, irreversible changes, mass data loss, system-level modifications
-- HIGH: File moves/copies with potential conflicts, installations, browser automation requiring auth, external API calls with side effects
-- MEDIUM: Read-only operations, simple navigation, queries, single-file operations with clear scope
-- LOW: Questions, information lookup, browsing, "what is" type queries
+- CRITICAL: File deletion, irreversible changes, mass data loss, system-level modifications (rm -rf, wipe, format)
+- HIGH: File moves/copies with potential overwrite conflicts, software installs, browser automation requiring login, external API calls with side effects
+- MEDIUM: Single-file operations with clear scope, simple navigation, queries
+- LOW: Questions, information lookup, read-only ops (open/show/list a file or folder), follow-up to a just-completed task where the target is already established in conversation
 
 Consider:
 1. Could this delete, corrupt, or overwrite data?
-2. Does it modify system state (files, installs, configs)?
-3. Does it require authentication or credentials?
-4. Are there ambiguous terms that could lead to unintended scope ("everything", "all files")?
+2. Does it require authentication or credentials not yet available?
+3. Are there ambiguous terms with potentially large scope ("everything", "all files")?
+4. Is this a simple follow-up where the target was named in a prior turn?
 
 Output ONLY one word: CRITICAL | HIGH | MEDIUM | LOW`;
 
@@ -387,7 +397,7 @@ class StateGraphBuilder {
           let needsGrill = false;
           
           if (state.llmBackend && !state.matchedSkillName) {
-            riskLevel = await assessRisk(state.message || '', intentType, state.llmBackend);
+            riskLevel = await assessRisk(state.message || '', intentType, state.llmBackend, state.conversationHistory || []);
             needsGrill = ['CRITICAL', 'HIGH'].includes(riskLevel);
             
             if (needsGrill) {
@@ -535,8 +545,15 @@ class StateGraphBuilder {
       //   }
       //   return 'planSkills';
       // },
-      // gatherContext + creatorPlanning both bypassed — kept for future re-enable
-      gatherContext: () => 'planSkills',
+      // gatherContext: grill-mode routes to gatherPlanContext (Q&A + history resolution);
+      // non-grill EXECUTE tasks go straight to planSkills.
+      gatherContext: (state) => {
+        if (state._grillMode) {
+          logger.debug('[StateGraph:Router] gatherContext grill-mode — routing to gatherPlanContext');
+          return 'gatherPlanContext';
+        }
+        return 'planSkills';
+      },
       creatorPlanning: () => 'planSkills',
 
       // planSkills → end (awaiting approval) or executeCommand (plan ready) or logConversation (plan error)

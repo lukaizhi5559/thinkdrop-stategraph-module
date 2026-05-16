@@ -98,16 +98,25 @@ CRITICAL ANTI-HALLUCINATION RULES — these override everything else:
 
 // ── LLM call ──────────────────────────────────────────────────────────────────
 
-async function _askLLM(llmBackend, userMessage, originalMessage, priorQA, logger) {
+async function _askLLM(llmBackend, userMessage, originalMessage, priorQA, conversationHistory, logger) {
   const priorContext = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
 
+  const recentCtx = (conversationHistory || []).slice(-4)
+    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 200)}`)
+    .join('\n');
+  const historyBlock = recentCtx
+    ? `\n\nRECENT CONVERSATION (resolve all references — "that folder", "it", "the result" — from this before deciding):\n${recentCtx}`
+    : '';
+
   const prompt = `ORIGINAL USER REQUEST: "${originalMessage}"
 
-CURRENT SUB-TASK: "${userMessage}"${priorContext}
+CURRENT SUB-TASK: "${userMessage}"${priorContext}${historyBlock}
 
 This is ONE STEP of a multi-step automation. Does THIS SPECIFIC SUB-TASK need clarification, or is it clear enough to execute?
+
+If the RECENT CONVERSATION shows what "that", "it", "the folder", "the file" etc. refer to, the task IS complete — do NOT ask.
 
 Is this specific sub-task complete enough to automate without further clarification?`;
 
@@ -193,7 +202,7 @@ module.exports = async function gatherPlanContext(state) {
   // every time, so skip it entirely and save ~1s.
   // Guard: must have a local-action verb + a local-location reference, AND must have
   // no external-service/recipient markers (which would make it non-local).
-  const _LOCAL_ACTION_VERBS = /\b(remove|delete|rename|move|copy|clear|clean|cleanup|clean\s+up|empty|list|find|scan|compress|zip|unzip|extract|backup|restore|show|sort|reset|organize|archive|eject|mount|unmount|chmod|chown|touch|mkdir|rmdir)\b/i;
+  const _LOCAL_ACTION_VERBS = /\b(open|launch|remove|delete|rename|move|copy|clear|cleanup|clean\s+up|empty|list|find|scan|compress|zip|unzip|extract|backup|restore|show|sort|reset|organize|archive|eject|mount|unmount|chmod|chown|touch|mkdir|rmdir)\b/i;
   const _LOCAL_LOCATION_RE  = /\b(desktop|downloads|documents|trash|home\s+folder|home\s+dir|disk|drive|volume|folder|directory|file|files|folders|~\/|\/Users\/|\/tmp\/|\.[a-zA-Z]{2,5}\b)/i;
   const _EXTERNAL_SIGNAL_RE = /\b(send|email|text\s+me|sms|message|notify|post|tweet|upload|api|slack|discord|telegram|whatsapp|to\s+@|\bcc\b|http|https|ftp|s3|dropbox|icloud|google\s+drive|onedrive)\b/i;
   if (_LOCAL_ACTION_VERBS.test(userMsg) && _LOCAL_LOCATION_RE.test(userMsg) && !_EXTERNAL_SIGNAL_RE.test(userMsg)) {
@@ -300,7 +309,7 @@ module.exports = async function gatherPlanContext(state) {
     }
     logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking task clarity for: "${userMsg.slice(0, 80)}"`);
 
-    const result = await _askLLM(llmBackend, userMsg, originalMsg, answers, logger);
+    const result = await _askLLM(llmBackend, userMsg, originalMsg, answers, state.conversationHistory || [], logger);
 
     // ── Task is clear — done ──────────────────────────────────────────────────
     if (result.complete) {

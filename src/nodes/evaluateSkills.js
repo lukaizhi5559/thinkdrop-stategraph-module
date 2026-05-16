@@ -285,8 +285,10 @@ Output ONLY valid JSON.`;
     query: evalQuery,
     context: {
       systemInstructions: systemPrompt,
+      conversationHistory: (state.conversationHistory || []).slice(-6),
       sessionId: context?.sessionId,
-      userId: context?.userId || 'default_user'
+      userId: context?.userId || 'default_user',
+      intent: 'command_automate'
     }
   };
 

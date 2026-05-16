@@ -35,6 +35,9 @@ browser.agent returned researchContentEmpty (CAPTCHA or bot block) → REPLAN: u
 browser.agent wrongDomain (landed on parking/squatter page) → REPLAN: use web.agent { action: "search_and_navigate", query: "<service> official website <task>", preferDomain: "<service>" } to find the correct URL, then browser.act navigate directly. Do NOT use browser.agent again for this service without a verified correct URL.
 browser selector not found → REPLAN: try different selector strategy
 search_no_results (mdfind/find/grep returned nothing) → REPLAN: broaden the search — remove -onlyin scope and search the whole home directory instead; do NOT ASK_USER
+shell.run error "spawn ... ENOENT" OR error "cmd contains shell operators/globs" OR error "cmd contains spaces" → AUTO_PATCH: the LLM put a full shell string in `cmd` instead of splitting cmd+argv. If cmd has globs/operators (* ? | ; & $): rewrite as `{ cmd: "bash", argv: ["-c", "<original cmd>"] }`. If cmd has only spaces (e.g. "python3 foo.py", "brew install ffmpeg"): split on spaces into `{ cmd: "python3", argv: ["foo.py"] }`. Do NOT suggest installing mv or using /bin/mv — mv is always present; the error is a spawn API misuse.
+browser.agent or cli.agent error "Agentic loop reached MAX_TURNS without completing" → If patchHistory already contains a prior max_turns_exhausted entry: ASK_USER immediately — do NOT REPLAN, the agent will hit MAX_TURNS again. If first occurrence: REPLAN with suggestion to decompose into smaller, focused steps. Never retry with the exact same task.
+shell.run exit code 1 with "No such file or directory" where the SOURCE path doesn't exist → REPLAN: First, check RECENT CONVERSATION for prior steps that contain "(ran: ...)" entries — use those exact paths verbatim (e.g. if a prior step ran `mv ... /Users/lukaizhi/Desktop/thinkdrop-files`, the correct path is `/Users/lukaizhi/Desktop/thinkdrop-files`, NOT `~/thinkdrop-files`). Do NOT guess path expansions. If the path is not in conversation context, REPLAN with a discovery step first: `bash -c "find ~/Desktop ~/ -maxdepth 2 -name 'FOLDERNAME' -type d 2>/dev/null | head -1"` then use that discovered path. If patchHistory already shows 2+ attempts with the same "no such file" error, skip REPLAN and output ASK_USER instead.
 mv/cp/rm exit code 1 with "cannot move/copy a directory into itself" or when using wildcards like `mv /path/* /path/dest/` → AUTO_PATCH: The `*` wildcard includes the destination directory. Change to use find with exclusion: `bash -c "find /path -maxdepth 1 -type f ! -path '*dest*' -exec mv {} /path/dest/ +"` OR use specific file patterns like `*.txt` instead of `*`
 mv/cp/rm exit code 1 after a prior mdfind/find step → AUTO_PATCH: combine into single bash -c pipeline using the path from the prior step stdout: `bash -c "src=$(mdfind -name 'FILENAME' | grep -v node_modules | head -1) && [ -n \"$src\" ] && mv \"$src\" DESTINATION"`
 osascript exit code 1 with `* seconds` in date arithmetic → AUTO_PATCH: `* seconds` is NOT a valid AppleScript constant. Replace `(current date) + N * seconds` with `(current date) + N` (raw integer adds seconds, since AppleScript's base time unit is seconds). Do NOT change to `* minutes`.
@@ -55,11 +58,19 @@ shell.run error includes `Output not created:` with toolName=`mkdir` and permiss
 
 When a `shell.run bash -c` step fails on a **file edit, JSON mutation, or data transformation**, pivot to Python instead of retrying bash. Python avoids shell quoting issues, handles Unicode/encoding correctly, and provides structured error handling.
 
-**Trigger conditions — REPLAN with Python when:**
+**Goal-mode escalation — use args.goal after repeated bash exit 1:**
+When `shell.run` bash exits code 1 and `patchHistory` already shows a prior AUTO_PATCH or REPLAN:
+```
+REPLAN: { "suggestion": "Bash failed multiple times. Switch to goal mode.", "constraint": "USE GOAL MODE: Do NOT generate args.cmd or args.argv. Emit { \"skill\": \"shell.run\", \"args\": { \"goal\": \"<plain English description>\" } } only. The executor will generate a safe, correct command." }
+```
+The executor's expert LLM (SHELL_RUN_SYSTEM) will pick the correct tool (python3, bash, osascript, etc.) from the plain-English goal description. Do NOT specify the language in the constraint — let the executor decide.
+
+**Trigger conditions — REPLAN with Python (or goal mode) when:**
 - `sed` / `awk` exits code 1 or 2 on a file that exists (quoting issue or multi-line pattern failure)
 - `bash -c` script exits code 2 (shell syntax/quoting error, especially when content contains apostrophes or special chars)
 - Any bash file write op (`echo >`, `tee`, `cat >`) exits non-zero on an existing writable path
 - `jq` exits non-zero (JSON parse error or missing key)
+- `mv`/`cp`/`find` loop exits code 1 (loop variable bug, wildcard-includes-dest, or path error) — switch to `args.goal` specifying python3 shutil
 - Task involves nested conditional logic, multiple file mutations, or CSV/JSON/Excel output
 
 **Python REPLAN pattern — temp script (preferred for anything > 3 lines):**

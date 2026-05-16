@@ -23,45 +23,12 @@
 const logger = console;
 
 async function extractInformationNeeds(message, riskContext) {
-  // Fast-path: simple extraction without LLM for common patterns
   const needs = [];
-  
-  // Check for email needs
-  if (/\bemail\b/i.test(message) && !message.match(/[\w._%+-]+@[\w.-]+\.[a-z]{2,}/i)) {
-    needs.push({ type: 'contact', description: 'email address', key: 'email' });
-  }
-  
-  // Check for phone needs  
-  if (/\b(text|sms|call|phone)\s+me\b/i.test(message) && !message.match(/\b\d{10,}\b/)) {
-    needs.push({ type: 'contact', description: 'phone number', key: 'phone' });
-  }
-  
-  // Check for external knowledge needs
-  if (/\b(windsurf|keyboard shortcut|cheat sheet|API docs|documentation)\b/i.test(message)) {
-    const match = message.match(/\b(\w+)\s+(?:shortcut|cheat|docs?|documentation)/i);
-    if (match) {
-      needs.push({ type: 'external_knowledge', description: `${match[1]} shortcuts or documentation`, key: 'external_knowledge' });
-    }
-  }
-  
-  // Check for personal facts
-  const personalPatterns = [
-    { pattern: /\b(wife|husband|spouse|partner)\b.*\bname\b/i, desc: "spouse's name", key: 'spouse_name' },
-    { pattern: /\b(my|user)\s+name\b/i, desc: "user's name", key: 'user_name' },
-    { pattern: /\b(address|location|where i live)\b/i, desc: "user's address", key: 'address' },
-    { pattern: /\b(favorite|preferred)\s+(color|food|movie)\b/i, desc: "user preferences", key: 'preferences' },
-  ];
-  
-  for (const { pattern, desc, key } of personalPatterns) {
-    if (pattern.test(message)) {
-      needs.push({ type: 'personal_fact', description: desc, key });
-    }
-  }
-  
-  // If riskContext indicates complex operation, use LLM for deeper extraction
-  if (riskContext?.operationType === 'file' || needs.length === 0) {
-    try {
-      const extractPrompt = `What specific information does the user need to complete this task?
+
+  // Always use LLM extraction — regex fast-paths were incomplete and brittle.
+  // The LLM understands the full range of information gaps from natural language.
+  try {
+    const extractPrompt = `What specific information does the user need to complete this task?
 
 User request: "${message}"
 
@@ -70,30 +37,31 @@ Examples:
 - "email me" when no email in message → { "type": "contact", "description": "email address for sending", "key": "email" }
 - "my wife's name" when not provided → { "type": "personal_fact", "description": "spouse's name", "key": "spouse_name" }
 - "windsurf shortcuts" → { "type": "external_knowledge", "description": "windsurf keyboard shortcuts", "key": "windsurf_shortcuts" }
+- If nothing is missing, return { "needs": [] }
 
 Return: { "needs": [{ "type": "contact|personal_fact|external_knowledge|file_scope", "description": "what is needed", "key": "identifier" }] }`;
 
-      const llmResult = await riskContext.llmBackend?.generateAnswer?.(extractPrompt, { 
-        temperature: 0, 
-        maxTokens: 200 
-      });
-      
-      if (llmResult) {
-        const parsed = JSON.parse(llmResult.replace(/```json\s*/i, '').replace(/```/g, '').trim());
-        if (parsed.needs) {
-          // Merge with existing needs, avoiding duplicates
+    const llmResult = await riskContext.llmBackend?.generateAnswer?.(extractPrompt, {
+      temperature: 0,
+      maxTokens: 200,
+    });
+
+    if (llmResult) {
+      const cleaned = llmResult.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/g, '').trim();
+      const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(parsed.needs)) {
           for (const need of parsed.needs) {
-            if (!needs.find(n => n.key === need.key)) {
-              needs.push(need);
-            }
+            if (!needs.find(n => n.key === need.key)) needs.push(need);
           }
         }
       }
-    } catch (e) {
-      logger.warn(`[Node:McpFillGaps] LLM extraction failed: ${e.message}`);
     }
+  } catch (e) {
+    logger.warn(`[Node:McpFillGaps] LLM extraction failed: ${e.message}`);
   }
-  
+
   return needs;
 }
 
