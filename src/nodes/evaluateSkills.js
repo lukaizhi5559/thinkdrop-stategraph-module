@@ -9,7 +9,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const MAX_EVAL_RETRIES = 2;
+const MAX_EVAL_RETRIES = 4;
 
 function loadEvalPrompt() {
   try {
@@ -74,6 +74,15 @@ module.exports = async function evaluateSkills(state) {
       (_lastCompletedStep.skill === 'browser.agent' || _lastCompletedStep.skill === 'cli.agent');
     if (_isAgentLastStep) {
       logger.info(`[Node:EvaluateSkills] Skipping post-run eval — last completed step was ${_lastCompletedStep.skill} ok:true (agent verified outcome internally)`);
+      return { ...state, evaluationVerdict: 'PASS' };
+    }
+    // Skip post-run evaluation when the last shell.run step confirms task completion in stdout.
+    // Shell exit 0 + explicit confirmation text is ground truth — the LLM judge must not
+    // override it (doing so causes false FIX verdicts that trigger needless replan cycles).
+    const lastShellOk = Array.isArray(skillResults) && [...skillResults].reverse().find(r => r.skill === 'shell.run' && r.ok === true);
+    const SHELL_CONFIRMED = /\brenamed\b|\balready done\b|\bmoved\b|\bRenaming:\s|\bmv:\s|\bcreated\b|\bmkdir\b|\binstalled\b|\bcopied\b/i;
+    if (lastShellOk && SHELL_CONFIRMED.test(String(lastShellOk.stdout || ''))) {
+      logger.info(`[Node:EvaluateSkills] Skipping post-run eval — last shell.run confirmed task completion in stdout`);
       return { ...state, evaluationVerdict: 'PASS' };
     }
     // Skip post-run evaluation for pure interaction tasks (navigate + click/fill/examine)
@@ -338,8 +347,24 @@ Output ONLY valid JSON.`;
     // (e.g., browser.agent succeeded but page snapshot was unavailable). Writing a rule
     // based on this artifact poisons the context for future runs.
     const isHollowArtifact = state.failedStep?._hollowResult === true;
-    if (isHollowArtifact) {
-      logger.info(`[Node:EvaluateSkills] Skipping context rule write — failure was a hollow-detection artifact (not a real execution failure)`);
+
+    // Bad-rule guard: if the rule recommends a tool that the failure itself reports as missing/unavailable,
+    // skip writing it — it would cement the wrong approach into DuckDB and cause the next retry
+    // to be pre-poisoned with a known-broken strategy.
+    const failedStderr = String(state.failedStep?.stderr || '').toLowerCase();
+    const failedStdout = String(state.failedStep?.stdout || '').toLowerCase();
+    const failedOutput = failedStderr + ' ' + failedStdout;
+    const BAD_RULE_SIGNALS = /no available formula|no such formula|command not found|modulenotfounderror|no module named|cannot find module|not found|error: no formula/i;
+    const ruleToolWords = verdict.ruleText.toLowerCase().match(/\b[a-z][a-z0-9_-]{2,}\b/g) || [];
+    const ruleRecommendsBrokenTool = ruleToolWords.some(word =>
+      word.length > 3 && failedOutput.includes(word) && BAD_RULE_SIGNALS.test(failedOutput)
+    );
+    if (ruleRecommendsBrokenTool) {
+      logger.warn(`[Node:EvaluateSkills] Bad-rule guard: skipping DuckDB write — rule recommends a tool that failed in this very run. ruleText: "${verdict.ruleText.slice(0, 120)}"`);
+    }
+
+    if (isHollowArtifact || ruleRecommendsBrokenTool) {
+      if (isHollowArtifact) logger.info(`[Node:EvaluateSkills] Skipping context rule write — failure was a hollow-detection artifact (not a real execution failure)`);
     } else if (mcpAdapter) {
       // Collect ALL hostnames touched during this run (planned + actual redirects).
       // Write the rule under every hostname so planSkills finds it regardless of
@@ -381,6 +406,8 @@ Output ONLY valid JSON.`;
       evaluationFromFailure: false,
       // Always increment so the failure-path cap fires after MAX_EVAL_RETRIES cycles.
       evaluationRetryCount: evaluationRetryCount + 1,
+      // At retry 3+, signal recoverSkill to trigger web.agent discovery — LLM-only guesses exhausted.
+      _needsWebDiscovery: (evaluationRetryCount + 1) >= 3,
       // Clear plan state so planSkills reruns fresh with the new rule injected
       skillPlan: null,
       skillCursor: 0,

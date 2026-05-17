@@ -349,22 +349,21 @@ module.exports = async function reviewExecution(state) {
   }
 
   // ── Fast-pass: shell-only plan where every step exited cleanly ───────────────
-  // When all steps are shell.run/cli.agent and every step: ok !== false, exitCode 0,
-  // and produced non-empty stdout — the LLM review would return PASS 100% of the time.
-  // Skip the ~2s roundtrip. The LLM path still runs if any step failed, exited non-zero,
-  // or produced empty/suspiciously-short stdout (possible silent failure).
+  // When all steps are shell.run/cli.agent and every step exited with ok=true and
+  // exitCode 0 — the LLM review would return PASS 100% of the time.
+  // Skip the ~2s roundtrip. The LLM path still runs if any step failed or exited non-zero.
   const _allShellOrCli = skillResults.every(r => r.skill === 'shell.run' || r.skill === 'cli.agent' || r.skill === 'synthesize');
   const _hasRealShell  = skillResults.some(r => r.skill === 'shell.run' || r.skill === 'cli.agent');
   if (_allShellOrCli && _hasRealShell) {
     const _allClean = skillResults
       .filter(r => r.skill === 'shell.run' || r.skill === 'cli.agent')
       .every(r => {
-        const exitOk  = r.ok !== false && (r.exitCode == null || r.exitCode === 0);
-        const hasOut  = String(r.stdout || r.result || '').trim().length > 0;
-        // File operations (mv, cp, mkdir, etc.) succeed silently with exitCode 0
-        const cmd     = String(r.args?.command || r.args?.argv?.join(' ') || '');
-        const isFileOp = /\b(mv|cp|mkdir|rmdir|rm|touch|chmod|chown|ln|rsync|scp|find)\b/.test(cmd);
-        return exitOk && (hasOut || isFileOp);
+        // exit 0 + ok=true IS the definitive success signal for shell commands.
+        // Silent stdout is normal Unix behaviour — many commands (open, mv, mkdir,
+        // osascript, launchctl, defaults, killall, …) produce no output on success.
+        // A hardcoded isFileOp list can never be exhaustive, so we rely solely on
+        // the exit code contract instead.
+        return r.ok !== false && (r.exitCode == null || r.exitCode === 0);
       });
     if (_allClean) {
       logger.info('[Node:ReviewExecution] Shell-only plan — all steps exited cleanly, skipping LLM review');
@@ -376,7 +375,17 @@ module.exports = async function reviewExecution(state) {
 
   // ── Phase 1: LLM analysis ────────────────────────────────────────────────────
 
-  const stepLog = skillResults.map((r, i) => {
+  // Dedup skillResults by step index — keep only the last result per step.
+  // AUTO_PATCH retries append a new entry for the same step index; the LLM
+  // should only see the final (successful) attempt, not the failed first one.
+  const dedupedResults = Object.values(
+    skillResults.reduce((acc, r) => {
+      acc[r.step ?? r.stepIndex ?? 0] = r;
+      return acc;
+    }, {})
+  );
+
+  const stepLog = dedupedResults.map((r, i) => {
     const lines = [
       `Step ${i + 1} (index ${i}): ${r.skill}${r.args?.action ? '/' + r.args.action : ''} | ok=${r.ok !== false}`,
     ];
@@ -432,11 +441,14 @@ Output ONLY valid JSON.`;
 
   // Too many suspicious steps — auto-patching N commands is risky and signals
   // a structurally broken plan. Surface everything to the user instead.
+  // Use skillPlan.length (planned steps) not skillResults.length (which includes
+  // retry attempts from AUTO_PATCH recovery, inflating the count).
+  const planStepCount = Math.max(skillPlan.length, 1);
   const tooMany = suspiciousSteps.length > MAX_AUTO_PATCH_COUNT ||
-    suspiciousSteps.length >= Math.ceil(skillResults.length / 2);
+    suspiciousSteps.length >= Math.ceil(planStepCount / 2);
 
   if (tooMany) {
-    logger.warn(`[Node:ReviewExecution] ${suspiciousSteps.length}/${skillResults.length} steps flagged — too many to auto-patch → ASK_USER`);
+    logger.warn(`[Node:ReviewExecution] ${suspiciousSteps.length}/${planStepCount} plan steps flagged — too many to auto-patch → ASK_USER`);
     const answer = buildPartialSummary(userMessage, skillResults, suspiciousSteps);
     return { ...state, reviewVerdict: 'ASK_USER', answer };
   }

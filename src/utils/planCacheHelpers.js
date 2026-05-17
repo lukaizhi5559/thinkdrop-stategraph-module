@@ -7,10 +7,17 @@
  * Exported as a module singleton so the in-memory session cache (_SESSION_CACHE)
  * is shared between both callers regardless of which one populates it first.
  *
+ * Cache strategy (industry-standard):
+ *   - Exact normalized match   → auto-execute immediately, no modal
+ *   - Semantic cosine ≥ 0.85   → show approval modal (suggest, never silently execute)
+ *   - Semantic cosine 0.50–0.84 → show approval modal (lower confidence)
+ *   - Semantic cosine < 0.50   → no cache hit, plan fresh
+ *   - Dot-syntax named recall  → auto-execute (explicit user intent)
+ *
  * Responsibilities:
- *   - extractEntityAnchors()    — extract identity tokens from a user message
- *   - anchorSetsMatch()         — symmetric anchor comparison (prevents false positives)
- *   - findSimilarCompletePlan() — disk-based plan similarity search
+ *   - normalizePrompt()         — canonical exact-match key
+ *   - cosineDistance()          — pure JS cosine similarity on float arrays
+ *   - findSimilarCompletePlan() — async: exact session hit OR semantic disk search
  *   - Session LRU cache         — zero-disk-I/O exact-repeat cache
  */
 
@@ -20,14 +27,11 @@ const os   = require('os');
 
 const PLANS_DIR = path.join(os.homedir(), '.thinkdrop', 'plans');
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-/** Jaccard similarity threshold above which a plan auto-executes (no modal). */
-const HIGH_CONFIDENCE_THRESHOLD = 0.8;
+// ── Semantic similarity thresholds ────────────────────────────────────────────
+/** Minimum cosine similarity to surface a plan as a suggestion (modal). */
+const SEMANTIC_SUGGEST_THRESHOLD = 0.50;
 
 // ── Cache invalidation: deprecated browser.act plans for named services ───────
-// If a cached plan uses ONLY browser.act (no browser.agent) and the prompt
-// mentions a recognizable named service, the plan is stale — it was generated
-// before the prompt was updated to route named sites through browser.agent.
 const _NAMED_SERVICE_RE = /\b(google|biblegateway|wikipedia|duckduckgo|reddit|youtube|stackoverflow|amazon|ebay|twitter|x\.com|facebook|instagram|pinterest|linkedin|yelp|tripadvisor|imdb|spotify|netflix|hulu|twitch|tiktok|chatgpt|gemini|perplexity|claude|grok|deepseek|mistral|copilot|midjourney|suno|notion|slack|discord|telegram|whatsapp|github|gitlab|bitbucket)\b/i;
 
 function _isStaleBrowserActPlan(skillPlan, prompt) {
@@ -38,22 +42,30 @@ function _isStaleBrowserActPlan(skillPlan, prompt) {
   return hasOnlyBrowserAct;
 }
 
-// ── In-memory session cache ───────────────────────────────────────────────────
+// ── In-memory session cache (exact-match only) ────────────────────────────────
 // Shared singleton Map — because Node caches module instances, both planSkills
 // and checkPlanCache reference the same Map object.
 const _SESSION_CACHE       = new Map();
 const SESSION_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 const SESSION_CACHE_MAX    = 50;
 
-function _sessionCacheKey(message) {
-  return message.toLowerCase().replace(/\s+/g, ' ').trim();
+/**
+ * Canonical normalisation for exact-match cache keys.
+ * Lowercases, collapses whitespace, strips leading/trailing punctuation.
+ */
+function normalizePrompt(text) {
+  return (text || '').toLowerCase().replace(/[^\w\s-]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-function _sessionCacheSet(key, skillPlan, anchors) {
+function _sessionCacheKey(message) {
+  return normalizePrompt(message);
+}
+
+function _sessionCacheSet(key, skillPlan) {
   if (_SESSION_CACHE.size >= SESSION_CACHE_MAX) {
     _SESSION_CACHE.delete(_SESSION_CACHE.keys().next().value); // evict oldest
   }
-  _SESSION_CACHE.set(key, { skillPlan, timestamp: Date.now(), anchors });
+  _SESSION_CACHE.set(key, { skillPlan, timestamp: Date.now() });
 }
 
 function _sessionCacheGet(key) {
@@ -66,81 +78,25 @@ function _sessionCacheGet(key) {
   return entry;
 }
 
-// ── Entity-anchor extraction ──────────────────────────────────────────────────
-// Proper nouns, emails, URLs, and phone numbers that uniquely identify WHAT the
-// plan operates on.  If two messages differ on any anchor, they target different
-// entities and must NOT auto-execute the same cached plan.
-
-const _STOP_NOUNS = new Set([
-  'I', 'The', 'A', 'An', 'This', 'That', 'My', 'Your', 'Please',
-  'Hi', 'Hello', 'Ok', 'Okay', 'Can', 'Could', 'Would', 'Should',
-  'Just', 'Using', 'With', 'From', 'Send', 'Get', 'Go', 'Do',
-]);
+// ── Cosine similarity ─────────────────────────────────────────────────────────
 
 /**
- * Extract identity-bearing anchor tokens from a message string.
- * @param {string} text
- * @returns {Set<string>}  lowercased anchor values
+ * Compute cosine similarity between two equal-length float arrays.
+ * Returns a value in [0, 1]. Returns 0 if either vector is zero-length.
+ * @param {number[]} a
+ * @param {number[]} b
+ * @returns {number}
  */
-function extractEntityAnchors(text) {
-  if (!text) return new Set();
-  const anchors = new Set();
-  let m;
-
-  // Email addresses
-  const emailRe = /\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b/g;
-  while ((m = emailRe.exec(text)) !== null) anchors.add(m[0].toLowerCase());
-
-  // URLs — keep hostname only to avoid query-string noise
-  const urlRe = /https?:\/\/[^\s]+/g;
-  while ((m = urlRe.exec(text)) !== null) {
-    try {
-      anchors.add(new URL(m[0]).hostname.replace(/^www\./, '').toLowerCase());
-    } catch (_) {
-      anchors.add(m[0].toLowerCase());
-    }
+function cosineDistance(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || a.length !== b.length) return 0;
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot   += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
   }
-
-  // Phone numbers (normalised to digits only)
-  const phoneRe = /(?<!\d)(\+?1?\s*[\(]?\d{3}[\)\-\s]?\d{3}[\-\s]?\d{4})(?!\d)/g;
-  while ((m = phoneRe.exec(text)) !== null) anchors.add(m[0].replace(/\D/g, ''));
-
-  // Capitalised proper nouns — filter out stop-words and sentence-start capitals.
-  // Strategy: split on sentence boundaries, then skip the first word of each chunk.
-  const sentences = text.split(/(?<=[.!?])\s+|\n+/);
-  const nounRe = /\b[A-Z][a-z]{1,}\b/g;
-  for (const sentence of sentences) {
-    const words = sentence.trim().split(/\s+/);
-    // Skip index 0 (sentence-start capital) — start from index 1
-    for (let i = 1; i < words.length; i++) {
-      const match = words[i].match(/^[A-Z][a-z]{1,}$/);
-      if (match && !_STOP_NOUNS.has(words[i])) {
-        anchors.add(words[i].toLowerCase());
-      }
-    }
-  }
-
-  // Also catch standalone capitalized words not caught by sentence splitting
-  nounRe.lastIndex = 0;
-  // (already handled above)
-
-  return anchors;
-}
-
-/**
- * Returns true when two anchor sets are "compatible" — both empty, or symmetric match.
- * Asymmetric presence → false (plan targeted "Sarah", new request names "John").
- * @param {Set<string>} anchorsA
- * @param {Set<string>} anchorsB
- * @returns {boolean}
- */
-function anchorSetsMatch(anchorsA, anchorsB) {
-  if (anchorsA.size === 0 && anchorsB.size === 0) return true;
-  if (anchorsA.size !== anchorsB.size) return false;
-  for (const a of anchorsA) {
-    if (!anchorsB.has(a)) return false;
-  }
-  return true;
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom === 0 ? 0 : dot / denom;
 }
 
 // ── Dot-syntax plan name helpers ────────────────────────────────────────────
@@ -232,20 +188,78 @@ function findPlanByName(planName, logger) {
   return null;
 }
 
-// ── Disk-based plan similarity search ────────────────────────────────────────
+// ── Disk-based plan similarity search (semantic embeddings) ──────────────────
 
 /**
- * Find the most similar previously-completed plan on disk.
- * Only considers plans with status: complete and a stored skill_plan_json.
- * Applies entity-anchor guard: plans with different anchors are flagged
- * autoExecute: false even if their Jaccard score exceeds the threshold.
- *
- * @param {string} prompt   user message
- * @param {object} logger
- * @returns {{ planFile, title, file, similarity, skillPlan, autoExecute, anchors } | null}
+ * Collect candidate completed plans from disk.
+ * Returns array of { planPath, file, title, planPrompt, jsonMatch } for scoring.
+ * @returns {Array}
  */
-function findSimilarCompletePlan(prompt, logger) {
-  // Fast path: check for exact dot-syntax name in the prompt first
+function _collectCandidatePlans() {
+  if (!fs.existsSync(PLANS_DIR)) return [];
+  const files = fs.readdirSync(PLANS_DIR)
+    .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
+    .sort().reverse()
+    .slice(0, 20);
+
+  const candidates = [];
+  for (const file of files) {
+    const planPath = path.join(PLANS_DIR, file);
+    try {
+      const content = fs.readFileSync(planPath, 'utf8');
+      const statusMatch = content.match(/^status:\s*(.+)/m);
+      if (!statusMatch || statusMatch[1].trim() !== 'complete') continue;
+      const jsonMatch = content.match(/^skill_plan_json:\s*'([^']+)'/m);
+      if (!jsonMatch) continue;
+      const titleMatch  = content.match(/^# Plan:\s*(.+)/m);
+      const promptMatch = content.match(/^original_prompt:\s*"([^"]+)"/m);
+      const planPrompt  = promptMatch ? promptMatch[1] : (titleMatch ? titleMatch[1] : '');
+      if (!planPrompt) continue;
+      candidates.push({
+        planPath,
+        file,
+        title: titleMatch?.[1]?.trim() || file,
+        planPrompt,
+        jsonMatch,
+        content,
+      });
+    } catch (_) { /* skip unreadable */ }
+  }
+  return candidates;
+}
+
+/**
+ * Call /memory.embed on the user-memory service (port 3001) to get vectors.
+ * Falls back gracefully if the service is unavailable.
+ * @param {string[]} texts
+ * @param {object} mcpAdapter
+ * @returns {Promise<number[][]>}  one vector per text, or []
+ */
+async function _getEmbeddings(texts, mcpAdapter) {
+  if (!mcpAdapter || !Array.isArray(texts) || texts.length === 0) return [];
+  try {
+    const result = await mcpAdapter.callService('user-memory', 'memory.embed', { texts }, { timeoutMs: 8000 });
+    if (result && Array.isArray(result.embeddings)) return result.embeddings;
+  } catch (_) {}
+  return [];
+}
+
+/**
+ * Find the most similar previously-completed plan on disk using semantic embeddings.
+ *
+ * Industry-standard rules:
+ *   - Exact normalized prompt match → autoExecute: true (returned directly, no embedding call)
+ *   - Semantic cosine ≥ 0.50       → autoExecute: false (caller shows approval modal)
+ *   - Semantic cosine < 0.50       → null (no cache hit)
+ *   - Never auto-executes on fuzzy similarity — only exact match or dot-name recall
+ *
+ * @param {string} prompt        user message
+ * @param {object} mcpAdapter    MCP adapter for embedding call
+ * @param {object} logger
+ * @returns {Promise<{ planFile, title, file, similarity, skillPlan, autoExecute } | null>}
+ */
+async function findSimilarCompletePlan(prompt, mcpAdapter, logger) {
+  // Fast path: dot-syntax named recall → always auto-execute
   const _dotName = extractDotNameFromPrompt(prompt);
   if (_dotName) {
     const _byName = findPlanByName(_dotName, logger);
@@ -253,80 +267,77 @@ function findSimilarCompletePlan(prompt, logger) {
   }
 
   try {
-    if (!fs.existsSync(PLANS_DIR)) return null;
-    const files = fs.readdirSync(PLANS_DIR)
-      .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
-      .sort().reverse()
-      .slice(0, 20);
+    const candidates = _collectCandidatePlans();
+    if (candidates.length === 0) return null;
 
-    const promptWords = new Set(
-      prompt.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter(w => w.length > 4)
-    );
-    const promptAnchors = extractEntityAnchors(prompt);
-
-    for (const file of files) {
-      const planPath = path.join(PLANS_DIR, file);
-      try {
-        const content = fs.readFileSync(planPath, 'utf8');
-
-        // Only match 100% successfully completed plans
-        const statusMatch = content.match(/^status:\s*(.+)/m);
-        if (!statusMatch || statusMatch[1].trim() !== 'complete') continue;
-
-        // Must have stored skill_plan_json to be reusable
-        const jsonMatch = content.match(/^skill_plan_json:\s*'([^']+)'/m);
-        if (!jsonMatch) continue;
-
-        const titleMatch  = content.match(/^# Plan:\s*(.+)/m);
-        const promptMatch = content.match(/^original_prompt:\s*"([^"]+)"/m);
-        const planRawPrompt = promptMatch ? promptMatch[1] : '';
-        const planText = ((titleMatch ? titleMatch[1] : '') + ' ' + planRawPrompt)
-          .toLowerCase().replace(/[^a-z0-9 ]/g, ' ');
-        const planWords   = new Set(planText.split(/\s+/).filter(w => w.length > 4));
-        const planAnchors = extractEntityAnchors(planRawPrompt + ' ' + (titleMatch ? titleMatch[1] : ''));
-
-        const intersection = [...promptWords].filter(w => planWords.has(w));
-        const union        = new Set([...promptWords, ...planWords]);
-        const similarity   = union.size > 0 ? intersection.length / union.size : 0;
-
-        if (similarity >= 0.3) {
-          try {
-            const decoded  = Buffer.from(jsonMatch[1], 'base64').toString('utf8');
-            const skillPlan = JSON.parse(decoded);
-            // Invalidate stale plans that use browser.act for named-service tasks
-            if (_isStaleBrowserActPlan(skillPlan, prompt)) {
-              logger.info(`[PlanCache] Invalidating stale browser.act plan for named service: ${file}`);
-              continue;
-            }
-            const anchorsOk   = anchorSetsMatch(promptAnchors, planAnchors);
-            const autoExecute = similarity >= HIGH_CONFIDENCE_THRESHOLD && anchorsOk;
-            logger.info(
-              `[PlanCache] Similar completed plan found ` +
-              `(${Math.round(similarity * 100)}% match, anchorsOk=${anchorsOk}, autoExecute=${autoExecute}): ${file}`
-            );
-            return {
-              planFile: planPath,
-              title: titleMatch?.[1]?.trim() || file,
-              file,
-              similarity,
-              skillPlan,
-              autoExecute,
-              anchors: promptAnchors,
-            };
-          } catch (_) { continue; }
-        }
-      } catch (_) { /* skip unreadable */ }
+    // ── Exact normalized match → auto-execute immediately (zero network call) ──
+    const normalizedPrompt = normalizePrompt(prompt);
+    for (const c of candidates) {
+      if (normalizePrompt(c.planPrompt) === normalizedPrompt) {
+        try {
+          const decoded   = Buffer.from(c.jsonMatch[1], 'base64').toString('utf8');
+          const skillPlan = JSON.parse(decoded);
+          if (_isStaleBrowserActPlan(skillPlan, prompt)) continue;
+          logger && logger.info(`[PlanCache] Exact prompt match → auto-execute: ${c.file}`);
+          return {
+            planFile: c.planPath,
+            title: c.title,
+            file: c.file,
+            similarity: 1.0,
+            skillPlan,
+            autoExecute: true,
+          };
+        } catch (_) { continue; }
+      }
     }
+
+    // ── Semantic similarity via embeddings → suggestion modal only ─────────────
+    if (!mcpAdapter) return null;
+
+    const texts    = [prompt, ...candidates.map(c => c.planPrompt)];
+    const vectors  = await _getEmbeddings(texts, mcpAdapter);
+    if (vectors.length < 2) return null;
+
+    const promptVec = vectors[0];
+    let bestScore   = 0;
+    let bestIdx     = -1;
+
+    for (let i = 0; i < candidates.length; i++) {
+      const score = cosineDistance(promptVec, vectors[i + 1]);
+      if (score > bestScore) { bestScore = score; bestIdx = i; }
+    }
+
+    if (bestScore < SEMANTIC_SUGGEST_THRESHOLD || bestIdx < 0) return null;
+
+    const best = candidates[bestIdx];
+    try {
+      const decoded   = Buffer.from(best.jsonMatch[1], 'base64').toString('utf8');
+      const skillPlan = JSON.parse(decoded);
+      if (_isStaleBrowserActPlan(skillPlan, prompt)) return null;
+      logger && logger.info(
+        `[PlanCache] Semantic match found (cosine=${bestScore.toFixed(3)}, autoExecute=false): ${best.file}`
+      );
+      return {
+        planFile: best.planPath,
+        title: best.title,
+        file: best.file,
+        similarity: bestScore,
+        skillPlan,
+        autoExecute: false,
+        content: best.content,
+      };
+    } catch (_) { return null; }
+
   } catch (err) {
-    logger.warn(`[PlanCache] findSimilarCompletePlan error: ${err.message}`);
+    logger && logger.warn(`[PlanCache] findSimilarCompletePlan error: ${err.message}`);
   }
   return null;
 }
 
 module.exports = {
-  HIGH_CONFIDENCE_THRESHOLD,
-  extractEntityAnchors,
-  anchorSetsMatch,
+  SEMANTIC_SUGGEST_THRESHOLD,
+  normalizePrompt,
+  cosineDistance,
   findSimilarCompletePlan,
   findPlanByName,
   isValidDotName,

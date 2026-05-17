@@ -26,10 +26,6 @@ const os = require('os');
 const { jsonrepair } = require('jsonrepair');
 const { buildReminderSkill } = require('../utils/buildReminderSkill');
 const {
-  HIGH_CONFIDENCE_THRESHOLD,
-  extractEntityAnchors,
-  anchorSetsMatch,
-  findSimilarCompletePlan,
   findPlanByName,
   _sessionCacheKey,
   _sessionCacheGet,
@@ -146,7 +142,7 @@ const _MACOS_SIGNAL_RE = /\b(finder|desktop|osascript|applescript|plistbuddy|pli
 
 // Signals that a task is a simple public-site navigate with no login, agent, or complex ops.
 const _SLIM_BROWSE_VERB_RE    = /^(goto|go\s+to|navigate\s+to|visit|open|look\s+up|search\s+on|search\s+for|browse)\b/i;
-const _SLIM_COMPLEX_VOCAB_RE  = /\b(send|email|text\s+me|sms|slack|discord|telegram|whatsapp|dm|notify|login|log\s+in|sign\s+in|password|api|curl|shell|script|file|download|upload|create|build|make|generate|schedule|cron|install|setup|compare|spreadsheet|pdf|csv|excel|screenshot|screen)\b/i;
+const _SLIM_COMPLEX_VOCAB_RE  = /\b(send|email|text\s+me|sms|slack|discord|telegram|whatsapp|dm|notify|login|log\s+in|sign\s+in|password|api|curl|shell|script|file|folder|directory|download|upload|create|build|make|generate|schedule|cron|install|setup|compare|spreadsheet|pdf|csv|excel|screenshot|screen)\b/i;
 const _SLIM_AGENT_REQUIRED_RE = /\b(gmail|notion|linear|jira|trello|github|stripe|twilio|clicksend|mailgun|sendgrid|spotify|netflix|linkedin)\b/i;
 
 /**
@@ -172,7 +168,8 @@ function buildSystemPrompt(userMessage, state) {
     !state.matchedSkillName &&
     _SLIM_BROWSE_VERB_RE.test(userMessage) &&
     !_SLIM_COMPLEX_VOCAB_RE.test(userMessage) &&
-    !_SLIM_AGENT_REQUIRED_RE.test(userMessage);
+    !_SLIM_AGENT_REQUIRED_RE.test(userMessage) &&
+    !_MACOS_SIGNAL_RE.test(userMessage);
 
   if (canUseSlim) {
     const slim = _loadPromptFile('plan-skills-browser.md');
@@ -343,7 +340,7 @@ async function planSkills(state) {
     const prebuiltPlan = state._skillPlan;
     // Populate session cache so next identical request executes instantly without a modal.
     const _ck = _sessionCacheKey(userMessage);
-    _sessionCacheSet(_ck, prebuiltPlan, require('../utils/planCacheHelpers').extractEntityAnchors(userMessage));
+    _sessionCacheSet(_ck, prebuiltPlan);
     // Emit plan_ready so AutomationProgress initialises its step list.
     // PlanPanel ignores plan_ready (it only handles plan: prefixed events), so this is safe
     // for both ASK_USER recovery re-runs and PlanPanel-approved plan re-runs.
@@ -525,7 +522,7 @@ async function planSkills(state) {
   // Guards: skip when replanning after failure, multi-intent queue, _forceNewPlan,
   // or recurring tasks (schedule parameters in the message must always be re-planned).
   if (!recoveryContext && !state.isMultiIntent && !state._forceNewPlan && !isRecurring) {
-    // ── Phase 3: In-memory session cache — zero disk I/O on exact repeats ──────
+    // ── Session cache — exact-match only, zero disk I/O ──────────────────────
     const _cacheKey = _sessionCacheKey(userMessage);
     const _cached   = _sessionCacheGet(_cacheKey);
     if (_cached) {
@@ -544,50 +541,30 @@ async function planSkills(state) {
       };
     }
 
-    // ── Phase 1+2: Disk-based plan match with entity-anchor guard ─────────────
-    const similarPlan = findSimilarCompletePlan(userMessage, logger);
-    if (similarPlan) {
-      // Phase 2: High-confidence + anchor match → auto-execute, skip approval modal
-      if (similarPlan.autoExecute) {
-        logger.info(`[Node:PlanSkills] Auto-executing cached plan (${Math.round(similarPlan.similarity * 100)}% match, anchors verified)`);
-        if (progressCallback) progressCallback({
-          type: 'plan:auto_executed',
-          planFile: similarPlan.planFile,
-          title: similarPlan.title,
-          similarity: similarPlan.similarity,
-          source: 'disk_cache',
-          message: `Reusing cached plan (${Math.round(similarPlan.similarity * 100)}% match)`,
-        });
-        // Populate session cache so next identical request is instant
-        _sessionCacheSet(_cacheKey, similarPlan.skillPlan, similarPlan.anchors);
-        return {
-          ...state,
-          skillPlan: similarPlan.skillPlan,
-          skillCursor: 0,
-          recoveryContext: null,
-          planError: null,
-        };
-      }
-
-      // Medium confidence or anchor mismatch → show approval modal
-      const skillPlanB64 = Buffer.from(JSON.stringify(similarPlan.skillPlan)).toString('base64');
+    // ── Semantic cache suggestion from checkPlanCache — show approval modal ───
+    // checkPlanCache already ran the embedding search and set _cachedPlanSuggestion.
+    // planSkills never re-does disk search — it only acts on the pre-computed result.
+    // Rule: semantic hits NEVER auto-execute, always require user approval.
+    if (state._cachedPlanSuggestion) {
+      const suggestion = state._cachedPlanSuggestion;
+      logger.info(`[Node:PlanSkills] Surfacing semantic cache suggestion (cosine=${suggestion.similarity.toFixed(3)}) → approval modal`);
+      const skillPlanB64 = Buffer.from(JSON.stringify(suggestion.skillPlan)).toString('base64');
       if (progressCallback) {
-        let existingContent = '';
-        try { existingContent = fs.readFileSync(similarPlan.planFile, 'utf8'); } catch (_) {}
         progressCallback({
           type: 'plan:found_existing',
-          planFile: similarPlan.planFile,
-          title: similarPlan.title,
-          file: similarPlan.file,
-          similarity: similarPlan.similarity,
-          content: existingContent,
+          planFile: suggestion.planFile,
+          title: suggestion.title,
+          file: suggestion.file,
+          similarity: suggestion.similarity,
+          content: suggestion.content || '',
           skillPlanJson: skillPlanB64,
         });
       }
       return {
         ...state,
         awaitingPlanApproval: true,
-        _skillPlanFile: similarPlan.planFile,
+        _skillPlanFile: suggestion.planFile,
+        _cachedPlanSuggestion: null,
         skillPlan: null,
         skillCursor: 0,
         recoveryContext: null,
@@ -1697,17 +1674,29 @@ Task: "${userMessage}"`;
           const coveredServiceIds = new Set(
             agentRows.map(a => (a.service || a.id.replace('.agent', '')).toLowerCase())
           );
-          // Gather services the user wants (from enrichIntent domainTags)
+          // Gather services the user wants (from enrichIntent domainTags).
+          // IMPORTANT: only use domainTags.services — tags are taxonomy labels
+          // (e.g. "spotify.control", "music", "file-system"), not service names.
+          // Including tags causes hallucinated labels to trigger the discovery note.
           const wantedServices = [
             ...(domainTags?.services || []),
-            ...(domainTags?.tags   || []),
           ].map(s => s.toLowerCase()).filter(s => s.length >= 3);
 
-          const missingService = wantedServices.find(svc =>
-            !coveredServiceIds.has(svc) &&
-            !coveredServiceIds.has(svc.replace(/-/g, '')) &&
-            !agentRows.some(a => (a.id || '').toLowerCase().includes(svc))
+          // Pre-compute message word set once for the explicit-mention check below.
+          const _msgWordsSet = new Set(
+            userMessage.replace(/[^a-z0-9\s]/gi, ' ').toLowerCase().split(/\s+/).filter(Boolean)
           );
+
+          const missingService = wantedServices.find(svc => {
+            if (coveredServiceIds.has(svc)) return false;
+            if (coveredServiceIds.has(svc.replace(/-/g, ''))) return false;
+            if (agentRows.some(a => (a.id || '').toLowerCase().includes(svc))) return false;
+            // STRUCTURAL GUARD: only fire discovery machinery when the service name
+            // is explicitly present in what the user typed. phi4 output is advisory
+            // only — if the user didn't name the service, don't act on phi4's guess.
+            const _svcToken = svc.replace(/[^a-z0-9]/gi, '').toLowerCase();
+            return [..._msgWordsSet].some(w => w === _svcToken || w.startsWith(_svcToken));
+          });
 
           if (missingService) {
             // Use preflight CLI data as the authoritative signal — c.cli is null when no binary exists.
@@ -1791,6 +1780,31 @@ Task: "${userMessage}"`;
         _chosenService = null;
         _domainTags = null;
       }
+    }
+  }
+
+  // ── Structural explicit-mention guard ─────────────────────────────────────
+  // phi4/domain.extract is advisory — its service candidates must be verified
+  // against the user's actual message before injecting domain context.
+  // If none of phi4's service names appear in the message, clear the tags so
+  // the planSkills LLM receives a clean prompt and plans the actual task.
+  // This covers all phi4 hallucination categories (local-fs, reminders, code, etc.)
+  // with one rule instead of per-category guards.
+  if (_domainTags?.services?.length > 0 || _chosenService) {
+    const _msgNorm = userMessage.replace(/[^a-z0-9\s]/gi, ' ').toLowerCase();
+    const _msgWords = new Set(_msgNorm.split(/\s+/).filter(Boolean));
+    const _candidates = [
+      ...(_domainTags?.services || []),
+      ...(_chosenService ? [_chosenService] : []),
+    ];
+    const _hasExplicitMention = _candidates.some(s => {
+      const tok = s.replace(/[^a-z0-9]/gi, '').toLowerCase();
+      return tok.length >= 3 && [..._msgWords].some(w => w === tok || w.startsWith(tok));
+    });
+    if (!_hasExplicitMention) {
+      logger.info(`[Node:PlanSkills] Explicit-mention guard: phi4 suggested [${_candidates.join(', ')}] but none appear in message — clearing domain context for: "${userMessage.substring(0, 60)}"`);
+      _domainTags = null;
+      _chosenService = null;
     }
   }
 

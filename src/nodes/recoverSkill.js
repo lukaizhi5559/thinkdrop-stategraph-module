@@ -451,6 +451,32 @@ module.exports = async function recoverSkill(state) {
       logger.debug('[Node:RecoverSkill] Python fallback hint injected');
     }
 
+    // ── Web discovery: after 2+ failed replans, use web.agent to find current best approach ──
+    // This is exhaustive recovery — like a human Googling when their first two guesses fail.
+    // Fires when: replanCount >= 2 OR evaluateSkills flagged _needsWebDiscovery (retry 3+).
+    if ((replanCount >= 2 || state._needsWebDiscovery) && mcpAdapter) {
+      try {
+        const taskDescription = (resolvedMessage || message || '').slice(0, 120);
+        const webQuery = `${taskDescription} macOS terminal command 2024`;
+        logger.info(`[Node:RecoverSkill] Web discovery triggered (replanCount=${replanCount}): "${webQuery.slice(0, 80)}"`);
+        const webRes = await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'web.agent',
+          args: { action: 'get_tutorial_steps', query: webQuery }
+        }, { timeoutMs: 10000 });
+        const webData = webRes?.data || webRes;
+        if (webData?.ok && Array.isArray(webData.mergedSteps) && webData.mergedSteps.length > 0) {
+          const stepLines = webData.mergedSteps.slice(0, 8).map((s, i) => `  ${i + 1}. ${s.text || s}`).join('\n');
+          lines.push(`\nWEB-DISCOVERED APPROACH (live search — use this instead of guessing):\n${stepLines}`);
+          logger.info(`[Node:RecoverSkill] Web discovery injected ${webData.mergedSteps.length} steps`);
+        } else if (webData?.ok && Array.isArray(webData.tutorials) && webData.tutorials.length > 0) {
+          const snippet = webData.tutorials[0].rawSnippet || '';
+          if (snippet) lines.push(`\nWEB-DISCOVERED APPROACH (live search):\n  ${snippet.slice(0, 400)}`);
+        }
+      } catch (webErr) {
+        logger.debug(`[Node:RecoverSkill] Web discovery failed (non-fatal): ${webErr.message}`);
+      }
+    }
+
     if (lines.length) {
       skillContextSection = `\nshell.run diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
       logger.debug(`[Node:RecoverSkill] shell.run context injected (${lines.length} items)`);
@@ -711,7 +737,7 @@ function _errorFingerprint(error) {
 }
 
 function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, skillResults, activeBrowserUrl, replanCount = 0, creatorSkillPath = null, webAgentBestUrl = null, patchHistory = []) {
-  const { skill, args, error = '', stderr = '' } = failedStep;
+  const { skill, args = {}, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
 
   // ── Progress-aware stuck detection ──────────────────────────────────────────

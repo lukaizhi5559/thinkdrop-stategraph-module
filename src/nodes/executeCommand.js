@@ -755,16 +755,35 @@ module.exports = async function executeCommand(state) {
 
   // ── {{PREV_OUTPUT}} template injection ───────────────────────────────────
   // Allows multi-step plans to pass data from one step to the next.
-  // The previous step's stdout is injected into any arg string containing
-  // the {{PREV_OUTPUT}} marker at dispatch time (not at plan-write time).
+  // The previous step's primary output is injected into any arg string containing
+  // the {{PREV_OUTPUT}} or {{prev_stdout}} marker at dispatch time (not at plan-write time).
+  // browser.agent stores page text in .result (not .stdout) — read both fields.
   let args = step.args || {};
   if (skillCursor > 0 && skillResults.length > 0) {
-    const prevStdout = (skillResults[skillResults.length - 1]?.stdout || '').slice(0, 4000);
+    const _prev = skillResults[skillResults.length - 1];
+    const prevStdout = (_prev?.stdout || _prev?.result || '').slice(0, 12000);
     if (prevStdout) {
-      const injectPrev = (val) => typeof val === 'string' ? val.replace(/\{\{PREV_OUTPUT\}\}/g, prevStdout) : val;
+      // Case-insensitive: match {{PREV_OUTPUT}} and {{prev_stdout}} (planner sometimes emits lowercase)
+      const injectPrev = (val) => typeof val === 'string'
+        ? val.replace(/\{\{PREV_OUTPUT\}\}/gi, prevStdout).replace(/\{\{prev_stdout\}\}/gi, prevStdout)
+        : val;
       const newArgs = {};
       for (const [k, v] of Object.entries(args)) newArgs[k] = injectPrev(v);
       args = newArgs;
+    }
+
+    // ── {{PREV_OUTPUT_FILE}} — for browser.agent steps that need bulk content ──
+    // browser.agent task strings are capped at 300 chars, so we can't inline content.
+    // Write the prior step's output to a temp file and substitute the path marker.
+    if (skill === 'browser.agent' && prevStdout) {
+      const _tmpFile = `/tmp/thinkdrop_pipe_${Date.now()}.txt`;
+      try {
+        require('fs').writeFileSync(_tmpFile, prevStdout, 'utf8');
+        const injectFile = (val) => typeof val === 'string' ? val.replace(/\{\{PREV_OUTPUT_FILE\}\}/g, _tmpFile) : val;
+        const fileArgs = {};
+        for (const [k, v] of Object.entries(args)) fileArgs[k] = injectFile(v);
+        args = { ...fileArgs, _prevOutputFile: _tmpFile };
+      } catch (_) {}
     }
   }
 
@@ -2783,10 +2802,12 @@ module.exports = async function executeCommand(state) {
   // the plan order is wrong.  Abort immediately with a clear error rather than
   // typing the literal placeholder into a form field.
   if (JSON.stringify(resolvedArgs).includes('{{synthesisAnswer}}')) {
+    const _planOrderError = 'Plan ordering error: a step references {{synthesisAnswer}} before the synthesize step that produces it. Please retry.';
     logger.error(`[Node:ExecuteCommand] Step ${skillCursor + 1} (${skill}) uses {{synthesisAnswer}} but no synthesize step has run yet — plan order is wrong`);
     return {
       ...state,
-      planError: 'Plan ordering error: a step references {{synthesisAnswer}} before the synthesize step that produces it. Please retry.',
+      planError: _planOrderError,
+      failedStep: { step: skillCursor + 1, skill, description, error: _planOrderError, args: args || {} },
       commandExecuted: false,
     };
   }
@@ -3461,12 +3482,14 @@ module.exports = async function executeCommand(state) {
     // For cli.agent / browser.agent: inject _progressCallbackUrl so the agent can POST
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
     const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent';
-    // For shell.run goal-mode steps: inject _progressCallback so goal resolution
-    // can surface thinking events ('Generating shell command…') to the UI.
-    const _isGoalModeStep = skill === 'shell.run' && !!resolvedArgs.goal && !resolvedArgs.cmd;
+    // For all shell.run steps: inject _progressCallback so that:
+    //   - goal-mode resolution surfaces thinking events ('Generating shell command…')
+    //   - live stdout chunks stream to the UI terminal panel (shell:stdout_chunk)
+    //   - sudo operations show a password warning before execution (shell:sudo_required)
+    const _isShellRunStep = skill === 'shell.run';
     const _callArgs = _isAgentSkill
       ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
-      : _isGoalModeStep
+      : _isShellRunStep
         ? { ...resolvedArgs, _progressCallback: (evt) => {
             if (!progressCallback) return;
             if (evt.type === 'shell:goal_resolving') {
@@ -3474,6 +3497,10 @@ module.exports = async function executeCommand(state) {
                 ? `Retrying command generation (${evt.attempt}/${evt.maxAttempts})…`
                 : 'Generating shell command…';
               progressCallback({ type: 'step_thinking', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'shell.run', thinking });
+            } else if (evt.type === 'shell:stdout_chunk') {
+              progressCallback({ type: 'step_output', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'shell.run', text: evt.text });
+            } else if (evt.type === 'shell:sudo_required') {
+              progressCallback({ type: 'step_sudo_required', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'shell.run', message: evt.message, cmd: evt.cmd });
             }
           }}
         : resolvedArgs;

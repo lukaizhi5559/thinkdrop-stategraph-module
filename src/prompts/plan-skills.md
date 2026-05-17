@@ -38,12 +38,15 @@ For ANY task that could be served by a CLI tool, REST API, or Python script — 
 
 ## Template variables
 
+**VALID TOKENS (exhaustive — this list is complete):**
 - `{{synthesisAnswer}}` — full text output of the last `synthesize` step
 - `{{synthesisAnswerFile}}` — temp file path containing the synthesis output
-- `{{prev_stdout}}` — stdout of the immediately preceding step (full string, not an object)
-- `{{bestUrl}}` — best URL returned by `web.agent search_and_navigate` (use this for navigation, not {{prev_stdout}})
+- `{{PREV_OUTPUT}}` — full output of the immediately preceding step (stdout for shell.run/cli.agent; result text for browser.agent). Use this when the NEXT step is `shell.run` or `cli.agent`. Also accepted as `{{prev_stdout}}` (legacy alias — prefer `{{PREV_OUTPUT}}`).
+- `{{bestUrl}}` — best URL returned by `web.agent search_and_navigate` (use this for navigation, not `{{PREV_OUTPUT}}`)
 
-**IMPORTANT**: Templates are simple string substitution. `{{prev_stdout}}` returns the entire stdout string (e.g., "Best URL: https://..."), NOT an object you can access with dots. To get just the URL from web.agent, use `{{bestUrl}}`.
+**CRITICAL: These are the ONLY valid `{{...}}` tokens. Any other `{{...}}` syntax (e.g. `{{user.agent.resolved.name}}`, `{{step.output}}`, `{{anything_else}}`) is undefined and will never be substituted. Never invent new tokens.**
+
+**IMPORTANT**: Templates are simple string substitution. `{{PREV_OUTPUT}}` returns the entire output string of the prior step — NOT an object you can access with dots. To get just the URL from web.agent, use `{{bestUrl}}`.
 
 ## Output Format Requirements
 
@@ -166,6 +169,22 @@ Use the EXACT agentId string from the AVAILABLE AGENTS block — do NOT guess or
 - **Pattern 2 — extract from one or more sources, synthesize, then deliver via a downstream browser step:** ALL extraction steps MUST come first, then `synthesize`, then the consumer step using `{{synthesisAnswer}}`. `{{synthesisAnswer}}` is ONLY available AFTER `synthesize` has executed — the orchestrator substitutes the real text before the consumer task runs. **CRITICAL ORDER: [extract step(s) → synthesize → consumer step]. NEVER place the consumer (browser.agent send email, etc.) before synthesize. NEVER place synthesize before all extractions are complete.** Multi-source example: `[playwright.agent ChatGPT extract → playwright.agent Gemini extract → synthesize → browser.agent send email with body: {{synthesisAnswer}}]`. Single-source example: `[playwright.agent AI Chat extract → synthesize → browser.agent send email with body: {{synthesisAnswer}}]`. **NEVER use `saveToFile` in synthesize and reference that path in the browser.agent task** — the browser agent cannot read filesystem files. Wrong order: [browser.agent send email → playwright.agent extract → synthesize]. Wrong order: [playwright.agent extract → browser.agent send email → synthesize]. Always include 'send' (not just 'compose') in the browser.agent task when the user wants the email delivered. **NO PLACEHOLDER TEXT**: NEVER write literal template placeholders like `[ChatGPT response]`, `[Perplexity response]`, `[AI answer]`, or `[source X content]` in any step args. When combining multi-source AI extractions into an email or message, always use `{{synthesisAnswer}}` as the sole body content token — never template the body with multiple source placeholders.
 
 - **Pattern 3 — multi-stage pipeline: read → synthesize → use result in next agent → synthesize → deliver:** When the output of one agent step must become the INPUT to a subsequent agent step (e.g. read an email then ask AI about its content, then reply with the AI's answer), use TWO synthesize steps — one after each retrieval, each scoped to only the stage it belongs to. **CRITICAL: `{{synthesisAnswer}}` always holds the output of the MOST RECENT synthesize step**, so the second synthesize overwrites the first — this is intentional. Multi-stage example: `[browser.agent(gmail, read email) → synthesize(prompt: "Extract the email sender and the full email body text") → browser.agent(chatgpt, "Ask for advice based on this email: {{synthesisAnswer}}") → synthesize(prompt: "Extract the AI advice that should be sent as a reply") → browser.agent(gmail, "Reply to the original sender with this advice: {{synthesisAnswer}}")]`. Each synthesize only sees the results from its immediately preceding extraction stage — NOT earlier stages. The synthesize `prompt` must be stage-specific: stage 1 extracts the email content; stage 2 extracts the AI's answer.
+
+**Consumer-type determines which data-passing mechanism to use — CRITICAL:**
+
+| Prior step produces content | Next (consumer) step | Correct mechanism | Wrong |
+|---|---|---|---|
+| `browser.agent` / `browser.act` | `shell.run` | `{{PREV_OUTPUT}}` in goal — **NO synthesize** | `synthesize` → `{{synthesisAnswer}}` |
+| `browser.agent` / `browser.act` | `cli.agent` | `{{PREV_OUTPUT}}` in goal — **NO synthesize** | `synthesize` → `{{synthesisAnswer}}` |
+| `browser.agent` / `browser.act` | another `browser.agent` | `synthesize` → `{{synthesisAnswer}}` in task | `{{PREV_OUTPUT}}` |
+| `shell.run` / `cli.agent` | `shell.run` | `{{PREV_OUTPUT}}` in goal — **NO synthesize** | `synthesize` → `{{synthesisAnswer}}` |
+| any step | display to user (end of plan) | `synthesize` | raw output |
+
+**Rule: `shell.run` NEVER uses `{{synthesisAnswer}}`.** It always uses `{{PREV_OUTPUT}}` in its `goal` string. The orchestrator injects the prior step's output at execution time — no `synthesize` step required between them.
+
+**Correct example — browser.agent → shell.run (write fetched content to file):**
+`[browser.agent([name].agent, "Get markdown resume template") → shell.run(goal: "Write the following content to /tmp/resume.md and convert to PDF:\n{{PREV_OUTPUT}}")]`
+NOT: `[browser.agent → synthesize → shell.run with {{synthesisAnswer}}]` ← WRONG, will fail
 
 **agent synthesize rule — CRITICAL:** When `browser.agent` or `cli.agent` is used to **retrieve information** the user needs to read (answers to questions, lists, data lookups, status checks), you MUST append a `synthesize` step immediately after the agent step. The `args.prompt` must describe what to extract and present cleanly in plain English. Omitting `synthesize` after a data-retrieval agent step shows the user raw page text or CLI stdout — always wrong.
 - Retrieval signals (synthesize required): "what is", "what are", "how many", "list", "show me", "tell me", "get", "find", "summarize", tasks asking an AI service a question.

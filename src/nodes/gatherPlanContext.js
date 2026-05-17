@@ -33,27 +33,6 @@
 
 const MAX_ROUNDS = 3;
 
-// ── Bypass detection ──────────────────────────────────────────────────────────
-
-const BYPASS_PATTERNS = [
-  /\bjust do it\b/i,
-  /\bskip[. ]*questions?\b/i,
-  /\bjust.*proceed\b/i,
-  /\bjust.*go ahead\b/i,
-  /\bjust.*run\b/i,
-  /\bno questions?\b/i,
-  /\bdon'?t ask\b/i,
-  /\bskip.*clarif/i,
-  // Research/extraction tasks with specific site + extract/get/save pattern
-  /\b(?:extract|get|find|search|look up|download).*\bfrom\b.*\b(?:wikipedia|google|youtube|reddit|amazon|github|stackoverflow)\b.*\b(?:save|write|export|extract|get)/i,
-  /\b(?:from|on)\s+(?:the\s+)?(?:wikipedia|google|youtube|reddit|amazon|github|stackoverflow)\b.*\b(?:extract|get|find|save|download|export)/i,
-  /\b(?:top|best|first|highest)\s+\d+\b.*\b(?:from|on)\b/i,
-];
-
-function _wantsToBypass(msg) {
-  return BYPASS_PATTERNS.some(re => re.test(msg));
-}
-
 // ── LLM system prompt ─────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are a task clarity assistant for a desktop automation system.
@@ -182,32 +161,43 @@ module.exports = async function gatherPlanContext(state) {
   }
 
   // ── Skip: user asked to bypass ───────────────────────────────────────────────
-  if (state._bypassGatherPlan || _wantsToBypass(userMsg)) {
-    logger.info('[Node:GatherPlanContext] Bypass detected — passing through to planSkills');
+  if (state._bypassGatherPlan) {
+    logger.info('[Node:GatherPlanContext] Bypass flag set — passing through to planSkills');
     return { ...state, planGatheringComplete: true, planGatheringSkipped: false };
   }
 
-  // ── Skip: self-contained browser task (named service + browse verb) ───────────
-  // These tasks are always fully specified — no LLM call needed, no false questions.
-  const _BROWSER_SERVICES = /\b(chatgpt|gemini|google|bing|youtube|reddit|twitter|x\.com|instagram|facebook|linkedin|amazon|walmart|target|netflix|spotify|github|notion|slack|discord|venice\s*ai|perplexity|claude|copilot|openai|ebay|etsy|pinterest|tiktok|wikipedia|biblegateway|bible\s*gateway|arxiv|stackoverflow|stack\s*overflow|medium|substack|quora|devto|dev\.to|hackernews|hacker\s*news|ycombinator|producthunt|product\s*hunt|npmjs|npm|pypi|cnn|bbc|reuters|techcrunch|theverge|wired|arstechnica|ars\s*technica|bloomberg|wsj|nytimes|washingtonpost|apnews|npr|forbes|businessinsider|engadget|zdnet|pcmag|pcworld|tomshardware|anandtech|macrumors|9to5mac|appleinsider|androidpolice|xda|gsmarena|digitaltrends|lifehacker|howtogeek|makeuseof|ifixit|instructables|wikihow|khanacademy|coursera|udemy|edx|duolingo|goodreads|letterboxd|imdb|rottentomatoes|metacritic|steamcommunity|steam|epicgames|gog|itch\.io|boardgamegeek|chess\.com|lichess|espn|nba|nfl|mlb|nhl|fifa|transfermarkt|flashscore|sofascore|strava|allrecipes|foodnetwork|seriouseats|epicurious|yummly|yelp|tripadvisor|booking|airbnb|expedia|kayak|skyscanner|zillow|redfin|realtor|craigslist|nextdoor|ancestry|23andme|pubmed|webmd|mayoclinic|healthline|drugs\.com|wolframalpha|mathway|desmos|geogebra|symbolab|chegg|quizlet|brainly|sparknotes|cliffsnotes|gutenberg|archive\.org|jstor|sciencedirect|springer|nature|cell)\b/i;
-  const _BROWSE_VERBS     = /\b(go\s+to|goto|open|navigate|look\s+up|search|find|browse|check|visit|look\s+on|search\s+on|search\s+for|look\s+for)\b/i;
-  if (_BROWSER_SERVICES.test(userMsg) && _BROWSE_VERBS.test(userMsg)) {
-    logger.info(`[Node:GatherPlanContext] Self-contained browser task — skipping clarification for: "${userMsg.slice(0, 80)}"`);
-    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
-  }
+  // ── Read LLM task classification (set by resolveReferencesV2) ────────────────
+  // Replaces all NLU regex guards — the LLM understands intent, task type, and
+  // cross-turn references without a hardcoded word list.
+  const tc = state._taskClassification || {};
 
-  // ── Skip: self-contained local filesystem task ───────────────────────────────
-  // Local file/folder operations are always fully specified — they need no recipient,
-  // no service selection, and no schedule. The LLM would return {"complete":true}
-  // every time, so skip it entirely and save ~1s.
-  // Guard: must have a local-action verb + a local-location reference, AND must have
-  // no external-service/recipient markers (which would make it non-local).
-  const _LOCAL_ACTION_VERBS = /\b(open|launch|remove|delete|rename|move|copy|clear|cleanup|clean\s+up|empty|list|find|scan|compress|zip|unzip|extract|backup|restore|show|sort|reset|organize|archive|eject|mount|unmount|chmod|chown|touch|mkdir|rmdir)\b/i;
-  const _LOCAL_LOCATION_RE  = /\b(desktop|downloads|documents|trash|home\s+folder|home\s+dir|disk|drive|volume|folder|directory|file|files|folders|~\/|\/Users\/|\/tmp\/|\.[a-zA-Z]{2,5}\b)/i;
-  const _EXTERNAL_SIGNAL_RE = /\b(send|email|text\s+me|sms|message|notify|post|tweet|upload|api|slack|discord|telegram|whatsapp|to\s+@|\bcc\b|http|https|ftp|s3|dropbox|icloud|google\s+drive|onedrive)\b/i;
-  if (_LOCAL_ACTION_VERBS.test(userMsg) && _LOCAL_LOCATION_RE.test(userMsg) && !_EXTERNAL_SIGNAL_RE.test(userMsg)) {
-    logger.info(`[Node:GatherPlanContext] Local filesystem task — skipping clarification for: "${userMsg.slice(0, 80)}"`);
-    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  // ── Skip: classifier says no clarification needed ────────────────────────────
+  // Covers: browser tasks, local file tasks, scheduling, bypass phrases, follow-ups
+  if (tc.needsClarification === false && tc.taskType !== 'ambiguous') {
+    const reason = tc.taskType === 'browser' ? 'browser task'
+      : tc.taskType === 'local_file' ? 'local file task'
+      : tc.taskType === 'scheduling' ? 'scheduling task'
+      : tc.taskType === 'messaging' && tc.targetService ? 'messaging task with service'
+      : tc.taskType === 'query' ? 'query task'
+      : 'classifier: no clarification needed';
+    logger.info(`[Node:GatherPlanContext] ${reason} — skipping clarification for: "${userMsg.slice(0, 80)}"`);
+
+    // ── Inline follow-up resolution: inject resolved target into resolvedMessage ──
+    // When the user says "that folder" / "it" / "the file", the classifier resolves
+    // followUpTarget from conversation history. Inject it so planSkills has the
+    // concrete value without asking the user.
+    let enrichedMsg = resolvedMessage || message || '';
+    if (tc.isFollowUp && tc.followUpTarget) {
+      enrichedMsg = `${enrichedMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
+      logger.info(`[Node:GatherPlanContext] Follow-up resolved: "${tc.followUpTarget}"`);
+    }
+
+    return {
+      ...state,
+      resolvedMessage: enrichedMsg,
+      planGatheringComplete: true,
+      planGatheringSkipped: true,
+    };
   }
 
   // ── Skip: no LLM backend ─────────────────────────────────────────────────────
@@ -225,74 +215,13 @@ module.exports = async function gatherPlanContext(state) {
     return { ...state, planGatheringComplete: true };
   }
 
-  // ── Check for references to recently created files ────────────────────────────
-  const refersToCreation = /\b(newly created|just created|that file|those files|it|them|the directory|the folder|(?:first|second|third|last|latest|earlier|previous)(?:\s+created)?)\b/i.test(userMsg);
-  
-  if (refersToCreation && state.sessionFileCreations?.length > 0) {
-    // Filter to recent creations (within 30 minutes)
-    const now = Date.now();
-    const recentCreations = state.sessionFileCreations.filter(op => {
-      const ageMs = now - new Date(op.timestamp).getTime();
-      return ageMs < 30 * 60 * 1000; // 30 minutes
-    });
-    
-    if (recentCreations.length === 1) {
-      // Single recent creation - use it directly
-      const op = recentCreations[0];
-      logger.info(`[Node:GatherPlanContext] Resolved "${userMsg.slice(0, 40)}..." to single creation: ${op.description}`);
-      const enriched = `${resolvedMessage || message || ''}\n\n(Referenced file: ${op.primaryPath})`;
-      return {
-        ...state,
-        planGatheringComplete: true,
-        planGatheringSkipped: true,
-        resolvedMessage: enriched,
-        _creationContext: op
-      };
-    } else if (recentCreations.length > 1) {
-      // Multiple creations - check for ordinal references
-      const ordinalMatch = userMsg.match(/\b(first|second|third|last|latest|earlier|previous)\b/i);
-      
-      if (ordinalMatch) {
-        const ordinal = ordinalMatch[1].toLowerCase();
-        let selectedOp = null;
-        
-        if ((ordinal === 'last' || ordinal === 'latest') && recentCreations.length > 0) {
-          selectedOp = recentCreations[recentCreations.length - 1];
-        } else if (ordinal === 'first' && recentCreations.length > 0) {
-          selectedOp = recentCreations[0];
-        } else if (ordinal === 'second' && recentCreations.length >= 2) {
-          selectedOp = recentCreations[1];
-        } else if (ordinal === 'third' && recentCreations.length >= 3) {
-          selectedOp = recentCreations[2];
-        } else if ((ordinal === 'earlier' || ordinal === 'previous') && recentCreations.length >= 2) {
-          selectedOp = recentCreations[recentCreations.length - 2];
-        }
-        
-        if (selectedOp) {
-          logger.info(`[Node:GatherPlanContext] Resolved "${ordinal}" to: ${selectedOp.description}`);
-          const enriched = `${resolvedMessage || message || ''}\n\n(Referenced: ${selectedOp.primaryPath})`;
-          return {
-            ...state,
-            planGatheringComplete: true,
-            planGatheringSkipped: true,
-            resolvedMessage: enriched,
-            _creationContext: selectedOp
-          };
-        }
-      }
-      
-      // No ordinal match - enrich with all recent creations for context
-      logger.info(`[Node:GatherPlanContext] Multiple recent creations (${recentCreations.length}), enriching context`);
-      const creationList = recentCreations.map((op, i) => `${i + 1}. ${op.description}`).join('\n');
-      const enriched = `${resolvedMessage || message || ''}\n\n(Recent file creations:\n${creationList})`;
-      return {
-        ...state,
-        planGatheringComplete: true,
-        planGatheringSkipped: true,
-        resolvedMessage: enriched,
-        _creationContext: recentCreations
-      };
-    }
+  // ── Follow-up resolution via classifier (fallback for ambiguous tasks) ─────────
+  // If the classifier resolved a follow-up target, inject it before entering the
+  // Q&A loop — the LLM clarity check may still mark this complete once it sees it.
+  let userMsg_enriched = userMsg;
+  if (tc.isFollowUp && tc.followUpTarget) {
+    userMsg_enriched = `${userMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
+    logger.info(`[Node:GatherPlanContext] Follow-up target injected for ambiguous task: "${tc.followUpTarget}"`);
   }
 
   // ── Inline await Q&A loop ────────────────────────────────────────────────────
@@ -307,9 +236,9 @@ module.exports = async function gatherPlanContext(state) {
     if (progressCallback) {
       progressCallback({ type: 'thinking', message: 'Checking task details…' });
     }
-    logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking task clarity for: "${userMsg.slice(0, 80)}"`);
+    logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking task clarity for: "${userMsg_enriched.slice(0, 80)}"`);
 
-    const result = await _askLLM(llmBackend, userMsg, originalMsg, answers, state.conversationHistory || [], logger);
+    const result = await _askLLM(llmBackend, userMsg_enriched, originalMsg, answers, state.conversationHistory || [], logger);
 
     // ── Task is clear — done ──────────────────────────────────────────────────
     if (result.complete) {

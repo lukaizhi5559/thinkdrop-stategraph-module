@@ -17,7 +17,7 @@ const retrieveMemoryNode = require('./nodes/retrieveMemory');
 const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
-const planSkillsNode = require('./nodes/planSkills');
+const planSkillsNode = require('./nodes/planSkillsV2');
 const recoverSkillNode = require('./nodes/recoverSkill');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
@@ -579,6 +579,11 @@ class StateGraphBuilder {
         // Also short-circuit for CLI/browser agent ask_user and needsLogin so recoverSkill is not invoked.
         if (state.scoutPending || state.pendingQuestion?._isScoutSelect || state.pendingQuestion?._isAgentAskUser) {
           return 'logConversation';
+        }
+        // Plan ordering error — route to recovery instead of looping forever
+        if (state.planError) {
+          logger.warn(`[StateGraph:Router] executeCommand planError → recoverSkill: ${state.planError}`);
+          return 'recoverSkill';
         }
         // More steps remaining — loop back
         if (Array.isArray(state.skillPlan) && state.skillCursor < state.skillPlan.length) {

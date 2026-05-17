@@ -90,9 +90,9 @@ module.exports = async function enrichIntentV2(state) {
   }
 
   // ── Browse-verb guard: skip domain.extract for pure navigation prompts ─────
-  const _BROWSE_VERB_RE   = /^(goto|go\s+to|navigate\s+to|visit|open|look\s+up|search\s+on|search\s+for|browse)\b/i;
-  const _MESSAGING_VOC_RE = /\b(send|text\s+me|email\s+me|email|message|DM|notify|sms|slack|discord|telegram|whatsapp|dm)\b/i;
-  const isBrowseOnly = _BROWSE_VERB_RE.test(userMessage) && !_MESSAGING_VOC_RE.test(userMessage);
+  // Read from _taskClassification (set by resolveReferencesV2) instead of regex.
+  const tc = state._taskClassification || {};
+  const isBrowseOnly = tc.isBrowseOnly === true || (tc.taskType === 'browser' && tc.taskType !== 'messaging');
 
   // ── Extract domain tags ────────────────────────────────────────────────────
   let domainTags = (state.matchedSkillName || isBrowseOnly)
@@ -103,10 +103,9 @@ module.exports = async function enrichIntentV2(state) {
     logger.info(`[Node:EnrichIntentV2] Browse-verb guard — skipping domain.extract: "${userMessage.slice(0, 60)}"`);
   }
 
-  // ── Local recurring reminder guard: clear hallucinated service tags ────────
-  const _LOCAL_RECUR_RE  = /\b(every\s+(morning|day|night|evening|week|month|hour|\d)|daily|weekly|monthly|each\s+(morning|day|night|evening|week)|remind\s+me\s+(daily|every)|recurring|repeat(ing)?|alarm)\b/i;
-  const _EXPLICIT_EXT_RE = /\b(discord|telegram|slack|twilio|clicksend|sendgrid|mailgun|pushover|pushbullet|onesignal|whatsapp|sms\s+me|text\s+me)\b/i;
-  if (domainTags && _LOCAL_RECUR_RE.test(userMessage) && !_EXPLICIT_EXT_RE.test(userMessage)) {
+  // ── Local recurring reminder guard: clear hallucinated service tags ─────────
+  // Use _taskClassification instead of regex for scheduling/recurring detection.
+  if (domainTags && tc.isRecurring && !tc.targetService) {
     logger.info(`[Node:EnrichIntentV2] Local recurring guard — clearing domain tags`);
     domainTags = null;
   }

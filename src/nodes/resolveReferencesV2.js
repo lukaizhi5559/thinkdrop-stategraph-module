@@ -7,12 +7,14 @@
  * coreference service call. Single responsibility:
  *   1. Fetch conversation history from the conversation service
  *   2. Attach it to state.conversationHistory for all downstream nodes
- *   3. Pass the user message through verbatim
+ *   3. Run classifyTask once and attach state._taskClassification for all downstream nodes
+ *   4. Pass the user message through verbatim
  *
- * Context resolution ("that folder", "it", "the result") is handled by the
- * planning LLM in planSkills via the conversationNote injection — exactly how
- * ChatGPT/Claude/Cursor work.
+ * Context resolution ("that folder", "it", "the result") is handled via
+ * _taskClassification.followUpTarget (LLM-resolved) so no node needs regex.
  */
+
+const { classifyTask } = require('../utils/classifyTask');
 
 function stripHtml(text) {
   return text ? text.replace(/<[^>]*>/g, '') : text;
@@ -66,11 +68,22 @@ module.exports = async function resolveReferencesV2(state) {
     logger.debug('[Node:ResolveReferencesV2] Could not fetch history, proceeding without:', err.message);
   }
 
+  // ── Classify task once — all downstream nodes read from _taskClassification ──
+  // This replaces per-node NLU regex (BYPASS_PATTERNS, _LOCAL_ACTION_VERBS, etc.)
+  const _taskClassification = await classifyTask(
+    message,
+    conversationHistory,
+    state.llmBackend || null,
+    logger
+  );
+  logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
+
   return {
     ...state,
     resolvedMessage:        message,
     originalMessage:        message,
     conversationHistory,
+    _taskClassification,
     coreferenceMethod:      'none',
     coreferenceReplacements: [],
   };

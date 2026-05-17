@@ -51,13 +51,8 @@ null
 
 Return "null" when there is NO clear match or when confidence is not HIGH. Never return MEDIUM or LOW matches.`;
 
-// Signals that the user wants a recurring/background task (not a one-off event)
-const RECURRING_SIGNALS_RE = /\b(every\s+(morning|day|night|evening|week|month|hour|\d)|daily|weekly|monthly|alarm|each\s+(morning|day|night|evening|week)|remind\s+me\s+(daily|every)|recurring|repeat(ing)?|on\s+a\s+(daily|weekly|\w+)\s+schedule|at\s+\d{1,2}(:\d{2})?\s*(am|pm)\s+(every|daily|each))\b/i;
 // Skill name fragments that indicate a one-shot event-creation skill (not a daemon)
 const ONE_SHOT_EVENT_MARKERS = ['calendar', '.event', 'booking', 'meeting', 'webex', 'zoom.schedule'];
-
-// Patterns that indicate the user wants to CREATE a skill (phrasing, not intent)
-const WANTS_TO_CREATE_RE = /\b(create|build|make|write|add|install|set up|setup)\b.{0,40}\b(skill|ability|feature|capability|automation|tool)\b|\bneed (a |to )?(create|build|make|have)\b|\bdon't have\b|\bdoesn'?t exist\b/i;
 
 module.exports = async function parseSkill(state) {
   const { mcpAdapter, message, resolvedMessage, llmBackend } = state;
@@ -179,7 +174,8 @@ module.exports = async function parseSkill(state) {
   // from the user message and check if any installed skill's description contains
   // a critical mass of them. This catches "scroll / type / shortcut / app control"
   // requests matching browser.act without relying on the LLM.
-  const userWantsToCreate = WANTS_TO_CREATE_RE.test(classifyMessage);
+  const tc = state._taskClassification || {};
+  const userWantsToCreate = tc.taskType === 'ambiguous' && /\b(skill|ability|feature|capability|automation|tool)\b/i.test(classifyMessage);
   {
     // Capability keyword groups — each group is a set of synonyms for one concept.
     // A skill description must contain at least MIN_GROUPS_MATCHED groups to match.
@@ -426,7 +422,7 @@ module.exports = async function parseSkill(state) {
   // Prevents "cold plunge every morning" from matching gcal.event.
   // Only filters when the message has clear recurring signals AND does NOT
   // explicitly mention Google Calendar or "calendar event".
-  const hasRecurringSignal = RECURRING_SIGNALS_RE.test(classifyMessage);
+  const hasRecurringSignal = tc.isRecurring === true;
   const hasExplicitCalendar = /\b(google calendar|my calendar|calendar event|add to (my )?calendar|create (a |an )?event|make (a |an )?appointment)\b/i.test(classifyMessage);
   if (hasRecurringSignal && !hasExplicitCalendar) {
     const beforeFilter = skillsWithDesc.length;
