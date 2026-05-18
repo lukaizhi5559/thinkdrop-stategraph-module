@@ -10,6 +10,16 @@ For ANY task that could be served by a CLI tool, REST API, or Python script — 
 
 ---
 
+## REQUIRED: cli.agent arg contract
+
+Every `cli.agent` step MUST include the `action` field. Valid values:
+- `"action": "run"` — execute an existing registered agent (also requires `agentId` and `task`)
+- `"action": "build_agent"` — discover, install, and generate a new agent (also requires `service`)
+
+A `cli.agent` step WITHOUT an `action` field will **always fail** with `Unknown action: "undefined"`. Never omit it.
+
+---
+
 ## CLI Discovery Pattern (use for ANY domain)
 
 When a task could be served by a CLI but no agent is registered yet:

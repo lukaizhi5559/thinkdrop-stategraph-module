@@ -67,97 +67,110 @@ Return: { "needs": [{ "type": "contact|personal_fact|external_knowledge|file_sco
 
 async function queryMcpForAnswer(need, mcpClient, llmBackend) {
   const { type, description, key } = need;
-  
+
   try {
-    // 1. Try structured data first (user_profile)
-    const profileResult = await mcpClient.callService('user-memory', 'query', {
-      sql: `SELECT key, value FROM user_profile WHERE key LIKE '%${key}%' OR value LIKE '%${description}%' ORDER BY id DESC LIMIT 3`
-    });
-    
-    if (profileResult?.rows?.length > 0) {
-      const row = profileResult.rows[0];
-      // Extract actual value (might be KEYTAR:xxx or direct value)
-      let value = row.value;
-      if (value?.startsWith('KEYTAR:')) {
-        // This is a reference, try to get actual value or use placeholder
-        value = `[stored securely: ${row.key}]`;
-      }
-      return { 
-        value, 
-        source: 'user_profile', 
-        confidence: 0.9,
-        key: row.key 
-      };
-    }
-    
-    // 2. Search all memory sources with semantic search if available
+    // 1. Try user profile via profile.get (replaces raw SQL /query against user_profile)
     try {
-      const memoryResult = await mcpClient.callService('user-memory', 'semanticSearch', {
+      const profileResult = await mcpClient.callService('user-memory', 'profile.get', {
+        key,
+      }, { timeoutMs: 3000 });
+      const row = profileResult?.data || profileResult;
+      if (row?.value) {
+        let value = row.value;
+        if (typeof value === 'string' && value.startsWith('KEYTAR:')) {
+          value = `[stored securely: ${row.key || key}]`;
+        }
+        return {
+          value,
+          source: 'user_profile',
+          confidence: 0.9,
+          key: row.key || key,
+        };
+      }
+    } catch (profileErr) {
+      logger.debug(`[Node:McpFillGaps] profile.get failed for "${key}": ${profileErr.message}`);
+    }
+
+    // 2. Semantic search via memory.search (replaces non-existent /semanticSearch)
+    try {
+      const memoryResult = await mcpClient.callService('user-memory', 'memory.search', {
         query: description,
-        topK: 3
-      });
-      
-      if (memoryResult?.rows?.[0]?.score > 0.7) {
-        const row = memoryResult.rows[0];
-        const extracted = extractValueFromText(
-          row.source_text || row.content || row.value,
-          description,
-          llmBackend
-        );
+        limit: 3,
+        minSimilarity: 0.5,
+      }, { timeoutMs: 4000 });
+      const results = memoryResult?.data?.results || memoryResult?.results || [];
+      const top = results[0];
+      if (top && (top.similarity || top.score || 0) > 0.5) {
+        const text = top.source_text || top.content || top.text || top.value || '';
+        const extracted = extractValueFromText(text, description, llmBackend);
         if (extracted) {
           return {
             value: extracted,
-            source: row.source_type || row.type || 'memory',
-            confidence: row.score
+            source: top.type || 'memory',
+            confidence: top.similarity || top.score || 0.6,
           };
         }
       }
-    } catch (semanticErr) {
-      // Fallback to simple text search if semantic search fails
-      logger.debug(`[Node:McpFillGaps] Semantic search failed, falling back to text search: ${semanticErr.message}`);
-      const textResult = await mcpClient.callService('user-memory', 'query', {
-        sql: `SELECT content, type FROM memory WHERE content LIKE '%${description}%' OR content LIKE '%${key}%' ORDER BY id DESC LIMIT 3`
-      });
-      
-      if (textResult?.rows?.length > 0) {
-        const row = textResult.rows[0];
-        const extracted = extractValueFromText(row.content, description);
-        if (extracted) {
-          return {
-            value: extracted,
-            source: row.type || 'memory',
-            confidence: 0.75
-          };
-        }
-      }
+    } catch (searchErr) {
+      logger.debug(`[Node:McpFillGaps] memory.search failed for "${description}": ${searchErr.message}`);
     }
-    
-    // 3. Check conversation history
+
+    // 3. Broader text search fallback via memory.search with lower threshold
+    // (replaces non-existent raw SQL /query against memory table)
     try {
-      const convResult = await mcpClient.callService('conversation', 'query', {
-        sql: `SELECT content, role FROM conversation_messages WHERE role = 'user' AND (content LIKE '%${description}%' OR content LIKE '%${key}%') ORDER BY id DESC LIMIT 3`
+      const textResult = await mcpClient.callService('user-memory', 'memory.search', {
+        query: `${description} ${key}`,
+        limit: 3,
+        minSimilarity: 0.2,
+      }, { timeoutMs: 4000 });
+      const results = textResult?.data?.results || textResult?.results || [];
+      const top = results[0];
+      if (top) {
+        const text = top.source_text || top.content || top.text || top.value || '';
+        const extracted = extractValueFromText(text, description);
+        if (extracted) {
+          return {
+            value: extracted,
+            source: top.type || 'memory',
+            confidence: 0.5,
+          };
+        }
+      }
+    } catch (textErr) {
+      logger.debug(`[Node:McpFillGaps] memory.search (broad) failed for "${key}": ${textErr.message}`);
+    }
+
+    // 4. Check recent conversation messages via conversation.message.list
+    try {
+      const convResult = await mcpClient.callService('conversation', 'message.list', {
+        limit: 20,
+        role: 'user',
+      }, { timeoutMs: 3000 });
+      const msgs = convResult?.data?.messages || convResult?.messages || [];
+      const descLower = description.toLowerCase();
+      const keyLower = key.toLowerCase();
+      const match = msgs.find(m => {
+        const c = (m.content || m.text || '').toLowerCase();
+        return c.includes(descLower) || c.includes(keyLower);
       });
-      
-      if (convResult?.rows?.length > 0) {
-        const row = convResult.rows[0];
-        const extracted = extractValueFromText(row.content, description);
+      if (match) {
+        const extracted = extractValueFromText(match.content || match.text, description);
         if (extracted) {
           return {
             value: extracted,
             source: 'conversation',
-            confidence: 0.7
+            confidence: 0.7,
           };
         }
       }
     } catch (convErr) {
-      // Conversation service might not be available
-      logger.debug(`[Node:McpFillGaps] Conversation query failed: ${convErr.message}`);
+      logger.debug(`[Node:McpFillGaps] conversation.message.list failed: ${convErr.message}`);
     }
-    
+
   } catch (e) {
     logger.warn(`[Node:McpFillGaps] MCP query failed for ${key}: ${e.message}`);
   }
-  
+
   return null;
 }
 
@@ -173,14 +186,14 @@ async function searchWebForNeed(need, mcpClient, llmBackend) {
       searchQuery = searchQuery.replace(/["']/g, '').trim();
     }
     
-    const webResult = await mcpClient.callService('web-search', 'search', {
+    const webResult = await mcpClient.callService('web-search', 'web.search', {
       query: searchQuery,
       limit: 3
     });
     
-    if (webResult?.results?.length > 0) {
-      // Synthesize results
-      const synthesized = await synthesizeWebResults(webResult.results, need.description, llmBackend);
+    const _webResults = webResult?.data?.results || webResult?.results || [];
+    if (_webResults.length > 0) {
+      const synthesized = await synthesizeWebResults(_webResults, need.description, llmBackend);
       return {
         value: synthesized,
         source: 'web_search',

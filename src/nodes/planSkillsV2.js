@@ -69,7 +69,9 @@ function _buildSystemPrompt(userMessage, state) {
     state.matchedSkillName ||
     state.matchedSkillDomain
   );
-  const canUseSlim = userMessage && _hasUrl && !_hasLocalSignals;
+  const canUseSlim = userMessage && _hasUrl && !_hasLocalSignals
+    && !state.recoveryContext
+    && state.intent?.type !== 'command_automate';
 
   if (canUseSlim) {
     const slim = _loadPromptFile('plan-skills-browser.md');
@@ -80,7 +82,8 @@ function _buildSystemPrompt(userMessage, state) {
   }
 
   const baseFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
-  console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile}`);
+  const _skipReason = _hasUrl && !canUseSlim ? ` (slim skipped: ${state.recoveryContext ? 'recovery' : 'command_automate'})` : '';
+  console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile}${_skipReason}`);
   const base = _loadPromptFile(baseFile) || _loadPromptFile('plan-skills.md');
   if (!base) return null;
 
@@ -250,7 +253,30 @@ async function planSkillsV2(state) {
   const _dataFileSuffix = state._dataFile
     ? `\n[Full content available at: ${state._dataFile} — read with fs.readFileSync if needed]`
     : '';
-  const userMessage = (state._dataPrefix ? state._dataPrefix + '\n' : '') + (resolvedMessage || message) + _dataFileSuffix;
+
+  // Sanitize _dataPrefix: strip raw HTML / Gist embed boilerplate that leaks from web-search
+  // results into the planning query. We only want clean URLs and factual snippets — not full
+  // page HTML which causes the planner to misread the task (e.g. "Clone this repository").
+  let _sanitizedDataPrefix = '';
+  if (state._dataPrefix) {
+    const _raw = String(state._dataPrefix);
+    const _hasHtmlNoise = /&amp;|&lt;|&gt;|&quot;|<script|Clone via HTTPS|Save .+ to your computer/i.test(_raw);
+    if (_hasHtmlNoise) {
+      // Extract plain URLs and keep only those as context
+      const _urlMatches = _raw.match(/https?:\/\/[^\s"'<>]+/g) || [];
+      const _uniqueUrls = [...new Set(_urlMatches)].slice(0, 5);
+      _sanitizedDataPrefix = _uniqueUrls.length > 0
+        ? `URL from previous step: ${_uniqueUrls[0]}`
+        : '';
+      if (_sanitizedDataPrefix) {
+        logger.info(`[Node:PlanSkillsV2] _dataPrefix sanitized (HTML stripped) → "${_sanitizedDataPrefix.slice(0, 80)}"`);
+      }
+    } else {
+      _sanitizedDataPrefix = _raw;
+    }
+  }
+
+  const userMessage = (_sanitizedDataPrefix ? _sanitizedDataPrefix + '\n' : '') + (resolvedMessage || message) + _dataFileSuffix;
 
   const correctionSourcePrompt = state._planCorrectionMode && state._planCorrectionSourcePrompt
     ? String(state._planCorrectionSourcePrompt) : '';
@@ -386,7 +412,15 @@ async function planSkillsV2(state) {
     const _POISON = /^(got\s+it\b|i'?ll\s+(use|try|search|go\s+to|open|run|look)|i\s+understand\b|based\s+on\b|understood\b|sure[,!\s]|of\s+course[,!\s]|happy\s+to\b)/i;
     const _RECOVERY_CONTENT = /returned a navigation\/welcome page|requires login or redirected|automatic search fallbacks failed/i;
 
-    const turnLines = recentTurns
+    // During recovery replanning, exclude all assistant turns — they may contain
+    // hallucinated intermediate pipeline answers (e.g. "I have created the issue...")
+    // that would corrupt the planner's understanding of what still needs to be done.
+    // User turns are kept so the planner always has the original request.
+    const historyTurnsForPlanning = recoveryContext
+      ? recentTurns.filter(m => m.role === 'user' || m.role === 'system' || m.sender === 'system')
+      : recentTurns;
+
+    const turnLines = historyTurnsForPlanning
       .filter(m => (m.role !== 'system' && m.sender !== 'system') && m.content?.trim())
       .filter(m => {
         if (m.role !== 'assistant') return true;
@@ -507,7 +541,8 @@ async function planSkillsV2(state) {
                   const installCmd = c.installMethod === 'npm' ? `npm install -g ${c.installPkg}` : `brew install ${c.installPkg || c.cli}`;
                   lines.push(`${c.service}: ${c.cli} NOT INSTALLED — install: ${installCmd}`);
                 } else {
-                  lines.push(`${c.service}: ${c.cli} installed ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
+                  const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : '');
+                  lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
                 }
               }
             }

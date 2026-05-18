@@ -151,7 +151,11 @@ class VSCodeLLMBackend extends LLMBackend {
             // Terminal error — all providers exhausted
             clearTimeout(activeTimeout);
             ws.close();
-            reject(new Error(msg.payload?.message || 'WebSocket LLM error'));
+            const llmErrMsg = msg.payload?.message || 'WebSocket LLM error';
+            if (/All LLM providers failed/i.test(llmErrMsg)) {
+              this._resetCircuitBreaker();
+            }
+            reject(new Error(llmErrMsg));
           } else if (msg.type === 'error') {
             // Legacy/non-streaming error — treat as terminal
             clearTimeout(activeTimeout);
@@ -185,6 +189,41 @@ class VSCodeLLMBackend extends LLMBackend {
       return fallback;
     }
     return accumulated;
+  }
+
+  /**
+   * Fire-and-forget: POST /api/circuit-breaker/reset to clear all stuck-open
+   * provider breakers after an "All LLM providers failed" error, so the next
+   * prompt succeeds without requiring a backend restart.
+   */
+  _resetCircuitBreaker() {
+    try {
+      const http = require('http');
+      // Derive HTTP base from wsUrl: ws://localhost:4000/ws/stream → http://localhost:4000
+      const httpBase = this.wsUrl
+        .replace(/^wss?:\/\//, 'http://')
+        .replace(/\/ws\/.*$/, '');
+      const parsed = new URL('/api/circuit-breaker/reset', httpBase);
+      const body = '{}';
+      const req = http.request(
+        {
+          hostname: parsed.hostname,
+          port: parsed.port || 80,
+          path: parsed.pathname,
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+          timeout: 3000,
+        },
+        (res) => { res.resume(); }
+      );
+      req.on('error', () => {});
+      req.on('timeout', () => { req.destroy(); });
+      req.write(body);
+      req.end();
+      console.log('[VSCodeLLMBackend] Circuit breaker reset triggered');
+    } catch (_) {
+      // non-fatal
+    }
   }
 
   async isAvailable() {

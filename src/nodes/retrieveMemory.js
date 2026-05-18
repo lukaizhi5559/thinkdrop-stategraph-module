@@ -259,14 +259,73 @@ module.exports = async function retrieveMemory(state) {
 
     logger.debug(`[Node:RetrieveMemory] Loaded ${conversationHistory.length} messages, ${memories.length} memories`);
 
+    // ── Profile.get fallback ──────────────────────────────────────────────────
+    // When semantic search returns nothing and it looks like a personal attribute
+    // query, try the profile KV store directly.
+    let profileFallback = null;
+    if (memories.length === 0 && !dateRange) {
+      const profileKeyMatch = (resolvedMessage || message || '').match(
+        /\b(?:my|what(?:'s| is) my)\s+(name|email|username|favorite\s*\w+|birthday|location|timezone|phone|occupation|job|company|github|language)\b/i
+      );
+      if (profileKeyMatch) {
+        const profileKey = profileKeyMatch[1].toLowerCase().replace(/\s+/g, '_');
+        try {
+          const profileRes = await mcpAdapter.callService('user-memory', 'profile.get', { key: profileKey });
+          const profileData = profileRes?.data || profileRes;
+          if (profileData?.value) {
+            profileFallback = { key: profileKey, value: profileData.value };
+            logger.debug(`[Node:RetrieveMemory] Profile fallback hit: ${profileKey} = "${profileData.value}"`);
+          }
+        } catch (e) {
+          logger.debug(`[Node:RetrieveMemory] Profile.get fallback failed: ${e.message}`);
+        }
+      }
+    }
+
+    // ── Cross-session semantic search fallback ──────────────────────────────────
+    // When no memories found and query looks like "what was that conversation about X",
+    // try message.search across all sessions.
+    let crossSessionSearchResults = [];
+    if (memories.length === 0 && !dateRange && !profileFallback) {
+      const CONV_RECALL_RE = /\b(conversation|chat|talk|discussed|talking)\s+(about|regarding|on|where)\b/i;
+      if (CONV_RECALL_RE.test(resolvedMessage || message || '')) {
+        try {
+          const searchRes = await mcpAdapter.callService('conversation', 'message.search', {
+            query: searchQuery,
+            limit: 15,
+            userId: context?.userId,
+          });
+          const searchData = searchRes?.data || searchRes;
+          crossSessionSearchResults = (searchData?.messages || searchData?.results || []).map(msg => ({
+            role: msg.sender === 'user' ? 'user' : 'assistant',
+            content: msg.text || msg.content,
+            timestamp: msg.timestamp,
+            formattedDate: formatTimestamp(msg.timestamp),
+            sessionId: msg.sessionId,
+          }));
+          if (crossSessionSearchResults.length > 0) {
+            logger.debug(`[Node:RetrieveMemory] Cross-session search found ${crossSessionSearchResults.length} messages`);
+          }
+        } catch (e) {
+          logger.debug(`[Node:RetrieveMemory] message.search fallback failed: ${e.message}`);
+        }
+      }
+    }
+
+    // Merge cross-session search results into conversation history if primary is empty
+    const finalHistory = conversationHistory.length > 0
+      ? conversationHistory
+      : (crossSessionSearchResults.length > 0 ? crossSessionSearchResults : conversationHistory);
+
     return {
       ...state,
-      conversationHistory,
+      conversationHistory: finalHistory,
       sessionFacts: [],
       sessionEntities: [],
       memories,
       filteredMemories: memories,
-      rawMemoriesCount: memories.length
+      rawMemoriesCount: memories.length,
+      ...(profileFallback ? { _profileFallback: profileFallback } : {}),
     };
   } catch (error) {
     logger.error('[Node:RetrieveMemory] Failed:', error.message);

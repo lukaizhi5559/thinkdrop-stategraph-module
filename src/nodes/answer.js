@@ -172,11 +172,37 @@ module.exports = async function answer(state) {
     langOverridePrefix = `LANGUAGE OVERRIDE: The user's message is in ${langName}. You MUST write your ENTIRE response in ${langName} only. Do NOT use English under any circumstance.\n\n`;
   }
 
+  // ─── Detect intermediate multi-intent pipeline step ─────────────────────────
+  // When isMultiIntent=true and intentQueue still has remaining steps, this node
+  // is executing an intermediate step (e.g. step 1 of 3). Injecting a structural
+  // pipeline context block prevents the LLM from synthesising a false "I have
+  // completed the task" answer before downstream steps have even run.
+  const isIntermediatePipelineStep = !!(
+    state.isMultiIntent &&
+    Array.isArray(state.intentQueue) && state.intentQueue.length > 0
+  );
+
+  let pipelineContextBlock = '';
+  if (isIntermediatePipelineStep) {
+    const stepN = (state.intentResults?.length ?? 0) + 1;
+    const stepM = stepN + state.intentQueue.length;
+    const remainingDescriptions = state.intentQueue
+      .map((s, i) => `  ${stepN + i + 1}. ${s.text || s.intent || 'next step'}`)
+      .join('\n');
+    pipelineContextBlock =
+      `PIPELINE CONTEXT — Step ${stepN} of ${stepM}\n` +
+      `You are executing step ${stepN} of a ${stepM}-step pipeline. More steps will follow.\n` +
+      `Your ONLY job is to extract and report the data found in this step.\n` +
+      `DO NOT claim the overall task is complete. DO NOT say "I have created...", "I have done...", "I successfully...", or similar completion phrases.\n` +
+      `Remaining steps after this one:\n${remainingDescriptions}\n` +
+      `Output: Return only the raw data found (URLs, file paths, IDs, content). Keep it factual and brief.\n\n`;
+  }
+
   // ─── Build system instructions (intent-driven) ───────────────────────────────
   const intentType = intent?.type || 'question';
 
   const baseInstruction = ANSWER_PROMPTS?.base || 'Answer using the provided context. Be direct and natural.';
-  let systemInstructions = `${langOverridePrefix}${baseInstruction}\n\nContext:`;
+  let systemInstructions = `${langOverridePrefix}${pipelineContextBlock}${baseInstruction}\n\nContext:`;
 
   const contextSources = [];
   if (filteredMemories.length > 0) contextSources.push(`- ${filteredMemories.length} user memories`);
@@ -312,12 +338,44 @@ module.exports = async function answer(state) {
   }
   const filteredConversationHistory = conversationHistory.filter(m => m.role !== 'system');
 
+  // ─── Workspace manifest injection (lightweight self-awareness) ──────────────
+  // Reads ~/.thinkdrop/manifest.json if present and injects a compact summary
+  // so ThinkDrop knows about its own capabilities when answering.
+  try {
+    const os = require('os');
+    const manifestPath = path.join(os.homedir(), '.thinkdrop', 'manifest.json');
+    if (fs.existsSync(manifestPath)) {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      const mLines = [
+        `\n═══ WORKSPACE MANIFEST ═══`,
+        `Agents: ${manifest.agents?.count || 0}${manifest.agents?.items?.length ? ' (' + manifest.agents.items.join(', ') + ')' : ''}`,
+        `Skills: ${manifest.skills?.count || 0}`,
+        `Context rules: ${manifest.contextRules?.count || 0}`,
+        `Databases: ${(manifest.databases || []).filter(d => d.exists).map(d => d.name).join(', ') || 'none'}`,
+        `Apps: ${manifest.applications?.length || 0}`,
+      ];
+      systemInstructions += mLines.join('\n');
+    }
+  } catch (_manifestErr) {}
+
   // Inject screen context into system instructions (not into the user query)
   if (state.context && typeof state.context === 'string') {
     const truncated = state.context.length > 6000
       ? state.context.substring(0, 6000) + '\n...(truncated)'
       : state.context;
     systemInstructions += `\n\n${truncated}`;
+  }
+
+  // Inject introspection context from executeIntrospect node
+  if (state._forceAnswerContext && typeof state._forceAnswerContext === 'string') {
+    systemInstructions += `\n\n${state._forceAnswerContext}`;
+    systemInstructions += '\n\nIMPORTANT: Summarize the introspection data above in a helpful, conversational way. Use counts, names, and status info. Do NOT dump raw JSON.';
+  }
+
+  // Inject profile fallback from retrieveMemory (personal attribute queries)
+  if (state._profileFallback && state._profileFallback.value) {
+    const pf = state._profileFallback;
+    systemInstructions += `\n\n## User Profile Data\nThe user's ${pf.key.replace(/_/g, ' ')} is: ${pf.value}\nAnswer their question using this profile data naturally and conversationally.`;
   }
 
   // ─── Build final query ───────────────────────────────────────────────────────

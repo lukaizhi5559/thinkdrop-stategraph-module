@@ -2396,9 +2396,12 @@ module.exports = async function executeCommand(state) {
         options: { maxTokens: 1500, temperature: 0.2, fastMode: false }
       };
       try {
-        synthesisAnswer = await llmBackend.generateAnswer(synthesisQuery, synthPayload, synthPayload.options, isStreaming ? streamCallback : null);
+        // Always generate silently first (pass null for streamCallback) so we can
+        // inspect the answer before streaming. Streaming the apology text to the UI
+        // and then correcting it on retry causes the Summary panel to show "I apologize"
+        // even when the retry succeeds. We stream the final confirmed answer below.
+        synthesisAnswer = await llmBackend.generateAnswer(synthesisQuery, synthPayload, synthPayload.options, null);
         logger.debug(`[Node:ExecuteCommand] synthesize: LLM answer generated (${synthesisAnswer.length} chars)`);
-        if (!isStreaming && typeof streamCallback === 'function' && synthesisAnswer) streamCallback(synthesisAnswer);
       } catch (err) {
         logger.error('[Node:ExecuteCommand] synthesize LLM call failed:', err.message);
         synthesisAnswer = `[Synthesis failed: ${err.message}]`;
@@ -2424,7 +2427,6 @@ module.exports = async function executeCommand(state) {
             synthesisAnswer = _retryAnswer;
             _retrySucceeded = true;
             logger.info('[Node:ExecuteCommand] synthesize: retry succeeded');
-            if (!isStreaming && typeof streamCallback === 'function') streamCallback(synthesisAnswer);
           } else {
             logger.warn('[Node:ExecuteCommand] synthesize: retry also returned apology — falling back to pretty-printed JSON');
           }
@@ -2457,6 +2459,14 @@ module.exports = async function executeCommand(state) {
             }
           }
         } // end if (!_retrySucceeded)
+      }
+
+      // ── Stream the final confirmed answer ─────────────────────────────────
+      // We deliberately held back the streamCallback above to avoid streaming
+      // an apology that the retry then corrects. Now that synthesisAnswer is final,
+      // stream it unconditionally (whether it came from the initial call or the retry).
+      if (typeof streamCallback === 'function' && synthesisAnswer && !synthesisAnswer.startsWith('[Synthesis')) {
+        streamCallback(synthesisAnswer);
       }
     } else {
       logger.warn('[Node:ExecuteCommand] synthesize: no llmBackend in state — skipping LLM call');
@@ -3610,10 +3620,19 @@ module.exports = async function executeCommand(state) {
         step: skillCursor + 1, skill, args: resolvedArgs, description,
         ok: false, askUser: true, error: raw.question,
       };
-      if (progressCallback) progressCallback({
-        type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill,
-        error: raw.question,
-      });
+      if (progressCallback) {
+        // Emit ask_user (amber question card) instead of step_failed (red error badge).
+        // The question is an expected clarification request, not a system failure.
+        progressCallback({
+          type: 'ask_user',
+          question: raw.question,
+          options: raw.options || [],
+          stepIndex: skillCursor,
+          skill,
+          description: description || skill,
+          source: 'agent_ask_user',
+        });
+      }
       return {
         ...state,
         skillResults: [...skillResults, askUserStep],

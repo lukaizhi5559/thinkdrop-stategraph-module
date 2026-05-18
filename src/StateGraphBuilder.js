@@ -38,6 +38,7 @@ const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
 const resolveUserContextNode = require('./nodes/resolveUserContext');
 const gatherPlanContextNode = require('./nodes/gatherPlanContext');
 const mcpFillGapsNode = require('./nodes/mcpFillGaps');
+const executeIntrospectNode = require('./nodes/executeIntrospect');
 
 /**
  * Assess risk level of a user request using LLM classification
@@ -356,6 +357,7 @@ class StateGraphBuilder {
       parseProject: (state) => parseProjectNode({ ...state, logger, llmBackend }),
       logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter }),
       summarizeMultiIntent: (state) => summarizeMultiIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
+      executeIntrospect: (state) => executeIntrospectNode({ ...state, logger, mcpAdapter }),
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
@@ -503,6 +505,9 @@ class StateGraphBuilder {
           
           return 'screenIntelligence';
         }
+        if (intentType === 'system_introspect') {
+          return 'executeIntrospect';
+        }
         if (intentType === 'app_control_start') {
           return 'parseProject';
         }
@@ -514,6 +519,9 @@ class StateGraphBuilder {
         }
         return 'retrieveMemory';
       },
+
+      // Introspection path: executeIntrospect → answer → logConversation
+      executeIntrospect: 'answer',
 
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',
@@ -727,6 +735,25 @@ class StateGraphBuilder {
             matchedSkillName: null,
           });
           return 'planExecutor';
+        }
+
+        // ── Multi-intent ask_user pause (mid-pipeline) ─────────────────────────
+        // If the current step ended with recoveryAction='ask_user' and there are
+        // still steps in the queue, pause and surface the question. When the user
+        // answers, the graph resumes with the pipeline state intact.
+        if (state.isMultiIntent && state.recoveryAction === 'ask_user' && state.pendingQuestion) {
+          logger.info('[StateGraph:Router] Multi-intent ask_user pause (mid-pipeline) — surfacing question');
+          if (typeof state.progressCallback === 'function') {
+            try {
+              state.progressCallback({
+                type:    'ask_user',
+                question: state.pendingQuestion.question,
+                options:  state.pendingQuestion.options || [],
+                source:  'multi_intent_pause',
+              });
+            } catch (_) {}
+          }
+          return 'end';
         }
 
         // ── More steps remain — execute next sub-intent ──────────────────────

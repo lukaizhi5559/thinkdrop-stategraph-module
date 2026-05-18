@@ -22,7 +22,8 @@
 const COMBINE_SYSTEM_PROMPT = `You are combining the results of a multi-step task into one coherent response for the user.
 Each step's result is labeled below. Synthesise them into a single, natural response.
 Do NOT say "Step 1", "Step 2" etc. in the final answer — write as if it flows naturally.
-Be concise. If some steps retrieved data that fed into a later step, only mention the final outcome.`;
+Be concise. If some steps retrieved data that fed into a later step, only mention the final outcome.
+CRITICAL: If any step FAILED or returned "(no result)" or an error, you MUST report the failure accurately. NEVER claim success for a step that failed. State clearly what went wrong and what the user may need to do.`;
 
 module.exports = async function summarizeMultiIntent(state) {
   const logger = state.logger || console;
@@ -41,7 +42,12 @@ module.exports = async function summarizeMultiIntent(state) {
 
   // ── Build the labelled sections block ─────────────────────────────────────
   const sections = intentResults
-    .map((r) => `[Step ${r.step + 1} - ${r.intent}]: ${r.result || '(no result)'}`)
+    .map((r) => {
+      const result = r.result || '(no result)';
+      const isFailed = !r.result || r.failed || /could not|error|failed|not found/i.test(result);
+      const prefix = isFailed ? '[FAILED] ' : '';
+      return `${prefix}[Step ${r.step + 1} - ${r.intent}]: ${result}`;
+    })
     .join('\n\n');
 
   const originalRequest = originalPrompt || state.message || '';
