@@ -109,6 +109,14 @@ module.exports = async function parseIntentV2(state) {
     return { ...state, intent: { type: 'app_control_start', confidence: 0.99, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'app-control-override', processingTimeMs: 0 } };
   }
 
+  // System settings: "set plans to auto approval", "change plan approval to always", "turn off plan approval"
+  const _SETTINGS_RE = /\b(set|change|switch|turn|enable|disable|make)\b.{0,40}\b(plan\s*approval|auto[\s-]?approv|always\s*approv|settings?|preference)/i;
+  if (_SETTINGS_RE.test(classifyMessage)) {
+    logger.debug(`[Node:ParseIntentV2] system_settings detected: "${classifyMessage.slice(0, 60)}"`);
+    writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'system-settings-override', intent: 'system_settings', confidence: 0.95 });
+    return { ...state, intent: { type: 'system_settings', confidence: 0.95, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'system-settings-override', processingTimeMs: 0 } };
+  }
+
   // System introspection: "how many agents", "list my agents", "what's in the database", "show my rules"
   const _INTROSPECT_RE = /\b(how\s+many|list\s+(my|all|the)|what('s|s|\s+is)\s+(in\s+(the|my)\s+)?(database|duckdb|agents?\s*db)|show\s+(my|all|the)|count\s+(my|the))\s*(agents?|skills?|rules?|context\s*rules?|tables?|databases?|workspace|thinkdrop\s*dir)/i;
   if (_INTROSPECT_RE.test(classifyMessage)) {

@@ -761,7 +761,10 @@ module.exports = async function executeCommand(state) {
   let args = step.args || {};
   if (skillCursor > 0 && skillResults.length > 0) {
     const _prev = skillResults[skillResults.length - 1];
-    const prevStdout = (_prev?.stdout || _prev?.result || '').slice(0, 12000);
+    const _prevResultStr = typeof _prev?.result === 'object' && _prev?.result !== null
+      ? JSON.stringify(_prev.result)
+      : (_prev?.result || '');
+    const prevStdout = (_prev?.stdout || _prevResultStr || '').slice(0, 12000);
     if (prevStdout) {
       // Case-insensitive: match {{PREV_OUTPUT}} and {{prev_stdout}} (planner sometimes emits lowercase)
       const injectPrev = (val) => typeof val === 'string'
@@ -784,6 +787,62 @@ module.exports = async function executeCommand(state) {
         for (const [k, v] of Object.entries(args)) fileArgs[k] = injectFile(v);
         args = { ...fileArgs, _prevOutputFile: _tmpFile };
       } catch (_) {}
+    }
+  }
+
+  // ── {{user.agent.resolved.*}} — substitute resolved user context fields ──────
+  // When the plan uses {{user.agent.resolved.email}}, {{user.agent.resolved.name}},
+  // etc., find the most recent user.agent result and substitute from its resolved
+  // object before the step args reach playwright.agent / browser.act.
+  if (skillCursor > 0) {
+    const _prevUserAgent = [...skillResults].reverse().find(r => r.skill === 'user.agent' && r.ok);
+    if (_prevUserAgent) {
+      const _uaResolved = _prevUserAgent?.result?.resolved || _prevUserAgent?.resolved || {};
+      logger.info(`[Node:ExecuteCommand] user.agent resolved keys: ${JSON.stringify(Object.keys(_uaResolved))} | result keys: ${JSON.stringify(Object.keys(_prevUserAgent?.result || {}))}`);
+      const _uaFlat = {};
+      if (_uaResolved.self) Object.entries(_uaResolved.self).forEach(([k, v]) => { _uaFlat[k] = String(v); });
+      if (_uaResolved.email) _uaFlat.email = String(_uaResolved.email);
+      if (_uaResolved.name) _uaFlat.name = String(_uaResolved.name);
+      // Fallback 1: extract email from summary text
+      const _uaSummary = _prevUserAgent?.result?.summary || _prevUserAgent?.summary || '';
+      if (!_uaFlat.email && _uaSummary) {
+        const _emailMatch = _uaSummary.match(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/);
+        if (_emailMatch) _uaFlat.email = _emailMatch[1];
+      }
+      // Fallback 2: scan full serialized result for any email address
+      if (!_uaFlat.email) {
+        const _uaResultStr = JSON.stringify(_prevUserAgent?.result || _prevUserAgent || '');
+        const _emailMatch2 = _uaResultStr.match(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/);
+        if (_emailMatch2) {
+          _uaFlat.email = _emailMatch2[1];
+          logger.info(`[Node:ExecuteCommand] user.agent email extracted from serialized result: ${_uaFlat.email}`);
+        }
+      }
+      logger.info(`[Node:ExecuteCommand] user.agent _uaFlat: ${JSON.stringify(_uaFlat)}`);
+      if (Object.keys(_uaFlat).length > 0) {
+        const _hasUaToken = (val) => typeof val === 'string' && val.includes('{{user.agent.');
+        const _injectUa = (val) => {
+          if (!_hasUaToken(val)) return val;
+          let result = val;
+          for (const [k, v] of Object.entries(_uaFlat)) {
+            result = result.replace(new RegExp(`\\{\\{user\\.agent\\.resolved\\.${k}\\}\\}`, 'gi'), v);
+          }
+          return result;
+        };
+        const _uaArgs = {};
+        for (const [k, v] of Object.entries(args)) _uaArgs[k] = _injectUa(v);
+        if (JSON.stringify(_uaArgs) !== JSON.stringify(args)) {
+          logger.info(`[Node:ExecuteCommand] Substituted {{user.agent.resolved.*}} tokens from prior user.agent result`);
+          args = _uaArgs;
+        } else if (Object.values(args).some(v => typeof v === 'string' && v.includes('{{user.agent.'))) {
+          logger.warn(`[Node:ExecuteCommand] {{user.agent.resolved.*}} token found in args but no substitution made — _uaFlat may be missing the key`);
+        }
+      }
+    } else {
+      // Log when token is present but no user.agent result found
+      if (Object.values(args).some(v => typeof v === 'string' && v.includes('{{user.agent.'))) {
+        logger.warn(`[Node:ExecuteCommand] {{user.agent.resolved.*}} token in args but no prior user.agent result found in skillResults`);
+      }
     }
   }
 
@@ -2208,6 +2267,72 @@ module.exports = async function executeCommand(state) {
         return `=== Image analysis: ${filePath} ===\n${r.stdout.trim()}`;
       });
 
+    // Include user.agent results — resolve_context/resolve_form return summary + resolved data
+    const userAgentResults = skillResults
+      .filter(r => r.skill === 'user.agent' && r.ok && (r.result?.summary || r.result?.resolved || r.summary || r.resolved))
+      .map(r => {
+        const summary = r.result?.summary || r.summary || '';
+        const resolved = r.result?.resolved || r.resolved || {};
+        // Build context from summary + key resolved fields
+        const parts = [];
+        if (summary) parts.push(summary);
+        // Add specific resolved data sections for richer context
+        if (resolved.self && Object.keys(resolved.self).length > 0) {
+          parts.push('User Profile:\n' + Object.entries(resolved.self)
+            .map(([k, v]) => `  ${k}: ${v}`).join('\n'));
+        }
+        if (resolved.contacts && Object.keys(resolved.contacts).length > 0) {
+          for (const [label, fields] of Object.entries(resolved.contacts)) {
+            parts.push(`Contact — ${label}:\n` + Object.entries(fields)
+              .map(([k, v]) => `  ${k}: ${v}`).join('\n'));
+          }
+        }
+        if (resolved.memories?.length > 0) {
+          parts.push('Memories:\n' + resolved.memories.slice(0, 5).map(m => `  • ${m.slice(0, 200)}`).join('\n'));
+        }
+        return `=== User Context (from ${r.action || 'user.agent'}) ===\n${parts.join('\n\n')}`;
+      });
+
+    // Include cli.agent results — CLI automation stdout
+    const cliAgentResults = skillResults
+      .filter(r => r.skill === 'cli.agent' && r.ok && r.stdout)
+      .map(r => `=== CLI Output (${r.args?.agentId || r.args?.cli || 'cli.agent'}) ===\n${r.stdout}`);
+
+    // Include playwright.agent results — browser automation final result
+    const playwrightAgentResults = skillResults
+      .filter(r => r.skill === 'playwright.agent' && r.ok && r.result)
+      .map(r => `=== Browser Automation (${r.args?.goal?.slice(0, 60) || 'playwright.agent'}) ===\n${r.result}`);
+
+    // Include web.agent results — web search results
+    const webAgentResults = skillResults
+      .filter(r => r.skill === 'web.agent' && r.ok && r.results)
+      .map(r => `=== Web Search Results ===\n${r.results.map((res, i) => `${i+1}. ${res.title || res.url}\n   ${res.snippet || ''}`).join('\n\n')}`);
+
+    // Include video.agent results — video transcript/content
+    const videoAgentResults = skillResults
+      .filter(r => r.skill === 'video.agent' && r.ok && r.stdout)
+      .map(r => `=== Video Content (${r.args?.videoUrl || 'video.agent'}) ===\n${r.stdout}`);
+
+    // Include screen.capture results — screen OCR text
+    const screenCaptureResults = skillResults
+      .filter(r => r.skill === 'screen.capture' && r.success && r.text)
+      .map(r => `=== Screen Capture (${r.appName || 'OCR'}) ===\n${r.text}`);
+
+    // Include file.watch results — file watch events
+    const fileWatchResults = skillResults
+      .filter(r => r.skill === 'file.watch' && r.ok && (r.events || r.matches))
+      .map(r => `=== File Watch Events ===\n${(r.events || r.matches || []).join('\n')}`);
+
+    // Include system.introspect results — system information (agents, skills, databases)
+    const systemIntrospectResults = skillResults
+      .filter(r => r.skill === 'system.introspect' && r.ok && r.result)
+      .map(r => `=== System Information (${r.args?.query || 'introspect'}) ===\n${JSON.stringify(r.result, null, 2)}`);
+
+    // Include external.skill results — external skill execution output
+    const externalSkillResults = skillResults
+      .filter(r => r.skill === 'external.skill' && r.ok && r.output)
+      .map(r => `=== External Skill (${r.skillName || 'external'}) ===\n${r.output}`);
+
     const allContextParts = [
       ...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`),
       ...processedShellResults,
@@ -2215,7 +2340,32 @@ module.exports = async function executeCommand(state) {
       ...fileBridgeResults,
       ...fsReadResults,
       ...imageAnalyzeResults,
+      ...userAgentResults,
+      ...cliAgentResults,
+      ...playwrightAgentResults,
+      ...webAgentResults,
+      ...videoAgentResults,
+      ...screenCaptureResults,
+      ...fileWatchResults,
+      ...systemIntrospectResults,
+      ...externalSkillResults,
     ];
+
+    // ── Prior synthesize results as fallback context ─────────────────────────
+    // When a downstream synthesize step (e.g. "write email comparing prices") finds
+    // no raw page-text results in its scope (because scraping happened before the
+    // previous synthesize), inject the prior synthesize output(s) as context so the
+    // LLM has the actual data instead of producing an apology.
+    // Only fires when allContextParts is empty to avoid double-counting.
+    if (allContextParts.length === 0) {
+      const priorSynthResults = skillResults
+        .filter(r => r.skill === 'synthesize' && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && r.step < skillCursor + 1)
+        .map(r => `=== Prior Analysis (step ${r.step}) ===\n${r.result.trim()}`);
+      if (priorSynthResults.length > 0) {
+        allContextParts.push(...priorSynthResults);
+        logger.info(`[Node:ExecuteCommand] synthesize: no fresh page-text — injecting ${priorSynthResults.length} prior synthesize result(s) as context`);
+      }
+    }
 
     // If no within-run context, check conversationHistory for prior image.analyze / skill output
     // This handles cross-turn synthesis: "put this in a text document" after a previous analysis run.
@@ -3488,6 +3638,99 @@ module.exports = async function executeCommand(state) {
   }
   // ─────────────────────────────────────────────────────────────────────────────
 
+  // ── runGroup parallel dispatch ────────────────────────────────────────────────
+  // When the current step has a runGroup property, collect all consecutive steps
+  // sharing the same group ID and fire them in parallel via Promise.allSettled.
+  // Results are merged into skillResults and cursor advances past all group steps.
+  if (step.runGroup) {
+    const groupId = step.runGroup;
+    // Collect all consecutive steps in this group starting from skillCursor
+    const groupSteps = [];
+    for (let gi = skillCursor; gi < skillPlan.length; gi++) {
+      if (skillPlan[gi].runGroup === groupId) groupSteps.push({ idx: gi, step: skillPlan[gi] });
+      else break;
+    }
+    logger.info(`[Node:ExecuteCommand] runGroup "${groupId}": dispatching ${groupSteps.length} steps in parallel`);
+
+    // Emit step_start for all group steps
+    for (const { idx, step: gs } of groupSteps) {
+      if (progressCallback) progressCallback({
+        type: 'step_start', stepIndex: idx, totalSteps: skillPlan.length,
+        skill: gs.skill, description: gs.description || gs.skill, runGroup: groupId,
+      });
+      if (_rawProgressCallback && state._skillPlanFile) {
+        _rawProgressCallback({ type: 'plan:step_start', stepIndex: idx, totalSteps: skillPlan.length, skill: gs.skill, description: gs.description });
+      }
+    }
+
+    // Helper: dispatch a single group step
+    const _dispatchGroupStep = async ({ idx, step: gs }) => {
+      const gsArgs = gs.args || {};
+      const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
+      const _callArgs = _isAgent
+        ? { ...gsArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+        : gsArgs;
+      try {
+        const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: 300000 });
+        const raw = res?.data || res;
+        return { idx, step: gs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, raw };
+      } catch (err) {
+        return { idx, step: gs, ok: false, error: err.message, result: null, stdout: null, raw: null };
+      }
+    };
+
+    const settled = await Promise.allSettled(groupSteps.map(_dispatchGroupStep));
+    const groupResults = [];
+    let firstFailure = null;
+    for (const outcome of settled) {
+      const r = outcome.status === 'fulfilled' ? outcome.value : { ...outcome.reason, ok: false };
+      const stepEntry = {
+        step: r.idx + 1,
+        skill: r.step?.skill,
+        args: r.step?.args || {},
+        description: r.step?.description,
+        ok: r.ok,
+        result: r.result,
+        stdout: r.stdout,
+        error: r.error || null,
+        runGroup: groupId,
+      };
+      groupResults.push(stepEntry);
+      if (progressCallback) progressCallback({
+        type: r.ok ? 'step_done' : 'step_failed',
+        stepIndex: r.idx, totalSteps: skillPlan.length,
+        skill: r.step?.skill, description: r.step?.description,
+        stdout: r.stdout, error: r.error, runGroup: groupId,
+      });
+      if (_rawProgressCallback && state._skillPlanFile) {
+        _rawProgressCallback({ type: r.ok ? 'plan:step_done' : 'plan:step_done', stepIndex: r.idx, totalSteps: skillPlan.length, skill: r.step?.skill, description: r.step?.description });
+      }
+      if (!r.ok && !r.step?.optional && !firstFailure) firstFailure = stepEntry;
+    }
+
+    const newResults = [...skillResults, ...groupResults];
+    const nextCursor = skillCursor + groupSteps.length;
+    logger.info(`[Node:ExecuteCommand] runGroup "${groupId}" complete — ${groupResults.filter(r => r.ok).length}/${groupResults.length} succeeded, cursor → ${nextCursor}`);
+
+    if (firstFailure) {
+      return {
+        ...state,
+        skillResults: newResults,
+        skillCursor: nextCursor,
+        commandExecuted: false,
+        failedStep: firstFailure,
+      };
+    }
+    return {
+      ...state,
+      skillResults: newResults,
+      skillCursor: nextCursor,
+      commandExecuted: nextCursor >= skillPlan.length,
+      failedStep: null,
+    };
+  }
+  // ─────────────────────────────────────────────────────────────────────────────
+
   try {
     // For cli.agent / browser.agent: inject _progressCallbackUrl so the agent can POST
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
@@ -3608,6 +3851,16 @@ module.exports = async function executeCommand(state) {
       } catch (_gatherErr) {
         logger.warn(`[Node:ExecuteCommand] credential gate error: ${_gatherErr.message}`);
       }
+    }
+
+    // ── Login wall normalization ─────────────────────────────────────────────
+    // browser.agent returns loginWallDetected: true when auth is needed but may
+    // omit askUser/question.  Normalize so the ask_user short-circuit below fires.
+    if (raw.loginWallDetected === true && !raw.askUser) {
+      raw.askUser = true;
+      raw.question = raw.question || `${(raw.agentId || skill).replace('.agent', '')} requires sign-in. A browser window has been opened — please sign in there.`;
+      raw.options = raw.options || [];
+      logger.info(`[Node:ExecuteCommand] normalized loginWallDetected → askUser for ${raw.agentId || skill}`);
     }
 
     // ── Agent ask_user short-circuit ──────────────────────────────────────────
@@ -3856,7 +4109,9 @@ module.exports = async function executeCommand(state) {
       stdout: raw.stdout || raw.output || waitForStdout || browserStdout || fsReadStdout || null,
       stderr: raw.stderr || null,
       exitCode: raw.exitCode ?? null,
-      result: raw.result ?? (skill === 'file.watch' ? raw : null),
+      result: raw.result
+        ?? (skill === 'user.agent' ? { resolved: raw.resolved, summary: raw.summary, action: raw.action } : null)
+        ?? (skill === 'file.watch' ? raw : null),
       watchId: skill === 'file.watch' ? (raw.watchId || null) : null,
       _raw: (skill === 'file.bridge' || skill === 'fs.read') ? raw : undefined,
       url: raw.url ?? null,

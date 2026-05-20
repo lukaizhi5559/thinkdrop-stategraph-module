@@ -141,10 +141,11 @@ async function queryMcpForAnswer(need, mcpClient, llmBackend) {
     }
 
     // 4. Check recent conversation messages via conversation.message.list
+    // Fetch both user AND assistant messages to find "that info" from previous responses
     try {
       const convResult = await mcpClient.callService('conversation', 'message.list', {
         limit: 20,
-        role: 'user',
+        // role filter removed - get all messages to see assistant's previous answers
       }, { timeoutMs: 3000 });
       const msgs = convResult?.data?.messages || convResult?.messages || [];
       const descLower = description.toLowerCase();
@@ -301,7 +302,42 @@ module.exports = async function mcpFillGaps(state) {
     
     for (const need of needs) {
       logger.info(`[Node:McpFillGaps] Searching for: ${need.description} (${need.key})`);
-      
+
+      // Check if data already exists in _dataPrefix from previous pipeline step
+      // Generic matching: works for family_info, appointment_history, contacts, etc.
+      if (state._dataPrefix && typeof state._dataPrefix === 'string' && state._dataPrefix.length > 100) {
+        const prefixLower = state._dataPrefix.toLowerCase();
+        const needLower = need.key.toLowerCase();
+        const descLower = need.description.toLowerCase();
+
+        // Match by need key appearing in data, or by description words appearing in data
+        const keyMatch = prefixLower.includes(needLower);
+        const descWords = descLower.split(/\s+/).filter(w => w.length > 3);
+        const descMatch = descWords.length > 0 &&
+          descWords.some(word => prefixLower.includes(word));
+
+        // Also check common information types that imply the data is in _dataPrefix
+        const infoTypes = ['information', 'info', 'data', 'details', 'list', 'memory', 'memories'];
+        const isInfoRequest = infoTypes.some(t => descLower.includes(t) || needLower.includes(t));
+
+        if (keyMatch || descMatch || isInfoRequest) {
+          logger.info(`[Node:McpFillGaps] Found ${need.key} in _dataPrefix (keyMatch=${keyMatch}, descMatch=${descMatch}, infoRequest=${isInfoRequest})`);
+          mcpFilled[need.key] = {
+            value: state._dataPrefix,
+            source: 'pipeline_data',
+            confidence: 0.85
+          };
+          postProgress(state, {
+            type: 'mcp:fill_found',
+            key: need.key,
+            source: 'pipeline_data',
+            confidence: 0.85,
+            message: `Found ${need.description} in previous step results`
+          });
+          continue; // Skip searching, already have the data
+        }
+      }
+
       // Try MCP services first
       let answer = await queryMcpForAnswer(need, mcpClient, llmBackend);
       

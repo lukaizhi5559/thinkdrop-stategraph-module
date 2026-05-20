@@ -165,6 +165,19 @@ module.exports = async function logConversation(state) {
       }
     }
 
+    // For memory_retrieve: wrap the answer in Step outputs / [synthesize]: format
+    // so that follow-up messaging tasks ("email this info to me") can find it via
+    // planSkills.priorSynthesizedContent scan — same pattern as command_automate.
+    if (intent?.type === 'memory_retrieve') {
+      const _memAnswer = answer && typeof answer === 'string' && answer.trim().length > 50
+        ? answer.trim()
+        : null;
+      if (_memAnswer) {
+        richAssistantText = `${answer}\n\nStep outputs:\n[synthesize]:\n${_memAnswer.slice(0, 2000)}`;
+        logger.info(`[Node:LogConversation] memory_retrieve: wrapped answer as [synthesize]: for follow-up context (${_memAnswer.length} chars)`);
+      }
+    }
+
     // [DEBUG DIAG] Remove after BODY fix confirmed
     logger.info(`[Node:LogConversation] richText preview (${richAssistantText?.length ?? 0}): ${(richAssistantText || '').slice(0, 200).replace(/\n/g, '↵')}`);
     if (richAssistantText && typeof richAssistantText === 'string') {

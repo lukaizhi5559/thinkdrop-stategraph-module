@@ -39,6 +39,7 @@ const resolveUserContextNode = require('./nodes/resolveUserContext');
 const gatherPlanContextNode = require('./nodes/gatherPlanContext');
 const mcpFillGapsNode = require('./nodes/mcpFillGaps');
 const executeIntrospectNode = require('./nodes/executeIntrospect');
+const executeSettingsNode = require('./nodes/executeSettings');
 
 /**
  * Assess risk level of a user request using LLM classification
@@ -136,15 +137,43 @@ function detectOperationType(message) {
  */
 function extractStepResult(state) {
   const intent = state.intent?.type;
+  const logger = state.logger || console;
 
-  // memory_retrieve: use first memory's source text
+  // Debug logging
+  logger.info(`[extractStepResult] intent=${intent}, filteredMemories=${Array.isArray(state.filteredMemories) ? state.filteredMemories.length : 'N/A'}`);
+  if (Array.isArray(state.filteredMemories) && state.filteredMemories.length > 0) {
+    logger.info(`[extractStepResult] First memory keys: ${Object.keys(state.filteredMemories[0]).join(', ')}`);
+  }
+
+  // memory_retrieve: use first memory's text (field is 'text', not 'source_text')
   if (intent === 'memory_retrieve' && Array.isArray(state.filteredMemories) && state.filteredMemories.length > 0) {
-    return state.filteredMemories
+    const result = state.filteredMemories
       .slice(0, 3)
-      .map(m => m.source_text || m.extracted_text || '')
+      .map(m => m.text || m.source_text || m.extracted_text || '')
       .filter(Boolean)
       .join(' | ')
       .slice(0, 2000);
+    logger.info(`[extractStepResult] Extracted ${result.length} chars from ${state.filteredMemories.length} memories`);
+    return result;
+  }
+
+  // memory_retrieve with profile fallback (when semantic search returns nothing but profile has the data)
+  if (intent === 'memory_retrieve' && state._profileFallback) {
+    const result = `Profile: ${state._profileFallback.key} = ${state._profileFallback.value}`;
+    logger.info(`[extractStepResult] Extracted profile fallback: ${result.slice(0, 100)}...`);
+    return result;
+  }
+
+  // memory_retrieve with conversation history (when no memories but conversation has relevant info)
+  if (intent === 'memory_retrieve' && Array.isArray(state.conversationHistory) && state.conversationHistory.length > 0) {
+    const result = state.conversationHistory
+      .slice(0, 5)
+      .map(m => m.content || m.text || '')
+      .filter(Boolean)
+      .join(' | ')
+      .slice(0, 2000);
+    logger.info(`[extractStepResult] Extracted ${result.length} chars from ${state.conversationHistory.length} conversation messages`);
+    return result;
   }
 
   // web_search: use top result snippet
@@ -358,13 +387,14 @@ class StateGraphBuilder {
       logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter }),
       summarizeMultiIntent: (state) => summarizeMultiIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeIntrospect: (state) => executeIntrospectNode({ ...state, logger, mcpAdapter }),
+      executeSettings: (state) => executeSettingsNode({ ...state, logger }),
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
     const edges = {
-      start: 'decomposePrompt',
-      decomposePrompt: 'resolveReferences',
-      resolveReferences: 'parseIntent',
+      start: 'resolveReferences',
+      resolveReferences: 'decomposePrompt',
+      decomposePrompt: 'parseIntent',
       parseIntent: 'checkPlanCache',
       checkPlanCache: 'parseSkill',
       parseSkill: (state) => {
@@ -398,7 +428,7 @@ class StateGraphBuilder {
           let riskLevel = 'LOW';
           let needsGrill = false;
           
-          if (state.llmBackend && !state.matchedSkillName) {
+          if (state.llmBackend && !state.matchedSkillName && !state._skillPlan) {
             riskLevel = await assessRisk(state.message || '', intentType, state.llmBackend, state.conversationHistory || []);
             needsGrill = ['CRITICAL', 'HIGH'].includes(riskLevel);
             
@@ -426,7 +456,8 @@ class StateGraphBuilder {
           
           // For high-risk operations, enable grill mode with MCP pre-fill
           // Route through mcpFillGaps → gatherContext for thorough Q&A
-          if (needsGrill && !state.matchedSkillName) {
+          // Skip if _skillPlan is already set (post-approval re-run) — plan is done, go execute.
+          if (needsGrill && !state.matchedSkillName && !state._skillPlan) {
             logger.info('[StateGraph:Router] enrichIntent: High-risk operation detected — routing to mcpFillGaps → gatherContext');
             return 'mcpFillGaps';
           }
@@ -505,6 +536,9 @@ class StateGraphBuilder {
           
           return 'screenIntelligence';
         }
+        if (intentType === 'system_settings') {
+          return 'executeSettings';
+        }
         if (intentType === 'system_introspect') {
           return 'executeIntrospect';
         }
@@ -522,6 +556,9 @@ class StateGraphBuilder {
 
       // Introspection path: executeIntrospect → answer → logConversation
       executeIntrospect: 'answer',
+
+      // Settings path: executeSettings → answer → logConversation
+      executeSettings: 'answer',
 
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',
@@ -811,6 +848,17 @@ class StateGraphBuilder {
                 new RegExp(`\\{\\{result\\[${depIdx}\\]\\}\\}`, 'g'),
                 depResult
               );
+            }
+          }
+
+          // Fallback: If no dataTemplate but has dependencies, auto-inject as prefix
+          if (!dataPrefix && (nextStep.dependsOn || []).length > 0) {
+            const depResults = (nextStep.dependsOn || []).map(depIdx => {
+              const dep = state.dataContext[depIdx];
+              return (dep && typeof dep === 'object') ? (dep.summary || '') : (dep || '');
+            }).filter(Boolean);
+            if (depResults.length > 0) {
+              dataPrefix = `Context from previous step:\n${depResults.join('\n')}\n\n`;
             }
           }
 

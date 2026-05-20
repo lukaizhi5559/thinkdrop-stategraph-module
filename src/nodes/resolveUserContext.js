@@ -85,8 +85,15 @@ function _hasSelfReferentialContext(state, msg) {
   if (state.intent?.type === 'sms_send') return true;
 
   // Broad heuristic — covers "text me", "email me", "my favorite X",
-  // "my family", recent purchases, document lookups, etc.
-  if (/\b(text me|sms me|send me (a |an )?(text|sms|email)|email me|my (phone|number|cell|email|favorite|family|contacts?)|bought last|ordered last|proposal i|report i|document i)\b/i.test(msg)) return true;
+  // "my family", recent purchases, document lookups, address queries, preferences, etc.
+  if (/\b(text me|sms me|send me (a |an )?(text|sms|email)|email me|my (phone|number|cell|email|favorite|family|contacts?|address|home|work address|zip|city|company|job|name|preference|location))\b/i.test(msg)) return true;
+  if (/\b(bought last|ordered last|proposal i|report i|document i)\b/i.test(msg)) return true;
+  // Follow-up patterns: "send it to me", "use my X", "call me", "ship to me", "deliver to me"
+  if (/\b(call me|ship (it |this )?(to me)|deliver (it |this )?(to me)|send (it|this) to me|use my (email|phone|address|info|number|details))\b/i.test(msg)) return true;
+  // Preference/personality queries
+  if (/\b(i (usually|prefer|like|always|typically)|my (usual|preferred|favorite|go-to|regular))\b/i.test(msg)) return true;
+  // "where I live", "where I work", "my home", "my office"
+  if (/\b(where i (live|work|stay)|my (home|house|apartment|office|workplace))\b/i.test(msg)) return true;
 
   return false;
 }

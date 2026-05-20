@@ -99,6 +99,56 @@ function _buildSystemPrompt(userMessage, state) {
     result += `\n\n## PRE-FLIGHT RESOLVED FACTS (user confirmed — use these exact values)\n\n${_lines}`;
   }
 
+  // Inject resolved user context (from resolveUserContext node) so planner knows what's available.
+  // resolvedSelfContext has FLAT keys: { email, phone, memories, conversation }
+  // (resolvedSelfContext.self is never populated — flat keys are the real data)
+  const _resolvedContext = state.resolvedSelfContext;
+  if (_resolvedContext) {
+    const _ctxLines = [];
+
+    // ── Flat scalar fields (email, phone, address) set by resolveUserContext ──
+    const _FLAT_FIELD_LABELS = { email: 'User email', phone: 'User phone', address: 'User address' };
+    for (const [key, label] of Object.entries(_FLAT_FIELD_LABELS)) {
+      if (_resolvedContext[key] && typeof _resolvedContext[key] === 'string') {
+        _ctxLines.push(`${label}: ${_resolvedContext[key]}`);
+      }
+    }
+
+    // ── Legacy sub-object (user.agent resolve_form output) ───────────────────
+    if (_resolvedContext.self && Object.keys(_resolvedContext.self).length > 0) {
+      _ctxLines.push('User Profile:\n' + Object.entries(_resolvedContext.self)
+        .map(([k, v]) => `  ${k}: ${v}`).join('\n'));
+    }
+    if (_resolvedContext.contacts && Object.keys(_resolvedContext.contacts).length > 0) {
+      for (const [label, fields] of Object.entries(_resolvedContext.contacts)) {
+        _ctxLines.push(`Contact — ${label}:\n` + Object.entries(fields)
+          .map(([k, v]) => `  ${k}: ${v}`).join('\n'));
+      }
+    }
+
+    // ── Memory snippets (broad context: favorites, family, preferences, etc.) ─
+    const _memSnippets = _resolvedContext.memories?.context || (_resolvedContext.memories && Array.isArray(_resolvedContext.memories) ? _resolvedContext.memories : []);
+    if (_memSnippets.length > 0) {
+      _ctxLines.push('Known facts from memory:\n' + _memSnippets.slice(0, 5).map(m => `  • ${String(m).slice(0, 200)}`).join('\n'));
+    }
+
+    // ── Conversation snippets (cross-session context) ────────────────────────
+    const _convSnippets = _resolvedContext.conversation?.context || [];
+    if (_convSnippets.length > 0) {
+      _ctxLines.push('Recent context from conversations:\n' + _convSnippets.slice(0, 3).map(m => `  • ${String(m).slice(0, 200)}`).join('\n'));
+    }
+
+    if (_ctxLines.length > 0) {
+      result += `\n\n## RESOLVED USER CONTEXT (already retrieved — use this data directly, do NOT re-fetch):\n\n${_ctxLines.join('\n\n')}`;
+    }
+  }
+
+  // Inject data from previous pipeline steps (from dataTemplate resolution)
+  const _dataPrefix = state._dataPrefix;
+  if (_dataPrefix && typeof _dataPrefix === 'string' && _dataPrefix.length > 0) {
+    result += `\n\n## CONTEXT FROM PREVIOUS STEP (data to use in your plan):\n\n${_dataPrefix}`;
+  }
+
   // ── Install scoring policy ──────────────────────────────────────────────
   // Injected for all local_file tasks (create, convert, export, generate, write).
   // Uses _taskClassification from the LLM classifier — no regex.
@@ -636,6 +686,73 @@ async function planSkillsV2(state) {
       })()
     : '';
 
+  // ── Messaging body injection (follow-up: "email/text this info to me") ─────
+  // When the user says "email this to me", "text this info", etc. and prior
+  // synthesized content exists, inject it explicitly so the LLM doesn't plan
+  // a user.agent/browser step to re-fetch content that's already available.
+  // Uses exact same regex + sanitizer as planSkills.js (battle-tested).
+  let messagingBodyNote = '';
+  const isMessagingTask = !isRecurring && (
+    /^(text|send|email|message|forward|share|ping|tell|notify)/i.test(userMessage.trim()) ||
+    /\b(text|sms|send.*message|email.*me|message.*me)\b/i.test(userMessage)
+  );
+  const _hasExplicitBody = /\b(say|saying|with\s+message|body\s*:|message\s*:|tell\s+(?:them|him|her|me)\s+(?:that\s+)?")/i.test(userMessage)
+    || /"[^"]{2,}"/.test(userMessage)
+    || /'[^']{2,}'/.test(userMessage);
+  if (isMessagingTask && priorSynthesizedContent && !_hasExplicitBody) {
+    let _sanitizedBody = priorSynthesizedContent;
+    if (/^here is the raw data returned/i.test(_sanitizedBody.trim()) ||
+        /^\[shell\.run\]:\s*[\[{]/m.test(_sanitizedBody)) {
+      const _jsonMatch = _sanitizedBody.match(/```json\n([\s\S]*?)\n```/) ||
+                         _sanitizedBody.match(/\[shell\.run\]:\n*([\s\S]+)/);
+      if (_jsonMatch) {
+        try {
+          const _parsed = JSON.parse(_jsonMatch[1].trim());
+          const _items = Array.isArray(_parsed) ? _parsed : (_parsed?.items || []);
+          if (_items.length > 0) {
+            _sanitizedBody = _items.map(item => `• ${item.summary || item.title || JSON.stringify(item)}`).join('\n');
+          }
+        } catch (_) {}
+      }
+    }
+    messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${_sanitizedBody}\n---\nDo NOT add a user.agent step to re-fetch this content — it is already provided above. Only add steps to resolve the recipient address (if unknown) and to send the email.`;
+    logger.info(`[Node:PlanSkillsV2] Injected prior synthesized content as messaging body (${priorSynthesizedContent.length} chars)`);
+  }
+
+  // ── SMS gateway injection ─────────────────────────────────────────────────
+  let smsGatewayNote = '';
+  if (state.smsGatewayTarget) {
+    const gwt = state.smsGatewayTarget;
+    const isMms = gwt.mode === 'mms' && gwt.mmsEmail;
+    const activeEmail = isMms ? gwt.mmsEmail : gwt.email;
+    if (activeEmail) {
+      const maxChars = isMms ? 1600 : 160;
+      smsGatewayNote = `\n\n⚠️ SMS GATEWAY ROUTE: To send an SMS/text message, send an email to "${activeEmail}" via gmail.agent (action: "run", agentId: "gmail.agent"). NEVER use Twilio, ClickSend, or any paid SMS API. Keep message body under ${maxChars} chars. The carrier gateway converts email→SMS automatically.`;
+    }
+  }
+
+  // ── Parallel runGroup instruction ─────────────────────────────────────────
+  // When steps are clearly independent (e.g. scraping two sites, resolving user
+  // info while browsing), instruct the LLM to mark them with the same runGroup
+  // value so executeCommand.js can fan them out with Promise.allSettled.
+  const parallelNote = `\n\n## PARALLEL EXECUTION (runGroup)
+When two or more steps are completely independent (no data dependency between them), add "runGroup": "<group_id>" to each step in the group. Steps sharing the same runGroup value will be executed in parallel.
+
+Rules:
+- Use short IDs like "g1", "g2" etc.
+- Only group steps that do NOT depend on each other's output
+- Grouped steps MUST be consecutive in the plan array
+- Do NOT group synthesize, schedule, or shell.run steps
+- Example: comparing prices on site A AND site B, plus resolving user email → all three can be "runGroup": "g1" since none depend on each other
+
+Example:
+[
+  { "skill": "browser.agent", "args": { "agentId": "amazon.agent", ... }, "runGroup": "g1", "description": "Search Amazon" },
+  { "skill": "browser.agent", "args": { "agentId": "ebay.agent", ... },   "runGroup": "g1", "description": "Search eBay" },
+  { "skill": "user.agent",    "args": { ... },                             "runGroup": "g1", "description": "Resolve user email" },
+  { "skill": "synthesize",    "args": { "prompt": "Compare and email results" } }
+]`;
+
   const planningQuery = [
     _agentIdentity,
     SKILL_SYSTEM_PROMPT,
@@ -647,8 +764,11 @@ async function planSkillsV2(state) {
     skillContractNote,
     cliPreflightNote,
     agentContextNote,
+    smsGatewayNote,
     dateRangeNote,
     runtimeNote,
+    messagingBodyNote,
+    parallelNote,
     `\n\nUser request: "${(runtimeParamMessage || userMessage).replace(/"/g, '\\"').slice(0, 2000)}"`,
   ].filter(Boolean).join('\n');
 
@@ -998,28 +1118,69 @@ async function planSkillsV2(state) {
     }
   }
 
-  // ── Emit plan_ready ───────────────────────────────────────────────────────
-  logger.debug(`[Node:PlanSkillsV2] Plan ready: ${skillPlan.length} steps`);
+  // ── Save plan to disk ─────────────────────────────────────────────────────
+  let _skillPlanFile = state._skillPlanFile || null;
+  let _planId = null;
+  try {
+    if (!fs.existsSync(PLANS_DIR)) fs.mkdirSync(PLANS_DIR, { recursive: true });
+    _planId = `plan_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const planMd = serializeSkillPlanToMd(skillPlan, userMessage, _planId, state.sessionId || 'unknown');
+    _skillPlanFile = path.join(PLANS_DIR, `${_planId}.md`);
+    fs.writeFileSync(_skillPlanFile, planMd, 'utf8');
+    logger.info(`[Node:PlanSkillsV2] Plan saved: ${_skillPlanFile}`);
+  } catch (_) {}
+
+  // ── Plan approval gate ──────────────────────────────────────────────────────
+  // Read planApprovalMode from settings: "always" | "multi_step" (default) | "auto"
+  let _planApprovalMode = 'multi_step';
+  try {
+    const _settingsPath = path.join(os.homedir(), '.thinkdrop', 'settings.json');
+    if (fs.existsSync(_settingsPath)) {
+      const _sd = JSON.parse(fs.readFileSync(_settingsPath, 'utf8'));
+      if (_sd.planApprovalMode && ['always', 'multi_step', 'auto'].includes(_sd.planApprovalMode)) {
+        _planApprovalMode = _sd.planApprovalMode;
+      }
+    }
+  } catch (_) {}
+
+  const _needsApproval = _planApprovalMode === 'always' ||
+    (_planApprovalMode === 'multi_step' && skillPlan.length >= 2);
+
+  if (_needsApproval) {
+    logger.info(`[Node:PlanSkillsV2] Plan approval required (mode=${_planApprovalMode}, steps=${skillPlan.length})`);
+    const planContent = _skillPlanFile ? fs.readFileSync(_skillPlanFile, 'utf8') : '';
+    const skillPlanJson = Buffer.from(JSON.stringify(skillPlan)).toString('base64');
+    if (progressCallback) {
+      progressCallback({
+        type: 'plan:generated',
+        planFile: _skillPlanFile,
+        planId: _planId,
+        content: planContent,
+        skillPlanJson,
+      });
+    }
+    return {
+      ...state,
+      awaitingPlanApproval: true,
+      _skillPlanFile,
+      skillPlan: null,
+      skillCursor: 0,
+      planError: null,
+      recoveryContext: null,
+    };
+  }
+
+  // ── Auto-execute: emit plan_ready ─────────────────────────────────────────
+  logger.debug(`[Node:PlanSkillsV2] Plan ready (auto-execute, mode=${_planApprovalMode}): ${skillPlan.length} steps`);
   skillPlan.forEach((s, i) => logger.debug(`  Step ${i + 1}: ${s.skill} — ${s.description || JSON.stringify(s.args)}`));
 
   if (progressCallback) {
     progressCallback({
       type: 'plan_ready',
-      steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })),
+      steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })),
       intent: state.intent?.type || 'command_automate',
     });
   }
-
-  // ── Save plan to disk ─────────────────────────────────────────────────────
-  let _skillPlanFile = state._skillPlanFile || null;
-  try {
-    if (!fs.existsSync(PLANS_DIR)) fs.mkdirSync(PLANS_DIR, { recursive: true });
-    const planId = `plan_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const planMd = serializeSkillPlanToMd(skillPlan, userMessage, planId, state.sessionId || 'unknown');
-    _skillPlanFile = path.join(PLANS_DIR, `${planId}.md`);
-    fs.writeFileSync(_skillPlanFile, planMd, 'utf8');
-    logger.info(`[Node:PlanSkillsV2] Plan saved: ${_skillPlanFile}`);
-  } catch (_) {}
 
   return {
     ...state,

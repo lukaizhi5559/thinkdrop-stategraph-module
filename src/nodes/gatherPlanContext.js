@@ -58,6 +58,7 @@ Rules:
 - Do NOT ask about information that exists in OTHER steps of the overall request.
 - Do NOT ask about credentials, optional preferences, or things the system can infer.
 - Do NOT ask if the information is already present in the CURRENT SUB-TASK.
+- If KNOWN RESOLVED FACTS are provided and they answer the missing info, return {"complete": true} — do NOT ask.
 - Keep the question under 15 words.
 - Ask only one question — never combine two into one.
 
@@ -77,25 +78,62 @@ CRITICAL ANTI-HALLUCINATION RULES — these override everything else:
 
 // ── LLM call ──────────────────────────────────────────────────────────────────
 
-async function _askLLM(llmBackend, userMessage, originalMessage, priorQA, conversationHistory, logger) {
+async function _askLLM(llmBackend, userMessage, originalMessage, priorQA, conversationHistory, resolvedSelfContext, logger) {
   const priorContext = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
 
-  const recentCtx = (conversationHistory || []).slice(-4)
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 200)}`)
+  const recentCtx = (conversationHistory || []).slice(-6)
+    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 300)}`)
     .join('\n');
   const historyBlock = recentCtx
     ? `\n\nRECENT CONVERSATION (resolve all references — "that folder", "it", "the result" — from this before deciding):\n${recentCtx}`
     : '';
 
+  // Build known-facts block from resolvedSelfContext (email, phone, etc. already resolved
+  // earlier in this same pipeline turn by resolveUserContext)
+  const _knownLines = [];
+  if (resolvedSelfContext) {
+    const _FIELD_LABELS = { email: 'User email', phone: 'User phone', address: 'User address' };
+    for (const [key, label] of Object.entries(_FIELD_LABELS)) {
+      if (resolvedSelfContext[key] && typeof resolvedSelfContext[key] === 'string') {
+        _knownLines.push(`- ${label}: already resolved`);
+      }
+    }
+    // Also scan memory snippets for facts mentioned in recent answers
+    const memCtx = resolvedSelfContext.memories?.context || [];
+    if (memCtx.length > 0) {
+      _knownLines.push(`- User memory facts available (${memCtx.length} snippets)`);
+    }
+    // Scan recent conversation for explicitly stated facts (email, address, phone given by user)
+    const _recentUserMsgs = (conversationHistory || []).slice(-8)
+      .filter(m => m.role === 'user')
+      .map(m => String(m.content || '').slice(0, 200));
+    for (const msg of _recentUserMsgs) {
+      if (/\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b/.test(msg)) {
+        _knownLines.push('- User email: provided in conversation history');
+        break;
+      }
+    }
+    for (const msg of _recentUserMsgs) {
+      if (/(\+?1[\s.-]?)?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}/.test(msg)) {
+        _knownLines.push('- User phone: provided in conversation history');
+        break;
+      }
+    }
+  }
+  const knownFactsBlock = _knownLines.length > 0
+    ? `\n\nKNOWN RESOLVED FACTS (already in system memory — do NOT ask about these):\n${_knownLines.join('\n')}`
+    : '';
+
   const prompt = `ORIGINAL USER REQUEST: "${originalMessage}"
 
-CURRENT SUB-TASK: "${userMessage}"${priorContext}${historyBlock}
+CURRENT SUB-TASK: "${userMessage}"${priorContext}${historyBlock}${knownFactsBlock}
 
 This is ONE STEP of a multi-step automation. Does THIS SPECIFIC SUB-TASK need clarification, or is it clear enough to execute?
 
 If the RECENT CONVERSATION shows what "that", "it", "the folder", "the file" etc. refer to, the task IS complete — do NOT ask.
+If KNOWN RESOLVED FACTS cover the missing info, the task IS complete — do NOT ask.
 
 Is this specific sub-task complete enough to automate without further clarification?`;
 
@@ -238,7 +276,7 @@ module.exports = async function gatherPlanContext(state) {
     }
     logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking task clarity for: "${userMsg_enriched.slice(0, 80)}"`);
 
-    const result = await _askLLM(llmBackend, userMsg_enriched, originalMsg, answers, state.conversationHistory || [], logger);
+    const result = await _askLLM(llmBackend, userMsg_enriched, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, logger);
 
     // ── Task is clear — done ──────────────────────────────────────────────────
     if (result.complete) {

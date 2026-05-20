@@ -2008,6 +2008,17 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
       const optionsList = (decision.options || [])
         .map((o, i) => `${i + 1}. ${o}`)
         .join('\n');
+      // Emit immediately so the UI shows the question card in real-time,
+      // without waiting for the full graph to exit and main.js finalState handler.
+      if (typeof state.progressCallback === 'function') {
+        try {
+          state.progressCallback({
+            type: 'ask_user',
+            question: decision.question,
+            options: decision.options || [],
+          });
+        } catch (_) {}
+      }
       return {
         ...state,
         recoveryAction: 'ask_user',

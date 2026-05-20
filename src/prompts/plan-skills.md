@@ -150,6 +150,11 @@ If `smsGatewayTarget.email` is null, the carrier has not been configured — ski
 - Use `user.agent { action: 'resolve_form' }` BEFORE any task that needs the user's personal data: filling in a profile/application form, sending a document with user details, drafting an email that refers to "my name / my address / my phone", looking up a contact's info.
 - Use `user.agent { action: 'resolve_context' }` BEFORE writing, summarising, or synthesising content that should sound like the user: emails, messages, proposals, bios, summaries of past conversations.
 - Pass `user.agent`'s `summary` output into the following `synthesize` step's `prompt` field — it acts as automatic context injection.
+- **User context + synthesize ordering rule — CRITICAL:** When `user.agent` is used to retrieve personal data (family info, memories, etc.) that will be included in content sent via another step (email, message, etc.), the order MUST be:
+  1. `user.agent` (retrieve the data)
+  2. `synthesize` (create the content using the user.agent summary and {{synthesisAnswer}} token)
+  3. `browser.agent` or other consumer step (send/deliver the content using {{synthesisAnswer}})
+  **NEVER place browser.agent before synthesize when generating personalized content.**
 - If `missingFields` is non-empty, add a `guide.step` asking the user to provide the missing values, THEN continue the plan.
 - NEVER use `user.agent` for tasks that have nothing to do with the user's personal context (web searches, code generation, generic system tasks).
 
