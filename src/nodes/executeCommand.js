@@ -3663,23 +3663,157 @@ module.exports = async function executeCommand(state) {
       }
     }
 
-    // Helper: dispatch a single group step
+    // Helper: dispatch a single group step (with automatic retry for Chrome crashes)
     const _dispatchGroupStep = async ({ idx, step: gs }) => {
       const gsArgs = gs.args || {};
       const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
       const _callArgs = _isAgent
         ? { ...gsArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
         : gsArgs;
-      try {
-        const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: 300000 });
-        const raw = res?.data || res;
-        return { idx, step: gs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, raw };
-      } catch (err) {
-        return { idx, step: gs, ok: false, error: err.message, result: null, stdout: null, raw: null };
-      }
+      // Shorter timeout for parallel browser steps to prevent indefinite hanging
+      const stepTimeoutMs = gs.skill === 'browser.agent' ? 120000 : 300000; // 2 min for browser, 5 min for CLI
+
+      // Inner function to attempt step with optional retry
+      const attemptStep = async (isRetry = false) => {
+        try {
+          const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: stepTimeoutMs });
+          const raw = res?.data || res;
+
+          // If browser crashed and this is first attempt, retry once immediately
+          if (raw?.ok === false && raw?.chromeCrash === true && !isRetry) {
+            logger.warn(`[Node:ExecuteCommand] runGroup step ${idx} (${gs.skill}) crashed, retrying once...`);
+            // Small delay to let Chrome cleanup before retry
+            await new Promise(r => setTimeout(r, 1000));
+            return attemptStep(true); // Retry with isRetry=true
+          }
+
+          // Send immediate progress for failed steps before Promise.allSettled completes
+          if (raw?.ok === false && progressCallback) {
+            logger.warn(`[Node:ExecuteCommand] runGroup step ${idx} (${gs.skill}) failed: ${raw?.error || 'unknown error'}`);
+            progressCallback({
+              type: 'step_failed',
+              stepIndex: idx,
+              totalSteps: skillPlan.length,
+              skill: gs.skill,
+              description: gs.description,
+              error: raw?.error || 'Step failed',
+              runGroup: groupId,
+            });
+          }
+          return { idx, step: gs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, raw };
+        } catch (err) {
+          // On exception, also retry once if first attempt
+          if (!isRetry) {
+            logger.warn(`[Node:ExecuteCommand] runGroup step ${idx} (${gs.skill}) threw error, retrying once: ${err.message}`);
+            await new Promise(r => setTimeout(r, 1000));
+            return attemptStep(true);
+          }
+          // Retry failed - send final failure
+          logger.error(`[Node:ExecuteCommand] runGroup step ${idx} (${gs.skill}) threw error after retry: ${err.message}`);
+          if (progressCallback) {
+            progressCallback({
+              type: 'step_failed',
+              stepIndex: idx,
+              totalSteps: skillPlan.length,
+              skill: gs.skill,
+              description: gs.description,
+              error: err.message,
+              runGroup: groupId,
+            });
+          }
+          return { idx, step: gs, ok: false, error: err.message, result: null, stdout: null, raw: null };
+        }
+      };
+
+      return attemptStep(false); // Start with isRetry=false
     };
 
-    const settled = await Promise.allSettled(groupSteps.map(_dispatchGroupStep));
+    let settled = await Promise.allSettled(groupSteps.map(_dispatchGroupStep));
+
+    // ── Parallel login wall detection ─────────────────────────────────────────
+    // If any step hit a login wall (loginWallDetected or askUser+needsCredentials),
+    // pause and ask the user how to handle each blocked service before continuing.
+    // Also catches researchContentEmpty (sparse content / quality gate failures) which
+    // often indicate login-required pages that bypassed the login wall detector.
+    const parallelLoginCallback = state.parallelLoginCallback;
+    const loginWallSteps = settled
+      .filter(o => o.status === 'fulfilled')
+      .map(o => o.value)
+      .filter(r => !r.ok && (
+        r.raw?.loginWallDetected === true ||
+        (r.raw?.askUser === true && r.raw?.needsCredentials === true) ||
+        r.raw?.researchContentEmpty === true
+      ));
+
+    if (loginWallSteps.length > 0 && typeof parallelLoginCallback === 'function') {
+      logger.info(`[Node:ExecuteCommand] runGroup "${groupId}" — ${loginWallSteps.length} login wall(s) detected, pausing for user decision`);
+
+      // Build service list for the UI card
+      const loginServices = loginWallSteps.map(r => ({
+        stepIdx: r.idx,
+        agentId: r.raw?.agentId || r.step?.args?.agentId || r.step?.skill,
+        service: (r.raw?.agentId || r.step?.args?.agentId || r.step?.skill || '').replace(/\.agent$/, ''),
+        description: r.step?.description || r.step?.skill || '',
+      }));
+
+      // Emit UI event so the card renders
+      if (progressCallback) progressCallback({
+        type: 'parallel_login_required',
+        services: loginServices,
+        runGroup: groupId,
+      });
+
+      // Await per-service decisions: { [agentId]: 'login' | 'try_without' | 'skip' }
+      let decisions = {};
+      try {
+        decisions = await parallelLoginCallback(loginServices, progressCallback) || {};
+      } catch (cbErr) {
+        logger.warn(`[Node:ExecuteCommand] parallelLoginCallback threw: ${cbErr.message} — skipping all login walls`);
+        loginServices.forEach(s => { decisions[s.agentId] = 'skip'; });
+      }
+
+      // Re-dispatch steps based on decisions
+      const reDispatchResults = await Promise.allSettled(loginWallSteps.map(async (r) => {
+        const svc = loginServices.find(s => s.stepIdx === r.idx);
+        const decision = decisions[svc?.agentId] || 'skip';
+        const gs = r.step;
+
+        if (decision === 'skip') {
+          logger.info(`[Node:ExecuteCommand] parallel login: skipping ${svc?.agentId}`);
+          return { idx: r.idx, step: gs, ok: false, skipped: true, result: null, stdout: null, error: 'Skipped by user', raw: null };
+        }
+
+        // 'login' or 'try_without' — re-dispatch with appropriate flags
+        const gsArgs = gs.args || {};
+        const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
+        const extraArgs = decision === 'try_without' ? { skipAuth: true } : {};
+        const _callArgs = _isAgent
+          ? { ...gsArgs, ...extraArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: r.idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+          : { ...gsArgs, ...extraArgs };
+
+        logger.info(`[Node:ExecuteCommand] parallel login: re-dispatching ${svc?.agentId} (decision=${decision})`);
+        try {
+          const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: 300000 });
+          const raw = res?.data || res;
+          return { idx: r.idx, step: gs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, raw };
+        } catch (err) {
+          return { idx: r.idx, step: gs, ok: false, error: err.message, result: null, stdout: null, raw: null };
+        }
+      }));
+
+      // Merge re-dispatch results back into settled array
+      const reDispatchMap = new Map();
+      for (const o of reDispatchResults) {
+        const r = o.status === 'fulfilled' ? o.value : { ok: false };
+        if (r.idx != null) reDispatchMap.set(r.idx, o);
+      }
+      settled = settled.map(o => {
+        const r = o.status === 'fulfilled' ? o.value : null;
+        if (r && reDispatchMap.has(r.idx)) return reDispatchMap.get(r.idx);
+        return o;
+      });
+    }
+
     const groupResults = [];
     let firstFailure = null;
     for (const outcome of settled) {
@@ -3690,6 +3824,7 @@ module.exports = async function executeCommand(state) {
         args: r.step?.args || {},
         description: r.step?.description,
         ok: r.ok,
+        skipped: r.skipped || false,
         result: r.result,
         stdout: r.stdout,
         error: r.error || null,
@@ -3697,7 +3832,7 @@ module.exports = async function executeCommand(state) {
       };
       groupResults.push(stepEntry);
       if (progressCallback) progressCallback({
-        type: r.ok ? 'step_done' : 'step_failed',
+        type: r.ok ? 'step_done' : r.skipped ? 'step_skipped' : 'step_failed',
         stepIndex: r.idx, totalSteps: skillPlan.length,
         skill: r.step?.skill, description: r.step?.description,
         stdout: r.stdout, error: r.error, runGroup: groupId,
@@ -3705,14 +3840,17 @@ module.exports = async function executeCommand(state) {
       if (_rawProgressCallback && state._skillPlanFile) {
         _rawProgressCallback({ type: r.ok ? 'plan:step_done' : 'plan:step_done', stepIndex: r.idx, totalSteps: skillPlan.length, skill: r.step?.skill, description: r.step?.description });
       }
-      if (!r.ok && !r.step?.optional && !firstFailure) firstFailure = stepEntry;
+      if (!r.ok && !r.skipped && !r.step?.optional && !firstFailure) firstFailure = stepEntry;
     }
 
     const newResults = [...skillResults, ...groupResults];
     const nextCursor = skillCursor + groupSteps.length;
-    logger.info(`[Node:ExecuteCommand] runGroup "${groupId}" complete — ${groupResults.filter(r => r.ok).length}/${groupResults.length} succeeded, cursor → ${nextCursor}`);
+    const succeededCount = groupResults.filter(r => r.ok).length;
+    const skippedCount = groupResults.filter(r => r.skipped).length;
+    logger.info(`[Node:ExecuteCommand] runGroup "${groupId}" complete — ${succeededCount}/${groupResults.length} succeeded (${skippedCount} skipped), cursor → ${nextCursor}`);
 
-    if (firstFailure) {
+    if (firstFailure && succeededCount === 0) {
+      // All steps failed — route to recovery
       return {
         ...state,
         skillResults: newResults,
@@ -3721,6 +3859,7 @@ module.exports = async function executeCommand(state) {
         failedStep: firstFailure,
       };
     }
+    // Partial or full success — advance cursor; synthesize will work with whatever results exist
     return {
       ...state,
       skillResults: newResults,
@@ -3735,6 +3874,19 @@ module.exports = async function executeCommand(state) {
     // For cli.agent / browser.agent: inject _progressCallbackUrl so the agent can POST
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
     const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent';
+    // Guard: planSkills LLM sometimes emits browser.agent/cli.agent steps without an
+    // explicit `action` field.  The agent's switch statement hits the default case and
+    // returns { ok: false, error: "Unknown action: \"undefined\"" }, triggering an
+    // unnecessary recoverSkill retry loop.  Default to 'run' here so the step succeeds
+    // on the first attempt without any recovery overhead.
+    if (skill === 'browser.agent' && resolvedArgs && !resolvedArgs.action) {
+      resolvedArgs = { action: 'run', ...resolvedArgs };
+      logger.debug('[Node:ExecuteCommand] browser.agent: defaulted missing action to \'run\'');
+    }
+    if (skill === 'cli.agent' && resolvedArgs && !resolvedArgs.action) {
+      resolvedArgs = { action: 'run', ...resolvedArgs };
+      logger.debug('[Node:ExecuteCommand] cli.agent: defaulted missing action to \'run\'');
+    }
     // For all shell.run steps: inject _progressCallback so that:
     //   - goal-mode resolution surfaces thinking events ('Generating shell command…')
     //   - live stdout chunks stream to the UI terminal panel (shell:stdout_chunk)
@@ -3902,78 +4054,6 @@ module.exports = async function executeCommand(state) {
         },
         commandExecuted: false,
       };
-    }
-
-    // ── Research-content-empty gate ────────────────────────────────────────────
-    // browser.agent quality gate detected the page returned nav/welcome content
-    // instead of actual research data.  Propagate as a fast-path ASK_USER so
-    // recoverSkill can offer alternative sources without calling the LLM.
-    if (skill === 'browser.agent' && raw.researchContentEmpty === true) {
-      if (raw.serviceUnavailable === true) {
-        const serviceLabel = raw.agentId || resolvedArgs.agentId || 'browser.agent';
-        const skipReason = `${serviceLabel} was unavailable (${raw.unavailableReason || raw.httpStatus || 'service error'})`;
-        logger.info(`[Node:ExecuteCommand] service-unavailable skip: "${serviceLabel}" — advancing to next step`);
-        if (progressCallback) progressCallback({
-          type: 'step_skipped', stepIndex: skillCursor, totalSteps: skillPlan.length,
-          skill, description: description || skill, reason: skipReason,
-        });
-        const skippedResult = {
-          step: skillCursor + 1,
-          skill,
-          args: resolvedArgs,
-          description,
-          ok: true,
-          skipped: true,
-          serviceUnavailable: true,
-          skipReason,
-          unavailableReason: raw.unavailableReason || null,
-          httpStatus: Number.isInteger(raw.httpStatus) ? raw.httpStatus : null,
-          stdout: `[Skipped: ${skipReason}]`,
-          error: raw.error || undefined,
-        };
-        const nextCursor = skillCursor + 1;
-        if (nextCursor >= skillPlan.length) {
-          const subPlanStackNow = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
-          if (subPlanStackNow.length > 0) {
-            const { completeSubPlan } = require('./subPlanEngine');
-            const resumed = completeSubPlan({ ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor });
-            return { ...state, ...resumed, commandExecuted: false, failedStep: null };
-          }
-          return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: true, failedStep: null };
-        }
-        return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: false, failedStep: null };
-      }
-
-      const serviceLabel = raw.agentId || resolvedArgs.agentId || 'browser.agent';
-      const skipReason = `${serviceLabel} returned no useful research content`;
-      logger.info(`[Node:ExecuteCommand] research-content-empty skip: "${serviceLabel}" — advancing to next step`);
-      if (progressCallback) progressCallback({
-        type: 'step_skipped', stepIndex: skillCursor, totalSteps: skillPlan.length,
-        skill, description: description || skill, reason: skipReason,
-      });
-      const skippedResult = {
-        step: skillCursor + 1,
-        skill,
-        args: resolvedArgs,
-        description,
-        ok: true,
-        skipped: true,
-        researchContentEmpty: true,
-        skipReason,
-        stdout: `[Skipped: ${skipReason}]`,
-        error: raw.error || undefined,
-      };
-      const nextCursor = skillCursor + 1;
-      if (nextCursor >= skillPlan.length) {
-        const subPlanStackNow = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
-        if (subPlanStackNow.length > 0) {
-          const { completeSubPlan } = require('./subPlanEngine');
-          const resumed = completeSubPlan({ ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor });
-          return { ...state, ...resumed, commandExecuted: false, failedStep: null };
-        }
-        return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: true, failedStep: null };
-      }
-      return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: false, failedStep: null };
     }
 
     // ── Wrong-destination gate ─────────────────────────────────────────────────
@@ -5223,7 +5303,17 @@ module.exports = async function executeCommand(state) {
       if (state._skillPlanFile) {
         try {
           const _planMd2 = fs.readFileSync(state._skillPlanFile, 'utf8');
-          const _allOk2 = updatedResults.every(r => r.ok);
+          // Deduplicate: when recoverSkill retried a step that originally failed,
+          // updatedResults contains both the ok:false first attempt and the ok:true
+          // retry for the same step index.  Keep only the best (ok:true) record per
+          // step so the plan is correctly marked 'complete' when all retries succeeded.
+          const _deduped2 = updatedResults.reduce((acc, r) => {
+            const idx = acc.findIndex(x => x.step === r.step);
+            if (idx === -1) { acc.push(r); }
+            else if (r.ok && !acc[idx].ok) { acc[idx] = r; }
+            return acc;
+          }, []);
+          const _allOk2 = _deduped2.every(r => r.ok);
           const _newStatus2 = _allOk2 ? 'complete' : 'failed';
           const _updatedMd2 = _planMd2.replace(/^(status:\s*)(pending|failed)(\s*)$/m, `$1${_newStatus2}$3`);
           fs.writeFileSync(state._skillPlanFile, _updatedMd2, 'utf8');

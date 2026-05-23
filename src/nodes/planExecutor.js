@@ -171,6 +171,12 @@ module.exports = async function planExecutor(state) {
     return {
       ...state,
       _planMode: false,
+      _planCorrectionMode: false,
+      _planCorrectionText: null,
+      _planCorrectionSourcePrompt: null,
+      _basePlanFile: null,
+      _skillPlanFile: null,
+      _skillPlanJson: null,
       planComplete: true,
       isMultiIntent: steps.length > 1,
       intentResults: steps.map((s) => ({

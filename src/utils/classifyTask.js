@@ -36,7 +36,9 @@ Output ONLY valid JSON with exactly these fields:
   "needsClarification": true | false,
   "targetService": "<service name>" | null,
   "isRecurring": true | false,
-  "isBrowseOnly": true | false
+  "isBrowseOnly": true | false,
+  "isScreenFollowUp": true | false,
+  "needsFreshScreen": true | false
 }
 
 Field rules:
@@ -65,6 +67,18 @@ Field rules:
 
 - isBrowseOnly: true when taskType is "browser" AND there is no send/message/notify intent
 
+- isScreenFollowUp: true when ALL of the following hold:
+  1. A PRIOR SCREEN CONTEXT block is present in the prompt (see below)
+  2. The user message refers to something on screen using a deictic ("this", "it", "that") OR asks for info/explanation without naming a new specific topic
+  3. The message does NOT start a clearly unrelated new topic (e.g. "search for X", "open Y", "remind me to Z")
+  Set false when no PRIOR SCREEN CONTEXT is present.
+
+- needsFreshScreen: true when BOTH of the following hold:
+  1. isScreenFollowUp is false (no prior context block available)
+  2. isFollowUp is true (message uses deictic terms or refers to something from context without naming it) OR taskType is "ambiguous"
+  This means: the user is referring to something they see on screen, but we have no cached screen data — we need to grab it.
+  Set false when isScreenFollowUp is already true (we already have context) or when the message has a concrete named subject.
+
 No explanation. No markdown. Only the JSON object.`;
 
 /**
@@ -76,7 +90,7 @@ No explanation. No markdown. Only the JSON object.`;
  * @param {object} logger
  * @returns {Promise<object>} classification object (always resolves, never throws)
  */
-async function classifyTask(userMessage, conversationHistory, llmBackend, logger) {
+async function classifyTask(userMessage, conversationHistory, llmBackend, logger, priorScreenSummary) {
   const _default = {
     taskType: 'ambiguous',
     isFollowUp: false,
@@ -85,6 +99,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     targetService: null,
     isRecurring: false,
     isBrowseOnly: false,
+    isScreenFollowUp: false,
+    needsFreshScreen: false,
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -94,7 +110,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 300)}`)
       .join('\n');
 
-    const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}\n\nCURRENT USER MESSAGE: "${userMessage}"`;
+    const screenBlock = priorScreenSummary ? `\n\n${priorScreenSummary}` : '';
+    const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}${screenBlock}\n\nCURRENT USER MESSAGE: "${userMessage}"`;
 
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
@@ -119,6 +136,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       targetService:      parsed.targetService       || null,
       isRecurring:        !!parsed.isRecurring,
       isBrowseOnly:       !!parsed.isBrowseOnly,
+      isScreenFollowUp:   !!parsed.isScreenFollowUp,
+      needsFreshScreen:   !!parsed.needsFreshScreen,
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

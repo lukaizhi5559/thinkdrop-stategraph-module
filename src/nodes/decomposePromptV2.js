@@ -33,8 +33,10 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - CRITICAL: If ALL sub-prompts implement one artifact (skill, script, scheduled task), return ONE sub-prompt with the original text and estimatedIntent:'command_automate'. Only split when the user has multiple INDEPENDENT goals.
 - Navigation commands (goto, navigate to, open + specific site) → command_automate, NOT web_search
 - Any task that involves interacting with a specific website or web service (sending, asking, navigating, posting, filling forms, etc.) → command_automate
+- PRIORITY RULE - FILE/FOLDER ANALYSIS (takes precedence over user info rules): When the message starts with "[Folder:" or involves analyzing/listing/describing files/folders/images on the local filesystem (e.g., "[Folder: /path] tell me what files are here", "what are these images about", "analyze files in /path/to/folder"), use SINGLE command_automate step. This requires shell commands to list and read actual files, NOT memory_retrieve or web_search which will hallucinate.
 - PRIORITY RULE - USER INFO WITH ACTION: When the request is about USER INFO (family, profile, personal data, relationships like mom/dad/wife/cousin, phone numbers, emails, addresses, contacts) AND also requires an external action (send, email, post, fill, submit, create, share), use SINGLE command_automate step. The user.agent skill retrieves the info internally.
 - PRIORITY RULE - USER INFO ONLY: When the request is ONLY asking to show/list/tell/display USER INFO with NO external action (e.g. "who is my wife", "list my family", "what is my mom's phone", "tell me about my contacts"), use SINGLE memory_retrieve step. Do NOT use command_automate for pure info lookup.
+- PRIORITY RULE - KNOWLEDGE vs SEARCH vs ACTION (when no specific website/tool is mentioned): For general questions without browser/tool interaction: Use general_knowledge for math/calculations ("convert 88s to minutes", "what is 5*7"), timeless facts ("who wrote Pride and Prejudice"), and definitions ("what is blockchain"). Use web_search for time-sensitive info (prices, news, "latest", "current"). Use command_automate ONLY when specific website interaction, tool usage, or external action is required.
 - General rule: When a request combines data retrieval with an action (e.g., "send weather info via email"), split into TWO steps: (1) retrieve the data (memory_retrieve/web_search), (2) perform the action (command_automate with dependsOn:[0]).
 
 JSON shape: {"subPrompts":[{"text":"...","estimatedIntent":"command_automate","order":0,"dependsOn":[],"isLongRunning":false}]}`;
@@ -102,7 +104,8 @@ function collapseUserInfoQuery(plan, originalMessage, logger) {
     'my info', 'my profile', 'personal data', 'contact', 'phone', 'email', 'address'
   ];
   const actionKeywords = [
-    'send', 'email', 'post', 'fill', 'submit', 'create', 'share', 'write', 'compose', 'upload', 'message', 'text'
+    'send', 'email', 'post', 'fill', 'submit', 'create', 'share', 'write', 'compose', 'upload', 'message', 'text',
+    'analyze', 'list', 'describe'  // filesystem actions
   ];
   const isUserInfoQuery = userInfoKeywords.some(kw => msgLower.includes(kw));
   const hasExternalAction = actionKeywords.some(kw => msgLower.includes(kw));
@@ -163,8 +166,8 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger) {
   const recentCtx = (conversationHistory || []).slice(-4)
     .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
-  const contextBlock = recentCtx ? `\nRecent conversation:\n${recentCtx}\n` : '';
-  const userPrompt = `Decompose this user message into ordered single-intent sub-prompts.${contextBlock}\n"${message}"`;
+  const contextBlock = recentCtx ? `\nRecent conversation (for context/grounding only - DO NOT include in decomposition):\n${recentCtx}\n` : '';
+  const userPrompt = `Decompose ONLY the NEW user message below into ordered single-intent sub-prompts.${contextBlock}\nNEW MESSAGE TO DECOMPOSE:\n"${message}"`;
 
   let raw;
   try {
@@ -220,6 +223,23 @@ module.exports = async function decomposePromptV2(state) {
   
   // Force-collapse user info queries to 1-step (backup if LLM ignores prompt instruction)
   subPrompts = collapseUserInfoQuery(subPrompts, message, logger);
+
+  // Filter out sub-prompts that are just repeats of previous user messages (catch LLM hallucinations)
+  const recentUserMessages = (conversationHistory || [])
+    .filter(m => m.role === 'user')
+    .slice(-3)
+    .map(m => String(m.content || '').toLowerCase().trim());
+
+  subPrompts = subPrompts.filter(sp => {
+    const spText = String(sp.text || '').toLowerCase().trim();
+    const isDuplicate = recentUserMessages.some(prev =>
+      spText === prev || spText.includes(prev) || prev.includes(spText)
+    );
+    if (isDuplicate) {
+      logger.info(`[Node:DecomposePromptV2] Filtered duplicate sub-prompt from history: ${sp.text.slice(0, 60)}`);
+    }
+    return !isDuplicate;
+  });
   
   const durationMs = Date.now() - t0;
 

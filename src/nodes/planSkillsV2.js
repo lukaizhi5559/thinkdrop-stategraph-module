@@ -339,7 +339,7 @@ async function planSkillsV2(state) {
   // ── Project skill plan passthrough ────────────────────────────────────────
   if (state.projectSkillPlan && Array.isArray(state.projectSkillPlan) && state.projectSkillPlan.length > 0) {
     logger.info(`[Node:PlanSkillsV2] Using project skill plan: ${state.projectSkillPlan[0].skill}`);
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: state.projectSkillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args })), intent: 'command_automate' });
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: state.projectSkillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args, runGroup: s.runGroup || undefined })), intent: 'command_automate' });
     return { ...state, skillPlan: state.projectSkillPlan, skillCursor: 0, planError: null, recoveryContext: null };
   }
 
@@ -356,15 +356,30 @@ async function planSkillsV2(state) {
   }
 
   // ── Pre-approved skill plan fast-path ─────────────────────────────────────
+  // _skillPlan may be either a JS array (decoded by main.js plan:approve before enqueue)
+  // or a base64 string (legacy path / direct enqueue). Handle both to avoid silent failures.
   if (state._skillPlan && !recoveryContext) {
     try {
-      const decoded = JSON.parse(Buffer.from(state._skillPlan, 'base64').toString('utf8'));
+      const decoded = Array.isArray(state._skillPlan)
+        ? state._skillPlan
+        : JSON.parse(Buffer.from(state._skillPlan, 'base64').toString('utf8'));
       if (Array.isArray(decoded) && decoded.length > 0) {
-        logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${decoded.length} steps`);
-        if (progressCallback) progressCallback({ type: 'plan_ready', steps: decoded.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })), intent: state.intent?.type || 'command_automate' });
-        return { ...state, skillPlan: decoded, skillCursor: 0, planError: null, recoveryContext: null };
+        // Check if this is a multi-service comparison task that needs parallel execution
+        const _multiServicePattern = /\b(perplexity|chatgpt|gemini|claude|google|amazon|ebay|etsy|stackoverflow|youtube|twitter|x|reddit)\b.*\b(perplexity|chatgpt|gemini|claude|google|amazon|ebay|etsy|stackoverflow|youtube|twitter|x|reddit)\b/i;
+        const _isMultiService = _multiServicePattern.test(state.originalPrompt || state.message || '');
+        const _hasRunGroup = decoded.some(s => s.runGroup);
+        if (_isMultiService && !_hasRunGroup) {
+          logger.info(`[Node:PlanSkillsV2] Multi-service task detected but no runGroup in cached plan — forcing regeneration`);
+          // Fall through to LLM planning to get proper runGroup assignment
+        } else {
+          logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${decoded.length} steps`);
+          if (progressCallback) progressCallback({ type: 'plan_ready', steps: decoded.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
+          return { ...state, skillPlan: decoded, skillCursor: 0, planError: null, recoveryContext: null };
+        }
       }
-    } catch (_) {}
+    } catch (err) {
+      logger.warn(`[Node:PlanSkillsV2] _skillPlan fast-path decode failed: ${err.message} — falling through to LLM`);
+    }
   }
 
   // ── Login resume fast-path ────────────────────────────────────────────────
@@ -846,7 +861,7 @@ Example:
         const retryRaw = await backend.generateAnswer(enrichedQuery, payload, payload.options, null);
         const retryPlan = parsePlan(retryRaw, logger);
         if (retryPlan && Array.isArray(retryPlan)) {
-          if (progressCallback) progressCallback({ type: 'plan_ready', steps: retryPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args })), intent: state.intent?.type || 'command_automate' });
+          if (progressCallback) progressCallback({ type: 'plan_ready', steps: retryPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
           return { ...state, skillPlan: retryPlan, skillCursor: 0, recoveryContext: null, planError: null };
         }
       } catch (_) {}

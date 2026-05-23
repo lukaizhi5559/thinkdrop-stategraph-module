@@ -25,9 +25,25 @@ module.exports = async function webSearch(state) {
 
   try {
     // Extract search query — prepend _dataPrefix (injected by multi-intent queue runner) if present
-    const query = (state._dataPrefix ? state._dataPrefix + ' ' : '') +
-                  message.replace(/^(search for|search|find|look up|google)\s+/i, '').trim();
-    
+    let query = (state._dataPrefix ? state._dataPrefix + ' ' : '') +
+                message.replace(/^(search for|search|find|look up|google)\s+/i, '').trim();
+
+    // ── Screen follow-up: inject screen subject into query ───────────────────
+    // classifyTask already resolved the concrete subject via LLM — trust it directly.
+    // No regex: the isScreenFollowUp flag IS the signal. Prepend subject so search is concrete.
+    const tc = state._taskClassification || {};
+    if (tc.isScreenFollowUp) {
+      const screenSubject =
+        tc.followUpTarget ||
+        state._priorScreenContext?.windowTitle ||
+        state._priorScreenContext?.appName ||
+        null;
+      if (screenSubject) {
+        query = `${screenSubject} ${query}`;
+        logger.info(`[Node:WebSearch] isScreenFollowUp — prepended subject: "${query}"`);
+      }
+    }
+
     logger.debug(`[Node:WebSearch] Query: "${query}"`);
 
     // Call web-search service

@@ -359,7 +359,7 @@ class StateGraphBuilder {
     // Full nodes with intent-based routing
     const nodes = {
       decomposePrompt: (state) => decomposePromptNode({ ...state, logger, llmBackend }),
-      resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter }),
+      resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       checkPlanCache: (state) => checkPlanCacheNode({ ...state, logger }),
@@ -413,6 +413,43 @@ class StateGraphBuilder {
       enrichIntent: async (state) => {
         const intentType = state.intent?.type || 'general_query';
         logger.info(`[StateGraph:Router] enrichIntent exit — intent: ${intentType} | _planFile: ${!!state._planFile} | _planMode: ${!!state._planMode}`);
+
+        // ── Screen follow-up: inject prior screen context before routing ─────
+        // When classifyTask detected isScreenFollowUp=true and we have a recent
+        // screen context file, attach the OCR text to state.context so answer.js
+        // injects it into systemInstructions regardless of which intent was classified.
+        if (state._taskClassification?.isScreenFollowUp && state._priorScreenContext?.contextText) {
+          logger.info(`[StateGraph:Router] isScreenFollowUp=true — injecting prior screen context (${state._priorScreenContext.contextText.length} chars)`);
+          state.context = state._priorScreenContext.contextText;
+          state.screenContext = state._priorScreenContext;
+          state._needsContextInterpretation = true;
+        }
+
+        // ── Screen follow-up knowledge query: bypass automation entirely ────────
+        // classifyTask already classified this as taskType='query' — the user is
+        // asking a knowledge question about what's on screen, not requesting an action.
+        // Route directly to answer which already has state.context (OCR text) injected above.
+        if (
+          state._taskClassification?.isScreenFollowUp &&
+          state._taskClassification?.taskType === 'query' &&
+          intentType === 'command_automate'
+        ) {
+          logger.info(`[StateGraph:Router] isScreenFollowUp+query — overriding command_automate → answer`);
+          state.intent = { type: 'general_knowledge', confidence: 0.95, entities: [], requiresMemoryAccess: false };
+          return 'answer';
+        }
+
+        // ── Lazy screen grab: referential message but no screen context available ───
+        // classifyTask set needsFreshScreen=true: message is deictic/ambiguous but
+        // there is no PRIOR SCREEN CONTEXT block. Capture fresh screen content first,
+        // then route to the correct handler with enriched context.
+        // Guard: !state._needsFreshScreen prevents re-triggering after the grab completes.
+        if (state._taskClassification?.needsFreshScreen && !state._needsFreshScreen) {
+          logger.info(`[StateGraph:Router] needsFreshScreen=true — auto-capturing screen before routing (intent: ${intentType})`);
+          state._needsFreshScreen = true;
+          state._postScreenIntent = intentType;
+          return 'screenIntelligence';
+        }
 
         // Enrichment gaps remain — ask user first (surface the question via logConversation)
         if (Array.isArray(state.enrichmentNeeded) && state.enrichmentNeeded.length > 0) {
@@ -515,25 +552,6 @@ class StateGraphBuilder {
           return 'executeCommand';
         }
         if (intentType === 'screen_intelligence') {
-          // Check for ambiguous follow-up queries that need conversation context
-          // These should go to answer node where LLM can interpret context naturally
-          const ambiguousPatterns = [
-            /\b(analysis|analyze|tell me about|what are)\s+(them|those|these|the|that|it|they)\b/i,
-            /\b(what about|what's with|what is with)\s+(them|those|these|the|that|it|they)\b/i,
-            /\b(what are the|tell me about the)\s+(screenshots?|pictures?|images?|files?)\b/i,
-            /\b(what|tell me|explain)\s+(about|regarding|concerning)?\s*(them|those|these)\b/i,
-            /\b(it|they|them|those)\s+(are|is|look|seem)\b/i,
-          ];
-          
-          const isAmbiguousFollowup = ambiguousPatterns.some(p => p.test(state.message || ''));
-          
-          if (isAmbiguousFollowup) {
-            logger.info(`[StateGraph:Router] Ambiguous follow-up detected for screen_intelligence — routing to answer node for context interpretation`);
-            // Mark this as needing context interpretation so answer node can include conversation history
-            state._needsContextInterpretation = true;
-            return 'answer';
-          }
-          
           return 'screenIntelligence';
         }
         if (intentType === 'system_settings') {
@@ -696,9 +714,54 @@ class StateGraphBuilder {
       // Screen intelligence path
       screenIntelligence: (state) => {
         // If already has answer (from vision API), log and end
-        if (state.answer) {
+        if (state.answer && !state._needsFreshScreen) {
           return 'logConversation';
         }
+
+        // ── Lazy screen grab cycle: fresh context captured, route to original intent ──
+        if (state._needsFreshScreen && state.context) {
+          logger.info(`[StateGraph:Router] _needsFreshScreen — fresh context captured, routing based on postIntent: ${state._postScreenIntent}`);
+
+          // Inject fresh capture into _priorScreenContext shape so downstream nodes see it
+          state._priorScreenContext = {
+            timestamp:   new Date().toISOString(),
+            appName:     state.screenContext?.appName     || null,
+            windowTitle: state.screenContext?.windowTitle || null,
+            url:         state.screenContext?.url         || null,
+            contextText: state.context,
+          };
+          state._taskClassification = {
+            ...(state._taskClassification || {}),
+            isScreenFollowUp: true,
+            followUpTarget: state.screenContext?.windowTitle || state.screenContext?.appName || null,
+          };
+
+          // Clear flags so multi-intent queue steps don't re-trigger
+          state._needsFreshScreen = false;
+          const postIntent = state._postScreenIntent || 'general_knowledge';
+          state._postScreenIntent = null;
+
+          // command_automate / scheduling: enrich resolvedMessage, proceed through automation path
+          if (postIntent === 'command_automate' || postIntent === 'scheduling') {
+            const subject = state.screenContext?.windowTitle || state.screenContext?.appName || '';
+            if (subject && state.resolvedMessage) {
+              state.resolvedMessage = `[Screen context: ${subject}] ${state.resolvedMessage}`;
+              logger.info(`[StateGraph:Router] _needsFreshScreen — enriched resolvedMessage for ${postIntent}`);
+            }
+            return 'resolveUserContext';
+          }
+
+          // memory intents: subject injected via _priorScreenContext, route normally
+          if (postIntent === 'memory_retrieve') return 'retrieveMemory';
+          if (postIntent === 'memory_store') return 'storeMemory';
+
+          // web_search: subject prepended by webSearch.js via _priorScreenContext
+          if (postIntent === 'web_search') return 'webSearch';
+
+          // query / general_knowledge / ambiguous / greeting → answer with injected context
+          return 'answer';
+        }
+
         // Otherwise, process with LLM
         return 'answer';
       },

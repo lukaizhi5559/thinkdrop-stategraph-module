@@ -14,6 +14,10 @@
  * - If no sessionId, calls session.route to auto-match or create a session
  */
 
+const fs   = require('fs');
+const os   = require('os');
+const path = require('path');
+
 module.exports = async function logConversation(state) {
   const { mcpAdapter, message, answer, context, intent } = state;
   const logger = state.logger || console;
@@ -209,6 +213,27 @@ module.exports = async function logConversation(state) {
     await Promise.all(logPromises);
 
     logger.debug(`[Node:LogConversation] Logged conversation turn to session: ${sessionId}`);
+
+    // ── Persist screen context for cross-turn/cross-session follow-ups ──────────
+    // Written after every screen_intelligence turn so resolveReferencesV2 can
+    // pick it up on the next prompt regardless of which session it lands in.
+    if (intent?.type === 'screen_intelligence' && state.screenContext) {
+      try {
+        const screenFile = path.join(os.homedir(), '.thinkdrop', 'last-screen-context.json');
+        const screenPayload = {
+          timestamp:   new Date().toISOString(),
+          appName:     state.screenContext.appName     || null,
+          windowTitle: state.screenContext.windowTitle || null,
+          url:         state.screenContext.url         || null,
+          contextText: typeof state.context === 'string' ? state.context : null,
+        };
+        fs.mkdirSync(path.join(os.homedir(), '.thinkdrop'), { recursive: true });
+        fs.writeFileSync(screenFile, JSON.stringify(screenPayload, null, 2), 'utf8');
+        logger.info(`[Node:LogConversation] screen_intelligence: wrote last-screen-context.json (${screenPayload.contextText?.length ?? 0} chars)`);
+      } catch (screenErr) {
+        logger.warn(`[Node:LogConversation] Failed to write last-screen-context.json: ${screenErr.message}`);
+      }
+    }
 
     return {
       ...state,

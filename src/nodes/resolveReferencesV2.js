@@ -20,6 +20,51 @@ function stripHtml(text) {
   return text ? text.replace(/<[^>]*>/g, '') : text;
 }
 
+// ── Fetch recent screen context from the background monitor heartbeat ───────────────────
+// The user-memory monitor runs every 5s, capturing screen OCR on window change or pixel diff.
+// memory.getRecentOcr returns the freshest capture within maxAgeSeconds — always current.
+// Falls back to the static last-screen-context.json file if the MCP call fails.
+const fs   = require('fs');
+const os   = require('os');
+const path = require('path');
+
+async function getRecentMonitorCapture(mcpAdapter, logger) {
+  // Primary: live monitor via user-memory MCP (max 5s stale)
+  if (mcpAdapter) {
+    try {
+      const result = await mcpAdapter.callService('user-memory', 'memory.getRecentOcr', {
+        maxAgeSeconds: 300, // 5 minutes — generous; monitor fires every 5s
+      });
+      const data = result?.data || result;
+      if (data?.available && data?.capture) {
+        const c = data.capture;
+        return {
+          timestamp:   c.capturedAt   || c.created_at || new Date().toISOString(),
+          appName:     c.appName      || null,
+          windowTitle: c.windowTitle  || null,
+          url:         c.url          || null,
+          contextText: c.text         || null,
+        };
+      }
+    } catch (err) {
+      logger.debug(`[Node:ResolveReferencesV2] memory.getRecentOcr unavailable: ${err.message}`);
+    }
+  }
+  // Fallback: static file written by logConversation after explicit screen_intelligence turns
+  try {
+    const screenFile = path.join(os.homedir(), '.thinkdrop', 'last-screen-context.json');
+    if (!fs.existsSync(screenFile)) return null;
+    const raw = fs.readFileSync(screenFile, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!parsed.timestamp) return null;
+    const ageMs = Date.now() - new Date(parsed.timestamp).getTime();
+    if (ageMs > 30 * 60 * 1000) return null; // 30min TTL for the fallback file
+    return parsed;
+  } catch (_) {
+    return null;
+  }
+}
+
 module.exports = async function resolveReferencesV2(state) {
   const { mcpAdapter, message, context } = state;
   const logger = state.logger || console;
@@ -68,13 +113,32 @@ module.exports = async function resolveReferencesV2(state) {
     logger.debug('[Node:ResolveReferencesV2] Could not fetch history, proceeding without:', err.message);
   }
 
-  // ── Classify task once — all downstream nodes read from _taskClassification ──
+  // ── Load prior screen context — prefer live monitor heartbeat, fallback to file ──────
+  const _priorScreenContext = await getRecentMonitorCapture(mcpAdapter, logger);
+  if (_priorScreenContext) {
+    const ageMin = Math.round((Date.now() - new Date(_priorScreenContext.timestamp).getTime()) / 60000);
+    logger.debug(`[Node:ResolveReferencesV2] Prior screen context available (${ageMin} min old): ${_priorScreenContext.appName || 'unknown app'}`);
+  }
+
+  // Build a compact summary string for the classifyTask LLM prompt when screen context exists
+  let priorScreenSummary = null;
+  if (_priorScreenContext) {
+    const ageMin = Math.round((Date.now() - new Date(_priorScreenContext.timestamp).getTime()) / 60000);
+    const parts = [];
+    if (_priorScreenContext.appName)     parts.push(`App: ${_priorScreenContext.appName}`);
+    if (_priorScreenContext.windowTitle) parts.push(`Window: "${_priorScreenContext.windowTitle}"`);
+    if (_priorScreenContext.url)         parts.push(`URL: ${_priorScreenContext.url}`);
+    priorScreenSummary = `PRIOR SCREEN CONTEXT (captured ${ageMin} min ago): ${parts.join(', ')}`;
+  }
+
+  // ── Classify task once — all downstream nodes read from _taskClassification ──────────
   // This replaces per-node NLU regex (BYPASS_PATTERNS, _LOCAL_ACTION_VERBS, etc.)
   const _taskClassification = await classifyTask(
     message,
     conversationHistory,
     state.llmBackend || null,
-    logger
+    logger,
+    priorScreenSummary,
   );
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
 
@@ -84,6 +148,7 @@ module.exports = async function resolveReferencesV2(state) {
     originalMessage:        message,
     conversationHistory,
     _taskClassification,
+    _priorScreenContext:    _priorScreenContext || null,
     coreferenceMethod:      'none',
     coreferenceReplacements: [],
   };
