@@ -19,6 +19,110 @@ const fs   = require('fs');
 const os   = require('os');
 
 const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../utils/planHelpers');
+
+/**
+ * Analyzes a skill plan and adds runGroup properties for parallel execution.
+ * Only called for plans with 4+ steps to avoid unnecessary LLM overhead.
+ * 
+ * @param {Array} skillPlan - The generated skill plan
+ * @param {string} userMessage - Original user request
+ * @param {Object} backend - LLM backend instance
+ * @param {Object} logger - Logger instance
+ * @returns {Array} - Plan with runGroup properties added where appropriate
+ */
+async function analyzeAndAddParallelGroups(skillPlan, userMessage, backend, logger) {
+  try {
+    logger.info(`[Node:PlanSkillsV2] Analyzing ${skillPlan.length} steps for parallel execution opportunities`);
+    
+    // Create a numbered list of steps for the LLM
+    const stepsList = skillPlan.map((step, i) => {
+      const desc = step.description || buildStepDescription(step);
+      return `${i + 1}. ${step.skill} — ${desc}`;
+    }).join('\n');
+    
+    const analysisPrompt = `Analyze this skill plan and identify which steps can run in parallel.
+
+USER REQUEST: "${userMessage}"
+
+PLAN STEPS:
+${stepsList}
+
+ORIGINAL PLAN STRUCTURE (preserve exactly, only add runGroup):
+${JSON.stringify(skillPlan, null, 2)}
+
+RULES:
+- Steps can run in parallel ONLY if they don't depend on each other's output
+- Independent searches, fetches, or data gathering steps are good candidates
+- synthesize, schedule, and shell.run steps should NOT be parallelized
+- Group consecutive independent steps with the same runGroup ID (g1, g2, etc.)
+- If no steps can be parallelized, return the plan unchanged
+- CRITICAL: Preserve ALL fields exactly as they are, only ADD runGroup where appropriate
+- DO NOT modify args, skill, description, or any other existing fields
+- IMPORTANT: Do NOT group steps that use template variables (like {{bestUrl}}, {{result}}, etc.) from previous steps
+- IMPORTANT: If a step's args contain {{variable}} patterns, it depends on the previous step and cannot be parallel
+
+Return the plan as a JSON array with runGroup properties added where appropriate.
+The output must be a valid JSON array starting with [ and ending with ].
+Example: [{"skill": "web.agent", "args": {"action": "...", "query": "..."}, "runGroup": "g1"}, ...]`;
+
+    const response = await backend.generateAnswer(analysisPrompt, {
+      query: analysisPrompt,
+      context: {
+        systemInstructions: 'You are a parallel execution optimizer. Return only valid JSON arrays.',
+        conversationHistory: [],
+        intent: 'command_automate'
+      },
+      options: { maxTokens: 1000, temperature: 0.1 }
+    });
+    
+    if (!response) {
+      logger.warn('[Node:PlanSkillsV2] Parallel analysis returned empty response');
+      return skillPlan;
+    }
+    
+    // Try to parse the response
+    let analyzedPlan;
+    try {
+      analyzedPlan = parsePlan(response, logger);
+    } catch (parseErr) {
+      logger.warn(`[Node:PlanSkillsV2] Failed to parse parallel analysis response: ${parseErr.message}`);
+      return skillPlan;
+    }
+    
+    if (!Array.isArray(analyzedPlan) || analyzedPlan.length !== skillPlan.length) {
+      logger.warn('[Node:PlanSkillsV2] Parallel analysis returned invalid plan structure');
+      return skillPlan;
+    }
+    
+    // Validate that args objects are preserved correctly
+    const corruptedArgs = analyzedPlan.filter((step, i) => {
+      const originalArgs = skillPlan[i].args;
+      const newArgs = step.args;
+      // Check if args was converted from object to string
+      return (typeof originalArgs === 'object' && originalArgs !== null) && 
+             (typeof newArgs !== 'object' || newArgs === null);
+    });
+    
+    if (corruptedArgs.length > 0) {
+      logger.warn(`[Node:PlanSkillsV2] Parallel analysis corrupted ${corruptedArgs.length} args fields - falling back to original plan`);
+      return skillPlan;
+    }
+    
+    // Count how many runGroups were added
+    const runGroupsAdded = analyzedPlan.filter(s => s.runGroup).length;
+    if (runGroupsAdded > 0) {
+      logger.info(`[Node:PlanSkillsV2] Added ${runGroupsAdded} steps to parallel groups`);
+      return analyzedPlan;
+    } else {
+      logger.info('[Node:PlanSkillsV2] No parallel execution opportunities identified');
+      return skillPlan;
+    }
+    
+  } catch (err) {
+    logger.error(`[Node:PlanSkillsV2] Error in parallel analysis: ${err.message}`);
+    return skillPlan;
+  }
+}
 const {
   parseContractCommands,
   resolveDateRange,
@@ -256,19 +360,12 @@ When a step produces content (text, markdown, JSON, file list, etc.) that a LATE
 
 const SKILL_SYSTEM_PROMPT_FALLBACK = `You are an automation planner. Convert the user's request into an ordered list of skill steps.
 
-Available skills: shell.run, browser.act, ui.axClick, ui.moveMouse, ui.click, ui.typeText, ui.waitFor, api_suggest, guide.step, needs_install
+Available skills: shell.run, browser.act, api_suggest, guide.step, needs_install
 
 shell.run|args:{cmd,argv[],cwd?,timeoutMs?,dryRun?,stdin?}
 browser.act|args:{action,url?,selector?,text?,sessionId?,timeoutMs?}
-ui.axClick|args:{app,label,role?,button?,settleMs?,timeoutMs?}|clicks_native_app_element_via_OS_accessibility_API
-ui.moveMouse|args:{label,settleMs?,confidence?,timeoutMs?}|OmniParser_LAST_RESORT_only
-ui.click|args:{button?,modifier?,x?,y?,settleMs?}|use_after_ui.moveMouse
-ui.typeText|args:{text,delayMs?}|tokens:{ENTER}{TAB}{ESC}{CMD+K}{CMD+C}{CMD+V}{BACKSPACE}{UP}{DOWN}
-ui.waitFor|args:{condition,value?,timeoutMs?}|conditions:text,app,url,windowTitle
 
-Priority: shell.run > browser.act > keyboard shortcuts > ui.axClick (native only) > ui.moveMouse+ui.click (last resort).
-ui.findAndClick does NOT exist. ui.axClick ONLY works for true native macOS apps.
-For Slack: always use osascript activate + {CMD+K} + type + {DOWN}{ENTER}. Never ui.axClick.
+Priority: shell.run > browser.act > keyboard shortcuts.
 api_suggest: use as FIRST step when task is RECURRING or programmatic AND the service has an API.
 guide.step: use for ANY task where the user must act manually step by step.
 Policy: no sudo/su/passwd. argv is string[] — no shell interpolation.
@@ -364,18 +461,9 @@ async function planSkillsV2(state) {
         ? state._skillPlan
         : JSON.parse(Buffer.from(state._skillPlan, 'base64').toString('utf8'));
       if (Array.isArray(decoded) && decoded.length > 0) {
-        // Check if this is a multi-service comparison task that needs parallel execution
-        const _multiServicePattern = /\b(perplexity|chatgpt|gemini|claude|google|amazon|ebay|etsy|stackoverflow|youtube|twitter|x|reddit)\b.*\b(perplexity|chatgpt|gemini|claude|google|amazon|ebay|etsy|stackoverflow|youtube|twitter|x|reddit)\b/i;
-        const _isMultiService = _multiServicePattern.test(state.originalPrompt || state.message || '');
-        const _hasRunGroup = decoded.some(s => s.runGroup);
-        if (_isMultiService && !_hasRunGroup) {
-          logger.info(`[Node:PlanSkillsV2] Multi-service task detected but no runGroup in cached plan — forcing regeneration`);
-          // Fall through to LLM planning to get proper runGroup assignment
-        } else {
-          logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${decoded.length} steps`);
-          if (progressCallback) progressCallback({ type: 'plan_ready', steps: decoded.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
-          return { ...state, skillPlan: decoded, skillCursor: 0, planError: null, recoveryContext: null };
-        }
+        logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${decoded.length} steps`);
+        if (progressCallback) progressCallback({ type: 'plan_ready', steps: decoded.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
+        return { ...state, skillPlan: decoded, skillCursor: 0, planError: null, recoveryContext: null };
       }
     } catch (err) {
       logger.warn(`[Node:PlanSkillsV2] _skillPlan fast-path decode failed: ${err.message} — falling through to LLM`);
@@ -751,21 +839,37 @@ async function planSkillsV2(state) {
   // info while browsing), instruct the LLM to mark them with the same runGroup
   // value so executeCommand.js can fan them out with Promise.allSettled.
   const parallelNote = `\n\n## PARALLEL EXECUTION (runGroup)
-When two or more steps are completely independent (no data dependency between them), add "runGroup": "<group_id>" to each step in the group. Steps sharing the same runGroup value will be executed in parallel.
+When two or more steps are completely independent (no data dependency between them), add "runGroup": "<group_id>" to each step in the group. Steps sharing the same runGroup value will be executed in parallel using Promise.allSettled.
+
+IMPORTANT: ALWAYS apply parallel grouping when:
+1. Multiple independent searches on the same service (e.g., finding 3 different YouTube videos)
+2. Multiple independent items being looked up (e.g., "find these products", "search for several items")
+3. Tasks that don't depend on each other's output
+4. The user asks for multiple distinct things
 
 Rules:
 - Use short IDs like "g1", "g2" etc.
 - Only group steps that do NOT depend on each other's output
 - Grouped steps MUST be consecutive in the plan array
 - Do NOT group synthesize, schedule, or shell.run steps
-- Example: comparing prices on site A AND site B, plus resolving user email → all three can be "runGroup": "g1" since none depend on each other
+- Each search/navigate/watch sequence for different items can be parallelized
 
-Example:
+Available agents/skills that can be parallelized (when independent):
+- cli.agent - CLI tool automation and command execution
+- browser.agent - Web browser automation and site interaction  
+- shell.run - Shell command execution
+- browser.act - Browser actions and navigation
+- screen.capture - Screen capture and visual analysis
+- system.introspect - System information and diagnostics
+- web.crawl - Web crawling and data extraction
+- external.skill - External skill execution
+- image.analyze - Image analysis and processing
+
+Generic parallel template (any combination of above agents):
 [
-  { "skill": "browser.agent", "args": { "agentId": "amazon.agent", ... }, "runGroup": "g1", "description": "Search Amazon" },
-  { "skill": "browser.agent", "args": { "agentId": "ebay.agent", ... },   "runGroup": "g1", "description": "Search eBay" },
-  { "skill": "user.agent",    "args": { ... },                             "runGroup": "g1", "description": "Resolve user email" },
-  { "skill": "synthesize",    "args": { "prompt": "Compare and email results" } }
+  { "skill": "[agent/skill]", "args": { "action": "run", "agentId": "service", "task": "task 1" }, "runGroup": "g1", "description": "Task 1" },
+  { "skill": "[agent/skill]", "args": { "action": "run", "agentId": "service", "task": "task 2" }, "runGroup": "g1", "description": "Task 2" },
+  { "skill": "synthesize", "args": { "prompt": "Combine and present results" } }
 ]`;
 
   const planningQuery = [
@@ -1112,6 +1216,12 @@ Example:
     const capability = needsSkillStep.args?.capability || userMessage;
     if (progressCallback) progressCallback({ type: 'needs_skill', capability });
     logger.info(`[Node:PlanSkillsV2] needs_skill: "${capability}"`);
+  }
+
+  // ── Conditional parallel execution analysis ───────────────────────────────
+  // Only analyze plans with 4+ steps for parallel execution opportunities
+  if (Array.isArray(skillPlan) && skillPlan.length >= 4 && backend) {
+    skillPlan = await analyzeAndAddParallelGroups(skillPlan, userMessage, backend, logger);
   }
 
   // ── Save skill intent detection ───────────────────────────────────────────

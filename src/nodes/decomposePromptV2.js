@@ -38,6 +38,12 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - PRIORITY RULE - USER INFO ONLY: When the request is ONLY asking to show/list/tell/display USER INFO with NO external action (e.g. "who is my wife", "list my family", "what is my mom's phone", "tell me about my contacts"), use SINGLE memory_retrieve step. Do NOT use command_automate for pure info lookup.
 - PRIORITY RULE - KNOWLEDGE vs SEARCH vs ACTION (when no specific website/tool is mentioned): For general questions without browser/tool interaction: Use general_knowledge for math/calculations ("convert 88s to minutes", "what is 5*7"), timeless facts ("who wrote Pride and Prejudice"), and definitions ("what is blockchain"). Use web_search for time-sensitive info (prices, news, "latest", "current"). Use command_automate ONLY when specific website interaction, tool usage, or external action is required.
 - General rule: When a request combines data retrieval with an action (e.g., "send weather info via email"), split into TWO steps: (1) retrieve the data (memory_retrieve/web_search), (2) perform the action (command_automate with dependsOn:[0]).
+- PRIORITY RULE - NAMED SERVICE/PLATFORM INTERACTION: When a user mentions a specific named service, website, platform, or application AND wants to find, search, locate, extract, or interact with content on that specific service → command_automate. Key distinction: "find workout videos" (general knowledge) vs "find workout videos on [named service]" (automation).
+- PRIORITY RULE - CONTENT/LINK EXTRACTION: Any request to extract, retrieve, get, or obtain specific links, URLs, or structured content from a targeted source → command_automate.
+- PRIORITY RULE - TARGETED INFORMATION RETRIEVAL: When the request specifies WHERE to find information (on a particular site, in a specific app, through a named service) rather than just asking WHAT information → command_automate.
+- PRIORITY RULE - INTERACTIVE TASKS: Any request that implies interacting with a specific interface, form, or system to accomplish a goal → command_automate.
+- PRIORITY RULE - ACCOUNT/PROFILE-BASED ACTIONS: Tasks that require accessing or managing information within a specific account, profile, or personalized system → command_automate.
+- PRIORITY RULE - REAL-TIME DATA ACCESS: Requests for current, live, or real-time information from specific services that require navigation → command_automate.
 
 JSON shape: {"subPrompts":[{"text":"...","estimatedIntent":"command_automate","order":0,"dependsOn":[],"isLongRunning":false}]}`;
 
@@ -181,12 +187,18 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger) {
   }
 
   if (!raw) return null;
+  logger.debug(`[Node:DecomposePromptV2] Raw LLM response: ${raw.slice(0, 200)}...`);
   const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
   const sanitized = cleaned.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ' ');
+  logger.debug(`[Node:DecomposePromptV2] Cleaned response: ${sanitized.slice(0, 200)}...`);
   try {
     const parsed = JSON.parse(sanitized);
+    logger.debug(`[Node:DecomposePromptV2] Parsed JSON: ${JSON.stringify(parsed).slice(0, 200)}...`);
     const subPrompts = parsed.subPrompts || parsed.sub_prompts;
-    if (!Array.isArray(subPrompts) || subPrompts.length < 1) return null;
+    if (!Array.isArray(subPrompts) || subPrompts.length < 1) {
+      logger.warn(`[Node:DecomposePromptV2] No valid subPrompts array found - parsed.subPrompts: ${JSON.stringify(parsed.subPrompts)}, parsed.sub_prompts: ${JSON.stringify(parsed.sub_prompts)}`);
+      return null;
+    }
     return subPrompts.map((sp, i) => ({
       text:            String(sp.text || '').trim().slice(0, 300),
       estimatedIntent: sp.estimatedIntent || sp.estimated_intent || 'general_knowledge',
@@ -220,21 +232,48 @@ module.exports = async function decomposePromptV2(state) {
 
   const t0 = Date.now();
   let subPrompts = await llmDecompose(message, llmBackend, conversationHistory, logger);
-  
+
+  // Guard: llmDecompose returns null on LLM failure or JSON parse error — pass-through
+  if (!subPrompts) {
+    logger.debug('[Node:DecomposePromptV2] llmDecompose returned null — pass-through');
+    return state;
+  }
+
   // Force-collapse user info queries to 1-step (backup if LLM ignores prompt instruction)
   subPrompts = collapseUserInfoQuery(subPrompts, message, logger);
 
+  // Guard: collapseUserInfoQuery can also return null for non-array input
+  if (!subPrompts) {
+    logger.debug('[Node:DecomposePromptV2] collapseUserInfoQuery returned null — pass-through');
+    return state;
+  }
+
   // Filter out sub-prompts that are just repeats of previous user messages (catch LLM hallucinations)
+  // Only filter exact matches, not partial matches, to avoid filtering legitimate platform-specific queries
+  // GRACE PERIOD: Don't filter if the similar message is >5 minutes old (user likely re-asking intentionally)
+  const FIVE_MINUTES_MS = 5 * 60 * 1000;
+  const now = Date.now();
   const recentUserMessages = (conversationHistory || [])
     .filter(m => m.role === 'user')
     .slice(-3)
-    .map(m => String(m.content || '').toLowerCase().trim());
+    .map(m => ({
+      text: String(m.content || '').toLowerCase().trim(),
+      timestamp: m.timestamp || m.created_at || now // fallback to now if no timestamp
+    }));
 
   subPrompts = subPrompts.filter(sp => {
     const spText = String(sp.text || '').toLowerCase().trim();
-    const isDuplicate = recentUserMessages.some(prev =>
-      spText === prev || spText.includes(prev) || prev.includes(spText)
-    );
+    const isDuplicate = recentUserMessages.some(prev => {
+      const textMatch = spText === prev.text;
+      if (!textMatch) return false;
+      // Check age - if >5 minutes old, treat as intentional re-request, not duplicate
+      const ageMs = now - (new Date(prev.timestamp).getTime() || now);
+      if (ageMs > FIVE_MINUTES_MS) {
+        logger.debug(`[Node:DecomposePromptV2] Similar message found but >5min old (${Math.round(ageMs/1000)}s) - treating as new request`);
+        return false;
+      }
+      return true; // Recent duplicate
+    });
     if (isDuplicate) {
       logger.info(`[Node:DecomposePromptV2] Filtered duplicate sub-prompt from history: ${sp.text.slice(0, 60)}`);
     }

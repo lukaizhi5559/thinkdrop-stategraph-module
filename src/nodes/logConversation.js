@@ -46,6 +46,7 @@ module.exports = async function logConversation(state) {
         const routeResult = await mcpAdapter.callService('conversation', 'session.route', {
           text: message,
           userId: context?.userId,
+          hintSessionId: state.resolvedSessionId || null,
           metadata: {
             intent: intent?.type,
             source: 'thinkdrop_electron'
@@ -53,7 +54,7 @@ module.exports = async function logConversation(state) {
         });
         const routeData = routeResult.data || routeResult;
         sessionId = routeData.sessionId || routeData.session?.id;
-        logger.debug(`[Node:LogConversation] Routed to session: ${sessionId}`);
+        logger.debug(`[Node:LogConversation] Routed to session: ${sessionId} (action: ${routeData.action || 'unknown'})`);
       } catch (routeErr) {
         logger.warn('[Node:LogConversation] Session routing failed, trying session.create:', routeErr.message);
         try {
@@ -180,6 +181,12 @@ module.exports = async function logConversation(state) {
         richAssistantText = `${answer}\n\nStep outputs:\n[synthesize]:\n${_memAnswer.slice(0, 2000)}`;
         logger.info(`[Node:LogConversation] memory_retrieve: wrapped answer as [synthesize]: for follow-up context (${_memAnswer.length} chars)`);
       }
+    }
+
+    // Strip markdown code fences before storing — prevents ```tool_code or ```json blocks
+    // from being persisted as history, which would prime the next LLM call to output code.
+    if (richAssistantText && typeof richAssistantText === 'string') {
+      richAssistantText = richAssistantText.replace(/^```[\w]*\r?\n?/gm, '').replace(/\r?\n?```\s*$/gm, '').trim();
     }
 
     // [DEBUG DIAG] Remove after BODY fix confirmed

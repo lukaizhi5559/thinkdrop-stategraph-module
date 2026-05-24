@@ -215,9 +215,9 @@ function extractStepResult(state) {
     }
   }
 
-  // memory_store: confirm text
+  // memory_store: use the answer set by storeMemory node
   if (intent === 'memory_store') {
-    return `Stored: ${state.message?.slice(0, 200) || 'memory stored'}`;
+    return state.answer?.slice(0, 2000) || `Got it! I'll remember that.`;
   }
 
   // Default: use state.answer if available

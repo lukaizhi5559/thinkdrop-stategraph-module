@@ -216,8 +216,12 @@ module.exports = async function answer(state) {
 
   // ── Inject conversation history for ambiguous follow-up interpretation ─────────
   // When _needsContextInterpretation is set (e.g., "what about them?" after file analysis),
-  // include the actual conversation history so LLM can resolve ambiguous references
-  if (state._needsContextInterpretation && conversationHistory.length > 0) {
+  // OR when classifyTask identified this as a conversation follow-up (isFollowUp:true),
+  // include the actual conversation history so LLM can resolve ambiguous references.
+  // This is critical for queries like "check for me now" where the raw message has no topic
+  // signal and the LLM must rely on prior turns to understand what is being asked.
+  const _isConversationFollowUp = !!(state._taskClassification?.isFollowUp && state._taskClassification?.followUpTarget);
+  if ((state._needsContextInterpretation || _isConversationFollowUp) && conversationHistory.length > 0) {
     const recentHistory = conversationHistory.slice(-5); // Last 5 messages
     const historyBlock = recentHistory.map((msg, i) => {
       const role = msg.role === 'assistant' ? 'ThinkDrop' : 'User';
@@ -378,6 +382,14 @@ module.exports = async function answer(state) {
     systemInstructions += `\n\n## User Profile Data\nThe user's ${pf.key.replace(/_/g, ' ')} is: ${pf.value}\nAnswer their question using this profile data naturally and conversationally.`;
   }
 
+  // ─── Anti-Hallucination Rules ───────────────────────────────────────────────
+  // Prevent LLM from inventing fake URLs when real ones aren't available
+  systemInstructions += `\n\n⚠️ CRITICAL ANTI-HALLUCINATION RULES:\n`;
+  systemInstructions += `- If asked to provide video URLs (YouTube, etc.) but the search results/memories contain NO actual video links, you MUST say you cannot find the URLs.\n`;
+  systemInstructions += `- Do NOT invent or hallucinate fake YouTube URLs like https://www.youtube.com/watch?v=dQw4w9WgXcQ or any other made-up links.\n`;
+  systemInstructions += `- A honest "I couldn't find the video URLs" is infinitely better than fabricated links that lead to the wrong content.\n`;
+  systemInstructions += `- Only include URLs that are actually present in the provided search results or memories above.`;
+
   // ─── Build final query ───────────────────────────────────────────────────────
   // IMPORTANT: Do NOT concatenate screen/visual context into the user query string.
   // Screen context is already in systemInstructions above. Concatenating it into
@@ -430,6 +442,57 @@ module.exports = async function answer(state) {
     );
 
     logger.debug(`[Node:Answer] Answer generated (${finalAnswer.length} chars) via ${backend.getInfo().name}`);
+
+    // ── Anti-Hallucination: Detect fake YouTube URLs ────────────────────────────
+    // If answer contains YouTube URLs that weren't in web search results or memories,
+    // the LLM is hallucinating. Replace with honest failure message.
+    const _YOUTUBE_URL_REGEX = /https?:\/\/(?:www\.)?youtube\.com\/watch\?v=[a-zA-Z0-9_-]+/g;
+    const _answerUrls = finalAnswer.match(_YOUTUBE_URL_REGEX) || [];
+    
+    if (_answerUrls.length > 0) {
+      // Build set of real YouTube URLs from context
+      const _realUrls = new Set();
+      // From web search results
+      if (contextDocs && contextDocs.length > 0) {
+        contextDocs.forEach(doc => {
+          if (doc.url && doc.url.includes('youtube.com/watch')) {
+            _realUrls.add(doc.url);
+          }
+          // Also check content
+          const contentUrls = (doc.text || '').match(_YOUTUBE_URL_REGEX) || [];
+          contentUrls.forEach(url => _realUrls.add(url));
+        });
+      }
+      // From memories
+      if (filteredMemories && filteredMemories.length > 0) {
+        filteredMemories.forEach(mem => {
+          const memUrls = (mem.text || '').match(_YOUTUBE_URL_REGEX) || [];
+          memUrls.forEach(url => _realUrls.add(url));
+        });
+      }
+      
+      // Find hallucinated URLs (in answer but not in context)
+      const _hallucinatedUrls = _answerUrls.filter(url => !_realUrls.has(url));
+      
+      if (_hallucinatedUrls.length > 0) {
+        logger.error(`[Node:Answer] LLM hallucinated ${_hallucinatedUrls.length} fake YouTube URL(s): ${_hallucinatedUrls.join(', ')}`);
+        // Replace with honest failure - but preserve any real context
+        const _hasRealVideoContent = _realUrls.size > 0;
+        finalAnswer = `⚠️ **Search Issue Detected**: The system found workout video titles but could not extract their actual YouTube URLs from the search results.
+
+${_hasRealVideoContent ? 'Some video links were found, but others appear to be incorrect. ' : ''}The search results may have contained:
+- YouTube's search page structure that the browser couldn't parse
+- Results requiring login to view
+- Dynamic content that wasn't captured
+
+Please try asking: "help me track down the video links for each one of these workouts" to trigger browser automation that can extract the actual URLs.`;
+        
+        // Re-stream the corrected answer if streaming
+        if (isStreaming && typeof streamCallback === 'function') {
+          streamCallback('\x00REPLACE\x00' + finalAnswer);
+        }
+      }
+    }
 
     // In non-streaming mode, still emit via streamCallback so UI receives it
     if (!isStreaming && typeof streamCallback === 'function' && finalAnswer) {

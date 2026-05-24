@@ -202,12 +202,69 @@ module.exports = async function parseIntentV2(state) {
     }
   }
 
-  // ── 7. Final fallback: rule-based ───────────────────────────────────────────
+  // ── 6.5. Ambiguity Clarification ───────────────────────────────────────
+  // Don't override if decomposePrompt already provided an intent
+  if (state.intentPlan || state._decomposedIntent) {
+    logger.debug(`[Node:ParseIntentV2] Skipping clarification - decomposePrompt already provided intent`);
+    return state;
+  }
+
   const lower = classifyMessage.toLowerCase();
+  const hasPlatform = /\b([a-z]+\.(com|org|net|io|ai|co|app|gov|edu)|[a-z]+ (app|service|platform|site|website|store|shop))\b/i.test(lower);
+  const hasContentVerb = /\b(find|search|locate|get|extract|retrieve|look up|track down)\b/.test(lower);
+  const hasLowConfidence = true; // We're in fallback path
+  
+  if (hasPlatform && hasContentVerb && hasLowConfidence) {
+    // Extract platform name for clarification
+    const platformMatch = lower.match(/\b([a-z]+\.(com|org|net|io|ai|co|app|gov|edu)|[a-z]+ (app|service|platform|site|website|store|shop))\b/i);
+    const platform = platformMatch ? platformMatch[1] : 'that platform';
+    
+    logger.info(`[Node:ParseIntentV2] Ambiguity detected - requesting clarification for platform: ${platform}`);
+    return {
+      ...state,
+      intent: { type: 'clarification_needed', confidence: 0.50, entities: [], requiresMemoryAccess: false },
+      clarification: {
+        question: `Are you asking me to search the web for information about your request, or navigate to ${platform} to find specific content there?`,
+        options: ['Search the web', `Navigate to ${platform}`]
+      },
+      metadata: { parser: 'ambiguity-clarification', processingTimeMs: 0 },
+    };
+  }
+
+  // ── 7. Final fallback: rule-based (only if decomposePrompt had no opinion) ───────
+  // Don't override if decomposePrompt already provided an intent
+  if (state.intentPlan || state._decomposedIntent) {
+    logger.debug(`[Node:ParseIntentV2] Skipping rule-fallback - decomposePrompt already provided intent`);
+    return state;
+  }
+
+  // Plan correction mode: when LLM fails to decompose the correction message,
+  // default to command_automate since user is correcting a browser automation task
+  if (state._planCorrectionMode) {
+    logger.info(`[Node:ParseIntentV2] Plan correction mode with failed decomposition → command_automate: "${classifyMessage.slice(0, 60)}"`);
+    return {
+      ...state,
+      intent: { type: 'command_automate', confidence: 0.75, entities: [], requiresMemoryAccess: false },
+      metadata: { parser: 'plan-correction-fallback', processingTimeMs: 0 },
+    };
+  }
+
+  // Platform + Content Discovery: finding/searching/locating content on named platforms
+  // Examples: "find youtube videos", "search twitter for X", "locate files on drive"
+  const CONTENT_DISCOVERY_VERBS = /\b(find|search|locate|track down|look up|get|extract|retrieve|pull up)\b/;
+  const NAMED_PLATFORMS = /\b(youtube\.?com|youtube|twitter\.?com|x\.?com|tiktok|instagram|facebook|linkedin|reddit|github|gmail|google|netflix|spotify|slack|notion|docs\.google\.com|drive\.google\.com)\b/;
+  const hasContentDiscovery = CONTENT_DISCOVERY_VERBS.test(lower);
+  const hasNamedPlatform = NAMED_PLATFORMS.test(lower);
+  
   let fallbackIntent = 'general_knowledge';
   if (/\b(remember|my name is|i am|my email|note that|store that|save that)\b/.test(lower)) fallbackIntent = 'memory_store';
   else if (/\b(what did i|do you know my|recall|retrieve|look up my|what was)\b/.test(lower)) fallbackIntent = 'memory_retrieve';
   else if (/\b(goto|go to|navigate|open|close|quit|exit|minimize|hide|show|stop|kill|launch|start|visit|click|run|execute|install|send|create|rename|move|delete|download|resize|maximize|scroll|type|press|drag)\b/.test(lower)) fallbackIntent = 'command_automate';
+  // NEW: Content discovery on named platforms → command_automate (browser automation needed)
+  else if (hasContentDiscovery && hasNamedPlatform) {
+    fallbackIntent = 'command_automate';
+    logger.info(`[Node:ParseIntentV2] Platform+discovery pattern detected → command_automate: "${classifyMessage.slice(0, 60)}"`);
+  }
   else if (/^(hi|hello|hey|good morning|good afternoon|howdy|sup)\b/i.test(lower)) fallbackIntent = 'greeting';
 
   logger.debug(`[Node:ParseIntentV2] Rule fallback → ${fallbackIntent}: "${classifyMessage.slice(0, 60)}"`);

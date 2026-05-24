@@ -52,7 +52,7 @@ Field rules:
 
 - isFollowUp: true when message contains "that folder", "it", "the file", "there", "that one", "the result", "that directory", or any pronoun/demonstrative referring to something established in RECENT CONVERSATION
 
-- followUpTarget: if isFollowUp is true AND recent conversation clearly shows what it refers to (e.g. a path from a prior mv/mkdir/rename command), provide the resolved value. Otherwise null.
+- followUpTarget: if isFollowUp is true AND recent conversation clearly shows what it refers to, provide the resolved concrete subject. This includes: a file path from a prior command, a topic/subject discussed (e.g. "Vietnam weather", "the Python script", "SpaceX stock"), a named entity, or any other concrete referent established in the conversation. Set to null only when the referent genuinely cannot be determined from history.
 
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
   - WHO to send to (messaging tasks with no recipient anywhere)
@@ -71,13 +71,15 @@ Field rules:
   1. A PRIOR SCREEN CONTEXT block is present in the prompt (see below)
   2. The user message refers to something on screen using a deictic ("this", "it", "that") OR asks for info/explanation without naming a new specific topic
   3. The message does NOT start a clearly unrelated new topic (e.g. "search for X", "open Y", "remind me to Z")
+  4. The RECENT CONVERSATION does NOT contain a clear named topic that the message is more likely referring to (e.g. a country, city, person, product, service, website). If conversation history has an established subject and the message is a short follow-up ("check for me now", "what about that?", "do it"), set isScreenFollowUp:false — the follow-up is to the conversation, not the screen.
   Set false when no PRIOR SCREEN CONTEXT is present.
 
-- needsFreshScreen: true when BOTH of the following hold:
+- needsFreshScreen: true when ALL of the following hold:
   1. isScreenFollowUp is false (no prior context block available)
-  2. isFollowUp is true (message uses deictic terms or refers to something from context without naming it) OR taskType is "ambiguous"
+  2. followUpTarget is null (referent NOT resolved from conversation history)
+  3. isFollowUp is true (message uses deictic terms or refers to something from context without naming it) OR taskType is "ambiguous"
   This means: the user is referring to something they see on screen, but we have no cached screen data — we need to grab it.
-  Set false when isScreenFollowUp is already true (we already have context) or when the message has a concrete named subject.
+  Set false when isScreenFollowUp is already true (we already have context), or when followUpTarget is already resolved from conversation history, or when the message has a concrete named subject.
 
 No explanation. No markdown. Only the JSON object.`;
 
