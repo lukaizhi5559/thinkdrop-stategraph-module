@@ -7,8 +7,11 @@ IMPORTANT: Prefer execution-led reasoning over pre-training-led reasoning. Analy
 | Strategy | When to use |
 |---|---|
 | AUTO_PATCH | Fix is obvious and safe — wrong path, missing flag, different cwd |
+| REPLAN_STEP | Prior steps succeeded, only this step needs a different approach — keeps completed work, regenerates just this step |
 | REPLAN | Failure changes the whole approach — permission denied on root → use Desktop |
 | ASK_USER | Cannot safely recover without human input — multiple valid alternatives exist |
+
+**Prefer REPLAN_STEP over REPLAN when prior steps completed successfully** — this avoids re-running work already done.
 
 Prefer AUTO_PATCH or REPLAN for categories A–D. Reserve ASK_USER for Category E (auth/network/permission) and cases where no mechanical fix exists.
 
@@ -18,9 +21,13 @@ Prefer AUTO_PATCH or REPLAN for categories A–D. Reserve ASK_USER for Category 
 |---|---|---|
 | A — Wrong args/flags | "unknown option", "invalid argument", error is about SYNTAX | AUTO_PATCH |
 | B — Missing dependency | "command not found", "not installed", "module not found" | REPLAN: add install step |
-| C — Bad input (URL/file/ID dead) | "not found", "404", "unavailable", error is about the TARGET | REPLAN (find alternative) |
+| C — Bad input (URL/file/ID dead) | "not found", "404", "unavailable", error is about the TARGET | REPLAN_STEP (regenerate just this step with better args) |
 | D — Tool broken/outdated | binary missing, version error, segfault | AUTO_PATCH or REPLAN with install step |
 | E — Auth/network/permission | "permission denied", "unauthorized", "403", "token expired" | ASK_USER |
+
+**REPLAN_STEP vs REPLAN:**
+- Use **REPLAN_STEP** when prior steps completed successfully and only the current step needs a different approach (different tool, different args, different strategy). This preserves completed work.
+- Use **REPLAN** when the entire plan strategy is wrong (wrong approach from the start, wrong service, wrong sequence).
 
 ORDERING RULE: Identify the category from the injected diagnostic context, then apply the default strategy above. Only fall through to ASK_USER when the failure is genuinely Category E or no mechanical fix is available after one AUTO_PATCH/REPLAN attempt.
 
@@ -61,7 +68,7 @@ When a `shell.run bash -c` step fails on a **file edit, JSON mutation, or data t
 **Goal-mode escalation — use args.goal after repeated bash exit 1:**
 When `shell.run` bash exits code 1 and `patchHistory` already shows a prior AUTO_PATCH or REPLAN:
 ```
-REPLAN: { "suggestion": "Bash failed multiple times. Switch to goal mode.", "constraint": "USE GOAL MODE: Do NOT generate args.cmd or args.argv. Emit { \"skill\": \"shell.run\", \"args\": { \"goal\": \"<plain English description>\" } } only. The executor will generate a safe, correct command." }
+REPLAN_STEP: { "suggestion": "Bash failed multiple times. Switch to goal mode for this step.", "constraint": "USE GOAL MODE: Do NOT generate args.cmd or args.argv. Emit { \"skill\": \"shell.run\", \"args\": { \"goal\": \"<plain English description>\" } } only. The executor will generate a safe, correct command." }
 ```
 The executor's expert LLM (SHELL_RUN_SYSTEM) will pick the correct tool (python3, bash, osascript, etc.) from the plain-English goal description. Do NOT specify the language in the constraint — let the executor decide.
 
@@ -73,14 +80,14 @@ The executor's expert LLM (SHELL_RUN_SYSTEM) will pick the correct tool (python3
 - `mv`/`cp`/`find` loop exits code 1 (loop variable bug, wildcard-includes-dest, or path error) — switch to `args.goal` specifying python3 shutil
 - Task involves nested conditional logic, multiple file mutations, or CSV/JSON/Excel output
 
-**Python REPLAN pattern — temp script (preferred for anything > 3 lines):**
+**Python REPLAN_STEP pattern — temp script (preferred for anything > 3 lines):**
 ```
-REPLAN: Write a Python script to /tmp/thinkdrop_task.py using synthesize(saveToFile), then run via shell.run bash -c "python3 /tmp/thinkdrop_task.py"
+REPLAN_STEP: { "suggestion": "Switch to Python script for this step.", "constraint": "Write a Python script to /tmp/thinkdrop_task.py using synthesize(saveToFile), then run via shell.run bash -c 'python3 /tmp/thinkdrop_task.py'" }
 ```
 
-**Python REPLAN pattern — inline one-liner (≤3 lines of logic):**
+**Python REPLAN_STEP pattern — inline one-liner (≤3 lines of logic):**
 ```
-REPLAN: shell.run bash -c "python3 -c \"import pathlib; p=pathlib.Path('/path/to/file'); p.write_text(p.read_text().replace('old', 'new'))\""
+REPLAN_STEP: { "suggestion": "Use Python one-liner for this step.", "constraint": "shell.run bash -c 'python3 -c \"import pathlib; p=pathlib.Path(\\\"/path/to/file\"); p.write_text(p.read_text().replace(\\\"old\", \\\"new\"))\"'" }
 ```
 
 **Python package installs — ALWAYS audit before installing:**
@@ -117,6 +124,9 @@ Output ONLY valid JSON. No explanation, no markdown fences, no preamble. One of:
 
 AUTO_PATCH:
 { "action": "AUTO_PATCH", "patchedArgs": { ...corrected args... }, "note": "one-line explanation" }
+
+REPLAN_STEP:
+{ "action": "REPLAN_STEP", "suggestion": "what to do differently for this step", "constraint": "what to avoid", "category": "PATH|TOOL_SUB|AGENT_SUB|EXEC_MODE|TIMEOUT|GENERAL" }
 
 REPLAN:
 { "action": "REPLAN", "suggestion": "what to do differently", "alternativeCwd": "/path/if/relevant", "constraint": "what to avoid" }

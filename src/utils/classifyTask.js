@@ -30,7 +30,7 @@ Given the user's message and recent conversation history, classify the task.
 
 Output ONLY valid JSON with exactly these fields:
 {
-  "taskType": "local_file" | "browser" | "messaging" | "scheduling" | "query" | "ambiguous",
+  "taskType": "local_file" | "browser" | "messaging" | "scheduling" | "skill_creation" | "query" | "ambiguous",
   "isFollowUp": true | false,
   "followUpTarget": "<resolved concrete value>" | null,
   "needsClarification": true | false,
@@ -47,10 +47,11 @@ Field rules:
   - "browser": navigate, search, open a website, go to a URL, look something up online
   - "messaging": send email, text, SMS, Slack, Discord, notify someone
   - "scheduling": set a reminder, schedule something, recurring alarm, cron task
+  - "skill_creation": turn a script/code into a reusable skill, "create a skill from that python script", "make that into a skill", "turn that code into a skill", "save that as a skill", "convert that to a skill" - triggered by follow-up requests referring to code/script from previous turns
   - "query": question, lookup, retrieve memory, general knowledge
   - "ambiguous": genuinely unclear even with history
 
-- isFollowUp: true when message contains "that folder", "it", "the file", "there", "that one", "the result", "that directory", or any pronoun/demonstrative referring to something established in RECENT CONVERSATION
+- isFollowUp: true when message contains "that folder", "it", "the file", "there", "that one", "the result", "that directory", "that script", "that code", "that python", "the previous", or any pronoun/demonstrative referring to something established in RECENT CONVERSATION
 
 - followUpTarget: if isFollowUp is true AND recent conversation clearly shows what it refers to, provide the resolved concrete subject. This includes: a file path from a prior command, a topic/subject discussed (e.g. "Vietnam weather", "the Python script", "SpaceX stock"), a named entity, or any other concrete referent established in the conversation. Set to null only when the referent genuinely cannot be determined from history.
 

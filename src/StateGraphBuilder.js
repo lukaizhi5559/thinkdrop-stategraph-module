@@ -40,6 +40,7 @@ const gatherPlanContextNode = require('./nodes/gatherPlanContext');
 const mcpFillGapsNode = require('./nodes/mcpFillGaps');
 const executeIntrospectNode = require('./nodes/executeIntrospect');
 const executeSettingsNode = require('./nodes/executeSettings');
+const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
 
 /**
  * Assess risk level of a user request using LLM classification
@@ -388,6 +389,7 @@ class StateGraphBuilder {
       summarizeMultiIntent: (state) => summarizeMultiIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeIntrospect: (state) => executeIntrospectNode({ ...state, logger, mcpAdapter }),
       executeSettings: (state) => executeSettingsNode({ ...state, logger }),
+      createSkillFromHistory: (state) => createSkillFromHistoryNode({ ...state, logger, mcpAdapter, llmBackend }),
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
@@ -455,6 +457,14 @@ class StateGraphBuilder {
         if (Array.isArray(state.enrichmentNeeded) && state.enrichmentNeeded.length > 0) {
           logger.debug('[StateGraph:Router] enrichIntent: gaps unresolved — asking user');
           return 'logConversation';
+        }
+
+        // ── Skill creation from conversation history ───────────────────────────
+        // classifyTask detected skill_creation intent — user wants to turn code/script
+        // from previous conversation into a reusable skill. Route to createSkillFromHistory.
+        if (state._taskClassification?.taskType === 'skill_creation') {
+          logger.info('[StateGraph:Router] skill_creation detected — routing to createSkillFromHistory');
+          return 'createSkillFromHistory';
         }
 
         // MODE B re-route: enrichIntent stored answers and set intent=command_automate
@@ -585,6 +595,9 @@ class StateGraphBuilder {
       // Constraint lift path: liftConstraint → logConversation → end
       liftConstraint: 'logConversation',
 
+      // Skill creation from history → logConversation → end
+      createSkillFromHistory: 'logConversation',
+
       // mcpFillGaps → gatherContext for grill mode operations
       mcpFillGaps: 'gatherContext',
 
@@ -683,10 +696,10 @@ class StateGraphBuilder {
           logger.info(`[StateGraph:Router] evaluateSkills FIX → planSkills (retry ${state.evaluationRetryCount})`);
           return 'planSkills';
         }
-        // recoverSkill set recoveryAction='replan' — evaluateSkills was inserted in that path.
+        // recoverSkill set recoveryAction='replan' or 'replan_step' — evaluateSkills was inserted in that path.
         // If no FIX rule was derived (PASS fallback), still continue to planSkills with recoveryContext.
-        if (verdict === 'PASS' && state.recoveryAction === 'replan' && state.recoveryContext) {
-          logger.debug('[StateGraph:Router] evaluateSkills PASS (failure path) → planSkills with recoveryContext');
+        if (verdict === 'PASS' && (state.recoveryAction === 'replan' || state.recoveryAction === 'replan_step') && state.recoveryContext) {
+          logger.debug(`[StateGraph:Router] evaluateSkills PASS (failure path) → planSkills with recoveryContext (action: ${state.recoveryAction})`);
           return 'planSkills';
         }
         return 'logConversation';
@@ -699,11 +712,12 @@ class StateGraphBuilder {
           logger.debug('[StateGraph:Router] Recovery: auto_patch → retry executeCommand');
           return 'executeCommand';
         }
-        if (action === 'replan') {
+        if (action === 'replan' || action === 'replan_step') {
           // Route through evaluateSkills so it can judge the failure and save a context rule.
           // evaluateSkills detects evaluationFromFailure=true and uses the failure-path prompt.
           // From there: FIX → planSkills (with saved rule), PASS → planSkills, ASK_USER → logConversation.
-          logger.debug('[StateGraph:Router] Recovery: replan → evaluateSkills (failure judge) → planSkills');
+          // replan_step: single-step replan preserves completed steps, regenerates only failed step.
+          logger.debug(`[StateGraph:Router] Recovery: ${action} → evaluateSkills (failure judge) → planSkills`);
           return 'evaluateSkills';
         }
         // ask_user: state.answer is already set with the question

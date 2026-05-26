@@ -110,12 +110,21 @@ function loadRecoveryPrompt() {
 }
 
 const RECOVERY_SYSTEM_PROMPT = loadRecoveryPrompt() || `You are an automation recovery agent. A skill step failed.
-Decide: AUTO_PATCH (fix args inline), REPLAN (rebuild plan), or ASK_USER (need human input).
+Decide: AUTO_PATCH (fix args inline), REPLAN_STEP (regenerate just this step), REPLAN (rebuild entire plan), or ASK_USER (need human input).
 Be conservative: prefer ASK_USER over guessing.
 
 AUTO_PATCH: { "action": "AUTO_PATCH", "patchedArgs": {...}, "note": "one-line explanation" }
+REPLAN_STEP: { "action": "REPLAN_STEP", "suggestion": "what to do differently for this step", "constraint": "what to avoid", "category": "PATH|TOOL_SUB|AGENT_SUB|EXEC_MODE|TIMEOUT|GENERAL" }
 REPLAN: { "action": "REPLAN", "suggestion": "what to do differently", "alternativeCwd": "/path", "constraint": "what to avoid" }
 ASK_USER: { "action": "ASK_USER", "question": "clear question", "options": ["option A", "option B"] }
+
+WHEN TO USE EACH:
+- AUTO_PATCH: Fix a specific arg (path, timeout, flag). Same skill, same approach.
+- REPLAN_STEP: Prior steps succeeded, only this step needs a different approach. Keeps completed work, regenerates just this step.
+- REPLAN: The whole strategy is wrong - rebuild entire plan from scratch.
+- ASK_USER: Need human input to proceed.
+
+Prefer REPLAN_STEP over REPLAN when prior steps completed successfully — this avoids re-running work already done.
 
 ESCALATION RULE: If the "Previous recovery attempts" list shows 2 or more entries with the same error class (same keyword repeating — e.g. "No such file or directory", "exit code 1", "ENOENT", "permission denied"), and your new suggestion would NOT fix the root cause (e.g. you don't know the correct path, or the fix requires user input), output ASK_USER — not REPLAN. REPLAN is only appropriate when you have a genuinely different strategy. Repeating REPLAN with minor variations while the same error recurs is always wrong.
 
@@ -319,6 +328,13 @@ module.exports = async function recoverSkill(state) {
         attempt: replanCount + 1,
         error: failedStep.error || 'unknown error',
         description: `Attempt ${replanCount + 1}: recovering from ${failedStep.skill} failure`,
+      });
+      // Also emit analyzing event for more granular UI feedback
+      state.progressCallback({
+        type: 'recovery:analyzing',
+        skill: failedStep.skill,
+        attempt: replanCount + 1,
+        message: `Analyzing ${failedStep.skill} failure...`,
       });
     } catch (_) { /* never block recovery on progress callback errors */ }
   }
@@ -865,7 +881,41 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     }
   }
 
-  // ── browser.agent run: wrong destination — auto-correct surfaced as ASK_USER ──
+  // ── shell.run: Force Python after 2+ bash failures ────────────────────────
+  // Track execution mode attempts and escalate to EXEC_MODE category to force
+  // python3 execution when bash keeps failing (GNU vs BSD command differences, etc.)
+  if (skill === 'shell.run' && failedStep.exitCode === 1 && args?.cmd === 'bash') {
+    // Count bash attempts from patch history (look for bash in the patched commands)
+    const bashAttempts = patchHistory.filter(p => {
+      if (typeof p !== 'string') return false;
+      // Check if this was a bash-related patch/replan
+      return p.includes('bash') || p.includes('shell.run');
+    }).length + 1; // +1 for current failed attempt
+    
+    if (bashAttempts >= 2) {
+      logger.info(`[Node:RecoverSkill] Fast-path: ${bashAttempts} bash attempts failed — escalating to EXEC_MODE (force Python)`);
+      // Emit mode switch event for UI visibility
+      if (typeof state.progressCallback === 'function') {
+        try {
+          state.progressCallback({
+            type: 'recovery:mode_switch',
+            skill: failedStep.skill,
+            fromMode: 'bash',
+            toMode: 'python3',
+            message: `Switching from bash to Python3 after ${bashAttempts} failures`,
+          });
+        } catch (_) {}
+      }
+      return {
+        action: 'REPLAN',
+        category: 'EXEC_MODE',
+        suggestion: `Bash command failed ${bashAttempts} times. This is likely due to GNU vs BSD command differences on macOS (e.g., 'find -printf' not available). Switch to Python3 for cross-platform compatibility.`,
+        constraint: 'USE PYTHON3: Emit shell.run with "cmd": "python3", "argv": ["-c", "python_script_here"]. Use pathlib for file operations, os.stat for file info. Do NOT use bash.',
+      };
+    }
+  }
+
+  // ── browser.agent run: wrong destination ─ auto-correct surfaced as ASK_USER ──
   // browser.agent returned {wrongDestination:true} when the pre-navigation resolver
   // detected the configured startUrl doesn't match the task intent and no high-confidence
   // correction existed. Surface the exact question the resolver built so the user can
@@ -1890,6 +1940,80 @@ Then keep any synthesize step that follows. The {{bestUrl}} token in the navigat
 }
 
 // ---------------------------------------------------------------------------
+// Strategy categorization based on failed step and output contract
+// ---------------------------------------------------------------------------
+
+/**
+ * Determine the strategy category for a failed step based on its output contract.
+ * Categories: PATH, TOOL_SUB, AGENT_SUB, EXEC_MODE, TIMEOUT
+ */
+function _determineStrategyCategory(failedStep, contract, suggestion = '') {
+  const { skill, error = '', args = {} } = failedStep;
+  const suggestionLower = suggestion.toLowerCase();
+  const errorLower = error.toLowerCase();
+
+  // Check contract outputs for specific failure patterns
+  const outputs = contract?.outputs || {};
+
+  // TIMEOUT: Explicit timeout errors or long execution time
+  if (/timeout|timed out|exceeded.*time|took too long/i.test(errorLower) ||
+      suggestionLower.includes('timeout') ||
+      suggestionLower.includes('increase timeout')) {
+    return 'TIMEOUT';
+  }
+
+  // PATH: File not found, path errors, missing resources
+  if (/no such file|not found|does not exist|path.*not.*found|cannot find|missing.*file/i.test(errorLower) ||
+      outputs.missingPath?.value ||
+      (outputs.exitCode?.value === 1 && /file|path|directory/i.test(errorLower))) {
+    return 'PATH';
+  }
+
+  // TOOL_SUB: Tool execution failures, command not found, tool errors
+  if (/command not found|not recognized|tool.*failed|execution.*failed|cannot execute/i.test(errorLower) ||
+      suggestionLower.includes('different tool') ||
+      suggestionLower.includes('try') && suggestionLower.includes('instead') ||
+      /try (python|osascript|bash|zsh)/i.test(suggestion)) {
+    return 'TOOL_SUB';
+  }
+
+  // AGENT_SUB: Agent failures, connection issues, auth problems
+  if (/agent.*failed|connection.*refused|cannot connect|unauthorized|authentication|login|sign in/i.test(errorLower) ||
+      skill.includes('agent') && /failed|error|timeout/i.test(errorLower) ||
+      suggestionLower.includes('different agent') ||
+      suggestionLower.includes('browser.agent') ||
+      suggestionLower.includes('cli.agent')) {
+    return 'AGENT_SUB';
+  }
+
+  // EXEC_MODE: Execution mode changes (bash vs python vs osascript)
+  if (/syntax error|interpreter|script.*failed|bash.*error|python.*error/i.test(errorLower) ||
+      suggestionLower.includes('bash') ||
+      suggestionLower.includes('python') ||
+      suggestionLower.includes('osascript') ||
+      args.cmd === 'bash' && /script|syntax/i.test(errorLower)) {
+    return 'EXEC_MODE';
+  }
+
+  // Default to PATH for most file/location related errors
+  if (/file|path|directory|location|folder/i.test(errorLower)) {
+    return 'PATH';
+  }
+
+  // Default to TOOL_SUB for command/tool errors
+  if (/command|tool|execute|run/i.test(errorLower)) {
+    return 'TOOL_SUB';
+  }
+
+  // Fallback: categorize based on skill type
+  if (skill === 'shell.run') return 'TOOL_SUB';
+  if (skill === 'browser.agent' || skill === 'browser.act') return 'AGENT_SUB';
+  if (skill === 'cli.agent') return 'AGENT_SUB';
+
+  return 'PATH'; // Default fallback
+}
+
+// ---------------------------------------------------------------------------
 // Apply a recovery decision to state
 // ---------------------------------------------------------------------------
 
@@ -1974,11 +2098,99 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
       };
     }
 
+    case 'REPLAN_STEP': {
+      // Single-step replan: regenerate only the failed step, keep prior successful steps
+      const suggestion = decision.suggestion || 'Retry with different approach';
+      const constraint = decision.constraint || null;
+      const failureReason = failedStep.error || failedStep.reason || 'Step failed';
+
+      logger.debug(`[Node:RecoverSkill] REPLAN_STEP (attempt ${replanCount + 1}): ${suggestion}`);
+
+      // Emit progress event for UI visibility
+      if (typeof state.progressCallback === 'function') {
+        try {
+          state.progressCallback({
+            type: 'step_replanning',
+            stepIndex: cursor,
+            skill: failedStep.skill,
+            message: `Replanning step ${cursor + 1} with new approach...`,
+            attempt: replanCount + 1,
+            suggestion: suggestion.slice(0, 100),
+          });
+        } catch (_) { /* never block recovery on progress callback errors */ }
+      }
+
+      return {
+        ...state,
+        recoveryAction: 'replan_step',
+        replanCount: replanCount + 1,
+        // CRITICAL: Keep existing plan intact - don't null it out
+        skillPlan: skillPlan,
+        skillCursor: cursor,   // Stay at failed step position
+        stepRetryCount: stepRetryCount + 1,
+        recoveryContext: {
+          failedSkill: failedStep.skill,
+          failedStep: failedStep.step,
+          failureReason,
+          suggestion,
+          constraint,
+          // Signal that this is a single-step replan, not full replan
+          replanMode: 'single_step',
+          // Pass the failed step's args so planSkills can generate replacement
+          failedStepArgs: failedStep.args,
+          // Include strategy category if available
+          strategyCategory: decision.category || 'GENERAL',
+        },
+        failedStep: null,
+      };
+    }
+
     case 'REPLAN': {
       const suggestion = decision.suggestion || 'Retry the previous step with a more specific element label or different approach.';
       const constraint = decision.constraint || null;
       const failureReason = failedStep.error || failedStep.reason || 'Step did not produce the expected result.';
-      logger.debug(`[Node:RecoverSkill] REPLAN (attempt ${replanCount + 1}): ${suggestion}`);
+
+      // ── Contract-aware strategy categorization ─────────────────────────────
+      // Analyze the failed step's output contract to categorize the failure
+      const stepContracts = state.stepContracts || [];
+      const failedContract = stepContracts.length > cursor ? stepContracts[cursor] : null;
+      const strategyCategory = _determineStrategyCategory(failedStep, failedContract, suggestion);
+
+      // Track replan history with categories
+      const updatedReplenHistory = [
+        ...(state.replanHistory || []),
+        {
+          attempt: replanCount + 1,
+          category: strategyCategory,
+          skill: failedStep.skill,
+          error: failureReason.slice(0, 200),
+          suggestion: suggestion.slice(0, 200),
+          timestamp: Date.now()
+        }
+      ].slice(-10); // Keep last 10 replan attempts
+
+      // Check if all 5 strategy categories have been exhausted
+      const usedCategories = new Set(updatedReplenHistory.map(h => h.category));
+      const allCategories = ['PATH', 'TOOL_SUB', 'AGENT_SUB', 'EXEC_MODE', 'TIMEOUT'];
+      const exhaustedCategories = allCategories.filter(c => usedCategories.has(c));
+      const isExhausted = exhaustedCategories.length >= 5 && replanCount >= 4;
+
+      if (isExhausted) {
+        logger.info(`[Node:RecoverSkill] All 5 strategy categories exhausted after ${replanCount + 1} replans — escalating to ASK_USER`);
+        return {
+          ...state,
+          recoveryAction: 'ask_user',
+          pendingQuestion: {
+            question: `I've tried all available recovery strategies (${exhaustedCategories.join(', ')}) but the step keeps failing. The error is: "${failureReason.slice(0, 120)}". What would you like to do?`,
+            options: ['Try a completely different approach', 'Skip this step', 'Cancel this task'],
+            context: { failedStep, exhaustedCategories, replanHistory: updatedReplenHistory }
+          },
+          replanHistory: updatedReplenHistory,
+          commandExecuted: false
+        };
+      }
+
+      logger.debug(`[Node:RecoverSkill] REPLAN (attempt ${replanCount + 1}, category: ${strategyCategory}): ${suggestion}`);
       // If the browser was closed, clear the persisted session so main.js doesn't
       // inject the dead sessionId into the next initialState.
       const isBrowserClosed = suggestion.includes('browser session was closed') || constraint?.includes('new sessionId');
@@ -1986,6 +2198,7 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
         ...state,
         recoveryAction: 'replan',
         replanCount: replanCount + 1,
+        replanHistory: updatedReplenHistory,
         evaluationFromFailure: true,
         recoveryContext: {
           failedSkill: failedStep.skill,
@@ -1993,7 +2206,9 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
           failureReason,
           suggestion,
           alternativeCwd: decision.alternativeCwd || null,
-          constraint
+          constraint,
+          strategyCategory,  // Pass category to planSkills for smarter replanning
+          failedContract    // Pass contract for context-aware replanning
         },
         failedStep: null,
         skillPlan: null,

@@ -22,7 +22,7 @@ const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../
 
 /**
  * Analyzes a skill plan and adds runGroup properties for parallel execution.
- * Only called for plans with 4+ steps to avoid unnecessary LLM overhead.
+ * Only called for plans with 3+ steps to avoid unnecessary LLM overhead.
  * 
  * @param {Array} skillPlan - The generated skill plan
  * @param {string} userMessage - Original user request
@@ -838,26 +838,28 @@ async function planSkillsV2(state) {
   // When steps are clearly independent (e.g. scraping two sites, resolving user
   // info while browsing), instruct the LLM to mark them with the same runGroup
   // value so executeCommand.js can fan them out with Promise.allSettled.
-  const parallelNote = `\n\n## PARALLEL EXECUTION (runGroup)
+  const parallelNote = `\n\n## PARALLEL EXECUTION (runGroup) - GOAL-ORIENTED OPTIMIZATION
 When two or more steps are completely independent (no data dependency between them), add "runGroup": "<group_id>" to each step in the group. Steps sharing the same runGroup value will be executed in parallel using Promise.allSettled.
 
-IMPORTANT: ALWAYS apply parallel grouping when:
-1. Multiple independent searches on the same service (e.g., finding 3 different YouTube videos)
-2. Multiple independent items being looked up (e.g., "find these products", "search for several items")
-3. Tasks that don't depend on each other's output
-4. The user asks for multiple distinct things
+GOAL: Minimize total execution time by parallelizing independent work. ANY plan with 3+ steps MUST be analyzed for parallel opportunities.
 
-Rules:
+MUST PARALLELIZE when:
+1. User asks for MULTIPLE distinct things ("find A, B, and C")
+2. Multiple independent searches on the same service (finding 3 different YouTube videos)
+3. Data gathering from different sources (web + CLI + file system)
+4. Independent lookups or checks ("check status of X, Y, Z")
+5. Any steps that don't use {{variable}} dependencies from other steps
+
+PARALLEL EXECUTION RULES:
 - Use short IDs like "g1", "g2" etc.
-- Only group steps that do NOT depend on each other's output
+- Only group steps that do NOT depend on each other's output (no {{variable}} references)
 - Grouped steps MUST be consecutive in the plan array
-- Do NOT group synthesize, schedule, or shell.run steps
-- Each search/navigate/watch sequence for different items can be parallelized
+- Do NOT group synthesize, schedule, or shell.run steps (these are sequential)
+- When in doubt: if steps are independent, PARALLELIZE them
 
-Available agents/skills that can be parallelized (when independent):
+PARALLELIZABLE AGENTS/SKILLS (when independent):
 - cli.agent - CLI tool automation and command execution
 - browser.agent - Web browser automation and site interaction  
-- shell.run - Shell command execution
 - browser.act - Browser actions and navigation
 - screen.capture - Screen capture and visual analysis
 - system.introspect - System information and diagnostics
@@ -865,11 +867,19 @@ Available agents/skills that can be parallelized (when independent):
 - external.skill - External skill execution
 - image.analyze - Image analysis and processing
 
-Generic parallel template (any combination of above agents):
+EXAMPLE - Parallel data gathering:
 [
-  { "skill": "[agent/skill]", "args": { "action": "run", "agentId": "service", "task": "task 1" }, "runGroup": "g1", "description": "Task 1" },
-  { "skill": "[agent/skill]", "args": { "action": "run", "agentId": "service", "task": "task 2" }, "runGroup": "g1", "description": "Task 2" },
-  { "skill": "synthesize", "args": { "prompt": "Combine and present results" } }
+  { "skill": "web.agent", "args": { "action": "search", "query": "product A reviews" }, "runGroup": "g1", "description": "Search product A" },
+  { "skill": "web.agent", "args": { "action": "search", "query": "product B reviews" }, "runGroup": "g1", "description": "Search product B" },
+  { "skill": "web.agent", "args": { "action": "search", "query": "product C reviews" }, "runGroup": "g1", "description": "Search product C" },
+  { "skill": "synthesize", "args": { "prompt": "Compare all three products" } }
+]
+
+EXAMPLE - Mixed parallel sources:
+[
+  { "skill": "browser.agent", "args": { "task": "Get pricing from website" }, "runGroup": "g1", "description": "Web pricing" },
+  { "skill": "cli.agent", "args": { "command": "get local inventory" }, "runGroup": "g1", "description": "Local inventory" },
+  { "skill": "synthesize", "args": { "prompt": "Combine pricing and inventory data" } }
 ]`;
 
   const planningQuery = [
@@ -890,6 +900,59 @@ Generic parallel template (any combination of above agents):
     parallelNote,
     `\n\nUser request: "${(runtimeParamMessage || userMessage).replace(/"/g, '\\"').slice(0, 2000)}"`,
   ].filter(Boolean).join('\n');
+
+  // ── Single-step replan mode ───────────────────────────────────────────────
+  // When recoverSkill decides only the failed step needs regeneration, we generate
+  // a replacement step instead of rebuilding the entire plan.
+  if (recoveryContext?.replanMode === 'single_step' && state.skillPlan) {
+    logger.info(`[Node:PlanSkillsV2] Single-step replan: regenerating step ${state.skillCursor} (${recoveryContext.failedSkill})`);
+    
+    const { generateSingleStep } = require('../utils/singleStepPlanner');
+    
+    const replacementStep = await generateSingleStep({
+      failedStep: recoveryContext.failedStep,
+      failedSkill: recoveryContext.failedSkill,
+      failedArgs: recoveryContext.failedStepArgs,
+      suggestion: recoveryContext.suggestion,
+      constraint: recoveryContext.constraint,
+      priorResults: skillResults,
+      userMessage: resolvedMessage || message,
+      llmBackend: backend,
+    });
+    
+    // Replace only the failed step, keep rest of plan
+    const newPlan = [
+      ...state.skillPlan.slice(0, state.skillCursor),
+      replacementStep,
+      ...state.skillPlan.slice(state.skillCursor + 1),
+    ];
+    
+    logger.info(`[Node:PlanSkillsV2] Single-step replan complete: replaced step ${state.skillCursor} with new ${replacementStep.skill}`);
+    
+    // Emit plan_ready with single-step replan flag so UI merges instead of replaces
+    if (progressCallback) {
+      progressCallback({
+        type: 'plan_ready',
+        steps: newPlan.map((s, i) => ({
+          index: i,
+          skill: s.skill,
+          description: s.description || buildStepDescription(s),
+          args: s.args,
+          runGroup: s.runGroup || undefined,
+        })),
+        intent: intent?.type || 'command_automate',
+        singleStepReplan: true,  // Signal this is a single-step replan (preserve prior step statuses)
+      });
+    }
+    
+    return {
+      ...state,
+      skillPlan: newPlan,
+      skillCursor: state.skillCursor,  // Stay at same position
+      planError: null,
+      recoveryContext: null,  // Clear after use
+    };
+  }
 
   // ── LLM call ──────────────────────────────────────────────────────────────
   if (progressCallback) progressCallback({ type: 'planning', message: 'Planning steps…' });
@@ -1219,8 +1282,8 @@ Generic parallel template (any combination of above agents):
   }
 
   // ── Conditional parallel execution analysis ───────────────────────────────
-  // Only analyze plans with 4+ steps for parallel execution opportunities
-  if (Array.isArray(skillPlan) && skillPlan.length >= 4 && backend) {
+  // Only analyze plans with 3+ steps for parallel execution opportunities
+  if (Array.isArray(skillPlan) && skillPlan.length >= 3 && backend) {
     skillPlan = await analyzeAndAddParallelGroups(skillPlan, userMessage, backend, logger);
   }
 

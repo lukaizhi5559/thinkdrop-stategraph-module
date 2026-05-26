@@ -34,6 +34,9 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+// Skill thinking helper for generating human-readable thinking messages
+const { generateSkillThinking } = require('../utils/skillThinking');
+
 // Read sessionLanguage from voice journal (single source of truth).
 // Returns e.g. 'zh', 'es', or 'en'. Never throws.
 function _readSessionLanguage() {
@@ -69,6 +72,271 @@ function _enrichFailureContext(stepResult) {
     enriched.stderrHint = enriched.stderr.trim().slice(0, 300) || null;
   }
   return enriched;
+}
+
+/**
+ * Generate a structured Output Contract for a completed step.
+ * This contract documents what the step did, what it produced, and its outcome.
+ * Downstream steps can reference these contracts for auto-injection.
+ */
+function generateStepContract(stepResult, stepIndex) {
+  if (!stepResult) return null;
+
+  const contract = {
+    stepIndex,
+    skill: stepResult.skill,
+    timestamp: Date.now(),
+    success: stepResult.ok === true,
+    summary: _generateContractSummary(stepResult),
+    outputs: {}
+  };
+
+  // Extract outputs based on skill type
+  switch (stepResult.skill) {
+    case 'shell.run':
+      contract.outputs = {
+        stdout: { type: 'text', value: stepResult.stdout || '' },
+        stderr: { type: 'text', value: stepResult.stderr || '' },
+        exitCode: { type: 'number', value: stepResult.exitCode ?? null },
+        filePaths: { type: 'array', value: _extractFilePathsFromText(stepResult.stdout) }
+      };
+      break;
+
+    case 'fs.read':
+      contract.outputs = {
+        files: { type: 'array', value: _extractFilesFromFsRead(stepResult) },
+        tree: { type: 'text', value: stepResult._raw?.tree || stepResult.stdout || '' },
+        content: { type: 'text', value: stepResult.stdout || '' }
+      };
+      break;
+
+    case 'browser.agent':
+    case 'browser.act':
+      contract.outputs = {
+        pageText: { type: 'text', value: stepResult.stdout || '' },
+        url: { type: 'text', value: stepResult.url || '' },
+        elements: { type: 'array', value: stepResult.result?.elements || [] },
+        httpStatus: { type: 'number', value: stepResult.result?.httpStatus || null }
+      };
+      break;
+
+    case 'web.agent':
+      contract.outputs = {
+        searchResults: { type: 'array', value: stepResult.result?.results || [] },
+        bestUrl: { type: 'text', value: stepResult.result?.bestUrl || '' },
+        summary: { type: 'text', value: stepResult.stdout || '' }
+      };
+      break;
+
+    case 'image.analyze':
+      contract.outputs = {
+        analysis: { type: 'text', value: stepResult.stdout || '' },
+        filePath: { type: 'text', value: stepResult.args?.filePath || '' }
+      };
+      break;
+
+    case 'cli.agent':
+      contract.outputs = {
+        command: { type: 'text', value: stepResult.args?.command || '' },
+        output: { type: 'text', value: stepResult.stdout || '' },
+        workingDir: { type: 'text', value: stepResult.args?.cwd || '' }
+      };
+      break;
+
+    case 'user.agent':
+      contract.outputs = {
+        resolved: { type: 'object', value: stepResult.result?.resolved || {} },
+        summary: { type: 'text', value: stepResult.result?.summary || '' }
+      };
+      break;
+
+    default:
+      // Generic contract for any skill
+      contract.outputs = {
+        result: { type: 'object', value: stepResult.result || null },
+        stdout: { type: 'text', value: stepResult.stdout || '' },
+        output: { type: 'text', value: stepResult.output || '' }
+      };
+  }
+
+  // Add error info for failed steps
+  if (!stepResult.ok) {
+    contract.error = {
+      message: stepResult.error || 'Unknown error',
+      missingPath: stepResult.missingPath || null,
+      stderrHint: stepResult.stderrHint || null
+    };
+  }
+
+  return contract;
+}
+
+/**
+ * Generate a human-readable summary of what a step did.
+ */
+function _generateContractSummary(stepResult) {
+  const { skill, ok, args = {} } = stepResult;
+  const status = ok ? 'completed successfully' : 'failed';
+
+  switch (skill) {
+    case 'shell.run':
+      const cmd = args.cmd || (args.argv?.[0] || 'unknown');
+      return `Shell command '${cmd}' ${status}`;
+    case 'fs.read':
+      return `File system ${args.action || 'read'} on ${args.path || 'path'} ${status}`;
+    case 'browser.agent':
+      return `Browser agent task '${args.task?.slice(0, 50)}...' ${status}`;
+    case 'browser.act':
+      return `Browser action '${args.action}' ${status}`;
+    case 'web.agent':
+      return `Web search for '${args.query?.slice(0, 50)}...' ${status}`;
+    case 'image.analyze':
+      return `Image analysis of ${args.filePath || 'image'} ${status}`;
+    case 'cli.agent':
+      return `CLI command '${args.command?.slice(0, 50)}...' ${status}`;
+    case 'user.agent':
+      return `User context resolution ${status}`;
+    default:
+      return `Step ${skill} ${status}`;
+  }
+}
+
+/**
+ * Extract file paths from text output (for shell.run file discovery).
+ */
+function _extractFilePathsFromText(text) {
+  if (!text || typeof text !== 'string') return [];
+
+  // Match common file path patterns
+  const patterns = [
+    // Absolute paths: /Users/name/... or ~/...
+    /(?:^|\s)(\/[^\s\n]+\.\w+)(?=\s|$)/gm,
+    /(?:^|\s)(~\/[^\s\n]+\.\w+)(?=\s|$)/gm,
+    // Path in quotes
+    /"([^"]+\.\w+)"/g,
+    /'([^']+\.\w+)'/g
+  ];
+
+  const paths = [];
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(text)) !== null) {
+      const path = match[1] || match[0];
+      if (path && !paths.includes(path)) {
+        paths.push(path);
+      }
+    }
+  }
+
+  return paths;
+}
+
+/**
+ * Extract file list from fs.read result.
+ */
+function _extractFilesFromFsRead(stepResult) {
+  if (!stepResult._raw) return [];
+
+  // From result.files array
+  if (stepResult._raw.files && Array.isArray(stepResult._raw.files)) {
+    return stepResult._raw.files.map(f => f.path || f).filter(Boolean);
+  }
+
+  // From tree output - parse tree structure
+  if (stepResult._raw.tree) {
+    const treeLines = stepResult._raw.tree.split('\n');
+    const files = [];
+    for (const line of treeLines) {
+      // Strip tree drawing chars
+      const name = line.replace(/^[│├└─\s]+/, '').replace(/\s*\([\d.]+[KMB]+\)\s*$/, '').trim();
+      if (name && !name.endsWith('/')) {
+        files.push(name);
+      }
+    }
+    return files;
+  }
+
+  return [];
+}
+
+/**
+ * Auto-inject missing arguments from prior step contracts.
+ * Scans previous contracts to find values for missing args like filePath.
+ */
+function autoInjectFromContracts(args, skill, stepContracts = []) {
+  if (!args || typeof args !== 'object' || stepContracts.length === 0) {
+    return args;
+  }
+
+  const newArgs = { ...args };
+  let injected = false;
+
+  // Auto-inject filePath for image.analyze from prior shell.run or fs.read
+  if (skill === 'image.analyze' && !newArgs.filePath) {
+    // Look for file paths in reverse order (most recent first)
+    for (let i = stepContracts.length - 1; i >= 0; i--) {
+      const contract = stepContracts[i];
+
+      // From shell.run stdout
+      if (contract.skill === 'shell.run' && contract.outputs?.filePaths?.value?.length > 0) {
+        const imagePath = contract.outputs.filePaths.value.find(p =>
+          /\.(png|jpg|jpeg|gif|webp|bmp|tiff|heic)$/i.test(p)
+        );
+        if (imagePath) {
+          newArgs.filePath = imagePath;
+          injected = true;
+          break;
+        }
+      }
+
+      // From fs.read files
+      if (contract.skill === 'fs.read' && contract.outputs?.files?.value?.length > 0) {
+        const imagePath = contract.outputs.files.value.find(f =>
+          /\.(png|jpg|jpeg|gif|webp|bmp|tiff|heic)$/i.test(f)
+        );
+        if (imagePath) {
+          newArgs.filePath = imagePath;
+          injected = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Auto-inject URL for browser.agent from prior web.agent
+  if (skill === 'browser.agent' && !newArgs.url && !newArgs.startingUrl) {
+    for (let i = stepContracts.length - 1; i >= 0; i--) {
+      const contract = stepContracts[i];
+      if (contract.skill === 'web.agent' && contract.outputs?.bestUrl?.value) {
+        newArgs.url = contract.outputs.bestUrl.value;
+        injected = true;
+        break;
+      }
+    }
+  }
+
+  // Auto-inject path for fs.read from prior shell.run that found files
+  if (skill === 'fs.read' && !newArgs.path) {
+    for (let i = stepContracts.length - 1; i >= 0; i--) {
+      const contract = stepContracts[i];
+      if (contract.skill === 'shell.run' && contract.outputs?.filePaths?.value?.length > 0) {
+        // Use the directory of the first found file
+        const firstPath = contract.outputs.filePaths.value[0];
+        const dir = firstPath.substring(0, firstPath.lastIndexOf('/'));
+        if (dir) {
+          newArgs.path = dir;
+          injected = true;
+          break;
+        }
+      }
+    }
+  }
+
+  if (injected) {
+    logger.info(`[Node:ExecuteCommand] Auto-injected args for ${skill}: ${JSON.stringify(newArgs)}`);
+  }
+
+  return newArgs;
 }
 
 /**
@@ -753,12 +1021,17 @@ module.exports = async function executeCommand(state) {
   const step = skillPlan[skillCursor];
   const { skill, optional = false, description } = step;
 
+  // ── Auto-inject from prior step contracts ────────────────────────────────
+  // Before template resolution, scan prior contracts to fill missing args
+  let args = step.args || {};
+  const stepContracts = state.stepContracts || [];
+  args = autoInjectFromContracts(args, skill, stepContracts);
+
   // ── {{PREV_OUTPUT}} template injection ───────────────────────────────────
   // Allows multi-step plans to pass data from one step to the next.
   // The previous step's primary output is injected into any arg string containing
   // the {{PREV_OUTPUT}} or {{prev_stdout}} marker at dispatch time (not at plan-write time).
   // browser.agent stores page text in .result (not .stdout) — read both fields.
-  let args = step.args || {};
   if (skillCursor > 0 && skillResults.length > 0) {
     const _prev = skillResults[skillResults.length - 1];
     const _prevResultStr = typeof _prev?.result === 'object' && _prev?.result !== null
@@ -876,7 +1149,16 @@ module.exports = async function executeCommand(state) {
 
   // Emit plan:step_start for PlanPanel step tracking
   if (_rawProgressCallback && state._skillPlanFile) {
-    _rawProgressCallback({ type: 'plan:step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description });
+    _rawProgressCallback({
+      type: 'plan:step_start',
+      stepIndex: skillCursor,
+      stepNum: skillCursor + 1,  // 1-based step number for UI
+      totalSteps: skillPlan.length,
+      skill,
+      description,
+      title: description || skill,  // title falls back to skill name
+      intent: state.intent?.type || 'unknown'  // intent from state
+    });
   }
 
   // ── schedule pseudo-skill (NON-BLOCKING) ─────────────────────────────────
@@ -906,7 +1188,9 @@ module.exports = async function executeCommand(state) {
     if (waitMs <= 0) {
       logger.info('[Node:ExecuteCommand] schedule: no valid future time — skipping');
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: 'Schedule: skipped', stdout: 'Skipped' });
-      return { ...state, skillResults: [...skillResults, { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: 'Skipped — time already passed' }], skillCursor: skillCursor + 1, commandExecuted: false };
+      const skipResult = { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: 'Skipped — time already passed' };
+      const skipContract = generateStepContract(skipResult, skillCursor);
+      return { ...state, skillResults: [...skillResults, skipResult], stepContracts: [...stepContracts, skipContract], skillCursor: skillCursor + 1, commandExecuted: false };
     }
     const targetIso = new Date(Date.now() + waitMs).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
     const reminderId = `reminder_${Date.now()}`;
@@ -1172,9 +1456,12 @@ module.exports = async function executeCommand(state) {
     logger.info(`[Node:ExecuteCommand] api_suggest: surfacing API offer for ${suggestApp}`);
     if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'api_suggest', description: description || `API recommendation for ${suggestApp}`, stdout: question });
 
+    const suggestResult = { step: skillCursor + 1, skill: 'api_suggest', args, description, ok: true, stdout: question };
+    const suggestContract = generateStepContract(suggestResult, skillCursor);
     return {
       ...state,
-      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'api_suggest', args, description, ok: true, stdout: question }],
+      skillResults: [...skillResults, suggestResult],
+      stepContracts: [...stepContracts, suggestContract],
       skillCursor: skillCursor + 1,
       commandExecuted: false,
       pendingQuestion: { question, options },
@@ -1445,6 +1732,7 @@ module.exports = async function executeCommand(state) {
             return {
               ...state,
               skillResults: updatedResults,
+              stepContracts: updatedStepContracts,
               skillCursor: skillCursor + 1,
               failedStep: replanSignal,
               activeBrowserSessionId: guideSessionId,
@@ -1531,8 +1819,9 @@ module.exports = async function executeCommand(state) {
 
     if (!pageSnapshot) {
       const errResult = { step: skillCursor + 1, skill: 'smartFill', args, description, ok: false, error: 'Could not capture page snapshot — browser session may not be open' };
+      const errContract = generateStepContract(errResult, skillCursor);
       if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill: 'smartFill', description: description || 'smartFill', error: errResult.error });
-      return { ...state, skillResults: [...skillResults, errResult], skillCursor, failedStep: errResult, commandExecuted: false };
+      return { ...state, skillResults: [...skillResults, errResult], stepContracts: [...stepContracts, errContract], skillCursor, failedStep: errResult, commandExecuted: false };
     }
 
     // ── Step 2: LLM maps field roles → exact CSS selectors ───────────────────
@@ -1688,14 +1977,17 @@ module.exports = async function executeCommand(state) {
     if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'smartFill', description: description || 'Fill form fields', stdout });
 
     const stepResult = { step: skillCursor + 1, skill: 'smartFill', args, description, ok: !allFailed, result: { filled, errors, selectors: resolvedSelectors }, stdout };
+    const stepContract = generateStepContract(stepResult, skillCursor);
+    const updatedStepContracts = [...stepContracts, stepContract];
 
     if (allFailed) {
-      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+      return { ...state, skillResults: [...skillResults, stepResult], stepContracts: updatedStepContracts, skillCursor, failedStep: stepResult, commandExecuted: false };
     }
 
     return {
       ...state,
       skillResults: [...skillResults, stepResult],
+      stepContracts: updatedStepContracts,
       skillCursor: skillCursor + 1,
       failedStep: null,
       commandExecuted: false,
@@ -3325,6 +3617,24 @@ Please try again or search with different terms.`;
   }
   const stepStartDescription = buildRichDescription(skill, resolvedArgs);
   logger.debug(`[Node:ExecuteCommand] Step ${skillCursor + 1}/${skillPlan.length}: ${stepStartDescription}`);
+
+  // ── Universal skill thinking phase ─────────────────────────────────────────
+  // Emit thinking message BEFORE step_start for immediate user visibility
+  if (progressCallback) {
+    const thinking = generateSkillThinking(skill, resolvedArgs, {
+      stepNum: skillCursor + 1,
+      totalSteps: skillPlan.length
+    });
+    progressCallback({
+      type: 'skill:thinking',
+      stepIndex: skillCursor,
+      totalSteps: skillPlan.length,
+      skill,
+      thinking,
+      phase: 'preparation',
+    });
+  }
+
   if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription });
 
   // Handle _waitBeforeMs injected by recoverSkill AUTO_PATCH for mid-navigation retries
@@ -3423,22 +3733,24 @@ Please try again or search with different terms.`;
         if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription, stdout: stepResult.stdout });
         if (nextCursor >= skillPlan.length) {
           const answer = `Project "${raw.projectName}" has been built and registered. You can now use it as a skill.`;
-          return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: true, answer, failedStep: null };
+          return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor: nextCursor, commandExecuted: true, answer, failedStep: null };
         }
-        return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+        return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
       } else {
         const errMsg = raw.error || 'project.builder returned failure';
         if (progressCallback) progressCallback({ type: 'project_build_fail', error: errMsg });
         const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+        const failContract = generateStepContract(stepResult, skillCursor);
         if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
-        return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+        return { ...state, skillResults: [...skillResults, stepResult], stepContracts: [...stepContracts, failContract], skillCursor, failedStep: stepResult, commandExecuted: false };
       }
     } catch (buildErr) {
       const errMsg = buildErr.message || 'project.builder threw an error';
       if (progressCallback) progressCallback({ type: 'project_build_fail', error: errMsg });
       const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+      const failContract = generateStepContract(stepResult, skillCursor);
       if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
-      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+      return { ...state, skillResults: [...skillResults, stepResult], stepContracts: [...stepContracts, failContract], skillCursor, failedStep: stepResult, commandExecuted: false };
     }
   }
 
@@ -3472,20 +3784,23 @@ Please try again or search with different terms.`;
         if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription, stdout: stepResult.stdout });
         if (nextCursor >= skillPlan.length) {
           const answer = raw.output || `"${raw.projectName}" is running at ${raw.url} and has been opened in your browser.`;
-          return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: true, answer, failedStep: null };
+          return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor: nextCursor, commandExecuted: true, answer, failedStep: null };
         }
-        return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+        return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
       } else {
         const errMsg = raw.error || 'project.launcher returned failure';
         const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+        const failContract = generateStepContract(stepResult, skillCursor);
         if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
-        return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+        return { ...state, skillResults: [...skillResults, stepResult], stepContracts: [...stepContracts, failContract], skillCursor, failedStep: stepResult, commandExecuted: false };
       }
     } catch (launchErr) {
       const errMsg = launchErr.message || 'project.launcher threw an error';
+      if (progressCallback) progressCallback({ type: 'project_launch_fail', error: errMsg });
       const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+      const failContract = generateStepContract(stepResult, skillCursor);
       if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
-      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+      return { ...state, skillResults: [...skillResults, stepResult], stepContracts: [...stepContracts, failContract], skillCursor, failedStep: stepResult, commandExecuted: false };
     }
   }
 
@@ -3517,20 +3832,22 @@ Please try again or search with different terms.`;
         const nextCursor = skillCursor + 1;
         if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription, stdout: stepResult.stdout });
         if (nextCursor >= skillPlan.length) {
-          return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: true, answer: raw.output, failedStep: null };
+          return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor: nextCursor, commandExecuted: true, answer: raw.output, failedStep: null };
         }
-        return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+        return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
       } else {
         const errMsg = raw.error || 'project.editor returned failure';
         const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+        const failContract = generateStepContract(stepResult, skillCursor);
         if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
-        return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+        return { ...state, skillResults: [...skillResults, stepResult], stepContracts: [...stepContracts, failContract], skillCursor, failedStep: stepResult, commandExecuted: false };
       }
     } catch (editErr) {
       const errMsg = editErr.message || 'project.editor threw an error';
       const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+      const failContract = generateStepContract(stepResult, skillCursor);
       if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
-      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+      return { ...state, skillResults: [...skillResults, stepResult], stepContracts: [...stepContracts, failContract], skillCursor, failedStep: stepResult, commandExecuted: false };
     }
   }
 
@@ -3559,18 +3876,19 @@ Please try again or search with different terms.`;
       if (ok) {
         if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription, stdout: stepResult.stdout });
         if (nextCursor >= skillPlan.length) {
-          return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: true, answer: raw.output, failedStep: null };
+          return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor: nextCursor, commandExecuted: true, answer: raw.output, failedStep: null };
         }
-        return { ...state, skillResults: updatedResults, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+        return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor: nextCursor, commandExecuted: false, failedStep: null };
       } else {
         if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: raw.error });
-        return { ...state, skillResults: updatedResults, skillCursor, failedStep: stepResult, commandExecuted: false };
+        return { ...state, skillResults: updatedResults, stepContracts: updatedStepContracts, skillCursor, failedStep: stepResult, commandExecuted: false };
       }
     } catch (stopErr) {
       const errMsg = stopErr.message || 'project.stopper threw an error';
       const stepResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: false, error: errMsg };
+      const failContract = generateStepContract(stepResult, skillCursor);
       if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: stepStartDescription, error: errMsg });
-      return { ...state, skillResults: [...skillResults, stepResult], skillCursor, failedStep: stepResult, commandExecuted: false };
+      return { ...state, skillResults: [...skillResults, stepResult], stepContracts: [...stepContracts, failContract], skillCursor, failedStep: stepResult, commandExecuted: false };
     }
   }
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3653,17 +3971,18 @@ Please try again or search with different terms.`;
         skill, description: description || skill, reason: whySkipped,
       });
       const skippedResult = { step: skillCursor + 1, skill, args: resolvedArgs, description, ok: true, skipped: true, stdout: `[Skipped: ${whySkipped}]` };
+      const skipContract = generateStepContract(skippedResult, skillCursor);
       const nextCursor = skillCursor + 1;
       if (nextCursor >= skillPlan.length) {
         const subPlanStackNow = Array.isArray(state.subPlanStack) ? state.subPlanStack : [];
         if (subPlanStackNow.length > 0) {
           const { completeSubPlan } = require('./subPlanEngine');
-          const resumed = completeSubPlan({ ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor });
-          return { ...state, ...resumed, commandExecuted: false, failedStep: null };
+          const resumed = completeSubPlan({ ...state, skillResults: [...skillResults, skippedResult], stepContracts: [...stepContracts, skipContract], skillCursor: nextCursor });
+          return { ...state, ...resumed, stepContracts: [...stepContracts, skipContract], commandExecuted: false, failedStep: null };
         }
-        return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: true, failedStep: null };
+        return { ...state, skillResults: [...skillResults, skippedResult], stepContracts: [...stepContracts, skipContract], skillCursor: nextCursor, commandExecuted: true, failedStep: null };
       }
-      return { ...state, skillResults: [...skillResults, skippedResult], skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+      return { ...state, skillResults: [...skillResults, skippedResult], stepContracts: [...stepContracts, skipContract], skillCursor: nextCursor, commandExecuted: false, failedStep: null };
     }
   }
   // ─────────────────────────────────────────────────────────────────────────────
@@ -3701,7 +4020,16 @@ Please try again or search with different terms.`;
         skill: gs.skill, description: gs.description || gs.skill, runGroup: groupId,
       });
       if (_rawProgressCallback && state._skillPlanFile) {
-        _rawProgressCallback({ type: 'plan:step_start', stepIndex: idx, totalSteps: skillPlan.length, skill: gs.skill, description: gs.description });
+        _rawProgressCallback({
+          type: 'plan:step_start',
+          stepIndex: idx,
+          stepNum: idx + 1,
+          totalSteps: skillPlan.length,
+          skill: gs.skill,
+          description: gs.description,
+          title: gs.description || gs.skill,
+          intent: state.intent?.type || 'unknown'
+        });
       }
     }
 
@@ -3972,8 +4300,25 @@ Please try again or search with different terms.`;
     //   - live stdout chunks stream to the UI terminal panel (shell:stdout_chunk)
     //   - sudo operations show a password warning before execution (shell:sudo_required)
     const _isShellRunStep = skill === 'shell.run';
+
+    // Create thinking emitter callback for agent skills
+    const _emitThinking = _isAgentSkill && progressCallback
+      ? (thinkingEvt) => {
+          progressCallback({
+            type: 'agent:thinking',
+            stepIndex: skillCursor,
+            totalSteps: skillPlan.length,
+            skill: thinkingEvt.agent || skill,
+            agentId: thinkingEvt.agentId,
+            phase: thinkingEvt.phase,
+            thought: thinkingEvt.thought,
+            context: thinkingEvt.context
+          });
+        }
+      : null;
+
     const _callArgs = _isAgentSkill
-      ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+      ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, _emitThinking, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
       : _isShellRunStep
         ? { ...resolvedArgs, _progressCallback: (evt) => {
             if (!progressCallback) return;
@@ -4136,6 +4481,44 @@ Please try again or search with different terms.`;
       };
     }
 
+    // ── shell.run allowlist ask_user short-circuit ─────────────────────────────
+    // When shell.run returns askUser: true for unknown commands, surface the
+    // allowlist question directly without routing through recoverSkill.
+    if (skill === 'shell.run' && raw.askUser === true && raw._isShellAllowlist) {
+      logger.info(`[Node:ExecuteCommand] shell.run ask_user (allowlist): "${String(raw.question).slice(0, 80)}"`);
+      const askUserStep = {
+        step: skillCursor + 1, skill, args: resolvedArgs, description,
+        ok: false, askUser: true, error: raw.question,
+      };
+      if (progressCallback) {
+        progressCallback({
+          type: 'ask_user',
+          question: raw.question,
+          options: raw.options || [],
+          stepIndex: skillCursor,
+          skill,
+          description: description || skill,
+          source: 'shell_allowlist',
+        });
+      }
+      return {
+        ...state,
+        skillResults: [...skillResults, askUserStep],
+        skillCursor,
+        failedStep: null,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: raw.question,
+          options: raw.options || [],
+          context: `${description || skill} (step ${skillCursor + 1})`,
+          _isShellAllowlist: true,
+          commandName: raw.commandName || null,
+          userAllowlistPath: raw.userAllowlistPath || null,
+        },
+        commandExecuted: false,
+      };
+    }
+
     // ── Wrong-destination gate ─────────────────────────────────────────────────
     // browser.agent pre-navigation resolver detected a mismatch between task intent
     // and configured startUrl, and no high-confidence auto-correction was available.
@@ -4201,7 +4584,8 @@ Please try again or search with different terms.`;
         type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill,
         error: oauthFailStep.error,
       });
-      return { ...state, skillResults: [...skillResults, oauthFailStep], skillCursor, failedStep: oauthFailStep, commandExecuted: false };
+      const oauthContract = generateStepContract(oauthFailStep, skillCursor);
+      return { ...state, skillResults: [...skillResults, oauthFailStep], stepContracts: [...stepContracts, oauthContract], skillCursor, failedStep: oauthFailStep, commandExecuted: false };
     }
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -4480,6 +4864,11 @@ Please try again or search with different terms.`;
 
     const updatedResults = [...skillResults, _normalizedResult];
 
+    // ── Generate step output contract ────────────────────────────────────────
+    const stepContract = generateStepContract(_normalizedResult, skillCursor);
+    const updatedStepContracts = [...stepContracts, stepContract];
+    logger.debug(`[Node:ExecuteCommand] Generated step contract for ${skill}: ${JSON.stringify(stepContract.summary)}`);
+
     // ── BLOCKED: OAuth token-file read — inline auto-patch, silent retry ───────
     // When validate() rejects a shell.run because the script reads from
     // ~/.thinkdrop/tokens/, don't route to recoverSkill (LLM round-trip + red X).
@@ -4644,11 +5033,14 @@ Please try again or search with different terms.`;
             });
 
             const scoutResults = [...skillResults, scoutStepResult];
+            const scoutContract = generateStepContract(scoutStepResult, skillCursor);
+            const scoutStepContracts = [...stepContracts, scoutContract];
 
             if (!runResult.ok && !optional) {
               return {
                 ...state,
                 skillResults: scoutResults,
+                stepContracts: scoutStepContracts,
                 failedStep: { step: skillCursor, skill, args: resolvedArgs, error: runResult.error, runnerType: effectiveRunnerType },
                 skillCursor,
                 skillPlan,
@@ -4659,12 +5051,13 @@ Please try again or search with different terms.`;
               return {
                 ...state,
                 skillResults: scoutResults,
+                stepContracts: scoutStepContracts,
                 skillCursor: skillCursor + 1,
                 commandExecuted: true,
                 answer: runResult.result || `${runnerType} skill "${stepSkillName}" completed.`,
               };
             }
-            return { ...state, skillResults: scoutResults, skillCursor: skillCursor + 1, skillPlan };
+            return { ...state, skillResults: scoutResults, stepContracts: scoutStepContracts, skillCursor: skillCursor + 1, skillPlan };
 
           } catch (runnerErr) {
             const logger = state.logger || console;
@@ -4887,6 +5280,7 @@ Please try again or search with different terms.`;
       return {
         ...state,
         skillResults: updatedResults,
+        stepContracts: updatedStepContracts,
         skillCursor,           // cursor stays at failed step
         failedStep: enrichedStepResult,
         commandExecuted: false
@@ -5054,6 +5448,7 @@ Please try again or search with different terms.`;
             return {
               ...state,
               skillResults: updatedResults,
+              stepContracts: updatedStepContracts,
               // Skip past the waitForAuth step if it's next — user will confirm when done
               skillCursor: nextIsWaitForAuth ? skillCursor + 2 : skillCursor + 1,
               failedStep: null,
@@ -5074,6 +5469,7 @@ Please try again or search with different terms.`;
           return {
             ...state,
             skillResults: updatedResults,
+            stepContracts: updatedStepContracts,
             skillCursor: skillCursor + 1,
             failedStep: null,
             activeBrowserSessionId,
@@ -5451,6 +5847,7 @@ Please try again or search with different terms.`;
       ...state,
       skillPlan: patchedSkillPlan,   // carry forward the (possibly patched) plan with real image paths
       skillResults: updatedResults,
+      stepContracts: updatedStepContracts,
       skillCursor: skillCursor + 1,
       failedStep: null,
       activeBrowserSessionId,
@@ -5531,9 +5928,11 @@ Please try again or search with different terms.`;
     }
     if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: stepResult.error, stderr: null });
 
+    const failContract = generateStepContract(stepResult, skillCursor);
     return {
       ...state,
       skillResults: [...skillResults, stepResult],
+      stepContracts: [...stepContracts, failContract],
       skillCursor,
       failedStep: stepResult,
       commandExecuted: false
