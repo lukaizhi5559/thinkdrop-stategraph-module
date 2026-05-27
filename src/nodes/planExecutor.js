@@ -113,6 +113,23 @@ module.exports = async function planExecutor(state) {
     };
   }
 
+  // Extract skill_plan_json from frontmatter
+  // let originalSkillPlan = null;
+  // try {
+  //   const frontmatterMatch = content.match(/^---\n(.*?)\n---/s);
+  //   if (frontmatterMatch) {
+  //     const frontmatter = frontmatterMatch[1];
+  //     const skillPlanJsonMatch = frontmatter.match(/skill_plan_json:\s*'([^']+)'/);
+  //     if (skillPlanJsonMatch) {
+  //       const decoded = Buffer.from(skillPlanJsonMatch[1], 'base64').toString('utf8');
+  //       originalSkillPlan = JSON.parse(decoded);
+  //       logger.debug(`[Node:PlanExecutor] Extracted original skill plan with ${originalSkillPlan.length} steps`);
+  //     }
+  //   }
+  // } catch (err) {
+  //   logger.warn(`[Node:PlanExecutor] Failed to extract skill_plan_json: ${err.message}`);
+  // }
+
   // 2. Handle re-entry after a step was just executed
   //    _planStepNum is set when logConversation's plan-mode handler calls back
   if (_planStepNum) {
@@ -243,7 +260,7 @@ module.exports = async function planExecutor(state) {
     resolvedMessage:  actionText,
     intent: {
       type:       nextStep.intent,
-      confidence: 0.99,
+      confidence: 1.0, // Maximum confidence to prevent override
       entities:   [],
       requiresMemoryAccess: nextStep.intent === 'memory_retrieve',
     },
@@ -258,7 +275,12 @@ module.exports = async function planExecutor(state) {
     contextDocs:      [],
     searchResults:    [],
     skillResults:     [],
-    skillPlan:        null,
+    skillPlan: null,
+    // skillPlan:        originalSkillPlan ? [originalSkillPlan[nextStep.num - 1]] : [{ // Use original skill plan or fallback
+    //   skill: nextStep.skills?.[0] || 'shell.run',
+    //   args: JSON.parse(nextStep.args || '{}'),
+    //   description: nextStep.title || nextStep.action || 'Execute step',
+    // }],
     skillCursor:      0,
     commandExecuted:  false,
     commandOutput:    null,

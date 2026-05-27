@@ -584,9 +584,12 @@ module.exports = async function recoverSkill(state) {
     }
 
     lines.push(`REQUIRED frontmatter fields: name, description, exec_path, exec_type`);
-    lines.push(`exec_type must be one of: node, shell`);
-    lines.push(`name must match: /^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$/ (e.g. reminder.cold.plunge)`);
-    lines.push(`exec_path must be inside ~/.thinkdrop/skills/<name>/skill.md`);
+    lines.push(`exec_type must be one of: python, node, shell`);
+    lines.push(`name must match: /^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$/ (e.g. markdown.image.analyzer)`);
+    lines.push(`exec_path must be inside ~/.thinkdrop/skills/<name>/`);
+    lines.push(`CORRECT PATTERN: synthesize(saveToFile: "~/.thinkdrop/skills/[name]/skill.md") → skill.install(skillPath: same path)`);
+    lines.push(`NEVER use shell.run to create skill.md files — always use synthesize with saveToFile`);
+    lines.push(`NEVER use /Users/[user]/skill.md — always use ~/.thinkdrop/skills/[name]/skill.md`);
 
     skillContextSection = `\nskill.install diagnostic context:\n${lines.map(l => `  ${l}`).join('\n')}\n`;
     logger.debug(`[Node:RecoverSkill] skill.install context injected (skillPath: ${skillPath})`);

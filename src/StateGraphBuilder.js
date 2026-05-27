@@ -41,6 +41,7 @@ const mcpFillGapsNode = require('./nodes/mcpFillGaps');
 const executeIntrospectNode = require('./nodes/executeIntrospect');
 const executeSettingsNode = require('./nodes/executeSettings');
 const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
+const planExecutorNode = require('./nodes/planExecutor');
 
 /**
  * Assess risk level of a user request using LLM classification
@@ -390,6 +391,7 @@ class StateGraphBuilder {
       executeIntrospect: (state) => executeIntrospectNode({ ...state, logger, mcpAdapter }),
       executeSettings: (state) => executeSettingsNode({ ...state, logger }),
       createSkillFromHistory: (state) => createSkillFromHistoryNode({ ...state, logger, mcpAdapter, llmBackend }),
+      planExecutor: (state) => planExecutorNode({ ...state, logger, mcpAdapter, llmBackend }),
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
@@ -414,6 +416,18 @@ class StateGraphBuilder {
       // enrichIntent router: handles MODE B re-routing + MODE A gap/resolve routing
       enrichIntent: async (state) => {
         const intentType = state.intent?.type || 'general_query';
+        
+        // Disable plan correction mode if a new session was created AND this is a new prompt (not plan execution)
+        // Plan execution requests (with _planFile) should still work even with new sessions
+        if (state._newSessionCreated && state._planCorrectionMode && !state._planFile) {
+          logger.info('[StateGraph:Router] New session created for new prompt - disabling plan correction mode');
+          state._planCorrectionMode = false;
+          state._planCorrectionText = null;
+          state._basePlanFile = null;
+          state._skillPlanJson = null;
+          state._planCorrectionSourcePrompt = null;
+        }
+        
         logger.info(`[StateGraph:Router] enrichIntent exit — intent: ${intentType} | _planFile: ${!!state._planFile} | _planMode: ${!!state._planMode}`);
 
         // ── Screen follow-up: inject prior screen context before routing ─────
@@ -431,12 +445,16 @@ class StateGraphBuilder {
         // classifyTask already classified this as taskType='query' — the user is
         // asking a knowledge question about what's on screen, not requesting an action.
         // Route directly to answer which already has state.context (OCR text) injected above.
+        // BUT: Don't override if decomposePromptV2 clearly identified command_automate
+        // with high confidence - this indicates a genuine automation request.
         if (
           state._taskClassification?.isScreenFollowUp &&
           state._taskClassification?.taskType === 'query' &&
-          intentType === 'command_automate'
+          intentType === 'command_automate' &&
+          (!state.intent || state.intent.confidence < 0.8) && // Only override low-confidence automation intents
+          !state._planMode // Don't override during plan execution
         ) {
-          logger.info(`[StateGraph:Router] isScreenFollowUp+query — overriding command_automate → answer`);
+          logger.info(`[StateGraph:Router] isScreenFollowUp+query — overriding low-confidence command_automate → answer`);
           state.intent = { type: 'general_knowledge', confidence: 0.95, entities: [], requiresMemoryAccess: false };
           return 'answer';
         }
@@ -462,8 +480,10 @@ class StateGraphBuilder {
         // ── Skill creation from conversation history ───────────────────────────
         // classifyTask detected skill_creation intent — user wants to turn code/script
         // from previous conversation into a reusable skill. Route to createSkillFromHistory.
-        if (state._taskClassification?.taskType === 'skill_creation') {
-          logger.info('[StateGraph:Router] skill_creation detected — routing to createSkillFromHistory');
+        // CRITICAL: Only route to skill creation if it's a follow-up referring to previous code
+        if (state._taskClassification?.taskType === 'skill_creation' && 
+            state._taskClassification?.isFollowUp === true) {
+          logger.info('[StateGraph:Router] skill_creation + isFollowUp detected — routing to createSkillFromHistory');
           return 'createSkillFromHistory';
         }
 
@@ -560,6 +580,10 @@ class StateGraphBuilder {
         }
         if (intentType === 'command_execute' || intentType === 'command_guide') {
           return 'executeCommand';
+        }
+        if (intentType === 'plan_execute' && state._planFile) {
+          logger.info('[StateGraph:Router] plan_execute with _planFile — routing to planExecutor', intentType);
+          return 'planExecutor';
         }
         if (intentType === 'screen_intelligence') {
           return 'screenIntelligence';
@@ -693,13 +717,27 @@ class StateGraphBuilder {
       evaluateSkills: (state) => {
         const verdict = state.evaluationVerdict;
         if (verdict === 'FIX' && state.evaluationFix) {
-          logger.info(`[StateGraph:Router] evaluateSkills FIX → planSkills (retry ${state.evaluationRetryCount})`);
+          // CRITICAL FIX: Preserve singleStepReplan context when routing to planSkills
+          // This prevents full replan when only one step failed
+          if (state.recoveryAction === 'replan_step') {
+            logger.info(`[StateGraph:Router] evaluateSkills FIX → planSkills (single-step replan, retry ${state.evaluationRetryCount})`);
+            // Preserve singleStepReplan flag in state for planSkillsV2 to detect
+            state.singleStepReplan = true;
+          } else {
+            logger.info(`[StateGraph:Router] evaluateSkills FIX → planSkills (full replan, retry ${state.evaluationRetryCount})`);
+          }
           return 'planSkills';
         }
         // recoverSkill set recoveryAction='replan' or 'replan_step' — evaluateSkills was inserted in that path.
         // If no FIX rule was derived (PASS fallback), still continue to planSkills with recoveryContext.
         if (verdict === 'PASS' && (state.recoveryAction === 'replan' || state.recoveryAction === 'replan_step') && state.recoveryContext) {
-          logger.debug(`[StateGraph:Router] evaluateSkills PASS (failure path) → planSkills with recoveryContext (action: ${state.recoveryAction})`);
+          // Also preserve singleStepReplan for PASS path
+          if (state.recoveryAction === 'replan_step') {
+            logger.debug(`[StateGraph:Router] evaluateSkills PASS (failure path) → planSkills with recoveryContext (single-step replan)`);
+            state.singleStepReplan = true;
+          } else {
+            logger.debug(`[StateGraph:Router] evaluateSkills PASS (failure path) → planSkills with recoveryContext (full replan)`);
+          }
           return 'planSkills';
         }
         return 'logConversation';
@@ -801,7 +839,8 @@ class StateGraphBuilder {
       answer: 'logConversation',
       synthesize: 'logConversation',
       summarizeMultiIntent: 'logConversation',
-      // planExecutor loops back through its own edge (above)
+      // planExecutor dispatches each step through the full pipeline (intent-aware routing)
+      planExecutor: 'enrichIntent',
 
       // Multi-intent queue runner.
       // Each time logConversation completes for a step, this conditional checks whether

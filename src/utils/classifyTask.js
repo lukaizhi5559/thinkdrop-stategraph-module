@@ -12,7 +12,7 @@
  *
  * Output shape:
  * {
- *   taskType: 'local_file' | 'browser' | 'messaging' | 'scheduling' | 'query' | 'ambiguous',
+ *   taskType: 'local_file' | 'local_system' | 'browser' | 'messaging' | 'scheduling' | 'query' | 'ambiguous',
  *   isFollowUp: boolean,           // message references prior turn ("that folder", "it", "the result")
  *   followUpTarget: string | null, // resolved concrete value from conversation history
  *   needsClarification: boolean,   // true only when a genuinely critical piece is missing
@@ -30,7 +30,7 @@ Given the user's message and recent conversation history, classify the task.
 
 Output ONLY valid JSON with exactly these fields:
 {
-  "taskType": "local_file" | "browser" | "messaging" | "scheduling" | "skill_creation" | "query" | "ambiguous",
+  "taskType": "local_file" | "local_system" | "browser" | "messaging" | "scheduling" | "query" | "ambiguous",
   "isFollowUp": true | false,
   "followUpTarget": "<resolved concrete value>" | null,
   "needsClarification": true | false,
@@ -44,11 +44,11 @@ Output ONLY valid JSON with exactly these fields:
 Field rules:
 - taskType:
   - "local_file": create, open, rename, move, copy, delete, generate, write, export, convert, compress, find any local file or folder
+  - "local_system": interrogate or control the local machine — check uptime, disk space, memory usage, CPU, battery, network interfaces, running processes, kill a process, system stats, hardware info, environment variables, hostname, OS version, run a shell command, check what is installed, list ports, ping a host. Use this whenever the task requires executing a shell command or querying the OS rather than reading/writing a file.
   - "browser": navigate, search, open a website, go to a URL, look something up online
   - "messaging": send email, text, SMS, Slack, Discord, notify someone
   - "scheduling": set a reminder, schedule something, recurring alarm, cron task
-  - "skill_creation": turn a script/code into a reusable skill, "create a skill from that python script", "make that into a skill", "turn that code into a skill", "save that as a skill", "convert that to a skill" - triggered by follow-up requests referring to code/script from previous turns
-  - "query": question, lookup, retrieve memory, general knowledge
+  - "query": question, lookup, retrieve memory, general knowledge — use ONLY for pure knowledge questions that do NOT require executing anything on the local machine
   - "ambiguous": genuinely unclear even with history
 
 - isFollowUp: true when message contains "that folder", "it", "the file", "there", "that one", "the result", "that directory", "that script", "that code", "that python", "the previous", or any pronoun/demonstrative referring to something established in RECENT CONVERSATION
@@ -59,7 +59,7 @@ Field rules:
   - WHO to send to (messaging tasks with no recipient anywhere)
   - WHICH service (when multiple equally valid options exist and user gave no hint)
   - NEVER ask about file format, content, or preferences — the system can infer those
-  - NEVER ask when taskType is local_file, browser, or scheduling — these are always clear enough
+  - NEVER ask when taskType is local_file, local_system, browser, or scheduling — these are always clear enough
   - NEVER ask when isFollowUp is true and followUpTarget is resolved
 
 - targetService: the specific external service named (e.g. "gmail", "github", "youtube"). null for local tasks.

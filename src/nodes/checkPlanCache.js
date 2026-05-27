@@ -57,7 +57,8 @@ module.exports = async function checkPlanCache(state) {
   if (!userMessage) return state;
 
   // ── 1. In-memory session cache — exact-match only (zero disk I/O) ─────────
-  const cacheKey = _sessionCacheKey(userMessage);
+  const sessionId = state.context?.sessionId || null;
+  const cacheKey = _sessionCacheKey(userMessage, sessionId);
   const cached   = _sessionCacheGet(cacheKey);
   if (cached) {
     if (_isStaleBrowserActPlan(cached.skillPlan, userMessage)) {
@@ -75,7 +76,7 @@ module.exports = async function checkPlanCache(state) {
 
   // ── 2. Disk search: exact match → auto-execute; semantic → suggestion only ──
   const mcpAdapter = state.mcpAdapter || null;
-  const similarPlan = await findSimilarCompletePlan(userMessage, mcpAdapter, logger);
+  const similarPlan = await findSimilarCompletePlan(userMessage, mcpAdapter, logger, sessionId);
 
   if (!similarPlan) return state;
 

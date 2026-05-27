@@ -371,6 +371,12 @@ module.exports = async function parseSkill(state) {
   // Only fires when intent is confirmed command_automate with high confidence AND we have an LLM backend.
   // Builds a compact skill menu (name + description) and asks the LLM for a
   // clear match. Falls through gracefully on timeout, missing backend, or null.
+  // Skip semantic matching for new sessions to allow fresh plan generation
+  // if (state._newSessionCreated) {
+  //   logger.debug(`[Node:ParseSkill] Strategy 3 skipped — new session created, allowing fresh plan: "${classifyMessage.substring(0, 80)}"`);
+  //   return state;
+  // }
+  
   if (state.intent?.type !== 'command_automate' || intentConf < 0.75) {
     logger.debug(`[Node:ParseSkill] Strategy 3 skipped — intent is not command_automate: "${classifyMessage.substring(0, 80)}"`);
     return state;

@@ -168,7 +168,7 @@ function collapseUserInfoQuery(plan, originalMessage, logger) {
   return plan;
 }
 
-async function llmDecompose(message, llmBackend, conversationHistory, logger) {
+async function llmDecompose(message, llmBackend, conversationHistory, logger, onParsed = null) {
   const recentCtx = (conversationHistory || []).slice(-4)
     .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
@@ -194,6 +194,7 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger) {
   try {
     const parsed = JSON.parse(sanitized);
     logger.debug(`[Node:DecomposePromptV2] Parsed JSON: ${JSON.stringify(parsed).slice(0, 200)}...`);
+    if (onParsed) onParsed(parsed); // Pass parsed JSON to main function
     const subPrompts = parsed.subPrompts || parsed.sub_prompts;
     if (!Array.isArray(subPrompts) || subPrompts.length < 1) {
       logger.warn(`[Node:DecomposePromptV2] No valid subPrompts array found - parsed.subPrompts: ${JSON.stringify(parsed.subPrompts)}, parsed.sub_prompts: ${JSON.stringify(parsed.sub_prompts)}`);
@@ -231,7 +232,10 @@ module.exports = async function decomposePromptV2(state) {
   }
 
   const t0 = Date.now();
-  let subPrompts = await llmDecompose(message, llmBackend, conversationHistory, logger);
+  let parsedJson = null; // Store parsed JSON for intent preservation
+  let subPrompts = await llmDecompose(message, llmBackend, conversationHistory, logger, (parsed) => {
+    parsedJson = parsed; // Capture the parsed JSON
+  });
 
   // Guard: llmDecompose returns null on LLM failure or JSON parse error — pass-through
   if (!subPrompts) {
@@ -283,6 +287,12 @@ module.exports = async function decomposePromptV2(state) {
   const durationMs = Date.now() - t0;
 
   if (!subPrompts || subPrompts.length === 0) {
+    // If we filtered out duplicates but had original analysis, preserve the intent
+    if (parsedJson && parsedJson.subPrompts && parsedJson.subPrompts.length > 0) {
+      const originalIntent = parsedJson.subPrompts[0].estimatedIntent;
+      logger.debug(`[Node:DecomposePromptV2] No sub-prompts after duplicate filtering - preserving _decomposedIntent: ${originalIntent}`);
+      return { ...state, _decomposedIntent: originalIntent };
+    }
     logger.debug('[Node:DecomposePromptV2] No sub-prompts returned — pass-through');
     return state;
   }

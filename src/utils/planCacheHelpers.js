@@ -57,8 +57,10 @@ function normalizePrompt(text) {
   return (text || '').toLowerCase().replace(/[^\w\s-]/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-function _sessionCacheKey(message) {
-  return normalizePrompt(message);
+function _sessionCacheKey(message, sessionId = null) {
+  const normalizedMessage = normalizePrompt(message);
+  // Include session ID in cache key to ensure plans are cached per session
+  return sessionId ? `${sessionId}:${normalizedMessage}` : normalizedMessage;
 }
 
 function _sessionCacheSet(key, skillPlan) {
@@ -76,6 +78,28 @@ function _sessionCacheGet(key) {
     return null;
   }
   return entry;
+}
+
+/**
+ * Clear cache entries for a specific session, or clear entire cache
+ * @param {string} sessionId optional: clear only entries for this session
+ */
+function _clearSessionCache(sessionId = null) {
+  if (sessionId) {
+    // Clear only entries for this session
+    const keysToDelete = [];
+    for (const key of _SESSION_CACHE.keys()) {
+      if (key.startsWith(`${sessionId}:`)) {
+        keysToDelete.push(key);
+      }
+    }
+    for (const key of keysToDelete) {
+      _SESSION_CACHE.delete(key);
+    }
+  } else {
+    // Clear entire cache
+    _SESSION_CACHE.clear();
+  }
 }
 
 // ── Cosine similarity ─────────────────────────────────────────────────────────
@@ -193,14 +217,24 @@ function findPlanByName(planName, logger) {
 /**
  * Collect candidate completed plans from disk.
  * Returns array of { planPath, file, title, planPrompt, jsonMatch } for scoring.
+ * @param {string} sessionId optional: scope search to current session only
  * @returns {Array}
  */
-function _collectCandidatePlans() {
+function _collectCandidatePlans(sessionId = null) {
   if (!fs.existsSync(PLANS_DIR)) return [];
-  const files = fs.readdirSync(PLANS_DIR)
+  let files = fs.readdirSync(PLANS_DIR)
     .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
-    .sort().reverse()
-    .slice(0, 20);
+    .sort().reverse();
+  
+  // If sessionId is provided, only search plans from current session
+  if (sessionId) {
+    // Plans are stored with timestamps, so we need to filter by session context
+    // For now, we'll limit to recent plans (last 10) to approximate session scoping
+    // TODO: Implement proper session-scoped plan storage
+    files = files.slice(0, 10);
+  } else {
+    files = files.slice(0, 20);
+  }
 
   const candidates = [];
   for (const file of files) {
@@ -256,9 +290,10 @@ async function _getEmbeddings(texts, mcpAdapter) {
  * @param {string} prompt        user message
  * @param {object} mcpAdapter    MCP adapter for embedding call
  * @param {object} logger
+ * @param {string} sessionId     optional: scope search to current session only
  * @returns {Promise<{ planFile, title, file, similarity, skillPlan, autoExecute } | null>}
  */
-async function findSimilarCompletePlan(prompt, mcpAdapter, logger) {
+async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = null) {
   // Fast path: dot-syntax named recall → always auto-execute
   const _dotName = extractDotNameFromPrompt(prompt);
   if (_dotName) {
@@ -267,7 +302,7 @@ async function findSimilarCompletePlan(prompt, mcpAdapter, logger) {
   }
 
   try {
-    const candidates = _collectCandidatePlans();
+    const candidates = _collectCandidatePlans(sessionId);
     if (candidates.length === 0) return null;
 
     // ── Exact normalized match → auto-execute immediately (zero network call) ──

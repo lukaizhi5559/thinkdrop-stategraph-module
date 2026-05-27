@@ -260,6 +260,86 @@ function _extractFilesFromFsRead(stepResult) {
 }
 
 /**
+ * Get contract by index (read-only access).
+ * Returns null if index is out of bounds or contract doesn't exist.
+ */
+function getContractByIndex(stepContracts, index) {
+  if (!Array.isArray(stepContracts) || index < 0 || index >= stepContracts.length) {
+    return null;
+  }
+  return stepContracts[index];
+}
+
+/**
+ * Get the most recent contract that matches a filter function.
+ * Returns null if no matching contract found.
+ */
+function findLastMatchingContract(stepContracts, filterFn) {
+  if (!Array.isArray(stepContracts) || typeof filterFn !== 'function') {
+    return null;
+  }
+  for (let i = stepContracts.length - 1; i >= 0; i--) {
+    const contract = stepContracts[i];
+    if (filterFn(contract)) {
+      return contract;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolve a contract path (e.g., "CONTRACT[0].outputs.stdout") to its value.
+ * Returns null if path cannot be resolved.
+ */
+function resolveContractPath(stepContracts, path) {
+  // Match patterns: CONTRACT[N], PREV_CONTRACT, LAST_SUCCESSFUL, LAST_WITH_OUTPUT
+  const contractMatch = path.match(/^CONTRACT\[(\d+)\](.*)$/);
+  const prevContractMatch = path.match(/^PREV_CONTRACT(.*)$/);
+  const lastSuccessfulMatch = path.match(/^LAST_SUCCESSFUL(.*)$/);
+  const lastWithOutputMatch = path.match(/^LAST_WITH_OUTPUT(.*)$/);
+  
+  let contract = null;
+  let remainingPath = '';
+  
+  if (contractMatch) {
+    const index = parseInt(contractMatch[1], 10);
+    contract = getContractByIndex(stepContracts, index);
+    remainingPath = contractMatch[2];
+  } else if (prevContractMatch) {
+    contract = getContractByIndex(stepContracts, stepContracts.length - 1);
+    remainingPath = prevContractMatch[1];
+  } else if (lastSuccessfulMatch) {
+    contract = findLastMatchingContract(stepContracts, c => c.success === true);
+    remainingPath = lastSuccessfulMatch[1];
+  } else if (lastWithOutputMatch) {
+    contract = findLastMatchingContract(stepContracts, c => 
+      c.outputs && (c.outputs.stdout || c.outputs.result || c.outputs.output)
+    );
+    remainingPath = lastWithOutputMatch[1];
+  }
+  
+  if (!contract) {
+    return null;
+  }
+  
+  // Navigate the remaining path (e.g., ".outputs.stdout")
+  if (remainingPath) {
+    const pathParts = remainingPath.substring(1).split('.');
+    let current = contract;
+    for (const part of pathParts) {
+      if (current && typeof current === 'object' && part in current) {
+        current = current[part];
+      } else {
+        return null;
+      }
+    }
+    return current;
+  }
+  
+  return contract;
+}
+
+/**
  * Auto-inject missing arguments from prior step contracts.
  * Scans previous contracts to find values for missing args like filePath.
  */
@@ -949,10 +1029,9 @@ module.exports = async function executeCommand(state) {
       const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
       answer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
     } else {
-      answer = `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
-      answer = imageAnalyzeFailure
-        ? `Image analysis failed: ${imageAnalyzeFailure.error || 'unknown error'}`
-        : `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`;
+      answer = failedCount > 0
+        ? `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`
+        : `All ${completedCount} step${completedCount !== 1 ? 's' : ''} completed successfully.`;
     }
 
     // Preserve the last active browser sessionId so follow-up tasks reuse the same tab
@@ -1061,6 +1140,34 @@ module.exports = async function executeCommand(state) {
         args = { ...fileArgs, _prevOutputFile: _tmpFile };
       } catch (_) {}
     }
+  }
+
+  // ── {{CONTRACT[]}} template injection ───────────────────────────────────────
+  // Allows read-only access to any previous step's contract data.
+  // Supports: CONTRACT[N].field, PREV_CONTRACT.field, LAST_SUCCESSFUL.field, LAST_WITH_OUTPUT.field
+  if (stepContracts.length > 0) {
+    const injectContract = (val) => {
+      if (typeof val !== 'string') return val;
+      
+      return val.replace(/\{\{(CONTRACT\[\d+\]|PREV_CONTRACT|LAST_SUCCESSFUL|LAST_WITH_OUTPUT)([^}]*)\}\}/g, (match, contractRef, fieldPath) => {
+        const resolved = resolveContractPath(stepContracts, contractRef + fieldPath);
+        if (resolved === null || resolved === undefined) {
+          logger.warn(`[Node:ExecuteCommand] Contract reference not found: ${match}`);
+          return match; // Keep original if not found
+        }
+        // Convert to string, handle objects
+        if (typeof resolved === 'object') {
+          return JSON.stringify(resolved);
+        }
+        return String(resolved);
+      });
+    };
+    
+    const newArgs = {};
+    for (const [k, v] of Object.entries(args)) {
+      newArgs[k] = injectContract(v);
+    }
+    args = newArgs;
   }
 
   // ── {{user.agent.resolved.*}} — substitute resolved user context fields ──────
@@ -2066,15 +2173,20 @@ module.exports = async function executeCommand(state) {
             try { fs.writeFileSync(skillPath, contractMd, 'utf8'); } catch (_) {}
           }
         } else {
-          // No file on disk — check if a prior synthesize step should have created it.
-          // Only auto-scaffold if a prior synthesize step with saveToFile ran in this plan
-          // (on-demand build flow). Otherwise fail so recoverSkill can replan with the
-          // full bootstrap (web.crawl → synthesize → skill.install).
+          // No file on disk — check if a prior step should have created it.
+          // Accept both synthesize with saveToFile AND shell.run that creates skill files.
+          // This handles both the preferred pattern (synthesize) and legacy/incorrect patterns.
           const hadPriorSynthesize = skillResults.some(r =>
             r.skill === 'synthesize' && r.ok && r.args?.saveToFile
           );
-          if (!hadPriorSynthesize) {
-            const errMsg = `Skill contract not found at ${skillPath}. The bootstrap plan must include web.crawl + synthesize steps before skill.install to create the skill.md file.`;
+          const hadPriorShellRunWithSkillFile = skillResults.some(r =>
+            r.skill === 'shell.run' && r.ok && (
+              (r.args?.goal && r.args.goal.toLowerCase().includes('skill.md')) ||
+              (r.stdout && r.stdout.toLowerCase().includes('skill.md'))
+            )
+          );
+          if (!hadPriorSynthesize && !hadPriorShellRunWithSkillFile) {
+            const errMsg = `Skill contract not found at ${skillPath}. Use synthesize with saveToFile to create the skill.md at ~/.thinkdrop/skills/[name]/skill.md, then skill.install.`;
             logger.warn(`[Node:ExecuteCommand] skill.install: ${errMsg}`);
             if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: 'Install failed', error: errMsg });
             return {
@@ -2092,12 +2204,17 @@ module.exports = async function executeCommand(state) {
           logger.info(`[Node:ExecuteCommand] skill.install: no file at ${skillPath || '(none)'} — auto-scaffolding contract for "${inferredName}"`);
           const scaffoldDir = path.join(os.homedir(), '.thinkdrop', 'skills', inferredName);
           const scaffoldFile = path.join(scaffoldDir, 'skill.md');
+          // Determine exec_type and implementation file based on skill name hints
+          const isPython = /python|py|script/i.test(inferredName + ' ' + (args.description || ''));
+          const isShell = /shell|bash|sh/i.test(inferredName + ' ' + (args.description || ''));
+          const execType = isPython ? 'python' : (isShell ? 'shell' : 'node');
+          const implFile = isPython ? 'index.py' : (isShell ? 'index.sh' : 'index.cjs');
           contractMd = [
             '---',
             `name: ${inferredName}`,
             `description: ${args.description || inferredName + ' skill (auto-scaffolded)'}`,
-            `exec_path: ~/.thinkdrop/skills/${inferredName}/index.cjs`,
-            'exec_type: node',
+            `exec_path: ~/.thinkdrop/skills/${inferredName}/${implFile}`,
+            `exec_type: ${execType}`,
             'version: 1.0.0',
             `trigger: ${inferredName}`,
             'schedule: on_demand',
@@ -2119,7 +2236,7 @@ module.exports = async function executeCommand(state) {
       // Mirrors skillRegistry.validateContract so errors are caught locally, with
       // clear fixes applied inline, rather than returned as an opaque HTTP 400.
       const REQUIRED_FM_FIELDS = ['name', 'description', 'exec_path', 'exec_type'];
-      const VALID_EXEC_TYPES = new Set(['node', 'shell']);
+      const VALID_EXEC_TYPES = new Set(['node', 'shell', 'python']);
       const SKILL_NAME_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
       {
         const fmPreflight = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
@@ -2622,8 +2739,21 @@ module.exports = async function executeCommand(state) {
 
     // Include external.skill results — external skill execution output
     const externalSkillResults = skillResults
-      .filter(r => r.skill === 'external.skill' && r.ok && r.output)
-      .map(r => `=== External Skill (${r.skillName || 'external'}) ===\n${r.output}`);
+      .filter(r => r.skill === 'external.skill' && r.ok && (r.output || r.stdout))
+      .map(r => {
+        const label = r.skillName || r.args?.name || 'external';
+        const parts = [`=== External Skill (${label}) ===`];
+        const mainOutput = r.output || r.stdout || '';
+        if (mainOutput) parts.push(mainOutput);
+        // Include additional structured fields beyond just the `output` string
+        // so synthesize/downstream LLMs see the full data (images[], counts, file paths, etc.)
+        const SKIP_FIELDS = new Set(['ok','skill','skillName','execType','step','description','args','stdout','output','_contract','requiresReauth']);
+        const extras = Object.entries(r)
+          .filter(([k, v]) => !SKIP_FIELDS.has(k) && v !== null && v !== undefined && typeof v !== 'function')
+          .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
+        if (extras.length > 0) parts.push(extras.join('\n'));
+        return parts.join('\n');
+      });
 
     const allContextParts = [
       ...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`),
@@ -2677,6 +2807,35 @@ module.exports = async function executeCommand(state) {
         crossTurnContext = recentOutputMsg.content;
         logger.debug(`[Node:ExecuteCommand] synthesize: using cross-turn context from conversation history (${crossTurnContext.length} chars)`);
       }
+    }
+
+    // ── External-skill-only fast path ─────────────────────────────────────────
+    // When the only context is from external.skill result(s) — no page text, no
+    // shell output, no web crawl — skip the LLM and return the skill output directly.
+    // This preserves the exact structured output instead of letting the LLM paraphrase
+    // (and potentially lose) data like images[], file paths, and counts.
+    const _onlyExternalSkill = externalSkillResults.length > 0 &&
+      pageTextResults.length === 0 && processedShellResults.length === 0 &&
+      webCrawlResults.length === 0 && fileBridgeResults.length === 0 &&
+      fsReadResults.length === 0 && imageAnalyzeResults.length === 0 &&
+      cliAgentResults.length === 0 && playwrightAgentResults.length === 0 &&
+      webAgentResults.length === 0 && videoAgentResults.length === 0 &&
+      screenCaptureResults.length === 0 && systemIntrospectResults.length === 0;
+
+    if (_onlyExternalSkill) {
+      const _directAnswer = externalSkillResults.join('\n\n');
+      logger.info(`[Node:ExecuteCommand] synthesize: external-skill-only — returning output directly (${_directAnswer.length} chars)`);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'synthesize', description: description || 'Skill result', stdout: _directAnswer, isSynthesisResult: true });
+      if (typeof streamCallback === 'function') streamCallback(_directAnswer);
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: _directAnswer, stdout: _directAnswer }],
+        skillCursor: skillCursor + 1,
+        failedStep: null,
+        answer: _directAnswer,
+        synthesisAnswer: _directAnswer,
+        commandExecuted: true,
+      };
     }
 
     const _rawSynthesisContext = allContextParts.length > 0

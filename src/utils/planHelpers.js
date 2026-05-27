@@ -46,6 +46,7 @@ function serializeSkillPlanToMd(skillPlan, originalPrompt, planId, sessionId) {
     const desc = step.description || buildStepDescription(step);
     lines.push(`### Step ${num} — ${desc}`);
     lines.push(`- **Skill**: ${step.skill}`);
+    lines.push(`- **Intent**: command_automate`);
     if (step.args) {
       const argsStr = JSON.stringify(step.args, null, 0).slice(0, 200);
       lines.push(`- **Args**: \`${argsStr}\``);

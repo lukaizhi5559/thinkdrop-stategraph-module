@@ -171,9 +171,8 @@ module.exports = async function parseIntentV2(state) {
     return { ...state, intent: { type: 'command_automate', confidence: 0.88, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'decomposed-intent-passthrough', processingTimeMs: 0 } };
   }
 
-  // ── 6. Fallback: LLM classification when decomposePrompt had no opinion ─────
+  // ── 6. Fallback: phi4 classification when decomposePrompt had no opinion ─────
   // This fires for messages that bypassed decomposePrompt (short greetings, etc.)
-  // The LLM classifies from scratch using the message + recent conversation context.
   const { mcpAdapter } = state;
   if (mcpAdapter) {
     try {

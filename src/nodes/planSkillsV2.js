@@ -396,6 +396,13 @@ async function planSkillsV2(state) {
   const logger = state.logger || console;
   const progressCallback = state.progressCallback || null;
   const homeDir = process.env.HOME || process.env.USERPROFILE || '/Users/unknown';
+  
+  // Debug logging for single-step replan
+  if (state.singleStepReplan || recoveryContext?.replanMode === 'single_step') {
+    logger.info(`[Node:PlanSkillsV2] DEBUG: singleStepReplan=${state.singleStepReplan}, recoveryMode=${recoveryContext?.replanMode}`);
+    logger.info(`[Node:PlanSkillsV2] DEBUG: skillPlan exists=${!!state.skillPlan}, skillPlan length=${state.skillPlan?.length || 0}, skillCursor=${state.skillCursor}`);
+    logger.info(`[Node:PlanSkillsV2] DEBUG: recoveryAction=${state.recoveryAction}, recoveryContext exists=${!!recoveryContext}`);
+  }
 
   const _dataFileSuffix = state._dataFile
     ? `\n[Full content available at: ${state._dataFile} — read with fs.readFileSync if needed]`
@@ -432,6 +439,24 @@ async function planSkillsV2(state) {
     : userMessage;
 
   let SKILL_SYSTEM_PROMPT = _buildSystemPrompt(userMessage, state) || SKILL_SYSTEM_PROMPT_FALLBACK;
+
+  // ── planMode fast-path: planExecutor dispatched this step ─────────────────
+  // _planMode=true means planExecutor set message+intent for a single plan step.
+  // Skip all LLM planning — build a minimal 1-step skillPlan so executeCommand
+  // fires immediately without regenerating a plan or triggering an approval gate.
+  if (state._planMode && state._planFile) {
+    const _stepSkill = (() => {
+      const t = state.intent?.type;
+      if (t === 'web_search' || t === 'general_knowledge') return 'web.agent';
+      if (t === 'memory_retrieve' || t === 'memory_store') return 'shell.run';
+      return 'shell.run';
+    })();
+    const _stepMsg = state.resolvedMessage || state.message || '';
+    const _stepPlan = [{ skill: _stepSkill, description: _stepMsg, args: { goal: _stepMsg } }];
+    logger.info(`[Node:PlanSkillsV2] _planMode fast-path — skipping planning for: "${_stepMsg.slice(0, 60)}"`);
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: _stepPlan.map((s, i) => ({ index: i, ...s })), intent: state.intent?.type || 'command_automate' });
+    return { ...state, skillPlan: _stepPlan, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null };
+  }
 
   // ── Project skill plan passthrough ────────────────────────────────────────
   if (state.projectSkillPlan && Array.isArray(state.projectSkillPlan) && state.projectSkillPlan.length > 0) {
@@ -659,9 +684,14 @@ async function planSkillsV2(state) {
           if (contractMd?.trim()) {
             const _fmMatch = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
             const _isNodeSkill = _fmMatch && /exec_type:\s*node\b/i.test(_fmMatch[1]);
-            if (_isNodeSkill) {
-              skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is a Node.js runtime skill (exec_type: node). Generate a SINGLE step: { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n3. FORBIDDEN: Do NOT generate shell.run or curl steps.\n\n${contractMd.slice(0, 2000)}`;
-            } else {
+            const _isPythonSkill = _fmMatch && /exec_type:\s*python\b/i.test(_fmMatch[1]);
+            // Shell contract: exec_type:shell where exec_path points to a .md file
+            // (defines curl/bash commands inline). Node and Python skills run via external.skill.
+            const _isShellContract = !_isNodeSkill && !_isPythonSkill;
+            if (_isNodeSkill || _isPythonSkill) {
+              const _runtimeType = _isPythonSkill ? 'Python' : 'Node.js';
+              skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is a ${_runtimeType} runtime skill (exec_type: ${_isPythonSkill ? 'python' : 'node'}). Generate a SINGLE step: { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n2. FORBIDDEN: Do NOT generate shell.run or curl steps.\n3. FORBIDDEN: Do NOT expand the implementation — just call external.skill.\n\n${contractMd.slice(0, 2000)}`;
+            } else if (_isShellContract) {
               skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step.\n3. FORBIDDEN: Do NOT use external.skill for this.\n\n${contractMd.slice(0, 3000)}`;
               _shellContractMd = contractMd;
               shellSkillNames.add(state.matchedSkillName);
@@ -904,54 +934,73 @@ EXAMPLE - Mixed parallel sources:
   // ── Single-step replan mode ───────────────────────────────────────────────
   // When recoverSkill decides only the failed step needs regeneration, we generate
   // a replacement step instead of rebuilding the entire plan.
-  if (recoveryContext?.replanMode === 'single_step' && state.skillPlan) {
-    logger.info(`[Node:PlanSkillsV2] Single-step replan: regenerating step ${state.skillCursor} (${recoveryContext.failedSkill})`);
+  logger.debug(`[Node:PlanSkillsV2] Single-step replan check: recoveryContext?.replanMode=${recoveryContext?.replanMode}, state.singleStepReplan=${state.singleStepReplan}, state.skillPlan=${!!state.skillPlan}, skillCursor=${state.skillCursor}`);
+  
+  // Check if we should do single-step replan
+  const shouldSingleStepReplan = (recoveryContext?.replanMode === 'single_step' || state.singleStepReplan);
+  
+  if (shouldSingleStepReplan) {
+    // Try to get the skill plan from various sources
+    let skillPlanToUse = state.skillPlan;
     
-    const { generateSingleStep } = require('../utils/singleStepPlanner');
-    
-    const replacementStep = await generateSingleStep({
-      failedStep: recoveryContext.failedStep,
-      failedSkill: recoveryContext.failedSkill,
-      failedArgs: recoveryContext.failedStepArgs,
-      suggestion: recoveryContext.suggestion,
-      constraint: recoveryContext.constraint,
-      priorResults: skillResults,
-      userMessage: resolvedMessage || message,
-      llmBackend: backend,
-    });
-    
-    // Replace only the failed step, keep rest of plan
-    const newPlan = [
-      ...state.skillPlan.slice(0, state.skillCursor),
-      replacementStep,
-      ...state.skillPlan.slice(state.skillCursor + 1),
-    ];
-    
-    logger.info(`[Node:PlanSkillsV2] Single-step replan complete: replaced step ${state.skillCursor} with new ${replacementStep.skill}`);
-    
-    // Emit plan_ready with single-step replan flag so UI merges instead of replaces
-    if (progressCallback) {
-      progressCallback({
-        type: 'plan_ready',
-        steps: newPlan.map((s, i) => ({
-          index: i,
-          skill: s.skill,
-          description: s.description || buildStepDescription(s),
-          args: s.args,
-          runGroup: s.runGroup || undefined,
-        })),
-        intent: intent?.type || 'command_automate',
-        singleStepReplan: true,  // Signal this is a single-step replan (preserve prior step statuses)
-      });
+    // If no skillPlan in state, try to get it from the results
+    if (!skillPlanToUse && state.skillResults && state.skillResults.length > 0) {
+      // Reconstruct the plan from skill results if needed
+      logger.info(`[Node:PlanSkillsV2] No skillPlan in state, attempting to reconstruct from context`);
+      // For now, we'll fall back to full replan if we can't find the original plan
     }
     
-    return {
-      ...state,
-      skillPlan: newPlan,
-      skillCursor: state.skillCursor,  // Stay at same position
-      planError: null,
-      recoveryContext: null,  // Clear after use
-    };
+    if (skillPlanToUse && Array.isArray(skillPlanToUse)) {
+      logger.info(`[Node:PlanSkillsV2] Single-step replan: regenerating step ${state.skillCursor} (${recoveryContext?.failedSkill || 'unknown skill'})`);
+      
+      const { generateSingleStep } = require('../utils/singleStepPlanner');
+      
+      const replacementStep = await generateSingleStep({
+        failedStep: recoveryContext?.failedStep || skillPlanToUse[state.skillCursor],
+        failedSkill: recoveryContext?.failedSkill || skillPlanToUse[state.skillCursor]?.skill,
+        failedArgs: recoveryContext?.failedStepArgs || skillPlanToUse[state.skillCursor]?.args,
+        suggestion: recoveryContext?.suggestion,
+        constraint: recoveryContext?.constraint,
+        priorResults: skillResults,
+        userMessage: resolvedMessage || message,
+        llmBackend: backend,
+      });
+      
+      // Replace only the failed step, keep rest of plan
+      const newPlan = [
+        ...skillPlanToUse.slice(0, state.skillCursor),
+        replacementStep,
+        ...skillPlanToUse.slice(state.skillCursor + 1),
+      ];
+      
+      logger.info(`[Node:PlanSkillsV2] Single-step replan complete: replaced step ${state.skillCursor} with new ${replacementStep.skill}`);
+      
+      // Emit plan_ready with single-step replan flag so UI merges instead of replaces
+      if (progressCallback) {
+        progressCallback({
+          type: 'plan_ready',
+          steps: newPlan.map((s, i) => ({
+            index: i,
+            skill: s.skill,
+            description: s.description || buildStepDescription(s),
+            args: s.args,
+            runGroup: s.runGroup || undefined,
+          })),
+          intent: intent?.type || 'command_automate',
+          singleStepReplan: true,  // Signal this is a single-step replan (preserve prior step statuses)
+        });
+      }
+      
+      return {
+        ...state,
+        skillPlan: newPlan,
+        skillCursor: state.skillCursor,  // Stay at same position
+        planError: null,
+        recoveryContext: null,  // Clear after use
+      };
+    } else {
+      logger.warn(`[Node:PlanSkillsV2] Single-step replan requested but no valid skillPlan found - falling back to full replan`);
+    }
   }
 
   // ── LLM call ──────────────────────────────────────────────────────────────
@@ -1312,7 +1361,7 @@ EXAMPLE - Mixed parallel sources:
   try {
     if (!fs.existsSync(PLANS_DIR)) fs.mkdirSync(PLANS_DIR, { recursive: true });
     _planId = `plan_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-    const planMd = serializeSkillPlanToMd(skillPlan, userMessage, _planId, state.sessionId || 'unknown');
+    const planMd = serializeSkillPlanToMd(skillPlan, userMessage, _planId, state.context?.sessionId || 'unknown');
     _skillPlanFile = path.join(PLANS_DIR, `${_planId}.md`);
     fs.writeFileSync(_skillPlanFile, planMd, 'utf8');
     logger.info(`[Node:PlanSkillsV2] Plan saved: ${_skillPlanFile}`);
@@ -1367,6 +1416,7 @@ EXAMPLE - Mixed parallel sources:
       type: 'plan_ready',
       steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })),
       intent: state.intent?.type || 'command_automate',
+      singleStepReplan: state.singleStepReplan || false,  // Preserve single-step replan context for UI
     });
   }
 
