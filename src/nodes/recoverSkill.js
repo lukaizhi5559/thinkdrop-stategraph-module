@@ -1939,6 +1939,20 @@ Then keep any synthesize step that follows. The {{bestUrl}} token in the navigat
     };
   }
 
+  // ── Runtime JS error fast-path (playwright.agent / browser.act / browser.agent) ──
+  // ReferenceError, TypeError, SyntaxError etc. are code bugs in the skill layer,
+  // not user-correctable issues. REPLAN_STEP: try a different approach for this
+  // step while preserving completed prior work.  No LLM round-trip needed.
+  if ((skill === 'playwright.agent' || skill === 'browser.act' || skill === 'browser.agent') &&
+      /\b(ReferenceError|TypeError|SyntaxError|RangeError|EvalError|URIError)\b/.test(combinedError)) {
+    logger.info(`[Node:RecoverSkill] Fast-path: runtime JS error in ${skill} → REPLAN_STEP`);
+    return {
+      action: 'REPLAN_STEP',
+      suggestion: `${skill} crashed with a JavaScript runtime error: ${combinedError.slice(0, 200)}. This is an internal code bug. Try a different approach for this step.`,
+      constraint: `The previous approach using ${skill} hit a code-level crash. Use browser.agent { action: "run" } to handle this task — it manages sessions, auth, and error recovery internally.`,
+    };
+  }
+
   return null;
 }
 

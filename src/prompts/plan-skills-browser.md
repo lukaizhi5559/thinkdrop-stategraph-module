@@ -1,6 +1,5 @@
-browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|domain agent factory+runner — handles auth, CAPTCHA, playbook caching, content extraction, service unavailability detection
-browser.act|args:{action:string,url?:string,selector?:string,text?:string,key?:string,sessionId?:string,timeoutMs?:number}|raw playwright-cli — ONLY for anonymous raw-URL reads with no named service
-web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,maxResults?:number}|web search agent — use when: (1) site blocks bots/CAPTCHA and you need to find a direct article URL, (2) LLM-generated URL may be wrong (unknown service), (3) need navigation hints for a complex site. actions: search_and_navigate (returns bestUrl), research_domain (returns insights+bestUrl), get_tutorial_steps
+browser.agent|args:{action:string,agentId?:string,task?:string,service?:string,url?:string}|**ONLY browser skill in a plan** — domain agent factory+runner. Handles auth, CAPTCHA, playbook caching, content extraction, session persistence, service unavailability detection. Works for named sites, raw URLs, and everything in between. `playwright.agent` and `browser.act` are internal primitives — NEVER emit them.
+web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,maxResults?:number}|web search agent — use when: (1) site blocks bots/CAPTCHA and you need a direct article URL, (2) LLM-generated URL may be wrong (unknown service), (3) need navigation hints for a complex site. actions: search_and_navigate (returns bestUrl), research_domain (returns insights+bestUrl), get_tutorial_steps
 synthesize|args:{prompt:string}|LLM synthesis of retrieved content — required after every data-retrieval step
 
 ## Output Format Requirements
@@ -15,14 +14,14 @@ Output ONLY a valid JSON array of skill steps. No markdown fences, no explanatio
 |------|--------------|
 | **Any named site/service** (google, biblegateway, wikipedia, duckduckgo, reddit, youtube, etc.) | `browser.agent { action: "run", agentId: "<service>.agent", task: "..." }` |
 | AI chatbot (ChatGPT, Gemini, Perplexity, Claude, Grok, DeepSeek, etc.) | `browser.agent { action: "run", agentId: "<service>.agent", task: "..." }` |
-| Raw URL with NO identifiable service name (user pastes a link) | `browser.act` navigate + getPageText |
-| **Site known to block bots** (stackoverflow, reddit, twitter/X, paywalled news) OR prior CAPTCHA detected | `web.agent { action: "search_and_navigate", query: "<task> site:<domain>" }` → `browser.act navigate(bestUrl)` → `getPageText` → `synthesize` |
-| **Unknown service / LLM may guess wrong domain** (service not in known list, novel tool) | `web.agent { action: "search_and_navigate", query: "<service> official website", preferDomain: "<service>" }` → use `bestUrl` to navigate |
+| Raw URL with NO identifiable service name (user pastes a link) | `browser.agent { action: "run", task: "<goal>", url: "<url>" }` |
+| **Site known to block bots** (stackoverflow, reddit, twitter/X, paywalled news) OR prior CAPTCHA detected | `web.agent { action: "search_and_navigate", query: "<task> site:<domain>" }` → `browser.agent { action: "run", task: "...", url: "{{bestUrl}}" }` → `synthesize` |
+| **Unknown service / LLM may guess wrong domain** (service not in known list, novel tool) | `web.agent { action: "search_and_navigate", query: "<service> official website", preferDomain: "<service>" }` → `browser.agent { action: "run", task: "...", url: "{{bestUrl}}" }` |
 | Data retrieval task (lookup, search, read, "what is", "find") | append `synthesize` step AFTER the agent/browser step |
 
-**RULE: If you can identify the site/service by name from the user's request, ALWAYS use `browser.agent`.** browser.agent handles auth detection, CAPTCHA fallback, playbook caching, session persistence, service unavailability detection, and intelligent content extraction. Raw `browser.act` misses all of these.
+**RULE: ALWAYS use `browser.agent` for ANY browser task.** It handles auth detection, CAPTCHA fallback, playbook caching, session persistence, service unavailability detection, and intelligent content extraction. `playwright.agent` and `browser.act` are internal primitives — **NEVER emit them in a plan.**
 
-**EXCEPTION: Use `web.agent` first when the site is known to aggressively block bots** (stackoverflow, reddit, twitter/X, news sites with paywalls). `web.agent` finds a specific article URL via search, then `browser.act` navigates directly to it — bypassing CAPTCHA-triggering search forms entirely. Pattern: `web.agent search_and_navigate` → `browser.act navigate(bestUrl)` → `browser.act getPageText` → `synthesize`.
+**EXCEPTION: Use `web.agent` first when the site is known to aggressively block bots** (stackoverflow, reddit, twitter/X, news sites with paywalls). `web.agent` finds a specific article URL via search, then `browser.agent` navigates directly to it. Pattern: `web.agent search_and_navigate` → `browser.agent { action: "run", task: "...", url: "{{bestUrl}}" }` → `synthesize`.
 
 ## browser.agent — primary skill for named sites
 
@@ -63,20 +62,11 @@ Output ONLY a valid JSON array of skill steps. No markdown fences, no explanatio
 ]
 ```
 
-## browser.act — raw URL fallback ONLY
-
-Use browser.act ONLY when the user provides a raw URL with no identifiable service name.
-
-**browser.act key actions:** navigate|getPageText|waitForStableText|examine|fill|press|screenshot
-
-**Session rule:** Use `sessionId: "browser"` for ALL browser.act steps.
-
 ### Example — read a raw URL (no named service)
 
 ```json
 [
-  { "skill": "browser.act", "args": { "action": "navigate", "url": "https://some-random-site.com/page", "sessionId": "browser" }, "description": "Navigate to the URL" },
-  { "skill": "browser.act", "args": { "action": "getPageText", "sessionId": "browser" }, "description": "Read page content" },
+  { "skill": "browser.agent", "args": { "action": "run", "task": "read and extract the main content from the page", "url": "https://some-random-site.com/page" }, "description": "Navigate and read the URL" },
   { "skill": "synthesize", "args": { "prompt": "Summarize the page content for the user" }, "description": "Summarize page content" }
 ]
 ```

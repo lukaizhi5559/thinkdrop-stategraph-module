@@ -20,92 +20,6 @@ function stripHtml(text) {
   return text ? text.replace(/<[^>]*>/g, '') : text;
 }
 
-/**
- * Check if new prompt should continue existing session using LLM
- */
-async function checkSessionContinuity(newPrompt, sessionId, mcpAdapter, llmBackend, logger) {
-  logger.info(`[Node:ResolveReferencesV2] LLM continuity check started for session: ${sessionId}`);
-  logger.info(`[Node:ResolveReferencesV2] Prompt: "${newPrompt}"`);
-  
-  if (!llmBackend) {
-    logger.warn('[Node:ResolveReferencesV2] No LLM backend available, allowing new session');
-    return true; // Default to allowing new session
-  }
-
-  try {
-    // Get recent messages from the session
-    const msgResult = await mcpAdapter.callService('conversation', 'message.list', {
-      sessionId,
-      limit: 3,
-      direction: 'DESC',
-    });
-    const msgData = msgResult.data || msgResult;
-    const recentMessages = (msgData.messages || [])
-      .filter(msg => msg.sender !== 'system')
-      .map(msg => ({
-        sender: msg.sender,
-        text: stripHtml(msg.text || msg.content || ''),
-      }))
-      .reverse();
-
-    logger.info(`[Node:ResolveReferencesV2] Found ${recentMessages.length} recent messages`);
-    recentMessages.forEach((msg, i) => {
-      logger.info(`[Node:ResolveReferencesV2] Message ${i+1}: ${msg.sender}: "${msg.text.substring(0, 50)}..."`);
-    });
-
-    if (recentMessages.length === 0) {
-      logger.info('[Node:ResolveReferencesV2] Session has no messages, allowing continuation');
-      return true;
-    }
-
-    // Check if this prompt is already in the recent messages
-    const promptExists = recentMessages.some(m => 
-      m.sender === 'user' && m.text === newPrompt
-    );
-    
-    if (promptExists) {
-      logger.debug('[Node:ResolveReferencesV2] Prompt already exists in session, allowing continuation');
-      return true;
-    }
-
-    // Use LLM to determine if this is a continuation
-    const context = recentMessages.slice(-3).map(m => `${m.sender}: ${m.text}`).join('\n');
-    
-    logger.info(`[Node:ResolveReferencesV2] Context for LLM:\n${context}`);
-    
-    const prompt = `You are checking if a new user prompt is a continuation of an existing conversation.
-
-Recent Context:
-${context}
-
-New Prompt: "${newPrompt}"
-
-Is this new prompt a continuation of the existing conversation, or is it starting a new unrelated task?
-
-Respond with ONLY:
-- "continue" if it's clearly a continuation (references previous work, uses "it/that/continue", etc.)
-- "new" if it's a new task (even if topically similar)`;
-
-    logger.info(`[Node:ResolveReferencesV2] Calling LLM with prompt...`);
-    const response = await llmBackend.generateAnswer(prompt, {
-      temperature: 0.1,
-      maxTokens: 10,
-      systemInstructions: 'You are a conversation continuity checker. Respond with only "continue" or "new".'
-    });
-    
-    const decision = response.toLowerCase().trim();
-    const shouldContinue = decision.includes('continue');
-    
-    logger.info(`[Node:ResolveReferencesV2] LLM response: "${response}"`);
-    logger.info(`[Node:ResolveReferencesV2] LLM decision: "${decision}" -> shouldContinue: ${shouldContinue}`);
-    
-    return shouldContinue;
-  } catch (error) {
-    logger.warn('[Node:ResolveReferencesV2] LLM continuity check failed:', error.message);
-    return true; // Default to allowing continuation on error
-  }
-}
-
 // ── Fetch recent screen context from the background monitor heartbeat ───────────────────
 // The user-memory monitor runs every 5s, capturing screen OCR on window change or pixel diff.
 // memory.getRecentOcr returns the freshest capture within maxAgeSeconds — always current.
@@ -171,53 +85,20 @@ module.exports = async function resolveReferencesV2(state) {
 
     if (!sessionId) {
       try {
-        // First, get existing session (if any)
+        // No sessionId provided — create/route to a new session
+        // (session selection via semantic matching is now done in main.js before graph execution)
         const routeResult = await mcpAdapter.callService('conversation', 'session.route', { text: message });
         sessionId = (routeResult.data || routeResult)?.sessionId || null;
         
         if (sessionId) {
           const sessionAction = (routeResult.data || routeResult)?.action || 'unknown';
           logger.info(`[Node:ResolveReferencesV2] Got session: ${sessionId} (action: ${sessionAction})`);
-          
-          // Store the resolved session ID in context for downstream nodes (especially checkPlanCache)
           if (!state.context) state.context = {};
           state.context.sessionId = sessionId;
         }
       } catch (_) {}
-    }
-
-    // ── LLM continuity check for existing sessions ───────────────────────────
-    if (sessionId) {
-      logger.info(`[Node:ResolveReferencesV2] Running LLM continuity check on session: ${sessionId}`);
-      
-      // Skip LLM check for synthetic plan_execute messages — always continue existing session
-      const isPlanExecute = /^\[plan_execute:/.test(message || '');
-      if (isPlanExecute) {
-        logger.debug('[Node:ResolveReferencesV2] plan_execute prompt — skipping continuity check, keeping session');
-      }
-      
-      // LLM continuity check - validate if this should continue the session
-      const shouldContinue = isPlanExecute || await checkSessionContinuity(message, sessionId, mcpAdapter, state.llmBackend, logger);
-      
-      if (!shouldContinue) {
-        logger.info(`[Node:ResolveReferencesV2] LLM detected new context, creating new session`);
-        // Create new session
-        const newRouteResult = await mcpAdapter.callService('conversation', 'session.route', { 
-          text: message,
-          forceNew: true 
-        });
-        sessionId = (newRouteResult.data || newRouteResult)?.sessionId || null;
-        logger.debug(`[Node:ResolveReferencesV2] Created new session: ${sessionId}`);
-        
-        // Update context with new session ID
-        if (!state.context) state.context = {};
-        state.context.sessionId = sessionId;
-        
-        // Set flag to indicate new session was created (for parseSkill to skip semantic matching)
-        state._newSessionCreated = true;
-      } else {
-        logger.info(`[Node:ResolveReferencesV2] LLM confirmed session continuation`);
-      }
+    } else {
+      logger.info(`[Node:ResolveReferencesV2] Using pre-resolved sessionId from context: ${sessionId}`);
     }
 
     if (sessionId) {

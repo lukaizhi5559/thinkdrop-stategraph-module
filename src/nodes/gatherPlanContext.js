@@ -317,6 +317,10 @@ module.exports = async function gatherPlanContext(state) {
       if (answer) {
         answers.push({ question, answer });
         logger.info(`[Node:GatherPlanContext] Answer received for Q${round + 1}: "${String(answer).slice(0, 80)}"`);
+        // Immediately clear the ask_user card in the UI — don't wait for the next LLM call
+        if (progressCallback) {
+          progressCallback({ type: 'gather_answer_received' });
+        }
       } else {
         // Timeout or null answer — proceed with what we have
         logger.warn(`[Node:GatherPlanContext] No answer received for Q${round + 1} — proceeding without`);

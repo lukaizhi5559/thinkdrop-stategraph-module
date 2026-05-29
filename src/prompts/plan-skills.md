@@ -8,10 +8,9 @@ project.stopper|args:{projectName:string,port?:number}|Stops_a_running_ThinkDrop
 needs_skill|args:{capability:string,suggestion:string}|Use_for_TWO_cases:_(1)_recurring_background_daemons_that_cannot_be_done_via_one-off_API_call,_(2)_desktop_UI_automation_/_app_control_tasks_(scroll,_type,_shortcuts,_interact_with_native_apps)_that_require_a_full_project_—_NOT_a_skill.md.__RULE:_if_the_user_asks_to_"create_a_skill"_or_"build_a_tool"_for_controlling_apps_(keyboard,_mouse,_scroll,_shortcuts,_window_control),_output_needs_skill_with_the_described_capability.
 external.skill|args:{name:string,args?:object,timeoutMs?:number}|executes_a_user_installed_external_skill_by_name
 user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string,entities?:string[],dateRange?:{start:string,end?:string},isCommsTask?:boolean}|[context_assembler]_resolves_user_identity_data_from_user_profile+memory+conversation_history.__action:'resolve_form'_→_fills_name/phone/email/address/any_form_fields.__action:'resolve_context'_→_assembles_richer_user_context_(projects,_interests,_contacts,_conversation_history)_for_content_generation.__ALWAYS_use_before_tasks_that_need_user_personal_data:_forms,_emails_addressed_to_user,_document_templates,_anything_referencing_"my_X".__Returns_{resolved:{field:value,...},summary:string,missingFields:string[]}.__summary_can_be_injected_directly_into_a_synthesize_prompt.
-playwright.agent|args:{goal:string,sessionId?:string,url?:string,maxTurns?:number,headed?:boolean,timeoutMs?:number}|[sub-agent]_agentic_browser_loop__LLM_drives_snapshot→action→repeat_until_goal_done__use_for_complex_open_ended_tasks_on_PUBLIC_or_ANONYMOUS_sites_only__(scraping,_read-only_research,_AI_chatbots_with_no_API).__⚠️_NEVER_use_for_any_service_in_AVAILABLE_AGENTS_or_any_registered_OAuth_service_(Gmail,_Slack,_Notion,_etc.)—those_MUST_use_browser.agent_{action:run}.
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI_agent_factory+runner.__Takes_ONE_high-level_task,_reads_agent_descriptor_from_DuckDB,_infers_correct_CLI_commands_via_LLM,_executes,_returns_result.__actions:_run_(delegate_task),_build_agent_(discover+install+register_CLI_service),_list_agents,_validate_agent,_preflight_check.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists;_use_action:build_agent_to_create_new_agents.
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_Browser/REST_API_agent_factory+runner.__Handles_OAuth_browser_services_AND_REST_API/API-key_services_(ClickSend,_Mailgun,_Twilio,_etc.).__Takes_ONE_task,_reads_descriptor,_handles_all_auth,_infers+executes_curl_or_browser_steps.__actions:_run_(delegate_task),_build_agent_(crawl_docs+create_descriptor),_list_agents.__Check_AVAILABLE_AGENTS_block_first—delegate_via_action:run_if_agent_exists.
-web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,maxResults?:number}|[web_search_agent]_Searches_the_web_via_MCP_web-search_service_and_returns_structured_results.__Use_when:_(1)_target_site_blocks_bots/CAPTCHA_and_you_need_a_direct_article_URL_without_triggering_a_search_form,_(2)_service_URL_is_unknown_or_LLM_may_guess_wrong_domain,_(3)_need_navigation_hints_for_complex_SaaS_before_browser_automation.__actions:_search_and_navigate_(returns_{bestUrl,title,snippet}),_research_domain_(returns_{insights,insightsText,bestUrl,confidence}),_get_tutorial_steps.__After_search_and_navigate,_use_browser.act_navigate(bestUrl)_to_go_directly_to_content._NEVER_use_web.agent_for_services_in_AVAILABLE_AGENTS—those_already_handle_auth_correctly.
+web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,maxResults?:number}|[web_search_agent]_Searches_the_web_via_MCP_web-search_service_and_returns_structured_results.__Use_when:_(1)_target_site_blocks_bots/CAPTCHA_and_you_need_a_direct_article_URL_without_triggering_a_search_form,_(2)_service_URL_is_unknown_or_LLM_may_guess_wrong_domain,_(3)_need_navigation_hints_for_complex_SaaS_before_browser_automation.__actions:_search_and_navigate_(returns_{bestUrl,title,snippet}),_research_domain_(returns_{insights,insightsText,bestUrl,confidence}),_get_tutorial_steps.__After_search_and_navigate,_use_browser.agent_{action:'run',_url:'{{bestUrl}}'}_to_go_directly_to_content._NEVER_use_web.agent_for_services_in_AVAILABLE_AGENTS—those_already_handle_auth_correctly.
 video.agent|args:{action:string,videoUrl?:string,platform?:string,query?:string,goal:string}|[video_agent]_Watches_and_transcribes_a_video_using_yt-dlp_subtitle_extraction_(primary,_~2s)_with_Whisper_fallback.__action:"watch_video"_{videoUrl,goal}_→_extract_full_transcript_+_metadata_+_synthesize_steps.__action:"find_and_watch_tutorial"_{platform,query,goal}_→_search_YouTube_by_title/creator,_pick_best_result,_extract_transcript.__⚠️_USE_THIS_(not_cli.agent/ytdlp.agent)_for_ANY_"watch",_"see",_"look_at",_"transcribe",_"get_transcript_from",_"extract_steps_from_video"_request.__NEVER_route_watch/transcribe_tasks_to_cli.agent_or_ytdlp.agent_even_if_ytdlp_appears_in_AVAILABLE_AGENTS—video.agent_always_wins_for_these_verbs.
 
 ## CLI-First Routing
@@ -58,7 +57,7 @@ For ANY task that could be served by a CLI tool, REST API, or Python script — 
 [
   { "skill": "shell.run", "args": { "goal": "Create temp file with 'hello world'" } },
   { "skill": "shell.run", "args": { "goal": "Read file: {{PREV_CONTRACT.outputs.filePaths[0]}}" } },
-  { "skill": "browser.act", "args": { "action": "navigate", "url": "{{CONTRACT[0].outputs.filePaths[0]}}" } },
+  { "skill": "browser.agent", "args": { "action": "run", "task": "navigate to {{CONTRACT[0].outputs.filePaths[0]}}" } },
   { "skill": "shell.run", "args": { "goal": "Delete file from last successful step: {{LAST_SUCCESSFUL.outputs.filePaths[0]}}" } }
 ]
 ```
@@ -81,7 +80,7 @@ For ANY task that could be served by a CLI tool, REST API, or Python script — 
 
 **CRITICAL — Every step MUST include a `description` field.** The description is a short, human-readable summary of what the step does (e.g., 'Search for OpenClaw information on Grok', 'Set up Gmail agent', 'Send email with OpenClaw summary and PDF attachment'). NEVER omit the description field — it is required for plan readability and user review.
 
-**Credential template tokens — ALWAYS use these for `browser.act` fill/type steps that need a login, NEVER hardcode or guess values:**
+**Credential template tokens — ALWAYS use these for browser login steps, NEVER hardcode or guess values:**
 - `{{<service>:username}}` — any service email/username (replace `<service>` with the site slug)
 - `{{<service>:password}}` — any service password
 
@@ -89,7 +88,7 @@ For ANY task that could be served by a CLI tool, REST API, or Python script — 
 1. NEVER use placeholder strings like `<your-email@example.com>`, `your-email@gmail.com`, `<password>`, or any angle-bracket placeholder in a `fill` / `type` / `smartType` value.
 2. ALWAYS use `{{service:username}}` and `{{service:password}}` for any fill step that needs login credentials.
 3. If the credential is not yet stored, the system will automatically pause, ask the user, and store it securely — you do NOT need to add extra steps for this.
-4. Example correct fill step: `{ "skill": "browser.act", "args": { "action": "fill", "selector": "input[type='email']", "value": "{{gmail:username}}", "sessionId": "gmail" } }`
+4. Credential tokens are automatically resolved by `browser.agent` when it handles login flows internally.
 
 
 **SKILL ROUTING — use the right skill for every task type:**
@@ -103,9 +102,10 @@ For ANY task that could be served by a CLI tool, REST API, or Python script — 
 | **Service listed in AVAILABLE AGENTS with type [api_key]** (openai.agent, anthropic.agent, mistral.agent, etc.) | ⚠️ **DEVELOPER API ONLY** — programmatic API calls ONLY. **`[api_key]` agents CANNOT navigate** — they have no browser and cannot fulfill any task phrased as "goto", "go to", "open", "visit", or "navigate to" a service. Those tasks unconditionally require a `[browser]` agent. If no `[browser]` agent exists for the target service → `build_agent` it first. Rule of thumb: talking *to* or visiting an AI → `[browser]` consumer-site agent. Building *with* an AI API → `[api_key]` developer agent. |
 | **Any web app that requires a login/account** — AI chatbots (ChatGPT, Claude, Perplexity, Gemini, Grok, etc.), productivity tools, social platforms, SaaS apps — **even if no open API exists** | Check AVAILABLE AGENTS first; if not found → `browser.agent { action: 'build_agent', service: '<name>' }` then `{ action: 'run', agentId: '...', task: '...' }`. Each service gets its own isolated browser session with persistent auth — no shared session, no re-login. **NEVER use `playwright.agent` or raw `browser.act` steps for services requiring login.** |
 | **Discovery task on a known agent** — "find", "browse", "show me what's on", "explore", "discover", "look for", "search for" something on a site where the navigation path is UNKNOWN | `browser.agent { action: 'explore', agentId: '<id>', goal: '<discovery goal>' }` — explore navigates, detects auth, iterates nav items until goal is met. Use `explore` when steps are NOT predetermined. Use `run` when specific actions are known (compose, send, fill, create). |
-| Truly public / anonymous content — no login required (Wikipedia, news articles, public docs, weather, open-access pages) | `playwright.agent` with `goal` and `url` — or `browser.act` for simple navigate + read |
-| **Site known to block bots/CAPTCHA** (stackoverflow, reddit, twitter/X, paywalled news) OR service URL is uncertain | `web.agent { action: "search_and_navigate", query: "<task> site:<domain>", preferDomain: "<domain>" }` → `browser.act navigate(bestUrl)` → `browser.act getPageText` → `synthesize` |
-| **Novel/unknown service** where LLM might guess the wrong URL | `web.agent { action: "search_and_navigate", query: "<service> official website" }` → use `bestUrl` to navigate directly |
+| Truly public / anonymous content — no login required (Wikipedia, news articles, public docs, weather, open-access pages, w3schools, etc.) | `browser.agent { action: 'run', agentId: '<site>.agent', task: '...' }` — browser.agent handles public sites transparently (session persistence, CAPTCHA fallback, playbook caching). **NEVER use `playwright.agent` or raw `browser.act` directly.** |
+| **Site known to block bots/CAPTCHA** (stackoverflow, reddit, twitter/X, paywalled news) OR service URL is uncertain | `web.agent { action: "search_and_navigate", query: "<task> site:<domain>", preferDomain: "<domain>" }` → `browser.agent { action: 'run', agentId: '<site>.agent', task: '...', url: '{{bestUrl}}' }` |
+| **Novel/unknown service** where LLM might guess the wrong URL | `web.agent { action: "search_and_navigate", query: "<service> official website" }` → `browser.agent { action: 'run', task: '...', url: '{{bestUrl}}' }` |
+| **Raw URL with no identifiable service** — user pastes a link | `browser.agent { action: 'run', task: '<goal>', url: '<url>' }` — browser.agent handles even raw URLs (creates ad-hoc agent, manages session) |
 | **Local system only**: file ops, grep, ffmpeg, local git, run local scripts, open apps | `shell.run` bash |
 | **Search for videos on a video platform** — "search YouTube for X", "find videos about X on Vimeo/TikTok/Rumble/Facebook", "look up X on YouTube" | `browser.agent { action: 'run', agentId: 'youtube.agent' (or vimeo.agent etc.), task: '<full request>' }` → `synthesize` — the agent's Search Videos playbook navigates directly to `/results?search_query=`, calls `waitForStableText` + `getPageText` to capture results, then synthesize presents them. **Do NOT use `video.agent` for search-only tasks.** |
 | **Watch, extract, summarize, or transcribe a specific video** — "watch this YouTube video and give me the steps", "summarize this tutorial", "what does this video teach?", "get transcript of this video" | `video.agent { action: 'watch_video', videoUrl: '<url>', goal: '<full request>' }` — uses yt-dlp subtitle extraction (~2s) with Whisper fallback. **⚠️ NEVER use `cli.agent`/`ytdlp.agent` for these verbs** — even if `ytdlp` appears in AVAILABLE AGENTS. |
@@ -129,12 +129,12 @@ When deciding how to handle a user request, follow this priority order:
 
 **Step 3: Browser Automation** (Slowest, but captures visual context)
 - Use `browser.agent` for OAuth services requiring login
-- Use `playwright.agent` for public/anonymous sites (no CLI equivalent)
+- Use `browser.agent` for ALL web tasks — public sites, auth sites, raw URLs, CAPTCHA bypass. `playwright.agent` and `browser.act` are internal-only primitives called by `browser.agent` — **NEVER emit them directly in a plan.**
 
 **Fast-Path Pattern Matching (1ms check before full decision):**
 - Words like "watch", "see", "look at", "transcribe", "get transcript", "extract from video", "extract steps from video" → `video.agent` directly (see Video Task Architecture below)
 - Words like "download video", "save video", "extract audio file", "convert to mp3", "download as mp3" → `cli.agent { action: 'run', agentId: 'ytdlp.agent', task: '...' }`
-- Words like "search YouTube for X", "find videos about X" (search-only, no extraction) → `playwright.agent` navigate + getPageText
+- Words like "search YouTube for X", "find videos about X" (search-only, no extraction) → `browser.agent { action: 'run', agentId: 'youtube.agent', task: '...' }`
 - Words like "convert", "download", "extract", "process file" → Try CLI first (but NOT "transcribe video" — that goes to `video.agent`)
 - Words like "goto", "visit", "open site", "check website" → Browser directly
 - Words like "api", "curl", "post to" → API directly
@@ -208,9 +208,9 @@ Use the EXACT agentId string from the AVAILABLE AGENTS block — do NOT guess or
 
 | Prior step produces content | Next (consumer) step | Correct mechanism | Wrong |
 |---|---|---|---|
-| `browser.agent` / `browser.act` | `shell.run` | `{{PREV_OUTPUT}}` in goal — **NO synthesize** | `synthesize` → `{{synthesisAnswer}}` |
-| `browser.agent` / `browser.act` | `cli.agent` | `{{PREV_OUTPUT}}` in goal — **NO synthesize** | `synthesize` → `{{synthesisAnswer}}` |
-| `browser.agent` / `browser.act` | another `browser.agent` | `synthesize` → `{{synthesisAnswer}}` in task | `{{PREV_OUTPUT}}` |
+| `browser.agent` | `shell.run` | `{{PREV_OUTPUT}}` in goal — **NO synthesize** | `synthesize` → `{{synthesisAnswer}}` |
+| `browser.agent` | `cli.agent` | `{{PREV_OUTPUT}}` in goal — **NO synthesize** | `synthesize` → `{{synthesisAnswer}}` |
+| `browser.agent` | another `browser.agent` | `synthesize` → `{{synthesisAnswer}}` in task | `{{PREV_OUTPUT}}` |
 | `shell.run` / `cli.agent` | `shell.run` | `{{PREV_OUTPUT}}` in goal — **NO synthesize** | `synthesize` → `{{synthesisAnswer}}` |
 | any step | display to user (end of plan) | `synthesize` | raw output |
 
@@ -309,9 +309,8 @@ A **sub-agent** accepts ONE high-level goal, runs its own internal reasoning loo
 
 | Sub-agent | When to use | Underlying primitive |
 |---|---|---|
-| `playwright.agent` | Open-ended browser tasks: unknown page structure, login flows, conditional logic, multi-step wizards | browser.act |
+| `browser.agent` | **ALL browser/web tasks** — public sites, auth sites, raw URLs, OAuth services, REST APIs. Handles auth, CAPTCHA, playbook caching, session persistence internally. `playwright.agent` and `browser.act` are internal primitives — **NEVER emit them in a plan.** | playwright.agent / browser.act (internal) |
 | `cli.agent` | CLI-backed services (gh, firebase, nvm, stripe, fly) — agent listed in AVAILABLE AGENTS block | shell.run (CLI) |
-| `browser.agent` | REST API or OAuth web services (ClickSend, Mailgun, Twilio, Gmail OAuth) — agent listed in AVAILABLE AGENTS block | curl / browser.act |
 | `video.agent` | **Watch, transcribe, or extract steps from any video URL** (YouTube, Vimeo, etc.) or find+watch by title/creator. ⚠️ Use even when `ytdlp.agent` is in AVAILABLE AGENTS — video.agent wins for watch/transcribe verbs. | yt-dlp subs / Whisper |
 
 **When AVAILABLE AGENTS block is present above:** emit a single delegation step using the EXACT agentId shown in the block — do NOT substitute a different name (e.g. the GitHub agent is registered as `github.agent`, not `gh.agent`):
@@ -326,39 +325,15 @@ A **sub-agent** accepts ONE high-level goal, runs its own internal reasoning loo
 
 **When user asks to rebuild/refresh/recreate/reset an existing agent** (e.g. "rebuild my docker agent", "recreate the stripe agent", "refresh my gh agent"): use `cli.agent { action: 'build_agent', service: '<service_name>', force: true }` — do NOT use `action: 'run'`. The `service` is the bare service name (e.g. `"github"`, `"stripe"`, `"fly"`) — strip the `.agent` suffix if present. This applies even when the agent already appears in the AVAILABLE AGENTS block.
 
-**`playwright.agent` is different** — it has no DuckDB descriptor. Use it for open-ended browser tasks where page structure is unknown, not for registered API/CLI services.
+## browser.agent — unified browser entry point
 
-## playwright.agent — agentic browser loop
+`browser.agent` is the **ONLY** browser skill you should emit in a plan. It wraps `playwright.agent` and `browser.act` internally and adds: auth detection, CAPTCHA fallback, playbook caching, session persistence, service unavailability detection, and content extraction hints.
 
-Use `playwright.agent` when the browser task is **open-ended** — you know the goal but not the exact sequence of clicks and fills needed to achieve it.
+**For named sites:** `browser.agent { action: 'run', agentId: '<service>.agent', task: '...' }`
+**For raw URLs:** `browser.agent { action: 'run', task: '...', url: '<url>' }`
+**For new services:** `browser.agent { action: 'build_agent', service: '<name>' }` then `{ action: 'run', ... }`
 
-**Use `playwright.agent` when:**
-- The page structure is unknown or dynamic (login forms, dashboards, wizard flows)
-- The task involves conditional logic (e.g. "if already logged in, skip login")
-- You need to verify something happened before proceeding
-- Step count is unpredictable (it will retry differently on failure)
-
-**Use `browser.act` when:**
-- You know the exact steps (navigate → fill → press Enter → waitForStableText)
-- The page is simple and predictable (Wikipedia, docs, public pages)
-- You need a specific single action (screenshot, getPageText, evaluate)
-
-```json
-{ "skill": "playwright.agent", "args": { "goal": "Log in to GitHub and star the repo anthropics/anthropic-sdk-python", "url": "https://github.com", "sessionId": "github", "maxTurns": 10 } }
-```
-
-The agent runs up to `maxTurns` reasoning turns (default 12). Each turn: reads ARIA snapshot → LLM decides next action → executes via `browser.act` → re-snapshots. Declares `done: true` when it has **confirmed** the goal is achieved. Returns full `transcript` for debugging. Aborts after 3 consecutive failures.
-
-## browser.act key actions
-
-navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|select|check|uncheck|press|keyboard|scroll|screenshot|pdf|getText|getPageText|evaluate|waitForSelector|waitForContent|waitForStableText|newPage|tab-new|tab-list|tab-close|tab-select|state-save|state-load|resize|examine|paste|pasteAttachment
-
-**browser.act is a pure playwright-cli terminal skill** — every action spawns a `playwright-cli` subprocess. No Node API, no npm packages. Sessions are managed by playwright-cli daemon via `-s=<sessionId>`. The `snapshot` command captures the accessibility tree and returns numbered element refs (`e1`, `e21`, etc.) used for click/fill/hover.
-
-**Selector rules:**
-- `[eN]` refs provided above → use `"selector": "e42"`, never label text, never add `examine`.
-- No refs (fresh navigate) → pass visible label/aria-name (e.g. `"Sign in"`, `"Email"`).
-- File attachments: `synthesize(saveToFile)` → `shell.run` osascript clipboard copy (exact path from prior step) → `browser.act pasteAttachment`. Never click the paperclip button.
+`browser.agent` auto-builds an agent if it doesn't exist. It navigates to the site, detects login walls, handles auth, and delegates complex interactions to its internal `playwright.agent` loop. ONE step does it all.
 
 **CRITICAL — AI chatbot URLs (use these exact URLs, NOT the wrong ones):**
 | Name | Correct URL | WRONG URL (do NOT use) |
@@ -368,19 +343,7 @@ navigate|goto|back|forward|reload|close|snapshot|click|dblclick|fill|type|hover|
 | Perplexity | `https://www.perplexity.ai` | `perplexity.com` |
 | Claude | `https://claude.ai` | `anthropic.com` |
 
-**CRITICAL — AI chatbots use contenteditable divs, not `<input>` fields.**
-`fill` will fail with "Element is not an input/textarea" on most AI chat UIs.
-Use `fill` as normal; the skill handles the fallback. Do NOT add a separate `click` step before `fill`.
-
-**CRITICAL — Multi-site tasks:** use ONE `sessionId` + `tab-new` for additional sites. NEVER use site names as sessionIds — use a single generic name like `"browser"`. Always `snapshot` after `navigate` or `tab-new` before `fill`.
-
-**Reading page content:** static pages → `getPageText`; dynamic/JS-rendered → `waitForStableText`; after AI chatbot submit → `waitForStableText` with `timeoutMs:60000`. NEVER use `sleep`. NEVER use `waitForSelector` for inputs — use `fill` with label. NEVER click a search button — use `press Enter`. NEVER navigate to hash-fragment URLs — use `navigate` + `fill` + `press Enter`.
-
-**`examine`** — add after `navigate` when clicking/filling specific elements. Returns `OK` / `RECOVERABLE` / `NEEDS_USER` / `BLOCKED`. If status ≠ `OK`, plan stops with user-friendly message.
-
-**screen vs browser tab:** "what's on my screen" → `screen.capture` (OCR). "extract from web page" → `browser.act getPageText`.
-
-**state-save / state-load:** saves/restores cookies + localStorage to `~/.thinkdrop/browser-sessions/<sessionId>.json`.
+**screen vs browser tab:** "what's on my screen" → `screen.capture` (OCR). "extract from web page" → `browser.agent { action: 'run', task: 'extract page text' }`.
 
 ## guide.step — routing rules
 
@@ -415,7 +378,18 @@ For unknown IDEs: plan a `web.search` step first to find the rules file location
 
 ## schedule — deferred execution
 
-Use as the FIRST step when user says "at 8pm", "in 30 minutes", "wait an hour then". Use `time` for clock time or `delayMs` for a duration. Do not use for recurring tasks (use the node-cron skill pattern instead).
+Use as the FIRST step when user says "at 8pm", "in 30 seconds", "in 30 minutes", "wait an hour then". Use `time` for clock time or `delayMs` for a duration (MILLISECONDS — 1 second = 1000, 1 minute = 60000, 1 hour = 3600000). Always set `label` to the subject of the reminder (e.g. "take out the trash") — never omit it. Do not use for recurring tasks (use the node-cron skill pattern instead).
+
+**CRITICAL — deferred action steps:** When the user asks to perform an action at a future time (e.g. "in one minute go to ChatGPT and look up X", "at 9pm open Gmail and send an email"), you MUST include the action steps AFTER the schedule step. The scheduler will execute all steps that follow `schedule` when the time arrives. NEVER plan only `[schedule, synthesize]` when the user asked you to perform an action — the action steps are mandatory.
+
+| User intent | Correct plan |
+|---|---|
+| "in 30 seconds remind me to take out the trash" | `[schedule { delayMs: 30000, label: "take out the trash" }, synthesize]` |
+| "in 1 minute go to ChatGPT and look up X" | `[schedule { delayMs: 60000, label: "go to ChatGPT and look up X" }, browser.agent(chatgpt, look up X), synthesize]` |
+| "at 9pm open Gmail and send an email to Bob" | `[schedule { time: "9:00 PM", label: "send email to Bob" }, browser.agent(gmail, send email to Bob)]` |
+| "remind me in 30 minutes to take out the trash" | `[schedule { delayMs: 1800000, label: "take out the trash" }, synthesize]` |
+
+The distinguishing rule: if the user wants the AI to **do something** (navigate, click, search, type, send) — those steps go AFTER `schedule`. If the user only wants a **reminder nudge** with no automation — `[schedule, synthesize]` is correct.
 
 ## external.skill — user-installed skills
 

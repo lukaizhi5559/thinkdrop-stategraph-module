@@ -180,6 +180,21 @@ class StateGraph {
       this.logger.debug(`[StateGraph] Workflow completed in ${state.elapsedMs}ms (${iterations} iterations)`);
     }
 
+    // Attach typed output contract — consumed by main.js planStepDispatcher and session routing
+    state._contract = {
+      sessionId:    state.resolvedSessionId || state.context?.sessionId || null,
+      intent:       state.intent?.type || 'unknown',
+      answer:       state.answer || null,
+      skillResults: (state.skillResults || []).map(r => ({ skill: r.skill, ok: r.ok, stdout: (r.stdout || '').slice(0, 200) })),
+      planFile:     state._planFile || null,
+      planStepNum:  state._planStepNum || null,
+      planComplete: state.planComplete || false,
+      elapsedMs:    state.elapsedMs,
+      success:      state.success,
+      error:        state.error || null,
+      ts:           Date.now(),
+    };
+
     return state;
   }
 

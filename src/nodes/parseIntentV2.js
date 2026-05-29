@@ -49,8 +49,12 @@ module.exports = async function parseIntentV2(state) {
   }
 
   // ── 2. Structural pass-throughs ─────────────────────────────────────────────
-  if (state._planFile && typeof state._planFile === 'string') {
+  if (state._planFile && typeof state._planFile === 'string' && !state._planMode) {
     return { ...state, intent: { type: 'plan_execute', confidence: 1.0, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'plan-execute-passthrough', processingTimeMs: 0 } };
+  }
+  if (state._planMode) {
+    logger.info(`[Node:ParseIntentV2] _planMode step — forcing command_automate: "${(state.message || '').slice(0, 60)}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 1.0, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'plan-step-passthrough', processingTimeMs: 0 } };
   }
   if (state._skillPlan && Array.isArray(state._skillPlan)) {
     return { ...state, intent: { type: 'command_automate', confidence: 1.0, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'skill-plan-passthrough', processingTimeMs: 0 } };

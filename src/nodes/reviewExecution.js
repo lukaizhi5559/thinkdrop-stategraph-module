@@ -198,6 +198,18 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'VERIFIED' };
   }
 
+  // ── schedule short-circuit ────────────────────────────────────────────────
+  // schedule steps produce no page content by design — the deferred steps run
+  // later via the skill-scheduler when the reminder fires.
+  // Content-based hollow checks must NEVER fire on schedule-only results.
+  const _hasScheduleSuccess = skillResults.some(r =>
+    r.skill === 'schedule' && r.ok !== false
+  );
+  if (_hasScheduleSuccess) {
+    logger.info('[Node:ReviewExecution] schedule step succeeded — skipping hollow check (deferred execution, no page text)');
+    return { ...state, reviewVerdict: 'VERIFIED' };
+  }
+
   // ── browser.agent short-circuit ───────────────────────────────────────────
   // If browser.agent reports success with action-completion signals in the result,
   // trust it without requiring page snapshot verification. This prevents false-hollow

@@ -156,12 +156,23 @@ module.exports = async function retrieveMemory(state) {
     logger.debug(`[Node:RetrieveMemory] Search query: "${searchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | minSimilarity: ${minSimilarity}`);
 
     // Parallel fetch: current session history + cross-session date query + long-term memories
+    // For multi-intent pipelines (step 2+), reduce the history limit so prior steps'
+    // logged answers don't bleed into the current step's LLM context.
+    // Each completed step adds ~2 messages (user + assistant); subtract them from the limit.
+    const completedIntentSteps = (state.isMultiIntent && Array.isArray(state.intentResults))
+      ? state.intentResults.length
+      : 0;
+    const conversationHistoryLimit = Math.max(4, 20 - completedIntentSteps * 2);
+    if (completedIntentSteps > 0) {
+      logger.debug(`[Node:RetrieveMemory] Multi-intent step ${completedIntentSteps + 1}: capping history to ${conversationHistoryLimit} msgs (avoids prior-step answer bleed)`);
+    }
+
     const [conversationResult, crossSessionResult, memoriesResult] = await Promise.all([
       // Current session conversation history
       context?.sessionId
         ? mcpAdapter.callService('conversation', 'message.list', {
             sessionId: context.sessionId,
-            limit: 20,
+            limit: conversationHistoryLimit,
             direction: 'DESC'
           }).catch(err => {
             logger.warn('[Node:RetrieveMemory] Conversation fetch failed:', err.message);

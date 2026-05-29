@@ -159,12 +159,14 @@ function _loadPromptFile(filename) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const _URL_RE = /https?:\/\/\S+|(?:^|\s)(?:www\.)\S+\.\w{2,}/i;
-const _PUBLIC_HOST_RE = /\b(?:google|youtube|github|twitter|linkedin|reddit|facebook|instagram|amazon|netflix|spotify|wikipedia|stackoverflow|medium|notion|slack|discord|twitch|pinterest|tiktok|bing|yahoo|duckduckgo|perplexity|openai|anthropic|mistral|deepseek|gemini|grok|suno|midjourney|runway|figma|canva|zoom|teams|outlook|gmail|dropbox|drive\.google|icloud|onedrive|salesforce|hubspot|stripe|shopify|paypal|venmo|etsy|airbnb|uber|lyft|doordash|grubhub|yelp|tripadvisor)\.(?:com|ai|org|net|io|co|app|dev|me|uk|us)\b/i;
+const _PUBLIC_HOST_RE = /\b(?:google|youtube|github|twitter|linkedin|reddit|facebook|instagram|amazon|netflix|spotify|wikipedia|stackoverflow|medium|notion|slack|discord|twitch|pinterest|tiktok|bing|yahoo|duckduckgo|perplexity|openai|anthropic|mistral|deepseek|gemini|grok|suno|midjourney|runway|figma|canva|zoom|teams|outlook|gmail|dropbox|drive\.google|icloud|onedrive|salesforce|hubspot|stripe|shopify|paypal|venmo|etsy|airbnb|uber|lyft|doordash|grubhub|yelp|tripadvisor|w3schools)\.(?:com|ai|org|net|io|co|app|dev|me|uk|us)\b/i;
+// Bare site names without TLD — catches "goto w3schools", "open youtube", etc.
+const _SITE_NAME_RE = /\b(?:google|youtube|github|twitter|linkedin|reddit|facebook|instagram|amazon|netflix|spotify|wikipedia|stackoverflow|medium|notion|slack|discord|twitch|pinterest|tiktok|bing|yahoo|duckduckgo|perplexity|openai|anthropic|gemini|grok|figma|canva|zoom|outlook|gmail|w3schools|chatgpt|claude|biblegateway)\b/i;
 
 function _buildSystemPrompt(userMessage, state) {
   const isWindows = process.platform === 'win32';
 
-  const _hasUrl = _URL_RE.test(userMessage) || _PUBLIC_HOST_RE.test(userMessage);
+  const _hasUrl = _URL_RE.test(userMessage) || _PUBLIC_HOST_RE.test(userMessage) || _SITE_NAME_RE.test(userMessage);
   const _hasLocalSignals = !!(
     state.grilledConstraints ||
     state.activeBrowserSessionId ||
@@ -174,8 +176,7 @@ function _buildSystemPrompt(userMessage, state) {
     state.matchedSkillDomain
   );
   const canUseSlim = userMessage && _hasUrl && !_hasLocalSignals
-    && !state.recoveryContext
-    && state.intent?.type !== 'command_automate';
+    && !state.recoveryContext;
 
   if (canUseSlim) {
     const slim = _loadPromptFile('plan-skills-browser.md');
@@ -186,7 +187,7 @@ function _buildSystemPrompt(userMessage, state) {
   }
 
   const baseFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
-  const _skipReason = _hasUrl && !canUseSlim ? ` (slim skipped: ${state.recoveryContext ? 'recovery' : 'command_automate'})` : '';
+  const _skipReason = _hasUrl && !canUseSlim ? ` (slim skipped: ${state.recoveryContext ? 'recovery' : 'local_signals'})` : '';
   console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile}${_skipReason}`);
   const base = _loadPromptFile(baseFile) || _loadPromptFile('plan-skills.md');
   if (!base) return null;
@@ -440,20 +441,28 @@ async function planSkillsV2(state) {
 
   let SKILL_SYSTEM_PROMPT = _buildSystemPrompt(userMessage, state) || SKILL_SYSTEM_PROMPT_FALLBACK;
 
-  // ── planMode fast-path: planExecutor dispatched this step ─────────────────
+  // ── planExecutor single-pass: skillPlan[] already built for all steps ────────
+  // planExecutor sets _skillPlanFile=_planFile and builds the complete skillPlan[].
+  // Skip all LLM planning — pass straight to executeCommand.
+  // GUARD: must NOT fire during singleStepReplan recovery (recoveryContext set or singleStepReplan=true),
+  // otherwise recovery resets skillCursor to 0 and re-runs already-completed steps.
+  const _isRecoveryPath = !!recoveryContext || !!state.singleStepReplan;
+  if (!_isRecoveryPath &&
+      state._skillPlanFile && state._planFile && state._skillPlanFile === state._planFile &&
+      Array.isArray(state.skillPlan) && state.skillPlan.length > 0) {
+    logger.info(`[Node:PlanSkillsV2] planExecutor passthrough — ${state.skillPlan.length} steps pre-built, skipping planning`);
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: state.skillPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+    return { ...state, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null };
+  }
+
+  // ── planMode fast-path: planExecutor dispatched this step (legacy) ─────────
   // _planMode=true means planExecutor set message+intent for a single plan step.
-  // Skip all LLM planning — build a minimal 1-step skillPlan so executeCommand
-  // fires immediately without regenerating a plan or triggering an approval gate.
   if (state._planMode && state._planFile) {
-    const _stepSkill = (() => {
-      const t = state.intent?.type;
-      if (t === 'web_search' || t === 'general_knowledge') return 'web.agent';
-      if (t === 'memory_retrieve' || t === 'memory_store') return 'shell.run';
-      return 'shell.run';
-    })();
     const _stepMsg = state.resolvedMessage || state.message || '';
-    const _stepPlan = [{ skill: _stepSkill, description: _stepMsg, args: { goal: _stepMsg } }];
-    logger.info(`[Node:PlanSkillsV2] _planMode fast-path — skipping planning for: "${_stepMsg.slice(0, 60)}"`);
+    const _stepPlan = (Array.isArray(state.skillPlan) && state.skillPlan.length > 0)
+      ? state.skillPlan
+      : [{ skill: 'shell.run', description: _stepMsg, args: { goal: _stepMsg } }];
+    logger.info(`[Node:PlanSkillsV2] _planMode fast-path — skipping planning for: "${_stepMsg.slice(0, 60)}" (skill: ${_stepPlan[0]?.skill})`);
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: _stepPlan.map((s, i) => ({ index: i, ...s })), intent: state.intent?.type || 'command_automate' });
     return { ...state, skillPlan: _stepPlan, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null };
   }
@@ -943,11 +952,27 @@ EXAMPLE - Mixed parallel sources:
     // Try to get the skill plan from various sources
     let skillPlanToUse = state.skillPlan;
     
-    // If no skillPlan in state, try to get it from the results
-    if (!skillPlanToUse && state.skillResults && state.skillResults.length > 0) {
-      // Reconstruct the plan from skill results if needed
-      logger.info(`[Node:PlanSkillsV2] No skillPlan in state, attempting to reconstruct from context`);
-      // For now, we'll fall back to full replan if we can't find the original plan
+    // If no skillPlan in state (e.g. evaluateSkills FIX verdict cleared it),
+    // reconstruct from the plan file's skill_plan_json frontmatter so we can
+    // splice in just the replacement step without a full LLM replan.
+    if (!skillPlanToUse && (state._skillPlanFile || state._planFile)) {
+      const planFilePath = state._skillPlanFile || state._planFile;
+      try {
+        const planContent = fs.readFileSync(planFilePath, 'utf8');
+        const fmMatch = planContent.match(/^---\n(.*?)\n---/s);
+        if (fmMatch) {
+          const spMatch = fmMatch[1].match(/skill_plan_json:\s*'([^']+)'/);
+          if (spMatch) {
+            const decoded = JSON.parse(Buffer.from(spMatch[1], 'base64').toString('utf8'));
+            if (Array.isArray(decoded) && decoded.length > 0) {
+              skillPlanToUse = decoded;
+              logger.info(`[Node:PlanSkillsV2] Single-step replan: recovered skillPlan[${decoded.length}] from plan file frontmatter`);
+            }
+          }
+        }
+      } catch (e) {
+        logger.warn(`[Node:PlanSkillsV2] Single-step replan: failed to recover skillPlan from plan file — ${e.message}`);
+      }
     }
     
     if (skillPlanToUse && Array.isArray(skillPlanToUse)) {

@@ -1272,10 +1272,29 @@ module.exports = async function executeCommand(state) {
   // Registers a one-shot reminder with command-service /reminder.register,
   // then returns immediately. No blocking setTimeout countdown.
   if (skill === 'schedule') {
-    const { time, delayMs: rawDelayMs, label = 'Waiting...' } = args;
+    const { time, delayMs: rawDelayMs, label: _rawLabel } = args;
+    const _synthStepForLabel = skillPlan.slice(skillCursor + 1).find(s => s.skill === 'synthesize');
+    const _synthPromptForLabel = _synthStepForLabel?.args?.prompt || '';
+    const _fallbackLabel = _synthPromptForLabel
+      .replace(/^remind(er)?\s+(the\s+user\s+to|me\s+to|to)\s*/i, '')
+      .replace(/^(it'?s\s+time\s+to\s*)/i, '')
+      .trim();
+    const label = (_rawLabel && _rawLabel !== 'Waiting...') ? _rawLabel : (_fallbackLabel || _rawLabel || 'Reminder');
+    let _correctedDelayMs = (rawDelayMs && typeof rawDelayMs === 'number') ? rawDelayMs : 0;
+    if (_correctedDelayMs > 0) {
+      const _origMsg = (state.message || state.resolvedMessage || '').toLowerCase();
+      const _secMatch = _origMsg.match(/\b(\d+)\s+seconds?\b/);
+      if (_secMatch) {
+        const _expectedMs = parseInt(_secMatch[1], 10) * 1000;
+        if (_correctedDelayMs === _expectedMs * 60) {
+          logger.warn(`[Node:ExecuteCommand] schedule: corrected delayMs ${_correctedDelayMs} → ${_expectedMs} (LLM scaled seconds as minutes)`);
+          _correctedDelayMs = _expectedMs;
+        }
+      }
+    }
     let waitMs = 0;
-    if (rawDelayMs && typeof rawDelayMs === 'number' && rawDelayMs > 0) {
-      waitMs = rawDelayMs;
+    if (_correctedDelayMs > 0) {
+      waitMs = _correctedDelayMs;
     } else if (time && typeof time === 'string') {
       const now = new Date();
       const ts = time.trim().toUpperCase();
@@ -1316,6 +1335,10 @@ module.exports = async function executeCommand(state) {
       ));
     const pendingRealSteps = remainingSteps.filter(s => !isNotificationStep(s));
     const triggerIntent = pendingRealSteps.length > 0 ? 'execute_steps' : 'notify';
+    // Warn if label contains action keywords but no real steps were found — likely a planner omission.
+    if (triggerIntent === 'notify' && /\b(go to|open|navigate|search|look up|send|click|type|find|check)\b/i.test(label || '')) {
+      logger.warn(`[Node:ExecuteCommand] schedule: triggerIntent=notify but label suggests an action — planner may have omitted action steps after schedule. label="${label}"`);
+    }
     // Always use a clean human-readable message for the dialog/notification shown on fire.
     // Never use state.message (the raw user prompt) — that causes infinite loops when re-run.
     const synthStep = remainingSteps.find(s => s.skill === 'synthesize');
@@ -1338,10 +1361,25 @@ module.exports = async function executeCommand(state) {
     } catch (e) { logger.warn(`[Node:ExecuteCommand] schedule: reminder register error: ${e.message}`); }
     logger.info(`[Node:ExecuteCommand] schedule: registered reminder "${label}" → fires at ${targetIso} (intent=${triggerIntent})`);
     if (progressCallback) progressCallback({ type: 'schedule_registered', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: `⏰ Reminder set — ${label} at ${targetIso}`, targetTime: targetIso, label, reminderId });
+    // Emit all_done so the UI spinner resolves — the schedule step is the last synchronous step.
+    // Remaining deferred steps execute later via the skill-scheduler; they don't block the UI.
+    const _scheduleResult = { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: `Reminder set for ${targetIso} — "${label}"` };
+    const _scheduleFinalResults = [...skillResults, _scheduleResult];
+    // Indices of steps that come after the schedule step — these are deferred (run when reminder fires)
+    const _deferredStepIndices = skillPlan.slice(skillCursor + 1).map((_, i) => skillCursor + 1 + i);
+    if (progressCallback) progressCallback({
+      type: 'all_done',
+      completedCount: _scheduleFinalResults.filter(r => r.ok).length,
+      totalCount: skillPlan.length,
+      skillResults: _scheduleFinalResults,
+      savedFilePaths: [],
+      planFile: state._skillPlanFile || null,
+      deferredStepIndices: _deferredStepIndices,
+    });
     // Return immediately — skip all remaining steps (they'll run when the reminder fires)
     return {
       ...state,
-      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: `Reminder set for ${targetIso} — "${label}"` }],
+      skillResults: _scheduleFinalResults,
       skillCursor: skillPlan.length, // skip to end — remaining steps fire on reminder
       commandExecuted: true,
       answer: `⏰ Reminder set: "${label}" at ${targetIso}`,
@@ -4416,11 +4454,49 @@ Please try again or search with different terms.`;
     const skippedCount = groupResults.filter(r => r.skipped).length;
     logger.info(`[Node:ExecuteCommand] runGroup "${groupId}" complete — ${succeededCount}/${groupResults.length} succeeded (${skippedCount} skipped), cursor → ${nextCursor}`);
 
+    // ── Capture webAgentBestUrl + generate stepContracts for all group entries ─
+    // This ensures downstream sequential steps can resolve {{bestUrl}} template
+    // variables and use autoInjectFromContracts() for cross-step output injection.
+    const groupContracts = settled.map((outcome, oi) => {
+      const r = outcome.status === 'fulfilled' ? outcome.value : { ...outcome.reason, ok: false };
+      const entry = groupResults[oi];
+      if (!entry) return null;
+      // Build a minimal stepResult shape for generateStepContract
+      const contractInput = {
+        ...entry,
+        skill: r.step?.skill || entry.skill,
+        args: r.step?.args || entry.args || {},
+        result: r.raw || entry.result,
+        _raw: r.raw || null,
+      };
+      return generateStepContract(contractInput, r.idx ?? (skillCursor + oi));
+    }).filter(Boolean);
+    const newStepContracts = [...(state.stepContracts || []), ...groupContracts];
+
+    // Extract bestUrl from the last successful web.agent step in the group
+    let newWebAgentBestUrl = state.webAgentBestUrl || null;
+    for (const outcome of settled) {
+      const r = outcome.status === 'fulfilled' ? outcome.value : null;
+      if (r && r.step?.skill === 'web.agent' && r.ok && r.raw?.bestUrl) {
+        newWebAgentBestUrl = r.raw.bestUrl;
+        // Also synthesize stdout on the matching groupResult entry
+        const grIdx = groupResults.findIndex(g => g.step === (r.idx + 1));
+        if (grIdx >= 0 && !groupResults[grIdx].stdout) {
+          const webAgentTitle = r.raw.title ? ` — "${r.raw.title}"` : '';
+          groupResults[grIdx].stdout = `Best URL: ${r.raw.bestUrl}${webAgentTitle}`;
+          if (r.raw.snippet) groupResults[grIdx].stdout += `\n${r.raw.snippet}`;
+          logger.info(`[Node:ExecuteCommand] runGroup web.agent: captured bestUrl=${r.raw.bestUrl}`);
+        }
+      }
+    }
+
     if (firstFailure && succeededCount === 0) {
       // All steps failed — route to recovery
       return {
         ...state,
         skillResults: newResults,
+        stepContracts: newStepContracts,
+        webAgentBestUrl: newWebAgentBestUrl,
         skillCursor: nextCursor,
         commandExecuted: false,
         failedStep: firstFailure,
@@ -4430,6 +4506,8 @@ Please try again or search with different terms.`;
     return {
       ...state,
       skillResults: newResults,
+      stepContracts: newStepContracts,
+      webAgentBestUrl: newWebAgentBestUrl,
       skillCursor: nextCursor,
       commandExecuted: nextCursor >= skillPlan.length,
       failedStep: null,

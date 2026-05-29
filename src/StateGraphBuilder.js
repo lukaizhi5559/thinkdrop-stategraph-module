@@ -487,6 +487,14 @@ class StateGraphBuilder {
           return 'createSkillFromHistory';
         }
 
+        // ── planMode step short-circuit ────────────────────────────────────
+        // planExecutor already set intent+message for this step — skip assessRisk,
+        // resolveUserContext, gatherPlanContext and go straight to planSkills.
+        if (intentType === 'command_automate' && state._planMode && state._planFile) {
+          logger.debug('[StateGraph:Router] enrichIntent: _planMode step — skipping to planSkills');
+          return 'planSkills';
+        }
+
         // MODE B re-route: enrichIntent stored answers and set intent=command_automate
         // or MODE A success: command_automate with profile complete — proceed to plan
         if (intentType === 'command_automate') {
@@ -581,8 +589,7 @@ class StateGraphBuilder {
         if (intentType === 'command_execute' || intentType === 'command_guide') {
           return 'executeCommand';
         }
-        if (intentType === 'plan_execute' && state._planFile) {
-          logger.info('[StateGraph:Router] plan_execute with _planFile — routing to planExecutor', intentType);
+        if (intentType === 'plan_execute') {
           return 'planExecutor';
         }
         if (intentType === 'screen_intelligence') {
@@ -831,6 +838,9 @@ class StateGraphBuilder {
         return 'appControl';
       },
 
+      // Plan executor — after building skillPlan[], route directly to planSkills (passthrough)
+      planExecutor: 'planSkills',
+
       // App control mode — routes to logConversation to persist state + show answer
       appControl: 'logConversation',
 
@@ -839,57 +849,12 @@ class StateGraphBuilder {
       answer: 'logConversation',
       synthesize: 'logConversation',
       summarizeMultiIntent: 'logConversation',
-      // planExecutor dispatches each step through the full pipeline (intent-aware routing)
-      planExecutor: 'enrichIntent',
-
       // Multi-intent queue runner.
       // Each time logConversation completes for a step, this conditional checks whether
       // more steps remain in intentQueue and loops back through enrichIntent.
       // Once the queue is empty and isMultiIntent=true it routes to summarizeMultiIntent.
       // summarizeMultiIntent sets isMultiIntent=false so the final logConversation exits here.
       logConversation: async (state) => {
-        // ── Plan mode: step just completed — hand back to planExecutor ────────
-        // _planMode is set by planExecutor for each step it dispatches.
-        // After the step runs through the normal node pipeline and reaches
-        // logConversation, we capture the result and re-enter planExecutor.
-        if (state._planMode && state._planFile) {
-          const stepResult = state.answer || state.commandOutput || '';
-          if (typeof state.progressCallback === 'function') {
-            try {
-              state.progressCallback({
-                type: 'plan:step_done',
-                stepNum: state._planStepNum,
-                totalSteps: state._planTotalSteps,
-                intent: state.intent?.type,
-                result: (stepResult || '').slice(0, 200),
-                status: (state.failedStep || state.planError) ? '❌ failed' : '✅ done',
-                planFile: state._planFile,
-              });
-            } catch (_) {}
-          }
-          // Re-enter planExecutor with the completed step result
-          Object.assign(state, {
-            _planStepResult: stepResult,
-            conversationLogged: false,
-            answer: null,
-            filteredMemories: [],
-            contextDocs: [],
-            searchResults: [],
-            skillResults: [],
-            skillPlan: null,
-            skillCursor: 0,
-            commandExecuted: false,
-            commandOutput: null,
-            executionResult: null,
-            failedStep: null,
-            planError: null,
-            recoveryAction: null,
-            enrichmentNeeded: [],
-            matchedSkillName: null,
-          });
-          return 'planExecutor';
-        }
-
         // ── Multi-intent ask_user pause (mid-pipeline) ─────────────────────────
         // If the current step ended with recoveryAction='ask_user' and there are
         // still steps in the queue, pause and surface the question. When the user

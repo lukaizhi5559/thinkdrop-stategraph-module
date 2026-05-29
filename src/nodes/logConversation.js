@@ -242,6 +242,32 @@ module.exports = async function logConversation(state) {
       }
     }
 
+    // ── Persist output contract into session context_data + update topic embedding ──
+    // This enables semantic session routing: future prompts can be matched back to
+    // this session using vector similarity on the topic_embedding column.
+    if (sessionId && state._contract) {
+      const contract = state._contract;
+      // Store contract in context_data (fire-and-forget, non-blocking)
+      mcpAdapter.callService('conversation', 'session.update', {
+        sessionId,
+        contextData: { contract },
+      }).catch(err => logger.warn(`[Node:LogConversation] Failed to store contract in context_data: ${err.message}`));
+
+      // Generate + store topic embedding from intent + answer excerpt (async, non-blocking)
+      const topicText = [
+        contract.intent !== 'unknown' ? contract.intent : '',
+        state.message ? state.message.slice(0, 150) : '',
+        contract.answer ? contract.answer.slice(0, 150) : '',
+      ].filter(Boolean).join(' ').trim();
+
+      if (topicText) {
+        mcpAdapter.callService('conversation', 'session.storeEmbedding', {
+          sessionId,
+          text: topicText,
+        }).catch(err => logger.warn(`[Node:LogConversation] Failed to store topic embedding: ${err.message}`));
+      }
+    }
+
     return {
       ...state,
       conversationLogged: true,
