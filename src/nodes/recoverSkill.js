@@ -2237,7 +2237,19 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
 
     case 'ASK_USER': {
       logger.debug(`[Node:RecoverSkill] ASK_USER: ${decision.question}`);
-      const optionsList = (decision.options || [])
+
+      // Offer "Train this path" when the failure is from a browser.agent task
+      const _isBrowserFailure = failedStep && (
+        failedStep.skill === 'browser.agent' ||
+        failedStep.skill === 'playwright.agent' ||
+        (failedStep.args?.agentId && failedStep.args.agentId.endsWith('.agent'))
+      );
+      let options = decision.options || [];
+      if (_isBrowserFailure && !options.some(o => /train/i.test(o))) {
+        options = [...options, 'Train me to navigate this path'];
+      }
+
+      const optionsList = options
         .map((o, i) => `${i + 1}. ${o}`)
         .join('\n');
       // Emit immediately so the UI shows the question card in real-time,
@@ -2247,7 +2259,9 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
           state.progressCallback({
             type: 'ask_user',
             question: decision.question,
-            options: decision.options || [],
+            options,
+            offerTraining: _isBrowserFailure,
+            agentId: failedStep?.args?.agentId,
           });
         } catch (_) {}
       }
@@ -2256,12 +2270,14 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
         recoveryAction: 'ask_user',
         pendingQuestion: {
           question: decision.question,
-          options: decision.options || [],
-          context: failedStep
+          options,
+          context: failedStep,
+          offerTraining: _isBrowserFailure,
+          agentId: failedStep?.args?.agentId,
         },
         commandExecuted: false,
         stepRetryCount: 0,
-        answer: decision.options?.length
+        answer: options.length
           ? `${decision.question}\n\n${optionsList}`
           : decision.question
       };

@@ -260,7 +260,14 @@ module.exports = async function parseIntentV2(state) {
   const hasNamedPlatform = NAMED_PLATFORMS.test(lower);
   
   let fallbackIntent = 'general_knowledge';
-  if (/\b(remember|my name is|i am|my email|note that|store that|save that)\b/.test(lower)) fallbackIntent = 'memory_store';
+  
+  // Check taskClassification from resolveReferencesV2 - if browser automation follow-up, default to command_automate
+  const tc = state._taskClassification;
+  if (tc?.taskType === 'browser' && tc?.isFollowUp) {
+    fallbackIntent = 'command_automate';
+    logger.info(`[Node:ParseIntentV2] taskClassification override (browser follow-up) → command_automate: "${classifyMessage.slice(0, 60)}"`);
+  }
+  else if (/\b(remember|my name is|i am|my email|note that|store that|save that)\b/.test(lower)) fallbackIntent = 'memory_store';
   else if (/\b(what did i|do you know my|recall|retrieve|look up my|what was)\b/.test(lower)) fallbackIntent = 'memory_retrieve';
   else if (/\b(goto|go to|navigate|open|close|quit|exit|minimize|hide|show|stop|kill|launch|start|visit|click|run|execute|install|send|create|rename|move|delete|download|resize|maximize|scroll|type|press|drag)\b/.test(lower)) fallbackIntent = 'command_automate';
   // NEW: Content discovery on named platforms → command_automate (browser automation needed)
