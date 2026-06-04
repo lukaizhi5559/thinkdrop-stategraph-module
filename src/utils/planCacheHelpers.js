@@ -26,6 +26,7 @@ const path = require('path');
 const os   = require('os');
 
 const PLANS_DIR = path.join(os.homedir(), '.thinkdrop', 'plans');
+const SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 
 // ── Semantic similarity thresholds ────────────────────────────────────────────
 /** Minimum cosine similarity to surface a plan as a suggestion (modal). */
@@ -40,6 +41,37 @@ function _isStaleBrowserActPlan(skillPlan, prompt) {
   const hasBrowserAgent = skillPlan.some(s => s.skill === 'browser.agent');
   const hasOnlyBrowserAct = !hasBrowserAgent && skillPlan.some(s => s.skill === 'browser.act');
   return hasOnlyBrowserAct;
+}
+
+// ── Cache invalidation: plans referencing deleted skills ──────────────────────
+/**
+ * Validate that all external.skill steps in a plan reference existing skills.
+ * Returns { valid: boolean, missing: string[] } with names of missing skills.
+ */
+function _validatePlanSkills(skillPlan) {
+  if (!Array.isArray(skillPlan)) return { valid: false, missing: [] };
+
+  const missing = [];
+  for (const step of skillPlan) {
+    const skillName = step.skill;
+    // Skip built-in skills that don't need files
+    if (skillName === 'browser.act' || skillName === 'browser.agent' ||
+        skillName === 'cli.agent' || skillName === 'shell.run' ||
+        skillName === 'creator.agent' || skillName === 'reviewer.agent' ||
+        skillName === 'skillCreator.skill' || skillName === 'system.introspect') {
+      continue;
+    }
+    // Check external.skill references
+    if (skillName === 'external.skill' && step.args?.name) {
+      const skillDir = path.join(SKILLS_DIR, step.args.name);
+      const indexPath = path.join(skillDir, 'index.cjs');
+      if (!fs.existsSync(indexPath)) {
+        missing.push(step.args.name);
+      }
+    }
+  }
+
+  return { valid: missing.length === 0, missing };
 }
 
 // ── In-memory session cache (exact-match only) ────────────────────────────────
@@ -193,6 +225,13 @@ function findPlanByName(planName, logger) {
         const titleMatch = content.match(/^# Plan:\s*(.+)/m);
         const decoded = Buffer.from(jsonMatch[1], 'base64').toString('utf8');
         const skillPlan = JSON.parse(decoded);
+        // Validate skills exist - delete stale plan if skills missing
+        const validation = _validatePlanSkills(skillPlan);
+        if (!validation.valid) {
+          logger && logger.info(`[PlanCache] Plan "${planName}" references deleted skills: ${validation.missing.join(', ')}. Deleting stale plan.`);
+          try { fs.unlinkSync(planPath); } catch (_) {}
+          continue;
+        }
         logger && logger.info(`[PlanCache] Exact name match found: ${planName} → ${file}`);
         return {
           planFile: planPath,
@@ -313,6 +352,13 @@ async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = n
           const decoded   = Buffer.from(c.jsonMatch[1], 'base64').toString('utf8');
           const skillPlan = JSON.parse(decoded);
           if (_isStaleBrowserActPlan(skillPlan, prompt)) continue;
+          // Validate skills exist - delete stale plan if skills missing
+          const validation = _validatePlanSkills(skillPlan);
+          if (!validation.valid) {
+            logger && logger.info(`[PlanCache] Plan references deleted skills: ${validation.missing.join(', ')}. Deleting stale plan.`);
+            try { fs.unlinkSync(c.planPath); } catch (_) {}
+            continue;
+          }
           logger && logger.info(`[PlanCache] Exact prompt match → auto-execute: ${c.file}`);
           return {
             planFile: c.planPath,
@@ -349,6 +395,13 @@ async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = n
       const decoded   = Buffer.from(best.jsonMatch[1], 'base64').toString('utf8');
       const skillPlan = JSON.parse(decoded);
       if (_isStaleBrowserActPlan(skillPlan, prompt)) return null;
+      // Validate skills exist - delete stale plan if skills missing
+      const validation = _validatePlanSkills(skillPlan);
+      if (!validation.valid) {
+        logger && logger.info(`[PlanCache] Plan references deleted skills: ${validation.missing.join(', ')}. Deleting stale plan.`);
+        try { fs.unlinkSync(best.planPath); } catch (_) {}
+        return null;
+      }
       logger && logger.info(
         `[PlanCache] Semantic match found (cosine=${bestScore.toFixed(3)}, autoExecute=false): ${best.file}`
       );
@@ -382,5 +435,7 @@ module.exports = {
   _sessionCacheKey,
   _sessionCacheGet,
   _sessionCacheSet,
+  _clearSessionCache,
   _isStaleBrowserActPlan,
+  _validatePlanSkills,
 };

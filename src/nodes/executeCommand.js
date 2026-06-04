@@ -1713,7 +1713,17 @@ module.exports = async function executeCommand(state) {
       logger.warn(`[Node:ExecuteCommand] guide.step: sessionId="${guideSessionId}" has no matching browser.act navigate — falling back to IPC mode`);
     }
 
-    if (usePageEventMode) {
+    // ── Auto-continue for skill installation guide steps ─────────────────────────
+    // If the guide.step is about installing a skill, auto-continue without waiting
+    // for user interaction. The skill build pipeline will handle the actual installation.
+    const instructionText = String(instruction || '');
+    const isSkillInstallGuide = /skill is not currently installed|install this skill|skill needs to be installed|install.*skill first/i.test(instructionText);
+    if (isSkillInstallGuide && !usePageEventMode) {
+      logger.info(`[Node:ExecuteCommand] guide.step: skill installation guide detected — auto-continuing without user interaction`);
+      continued = true;
+    }
+
+    if (usePageEventMode && !continued) {
       // ── MODE 1: waitForTrigger — CDP exposeBinding, CSP-safe, event-driven ──
       // The highlight overlay attaches blur/change/click listener per element type.
       // When the user interacts, listener calls window.__tdTrigger() — a CDP binding
@@ -3037,6 +3047,23 @@ module.exports = async function executeCommand(state) {
         },
         options: { maxTokens: 1500, temperature: 0.2, fastMode: false }
       };
+      // ── Progress indicator timers ────────────────────────────────────────────
+      // Long synthesis calls need periodic user feedback so they don't appear hung
+      const _progressTimers = [];
+      const _progressMessages = [
+        { delay: 10000, msg: 'Working...' },
+        { delay: 30000, msg: 'Still going at it...' },
+        { delay: 90000, msg: 'Need some more time...' },
+        { delay: 120000, msg: 'Almost done, just a couple more minutes...' }
+      ];
+      _progressMessages.forEach(({ delay, msg }) => {
+        const timer = setTimeout(() => {
+          if (progressCallback) progressCallback({ type: 'thinking', stepIndex: skillCursor, totalSteps: skillPlan.length, message: msg });
+          logger.info(`[Node:ExecuteCommand] synthesize: ${msg}`);
+        }, delay);
+        _progressTimers.push(timer);
+      });
+
       try {
         // Always generate silently first (pass null for streamCallback) so we can
         // inspect the answer before streaming. Streaming the apology text to the UI
@@ -3044,6 +3071,9 @@ module.exports = async function executeCommand(state) {
         // even when the retry succeeds. We stream the final confirmed answer below.
         synthesisAnswer = await llmBackend.generateAnswer(synthesisQuery, synthPayload, synthPayload.options, null);
         logger.debug(`[Node:ExecuteCommand] synthesize: LLM answer generated (${synthesisAnswer.length} chars)`);
+
+        // Clear all progress timers since we're done
+        _progressTimers.forEach(t => clearTimeout(t));
 
         // ── Hallucination Detection: Fake YouTube URLs ──────────────────────────
         // Check if LLM invented video URLs when none were actually extracted
@@ -3072,6 +3102,8 @@ Please try again or search with different terms.`;
           }
         }
       } catch (err) {
+        // Clear timers on error
+        _progressTimers.forEach(t => clearTimeout(t));
         logger.error('[Node:ExecuteCommand] synthesize LLM call failed:', err.message);
         synthesisAnswer = `[Synthesis failed: ${err.message}]`;
       }
@@ -4572,6 +4604,22 @@ Please try again or search with different terms.`;
           }}
         : resolvedArgs;
 
+    // ── Pre-execution guard: external.skill existence check ─────────────────
+    // If external.skill is about to run but the skill doesn't exist, fail fast
+    // with a clear error instead of waiting for the MCP call to fail.
+    if (skill === 'external.skill') {
+      const skillName = resolvedArgs.name || args.name;
+      if (skillName) {
+        const skillPath = path.join(os.homedir(), '.thinkdrop', 'skills', skillName, 'index.cjs');
+        const skillMdPath = path.join(os.homedir(), '.thinkdrop', 'skills', skillName, 'skill.md');
+        if (!fs.existsSync(skillPath) && !fs.existsSync(skillMdPath)) {
+          const errorMsg = `Skill "${skillName}" not found at ~/.thinkdrop/skills/${skillName}/. Use browser.agent or cli.agent instead.`;
+          logger.error(`[Node:ExecuteCommand] external.skill pre-check failed: ${errorMsg}`);
+          throw new Error(errorMsg);
+        }
+      }
+    }
+
     const result = await mcpAdapter.callService('command', 'command.automate', {
       skill,
       args: _callArgs
@@ -5314,6 +5362,17 @@ Please try again or search with different terms.`;
         typeof enrichedStepResult.error === 'string' &&
         (enrichedStepResult.error.includes('Skill file not found') ||
          enrichedStepResult.error.includes('No installed skill named'));
+
+      // Clear session cache when skill is missing to prevent stale plan reuse
+      if (isMissingSkill) {
+        try {
+          const { _clearSessionCache } = require('../utils/planCacheHelpers');
+          _clearSessionCache();
+          logger.info('[Node:ExecuteCommand] Session plan cache cleared due to missing skill');
+        } catch (cacheErr) {
+          logger.debug('[Node:ExecuteCommand] Failed to clear session cache:', cacheErr.message);
+        }
+      }
 
       if (isMissingSkill && !!state.creatorProjectId && !state.skillCreatorRegenAttempted && !state.skillCreatorBuildAttempted && mcpAdapter) {
         // Creator skill missing — re-run skillCreator silently before failing (once only)

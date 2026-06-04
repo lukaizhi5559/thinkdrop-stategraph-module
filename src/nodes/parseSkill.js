@@ -85,8 +85,8 @@ module.exports = async function parseSkill(state) {
   }
 
   if (installedSkills.length === 0) {
-    logger.debug('[Node:ParseSkill] No installed skills — skipping');
-    return state;
+    logger.info('[Node:ParseSkill] No installed skills — setting prohibition flag');
+    return { ...state, _noInstalledSkillMatch: true };
   }
 
   // ── Merge filesystem skill dirs as canonical source of truth ──────────────────
@@ -535,8 +535,8 @@ Examples: "gcal.event|HIGH" or "null"`;
     logger.debug(`[Node:ParseSkill] Semantic match skipped: ${e.message}`);
   }
 
-  logger.debug(`[Node:ParseSkill] No skill match for: "${classifyMessage.substring(0, 80)}"`);
-  return state;
+  logger.info(`[Node:ParseSkill] No skill match for: "${classifyMessage.substring(0, 80)}" — setting prohibition flag`);
+  return { ...state, _noInstalledSkillMatch: true };
 };
 
 function _matchedState(state, skillName, userWantsToCreate = false, matchedSkillDomain = null, matchedSkillAction = null) {

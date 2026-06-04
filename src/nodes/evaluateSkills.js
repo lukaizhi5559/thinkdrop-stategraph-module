@@ -180,9 +180,10 @@ module.exports = async function evaluateSkills(state) {
     /UtilityScript\.evaluate/i,
     /unexpected token/i,
     /is not a (function|constructor)/i,
+    /Failed to deserialize|Serialization Error/i,
   ];
   const failedBrowserSteps = skillResults.filter(r =>
-    r.skill === 'browser.act' && !r.ok &&
+    (r.skill === 'browser.act' || r.skill === 'browser.agent' || r.skill === 'cli.agent') && !r.ok &&
     TOOL_ERROR_PATTERNS.some(p => p.test(String(r.error || r.result || r.stdout || '')))
   );
   if (failedBrowserSteps.length > 0 && evaluationRetryCount === 0) {

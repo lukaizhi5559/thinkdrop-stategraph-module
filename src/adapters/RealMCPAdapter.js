@@ -15,16 +15,32 @@ class RealMCPAdapter extends MCPAdapter {
   }
 
   async callService(serviceName, action, params, options = {}) {
-    try {
-      this.logger.debug(`[RealMCP] Calling ${serviceName}.${action}`);
-      
-      // Delegate to existing MCPClient — pass options so timeoutMs override works
-      const result = await this.mcpClient.callService(serviceName, action, params, options);
-      
-      return result;
-    } catch (error) {
-      this.logger.error(`[RealMCP] Error calling ${serviceName}.${action}:`, error.message);
-      throw error;
+    const maxRetries = options.maxRetries || (serviceName === 'user-memory' ? 3 : 1);
+    const baseDelayMs = options.retryDelayMs || 1000;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        this.logger.debug(`[RealMCP] Calling ${serviceName}.${action} (attempt ${attempt}/${maxRetries})`);
+        
+        // Delegate to existing MCPClient — pass options so timeoutMs override works
+        const result = await this.mcpClient.callService(serviceName, action, params, options);
+        
+        return result;
+      } catch (error) {
+        const isECONNREFUSED = error.message?.includes('ECONNREFUSED') || error.code === 'ECONNREFUSED';
+        const isUserMemory = serviceName === 'user-memory';
+        
+        // Retry on ECONNREFUSED for user-memory service with exponential backoff
+        if (isECONNREFUSED && isUserMemory && attempt < maxRetries) {
+          const delayMs = baseDelayMs * Math.pow(2, attempt - 1);
+          this.logger.warn(`[RealMCP] ${serviceName}.${action} connection refused, retrying in ${delayMs}ms (attempt ${attempt}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+          continue;
+        }
+        
+        this.logger.error(`[RealMCP] Error calling ${serviceName}.${action}:`, error.message);
+        throw error;
+      }
     }
   }
 

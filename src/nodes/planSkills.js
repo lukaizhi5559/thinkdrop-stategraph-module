@@ -1476,6 +1476,27 @@ Task: "${userMessage}"`;
         }
       }
 
+      // ── Agent-first: ensure parent agent exists before running skill ──────────
+      // Extract domain from skill name (e.g., "w3schools.editor" -> "w3schools")
+      const _domainFromSkill = _skillName.split('.')[0];
+      const _agentName = `${_domainFromSkill}.agent`;
+      const _agentPath = path.join(os.homedir(), '.thinkdrop', 'agents', `${_agentName}.md`);
+      
+      // Check if this is a web service skill that needs a parent agent
+      // Skip for well-known CLI tools (github, aws, etc.) that use cli.agent
+      const _cliServices = ['github', 'aws', 'heroku', 'vercel', 'netlify', 'firebase'];
+      const _isCliService = _cliServices.includes(_domainFromSkill);
+      const _needsBrowserAgent = !_isCliService && _skillName.includes('.') && !fs.existsSync(_agentPath);
+      
+      if (_needsBrowserAgent) {
+        logger.info(`[Node:PlanSkills] Agent-first: ${_agentName} not found, prepending build_agent step`);
+        _fastPlan.push({
+          skill: 'browser.agent',
+          args: { action: 'build_agent', service: _domainFromSkill },
+          description: `Build ${_agentName} for ${_domainFromSkill} domain`,
+        });
+      }
+
       // Core skill step
       // external.skill.run() destructures: const { name, args: skillArgs } = args
       // so skill params must be nested under args.args, not spread at the top level.

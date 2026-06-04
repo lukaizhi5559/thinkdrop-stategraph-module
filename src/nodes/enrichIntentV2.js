@@ -103,6 +103,9 @@ module.exports = async function enrichIntentV2(state) {
     logger.info(`[Node:EnrichIntentV2] Browse-verb guard — skipping domain.extract: "${userMessage.slice(0, 60)}"`);
   }
 
+  // Signal when no domain services detected (helps downstream planning avoid false assumptions)
+  const _noDomainServicesDetected = !domainTags || !domainTags.tags || domainTags.tags.length === 0;
+
   // ── Local recurring reminder guard: clear hallucinated service tags ─────────
   // Use _taskClassification instead of regex for scheduling/recurring detection.
   if (domainTags && tc.isRecurring && !tc.targetService) {
@@ -172,5 +175,6 @@ module.exports = async function enrichIntentV2(state) {
     enrichmentNeeded: [],
     _smsTagSignal,
     _emailTagSignal,
+    _noDomainServicesDetected,
   };
 };

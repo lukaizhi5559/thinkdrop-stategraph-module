@@ -517,7 +517,25 @@ async function planSkillsV2(state) {
     const _csPath = path.join(SKILLS_DIR, _csName.replace(/\./g, '_'), 'index.cjs');
     if (fs.existsSync(_csPath)) {
       logger.info(`[Node:PlanSkillsV2] Creator shortcut: ${_csName}`);
-      const plan = [{ skill: 'external.skill', description: `Run ${_csName}`, args: { name: _csName } }];
+      
+      // ── Agent-first: ensure parent agent exists ──────────────────────────────
+      const _domainFromSkill = _csName.split('.')[0];
+      const _agentName = `${_domainFromSkill}.agent`;
+      const _agentPath = path.join(os.homedir(), '.thinkdrop', 'agents', `${_agentName}.md`);
+      const _needsBrowserAgent = _csName.includes('.') && !fs.existsSync(_agentPath);
+      
+      const plan = [];
+      if (_needsBrowserAgent) {
+        logger.info(`[Node:PlanSkillsV2] Creator shortcut: ${_agentName} not found, prepending build_agent step`);
+        plan.push({
+          skill: 'browser.agent',
+          args: { action: 'build_agent', service: _domainFromSkill },
+          description: `Build ${_agentName} for ${_domainFromSkill} domain`,
+        });
+      }
+      
+      plan.push({ skill: 'external.skill', description: `Run ${_csName}`, args: { name: _csName } });
+      
       if (progressCallback) progressCallback({ type: 'plan_ready', steps: plan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
       return { ...state, skillPlan: plan, skillCursor: 0, planError: null, recoveryContext: null };
     }
@@ -680,6 +698,7 @@ async function planSkillsV2(state) {
   let _registeredAgentServiceMap = {};
   const shellSkillNames = new Set();
   let installedSkillsList = [];
+  let _trainedRecipeMap = {}; // hoisted for fast-path access after Promise.all
 
   if (mcpAdapter) {
     await Promise.all([
@@ -749,11 +768,56 @@ async function planSkillsV2(state) {
           const agRes = await mcpAdapter.callService('user-memory', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
           const agents = agRes?.data || agRes || [];
           if (Array.isArray(agents) && agents.length > 0) {
-            const agentLines = agents.map(a => `- ${a.id}: ${a.type} agent${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`);
-            agentContextNote = `\n\nREGISTERED AGENTS (use browser.agent { action: "run", agentId: "<id>", task: "..." } for these — do NOT use raw browser.act navigate):\n${agentLines.join('\n')}`;
+            const agentLines = [];
+            const trainedRecipeLines = [];
+
             for (const a of agents) {
+              const baseLine = `- ${a.id}: ${a.type} agent${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`;
+              agentLines.push(baseLine);
               const svc = (a.id || '').replace('.agent', '').toLowerCase();
               if (svc) _registeredAgentServiceMap[svc] = a.id;
+
+              // ── Fetch trained recipes for this agent ─────────────────────
+              if (a.type === 'browser' || a.type === 'cli') {
+                try {
+                  const tsRes = await mcpAdapter.callService('command', 'command.automate', {
+                    skill: 'trainer.agent',
+                    args: { action: 'list_skills', agentId: svc }
+                  }, { timeoutMs: 3000 }).catch(() => null);
+                  const skills = tsRes?.data?.skills || tsRes?.skills || [];
+                  if (skills.length > 0) {
+                    const skillNames = skills.map(s => s.name).join(', ');
+                    const agentTypeSkill = a.type === 'cli' ? 'cli.agent' : 'browser.agent';
+                    trainedRecipeLines.push(`- ${a.id}: [${skillNames}] → use ${agentTypeSkill} { action: "run", agentId: "${a.id}" }`);
+
+                    // Build fuzzy matching map
+                    for (const s of skills) {
+                      const baseName = s.name.toLowerCase();
+                      const variants = [
+                        baseName,
+                        baseName.replace(/_/g, '.'),
+                        baseName.replace(/\./g, ' '),
+                        baseName.replace(/_/g, ' '),
+                        baseName.replace(/\./g, '_'),
+                        baseName.replace(/^[^.]+\./, ''), // remove domain prefix (e.g., "theeditor")
+                      ];
+                      for (const v of variants) {
+                        if (!_trainedRecipeMap[v]) {
+                          _trainedRecipeMap[v] = { agentId: a.id, skillName: s.name, agentType: a.type === 'cli' ? 'cli.agent' : 'browser.agent' };
+                        }
+                      }
+                    }
+                  }
+                } catch (err) {
+                  logger.warn(`[Node:PlanSkillsV2] trainer.agent call failed for ${svc}: ${err.message}`);
+                }
+              }
+            }
+
+            agentContextNote = `\n\nREGISTERED AGENTS (use browser.agent { action: "run", agentId: "<id>", task: "..." } for these — do NOT use raw browser.act navigate):\n${agentLines.join('\n')}`;
+
+            if (trainedRecipeLines.length > 0) {
+              agentContextNote += `\n\nTRAINED RECIPES (when user mentions these, use browser.agent/cli.agent — NOT external.skill):\n${trainedRecipeLines.join('\n')}`;
             }
           }
         } catch (_) {}
@@ -768,6 +832,64 @@ async function planSkillsV2(state) {
         } catch (_) {}
       })(),
     ]);
+    
+    // ── Disk-scan fallback: load recipes directly from filesystem ────────────
+    // Runs after trainer.agent pass regardless of success. Merges in any recipe
+    // not already present (trainer.agent data takes priority). This ensures the
+    // fast-path works even when agents.db is locked and agent.list returns [].
+    try {
+      const skillsRoot = path.join(os.homedir(), '.thinkdrop', 'skills');
+      if (fs.existsSync(skillsRoot)) {
+        let diskCount = 0;
+        const agentDirs = fs.readdirSync(skillsRoot).filter(d => {
+          try { return fs.statSync(path.join(skillsRoot, d)).isDirectory(); } catch (_) { return false; }
+        });
+        for (const agentDir of agentDirs) {
+          const recipeDir = path.join(skillsRoot, agentDir);
+          let recipeFiles;
+          try { recipeFiles = fs.readdirSync(recipeDir).filter(f => f.endsWith('.recipe.json')); }
+          catch (_) { continue; }
+          for (const recipeFile of recipeFiles) {
+            try {
+              const recipe = JSON.parse(fs.readFileSync(path.join(recipeDir, recipeFile), 'utf8'));
+              if (!recipe.name) continue;
+              const inferredAgentId = recipe.agentId || `${agentDir}.agent`;
+              const agentType = 'browser.agent'; // recipes are always browser-based
+              const baseName = recipe.name.toLowerCase();
+              const variants = [
+                baseName,
+                baseName.replace(/_/g, '.'),
+                baseName.replace(/\./g, ' '),
+                baseName.replace(/_/g, ' '),
+                baseName.replace(/\./g, '_'),
+                baseName.replace(/^[^.]+\./, ''), // no-prefix: "w3schools.theeditor" → "theeditor"
+              ];
+              for (const v of variants) {
+                if (!_trainedRecipeMap[v]) {
+                  _trainedRecipeMap[v] = { agentId: inferredAgentId, skillName: recipe.name, agentType };
+                  diskCount++;
+                }
+              }
+            } catch (_) { /* skip unreadable recipe */ }
+          }
+        }
+        if (diskCount > 0) {
+          logger.info(`[Node:PlanSkillsV2] Disk-scan added ${diskCount} recipe variant(s) (DB had ${Object.keys(_trainedRecipeMap).length - diskCount})`);
+        }
+      }
+    } catch (diskErr) {
+      logger.warn(`[Node:PlanSkillsV2] Disk-scan fallback error: ${diskErr.message}`);
+    }
+
+    // After parallel fetches + disk-scan, save trained recipe map to state for fast-path
+    const mapSize = Object.keys(_trainedRecipeMap).length;
+    logger.info(`[Node:PlanSkillsV2] Trained recipe map built: ${mapSize} variants`);
+    if (mapSize > 0) {
+      state._trainedRecipeMap = _trainedRecipeMap;
+      logger.info(`[Node:PlanSkillsV2] Trained recipes loaded: ${Object.keys(_trainedRecipeMap).slice(0, 5).join(', ')}...`);
+    } else {
+      logger.warn(`[Node:PlanSkillsV2] No trained recipes loaded — trainer.agent calls may have failed or returned empty (check for database lock conflicts)`);
+    }
   }
 
   // ── Date range resolution (deterministic) ─────────────────────────────────
@@ -780,11 +902,29 @@ async function planSkillsV2(state) {
   // ── Domain skill fast-path ────────────────────────────────────────────────
   if (state.matchedSkillType === 'domain' && state.matchedSkillName && !recoveryContext) {
     logger.info(`[Node:PlanSkillsV2] Domain skill fast-path: ${state.matchedSkillName}`);
-    const domainPlan = [{
+    
+    // ── Agent-first: ensure parent agent exists before running skill ─────────
+    const _domainFromSkill = state.matchedSkillName.split('.')[0];
+    const _agentName = `${_domainFromSkill}.agent`;
+    const _agentPath = path.join(os.homedir(), '.thinkdrop', 'agents', `${_agentName}.md`);
+    const _needsBrowserAgent = state.matchedSkillName.includes('.') && !fs.existsSync(_agentPath);
+    
+    const domainPlan = [];
+    if (_needsBrowserAgent) {
+      logger.info(`[Node:PlanSkillsV2] Agent-first: ${_agentName} not found, prepending build_agent step`);
+      domainPlan.push({
+        skill: 'browser.agent',
+        args: { action: 'build_agent', service: _domainFromSkill },
+        description: `Build ${_agentName} for ${_domainFromSkill} domain`,
+      });
+    }
+    
+    domainPlan.push({
       skill: 'external.skill',
       description: `Run domain skill: ${state.matchedSkillName}`,
       args: { name: state.matchedSkillName, ...(state.matchedSkillParams || {}) },
-    }];
+    });
+    
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: domainPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
     return { ...state, skillPlan: domainPlan, skillCursor: 0, planError: null, recoveryContext: null, domainSkillFastPath: true };
   }
@@ -817,6 +957,128 @@ async function planSkillsV2(state) {
         }
       } catch (_) {}
     }
+  }
+
+  // ── Trained recipe fuzzy match fast-path ──────────────────────────────────
+  // If user message directly matches a trained recipe name, short-circuit to agent
+  const _recipeMap = state._trainedRecipeMap || {};
+  const recipeMapSize = Object.keys(_recipeMap).length;
+  logger.info(`[Node:PlanSkillsV2] Fast-path check: ${recipeMapSize} recipes, recovery=${!!recoveryContext}, msg="${userMessage.slice(0, 60)}"`);
+  
+  if (!recoveryContext && recipeMapSize > 0) {
+    const messageLower = userMessage.toLowerCase();
+    let matchedRecipe = null;
+    let matchedVariant = null;
+    
+    // Strategy 1: Exact phrase match (longer matches prioritized)
+    const sortedVariants = Object.keys(_recipeMap).sort((a, b) => b.length - a.length);
+    for (const variant of sortedVariants) {
+      if (messageLower.includes(variant)) {
+        matchedRecipe = _recipeMap[variant];
+        matchedVariant = variant;
+        break;
+      }
+    }
+    
+    // Strategy 2: Scoring-based fuzzy matching with multi-signal confidence
+    if (!matchedRecipe) {
+      const stopWords = new Set(['use', 'the', 'with', 'for', 'to', 'a', 'an', 'and', 'or', 'in', 'on', 'at', 'from', 'by', 'my', 'me', 'i', 'you', 'it', 'this', 'that', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare', 'ought', 'used', 'however', 'whatever', 'whenever', 'wherever', 'whether', 'although', 'though', 'because', 'since', 'unless', 'until', 'while', 'before', 'after', 'once', 'when', 'where', 'why', 'what', 'who', 'which', 'whom', 'whose', 'how', 'via', 'using', 'through', 'about', 'into', 'onto', 'upon', 'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than', 'too', 'very', 'just', 'now']);
+      
+      // Clean message: remove stopwords, short words, extract meaningful tokens
+      const msgTokens = messageLower
+        .replace(/[^a-z0-9._\s]/g, ' ')  // remove punctuation except ._ 
+        .split(/\s+/)
+        .filter(w => w.length >= 4 && !stopWords.has(w));
+      
+      let bestMatch = null;
+      let bestScore = 0;
+      const SCORE_THRESHOLD = 0.3; // minimum match quality
+      
+      for (const [variant, info] of Object.entries(_recipeMap)) {
+        const skillName = info.skillName.toLowerCase();
+        const skillTokens = skillName.split(/[._]/).filter(w => w.length >= 3);
+        
+        let score = 0;
+        const matchedTokens = [];
+        
+        // 1. Exact token matches (highest weight: 1.0)
+        for (const token of msgTokens) {
+          if (skillTokens.includes(token)) {
+            score += 1.0;
+            matchedTokens.push(token);
+          }
+        }
+        
+        // 2. Substring matches (weight: 0.7 for msg ⊂ skill, 0.5 for skill ⊂ msg)
+        for (const msgToken of msgTokens) {
+          for (const skillToken of skillTokens) {
+            if (msgToken === skillToken) continue; // already counted above
+            // msgToken is substring of skillToken (e.g., "editor" in "theeditor")
+            if (skillToken.includes(msgToken) && msgToken.length >= 5) {
+              score += 0.7 * (msgToken.length / skillToken.length);
+              matchedTokens.push(`${msgToken}⊂${skillToken}`);
+            }
+            // skillToken is substring of msgToken (e.g., "schools" in "w3schoolsplatform")
+            else if (msgToken.includes(skillToken) && skillToken.length >= 4) {
+              score += 0.5 * (skillToken.length / msgToken.length);
+              matchedTokens.push(`${skillToken}⊂${msgToken}`);
+            }
+          }
+        }
+        
+        // 3. Prefix/suffix matches (weight: 0.4) - for compound words
+        for (const msgToken of msgTokens) {
+          for (const skillToken of skillTokens) {
+            if (msgToken === skillToken) continue;
+            // Common prefix (e.g., "gmail" matches "gmailcompose" or "compose" matches "gmailcompose")
+            let commonPrefix = 0;
+            for (let i = 0; i < Math.min(msgToken.length, skillToken.length); i++) {
+              if (msgToken[i] === skillToken[i]) commonPrefix++;
+              else break;
+            }
+            if (commonPrefix >= 4) {
+              score += 0.4 * (commonPrefix / Math.max(msgToken.length, skillToken.length));
+              matchedTokens.push(`prefix:${commonPrefix}`);
+            }
+          }
+        }
+        
+        // Normalize by token count to avoid bias toward longer skill names
+        const normalizedScore = score / Math.max(skillTokens.length, msgTokens.length * 0.5);
+        
+        // Boost if domain word appears in message (strong signal)
+        const domainBoost = skillTokens.some(st => 
+          msgTokens.some(mt => mt === st || mt.includes(st) || st.includes(mt))
+        ) ? 0.2 : 0;
+        
+        const finalScore = normalizedScore + domainBoost;
+        
+        if (finalScore > bestScore && finalScore >= SCORE_THRESHOLD) {
+          bestScore = finalScore;
+          bestMatch = { info, matchedTokens: [...new Set(matchedTokens)], score: finalScore };
+        }
+      }
+      
+      if (bestMatch) {
+        matchedRecipe = bestMatch.info;
+        matchedVariant = `${bestMatch.matchedTokens.join(',')}=${bestMatch.score.toFixed(2)}`;
+      }
+    }
+    
+    if (matchedRecipe) {
+      logger.info(`[Node:PlanSkillsV2] Trained recipe fast-path: "${matchedVariant}" → ${matchedRecipe.agentId} (${matchedRecipe.skillName})`);
+      const fastPlan = [{
+        skill: matchedRecipe.agentType,
+        args: { action: 'run', agentId: matchedRecipe.agentId, task: userMessage },
+        description: `Execute trained recipe: ${matchedRecipe.skillName}`
+      }];
+      if (progressCallback) progressCallback({ type: 'plan_ready', steps: fastPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+      return { ...state, skillPlan: fastPlan, skillCursor: 0, planError: null, recoveryContext: null, _trainedRecipeMap };
+    } else {
+      logger.info(`[Node:PlanSkillsV2] No trained recipe match found, falling through to LLM planning`);
+    }
+  } else if (recipeMapSize === 0) {
+    logger.info(`[Node:PlanSkillsV2] No trained recipes available in map`);
   }
 
   // ── Build the LLM planning query ──────────────────────────────────────────
@@ -921,6 +1183,25 @@ EXAMPLE - Mixed parallel sources:
   { "skill": "synthesize", "args": { "prompt": "Combine pricing and inventory data" } }
 ]`;
 
+  // ── External skill prohibition (when parseSkill found no match) ─────────────
+  let externalSkillProhibition = '';
+  if (state._noInstalledSkillMatch && !recoveryContext) {
+    externalSkillProhibition = `
+
+⚠️ CRITICAL SKILL CONSTRAINT — NO INSTALLED SKILL MATCH:
+The user's request does NOT match any installed skill.
+
+**FORBIDDEN:** You MUST NOT use "external.skill" — it will fail because no such skill is installed.
+
+**USE INSTEAD:**
+- **browser.agent** — For web-based services (w3schools, perplexity, gmail, etc.)
+- **cli.agent** — For command-line tools (git, npm, docker, etc.)
+- **shell.run** — For one-off shell commands
+
+**WHY:** external.skill only works for pre-installed Node.js/Python skills with an index.cjs file. It CANNOT auto-install or create skills.`;
+    logger.info(`[Node:PlanSkillsV2] Injecting external.skill prohibition (no installed skill match)`);
+  }
+
   const planningQuery = [
     _agentIdentity,
     SKILL_SYSTEM_PROMPT,
@@ -932,6 +1213,7 @@ EXAMPLE - Mixed parallel sources:
     skillContractNote,
     cliPreflightNote,
     agentContextNote,
+    externalSkillProhibition,
     smsGatewayNote,
     dateRangeNote,
     runtimeNote,
