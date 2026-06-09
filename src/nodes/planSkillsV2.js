@@ -765,7 +765,7 @@ async function planSkillsV2(state) {
       // ── Agent registry ────────────────────────────────────────────────────
       (async () => {
         try {
-          const agRes = await mcpAdapter.callService('user-memory', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+          const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
           const agents = agRes?.data || agRes || [];
           if (Array.isArray(agents) && agents.length > 0) {
             const agentLines = [];

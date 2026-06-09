@@ -3,7 +3,7 @@
 const fs   = require('fs');
 const path = require('path');
 
-const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.jsonl');
+const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeIntentLog(entry) {
   try { fs.appendFileSync(INTENT_LOG_PATH, JSON.stringify(entry) + '\n', 'utf8'); }
   catch (_) {}

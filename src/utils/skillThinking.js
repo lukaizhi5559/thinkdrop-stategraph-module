@@ -145,7 +145,7 @@ function generateBrowserActThinking(args, prefix) {
 
 function generateBrowserAgentThinking(args, prefix) {
   const agentId = args.agentId || 'browser';
-  const task = args.task ? `: "${args.task.slice(0, 60)}"` : '';
+  const task = args.task ? `: "${String(args.task).slice(0, 60)}"` : '';
   return `${prefix}🤖 ${agentId}${task}`;
 }
 

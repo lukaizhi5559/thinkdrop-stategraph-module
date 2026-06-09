@@ -3507,6 +3507,10 @@ Please try again or search with different terms.`;
     if (_task !== resolvedArgs.task) {
       resolvedArgs = { ...resolvedArgs, task: _task };
     }
+  } else if (skill === 'browser.agent' && resolvedArgs && resolvedArgs.task !== undefined && resolvedArgs.task !== null && typeof resolvedArgs.task !== 'string') {
+    // singleStepPlanner LLM may return task as a non-string object — coerce to string
+    resolvedArgs = { ...resolvedArgs, task: String(resolvedArgs.task) };
+    logger.debug(`[Node:ExecuteCommand] browser.agent task coerced from non-string to string`);
   }
 
   // Guard: if {{synthesisAnswer}} survived unsubstituted, synthesize hasn't run yet —
@@ -4559,6 +4563,26 @@ Please try again or search with different terms.`;
     if (skill === 'browser.agent' && resolvedArgs && !resolvedArgs.action) {
       resolvedArgs = { action: 'run', ...resolvedArgs };
       logger.debug('[Node:ExecuteCommand] browser.agent: defaulted missing action to \'run\'');
+    }
+    // Guard: planSkills LLM sometimes emits browser.agent steps without agentId when
+    // using a trained recipe. Auto-inject from the recipe map if available.
+    if (skill === 'browser.agent' && resolvedArgs && !resolvedArgs.agentId) {
+      const _recipeMap = state._trainedRecipeMap || {};
+      const _task = (resolvedArgs.task || '').toLowerCase();
+      let _injectedAgentId = null;
+      for (const [variant, info] of Object.entries(_recipeMap)) {
+        if (_task.includes(variant) || variant.includes(_task.split(' ').find(w => w.length >= 4) || '')) {
+          _injectedAgentId = info.agentId;
+          break;
+        }
+      }
+      if (!_injectedAgentId && Object.keys(_recipeMap).length > 0) {
+        _injectedAgentId = Object.values(_recipeMap)[0].agentId;
+      }
+      if (_injectedAgentId) {
+        resolvedArgs = { ...resolvedArgs, agentId: _injectedAgentId };
+        logger.debug(`[Node:ExecuteCommand] browser.agent: auto-injected missing agentId="${_injectedAgentId}" from recipe map`);
+      }
     }
     if (skill === 'cli.agent' && resolvedArgs && !resolvedArgs.action) {
       resolvedArgs = { action: 'run', ...resolvedArgs };
