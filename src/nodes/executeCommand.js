@@ -3483,6 +3483,25 @@ Please try again or search with different terms.`;
   // Regex catches template variables including dot notation (e.g., {{prev_stdout.besturl}})
   if (typeof resolvedArgs.url === 'string' && /\{\{[a-zA-Z_0-9.]+\}\}/.test(resolvedArgs.url)) {
     const unresolvedToken = (resolvedArgs.url.match(/\{\{[a-zA-Z_0-9.]+\}\}/) || [])[0];
+    // ── Special case: {{bestUrl}} unresolved because prior web.agent found no URL ──
+    // The search step succeeded but returned no matching URL (score=0). Rather than
+    // crashing the entire plan, skip this navigation step gracefully and let the
+    // plan complete — downstream synthesize steps will surface a "no results" answer.
+    if (unresolvedToken === '{{bestUrl}}' && !webAgentBestUrl) {
+      const skipMsg = 'Skipped: prior web search returned no URL to navigate to';
+      logger.warn(`[Node:ExecuteCommand] ${skipMsg} — skipping step ${skillCursor + 1} (${skill})`);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description, stdout: skipMsg });
+      if (_rawProgressCallback && state._skillPlanFile) {
+        _rawProgressCallback({ type: 'plan:step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description });
+      }
+      return {
+        ...state,
+        skillResults: [...skillResults, { step: skillCursor + 1, skill, args, description, ok: false, skipped: true, stdout: skipMsg }],
+        skillCursor: skillCursor + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
     throw new Error(`Unresolved template variable ${unresolvedToken} in URL — prior step returned no output. Check that the preceding step succeeded and produced a URL.`);
   }
 
