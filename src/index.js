@@ -35,13 +35,13 @@ const VSCodeLLMBackend = require('./backends/VSCodeLLMBackend');
 const ExternalLLMBackend = require('./backends/ExternalLLMBackend');
 
 // Nodes (for custom graphs)
-const parseIntentNode = require('./nodes/parseIntent');
+const parseIntentNode = require('./nodes/parseIntentV2');
 const answerNode = require('./nodes/answer');
 const retrieveMemoryNode = require('./nodes/retrieveMemory');
 const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
-const planSkillsNode = require('./nodes/planSkills');
+const planSkillsNode = require('./nodes/planSkillsV2');
 const recoverSkillNode = require('./nodes/recoverSkill');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');

@@ -36,6 +36,8 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - PRIORITY RULE - FILE/FOLDER ANALYSIS (takes precedence over user info rules): When the message starts with "[Folder:" or involves analyzing/listing/describing files/folders/images on the local filesystem (e.g., "[Folder: /path] tell me what files are here", "what are these images about", "analyze files in /path/to/folder"), use SINGLE command_automate step. This requires shell commands to list and read actual files, NOT memory_retrieve or web_search which will hallucinate.
 - PRIORITY RULE - USER INFO WITH ACTION: When the request is about USER INFO (family, profile, personal data, relationships like mom/dad/wife/cousin, phone numbers, emails, addresses, contacts) AND also requires an external action (send, email, post, fill, submit, create, share), use SINGLE command_automate step. The user.agent skill retrieves the info internally.
 - PRIORITY RULE - USER INFO ONLY: When the request is ONLY asking to show/list/tell/display USER INFO with NO external action (e.g. "who is my wife", "list my family", "what is my mom's phone", "tell me about my contacts"), use SINGLE memory_retrieve step. Do NOT use command_automate for pure info lookup.
+- EXAMPLES OF memory_retrieve: "who is my wife" → memory_retrieve | "list all info about my family" → memory_retrieve | "what do you know about my mom" → memory_retrieve | "tell me about my contacts" → memory_retrieve | "show my saved addresses" → memory_retrieve
+- EXAMPLES of command_automate (user info + action): "send my family info via email" → command_automate | "email my wife's number to John" → command_automate | "post about my mom on Facebook" → command_automate | "share my contact list" → command_automate
 - PRIORITY RULE - KNOWLEDGE vs SEARCH vs ACTION (when no specific website/tool is mentioned): For general questions without browser/tool interaction: Use general_knowledge for math/calculations ("convert 88s to minutes", "what is 5*7"), timeless facts ("who wrote Pride and Prejudice"), and definitions ("what is blockchain"). Use web_search for time-sensitive info (prices, news, "latest", "current"). Use command_automate ONLY when specific website interaction, tool usage, or external action is required.
 - General rule: When a request combines data retrieval with an action (e.g., "send weather info via email"), split into TWO steps: (1) retrieve the data (memory_retrieve/web_search), (2) perform the action (command_automate with dependsOn:[0]).
 - PRIORITY RULE - NAMED SERVICE/PLATFORM INTERACTION: When a user mentions a specific named service, website, platform, or application AND wants to find, search, locate, extract, or interact with content on that specific service → command_automate. Key distinction: "find workout videos" (general knowledge) vs "find workout videos on [named service]" (automation).
@@ -211,6 +213,25 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
     }));
   } catch (e) {
     logger.warn(`[Node:DecomposePromptV2] JSON parse failed: ${e.message}`);
+    
+    // Attempt to extract intent from malformed JSON as fallback
+    // This handles cases like: {"subPrompts=[{"text":"...","estimatedIntent":"web_search"...}]}
+    const intentMatch = sanitized.match(/["']estimatedIntent["']\s*[:=]\s*["']([^"']+)["']/);
+    if (intentMatch) {
+      const extractedIntent = intentMatch[1];
+      logger.info(`[Node:DecomposePromptV2] Extracted intent from malformed JSON: ${extractedIntent}`);
+      // Return a minimal subPrompt with the extracted intent so it's not lost
+      return [{
+        text: message, // Use original message
+        estimatedIntent: extractedIntent,
+        confidence: 0.70,
+        order: 0,
+        dependsOn: [],
+        isLongRunning: false,
+        dataTemplate: null
+      }];
+    }
+    
     return null;
   }
 }
@@ -291,7 +312,12 @@ module.exports = async function decomposePromptV2(state) {
     if (parsedJson && parsedJson.subPrompts && parsedJson.subPrompts.length > 0) {
       const originalIntent = parsedJson.subPrompts[0].estimatedIntent;
       logger.debug(`[Node:DecomposePromptV2] No sub-prompts after duplicate filtering - preserving _decomposedIntent: ${originalIntent}`);
-      return { ...state, _decomposedIntent: originalIntent };
+      // Create an intentPlan so the router can still execute the intent (e.g., web_search)
+      return { 
+        ...state, 
+        _decomposedIntent: originalIntent,
+        intentPlan: [{ text: message, estimatedIntent: originalIntent, order: 0, dependsOn: [], isLongRunning: false }]
+      };
     }
     logger.debug('[Node:DecomposePromptV2] No sub-prompts returned — pass-through');
     return state;

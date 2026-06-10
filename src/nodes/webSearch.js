@@ -51,8 +51,17 @@ module.exports = async function webSearch(state) {
     // "India weather" instead of China/America/India respectively).
     const isResolvedSubPrompt = Array.isArray(state.intentPlan) && state.intentPlan.length > 1;
     if (!tc.isScreenFollowUp && tc.isFollowUp && tc.followUpTarget && !isResolvedSubPrompt) {
-      query = tc.followUpTarget;
-      logger.info(`[Node:WebSearch] isFollowUp — using followUpTarget as query: "${query}"`);
+      // If original message contains visual/show intent keywords, use it for web-search classification
+      // The web-search service has its own intent classifier that detects images, art, etc.
+      const visualIntentPattern = /\b(show|see|look|pics?|pictures?|images?|photos?|art|artwork|drawings?|visual|gallery)\b/i;
+      if (visualIntentPattern.test(message)) {
+        // Use the full original message (cleaned) so web-search can properly classify
+        query = message.replace(/^(search for|search|find|look up|google)\s+/i, '').trim();
+        logger.info(`[Node:WebSearch] isFollowUp with visual intent — using original message: "${query}"`);
+      } else {
+        query = tc.followUpTarget;
+        logger.info(`[Node:WebSearch] isFollowUp — using followUpTarget as query: "${query}"`);
+      }
     }
 
     logger.debug(`[Node:WebSearch] Query: "${query}"`);
@@ -69,17 +78,30 @@ module.exports = async function webSearch(state) {
     
     logger.debug(`[Node:WebSearch] Found ${searchResults.length} results`);
 
-    return {
-      ...state,
-      searchResults,
-      contextDocs: searchResults.map(r => ({
+    // Map search results to contextDocs, with special handling for image results
+    const contextDocs = searchResults.map(r => {
+      const isImageResult = r.type === 'image-result';
+      const imageUrl = isImageResult && r.metadata?.properties?.url ? r.metadata.properties.url : null;
+      const originalUrl = isImageResult && r.metadata?.properties?.originalUrl ? r.metadata.properties.originalUrl : null;
+      
+      return {
         id: r.url || r.link,
         text: `${r.title}\n${r.snippet || r.description || ''}`,
         source: 'web_search',
         url: r.url || r.link,
         title: r.title || '',
-        snippet: r.snippet || r.description || ''
-      }))
+        snippet: r.snippet || r.description || '',
+        // Include image URL for image search results so they can be displayed
+        // imageUrl is the Brave thumbnail (reliable CDN), originalUrl is the source page
+        ...(imageUrl && { imageUrl, isImage: true }),
+        ...(originalUrl && { originalUrl })
+      };
+    });
+
+    return {
+      ...state,
+      searchResults,
+      contextDocs
     };
   } catch (error) {
     logger.error('[Node:WebSearch] Error:', error.message);

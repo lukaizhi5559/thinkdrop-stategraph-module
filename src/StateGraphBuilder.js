@@ -671,6 +671,24 @@ class StateGraphBuilder {
         }
         if (state.planError && !state.skillPlan) {
           logger.debug(`[StateGraph:Router] planSkills failed: ${state.planError}`);
+          // If all providers failed, surface this to the user instead of silent fallback
+          if (state.planError.includes('All LLM providers failed')) {
+            state.answer = "I'm unable to process your request right now because all AI providers are currently unavailable. This is likely due to rate limits or API key issues. Please check your provider settings or try again in a few minutes.";
+            logger.info('[StateGraph:Router] All providers failed — surfacing error to user');
+            // Emit progress event to update UI immediately (don't leave it stuck on "Planning steps...")
+            if (typeof state.progressCallback === 'function') {
+              try {
+                state.progressCallback({
+                  type: 'planning_failed',
+                  message: state.answer,
+                  error: state.planError,
+                  source: 'planSkills'
+                });
+              } catch (err) {
+                logger.warn('[StateGraph:Router] Failed to emit planning_failed progress event:', err.message);
+              }
+            }
+          }
           return 'logConversation';
         }
         return 'executeCommand';

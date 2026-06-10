@@ -214,6 +214,25 @@ module.exports = async function answer(state) {
     ? '\n' + contextSources.join('\n')
     : '\n- No additional context';
 
+  // ── Inject formatted web search results so LLM clearly sees all URLs ───────────
+  if (contextDocs.length > 0) {
+    const formattedResults = contextDocs.map((doc, i) => {
+      const isImage = doc.isImage || doc.imageUrl;
+      let lines = `[${i + 1}] ${doc.title || 'Untitled'}`;
+      if (isImage && doc.imageUrl) {
+        lines += `\n    IMAGE URL (USE THIS): ${doc.imageUrl}`;
+        lines += `\n    Source page: ${doc.url || doc.originalUrl || 'N/A'}`;
+      } else {
+        lines += `\n    URL: ${doc.url || 'N/A'}`;
+      }
+      if (doc.snippet) {
+        lines += `\n    Snippet: ${doc.snippet.substring(0, 150)}${doc.snippet.length > 150 ? '...' : ''}`;
+      }
+      return lines;
+    }).join('\n\n');
+    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: For image results, use the IMAGE URL provided above. Do NOT invent or hallucinate image URLs.`;
+  }
+
   // ── Inject conversation history for ambiguous follow-up interpretation ─────────
   // When _needsContextInterpretation is set (e.g., "what about them?" after file analysis),
   // OR when classifyTask identified this as a conversation follow-up (isFollowUp:true),
