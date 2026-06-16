@@ -172,6 +172,35 @@ module.exports = async function answer(state) {
     langOverridePrefix = `LANGUAGE OVERRIDE: The user's message is in ${langName}. You MUST write your ENTIRE response in ${langName} only. Do NOT use English under any circumstance.\n\n`;
   }
 
+  // ─── Fast-path: app-awareness questions answered directly from monitorService ─
+  // "What app am I in?", "What type of app is this?", "What's the active app?"
+  // _priorScreenContext is already populated by resolveReferencesV2 from memory.getRecentOcr.
+  // No shell.run, no LLM planning — just read what the monitor already knows.
+  const _APP_AWARENESS_RE = /\b(what\s+(app|application|program|software)\s+(am\s+i|are\s+you|is\s+(this|active|open|running|focused))|which\s+app|what('?s|\s+is)\s+(the\s+)?(active|current|open|focused|running)\s+(app|application|program|window)|what\s+type\s+of\s+app|what\s+kind\s+of\s+(app|application))\b/i;
+  const _priorScreenContext = state._priorScreenContext || null;
+  if (_APP_AWARENESS_RE.test(queryMessage) && _priorScreenContext?.appName) {
+    const appName  = _priorScreenContext.appName;
+    const category = _priorScreenContext.category && _priorScreenContext.category !== 'other'
+      ? _priorScreenContext.category
+      : null;
+    const windowTitle = _priorScreenContext.windowTitle || null;
+    const ageMin = _priorScreenContext.timestamp
+      ? Math.round((Date.now() - new Date(_priorScreenContext.timestamp).getTime()) / 60000)
+      : null;
+
+    let fastAnswer = `You're currently in **${appName}**`;
+    if (category) fastAnswer += ` — a **${category}** app`;
+    if (windowTitle && windowTitle !== 'unknown' && windowTitle !== appName) {
+      fastAnswer += `. Window: "${windowTitle}"`;
+    }
+    fastAnswer += '.';
+    if (ageMin !== null) fastAnswer += ` *(Screen captured ${ageMin} min ago)*`;
+
+    logger.info(`[Node:Answer] app-awareness fast-path: ${appName} (${category || 'other'})`);
+    if (typeof streamCallback === 'function') streamCallback(fastAnswer);
+    return { ...state, answer: fastAnswer, metadata: { ...state.metadata, answerSource: 'monitor-fast-path' } };
+  }
+
   // ─── Detect intermediate multi-intent pipeline step ─────────────────────────
   // When isMultiIntent=true and intentQueue still has remaining steps, this node
   // is executing an intermediate step (e.g. step 1 of 3). Injecting a structural
@@ -380,6 +409,11 @@ module.exports = async function answer(state) {
       systemInstructions += mLines.join('\n');
     }
   } catch (_manifestErr) {}
+
+  // Inject live screen context note from monitorService (appName, category, window)
+  if (state._screenContextNote) {
+    systemInstructions += `\n\n${state._screenContextNote}`;
+  }
 
   // Inject screen context into system instructions (not into the user query)
   if (state.context && typeof state.context === 'string') {

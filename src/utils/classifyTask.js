@@ -19,6 +19,7 @@
  *   targetService: string | null,  // named external service if present
  *   isRecurring: boolean,          // recurring/scheduled task signal
  *   isBrowseOnly: boolean,         // pure navigation — no messaging/send intent
+ *   requiresDOM: boolean,           // browser task needing DOM access (form fill, login, scrape)
  * }
  *
  * Fails open: any error returns a safe default that never blocks execution.
@@ -37,6 +38,7 @@ Output ONLY valid JSON with exactly these fields:
   "targetService": "<service name>" | null,
   "isRecurring": true | false,
   "isBrowseOnly": true | false,
+  "requiresDOM": true | false,
   "isScreenFollowUp": true | false,
   "needsFreshScreen": true | false
 }
@@ -45,10 +47,10 @@ Field rules:
 - taskType:
   - "local_file": create, open, rename, move, copy, delete, generate, write, export, convert, compress, find any local file or folder
   - "local_system": interrogate or control the local machine — check uptime, disk space, memory usage, CPU, battery, network interfaces, running processes, kill a process, system stats, hardware info, environment variables, hostname, OS version, run a shell command, check what is installed, list ports, ping a host. Use this whenever the task requires executing a shell command or querying the OS rather than reading/writing a file.
-  - "browser": navigate, search, open a website, go to a URL, look something up online
+  - "browser": navigate, search, open a website, go to a URL, look something up online — ONLY for web browser tasks. NOT for tasks that inspect, use, or interact with a native desktop app's UI (e.g. Slack, Figma, Zoom, Discord) — those are "local_system" or "query" even if a service name is mentioned.
   - "messaging": send email, text, SMS, Slack, Discord, notify someone
   - "scheduling": set a reminder, schedule something, recurring alarm, cron task
-  - "query": question, lookup, retrieve memory, general knowledge — use ONLY for pure knowledge questions that do NOT require executing anything on the local machine
+  - "query": question, lookup, retrieve memory, general knowledge — includes asking about or locating UI elements in a desktop app ("show me where X is in Slack", "where is the toolbar in Figma"). Use for tasks that ask to find, describe, or explain something without sending or modifying anything.
   - "ambiguous": genuinely unclear even with history
 
 - isFollowUp: true when message contains "that folder", "it", "the file", "there", "that one", "the result", "that directory", "that script", "that code", "that python", "the previous", or any pronoun/demonstrative referring to something established in RECENT CONVERSATION
@@ -67,6 +69,11 @@ Field rules:
 - isRecurring: true for "every day", "daily", "weekly", "remind me every", "alarm", "recurring", "each morning"
 
 - isBrowseOnly: true when taskType is "browser" AND there is no send/message/notify intent
+
+- requiresDOM: true when taskType is "browser" AND the task requires precise DOM-level interaction that keyboard shortcuts cannot do reliably:
+  form fill, login/authentication/OAuth, structured data scraping, file upload via browser input, clicking specific page elements by selector, multi-step page flows (e.g. click button → wait → fill → submit).
+  false for: navigate to URL, open new tab, scroll page, copy page content, find on page, back/forward, reload — all achievable via keyboard shortcuts.
+  NEVER true for tasks that ask to visually locate, identify, or describe a UI element in a desktop app (e.g. "show me where the input area is in Slack", "find the toolbar in Figma") — those use screen capture/OCR, not DOM access. Always false when taskType is not "browser".
 
 - isScreenFollowUp: true when ALL of the following hold:
   1. A PRIOR SCREEN CONTEXT block is present in the prompt (see below)
@@ -102,6 +109,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     targetService: null,
     isRecurring: false,
     isBrowseOnly: false,
+    requiresDOM: false,
     isScreenFollowUp: false,
     needsFreshScreen: false,
   };
@@ -139,6 +147,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       targetService:      parsed.targetService       || null,
       isRecurring:        !!parsed.isRecurring,
       isBrowseOnly:       !!parsed.isBrowseOnly,
+      requiresDOM:        !!parsed.requiresDOM,
       isScreenFollowUp:   !!parsed.isScreenFollowUp,
       needsFreshScreen:   !!parsed.needsFreshScreen,
     };

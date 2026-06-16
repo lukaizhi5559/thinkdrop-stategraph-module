@@ -42,6 +42,7 @@ async function getRecentMonitorCapture(mcpAdapter, logger) {
           timestamp:   c.capturedAt   || c.created_at || new Date().toISOString(),
           appName:     c.appName      || null,
           windowTitle: c.windowTitle  || null,
+          category:    c.category     || 'other',
           url:         c.url          || null,
           contextText: c.text         || null,
         };
@@ -130,15 +131,18 @@ module.exports = async function resolveReferencesV2(state) {
     logger.debug(`[Node:ResolveReferencesV2] Prior screen context available (${ageMin} min old): ${_priorScreenContext.appName || 'unknown app'}`);
   }
 
-  // Build a compact summary string for the classifyTask LLM prompt when screen context exists
+  // Build a compact summary string for the classifyTask LLM prompt + downstream planning nodes
   let priorScreenSummary = null;
+  let _screenContextNote = null;
   if (_priorScreenContext) {
     const ageMin = Math.round((Date.now() - new Date(_priorScreenContext.timestamp).getTime()) / 60000);
     const parts = [];
     if (_priorScreenContext.appName)     parts.push(`App: ${_priorScreenContext.appName}`);
+    if (_priorScreenContext.category && _priorScreenContext.category !== 'other') parts.push(`Category: ${_priorScreenContext.category}`);
     if (_priorScreenContext.windowTitle) parts.push(`Window: "${_priorScreenContext.windowTitle}"`);
     if (_priorScreenContext.url)         parts.push(`URL: ${_priorScreenContext.url}`);
     priorScreenSummary = `PRIOR SCREEN CONTEXT (captured ${ageMin} min ago): ${parts.join(', ')}`;
+    _screenContextNote = `ACTIVE SCREEN (${ageMin} min ago): ${parts.join(', ')}`;
   }
 
   // ── Classify task once — all downstream nodes read from _taskClassification ──────────
@@ -159,6 +163,7 @@ module.exports = async function resolveReferencesV2(state) {
     conversationHistory,
     _taskClassification,
     _priorScreenContext:    _priorScreenContext || null,
+    _screenContextNote:     _screenContextNote || null,
     coreferenceMethod:      'none',
     coreferenceReplacements: [],
   };

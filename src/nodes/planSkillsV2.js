@@ -158,15 +158,12 @@ function _loadPromptFile(filename) {
 //         "open my-folder for me" has no URL → full prompt, always correct
 // ─────────────────────────────────────────────────────────────────────────────
 
-const _URL_RE = /https?:\/\/\S+|(?:^|\s)(?:www\.)\S+\.\w{2,}/i;
-const _PUBLIC_HOST_RE = /\b(?:google|youtube|github|twitter|linkedin|reddit|facebook|instagram|amazon|netflix|spotify|wikipedia|stackoverflow|medium|notion|slack|discord|twitch|pinterest|tiktok|bing|yahoo|duckduckgo|perplexity|openai|anthropic|mistral|deepseek|gemini|grok|suno|midjourney|runway|figma|canva|zoom|teams|outlook|gmail|dropbox|drive\.google|icloud|onedrive|salesforce|hubspot|stripe|shopify|paypal|venmo|etsy|airbnb|uber|lyft|doordash|grubhub|yelp|tripadvisor|w3schools)\.(?:com|ai|org|net|io|co|app|dev|me|uk|us)\b/i;
-// Bare site names without TLD — catches "goto w3schools", "open youtube", etc.
-const _SITE_NAME_RE = /\b(?:google|youtube|github|twitter|linkedin|reddit|facebook|instagram|amazon|netflix|spotify|wikipedia|stackoverflow|medium|notion|slack|discord|twitch|pinterest|tiktok|bing|yahoo|duckduckgo|perplexity|openai|anthropic|gemini|grok|figma|canva|zoom|outlook|gmail|w3schools|chatgpt|claude|biblegateway)\b/i;
+const _URL_RE = /https?:\/\/\S+/i;
 
 function _buildSystemPrompt(userMessage, state) {
   const isWindows = process.platform === 'win32';
 
-  const _hasUrl = _URL_RE.test(userMessage) || _PUBLIC_HOST_RE.test(userMessage) || _SITE_NAME_RE.test(userMessage);
+  const _hasExplicitUrl = _URL_RE.test(userMessage);
   const _hasLocalSignals = !!(
     state.grilledConstraints ||
     state.activeBrowserSessionId ||
@@ -175,20 +172,55 @@ function _buildSystemPrompt(userMessage, state) {
     state.matchedSkillName ||
     state.matchedSkillDomain
   );
-  const canUseSlim = userMessage && _hasUrl && !_hasLocalSignals
-    && !state.recoveryContext;
+  const _tc = state._taskClassification;
+  const _screenCtx = state._priorScreenContext;
 
-  if (canUseSlim) {
+  // Is a browser app currently in focus (live Chrome/Safari/Firefox window)?
+  const _browserIsOpen = _screenCtx?.category === 'browser' && !!_screenCtx?.appName;
+
+  // ── Tier 1: browser.agent (playwright-cli) ──────────────────────────────────
+  // Only when task genuinely needs DOM access (form fill, login, scraping, multi-step)
+  // OR when message has an explicit URL but no browser is open (headless needed)
+  const canUseBrowserSlim = !_hasLocalSignals && !state.recoveryContext && (
+    (_tc?.requiresDOM === true) ||
+    (_hasExplicitUrl && !_browserIsOpen)
+  );
+
+  if (canUseBrowserSlim) {
     const slim = _loadPromptFile('plan-skills-browser.md');
     if (slim) {
-      console.info('[Node:PlanSkillsV2] system prompt: plan-skills-browser.md (URL-present, no local signals)');
+      const reason = _tc?.requiresDOM ? 'requiresDOM' : 'explicit-url-no-browser';
+      console.info(`[Node:PlanSkillsV2] system prompt: plan-skills-browser.md (${reason}, taskType:${_tc?.taskType})`);
+      return slim;
+    }
+  }
+
+  // ── Tier 2: app.agent (NutJS + shortcuts) — default for desktop + browser nav ──
+  // Native desktop app task OR browser navigation that doesn't need DOM
+  const _isNativeDesktopTask = _tc?.taskType !== 'browser'
+    && !(_tc?.taskType === 'query' && !_tc?.targetService); // exclude pure abstract knowledge Q
+
+  const _isBrowserNavTask = _tc?.taskType === 'browser'
+    && !_tc?.requiresDOM; // simple nav (Cmd+L, Cmd+T, scroll) — app.agent handles this
+
+  const canUseAppSlim = (_isNativeDesktopTask || _isBrowserNavTask)
+    && !canUseBrowserSlim
+    && !_hasExplicitUrl  // explicit URL with no browser → already handled by browser slim above
+    && !_hasLocalSignals
+    && !state.recoveryContext;
+
+  if (canUseAppSlim) {
+    const slim = _loadPromptFile('plan-skills-app.md');
+    if (slim) {
+      const reason = _isBrowserNavTask ? `browser-nav,app:${_screenCtx?.appName || 'none'}` : `native,taskType:${_tc?.taskType},target:${_tc?.targetService || 'none'}`;
+      console.info(`[Node:PlanSkillsV2] system prompt: plan-skills-app.md (${reason})`);
       return slim;
     }
   }
 
   const baseFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
-  const _skipReason = _hasUrl && !canUseSlim ? ` (slim skipped: ${state.recoveryContext ? 'recovery' : 'local_signals'})` : '';
-  console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile}${_skipReason}`);
+  const _skipReason = _hasLocalSignals ? ' (slim skipped: local_signals)' : state.recoveryContext ? ' (slim skipped: recovery)' : '';
+  console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile}${_skipReason} taskType:${_tc?.taskType || 'unknown'}`);
   const base = _loadPromptFile(baseFile) || _loadPromptFile('plan-skills.md');
   if (!base) return null;
 

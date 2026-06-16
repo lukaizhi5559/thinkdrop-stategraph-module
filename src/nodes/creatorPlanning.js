@@ -433,9 +433,13 @@ module.exports = async function creatorPlanning(state) {
 
     // ── Enrich prompt with gathered context (services, timezone, secrets) ────────
   const gatheredContext = state.gatheredContext || null;
+  const _screenContextNote = state._screenContextNote || null;
   let enrichedPrompt = userMessage;
+  if (_screenContextNote) {
+    enrichedPrompt = `${_screenContextNote}\n\n${userMessage}`;
+  }
   if (gatheredContext) {
-    const parts = [userMessage, ''];
+    const parts = [enrichedPrompt, ''];
     if (gatheredContext.services?.length) {
       parts.push('Services confirmed: ' + gatheredContext.services.join(', '));
     }
