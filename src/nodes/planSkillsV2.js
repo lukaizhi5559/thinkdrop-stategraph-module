@@ -108,6 +108,13 @@ Example: [{"skill": "web.agent", "args": {"action": "...", "query": "..."}, "run
       return skillPlan;
     }
     
+    // Hard guard: strip runGroup from skills that must never run in parallel,
+    // regardless of what the LLM returned
+    const SEQUENTIAL_ONLY_SKILLS = new Set(['synthesize', 'schedule', 'shell.run']);
+    analyzedPlan = analyzedPlan.map(step =>
+      SEQUENTIAL_ONLY_SKILLS.has(step.skill) ? { ...step, runGroup: undefined } : step
+    );
+
     // Count how many runGroups were added
     const runGroupsAdded = analyzedPlan.filter(s => s.runGroup).length;
     if (runGroupsAdded > 0) {
@@ -198,7 +205,7 @@ function _buildSystemPrompt(userMessage, state) {
   // ── Tier 2: app.agent (NutJS + shortcuts) — default for desktop + browser nav ──
   // Native desktop app task OR browser navigation that doesn't need DOM
   const _isNativeDesktopTask = _tc?.taskType !== 'browser'
-    && !(_tc?.taskType === 'query' && !_tc?.targetService); // exclude pure abstract knowledge Q
+    && !(_tc?.taskType === 'query' && !_tc?.targetService && !_tc?.isAppUiInspection); // exclude pure abstract knowledge Q (but not named-app UI inspection)
 
   const _isBrowserNavTask = _tc?.taskType === 'browser'
     && !_tc?.requiresDOM; // simple nav (Cmd+L, Cmd+T, scroll) — app.agent handles this

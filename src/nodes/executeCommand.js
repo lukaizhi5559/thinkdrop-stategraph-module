@@ -2512,6 +2512,7 @@ module.exports = async function executeCommand(state) {
     const pageTextResults = skillResults
       .filter(r => (
         (r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText')) ||
+        (r.skill === 'app.agent' && r.args?.action === 'get_recent_ocr' && r.result && typeof r.result === 'string' && r.result.trim().length > 50) ||
         (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:'))
       ) && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0
         && r.step > lastSynthesizeStep)

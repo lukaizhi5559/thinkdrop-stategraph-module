@@ -35,13 +35,13 @@ When user asks to open a file in any app (VSCode, Xcode, Finder, etc.):
 5. `shell.run` → `open -a '<AppName>' '<resolved_path>'` to open the file
 6. `synthesize` → confirm what was opened
 
-**Example plan for "Open main.tsx in VSCode":**
+**Example plan for "Open <filename> in <AppName>":**
 ```json
 [
-  { "skill": "shell.run", "args": { "goal": "mdfind -name 'main.tsx'" }, "description": "Find all files named main.tsx using Spotlight" },
-  { "skill": "guide.step", "args": { "instruction": "Found these files:\n{{PREV_OUTPUT}}\n\nWhich one do you want to open in VSCode?", "sessionId": "open_file_disambig" }, "description": "Ask user to pick the right file (include ONLY if multiple results expected)" },
-  { "skill": "shell.run", "args": { "goal": "open -a 'Visual Studio Code' '/chosen/path/main.tsx'" }, "description": "Open the selected file in VSCode" },
-  { "skill": "synthesize", "args": { "prompt": "Confirm to the user which file was opened in VSCode" }, "description": "Confirm result" }
+  { "skill": "shell.run", "args": { "goal": "mdfind -name '<filename>'" }, "description": "Find all matching files using Spotlight" },
+  { "skill": "guide.step", "args": { "instruction": "Found these files:\n{{PREV_OUTPUT}}\n\nWhich one do you want to open in <AppName>?", "sessionId": "open_file_disambig" }, "description": "Ask user to pick the right file (include ONLY if multiple results expected)" },
+  { "skill": "shell.run", "args": { "goal": "open -a '<AppName>' '/chosen/path/<filename>'" }, "description": "Open the selected file in <AppName>" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm to the user which file was opened in <AppName>" }, "description": "Confirm result" }
 ]
 ```
 
@@ -105,13 +105,13 @@ When user asks to open a file in any app (VSCode, Xcode, Finder, etc.):
 
 ## Common Patterns
 
-**Open VSCode at a specific file (canonical):**
+**Open a file in an app:**
 ```json
 [
-  { "skill": "shell.run", "args": { "goal": "mdfind -name 'main.tsx'" }, "description": "Find all main.tsx files" },
+  { "skill": "shell.run", "args": { "goal": "mdfind -name '<filename>'" }, "description": "Find all matching files" },
   { "skill": "guide.step", "args": { "instruction": "Found these files:\n{{PREV_OUTPUT}}\n\nWhich do you want to open?", "sessionId": "pick_file" }, "description": "Disambiguate (only if multiple results)" },
-  { "skill": "shell.run", "args": { "goal": "open -a 'Visual Studio Code' '/selected/path/main.tsx'" }, "description": "Open in VSCode" },
-  { "skill": "synthesize", "args": { "prompt": "Confirm the file was opened in VSCode" }, "description": "Done" }
+  { "skill": "shell.run", "args": { "goal": "open -a '<AppName>' '/selected/path/<filename>'" }, "description": "Open in <AppName>" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the file was opened in <AppName>" }, "description": "Done" }
 ]
 ```
 
@@ -134,8 +134,16 @@ When user asks to open a file in any app (VSCode, Xcode, Finder, etc.):
 **Open app then run shortcut:**
 ```json
 [
-  { "skill": "shell.run", "args": { "goal": "open -a 'Visual Studio Code'" }, "description": "Launch or focus VSCode" },
-  { "skill": "app.agent", "args": { "action": "verify_app_focused", "appName": "Visual Studio Code", "waitMs": 5000 }, "description": "Confirm VSCode is focused" },
-  { "skill": "app.agent", "args": { "action": "execute_shortcut", "appName": "Visual Studio Code", "shortcutOverride": "Cmd+Shift+P" }, "description": "Open command palette" }
+  { "skill": "shell.run", "args": { "goal": "open -a '<AppName>'" }, "description": "Launch or focus <AppName>" },
+  { "skill": "app.agent", "args": { "action": "verify_app_focused", "appName": "<AppName>", "waitMs": 5000 }, "description": "Confirm <AppName> is focused" },
+  { "skill": "app.agent", "args": { "action": "execute_shortcut", "appName": "<AppName>", "shortcutOverride": "<Shortcut>" }, "description": "Execute shortcut in <AppName>" }
+]
+```
+
+**Locate / inspect a UI element in an app ("show me where X is", "where is the toolbar", "find the input area"):**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "get_recent_ocr", "appName": "<AppName>" }, "description": "Capture current screen state of <AppName>" },
+  { "skill": "synthesize", "args": { "prompt": "Based on what is visible on screen, describe where the <element> is located in <AppName> and how the user can find or access it" }, "description": "Explain element location to user" }
 ]
 ```

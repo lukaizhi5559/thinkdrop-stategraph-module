@@ -40,7 +40,8 @@ Output ONLY valid JSON with exactly these fields:
   "isBrowseOnly": true | false,
   "requiresDOM": true | false,
   "isScreenFollowUp": true | false,
-  "needsFreshScreen": true | false
+  "needsFreshScreen": true | false,
+  "isAppUiInspection": true | false
 }
 
 Field rules:
@@ -69,6 +70,8 @@ Field rules:
 - isRecurring: true for "every day", "daily", "weekly", "remind me every", "alarm", "recurring", "each morning"
 
 - isBrowseOnly: true when taskType is "browser" AND there is no send/message/notify intent
+
+- isAppUiInspection: true when taskType is "query" AND the task is specifically asking to locate, find, show, or identify a UI element WITHIN a named desktop app (e.g. "show me where the message input area is in Slack", "where is the toolbar in Figma", "find the send button in Discord", "locate the settings panel in Notion", "point me to the search bar in Slack"). These require app.agent to capture and analyze that specific app's screen. false for all other cases, including passive screen observations ("what's on my screen") and general knowledge questions.
 
 - requiresDOM: true when taskType is "browser" AND the task requires precise DOM-level interaction that keyboard shortcuts cannot do reliably:
   form fill, login/authentication/OAuth, structured data scraping, file upload via browser input, clicking specific page elements by selector, multi-step page flows (e.g. click button → wait → fill → submit).
@@ -112,6 +115,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     requiresDOM: false,
     isScreenFollowUp: false,
     needsFreshScreen: false,
+    isAppUiInspection: false,
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -140,16 +144,17 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const parsed = JSON.parse(jsonMatch[0]);
 
     return {
-      taskType:           parsed.taskType           || _default.taskType,
-      isFollowUp:         !!parsed.isFollowUp,
-      followUpTarget:     parsed.followUpTarget      || null,
-      needsClarification: !!parsed.needsClarification,
-      targetService:      parsed.targetService       || null,
-      isRecurring:        !!parsed.isRecurring,
-      isBrowseOnly:       !!parsed.isBrowseOnly,
-      requiresDOM:        !!parsed.requiresDOM,
-      isScreenFollowUp:   !!parsed.isScreenFollowUp,
-      needsFreshScreen:   !!parsed.needsFreshScreen,
+      taskType:            parsed.taskType           || _default.taskType,
+      isFollowUp:          !!parsed.isFollowUp,
+      followUpTarget:      parsed.followUpTarget      || null,
+      needsClarification:  !!parsed.needsClarification,
+      targetService:       parsed.targetService       || null,
+      isRecurring:         !!parsed.isRecurring,
+      isBrowseOnly:        !!parsed.isBrowseOnly,
+      requiresDOM:         !!parsed.requiresDOM,
+      isScreenFollowUp:    !!parsed.isScreenFollowUp,
+      needsFreshScreen:    !!parsed.needsFreshScreen,
+      isAppUiInspection:   !!parsed.isAppUiInspection,
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

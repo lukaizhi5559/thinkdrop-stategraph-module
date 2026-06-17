@@ -155,8 +155,17 @@ module.exports = async function parseIntentV2(state) {
   // ── 4. Trust decomposePromptV2 intentPlan (single sub-prompt) ───────────────
   if (intentPlan && Array.isArray(intentPlan) && intentPlan.length === 1) {
     const sp         = intentPlan[0];
-    const finalIntent = sp.estimatedIntent || 'general_knowledge';
+    let   finalIntent = sp.estimatedIntent || 'general_knowledge';
     const finalConf   = typeof sp.confidence === 'number' ? sp.confidence : 0.88;
+
+    // Safety net: classifyTask independently flags named-app UI inspection tasks
+    // (e.g. "show me where the input area is in Slack") which decomposePromptV2 can
+    // misclassify as screen_intelligence. Override to command_automate so planSkills
+    // generates the correct app.agent get_recent_ocr + synthesize plan.
+    if (finalIntent === 'screen_intelligence' && state._taskClassification?.isAppUiInspection === true) {
+      logger.info(`[Node:ParseIntentV2] isAppUiInspection override: screen_intelligence → command_automate for "${classifyMessage.slice(0, 80)}"`);
+      finalIntent = 'command_automate';
+    }
 
     logger.debug(`[Node:ParseIntentV2] intentPlan passthrough → ${finalIntent} (${finalConf}): "${classifyMessage.slice(0, 80)}"`);
     writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'llm-decompose', intent: finalIntent, confidence: finalConf, subPromptCount: 1, durationMs: 0, subPrompts: [{ order: 0, text: sp.text, estimatedIntent: finalIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }] });
