@@ -162,12 +162,7 @@ module.exports = async function evaluateSkills(state) {
         return { ...state, evaluationVerdict: 'PASS' };
       }
     }
-    // Skip evaluation for guide.step plans — user hasn't acted yet, nothing to judge
-    const hasGuideStep = skillPlan.some(s => s.skill === 'guide.step');
-    if (hasGuideStep) {
-      logger.info(`[Node:EvaluateSkills] Skipping — plan contains guide.step (user interaction pending)`);
-      return { ...state, evaluationVerdict: 'PASS' };
-    }
+
   }
 
   // ── Self-healing: detect playwright tool errors and auto-diagnose ──────────

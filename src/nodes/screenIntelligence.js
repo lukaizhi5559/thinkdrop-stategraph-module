@@ -51,14 +51,18 @@ module.exports = async function screenIntelligence(state) {
     let capture = null;
 
     // ── Step 1: Check for a recent OCR capture from user-memory monitor ──────
+    // Pass activeAppName so the query only returns captures for the current app.
+    // Reduces maxAgeSeconds to 3 to minimize the stale-app race window.
+    const _activeAppName = state._priorScreenContext?.appName || null;
     try {
       const recentResult = await mcpAdapter.callService('user-memory', 'memory.getRecentOcr', {
-        maxAgeSeconds: 10
+        maxAgeSeconds: 3,
+        appName: _activeAppName || undefined
       });
       const recentData = recentResult.data || recentResult;
       if (recentData.available && recentData.capture) {
         capture = recentData.capture;
-        logger.debug('[Node:ScreenIntelligence] Reusing recent OCR capture (< 10s old)');
+        logger.debug(`[Node:ScreenIntelligence] Reusing recent OCR capture (< 3s old, app=${capture.appName})`);
       }
     } catch (ocrCheckErr) {
       logger.debug('[Node:ScreenIntelligence] recentOcr check failed, proceeding with fresh capture:', ocrCheckErr.message);

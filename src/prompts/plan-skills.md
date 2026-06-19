@@ -1,5 +1,4 @@
 api_suggest|args:{app:string,reason:string,apiDocsUrl?:string,apiSetupPrompt?:string,guidePrompt?:string}|surfaces_API_offer_when_task_is_better_served_by_API
-guide.step|args:{instruction:string,sessionId:string,timeoutMs?:number}|pauses_plan_shows_instruction_card_polls_window.__tdGuideTriggered_auto_advances_when_user_clicks_highlighted_element
 schedule|args:{time?:string,delayMs?:number,label?:string}|waits_until_clock_time_or_delay_then_continues_plan
 list_skills|args:{}|returns_full_skill_registry_including_installed_user_skills
 skill.install|args:{skillPath:string}|reads_skill_contract_md_at_path_and_registers_it_in_the_skill_registry.__ALWAYS_use_this_to_install_a_skill__never_shell.run.__skillPath_must_be_absolute_eg_/Users/lukaizhi/.thinkdrop/skills/send.text/skill.md
@@ -186,7 +185,7 @@ If `smsGatewayTarget.email` is null, the carrier has not been configured — ski
   2. `synthesize` (create the content using the user.agent summary and {{synthesisAnswer}} token)
   3. `browser.agent` or other consumer step (send/deliver the content using {{synthesisAnswer}})
   **NEVER place browser.agent before synthesize when generating personalized content.**
-- If `missingFields` is non-empty, add a `guide.step` asking the user to provide the missing values, THEN continue the plan.
+- If `missingFields` is non-empty, add a `synthesize` step telling the user which fields are missing and asking them to re-ask with those values included.
 - NEVER use `user.agent` for tasks that have nothing to do with the user's personal context (web searches, code generation, generic system tasks).
 
 **Registered agents — check AVAILABLE AGENTS block first (highest priority).** If an agent for the needed service is listed there, skip `build_agent` and delegate directly via `action: 'run'`:
@@ -346,12 +345,6 @@ A **sub-agent** accepts ONE high-level goal, runs its own internal reasoning loo
 | Claude | `https://claude.ai` | `anthropic.com` |
 
 **screen vs browser tab:** "what's on my screen" → `screen.capture` (OCR). "extract from web page" → `browser.agent { action: 'run', task: 'extract page text' }`.
-
-## guide.step — routing rules
-
-**Use ONLY when automation cannot complete the action:** CAPTCHAs, TOTP/2FA prompts, tasks explicitly requesting "walk me through" / "guide me".
-
-**NEVER use for:** button clicks, form fills, OAuth logins (handled via credential tokens), API key setup (use `browser.agent build_agent`), curl commands (use `shell.run`).
 
 ## api_suggest — when to use
 

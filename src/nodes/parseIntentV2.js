@@ -167,6 +167,14 @@ module.exports = async function parseIntentV2(state) {
       finalIntent = 'command_automate';
     }
 
+    // Spatial analysis queries ("what regions are on screen", "describe the layout") need
+    // app.agent analyze_spatial_grid — screen_intelligence → answer only has plain OCR text
+    // and structurally cannot return spatial coordinate data.
+    if (finalIntent === 'screen_intelligence' && state._taskClassification?.isSpatialAnalysis === true) {
+      logger.info(`[Node:ParseIntentV2] isSpatialAnalysis override: screen_intelligence → command_automate for "${classifyMessage.slice(0, 80)}"`);
+      finalIntent = 'command_automate';
+    }
+
     logger.debug(`[Node:ParseIntentV2] intentPlan passthrough → ${finalIntent} (${finalConf}): "${classifyMessage.slice(0, 80)}"`);
     writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'llm-decompose', intent: finalIntent, confidence: finalConf, subPromptCount: 1, durationMs: 0, subPrompts: [{ order: 0, text: sp.text, estimatedIntent: finalIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }] });
 

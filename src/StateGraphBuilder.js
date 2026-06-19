@@ -452,7 +452,7 @@ class StateGraphBuilder {
           state._taskClassification?.taskType === 'query' &&
           !state._taskClassification?.isAppUiInspection && // Never override named-app UI inspection tasks
           intentType === 'command_automate' &&
-          (!state.intent || state.intent.confidence < 0.8) && // Only override low-confidence automation intents
+          (!state.intent || state.intent.confidence < 0.65) && // Only override genuinely absent/uncertain intents (0.7 is decompose default, not low-confidence)
           !state._planMode // Don't override during plan execution
         ) {
           logger.info(`[StateGraph:Router] isScreenFollowUp+query — overriding low-confidence command_automate → answer`);

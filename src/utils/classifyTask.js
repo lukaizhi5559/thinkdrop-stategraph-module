@@ -41,17 +41,18 @@ Output ONLY valid JSON with exactly these fields:
   "requiresDOM": true | false,
   "isScreenFollowUp": true | false,
   "needsFreshScreen": true | false,
-  "isAppUiInspection": true | false
+  "isAppUiInspection": true | false,
+  "isSpatialAnalysis": true | false
 }
 
 Field rules:
 - taskType:
   - "local_file": create, open, rename, move, copy, delete, generate, write, export, convert, compress, find any local file or folder
-  - "local_system": interrogate or control the local machine — check uptime, disk space, memory usage, CPU, battery, network interfaces, running processes, kill a process, system stats, hardware info, environment variables, hostname, OS version, run a shell command, check what is installed, list ports, ping a host. Use this whenever the task requires executing a shell command or querying the OS rather than reading/writing a file.
+  - "local_system": interrogate or control the local machine — check uptime, disk space, memory usage, CPU, battery, network interfaces, running processes, kill a process, system stats, hardware info, environment variables, hostname, OS version, run a shell command, check what is installed, list ports, ping a host. Use this whenever the task requires executing a shell command or querying the OS rather than reading/writing a file. ALSO use "local_system" for any imperative action targeting the current screen or active app UI — e.g. highlight elements, capture screenshot, scroll the screen, annotate, show bounding boxes, monitor screen activity, take a screenshot, zoom in. These execute against the running OS/app and are NOT "query" even if the user says "on my screen" or "on this page".
   - "browser": navigate, search, open a website, go to a URL, look something up online — ONLY for web browser tasks. NOT for tasks that inspect, use, or interact with a native desktop app's UI (e.g. Slack, Figma, Zoom, Discord) — those are "local_system" or "query" even if a service name is mentioned.
   - "messaging": send email, text, SMS, Slack, Discord, notify someone
   - "scheduling": set a reminder, schedule something, recurring alarm, cron task
-  - "query": question, lookup, retrieve memory, general knowledge — includes asking about or locating UI elements in a desktop app ("show me where X is in Slack", "where is the toolbar in Figma"). Use for tasks that ask to find, describe, or explain something without sending or modifying anything.
+  - "query": question, lookup, retrieve memory, general knowledge — includes asking about or locating UI elements in a desktop app ("show me where X is in Slack", "where is the toolbar in Figma"). Use for tasks that ask to find, describe, or explain something without sending or modifying anything. NOT "query" when the task is an imperative action ON the screen (highlight, scroll, capture, monitor, annotate) — those are "local_system".
   - "ambiguous": genuinely unclear even with history
 
 - isFollowUp: true when message contains "that folder", "it", "the file", "there", "that one", "the result", "that directory", "that script", "that code", "that python", "the previous", or any pronoun/demonstrative referring to something established in RECENT CONVERSATION
@@ -73,10 +74,13 @@ Field rules:
 
 - isAppUiInspection: true when taskType is "query" AND the task is specifically asking to locate, find, show, or identify a UI element WITHIN a named desktop app (e.g. "show me where the message input area is in Slack", "where is the toolbar in Figma", "find the send button in Discord", "locate the settings panel in Notion", "point me to the search bar in Slack"). These require app.agent to capture and analyze that specific app's screen. false for all other cases, including passive screen observations ("what's on my screen") and general knowledge questions.
 
+- isSpatialAnalysis: true when the task is asking to identify, analyze, map, or describe the SPATIAL LAYOUT, REGIONS, or SECTIONS of the screen — such as headers, sidebars, footers, content areas, grid layout, bounding boxes, or UI zones. These require app.agent analyze_spatial_grid to return structured coordinate data, NOT plain OCR. Examples: "what regions are on my screen" → true | "what sections can you see" → true | "describe the screen layout" → true | "what areas are visible" → true | "show me the screen grid" → true | "what UI zones are present" → true. DISTINCTION: "what is ON my screen" (passive read of content) → false. "what REGIONS/SECTIONS/LAYOUT structure does my screen have" (spatial tool call) → true. false for all passive screen observation queries ("what app am I in", "what's on my screen", "read what's visible").
+
 - requiresDOM: true when taskType is "browser" AND the task requires precise DOM-level interaction that keyboard shortcuts cannot do reliably:
   form fill, login/authentication/OAuth, structured data scraping, file upload via browser input, clicking specific page elements by selector, multi-step page flows (e.g. click button → wait → fill → submit).
   false for: navigate to URL, open new tab, scroll page, copy page content, find on page, back/forward, reload — all achievable via keyboard shortcuts.
   NEVER true for tasks that ask to visually locate, identify, or describe a UI element in a desktop app (e.g. "show me where the input area is in Slack", "find the toolbar in Figma") — those use screen capture/OCR, not DOM access. Always false when taskType is not "browser".
+  NEVER true when the PRIMARY action is a GhostLayer screen highlight (e.g. "highlight [term]", "highlight all text", "show boundaries", "clear highlights", "highlight the term X and type Y") — these are handled entirely by app.agent using LiteParser + nutJS, not DOM access. Secondary words like "type", "input field", or "click" do not change this when highlighting is the leading intent.
 
 - isScreenFollowUp: true when ALL of the following hold:
   1. A PRIOR SCREEN CONTEXT block is present in the prompt (see below)
@@ -116,6 +120,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     isScreenFollowUp: false,
     needsFreshScreen: false,
     isAppUiInspection: false,
+    isSpatialAnalysis: false,
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -155,6 +160,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isScreenFollowUp:    !!parsed.isScreenFollowUp,
       needsFreshScreen:    !!parsed.needsFreshScreen,
       isAppUiInspection:   !!parsed.isAppUiInspection,
+      isSpatialAnalysis:   !!parsed.isSpatialAnalysis,
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

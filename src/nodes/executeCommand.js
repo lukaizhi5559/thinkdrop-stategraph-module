@@ -1646,294 +1646,6 @@ module.exports = async function executeCommand(state) {
     };
   }
 
-  // ── guide.step pseudo-skill ──────────────────────────────────────────────
-  // Pauses the plan and shows the user a guided instruction card.
-  // Supports two resume modes:
-  //
-  // MODE 1 — Page-event mode (preferred, when sessionId is provided):
-  //   The highlight action injects a click listener on the target element that
-  //   sets window.__tdGuideTriggered = true on the page. guide.step polls this
-  //   flag via mcpAdapter (browser.act evaluate). When the user clicks the
-  //   highlighted element in the browser, the plan auto-advances — no button needed.
-  //
-  // MODE 2 — IPC fallback (when no sessionId):
-  //   Shows "✓ Done — Continue" button in ResultsWindow. User clicks it,
-  //   guide:continue IPC fires, confirmGuideCallback Promise resolves.
-  //
-  // Args:
-  //   instruction {string}  What the user needs to do (shown in card + browser bubble)
-  //   sessionId   {string}  Playwright session to poll for page-event trigger
-  //   url         {string}  Optional URL context shown in card
-  //   timeoutMs   {number}  Max wait time (default: 5 minutes)
-  if (skill === 'guide.step') {
-    const { instruction, sessionId: guideSessionId_llm, url: guideUrl, timeoutMs: guideTimeout = 300000 } = args;
-    // Prefer the sessionId from the most recent browser.act step — the LLM may generate
-    // a different name (e.g. "webBrowsingSession") than what navigate actually used
-    // (derived from hostname, e.g. "www.google.com"). Mismatched sessionId → about:blank tab.
-    const lastBrowserResult = skillResults.slice().reverse().find(r => r.skill === 'browser.act' && r.args?.sessionId);
-    const guideSessionId = lastBrowserResult?.args?.sessionId || guideSessionId_llm;
-
-    if (!instruction) {
-      logger.warn('[Node:ExecuteCommand] guide.step: missing instruction — skipping');
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'guide.step', description: description || 'Guide step', stdout: 'Skipped (no instruction)', instruction: '' });
-      return {
-        ...state,
-        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'Skipped (no instruction)' }],
-        skillCursor: skillCursor + 1,
-        commandExecuted: false
-      };
-    }
-
-    logger.info(`[Node:ExecuteCommand] guide.step: showing instruction — mode=${guideSessionId ? 'page-event' : 'ipc-fallback'}`);
-    if (progressCallback) progressCallback({
-      type: 'guide_step',
-      stepIndex: skillCursor,
-      totalSteps: skillPlan.length,
-      instruction,
-      sessionId: guideSessionId || null,
-      url: guideUrl || null,
-      description: description || 'Follow the steps below',
-      mode: guideSessionId ? 'page_event' : 'ipc'
-    });
-
-    let continued = false;
-
-    // ── Session validation guard ──────────────────────────────────────────────
-    // Only use page-event mode if a preceding browser.act step actually opened
-    // a browser session (navigate/goto). If the sessionId was invented by the LLM
-    // (e.g. "desktop_prefs" for System Settings) without a real browser.act navigate,
-    // there is no Playwright session to poll — fall back to IPC mode immediately.
-    const hasRealBrowserSession = skillResults.some(
-      r => r.skill === 'browser.act' && r.ok && r.args?.sessionId &&
-        (r.args.action === 'navigate' || r.args.action === 'goto' || r.args.url)
-    );
-    const usePageEventMode = guideSessionId && mcpAdapter && hasRealBrowserSession;
-
-    if (!hasRealBrowserSession && guideSessionId) {
-      logger.warn(`[Node:ExecuteCommand] guide.step: sessionId="${guideSessionId}" has no matching browser.act navigate — falling back to IPC mode`);
-    }
-
-    // ── Auto-continue for skill installation guide steps ─────────────────────────
-    // If the guide.step is about installing a skill, auto-continue without waiting
-    // for user interaction. The skill build pipeline will handle the actual installation.
-    const instructionText = String(instruction || '');
-    const isSkillInstallGuide = /skill is not currently installed|install this skill|skill needs to be installed|install.*skill first/i.test(instructionText);
-    if (isSkillInstallGuide && !usePageEventMode) {
-      logger.info(`[Node:ExecuteCommand] guide.step: skill installation guide detected — auto-continuing without user interaction`);
-      continued = true;
-    }
-
-    if (usePageEventMode && !continued) {
-      // ── MODE 1: waitForTrigger — CDP exposeBinding, CSP-safe, event-driven ──
-      // The highlight overlay attaches blur/change/click listener per element type.
-      // When the user interacts, listener calls window.__tdTrigger() — a CDP binding
-      // registered once per session in getSession(). No eval, no polling, no CSP issues.
-      logger.info(`[Node:ExecuteCommand] guide.step: waiting for page trigger on session=${guideSessionId}`);
-      let triggered = false;
-      let waitTriggerRaw = null;
-
-      try {
-        const waitTriggerRes = await mcpAdapter.callService('command', 'command.automate', {
-          skill: 'browser.act',
-          args: { action: 'waitForTrigger', sessionId: guideSessionId, timeoutMs: guideTimeout }
-        }, { timeoutMs: guideTimeout + 5000 });
-        waitTriggerRaw = waitTriggerRes?.data || waitTriggerRes;
-        triggered = true;
-      } catch (err) {
-        const errMsg = err.message || '';
-        // If the session doesn't exist or playwright-cli is not running, do NOT
-        // auto-approve. Fall back to IPC mode so user must explicitly continue.
-        if (/no active browser session|playwright-cli is not running|session was never opened/i.test(errMsg)) {
-          logger.warn(`[Node:ExecuteCommand] guide.step: waitForTrigger failed — no browser session "${guideSessionId}" — falling back to IPC mode`);
-          triggered = false;
-        } else {
-          // Genuine timeout or expected error (e.g. page closed) — auto-continue
-          triggered = true;
-          logger.info(`[Node:ExecuteCommand] guide.step: waitForTrigger ended (${errMsg.slice(0, 60)}) — auto-continuing`);
-        }
-      }
-
-      // ── Auth wall detection ─────────────────────────────────────────────────
-      // waitForTrigger is aliased to waitForStableText in the command service.
-      // When the browser is on a login/redirect page, waitForStableText returns
-      // quickly with authRequired:true (stable login-page text). This is NOT
-      // a real user interaction — surface it to the user immediately instead of
-      // continuing through guide steps that do nothing.
-      if (triggered && waitTriggerRaw?.authRequired) {
-        let friendlyHost = 'the site';
-        try {
-          friendlyHost = new URL(state.activeBrowserUrl || guideUrl || '').hostname.replace(/^www\./, '');
-        } catch (_) {}
-        logger.info(`[Node:ExecuteCommand] guide.step: auth wall on session=${guideSessionId} (${friendlyHost}) — surfacing login requirement`);
-        if (progressCallback) progressCallback({ type: 'all_done', totalCount: skillResults.length + 1, skillResults });
-        return {
-          ...state,
-          answer: `I need you to sign in to **${friendlyHost}** first. The browser opened the login page — please enter your credentials there. Once you're logged in, ask me to retry.`,
-          examineBlocked: true,
-          skillCursor: skillPlan.length,
-          commandExecuted: true,
-          failedStep: null,
-          skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: false, stdout: '[auth wall — login required]', authWall: true }],
-        };
-      }
-
-      if (!triggered) {
-        // waitForTrigger failed due to non-existent session — fall through to IPC mode below
-        logger.info(`[Node:ExecuteCommand] guide.step: page-event mode failed — falling through to IPC mode`);
-      }
-
-      if (triggered) {
-        continued = true;
-        logger.info(`[Node:ExecuteCommand] guide.step: page trigger fired — continuing`);
-      }
-
-      // Check if user clicked "Stop Guide" — if so, abort cleanly instead of continuing.
-      const isGuideCancelled = typeof state.isGuideCancelled === 'function' ? state.isGuideCancelled : () => false;
-      if (isGuideCancelled()) {
-        logger.info(`[Node:ExecuteCommand] guide.step: guide cancelled by user — aborting`);
-        if (progressCallback) progressCallback({ type: 'all_done', totalCount: skillResults.length, skillResults });
-        return {
-          ...state,
-          skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'Guide cancelled by user' }],
-          skillCursor: skillPlan.length,
-          commandExecuted: true,
-          failedStep: null,
-          activeBrowserSessionId: null,
-          activeBrowserUrl: null
-        };
-      }
-
-      // Only do post-trigger navigation/rescan when the page-event actually fired.
-      // If triggered=false, we're falling through to IPC mode — no browser interaction happened.
-      if (!triggered) {
-        // Skip nav wait + rescan — fall through to IPC fallback below
-      } else {
-
-      // Wait for navigation to settle — user click likely triggered a page change.
-      // Use waitForNavigation (load state) which handles the new page properly.
-      try {
-        await mcpAdapter.callService('command', 'command.automate', {
-          skill: 'browser.act',
-          args: { action: 'waitForNavigation', sessionId: guideSessionId, waitUntil: 'domcontentloaded', timeoutMs: 8000 }
-        }, { timeoutMs: 12000 });
-      } catch (_) {
-        // No navigation happened or already settled — brief pause for JS to render
-        await new Promise(r => setTimeout(r, 800));
-      }
-
-      // ── Post-navigation rescan ──────────────────────────────────────────────
-      // Scan the new page and patch the NEXT highlight step with real labels.
-      // This prevents the LLM's pre-planned labels from being wrong after navigation.
-      const nextHighlightIdx = skillPlan.findIndex(
-        (s, i) => i > skillCursor && s.skill === 'browser.act' && s.args?.action === 'highlight'
-      );
-      if (nextHighlightIdx !== -1) {
-        try {
-          const rescanResult = await mcpAdapter.callService('command', 'command.automate', {
-            skill: 'browser.act',
-            args: { action: 'scanCurrentPage', sessionId: guideSessionId }
-          }, { timeoutMs: 8000 });
-          const rescan = rescanResult?.data || rescanResult;
-
-          if (rescan?.ok && rescan?.result?.elements?.length > 0) {
-            const newPageUrl = rescan.result.url;
-            const els = rescan.result.elements;
-            logger.info(`[Node:ExecuteCommand] Post-nav rescan: ${els.length} elements on ${newPageUrl}`);
-
-            // Track what the user just clicked so planSkills can filter it out
-            // of future element lists — prevents the LLM from re-planning it.
-            const clickedLabel = args.label || description || null;
-            const prevUrl = state.activeBrowserUrl || '';
-            const existingCompleted = state.completedGuideSteps || [];
-            const completedGuideSteps = clickedLabel
-              ? [...existingCompleted, { label: clickedLabel, url: prevUrl }]
-              : existingCompleted;
-
-            // Detect whether this is a real page change or just a hash/anchor scroll.
-            // Hash-only changes (e.g. /renew.html → /renew.html#Step%20One) stay on the
-            // same page — same content, same elements — no replan needed.
-            const isSamePagePath = (() => {
-              try {
-                const prev = new URL(prevUrl);
-                const next = new URL(newPageUrl);
-                return prev.hostname === next.hostname && prev.pathname === next.pathname;
-              } catch (_) { return false; }
-            })();
-
-            if (isSamePagePath) {
-              // Same page (hash scroll or no navigation) — just continue the existing plan.
-              logger.info(`[Node:ExecuteCommand] Post-nav rescan: same page path (hash change only) — continuing plan`);
-              return {
-                ...state,
-                skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing', instruction: instruction || '' }],
-                skillCursor: skillCursor + 1,
-                activeBrowserUrl: newPageUrl,
-                activeBrowserPageElements: { url: newPageUrl, elements: els },
-                completedGuideSteps,
-                commandExecuted: false
-              };
-            }
-
-            // Real page change — force a replan with real elements from the new page.
-            const updatedResults = [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing', instruction: instruction || '' }];
-            const replanSignal = {
-              step: skillCursor + 1,
-              skill: 'guide.step',
-              args,
-              ok: false,
-              error: `replan_after_navigation: user clicked "${clickedLabel || 'a link'}" on ${prevUrl || 'previous page'} and navigated to ${newPageUrl} — replan remaining steps with real page elements from the new page`
-            };
-            logger.info(`[Node:ExecuteCommand] Post-nav rescan: forcing replan with ${els.length} real elements from ${newPageUrl}`);
-            return {
-              ...state,
-              skillResults: updatedResults,
-              stepContracts: updatedStepContracts,
-              skillCursor: skillCursor + 1,
-              failedStep: replanSignal,
-              activeBrowserSessionId: guideSessionId,
-              activeBrowserUrl: newPageUrl,
-              activeBrowserPageElements: { url: newPageUrl, elements: els },
-              completedGuideSteps,
-              commandExecuted: false
-            };
-          }
-        } catch (rescanErr) {
-          logger.debug(`[Node:ExecuteCommand] Post-nav rescan failed (non-fatal): ${rescanErr.message}`);
-        }
-      }
-
-      } // end else (triggered=true post-trigger logic)
-    } // end if (usePageEventMode)
-
-    // ── MODE 2: IPC fallback — wait for guide:continue from ResultsWindow ──
-    // Falls through here if: (a) usePageEventMode is false, or (b) page-event
-    // mode failed (triggered=false → continued still false).
-    if (!continued) {
-      const confirmGuideCallback = state.confirmGuideCallback || null;
-      if (typeof confirmGuideCallback === 'function') {
-        logger.info(`[Node:ExecuteCommand] guide.step: IPC mode — waiting for user to click Continue`);
-        try {
-          continued = await confirmGuideCallback();
-        } catch (err) {
-          logger.warn(`[Node:ExecuteCommand] guide.step: IPC timed out — auto-continuing: ${err.message}`);
-          continued = true;
-        }
-      } else {
-        logger.warn('[Node:ExecuteCommand] guide.step: no confirmGuideCallback — auto-continuing');
-        continued = true;
-      }
-    }
-
-    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'guide.step', description: description || 'Guide step', stdout: 'User action detected — continuing', instruction: instruction || '' });
-
-    return {
-      ...state,
-      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'guide.step', args, description, ok: true, stdout: 'User action detected — continuing', instruction: instruction || '' }],
-      skillCursor: skillCursor + 1,
-      commandExecuted: false
-    };
-  }
-
   // ── smartFill pseudo-skill ───────────────────────────────────────────────
   // Universal form-filling: snapshot the live DOM, ask the LLM to identify
   // which visible input maps to each role (to/subject/body or any field map),
@@ -2437,7 +2149,6 @@ module.exports = async function executeCommand(state) {
       { name: 'ui.screen.verify',  desc: 'Verify what is on screen using vision AI' },
       { name: 'schedule',          desc: 'Schedule a task to run at a future time or after a delay' },
       { name: 'synthesize',        desc: 'Run an inline LLM call to summarize, compare, or analyze results from prior steps' },
-      { name: 'guide.step',        desc: 'Interactive step-by-step browser guide with visual highlights and user prompts' },
     ];
 
     // Fetch installed user skills from MCP
@@ -2766,6 +2477,45 @@ module.exports = async function executeCommand(state) {
       .filter(r => r.skill === 'web.agent' && r.ok && r.results)
       .map(r => `=== Web Search Results ===\n${r.results.map((res, i) => `${i+1}. ${res.title || res.url}\n   ${res.snippet || ''}`).join('\n\n')}`);
 
+    // Include app.agent results — covers all actions that produce meaningful synthesize context
+    const appAgentResults = skillResults
+      .filter(r => r.skill === 'app.agent' && r.ok && (
+        r.shortcuts?.length ||
+        r.boundaries?.length ||
+        r.sections?.length ||
+        r.context ||
+        r.grid ||
+        r.focused !== undefined && r.focused !== null ||
+        r.summary ||
+        r.status ||
+        (r.text && r.text.length > 20) ||
+        (r.afterOCR && r.afterOCR.length > 20) ||
+        (r.content && r.content.length > 20) ||
+        r.anchoredAt
+      ))
+      .map(r => {
+        const action = r.args?.action || 'app.agent';
+        const parts = [`=== App Agent (${action}) ===`];
+        if (r.shortcuts?.length)  parts.push(`Shortcuts (${r.shortcuts.length} total):\n${r.shortcuts.map(s => `  ${s.shortcut || s.keys || '?'} — ${s.action || s.description || s.label || ''}`).join('\n')}`);
+        if (r.boundaries?.length) parts.push(`UI Boundaries:\n${JSON.stringify(r.boundaries, null, 2)}`);
+        if (r.sections?.length)   parts.push(`Screen Sections:\n${JSON.stringify(r.sections, null, 2)}`);
+        if (r.grid)               parts.push(`Spatial Grid:\n${typeof r.grid === 'object' ? JSON.stringify(r.grid, null, 2) : r.grid}`);
+        if (r.context)            parts.push(`Context:\n${r.context}`);
+        if (r.focused !== undefined && r.focused !== null) {
+          const focusStatus = r.focused
+            ? `${r.appFocused || 'App'} is in focus (waited ${r.waited ?? 0}ms)`
+            : `${r.appFocused || 'App'} focus not confirmed after ${r.waited ?? 0}ms`;
+          parts.push(`App Focus Status: ${focusStatus}`);
+        }
+        if (r.summary)            parts.push(`Summary: ${r.summary}`);
+        if (r.status)             parts.push(`Status: ${r.status}`);
+        if (r.text && r.text.length > 20)       parts.push(`Screen Text:\n${r.text}`);
+        if (r.afterOCR && r.afterOCR.length > 20) parts.push(`Screen State After Action:\n${r.afterOCR}`);
+        if (r.content && r.content.length > 20)   parts.push(`Extracted Content:\n${r.content}`);
+        if (r.anchoredAt)         parts.push(`Anchored At: ${r.anchoredAt}`);
+        return parts.join('\n');
+      });
+
     // Include video.agent results — video transcript/content
     const videoAgentResults = skillResults
       .filter(r => r.skill === 'video.agent' && r.ok && r.stdout)
@@ -2815,6 +2565,7 @@ module.exports = async function executeCommand(state) {
       ...cliAgentResults,
       ...playwrightAgentResults,
       ...webAgentResults,
+      ...appAgentResults,
       ...videoAgentResults,
       ...screenCaptureResults,
       ...fileWatchResults,
@@ -2840,15 +2591,18 @@ module.exports = async function executeCommand(state) {
 
     // If no within-run context, check conversationHistory for prior image.analyze / skill output
     // This handles cross-turn synthesis: "put this in a text document" after a previous analysis run.
-    // GUARD: Do NOT fall back to conversation history when the current run has browser/agent results
-    // that simply weren't captured by the filters above — prevents cross-turn context pollution
-    // (e.g. BibleGateway results leaking into a DuckDuckGo synthesis after recovery replan).
+    // GUARD: Do NOT fall back to conversation history when the current run has any real action step
+    // that simply didn't produce extractable text — prevents cross-turn context pollution.
+    // Cross-turn is ONLY valid when zero action steps ran this turn (genuine follow-up prompt).
+    // Meta-skills (synthesize, ask_user, schedule, needs_skill, api_suggest) are excluded from this
+    // check — they don't represent real work on a new task.
     const conversationHistory = state.conversationHistory || [];
-    const hasBrowserResults = skillResults.some(r =>
-      (r.skill === 'browser.act' || r.skill === 'browser.agent') && r.ok && r.step > lastSynthesizeStep
+    const META_SKILLS = new Set(['synthesize', 'ask_user', 'schedule', 'needs_skill', 'api_suggest']);
+    const hasActionStepsThisTurn = skillResults.some(r =>
+      r.ok && !r.skipped && r.step > lastSynthesizeStep && !META_SKILLS.has(r.skill)
     );
     let crossTurnContext = '';
-    if (allContextParts.length === 0 && !hasBrowserResults && conversationHistory.length > 0) {
+    if (allContextParts.length === 0 && !hasActionStepsThisTurn && conversationHistory.length > 0) {
       // Find the most recent assistant message that contains step outputs
       const recentOutputMsg = [...conversationHistory].reverse()
         .find(m => m.role === 'assistant' && m.content && m.content.includes('Step outputs:'));
@@ -2868,7 +2622,8 @@ module.exports = async function executeCommand(state) {
       webCrawlResults.length === 0 && fileBridgeResults.length === 0 &&
       fsReadResults.length === 0 && imageAnalyzeResults.length === 0 &&
       cliAgentResults.length === 0 && playwrightAgentResults.length === 0 &&
-      webAgentResults.length === 0 && videoAgentResults.length === 0 &&
+      webAgentResults.length === 0 && appAgentResults.length === 0 &&
+      videoAgentResults.length === 0 &&
       screenCaptureResults.length === 0 && systemIntrospectResults.length === 0;
 
     if (_onlyExternalSkill) {
@@ -3929,6 +3684,16 @@ Please try again or search with different terms.`;
   if (skill === 'browser.agent' || skill === 'cli.agent') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 300000); // 5 min
   }
+  // app.agent long-running monitors run their own internal loop for up to maxDurationMs.
+  // The MCP HTTP timeout must exceed that or the call is killed while the monitor is still running.
+  // Give 30s of buffer over the inner maxDurationMs (default 300s → 330s HTTP timeout).
+  if (skill === 'app.agent') {
+    const MONITOR_ACTIONS = ['monitor_with_backoff', 'monitor_file_upload', 'monitor_build_completion', 'monitor_form_submission'];
+    if (MONITOR_ACTIONS.includes(resolvedArgs.action)) {
+      const innerMax = resolvedArgs.maxDurationMs || 300000;
+      stepTimeoutMs = Math.max(stepTimeoutMs, innerMax + 30000);
+    }
+  }
   // ── project_build: route to project.builder MCP skill ──────────────────────
   if (skill === 'project_build') {
     if (progressCallback) progressCallback({
@@ -4664,6 +4429,61 @@ Please try again or search with different terms.`;
       }
     }
 
+    // ── Phase 2: Smart Routing — Skip shell.run if app already focused ───────
+    // Detects shell.run steps that open apps and skips them if the app is already
+    // open and focused. Reduces unnecessary process spawning.
+    if (skill === 'shell.run') {
+      const cmd = resolvedArgs.cmd || '';
+      const argv = resolvedArgs.argv || [];
+      const script = Array.isArray(argv) ? argv.join(' ') : String(argv);
+      const fullCmd = `${cmd} ${script}`;
+
+      // Match 'open -a "AppName"' or 'open AppName.app' patterns
+      const openAppMatch = fullCmd.match(/open\s+-a\s+["']?([^"']+)["']?|open\s+([\w\s]+)\.app/i);
+      if (openAppMatch) {
+        const appName = (openAppMatch[1] || openAppMatch[2] || '').trim();
+        if (appName) {
+          try {
+            // Call app.agent to check if app is already focused
+            const focusCheck = await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'app.agent',
+              args: { action: 'verify_app_focused', appName, waitMs: 1000 }
+            }, { timeoutMs: 5000 });
+            const focusRaw = focusCheck?.data || focusCheck;
+            if (focusRaw?.focused) {
+              logger.info(`[Node:ExecuteCommand] Smart routing: ${appName} already focused, skipping shell.run`);
+              if (progressCallback) progressCallback({
+                type: 'step_skipped',
+                stepIndex: skillCursor,
+                totalSteps: skillPlan.length,
+                skill: 'shell.run',
+                description: stepStartDescription,
+                reason: `${appName} already open and focused`
+              });
+              const skipResult = {
+                step: skillCursor + 1,
+                skill: 'shell.run',
+                args: resolvedArgs,
+                description,
+                ok: true,
+                skipped: true,
+                stdout: `${appName} already open and focused — no action needed`
+              };
+              const skipContract = generateStepContract(skipResult, skillCursor);
+              const nextCursor = skillCursor + 1;
+              if (nextCursor >= skillPlan.length) {
+                return { ...state, skillResults: [...skillResults, skipResult], stepContracts: [...stepContracts, skipContract], skillCursor: nextCursor, commandExecuted: true, failedStep: null };
+              }
+              return { ...state, skillResults: [...skillResults, skipResult], stepContracts: [...stepContracts, skipContract], skillCursor: nextCursor, commandExecuted: false, failedStep: null };
+            }
+          } catch (err) {
+            // If focus check fails, proceed with normal shell.run
+            logger.debug(`[Node:ExecuteCommand] Smart routing focus check failed: ${err.message}`);
+          }
+        }
+      }
+    }
+
     const result = await mcpAdapter.callService('command', 'command.automate', {
       skill,
       args: _callArgs
@@ -5005,6 +4825,21 @@ Please try again or search with different terms.`;
       commandName: raw.commandName || null,
       userAllowlistPath: raw.userAllowlistPath || null,
       cmd: raw.cmd || null,
+      shortcuts:   skill === 'app.agent' ? (raw.shortcuts   || null) : undefined,
+      boundaries:  skill === 'app.agent' ? (raw.boundaries  || null) : undefined,
+      sections:    skill === 'app.agent' ? (raw.sections    || null) : undefined,
+      grid:        skill === 'app.agent' ? (raw.grid        || null) : undefined,
+      context:     skill === 'app.agent' ? (raw.context     || null) : undefined,
+      focused:     skill === 'app.agent' ? (raw.focused     ?? null) : undefined,
+      appFocused:  skill === 'app.agent' ? (raw.appName     || null) : undefined,
+      waited:      skill === 'app.agent' ? (raw.waited      ?? null) : undefined,
+      summary:     skill === 'app.agent' ? (raw.summary     || null) : undefined,
+      status:      skill === 'app.agent' ? (raw.status      || null) : undefined,
+      text:        skill === 'app.agent' ? (raw.text        || null) : undefined,
+      afterOCR:    skill === 'app.agent' ? (raw.afterOCR    || null) : undefined,
+      content:     skill === 'app.agent' ? (raw.content     || null) : undefined,
+      anchoredAt:  skill === 'app.agent' ? (raw.anchoredAt  || null) : undefined,
+      source:      skill === 'app.agent' ? (raw.source      || null) : undefined,
     };
 
     // Detect shell.run search commands that returned no results — treat as soft failure

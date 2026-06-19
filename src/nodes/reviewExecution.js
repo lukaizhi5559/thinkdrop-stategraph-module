@@ -223,6 +223,24 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'VERIFIED' };
   }
 
+  // ── app.agent GhostLayer short-circuit ───────────────────────────────────
+  // Highlight and clear actions produce no text output by design — they are
+  // visual overlay operations that either succeed or throw. If ok=true, treat
+  // as UNVERIFIABLE (success assumed) to prevent a false hollow-result loop.
+  const _GHOSTLAYER_ACTIONS = new Set([
+    'highlight_all', 'highlight_search', 'highlight_boundaries',
+    'highlight_assets', 'clear_highlights', 'highlight_elements',
+  ]);
+  const _hasGhostLayerSuccess = skillResults.some(r =>
+    r.skill === 'app.agent' &&
+    _GHOSTLAYER_ACTIONS.has(r.args?.action) &&
+    r.ok !== false
+  );
+  if (_hasGhostLayerSuccess) {
+    logger.info('[Node:ReviewExecution] app.agent GhostLayer action succeeded — skipping hollow check (visual overlay, no page text)');
+    return { ...state, reviewVerdict: 'UNVERIFIABLE' };
+  }
+
   // Second pass — a patch was applied last time but re-verification still failed.
   // Don't loop: surface what we know to the user.
   if (reviewRetryCount > 0) {

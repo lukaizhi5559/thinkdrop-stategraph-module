@@ -400,14 +400,13 @@ When a step produces content (text, markdown, JSON, file list, etc.) that a LATE
 
 const SKILL_SYSTEM_PROMPT_FALLBACK = `You are an automation planner. Convert the user's request into an ordered list of skill steps.
 
-Available skills: shell.run, browser.act, api_suggest, guide.step, needs_install
+Available skills: shell.run, browser.act, api_suggest, needs_install
 
 shell.run|args:{cmd,argv[],cwd?,timeoutMs?,dryRun?,stdin?}
 browser.act|args:{action,url?,selector?,text?,sessionId?,timeoutMs?}
 
 Priority: shell.run > browser.act > keyboard shortcuts.
 api_suggest: use as FIRST step when task is RECURRING or programmatic AND the service has an API.
-guide.step: use for ANY task where the user must act manually step by step.
 Policy: no sudo/su/passwd. argv is string[] — no shell interpolation.
 Output ONLY a valid JSON array. No explanation, no markdown fences.
 For synthesize steps: keep prompt strings UNDER 200 chars. Use {{EXPAND:<intent>}} for longer prompts.
@@ -704,7 +703,9 @@ async function planSkillsV2(state) {
   }
 
   // ── Semantic cache check ──────────────────────────────────────────────────
-  const isRecurring = /\b(every|daily|weekly|each\s+morning|each\s+evening|at\s+\d+\s*(am|pm)|cron|recurring)\b/i.test(userMessage);
+  // Use _taskClassification.isRecurring (LLM-based, from resolveReferencesV2) instead of
+  // regex on userMessage — regex matched adjectives like "daily" in "my daily notes".
+  const isRecurring = !!state._taskClassification?.isRecurring;
   if (!recoveryContext && !state._planCorrectionMode && !isRecurring) {
     try {
       const cached = await findSimilarCompletePlan(userMessage, PLANS_DIR, logger);
@@ -1004,7 +1005,7 @@ async function planSkillsV2(state) {
   const recipeMapSize = Object.keys(_recipeMap).length;
   logger.info(`[Node:PlanSkillsV2] Fast-path check: ${recipeMapSize} recipes, recovery=${!!recoveryContext}, msg="${userMessage.slice(0, 60)}"`);
   
-  if (!recoveryContext && recipeMapSize > 0) {
+  if (!recoveryContext && recipeMapSize > 0 && !state._taskClassification?.isScreenFollowUp) {
     const messageLower = userMessage.toLowerCase();
     let matchedRecipe = null;
     let matchedVariant = null;
@@ -1133,12 +1134,10 @@ async function planSkillsV2(state) {
   // When the user says "email this to me", "text this info", etc. and prior
   // synthesized content exists, inject it explicitly so the LLM doesn't plan
   // a user.agent/browser step to re-fetch content that's already available.
-  // Uses exact same regex + sanitizer as planSkills.js (battle-tested).
+  // Use _taskClassification.taskType === 'messaging' (LLM-based) instead of regex —
+  // regex matched nouns like "text" in "visible text on my screen" causing plan poisoning.
   let messagingBodyNote = '';
-  const isMessagingTask = !isRecurring && (
-    /^(text|send|email|message|forward|share|ping|tell|notify)/i.test(userMessage.trim()) ||
-    /\b(text|sms|send.*message|email.*me|message.*me)\b/i.test(userMessage)
-  );
+  const isMessagingTask = state._taskClassification?.taskType === 'messaging';
   const _hasExplicitBody = /\b(say|saying|with\s+message|body\s*:|message\s*:|tell\s+(?:them|him|her|me)\s+(?:that\s+)?")/i.test(userMessage)
     || /"[^"]{2,}"/.test(userMessage)
     || /'[^']{2,}'/.test(userMessage);
@@ -1661,7 +1660,9 @@ The user's request does NOT match any installed skill.
   const projectLauncherStep = skillPlan.length === 1 && skillPlan[0].skill === 'project.launcher' ? skillPlan[0] : null;
   if (projectLauncherStep) {
     const msgLower = (userMessage || '').toLowerCase();
-    const explicit = /\b(open|launch|start|run|show)\b.{0,30}\bproject\b/i.test(userMessage) || (projectLauncherStep.args?.projectName && msgLower.includes(projectLauncherStep.args.projectName.toLowerCase()));
+    // Use only the args-based check — the regex branch matched "project" as a generic word
+    // (e.g. "show me the project files") and caused false positives.
+    const explicit = !!(projectLauncherStep.args?.projectName && msgLower.includes(projectLauncherStep.args.projectName.toLowerCase()));
     if (!explicit) {
       logger.info('[Node:PlanSkillsV2] Guard: project.launcher without explicit reference — converting to needs_skill');
       skillPlan = [{ skill: 'needs_skill', args: { capability: userMessage, suggestion: null }, description: 'needs_skill' }];

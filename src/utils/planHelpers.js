@@ -89,7 +89,7 @@ function buildStepDescription(step) {
     return args.goal ? `playwright.agent — ${args.goal.slice(0, 50)}…` : 'playwright.agent';
   }
   if (skill === 'external.skill') return `external.skill — ${args.name || ''}`;
-  if (skill === 'guide.step') return `guide.step — ${(args.instruction || '').slice(0, 40)}`;
+
   return skill;
 }
 
