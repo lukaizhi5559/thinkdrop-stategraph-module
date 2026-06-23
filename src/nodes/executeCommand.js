@@ -194,6 +194,8 @@ function _generateContractSummary(stepResult) {
       return `Image analysis of ${args.filePath || 'image'} ${status}`;
     case 'cli.agent':
       return `CLI command '${args.command?.slice(0, 50)}...' ${status}`;
+    case 'app.agent':
+      return `App agent '${args.action || 'action'}' on ${args.appName || 'app'} ${status}`;
     case 'user.agent':
       return `User context resolution ${status}`;
     default:
@@ -2477,9 +2479,14 @@ module.exports = async function executeCommand(state) {
       .filter(r => r.skill === 'web.agent' && r.ok && r.results)
       .map(r => `=== Web Search Results ===\n${r.results.map((res, i) => `${i+1}. ${res.title || res.url}\n   ${res.snippet || ''}`).join('\n\n')}`);
 
-    // Include app.agent results — covers all actions that produce meaningful synthesize context
+    // Include app.agent results — covers all actions that produce meaningful synthesize context.
+    // Exclude pure setup actions (enrich_app_context, discover_shortcuts) whose shortcuts/boundary
+    // data is configuration noise, not content the user asked to synthesize.
+    const _APP_AGENT_SETUP_ACTIONS = new Set(['enrich_app_context', 'discover_shortcuts', 'clear_boundary_cache']);
     const appAgentResults = skillResults
-      .filter(r => r.skill === 'app.agent' && r.ok && (
+      .filter(r => r.skill === 'app.agent' && r.ok
+        && !_APP_AGENT_SETUP_ACTIONS.has(r.args?.action)
+        && (
         r.shortcuts?.length ||
         r.boundaries?.length ||
         r.sections?.length ||
@@ -2488,6 +2495,8 @@ module.exports = async function executeCommand(state) {
         r.focused !== undefined && r.focused !== null ||
         r.summary ||
         r.status ||
+        r.stopReason ||
+        (r.accumulatedText && r.accumulatedText.length > 20) ||
         (r.text && r.text.length > 20) ||
         (r.afterOCR && r.afterOCR.length > 20) ||
         (r.content && r.content.length > 20) ||
@@ -2509,7 +2518,24 @@ module.exports = async function executeCommand(state) {
         }
         if (r.summary)            parts.push(`Summary: ${r.summary}`);
         if (r.status)             parts.push(`Status: ${r.status}`);
-        if (r.text && r.text.length > 20)       parts.push(`Screen Text:\n${r.text}`);
+        if (r.stopReason) {
+          const scrollCtx = r.found
+            ? `Scroll result: target FOUND after ${r.scrolls ?? '?'} scroll(s) (${r.stopReason})`
+            : `Scroll result: ${r.scrolls ?? '?'} scroll(s) completed — stop reason: ${r.stopReason}`;
+          parts.push(scrollCtx);
+        }
+        if (r.stopReason) {
+          // Scroll result — prefer accumulated journal over single-viewport text
+          const scrollLabel = r.found
+            ? `Content scrolled to reach target (${r.stopReason}):`
+            : `Screen content accumulated during scrolling (${r.stopReason}):`;
+          const scrollContent = (r.accumulatedText && r.accumulatedText.length > 20)
+            ? r.accumulatedText
+            : (r.text && r.text.length > 20 ? r.text : null);
+          if (scrollContent) parts.push(`${scrollLabel}\n${scrollContent}`);
+        } else if (r.text && r.text.length > 20) {
+          parts.push(`Screen Text:\n${r.text}`);
+        }
         if (r.afterOCR && r.afterOCR.length > 20) parts.push(`Screen State After Action:\n${r.afterOCR}`);
         if (r.content && r.content.length > 20)   parts.push(`Extracted Content:\n${r.content}`);
         if (r.anchoredAt)         parts.push(`Anchored At: ${r.anchoredAt}`);
@@ -3693,6 +3719,10 @@ Please try again or search with different terms.`;
       const innerMax = resolvedArgs.maxDurationMs || 300000;
       stepTimeoutMs = Math.max(stepTimeoutMs, innerMax + 30000);
     }
+    // search_scroll / scroll: boundary probe loop + N OCR captures per scroll can take 60–120s
+    if (resolvedArgs.action === 'search_scroll' || resolvedArgs.action === 'scroll') {
+      stepTimeoutMs = Math.max(stepTimeoutMs, 120000);
+    }
   }
   // ── project_build: route to project.builder MCP skill ──────────────────────
   if (skill === 'project_build') {
@@ -4840,6 +4870,10 @@ Please try again or search with different terms.`;
       content:     skill === 'app.agent' ? (raw.content     || null) : undefined,
       anchoredAt:  skill === 'app.agent' ? (raw.anchoredAt  || null) : undefined,
       source:      skill === 'app.agent' ? (raw.source      || null) : undefined,
+      stopReason:      skill === 'app.agent' ? (raw.stopReason      || null) : undefined,
+      found:           skill === 'app.agent' ? (raw.found           ?? null) : undefined,
+      scrolls:         skill === 'app.agent' ? (raw.scrolls         ?? null) : undefined,
+      accumulatedText: skill === 'app.agent' ? (raw.accumulatedText || null) : undefined,
     };
 
     // Detect shell.run search commands that returned no results — treat as soft failure

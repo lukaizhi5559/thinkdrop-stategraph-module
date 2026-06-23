@@ -13,6 +13,13 @@ const fs   = require('fs');
 const path = require('path');
 
 const planScanner = require('../utils/planScanner');
+const {
+  extractPlanContext,
+  getCurrentBrowserContext,
+  contextMismatch,
+  findHardcodedDesktopFilename,
+  suggestFilenameFromTitle,
+} = require('../utils/planCacheHelpers');
 
 function readPlanFile(planFile, logger) {
   try { return fs.readFileSync(planFile, 'utf8'); }
@@ -95,6 +102,50 @@ module.exports = async function planExecutor(state) {
   }
 
   const originalPrompt = extractOriginalPrompt(content) || state.originalPrompt || state.message || '';
+
+  // 4b. Detect context mismatch and ask for a filename when the cached plan
+  //     hardcoded a name derived from a prior browser context.
+  const planContext = extractPlanContext(content);
+  const currentContext = getCurrentBrowserContext(state);
+  const hardcodedFilename = findHardcodedDesktopFilename(skillPlan);
+
+  if (hardcodedFilename && contextMismatch(planContext, currentContext)) {
+    logger.info(`[Node:PlanExecutor] Context mismatch — cached filename ${hardcodedFilename} may be stale`);
+    const gatherAnswerCallback = state.gatherAnswerCallback;
+    if (typeof gatherAnswerCallback === 'function') {
+      const currentTitle = currentContext.windowTitle || currentContext.contextText || 'this page';
+      const suggested = suggestFilenameFromTitle(currentTitle, 'txt');
+      const question = `I found a saved plan for this prompt, but the active page has changed to "${currentTitle}". What filename should I use on the Desktop? (suggested: ${suggested})`;
+      try {
+        let newFilename = await gatherAnswerCallback(question);
+        if (newFilename && newFilename.trim()) {
+          newFilename = newFilename.trim().replace(/[^\w\s._~/-]/g, '').replace(/\s+/g, '_');
+          if (!newFilename.includes('/')) {
+            if (!/\.[a-zA-Z0-9]{1,6}$/i.test(newFilename)) {
+              newFilename += '.txt';
+            }
+            newFilename = `~/Desktop/${newFilename}`;
+          }
+          // Replace the stale filename in every affected shell.run step
+          for (const step of skillPlan) {
+            if (step.skill !== 'shell.run') continue;
+            const argsJson = JSON.stringify(step.args);
+            const replacedJson = argsJson.split(hardcodedFilename).join(newFilename);
+            if (replacedJson !== argsJson) {
+              step.args = JSON.parse(replacedJson);
+            }
+          }
+          logger.info(`[Node:PlanExecutor] Replaced stale filename: ${hardcodedFilename} → ${newFilename}`);
+        } else {
+          logger.info('[Node:PlanExecutor] No filename provided — continuing with cached plan filename');
+        }
+      } catch (err) {
+        logger.warn(`[Node:PlanExecutor] Filename ask failed: ${err.message} — continuing with cached plan filename`);
+      }
+    } else {
+      logger.warn('[Node:PlanExecutor] No gatherAnswerCallback available — cannot ask for filename');
+    }
+  }
 
   logger.info(`[Node:PlanExecutor] Built skillPlan[${skillPlan.length}] — handing to planSkills → executeCommand`);
 

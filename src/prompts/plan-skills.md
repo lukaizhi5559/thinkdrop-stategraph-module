@@ -80,6 +80,8 @@ For ANY task that could be served by a CLI tool, REST API, or Python script — 
 
 **CRITICAL — Every step MUST include a `description` field.** The description is a short, human-readable summary of what the step does (e.g., 'Search for OpenClaw information on Grok', 'Set up Gmail agent', 'Send email with OpenClaw summary and PDF attachment'). NEVER omit the description field — it is required for plan readability and user review.
 
+**Filename Reporting Rule — ALWAYS report the exact file path after a save.** When a `shell.run` step creates or writes a file and the final step is a `synthesize` confirmation, the `synthesize` prompt MUST explicitly include the full file path, e.g., "Confirm to the user that the file was saved to {{LAST_SUCCESSFUL.outputs.filePaths[0]}}." Never say "file saved" without naming the path.
+
 **Credential template tokens — ALWAYS use these for browser login steps, NEVER hardcode or guess values:**
 - `{{<service>:username}}` — any service email/username (replace `<service>` with the site slug)
 - `{{<service>:password}}` — any service password

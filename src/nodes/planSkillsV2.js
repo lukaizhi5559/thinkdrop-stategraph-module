@@ -185,53 +185,59 @@ function _buildSystemPrompt(userMessage, state) {
   // Is a browser app currently in focus (live Chrome/Safari/Firefox window)?
   const _browserIsOpen = _screenCtx?.category === 'browser' && !!_screenCtx?.appName;
 
-  // ── Tier 1: browser.agent (playwright-cli) ──────────────────────────────────
-  // Only when task genuinely needs DOM access (form fill, login, scraping, multi-step)
-  // OR when message has an explicit URL but no browser is open (headless needed)
-  const canUseBrowserSlim = !_hasLocalSignals && !state.recoveryContext && (
-    (_tc?.requiresDOM === true) ||
-    (_hasExplicitUrl && !_browserIsOpen)
-  );
+  // ── Determine which domain appendices are relevant ──────────────────────
+  // The base prompt is always loaded; selected appendices are concatenated so
+  // cross-domain tasks (e.g. browser extraction + file save) see the full toolset.
+  const _needsBrowser = (_tc?.requiresDOM === true) || (_hasExplicitUrl && !_browserIsOpen);
 
-  if (canUseBrowserSlim) {
-    const slim = _loadPromptFile('plan-skills-browser.md');
-    if (slim) {
-      const reason = _tc?.requiresDOM ? 'requiresDOM' : 'explicit-url-no-browser';
-      console.info(`[Node:PlanSkillsV2] system prompt: plan-skills-browser.md (${reason}, taskType:${_tc?.taskType})`);
-      return slim;
-    }
-  }
-
-  // ── Tier 2: app.agent (NutJS + shortcuts) — default for desktop + browser nav ──
-  // Native desktop app task OR browser navigation that doesn't need DOM
   const _isNativeDesktopTask = _tc?.taskType !== 'browser'
     && !(_tc?.taskType === 'query' && !_tc?.targetService && !_tc?.isAppUiInspection); // exclude pure abstract knowledge Q (but not named-app UI inspection)
 
   const _isBrowserNavTask = _tc?.taskType === 'browser'
     && !_tc?.requiresDOM; // simple nav (Cmd+L, Cmd+T, scroll) — app.agent handles this
 
-  const canUseAppSlim = (_isNativeDesktopTask || _isBrowserNavTask)
-    && !canUseBrowserSlim
-    && !_hasExplicitUrl  // explicit URL with no browser → already handled by browser slim above
-    && !_hasLocalSignals
-    && !state.recoveryContext;
+  const _needsApp = _isNativeDesktopTask || _isBrowserNavTask;
 
-  if (canUseAppSlim) {
-    const slim = _loadPromptFile('plan-skills-app.md');
-    if (slim) {
-      const reason = _isBrowserNavTask ? `browser-nav,app:${_screenCtx?.appName || 'none'}` : `native,taskType:${_tc?.taskType},target:${_tc?.targetService || 'none'}`;
-      console.info(`[Node:PlanSkillsV2] system prompt: plan-skills-app.md (${reason})`);
-      return slim;
-    }
-  }
+  const _needsShell = _tc?.taskType === 'local_file'
+    || ['file', 'copy', 'save', 'write', 'export', 'convert', 'move', 'delete', 'find'].some(k =>
+      _tc?.taskType?.includes(k) || _tc?.intent?.includes(k) || userMessage.toLowerCase().includes(k)
+    );
+
+  const _needsCli = _tc?.taskType === 'cli'
+    || _tc?.targetService?.startsWith('cli:')
+    || ['gh', 'aws', 'yt-dlp', 'ffmpeg', 'pandoc', 'imagemagick'].some(t =>
+      userMessage.toLowerCase().includes(t)
+    );
+
+  const _isMacOS = process.platform === 'darwin';
 
   const baseFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
-  const _skipReason = _hasLocalSignals ? ' (slim skipped: local_signals)' : state.recoveryContext ? ' (slim skipped: recovery)' : '';
-  console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile}${_skipReason} taskType:${_tc?.taskType || 'unknown'}`);
   const base = _loadPromptFile(baseFile) || _loadPromptFile('plan-skills.md');
   if (!base) return null;
 
   let result = base;
+  const appendices = [];
+
+  // Domain appendices are appended in skill-preference order: shell/CLI → app → browser.
+  // Skip them when local signals or recovery context are present to avoid confusing the
+  // planner with extra context during complex flows; the base prompt still applies.
+  if (!_hasLocalSignals && !state.recoveryContext && !isWindows) {
+    if (_needsShell) appendices.push('plan-skills-shell.md');
+    if (_needsCli) appendices.push('plan-skills-cli-first.md');
+    if (_isMacOS) appendices.push('plan-skills-macos.md');
+    if (_needsApp) appendices.push('plan-skills-app.md');
+    if (_needsBrowser) appendices.push('plan-skills-browser.md');
+  }
+
+  for (const filename of appendices) {
+    const appendix = _loadPromptFile(filename);
+    if (appendix) {
+      result += `\n\n---\n\n${appendix}`;
+    }
+  }
+
+  const _skipReason = _hasLocalSignals ? ' (appendices skipped: local_signals)' : state.recoveryContext ? ' (appendices skipped: recovery)' : '';
+  console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile}${_skipReason} appendices:[${appendices.join(',')}] taskType:${_tc?.taskType || 'unknown'}`);
 
   if (state.grilledConstraints) {
     result += `\n\n## GRILLED CONSTRAINTS (User Confirmed)\n\nThese constraints were confirmed through detailed questioning. You MUST follow them:\n\n\`\`\`json\n${JSON.stringify(state.grilledConstraints, null, 2)}\n\`\`\``;
