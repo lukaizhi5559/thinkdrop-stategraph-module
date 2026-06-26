@@ -42,12 +42,13 @@ Domain-specific guidance for `app.agent`. General skill list, routing hierarchy,
 |--------|-------------|
 | `verify_app_focused` | Wait for app to open/load/be ready (OCR polls, no LLM calls) |
 | `execute_shortcut` | Keyboard shortcuts (after focus verified) |
-| `teleport_to_element` | Cmd+F navigation to jump to and focus an anchor text element |
+| `teleport_to_element` | Cmd+F navigation to jump to and focus an anchor text element. Only scrolls/focuses — does NOT click. |
+| `search_and_click` | Browser only. Use Cmd+F to find text, cycle matches, and press Enter to click. Call when user says "click X", "open X", or "select X" in a browser. |
 | `scroll` | Auto-routes to correct scroll mode based on app category |
 | `search_scroll` | Scroll up/down to find content by keyword (run `enrich_app_context` first) |
 | `ai_response_scroll` | Scroll and use LLM to detect when AI assistant stops responding |
 | `live_chat_scroll` | Watch for new incoming messages via monitorService watchMode |
-| `passive_read_scroll` | Scroll down accumulating all visible text |
+| `passive_read_scroll` | Scroll accumulating all visible text; direction is category-dependent (`up` for editor/chat/terminal, `down` for email/design/document) |
 | `monitor_with_backoff` | ONLY for waiting on AI streaming responses to finish (uses LLM diff, expensive) |
 | `monitor_file_upload` | Watch for upload progress/completion indicators on screen |
 | `monitor_build_completion` | Watch terminal/IDE output for build success or failure patterns |
@@ -66,11 +67,10 @@ Domain-specific guidance for `app.agent`. General skill list, routing hierarchy,
 **Open app then run shortcut:**
 ```json
 [
-  { "skill": "shell.run", "args": { "goal": "open -a '<AppName>'" }, "description": "Launch or focus <AppName>" },
-  { "skill": "app.agent", "args": { "action": "verify_app_focused", "appName": "<AppName>", "waitMs": 5000 }, "description": "Confirm <AppName> is focused" },
-  { "skill": "app.agent", "args": { "action": "execute_shortcut", "appName": "<AppName>", "shortcutOverride": "<Shortcut>" }, "description": "Execute shortcut in <AppName>" }
+  { "skill": "app.agent", "args": { "action": "execute_shortcut", "appName": "<AppName>", "shortcutOverride": "<Shortcut>" }, "description": "Focus <AppName> and execute the shortcut" }
 ]
 ```
+Do NOT emit a separate `shell.run` step to open or focus the app. `execute_shortcut` verifies focus internally.
 
 **Scroll to find content in an app (search scroll — Mode A):**
 ```json
@@ -80,6 +80,24 @@ Domain-specific guidance for `app.agent`. General skill list, routing hierarchy,
   { "skill": "synthesize", "args": { "prompt": "Summarize the content visible at the scroll target" }, "description": "Report findings" }
 ]
 ```
+
+**Passive read scroll — accumulate all visible text (Mode B):**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "enrich_app_context", "appName": "<AppName>", "category": "<category>" }, "description": "Capture boundaries so scroll targets the correct panel" },
+  { "skill": "app.agent", "args": { "action": "passive_read_scroll", "scrollPlan": { "direction": "<up|down>", "scrollMode": "passive_read", "maxScrolls": 20 }, "appName": "<AppName>", "category": "<category>" }, "description": "Scroll through all content accumulating text" },
+  { "skill": "synthesize", "args": { "prompt": "Summarize the accumulated content for the user" }, "description": "Report findings" }
+]
+```
+`direction` is required — use the category default from the table above (`up` for editor/chat/terminal, `down` for email/design/document/other).
+
+**Browser click / open / select a text element:**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "search_and_click", "searchText": "<SOME_SEARCH_TEXT>", "appName": "<BrowserName>", "category": "browser" }, "description": "Find and click the bible study element in the browser" }
+]
+```
+For browser category, when the user wants to click, open, or select a text-based element, prefer `app.agent search_and_click` over other agent(s).
 
 **Wait for AI to finish responding:**
 ```json
@@ -95,7 +113,6 @@ When user asks to "copy all text", "extract text from page", "get page content",
 
 **CRITICAL — ALWAYS use the single `extract_content_via_clipboard` action.**
 - NEVER generate a multi-step `execute_shortcut` chain (Cmd+L, Tab, Cmd+A, Cmd+C) for this purpose.
-- NEVER use `browser.act` to focus the browser window first.
 - `extract_content_via_clipboard` handles app focus, the shortcut chain, clipboard backup/restore, and the `pbpaste` retrieval internally.
 
 **Example plan for "Copy all the text on this page":**
@@ -114,6 +131,19 @@ When user asks to "copy all text", "extract text from page", "get page content",
   { "skill": "synthesize", "args": { "prompt": "Confirm to the user that the file was saved to the desktop and report the file path." }, "description": "Confirm desktop file saved" }
 ]
 ```
+
+## App-Category Default for Reading / Summarizing On-Screen Content
+
+When the user asks to read, scroll, summarize, or tell them about the content currently on screen, choose the extraction method based on the ACTIVE SCREEN CATEGORY shown in the system prompt. The active app category is authoritative — do not rely on the verb the user used.
+
+| Active category | Correct action | Direction / notes |
+|---|---|---|
+| `browser` | `extract_content_via_clipboard` | Use the Cmd+L → Tab → Cmd+A → Cmd+C chain. NEVER use `scroll`, `passive_read_scroll`, or `search_scroll` for browser content. |
+| `editor`, `chat`, `terminal` | `passive_read_scroll` | `direction: "up"` — jump to the bottom, then scroll up to accumulate history. |
+| `email`, `design`, `document` | `passive_read_scroll` | `direction: "down"` — start at the top, scroll down. |
+| `other` | `passive_read_scroll` | `direction: "down"` unless the goal clearly indicates searching for a recent item at the bottom. |
+
+CRITICAL: If the active screen is a browser, ignore phrases like "scroll this page", "read this page", "tell me about this" — always use `extract_content_via_clipboard` and then `synthesize`.
 
 ## Screen Highlighting — GhostLayer Overlay
 

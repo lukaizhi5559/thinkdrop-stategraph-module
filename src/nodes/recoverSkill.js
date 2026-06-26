@@ -759,6 +759,32 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
   const { skill, args = {}, error = '', stderr = '' } = failedStep;
   const combinedError = `${error} ${stderr}`.toLowerCase();
 
+  // ── app.agent monitor timeout → ASK_USER (never concurrent retry) ───────────
+  // A monitor (monitor_with_backoff etc.) runs a single long-lived server-side
+  // loop. The generic 2×/3× timeoutMs retry would relaunch the monitor while the
+  // first loop may still be tearing down — spawning concurrent capture loops that
+  // taint OCR and never stop. The right outcome when a monitor times out is to
+  // ask the user how to proceed, not to silently relaunch it.
+  const MONITOR_ACTIONS = new Set([
+    'monitor_with_backoff', 'monitor_file_upload',
+    'monitor_build_completion', 'monitor_form_submission',
+  ]);
+  if (skill === 'app.agent' && MONITOR_ACTIONS.has(args.action)) {
+    // A clean abort (client disconnect / superseded) is not a failure to recover.
+    if (failedStep.aborted) {
+      logger.info('[Node:RecoverSkill] app.agent monitor aborted — surfacing as ASK_USER (no relaunch)');
+    }
+    const isTimeout = failedStep.aborted || /monitoring timeout|timed out|timeout/i.test(combinedError) || !error;
+    if (isTimeout) {
+      logger.info('[Node:RecoverSkill] Fast-path: app.agent monitor timeout → ASK_USER (no concurrent relaunch)');
+      return {
+        action: 'ASK_USER',
+        question: `I waited but couldn't confirm the task finished. It may still be running. How would you like to proceed?`,
+        options: ['Keep waiting (check again)', 'It finished — continue', 'Cancel this task'],
+      };
+    }
+  }
+
   // ── Progress-aware stuck detection ──────────────────────────────────────────
   // If patchHistory already contains 2+ entries matching the same error fingerprint,
   // recovery is cycling without progress — escalate to ASK_USER immediately.

@@ -85,7 +85,7 @@ You will receive a structured execution log. Here is what each field means:
 
 **ASK_USER** — only when:
 - ALL sites failed with auth walls AND no alternative URL is known
-- Retry cap reached (`retryCount >= 2`)
+- Retry cap reached (`retryCount >= 4`)
 - Multiple steps failed for unrelated reasons (systemic issue)
 
 **DO NOT emit ASK_USER when only some sites hit auth walls** — emit FIX with corrected URL rules instead.
@@ -115,4 +115,4 @@ The rule will be injected into future plans for this exact site/app. Keep it und
 
 ## Retry limit
 
-If `retryCount >= 2`, always output ASK_USER — do not loop forever.
+If `retryCount >= 4`, always output ASK_USER — do not loop forever.

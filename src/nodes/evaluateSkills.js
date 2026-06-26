@@ -223,7 +223,12 @@ module.exports = async function evaluateSkills(state) {
       ...state,
       evaluationVerdict: 'ASK_USER',
       evaluationFromFailure: false,
-      answer: `I tried ${evaluationRetryCount} different approaches but couldn\'t resolve this automatically. Please try a different approach or check the task manually.`,
+      recoveryAction: 'ask_user',
+      pendingQuestion: {
+        question: `I tried ${evaluationRetryCount} different approaches but couldn't resolve this automatically. Please try a different approach or check the task manually.`,
+        options: []
+      },
+      answer: `I tried ${evaluationRetryCount} different approaches but couldn't resolve this automatically. Please try a different approach or check the task manually.`,
     };
   }
 
@@ -332,7 +337,9 @@ Output ONLY valid JSON.`;
     return {
       ...state,
       evaluationVerdict: 'ASK_USER',
-      answer: `I completed the task but the result may not be what you expected: ${verdict.reason}`
+      recoveryAction: 'ask_user',
+      pendingQuestion: { question: verdict.reason, options: [] },
+      answer: `I ran into an issue and need your help: ${verdict.reason}`
     };
   }
 

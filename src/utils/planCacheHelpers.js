@@ -74,6 +74,117 @@ function _validatePlanSkills(skillPlan) {
   return { valid: missing.length === 0, missing };
 }
 
+// ── Context mismatch detection for cached plans ─────────────────────────────────
+
+const _COMMON_TITLE_WORDS = new Set([
+  'google', 'search', 'bing', 'yahoo', 'duckduckgo', 'homepage', 'home',
+  'welcome', 'loading', 'error', '404', 'page', 'new', 'tab', 'untitled',
+]);
+
+function _normalizeContextWords(text) {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 3 && !_COMMON_TITLE_WORDS.has(w));
+}
+
+function _wordOverlapScore(a, b) {
+  const wordsA = new Set(_normalizeContextWords(a));
+  const wordsB = _normalizeContextWords(b);
+  if (wordsA.size === 0) return wordsB.size === 0 ? 1 : 0;
+  let hits = 0;
+  for (const w of wordsB) {
+    if (wordsA.has(w)) hits++;
+  }
+  return hits / wordsA.size;
+}
+
+function _stripCommonSuffixes(title) {
+  return (title || '')
+    .replace(/\s*[-|]\s*(Google Search|Bing Search|Yahoo Search|DuckDuckGo Search|Search Results)\s*$/i, '')
+    .replace(/\s*[-|]\s*(Google|Bing|Yahoo|DuckDuckGo|Search)\s*$/i, '')
+    .replace(/\s*[-|]\s*[^a-zA-Z0-9]*\s*$/i, '')
+    .trim();
+}
+
+function extractPlanContext(content) {
+  const promptMatch = content.match(/^original_prompt:\s*"([^"]+)"/m);
+  const prompt = promptMatch ? promptMatch[1] : '';
+  const contextMatch = prompt.match(/\(Context from prior turn:\s*(.*?)\s*\)/i);
+  const title = contextMatch ? _stripCommonSuffixes(contextMatch[1]) : null;
+  const urlMatch = prompt.match(/(https?:\/\/[^\s"]+)/);
+  return {
+    prompt,
+    title: title || prompt || null,
+    url: urlMatch ? urlMatch[1] : null,
+  };
+}
+
+function getCurrentBrowserContext(state) {
+  const ctx = state._priorScreenContext || state.screenContext || {};
+  return {
+    appName: ctx.appName || null,
+    windowTitle: ctx.windowTitle || null,
+    url: ctx.url || null,
+    contextText: ctx.contextText || (typeof state.context === 'string' ? state.context : null),
+  };
+}
+
+function contextMismatch(planContext, currentContext) {
+  if (!planContext || !currentContext) return false;
+
+  // URL comparison is authoritative when both are present
+  if (planContext.url && currentContext.url) {
+    try {
+      const a = new URL(planContext.url);
+      const b = new URL(currentContext.url);
+      const sameHost = a.hostname.toLowerCase() === b.hostname.toLowerCase();
+      const samePath = a.pathname === b.pathname;
+      const sameSearch = a.search === b.search;
+      if (sameHost && samePath && sameSearch) return false;
+      // Different page → stale context
+      return true;
+    } catch (_) { /* fall through to title comparison */ }
+  }
+
+  const planTitle = _stripCommonSuffixes(planContext.title || planContext.prompt || '');
+  const currentTitle = _stripCommonSuffixes(
+    currentContext.windowTitle || currentContext.contextText || ''
+  );
+
+  // No current browser context to compare — cannot determine mismatch
+  if (!currentTitle.trim()) return false;
+
+  // Same title (after stripping search-engine suffixes) → context unchanged
+  if (planTitle.toLowerCase() === currentTitle.toLowerCase()) return false;
+
+  // If titles share enough uncommon words, treat as same context
+  const overlap = _wordOverlapScore(planTitle, currentTitle);
+  return overlap < 0.3;
+}
+
+function findHardcodedDesktopFilename(skillPlan) {
+  if (!Array.isArray(skillPlan)) return null;
+  for (const step of skillPlan) {
+    if (step.skill !== 'shell.run') continue;
+    const text = JSON.stringify(step.args || {});
+    const match = text.match(/(?:~|\/Users\/[^/]+)\/Desktop\/([^"'\s]+)/);
+    if (match) return match[0];
+  }
+  return null;
+}
+
+function suggestFilenameFromTitle(title, ext = 'txt') {
+  const base = _stripCommonSuffixes(title || 'saved_content')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_+/g, '_')
+    .slice(0, 60) || 'saved_content';
+  return `${base}.${ext}`;
+}
+
 // ── In-memory session cache (exact-match only) ────────────────────────────────
 // Shared singleton Map — because Node caches module instances, both planSkills
 // and checkPlanCache reference the same Map object.
@@ -438,4 +549,9 @@ module.exports = {
   _clearSessionCache,
   _isStaleBrowserActPlan,
   _validatePlanSkills,
+  extractPlanContext,
+  getCurrentBrowserContext,
+  contextMismatch,
+  findHardcodedDesktopFilename,
+  suggestFilenameFromTitle,
 };

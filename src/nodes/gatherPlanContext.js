@@ -225,9 +225,11 @@ module.exports = async function gatherPlanContext(state) {
     // followUpTarget from conversation history. Inject it so planSkills has the
     // concrete value without asking the user.
     let enrichedMsg = resolvedMessage || message || '';
-    if (tc.isFollowUp && tc.followUpTarget) {
+    if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp) {
       enrichedMsg = `${enrichedMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
       logger.info(`[Node:GatherPlanContext] Follow-up resolved: "${tc.followUpTarget}"`);
+    } else if (tc.isFollowUp && tc.isScreenFollowUp) {
+      logger.info(`[Node:GatherPlanContext] Follow-up is screen-based (isScreenFollowUp=true) — skipping stale followUpTarget injection, live screen context takes priority`);
     }
 
     return {
@@ -257,7 +259,7 @@ module.exports = async function gatherPlanContext(state) {
   // If the classifier resolved a follow-up target, inject it before entering the
   // Q&A loop — the LLM clarity check may still mark this complete once it sees it.
   let userMsg_enriched = userMsg;
-  if (tc.isFollowUp && tc.followUpTarget) {
+  if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp) {
     userMsg_enriched = `${userMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
     logger.info(`[Node:GatherPlanContext] Follow-up target injected for ambiguous task: "${tc.followUpTarget}"`);
   }

@@ -196,7 +196,13 @@ function _buildSystemPrompt(userMessage, state) {
   const _isBrowserNavTask = _tc?.taskType === 'browser'
     && !_tc?.requiresDOM; // simple nav (Cmd+L, Cmd+T, scroll) — app.agent handles this
 
-  const _needsApp = _isNativeDesktopTask || _isBrowserNavTask;
+  // In-page click/select/open of a visible text element in the current browser window
+  // is handled by app.agent search_and_click, not browser.agent.
+  const _isBrowserInPageClick = _tc?.taskType === 'browser'
+    && _browserIsOpen
+    && /\b(click|open|select|tap|activate)\b/i.test(userMessage || '');
+
+  const _needsApp = _isNativeDesktopTask || _isBrowserNavTask || _isBrowserInPageClick;
 
   const _needsShell = _tc?.taskType === 'local_file'
     || ['file', 'copy', 'save', 'write', 'export', 'convert', 'move', 'delete', 'find'].some(k =>
@@ -297,6 +303,14 @@ function _buildSystemPrompt(userMessage, state) {
   const _dataPrefix = state._dataPrefix;
   if (_dataPrefix && typeof _dataPrefix === 'string' && _dataPrefix.length > 0) {
     result += `\n\n## CONTEXT FROM PREVIOUS STEP (data to use in your plan):\n\n${_dataPrefix}`;
+  }
+
+  // Inject live screen context so the planner knows which app is actually active.
+  // _screenContextNote is built by resolveReferencesV2 from getRecentOcr and contains
+  // the real focused app name, category, window title, and URL (if any).
+  const _screenNote = state._screenContextNote;
+  if (_screenNote && typeof _screenNote === 'string' && _screenNote.length > 0) {
+    result += `\n\n## ACTIVE SCREEN CONTEXT (live — use this app as the target for screen-related tasks)\n\n${_screenNote}`;
   }
 
   // ── Install scoring policy ──────────────────────────────────────────────

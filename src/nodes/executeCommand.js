@@ -2225,36 +2225,41 @@ module.exports = async function executeCommand(state) {
     const pageTextResults = skillResults
       .filter(r => (
         (r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText')) ||
-        (r.skill === 'app.agent' && r.args?.action === 'get_recent_ocr' && r.result && typeof r.result === 'string' && r.result.trim().length > 50) ||
+        (r.skill === 'app.agent' && r.args?.action === 'get_recent_ocr' &&
+          ((r.result && typeof r.result === 'string' && r.result.trim().length > 50) ||
+           (r.text && typeof r.text === 'string' && r.text.trim().length > 50))) ||
         (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:'))
-      ) && r.ok && r.result && typeof r.result === 'string' && r.result.trim().length > 0
+      ) && r.ok
+        && ((r.result && typeof r.result === 'string' && r.result.trim().length > 0) ||
+            (r.text && typeof r.text === 'string' && r.text.trim().length > 0))
         && r.step > lastSynthesizeStep)
       .map(r => {
-        const analysis = analyzePageContent(r.result, r.url, r.args?.agentId);
-        let processedText = r.result;
+        const _rawText = (typeof r.result === 'string' && r.result) || r.text || '';
+        const analysis = analyzePageContent(_rawText, r.url, r.args?.agentId);
+        let processedText = _rawText;
         
         // If we have UI chrome but also real content, add clarifying note
         if (analysis.uiChromeDetected && analysis.hasContent) {
-          processedText = `[PAGE NOTE: Navigation UI detected at start, but ${analysis.contentScore} content sections found below. Extract substantive content.]\n\n${r.result}`;
+          processedText = `[PAGE NOTE: Navigation UI detected at start, but ${analysis.contentScore} content sections found below. Extract substantive content.]\n\n${_rawText}`;
         }
         
         // If auth wall detected AND no real content, mark clearly as login-blocked
         // If authWallDetected but hasContent is true, the page loaded nav/sign-in chrome
         // alongside the actual AI response — treat as UI chrome, not a true block.
         if (analysis.authWallDetected && !analysis.hasContent) {
-          processedText = `[AUTH WALL: Login required]\n\n${r.result}`;
+          processedText = `[AUTH WALL: Login required]\n\n${_rawText}`;
         } else if (analysis.authWallDetected && analysis.hasContent) {
-          processedText = `[PAGE NOTE: Sign-in nav detected but page has content below. Extract substantive content.]\n\n${r.result}`;
+          processedText = `[PAGE NOTE: Sign-in nav detected but page has content below. Extract substantive content.]\n\n${_rawText}`;
         }
         
         return { 
-          source: r.args?.sessionId || r.args?.agentId || 'browser.agent', 
+          source: r.args?.sessionId || r.args?.agentId || (r.skill === 'app.agent' ? 'app.agent' : 'browser.agent'), 
           url: r.url || '', 
           text: processedText,
           _analysis: analysis // for debugging
         };
       });
-    logger.debug(`[Node:ExecuteCommand] synthesize: found ${pageTextResults.length} getPageText/waitForStableText results`);
+    logger.debug(`[Node:ExecuteCommand] synthesize: found ${pageTextResults.length} getPageText/waitForStableText/get_recent_ocr results`);
     const skippedStepNotes = skillResults
       .filter(r => r.skipped && r.skipReason && r.step > lastSynthesizeStep)
       .map(r => `- Step ${r.step} (${r.description || r.skill}): ${r.skipReason}`);
@@ -3716,7 +3721,12 @@ Please try again or search with different terms.`;
   if (skill === 'app.agent') {
     const MONITOR_ACTIONS = ['monitor_with_backoff', 'monitor_file_upload', 'monitor_build_completion', 'monitor_form_submission'];
     if (MONITOR_ACTIONS.includes(resolvedArgs.action)) {
-      const innerMax = resolvedArgs.maxDurationMs || 300000;
+      // The monitor floors its own runtime at MIN_MONITOR_DURATION_MS (180s) even
+      // when the LLM supplies a smaller maxDurationMs, so the HTTP timeout must
+      // account for that floor — otherwise the socket is destroyed mid-run and the
+      // single long loop gets killed (then recoverSkill would relaunch it).
+      const MIN_MONITOR_DURATION_MS = 180000;
+      const innerMax = Math.max(resolvedArgs.maxDurationMs || 300000, MIN_MONITOR_DURATION_MS);
       stepTimeoutMs = Math.max(stepTimeoutMs, innerMax + 30000);
     }
     // search_scroll / scroll: boundary probe loop + N OCR captures per scroll can take 60–120s
@@ -4874,7 +4884,25 @@ Please try again or search with different terms.`;
       found:           skill === 'app.agent' ? (raw.found           ?? null) : undefined,
       scrolls:         skill === 'app.agent' ? (raw.scrolls         ?? null) : undefined,
       accumulatedText: skill === 'app.agent' ? (raw.accumulatedText || null) : undefined,
+      aborted:         skill === 'app.agent' ? (raw.aborted         ?? false) : undefined,
     };
+
+    // Defensive fallback: app.agent extract_content_via_clipboard returns the
+    // page text in .content, but some downstream paths only check .text or
+    // .accumulatedText. Mirror the content into those fields so synthesis always
+    // sees the extracted text.
+    if (skill === 'app.agent' && stepResult.content && stepResult.content.length > 0) {
+      if (!stepResult.text || stepResult.text.length < 20) {
+        stepResult.text = stepResult.content;
+      }
+      if (!stepResult.accumulatedText || stepResult.accumulatedText.length < 20) {
+        stepResult.accumulatedText = stepResult.content;
+      }
+      // Surface as stdout so {{PREV_OUTPUT}} / {{LAST_WITH_OUTPUT}} work.
+      if (stepResult.args?.action === 'extract_content_via_clipboard') {
+        stepResult.stdout = stepResult.stdout || `Extracted ${stepResult.content.length} chars from ${stepResult.args?.appName || 'app'} via clipboard.\n\n${stepResult.content.slice(0, 3000)}`;
+      }
+    }
 
     // Detect shell.run search commands that returned no results — treat as soft failure
     // so recoverSkill can REPLAN with a different search strategy (e.g. mdfind → find)

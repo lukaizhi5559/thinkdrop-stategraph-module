@@ -874,6 +874,24 @@ class StateGraphBuilder {
       // Once the queue is empty and isMultiIntent=true it routes to summarizeMultiIntent.
       // summarizeMultiIntent sets isMultiIntent=false so the final logConversation exits here.
       logConversation: async (state) => {
+        // ── Single-intent ask_user pause (end-of-pipeline) ────────────────────
+        // If a single-intent run escalated to ASK_USER, surface the question card
+        // here before exiting to end. Otherwise the user gets a silent spinner.
+        if (!state.isMultiIntent && state.recoveryAction === 'ask_user' && state.pendingQuestion) {
+          logger.info('[StateGraph:Router] Single-intent ask_user pause — surfacing question');
+          if (typeof state.progressCallback === 'function') {
+            try {
+              state.progressCallback({
+                type:    'ask_user',
+                question: state.pendingQuestion.question,
+                options:  state.pendingQuestion.options || [],
+                source:  'single_intent_pause',
+              });
+            } catch (_) {}
+          }
+          return 'end';
+        }
+
         // ── Multi-intent ask_user pause (mid-pipeline) ─────────────────────────
         // If the current step ended with recoveryAction='ask_user' and there are
         // still steps in the queue, pause and surface the question. When the user

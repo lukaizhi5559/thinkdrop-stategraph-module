@@ -18,7 +18,7 @@ Domain-specific patterns for `shell.run`. The base prompt already establishes th
 | **JSON mutation** | `python3 -c 'import json...'` |
 | **CSV/Excel processing** | Python temp script |
 | **Simple pipeline (`grep | sort`)** | `shell.run` bash (exception) |
-| **Open app** | `shell.run` bash with `open -a` (exception) |
+| **Open/focus app** | NEVER `shell.run`; use `app.agent` (focus is handled internally) |
 
 ### Python Temp Script Pattern (for complex logic)
 
@@ -83,14 +83,14 @@ When a prior step (e.g., `app.agent extract_content_via_clipboard`) has placed c
 ```json
 [
   { "skill": "app.agent", "args": { "action": "extract_content_via_clipboard", "appName": "<AppName>", "category": "browser" }, "description": "Copy all text from the current page to the clipboard" },
-  { "skill": "shell.run", "args": { "goal": "Write the clipboard contents to a plain-text file on the desktop: pbpaste > ~/Desktop/<filename>.txt" }, "description": "Save clipboard content to a desktop file" },
+  { "skill": "shell.run", "args": { "goal": "Write the clipboard contents to a plain-text file on the desktop: pbpaste > ~/Desktop/page_content_$(date +%Y%m%d_%H%M%S).txt" }, "description": "Save clipboard content to a desktop file" },
   { "skill": "synthesize", "args": { "prompt": "Confirm to the user that the file was saved and report the exact full path." }, "description": "Confirm file saved" }
 ]
 ```
 
 **Rules:**
 - Use `pbpaste` to read the system clipboard (not `{{PREV_OUTPUT}}` — the clipboard content is not stdout of the app.agent step)
-- The filename MUST be derived from the current page/app title or use a generic timestamped name (e.g., `saved_clip_<timestamp>.txt`). NEVER hardcode a context-specific filename from a prior turn.
+- If the user did not specify a filename, ALWAYS use a timestamp-based generic name: `~/Desktop/page_content_$(date +%Y%m%d_%H%M%S).txt`. NEVER derive a filename from window title, prior screen context, or LLM inference about the page subject. NEVER hardcode content-specific names (e.g. `SpaceX_IPO.txt`, `Safety_Comparison.txt`).
 - Prefer a simple `pbpaste > /path/to/file.txt` or `pbpaste | python3 -c "...
 - Use `synthesize` only if the user needs a confirmation message; otherwise the shell.run step is sufficient
 - When a file is saved, the final `synthesize` step MUST include the exact file path (e.g., `Saved to ~/Desktop/SpaceX_IPO.txt`). Never omit the filename.

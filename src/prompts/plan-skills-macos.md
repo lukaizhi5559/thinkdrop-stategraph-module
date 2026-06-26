@@ -4,9 +4,9 @@ Domain-specific guidance for macOS system behavior. File-operation patterns (mdf
 
 ## Opening and Closing Apps / Documents
 
-- **Opening apps** — always `shell.run open -a AppName`, never `browser.act`
+- **Opening/focusing apps** — use `app.agent` (e.g. `execute_shortcut` or `verify_app_focused`), never `shell.run` and never `browser.act`. `app.agent` handles bringing the app to the front internally.
 - **Closing a file on macOS** — use `osascript -e 'tell application "AppName" to close (every document whose name is "filename")'`. NEVER use `lsof | kill`, `kill -9`, or `xargs kill` — those kill the whole app or random processes. To find which app has the file open: `mdls -name kMDItemLastUsedApp "/path/to/file"`. For .txt files the app is usually "TextEdit". For PDFs use "Preview". Always close the document, not the application (unless the user explicitly says "quit TextEdit").
-- **osascript / AppleScript** — use `shell.run bash -c 'osascript -e "..."'` for simple AppleScript commands. Note: macOS requires the user to grant Automation permission in System Settings → Privacy & Security → Automation before osascript can control other apps. If a simpler alternative exists (e.g., `open -a AppName` to open an app, `bash -c "echo hello"` to run a command), prefer it over osascript.
+- **osascript / AppleScript** — use `shell.run bash -c 'osascript -e "..."'` only for simple AppleScript commands that no skill can do (e.g. closing a specific document). Do NOT use osascript to open or focus apps — that is handled by `app.agent`. Note: macOS requires the user to grant Automation permission in System Settings → Privacy & Security → Automation before osascript can control other apps.
 
 ## System Settings / System Preferences
 
