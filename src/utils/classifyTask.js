@@ -12,7 +12,7 @@
  *
  * Output shape:
  * {
- *   taskType: 'local_file' | 'local_system' | 'browser' | 'messaging' | 'scheduling' | 'query' | 'ambiguous',
+ *   taskType: 'local_file' | 'local_system' | 'app_automation' | 'browser' | 'messaging' | 'scheduling' | 'query' | 'ambiguous',
  *   isFollowUp: boolean,           // message references prior turn ("that folder", "it", "the result")
  *   followUpTarget: string | null, // resolved concrete value from conversation history
  *   needsClarification: boolean,   // true only when a genuinely critical piece is missing
@@ -31,7 +31,7 @@ Given the user's message and recent conversation history, classify the task.
 
 Output ONLY valid JSON with exactly these fields:
 {
-  "taskType": "local_file" | "local_system" | "browser" | "messaging" | "scheduling" | "query" | "ambiguous",
+  "taskType": "local_file" | "local_system" | "app_automation" | "browser" | "messaging" | "scheduling" | "query" | "ambiguous",
   "isFollowUp": true | false,
   "followUpTarget": "<resolved concrete value>" | null,
   "needsClarification": true | false,
@@ -49,10 +49,11 @@ Field rules:
 - taskType:
   - "local_file": create, open, rename, move, copy, delete, generate, write, export, convert, compress, find any local file or folder
   - "local_system": interrogate or control the local machine — check uptime, disk space, memory usage, CPU, battery, network interfaces, running processes, kill a process, system stats, hardware info, environment variables, hostname, OS version, run a shell command, check what is installed, list ports, ping a host. Use this whenever the task requires executing a shell command or querying the OS rather than reading/writing a file. ALSO use "local_system" for any imperative action targeting the current screen or active app UI — e.g. highlight elements, capture screenshot, scroll the screen, annotate, show bounding boxes, monitor screen activity, take a screenshot, zoom in. These execute against the running OS/app and are NOT "query" even if the user says "on my screen" or "on this page". ALSO use "local_system" when the active screen is a web browser and the user wants to click, open, or select a visible text element on the current page (e.g. "click the bible study", "open that project", "select the link"). These are in-page UI interactions handled by app.agent using keyboard shortcuts and screen capture, not browser navigation tasks.
-  - "browser": navigate, search, open a website, go to a URL, look something up online, or interact with a web page via precise DOM access — ONLY for web browser tasks that go beyond the currently visible page. NOT for tasks that inspect, use, or interact with a native desktop app's UI (e.g. Slack, Figma, Zoom, Discord) — those are "local_system" or "query" even if a service name is mentioned. NOT for clicking a visible text element on the current browser page — those are "local_system".
+  - "app_automation": the user wants to use a named desktop application's built-in AI assistant or agent to do work inside that app. The phrase "in [app] use the AI" or "use the AI in [app]" or "ask [app] AI to ..." are strong signals. Examples: "In Devin use the AI to add tests to this file", "Ask Claude in Slack to summarize the thread", "Use Cursor's AI to refactor the file". These are handled by app.agent run_agent, which opens the file and uses the app's AI assistant. Use "app_automation" whenever the user explicitly asks to invoke an app's AI assistant, even if the task also mentions a file path.
+  - "browser": navigate, search, open a website, go to a URL, look something up online, or interact with a web page via precise DOM access — ONLY for web browser tasks that go beyond the currently visible page. NOT for tasks that inspect, use, or interact with a native desktop app's UI (e.g. Slack, Figma, Zoom, Discord) — those are "local_system" or "app_automation" or "query" even if a service name is mentioned. NOT for clicking a visible text element on the current browser page — those are "local_system".
   - "messaging": send email, text, SMS, Slack, Discord, notify someone
   - "scheduling": set a reminder, schedule something, recurring alarm, cron task
-  - "query": question, lookup, retrieve memory, general knowledge — includes asking about or locating UI elements in a desktop app ("show me where X is in Slack", "where is the toolbar in Figma"). Use for tasks that ask to find, describe, or explain something without sending or modifying anything. NOT "query" when the task is an imperative action ON the screen (highlight, scroll, capture, monitor, annotate) — those are "local_system".
+  - "query": question, lookup, retrieve memory, general knowledge — includes asking about or locating UI elements in a desktop app ("show me where X is in Slack", "where is the toolbar in Figma"). Use for tasks that ask to find, describe, or explain something without sending or modifying anything. NOT "query" when the task is an imperative action ON the screen (highlight, scroll, capture, monitor, annotate) — those are "local_system". NOT "query" when the task explicitly asks to use an app's AI assistant — those are "app_automation".
   - "ambiguous": genuinely unclear even with history
 
 - isFollowUp: true when message contains "that folder", "it", "the file", "there", "that one", "the result", "that directory", "that script", "that code", "that python", "the previous", or any pronoun/demonstrative referring to something established in RECENT CONVERSATION
@@ -63,7 +64,7 @@ Field rules:
   - WHO to send to (messaging tasks with no recipient anywhere)
   - WHICH service (when multiple equally valid options exist and user gave no hint)
   - NEVER ask about file format, content, or preferences — the system can infer those
-  - NEVER ask when taskType is local_file, local_system, browser, or scheduling — these are always clear enough
+  - NEVER ask when taskType is local_file, local_system, app_automation, browser, or scheduling — these are always clear enough
   - NEVER ask when isFollowUp is true and followUpTarget is resolved
 
 - targetService: the specific external service named (e.g. "gmail", "github", "youtube"). null for local tasks.

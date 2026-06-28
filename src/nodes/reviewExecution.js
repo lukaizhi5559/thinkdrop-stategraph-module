@@ -223,6 +223,21 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'VERIFIED' };
   }
 
+  // ── app.agent state-change short-circuit ────────────────────────────────
+  // State-changing actions such as search_and_click detect a meaningful UI
+  // change by comparing a fresh baseline capture to a post-action capture.
+  // result.stateChanged is direct evidence of success, so we do not need a
+  // browser page snapshot or synthesize output to confirm fulfillment.
+  const _hasAppAgentStateChange = skillResults.some(r =>
+    r.skill === 'app.agent' &&
+    r.ok === true &&
+    (r.stateChanged === true || r.result?.stateChanged === true)
+  );
+  if (_hasAppAgentStateChange) {
+    logger.info('[Node:ReviewExecution] app.agent reported a successful UI state change — skipping hollow check');
+    return { ...state, reviewVerdict: 'VERIFIED' };
+  }
+
   // ── app.agent GhostLayer short-circuit ───────────────────────────────────
   // Highlight and clear actions produce no text output by design — they are
   // visual overlay operations that either succeed or throw. If ok=true, treat

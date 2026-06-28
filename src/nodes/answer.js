@@ -172,20 +172,24 @@ module.exports = async function answer(state) {
     langOverridePrefix = `LANGUAGE OVERRIDE: The user's message is in ${langName}. You MUST write your ENTIRE response in ${langName} only. Do NOT use English under any circumstance.\n\n`;
   }
 
-  // ─── Fast-path: app-awareness questions answered directly from monitorService ─
+  // ─── Fast-path: app-awareness questions answered directly from screen context ─
   // "What app am I in?", "What type of app is this?", "What's the active app?"
-  // _priorScreenContext is already populated by resolveReferencesV2 from memory.getRecentOcr.
-  // No shell.run, no LLM planning — just read what the monitor already knows.
+  // Prefer the fresh screenContext captured by this run's screenIntelligence node;
+  // fall back to the cached _priorScreenContext from resolveReferencesV2 only when
+  // no fresh capture exists (e.g. a pure follow-up that skipped the screen node).
+  // No shell.run, no LLM planning — just read what the screen pipeline already knows.
   const _APP_AWARENESS_RE = /\b(what\s+(app|application|program|software)\s+(am\s+i|are\s+you|is\s+(this|active|open|running|focused))|which\s+app|what('?s|\s+is)\s+(the\s+)?(active|current|open|focused|running)\s+(app|application|program|window)|what\s+type\s+of\s+app|what\s+kind\s+of\s+(app|application))\b/i;
+  const _screenContext = state.screenContext || null;
   const _priorScreenContext = state._priorScreenContext || null;
-  if (_APP_AWARENESS_RE.test(queryMessage) && _priorScreenContext?.appName) {
-    const appName  = _priorScreenContext.appName;
-    const category = _priorScreenContext.category && _priorScreenContext.category !== 'other'
-      ? _priorScreenContext.category
+  const activeScreenContext = (_screenContext?.appName ? _screenContext : _priorScreenContext) || null;
+  if (_APP_AWARENESS_RE.test(queryMessage) && activeScreenContext?.appName) {
+    const appName  = activeScreenContext.appName;
+    const category = activeScreenContext.category && activeScreenContext.category !== 'other'
+      ? activeScreenContext.category
       : null;
-    const windowTitle = _priorScreenContext.windowTitle || null;
-    const ageMin = _priorScreenContext.timestamp
-      ? Math.round((Date.now() - new Date(_priorScreenContext.timestamp).getTime()) / 60000)
+    const windowTitle = activeScreenContext.windowTitle || null;
+    const ageMin = activeScreenContext.timestamp
+      ? Math.round((Date.now() - new Date(activeScreenContext.timestamp).getTime()) / 60000)
       : null;
 
     let fastAnswer = `You're currently in **${appName}**`;
@@ -194,11 +198,12 @@ module.exports = async function answer(state) {
       fastAnswer += `. Window: "${windowTitle}"`;
     }
     fastAnswer += '.';
-    if (ageMin !== null) fastAnswer += ` *(Screen captured ${ageMin} min ago)*`;
+    if (ageMin !== null && ageMin > 0) fastAnswer += ` *(Screen captured ${ageMin} min ago)*`;
 
+    const answerSource = _screenContext?.appName ? 'screen-fast-path' : 'monitor-fast-path';
     logger.info(`[Node:Answer] app-awareness fast-path: ${appName} (${category || 'other'})`);
     if (typeof streamCallback === 'function') streamCallback(fastAnswer);
-    return { ...state, answer: fastAnswer, metadata: { ...state.metadata, answerSource: 'monitor-fast-path' } };
+    return { ...state, answer: fastAnswer, metadata: { ...state.metadata, answerSource } };
   }
 
   // ─── Detect intermediate multi-intent pipeline step ─────────────────────────

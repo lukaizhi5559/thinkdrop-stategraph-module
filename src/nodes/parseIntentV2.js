@@ -175,6 +175,13 @@ module.exports = async function parseIntentV2(state) {
       finalIntent = 'command_automate';
     }
 
+    // app_automation tasks (e.g. "In Devin use the AI to add tests") must never be
+    // downgraded to local_system/synthesize by the decomposer. Force command_automate.
+    if (state._taskClassification?.taskType === 'app_automation') {
+      logger.info(`[Node:ParseIntentV2] app_automation override: ${finalIntent} → command_automate for "${classifyMessage.slice(0, 80)}"`);
+      finalIntent = 'command_automate';
+    }
+
     logger.debug(`[Node:ParseIntentV2] intentPlan passthrough → ${finalIntent} (${finalConf}): "${classifyMessage.slice(0, 80)}"`);
     writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'llm-decompose', intent: finalIntent, confidence: finalConf, subPromptCount: 1, durationMs: 0, subPrompts: [{ order: 0, text: sp.text, estimatedIntent: finalIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }] });
 
@@ -283,6 +290,10 @@ module.exports = async function parseIntentV2(state) {
   if (tc?.taskType === 'browser' && tc?.isFollowUp) {
     fallbackIntent = 'command_automate';
     logger.info(`[Node:ParseIntentV2] taskClassification override (browser follow-up) → command_automate: "${classifyMessage.slice(0, 60)}"`);
+  }
+  else if (tc?.taskType === 'app_automation') {
+    fallbackIntent = 'command_automate';
+    logger.info(`[Node:ParseIntentV2] taskClassification override (app_automation) → command_automate: "${classifyMessage.slice(0, 60)}"`);
   }
   else if (/\b(remember|my name is|i am|my email|note that|store that|save that)\b/.test(lower)) fallbackIntent = 'memory_store';
   else if (/\b(what did i|do you know my|recall|retrieve|look up my|what was)\b/.test(lower)) fallbackIntent = 'memory_retrieve';

@@ -4849,6 +4849,7 @@ Please try again or search with different terms.`;
       _raw: (skill === 'file.bridge' || skill === 'fs.read') ? raw : undefined,
       url: raw.url ?? null,
       pageContext: raw.pageContext ?? null,
+      stateChanged: raw.stateChanged ?? null,
       error: raw.error || null,
       executionTime: raw.executionTime || null,
       needsManualStep: raw.needsManualStep || false,

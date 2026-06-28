@@ -158,6 +158,56 @@ function _loadPromptFile(filename) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// App descriptor loader for app.agent tasks
+// Reads the per-app skill descriptor so the planner can use discovered shortcuts
+// instead of guessing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function _extractAppNameFromMessage(userMessage, screenCtx) {
+  if (screenCtx?.appName) return screenCtx.appName;
+
+  const patterns = [
+    /in\s+(?:the\s+)?([a-z][a-z0-9]*)\s+app/i,
+    /using\s+(?:the\s+)?([a-z][a-z0-9]*)\s+app/i,
+    /via\s+(?:the\s+)?([a-z][a-z0-9]*)\s+app/i,
+    /open\s+(?:the\s+)?([a-z][a-z0-9]*)\s+app/i,
+    /([a-z][a-z0-9]*)\s+app\b/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = userMessage.match(pattern);
+    if (match) {
+      return match[1].charAt(0).toUpperCase() + match[1].slice(1).toLowerCase();
+    }
+  }
+
+  return null;
+}
+
+function _readAppDescriptorForPlanner(appName) {
+  try {
+    const safe = appName.replace(/\s+/g, '_').toLowerCase();
+    const descriptorPath = path.join(os.homedir(), '.thinkdrop', 'agents', `${safe}.app.agent.md`);
+    if (!fs.existsSync(descriptorPath)) return null;
+
+    const content = fs.readFileSync(descriptorPath, 'utf8');
+    const shortcutsMatch = content.match(/## Shortcuts\n([\s\S]*?)(?=\n## |$)/);
+    if (!shortcutsMatch) return null;
+
+    const tableLines = shortcutsMatch[1].trim().split('\n').filter(l => l.startsWith('|') && !l.includes('---'));
+    const shortcuts = tableLines.slice(1).map(line => {
+      const cols = line.split('|').map(c => c.trim()).filter(Boolean);
+      if (cols.length >= 2) return { action: cols[0], shortcut: cols[1], context: cols[2] || '' };
+      return null;
+    }).filter(Boolean);
+
+    return { appName, shortcuts, descriptorPath };
+  } catch (err) {
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Prompt tier selection — V2 architecture
 //
 // BEFORE: regex stacking — "open" verb triggers slim → "open my-folder" fires slim
@@ -202,12 +252,12 @@ function _buildSystemPrompt(userMessage, state) {
     && _browserIsOpen
     && /\b(click|open|select|tap|activate)\b/i.test(userMessage || '');
 
-  const _needsApp = _isNativeDesktopTask || _isBrowserNavTask || _isBrowserInPageClick;
+  const _needsApp = _isNativeDesktopTask || _isBrowserNavTask || _isBrowserInPageClick || _tc?.taskType === 'app_automation';
 
   const _needsShell = _tc?.taskType === 'local_file'
-    || ['file', 'copy', 'save', 'write', 'export', 'convert', 'move', 'delete', 'find'].some(k =>
+    || (_tc?.taskType !== 'app_automation' && ['file', 'copy', 'save', 'write', 'export', 'convert', 'move', 'delete', 'find'].some(k =>
       _tc?.taskType?.includes(k) || _tc?.intent?.includes(k) || userMessage.toLowerCase().includes(k)
-    );
+    ));
 
   const _needsCli = _tc?.taskType === 'cli'
     || _tc?.targetService?.startsWith('cli:')
@@ -240,6 +290,27 @@ function _buildSystemPrompt(userMessage, state) {
     if (appendix) {
       result += `\n\n---\n\n${appendix}`;
     }
+  }
+
+  // Inject discovered app shortcuts for native desktop tasks so the planner
+  // does not guess the wrong keys (e.g., Cmd+Shift+A for AI instead of Cmd+L).
+  if (_needsApp || _tc?.taskType === 'app_automation') {
+    const _appName = _extractAppNameFromMessage(userMessage, _screenCtx);
+    if (_appName) {
+      const _descriptor = _readAppDescriptorForPlanner(_appName);
+      if (_descriptor && _descriptor.shortcuts.length > 0) {
+        const _shortcutLines = _descriptor.shortcuts
+          .map(s => `- ${s.action}: ${s.shortcut}${s.context ? ` (${s.context})` : ''}`)
+          .join('\n');
+        result += `\n\n## DISCOVERED SHORTCUTS FOR ${_appName}\n\nThe user is interacting with ${_appName}. Use these semantic action names, not hardcoded keys. The app.agent will resolve each action to the correct shortcut:\n\n${_shortcutLines}\n\nFor "open a file and use the app's AI assistant" tasks, use the \`app.agent\` \`run_agent\` action with \`appName: "${_appName}"\`, \`filePath: "<absolute path from user message>"\`, and \`prompt: "<AI instruction only, no boilerplate>"\`.`;
+      }
+    }
+  }
+
+  // CRITICAL: app-automation tasks must never be answered by synthesizing or shell-editing;
+  // the named app owns the content and the save action.
+  if (_tc?.taskType === 'app_automation') {
+    result += `\n\n## CRITICAL: APP-AI AUTOMATION\n\nThis task asks to use a named app's built-in AI assistant. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
   }
 
   const _skipReason = _hasLocalSignals ? ' (appendices skipped: local_signals)' : state.recoveryContext ? ' (appendices skipped: recovery)' : '';

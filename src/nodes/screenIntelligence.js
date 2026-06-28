@@ -12,6 +12,28 @@
  * - Without MCP: Returns placeholder with intent info
  */
 
+// Mirrors the categorization in thinkdrop-user-memory-service/src/monitor/monitorService.js
+// so that freshly captured screen context can also report an app type.
+const APP_CATEGORY = {
+  'Google Chrome': 'browser', 'Safari': 'browser', 'Firefox': 'browser',
+  'Microsoft Edge': 'browser', 'Brave Browser': 'browser',
+  'Visual Studio Code': 'editor', 'Code': 'editor', 'Cursor': 'editor',
+  'Windsurf': 'editor', 'Zed': 'editor', 'Sublime Text': 'editor',
+  'TextEdit': 'editor', 'Devin': 'editor',
+  'Slack': 'chat', 'Discord': 'chat', 'Microsoft Teams': 'chat',
+  'Telegram': 'chat', 'WhatsApp': 'chat', 'Messages': 'chat',
+  'Figma': 'design', 'Adobe Photoshop': 'design', 'Adobe Illustrator': 'design',
+  'Sketch': 'design',
+  'Terminal': 'terminal', 'iTerm': 'terminal', 'iTerm2': 'terminal',
+  'Warp': 'terminal', 'Hyper': 'terminal',
+  'Mail': 'email', 'Microsoft Outlook': 'email', 'Spark': 'email'
+};
+
+function getAppCategory(appName) {
+  if (!appName) return null;
+  return APP_CATEGORY[appName] || null;
+}
+
 /**
  * Build a structured LLM context string from OCR capture data.
  * @param {object} capture - { text, appName, windowTitle, url, confidence }
@@ -80,13 +102,15 @@ module.exports = async function screenIntelligence(state) {
 
       const resultData = result.data || result;
 
-      // screen-intelligence returns: { text, rawText, appName, windowTitle, url, confidence, elapsed }
+      // screen-intelligence returns: { text, rawText, appName, windowTitle, url, confidence, elapsed, timestamp }
       capture = {
         text:        resultData.text        || resultData.rawText || '',
         appName:     resultData.appName     || null,
         windowTitle: resultData.windowTitle || null,
         url:         resultData.url         || null,
-        confidence:  resultData.confidence  || resultData.ocrConfidence || null
+        confidence:  resultData.confidence  || resultData.ocrConfidence || null,
+        timestamp:   resultData.timestamp   || new Date().toISOString(),
+        category:    getAppCategory(resultData.appName) || null
       };
       logger.debug(`[Node:ScreenIntelligence] Fresh OCR capture: ${capture.text.length} chars, app=${capture.appName}`);
     }
@@ -99,7 +123,9 @@ module.exports = async function screenIntelligence(state) {
       windowTitle: capture.windowTitle,
       url:         capture.url,
       text:        capture.text,
-      confidence:  capture.confidence || capture.ocrConfidence || null
+      confidence:  capture.confidence || capture.ocrConfidence || null,
+      timestamp:   capture.timestamp || capture.capturedAt || capture.created_at || new Date().toISOString(),
+      category:    capture.category || getAppCategory(capture.appName) || null
     };
 
     return {

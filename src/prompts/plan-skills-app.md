@@ -42,8 +42,9 @@ Domain-specific guidance for `app.agent`. General skill list, routing hierarchy,
 |--------|-------------|
 | `verify_app_focused` | Wait for app to open/load/be ready (OCR polls, no LLM calls) |
 | `execute_shortcut` | Keyboard shortcuts (after focus verified) |
+| `run_agent` | Per-app skill runner: opens a file in an app and invokes the app's AI assistant to edit it. Use for "open X and use the app's AI" tasks. |
 | `teleport_to_element` | Cmd+F navigation to jump to and focus an anchor text element. Only scrolls/focuses — does NOT click. |
-| `search_and_click` | Browser only. Use Cmd+F to find text, cycle matches, and press Enter to click. Call when user says "click X", "open X", or "select X" in a browser. |
+| `search_and_click` | Browser only. Uses OCR to find the text element, progressively shortens the phrase until a match is found, clicks it, and falls back to Cmd+F only if the mouse click fails. Call when user says "click X", "open X", or "select X" in a browser. |
 | `scroll` | Auto-routes to correct scroll mode based on app category |
 | `search_scroll` | Scroll up/down to find content by keyword (run `enrich_app_context` first) |
 | `ai_response_scroll` | Scroll and use LLM to detect when AI assistant stops responding |
@@ -94,7 +95,7 @@ Do NOT emit a separate `shell.run` step to open or focus the app. `execute_short
 **Browser click / open / select a text element:**
 ```json
 [
-  { "skill": "app.agent", "args": { "action": "search_and_click", "searchText": "<SOME_SEARCH_TEXT>", "appName": "<BrowserName>", "category": "browser" }, "description": "Find and click the bible study element in the browser" }
+  { "skill": "app.agent", "args": { "action": "search_and_click", "searchText": "<SOME_SEARCH_TEXT>", "appName": "<AppName>", "category": "browser" }, "description": "Find and click the bible study element in the browser" }
 ]
 ```
 For browser category, when the user wants to click, open, or select a text-based element, prefer `app.agent search_and_click` over other agent(s).
@@ -106,6 +107,19 @@ For browser category, when the user wants to click, open, or select a text-based
   { "skill": "synthesize", "args": { "prompt": "Summarize what changed on screen after the response completed" }, "description": "Report result" }
 ]
 ```
+
+**Open a file in an app and use the app's AI assistant to edit it (proxy workflow):**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "run_agent", "appName": "<AppName>", "filePath": "<filePath>", "prompt": "<instruction>" }, "description": "Open <filePath> in <AppName> and ask its AI assistant to <instruction>" }
+]
+```
+- Extract the exact file path from the user's message and pass it as `filePath`.
+- Extract the instruction for the app's AI assistant and pass it as `prompt`. Do NOT include boilerplate like "open the file" or "in the app" in the prompt.
+- ThinkDrop is only the proxy/orchestrator. The target app (e.g., Devin/Cursor/OpenCode) owns the file and its AI assistant.
+- The app's AI assistant performs the actual edit. The final save is triggered by the app's own save shortcut via `run_agent`.
+- Do NOT use `shell.run` to write to the file from outside the app.
+- Do NOT emit separate `execute_shortcut` + `typeText` steps for this pattern unless `run_agent` is unavailable. The per-app skill descriptor provides the correct shortcuts.
 
 ## Browser Content Extraction (Copy Page Text via Clipboard)
 
