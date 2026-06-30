@@ -18,6 +18,13 @@
 // e.g. "My dentist office address is 123 Main" → { memType: 'place_entity', ... }
 // e.g. "My hammer is in the garage" → { memType: 'thing_entity', ... }
 
+const {
+  profileKeysFrom,
+  dualWriteProfile,
+  upsertPersonalProfile,
+  storePersonalProfileFact,
+} = require('../utils/personalProfile');
+
 const SCALAR_FIELDS = {
   name: 'user_name', phone: 'my_phone', number: 'my_phone', cell: 'my_phone',
   email: 'my_email', address: 'home_address', home: 'home_address',
@@ -175,88 +182,6 @@ function _detectKeyType(label) {
 //   self:<field>         — user's own data (name, phone, email, address…)
 //   contact:<label>:<field> — a named contact (e.g. contact:wife:phone)
 
-const SELF_FIELD_MAP = {
-  user_name:    'self:first_name',  // full name stored too; split is best-effort
-  my_phone:     'self:phone',
-  my_email:     'self:email',
-  home_address: 'self:address',
-  work_address: 'self:work_address',
-};
-
-/**
- * Derive one or more profile keys from a parsed personal fact.
- * Returns an array of { key, value } pairs to write to user_profile.
- */
-function _profileKeysFrom(parsed) {
-  const pairs = [];
-
-  // ── Self scalar fields (name, phone, email, address) ─────────────────────
-  const selfKey = SELF_FIELD_MAP[parsed.field];
-  if (selfKey) {
-    pairs.push({ key: selfKey, value: parsed.value });
-
-    // Best-effort first/last split for names
-    if (parsed.field === 'user_name') {
-      const parts = parsed.value.trim().split(/\s+/);
-      if (parts.length >= 2) {
-        pairs.push({ key: 'self:first_name', value: parts[0] });
-        pairs.push({ key: 'self:last_name',  value: parts.slice(1).join(' ') });
-      } else {
-        pairs.push({ key: 'self:first_name', value: parsed.value });
-      }
-      // Also store as full name
-      pairs.push({ key: 'self:name', value: parsed.value });
-    }
-
-    // Phone: also store carrier lookup opportunity flag
-    if (parsed.field === 'my_phone') {
-      pairs.push({ key: 'self:phone_carrier_lookup_needed', value: '1' });
-    }
-    return pairs;
-  }
-
-  // ── Contact / relationship fields (wife, boss, dentist, etc.) ─────────────
-  // field = 'wife', label = 'wife', value = 'Sarah'  → contact:wife:name
-  // field = 'dentist_phone', label = 'dentist phone' → contact:dentist:phone
-  const label  = (parsed.label || parsed.field || '').toLowerCase().trim();
-  const fieldLC = parsed.field.toLowerCase();
-
-  // If the field ends with a known sub-field type, use contact:<role>:<type>
-  const subFieldMap = { phone: 'phone', email: 'email', address: 'address', number: 'phone' };
-  for (const [suffix, subKey] of Object.entries(subFieldMap)) {
-    if (fieldLC.endsWith(`_${suffix}`)) {
-      const role = fieldLC.slice(0, fieldLC.length - suffix.length - 1).replace(/_/g, ' ');
-      pairs.push({ key: `contact:${role}:${subKey}`, value: parsed.value });
-      return pairs;
-    }
-  }
-
-  // Default: store as contact:<label>:name
-  if (label) {
-    pairs.push({ key: `contact:${label.replace(/\s+/g, '_')}:name`, value: parsed.value });
-  }
-  return pairs;
-}
-
-/**
- * Fire-and-forget profile dual-write. Never throws — storeMemory must not
- * fail just because user_profile is unreachable.
- */
-async function _dualWriteProfile(mcpAdapter, profilePairs, userId, logger) {
-  for (const { key, value } of profilePairs) {
-    try {
-      await mcpAdapter.callService('user-memory', 'profile.set', {
-        key,
-        valueRef: value,
-        userId,
-      }, { timeoutMs: 4000 });
-      logger.debug(`[Node:StoreMemory] profile.set key="${key}"`);
-    } catch (e) {
-      logger.warn(`[Node:StoreMemory] profile.set failed for key="${key}": ${e.message}`);
-    }
-  }
-}
-
 // ── Main node ────────────────────────────────────────────────────────────────
 
 module.exports = async function storeMemory(state) {
@@ -278,69 +203,80 @@ module.exports = async function storeMemory(state) {
 
   try {
     // ── Personal-fact declaration path ───────────────────────────────────────
-    if (intent?.factDeclaration) {
-      const parsed = parsePersonalFact(text);
-      if (parsed) {
-        logger.info(`[Node:StoreMemory] Personal-fact declaration — field: ${parsed.field}, value: "${parsed.value}", type: ${parsed.memType}`);
+    // Always parse for personal facts first, regardless of intent.factDeclaration.
+    // The intent classifier does not reliably set factDeclaration, so relying on it
+    // caused personal facts to be stored as generic user_memory rows.
+    const parsed = parsePersonalFact(text);
+    if (parsed) {
+      logger.info(`[Node:StoreMemory] Personal-fact declaration — field: ${parsed.field}, value: "${parsed.value}", type: ${parsed.memType}`);
 
-        // ── Security guard: route credentials to OS keychain ─────────────────
-        // Never let a raw password / token / API key touch the memory table.
-        if (SENSITIVE_LABEL_RE.test(parsed.label) && parsed.value && parsed.value.length > 2) {
-          const service   = _inferServiceFromLabel(parsed.label);
-          const keyType   = _detectKeyType(parsed.label);
-          // For unknown services derive prefix from the field name, but strip any
-          // trailing credential-type word so we don't get NETFLIX_PASSWORD_PASSWORD.
-          // e.g. field='netflix_password' → strip '_password' → 'NETFLIX'
-          const _rawField    = (parsed.field || 'unknown');
-          const _strippedField = _rawField
-            .replace(/_?(password|passwd|passphrase|token|secret|api_key|access_key|private_key|credential|pin)$/i, '')
-            .replace(/[^A-Z0-9]/gi, '_')
-            .toUpperCase()
-            .replace(/_+$/, '') || 'UNKNOWN';
-          const prefix    = service !== 'unknown'
-            ? service.toUpperCase()
-            : _strippedField;
-          const keytarKey = `${prefix}_${keyType}`;
+      // ── Security guard: route credentials to OS keychain ─────────────────
+      // Never let a raw password / token / API key touch the memory table.
+      if (SENSITIVE_LABEL_RE.test(parsed.label) && parsed.value && parsed.value.length > 2) {
+        const service   = _inferServiceFromLabel(parsed.label);
+        const keyType   = _detectKeyType(parsed.label);
+        // For unknown services derive prefix from the field name, but strip any
+        // trailing credential-type word so we don't get NETFLIX_PASSWORD_PASSWORD.
+        // e.g. field='netflix_password' → strip '_password' → 'NETFLIX'
+        const _rawField    = (parsed.field || 'unknown');
+        const _strippedField = _rawField
+          .replace(/_?(password|passwd|passphrase|token|secret|api_key|access_key|private_key|credential|pin)$/i, '')
+          .replace(/[^A-Z0-9]/gi, '_')
+          .toUpperCase()
+          .replace(/_+$/, '') || 'UNKNOWN';
+        const prefix    = service !== 'unknown'
+          ? service.toUpperCase()
+          : _strippedField;
+        const keytarKey = `${prefix}_${keyType}`;
 
-          try {
-            await mcpAdapter.callService('user-memory', 'profile.store_secret', {
-              keytarKey,
-              value:   parsed.value,
-              service: service !== 'unknown' ? service : null,
-              label:   parsed.label,
-            }, { timeoutMs: 5000 });
-          } catch (secureErr) {
-            logger.warn(`[Node:StoreMemory] Keychain store failed for "${keytarKey}": ${secureErr.message}`);
-          }
-
-          // Store a sanitised KEYTAR ref in memory — raw value is NEVER written here
-          await mcpAdapter.callService('user-memory', 'memory.store', {
-            text: `My ${parsed.label} is KEYTAR:${keytarKey}`,
-            type: 'personal_profile',
-            userId,
-            entities: [],
-            metadata: {
-              source: 'fact_declaration',
-              field:  parsed.field,
-              sensitive: true,
-              sessionId: context?.sessionId,
-              timestamp: new Date().toISOString(),
-            },
-          }, { timeoutMs: 8000 });
-
-          logger.info(`[Node:StoreMemory] Credential intercepted → keychain key "${keytarKey}"`);
-          return {
-            ...state,
-            memoryStored: true,
-            answer: `Got it — I've stored your ${parsed.label} securely in your system keychain. It will never be written to disk as plain text.`,
-          };
+        try {
+          await mcpAdapter.callService('user-memory', 'profile.store_secret', {
+            keytarKey,
+            value:   parsed.value,
+            service: service !== 'unknown' ? service : null,
+            label:   parsed.label,
+          }, { timeoutMs: 5000 });
+        } catch (secureErr) {
+          logger.warn(`[Node:StoreMemory] Keychain store failed for "${keytarKey}": ${secureErr.message}`);
         }
 
-        const entities = parsed.entityType
-          ? [{ type: parsed.label, value: parsed.value, entity_type: parsed.entityType }]
-          : [];
+        // Store a sanitised KEYTAR ref in memory — raw value is NEVER written here
+        await mcpAdapter.callService('user-memory', 'memory.store', {
+          text: `My ${parsed.label} is KEYTAR:${keytarKey}`,
+          type: 'personal_profile',
+          userId,
+          entities: [],
+          metadata: {
+            source: 'fact_declaration',
+            field:  parsed.field,
+            sensitive: true,
+            sessionId: context?.sessionId,
+            timestamp: new Date().toISOString(),
+          },
+        }, { timeoutMs: 8000 });
 
-        const result = await mcpAdapter.callService('user-memory', 'memory.store', {
+        logger.info(`[Node:StoreMemory] Credential intercepted → keychain key "${keytarKey}"`);
+        return {
+          ...state,
+          memoryStored: true,
+          answer: `Got it — I've stored your ${parsed.label} securely in your system keychain. It will never be written to disk as plain text.`,
+        };
+      }
+
+      const entities = parsed.entityType
+        ? [{ type: parsed.label, value: parsed.value, entity_type: parsed.entityType }]
+        : [];
+
+      // ── Conflict resolution: upsert personal_profile rows by field ─────────
+      // For personal facts we want a single row per field (e.g. one name row).
+      // Try to update an existing row; fall back to INSERT if none exists.
+      let result;
+      if (parsed.memType === 'personal_profile') {
+        result = await upsertPersonalProfile(mcpAdapter, parsed, userId, context, logger);
+      }
+
+      if (!result) {
+        result = await mcpAdapter.callService('user-memory', 'memory.store', {
           text: parsed.memText,
           type: parsed.memType,
           userId,
@@ -352,26 +288,26 @@ module.exports = async function storeMemory(state) {
             timestamp: new Date().toISOString(),
           },
         }, { timeoutMs: 8000 });
-
-        const memoryData = result?.data || result;
-        logger.info(`[Node:StoreMemory] Stored ${parsed.memType}: "${parsed.memText}"`);
-
-        // ── Dual-write to user_profile for fast O(1) key lookup ──────────────
-        if (parsed.memType === 'personal_profile') {
-          const profilePairs = _profileKeysFrom(parsed);
-          if (profilePairs.length > 0) {
-            // fire-and-forget — don't block on this; storeMemory must stay fast
-            _dualWriteProfile(mcpAdapter, profilePairs, userId, logger).catch(() => {});
-          }
-        }
-
-        return {
-          ...state,
-          memoryStored: true,
-          memoryId: memoryData?.id,
-          answer: `Got it — I'll remember that your ${parsed.label} is ${parsed.value}.`,
-        };
       }
+
+      const memoryData = result?.data || result;
+      logger.info(`[Node:StoreMemory] Stored ${parsed.memType}: "${parsed.memText}"`);
+
+      // ── Dual-write to user_profile for fast O(1) key lookup ──────────────
+      if (parsed.memType === 'personal_profile') {
+        const profilePairs = profileKeysFrom(parsed);
+        if (profilePairs.length > 0) {
+          // fire-and-forget — don't block on this; storeMemory must stay fast
+          dualWriteProfile(mcpAdapter, profilePairs, userId, logger).catch(() => {});
+        }
+      }
+
+      return {
+        ...state,
+        memoryStored: true,
+        memoryId: memoryData?.id || memoryData?.memoryId,
+        answer: `Got it — I'll remember that your ${parsed.label} is ${parsed.value}.`,
+      };
     }
 
     // ── General memory store path ────────────────────────────────────────────

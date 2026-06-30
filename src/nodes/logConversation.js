@@ -18,8 +18,21 @@ const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
 
+const { storePersonalProfileFact } = require('../utils/personalProfile');
+
+let EXTRACT_PROMPT = null;
+function loadExtractPrompt() {
+  if (EXTRACT_PROMPT) return EXTRACT_PROMPT;
+  try {
+    EXTRACT_PROMPT = fs.readFileSync(path.join(__dirname, '../prompts/extract-personal-facts.md'), 'utf8');
+  } catch (_) {
+    EXTRACT_PROMPT = '';
+  }
+  return EXTRACT_PROMPT;
+}
+
 module.exports = async function logConversation(state) {
-  const { mcpAdapter, message, answer, context, intent } = state;
+  const { mcpAdapter, message, answer, context, intent, llmBackend } = state;
   const logger = state.logger || console;
 
   logger.debug('[Node:LogConversation] Logging conversation turn...');
@@ -268,6 +281,18 @@ module.exports = async function logConversation(state) {
       }
     }
 
+    // ── Auto-extract personal facts from this turn (non-blocking) ─────────────
+    if (llmBackend && message && answer) {
+      const _isRecoveryTurn = !!(state.recoveryAction || state.recoveryQuestion ||
+                                 state._isAgentAskUser || state.askUser);
+      const _isMemoryStore = intent?.type === 'memory_store';
+      if (!_isRecoveryTurn && !_isMemoryStore) {
+        _extractAndStoreFacts(mcpAdapter, llmBackend, message, answer, context, logger).catch(err => {
+          logger.warn(`[Node:LogConversation] Auto-extraction failed: ${err.message}`);
+        });
+      }
+    }
+
     return {
       ...state,
       conversationLogged: true,
@@ -280,3 +305,50 @@ module.exports = async function logConversation(state) {
     return state;
   }
 };
+
+async function _extractAndStoreFacts(mcpAdapter, llmBackend, message, answer, context, logger) {
+  const prompt = loadExtractPrompt();
+  if (!prompt) return;
+
+  const exchange = `User: ${message}\n\nAssistant: ${answer}`;
+  const raw = await llmBackend.generateAnswer(
+    `${prompt}\n\n---\n\n${exchange}`,
+    {
+      query: exchange,
+      context: { systemInstructions: prompt },
+      options: { maxTokens: 300, temperature: 0.1 }
+    }
+  );
+  if (!raw) return;
+
+  let parsed;
+  try {
+    const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
+    parsed = JSON.parse(cleaned);
+  } catch (e) {
+    logger.warn(`[Node:LogConversation] Auto-extraction parse failed: ${e.message}`);
+    return;
+  }
+
+  const facts = Array.isArray(parsed?.facts) ? parsed.facts : [];
+  if (facts.length === 0) return;
+
+  const userId = context?.userId || 'local_user';
+  for (const fact of facts) {
+    if (!fact.field || !fact.value || !fact.label) continue;
+    const parsedFact = {
+      memType: 'personal_profile',
+      field: fact.field,
+      label: fact.label,
+      value: fact.value,
+      entityType: fact.entityType || 'PERSON',
+      memText: fact.sourceText || `My ${fact.label} is ${fact.value}`,
+    };
+    try {
+      await storePersonalProfileFact(mcpAdapter, parsedFact, userId, context, logger, 'auto_extraction');
+      logger.info(`[Node:LogConversation] Auto-extracted personal fact: ${fact.field} = ${fact.value}`);
+    } catch (e) {
+      logger.warn(`[Node:LogConversation] Failed to store auto-extracted fact ${fact.field}: ${e.message}`);
+    }
+  }
+}

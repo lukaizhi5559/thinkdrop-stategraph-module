@@ -320,7 +320,7 @@ class StateGraphBuilder {
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       retrieveMemory: (state) => retrieveMemoryNode({ ...state, logger, mcpAdapter }),
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
-      logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter })
+      logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter, llmBackend })
     };
     
     const edges = {
@@ -386,7 +386,7 @@ class StateGraphBuilder {
       answer: (state) => answerNode({ ...state, logger, mcpAdapter, llmBackend }),
       appControl: (state) => appControlNode({ ...state, logger }),
       parseProject: (state) => parseProjectNode({ ...state, logger, llmBackend }),
-      logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter }),
+      logConversation: (state) => logConversationNode({ ...state, logger, mcpAdapter, llmBackend }),
       summarizeMultiIntent: (state) => summarizeMultiIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeIntrospect: (state) => executeIntrospectNode({ ...state, logger, mcpAdapter }),
       executeSettings: (state) => executeSettingsNode({ ...state, logger }),

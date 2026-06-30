@@ -90,6 +90,102 @@ function buildSearchQuery(message, resolvedMessage) {
   return resolvedMessage || message;
 }
 
+/**
+ * Detect whether a message is asking for a known personal attribute.
+ * Returns the normalized attribute name (e.g. 'name', 'email', 'phone') or null.
+ */
+function _detectPersonalAttribute(message) {
+  const q = (message || '').toLowerCase().trim();
+
+  // Direct identity questions
+  if (/\b(what('?s|\s+is)\s+(my\s+name|your\s+name)|who\s+am\s+i|what\s+did\s+you\s+call\s+me|what\s+name\s+(did\s+you\s+say|do\s+you\s+have)\b)/i.test(q)) {
+    return 'name';
+  }
+
+  const match = q.match(
+    /\b(?:my|what(?:'s|\s+is)\s+my)\s+(name|email|e-mail|username|favorite\s*\w+|birthday|birthdate|date\s+of\s+birth|location|timezone|phone|phone\s+number|cell|cellphone|mobile|number|occupation|job|company|employer|github|git|language|home\s+address|work\s+address|address)\b/i
+  );
+  if (match) {
+    let attr = match[1].toLowerCase().replace(/\s+/g, '_');
+    if (attr === 'e-mail') attr = 'email';
+    if (attr === 'phone_number' || attr === 'cell' || attr === 'cellphone' || attr === 'mobile') attr = 'phone';
+    if (attr === 'birthdate' || attr === 'date_of_birth') attr = 'birthday';
+    if (attr === 'employer') attr = 'company';
+    if (attr === 'git') attr = 'github';
+    if (attr === 'home_address' || attr === 'work_address') attr = 'address';
+    return attr;
+  }
+
+  return null;
+}
+
+/**
+ * Detect a canonical app name in the user's query so episodic search can
+ * filter by appName when the user asks about a specific app (e.g. "VS Code",
+ * "Chrome", "Slack"). This is much more reliable than BM25 keyword matching
+ * because generic terms like "Code" otherwise match many unrelated captures.
+ */
+function _extractAppNameFilter(message) {
+  const q = (message || '').toLowerCase();
+
+  const appPatterns = [
+    { aliases: ['vs code', 'visual studio code', 'vscode'], appName: 'VS Code' },
+    { aliases: ['google chrome', 'chrome'], appName: 'Google Chrome' },
+    { aliases: ['safari'], appName: 'Safari' },
+    { aliases: ['firefox'], appName: 'Firefox' },
+    { aliases: ['slack'], appName: 'Slack' },
+    { aliases: ['spotify'], appName: 'Spotify' },
+    { aliases: ['figma'], appName: 'Figma' },
+    { aliases: ['warp'], appName: 'Warp' },
+    { aliases: ['devin'], appName: 'Devin' },
+    { aliases: ['calendar'], appName: 'Calendar' },
+    { aliases: ['github'], appName: 'GitHub' },
+    { aliases: ['terminal'], appName: 'Terminal' },
+  ];
+
+  for (const { aliases, appName } of appPatterns) {
+    if (aliases.some(alias => q.includes(alias))) {
+      return appName;
+    }
+  }
+  return null;
+}
+
+/**
+ * Map a normalized personal attribute to the structured user_profile key(s)
+ * that storeMemory.js writes. Order matters — try the most specific first.
+ */
+function _profileKeysForAttribute(attribute) {
+  switch (attribute) {
+    case 'name':
+      return ['self:name', 'self:first_name'];
+    case 'email':
+      return ['self:email'];
+    case 'phone':
+      return ['self:phone'];
+    case 'address':
+      return ['self:address', 'self:work_address'];
+    case 'birthday':
+      return ['self:birthday'];
+    case 'location':
+      return ['self:location'];
+    case 'timezone':
+      return ['self:timezone'];
+    case 'company':
+      return ['self:company', 'self:occupation'];
+    case 'occupation':
+      return ['self:occupation', 'self:company'];
+    case 'github':
+      return ['self:github'];
+    case 'language':
+      return ['self:language'];
+    case 'username':
+      return ['self:username'];
+    default:
+      return [`self:${attribute}`];
+  }
+}
+
 module.exports = async function retrieveMemory(state) {
   const { mcpAdapter, message, resolvedMessage, context, intent } = state;
   const logger = state.logger || console;
@@ -155,6 +251,31 @@ module.exports = async function retrieveMemory(state) {
 
     logger.debug(`[Node:RetrieveMemory] Search query: "${searchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | minSimilarity: ${minSimilarity}`);
 
+    // ── Primary profile lookup for personal-attribute queries ───────────────
+    // Before running noisy semantic search across thousands of screen captures,
+    // check the structured user_profile KV store for known personal attributes.
+    let profileFallback = null;
+    const personalAttribute = _detectPersonalAttribute(resolvedMessage || message);
+    if (personalAttribute && !dateRange) {
+      const profileKeys = _profileKeysForAttribute(personalAttribute);
+      for (const key of profileKeys) {
+        try {
+          const profileRes = await mcpAdapter.callService('user-memory', 'profile.get', {
+            key,
+            userId: context?.userId,
+          }, { timeoutMs: 4000 });
+          const profileData = profileRes?.data || profileRes;
+          if (profileData?.valueRef) {
+            profileFallback = { key, value: profileData.valueRef, attribute: personalAttribute };
+            logger.info(`[Node:RetrieveMemory] Profile primary hit: ${key} = "${profileData.valueRef}"`);
+            break;
+          }
+        } catch (e) {
+          logger.debug(`[Node:RetrieveMemory] profile.get "${key}" failed: ${e.message}`);
+        }
+      }
+    }
+
     // Parallel fetch: current session history + cross-session date query + long-term memories
     // For multi-intent pipelines (step 2+), reduce the history limit so prior steps'
     // logged answers don't bleed into the current step's LLM context.
@@ -167,7 +288,11 @@ module.exports = async function retrieveMemory(state) {
       logger.debug(`[Node:RetrieveMemory] Multi-intent step ${completedIntentSteps + 1}: capping history to ${conversationHistoryLimit} msgs (avoids prior-step answer bleed)`);
     }
 
-    const [conversationResult, crossSessionResult, memoriesResult] = await Promise.all([
+    // Extract a canonical app name from the query so episodic search can filter
+    // exactly when the user asks about a specific app (e.g. "VS Code yesterday").
+    const episodicAppName = _extractAppNameFilter(resolvedMessage || message);
+
+    const [conversationResult, crossSessionResult, memoriesResult, episodicResult] = await Promise.all([
       // Current session conversation history
       context?.sessionId
         ? mcpAdapter.callService('conversation', 'message.list', {
@@ -193,16 +318,40 @@ module.exports = async function retrieveMemory(state) {
           })
         : Promise.resolve({ messages: [] }),
 
-      // Long-term memories (skip for meta-questions)
+      // Semantic memory search (skip for meta-questions; screen captures live in episodic_memory)
+      // For personal-attribute queries, exclude screen_capture noise so the
+      // semantic search only scans user-declared facts.
       intent?.type !== 'context_query'
         ? mcpAdapter.callService('user-memory', 'memory.search', {
             query: searchQuery,
             limit: 10,
             userId: context?.userId,
             minSimilarity,
-            ...(dateRange || {})
+            filters: personalAttribute
+              ? { excludeTypes: ['screen_capture'] }
+              : {}
           }).catch(err => {
             logger.warn('[Node:RetrieveMemory] Memory search failed:', err.message);
+            return { results: [] };
+          })
+        : Promise.resolve({ results: [] }),
+
+      // Episodic memory search for date-range activity / screen capture queries
+      dateRange && intent?.type !== 'context_query'
+        ? mcpAdapter.callService('user-memory', 'episodic.search', {
+            query: searchQuery,
+            limit: 10,
+            userId: context?.userId,
+            startDate: dateRange.startDate,
+            endDate: dateRange.endDate,
+            filters: {
+              type: 'screen_capture',
+              excludeOverlay: true,
+              ...(episodicAppName ? { appName: episodicAppName } : {})
+            },
+            dedup: true
+          }).catch(err => {
+            logger.warn('[Node:RetrieveMemory] Episodic search failed:', err.message);
             return { results: [] };
           })
         : Promise.resolve({ results: [] })
@@ -212,6 +361,18 @@ module.exports = async function retrieveMemory(state) {
     const conversationData = conversationResult.data || conversationResult;
     const crossSessionData = crossSessionResult.data || crossSessionResult;
     const memoriesData = memoriesResult.data || memoriesResult;
+    const episodicData = episodicResult.data || episodicResult;
+
+    // Merge episodic screen captures into memory results for date-range queries
+    if (episodicData?.results?.length > 0) {
+      const seenIds = new Set((memoriesData.results || []).map(m => m.id));
+      for (const e of episodicData.results) {
+        if (!seenIds.has(e.id)) {
+          (memoriesData.results || []).push(e);
+          seenIds.add(e.id);
+        }
+      }
+    }
 
     if (crossSessionData.messages?.length > 0) {
       logger.debug(`[Node:RetrieveMemory] Cross-session fetch: ${crossSessionData.messages.length} messages from date range`);
@@ -269,29 +430,6 @@ module.exports = async function retrieveMemory(state) {
     });
 
     logger.debug(`[Node:RetrieveMemory] Loaded ${conversationHistory.length} messages, ${memories.length} memories`);
-
-    // ── Profile.get fallback ──────────────────────────────────────────────────
-    // When semantic search returns nothing and it looks like a personal attribute
-    // query, try the profile KV store directly.
-    let profileFallback = null;
-    if (memories.length === 0 && !dateRange) {
-      const profileKeyMatch = (resolvedMessage || message || '').match(
-        /\b(?:my|what(?:'s| is) my)\s+(name|email|username|favorite\s*\w+|birthday|location|timezone|phone|occupation|job|company|github|language)\b/i
-      );
-      if (profileKeyMatch) {
-        const profileKey = profileKeyMatch[1].toLowerCase().replace(/\s+/g, '_');
-        try {
-          const profileRes = await mcpAdapter.callService('user-memory', 'profile.get', { key: profileKey });
-          const profileData = profileRes?.data || profileRes;
-          if (profileData?.value) {
-            profileFallback = { key: profileKey, value: profileData.value };
-            logger.debug(`[Node:RetrieveMemory] Profile fallback hit: ${profileKey} = "${profileData.value}"`);
-          }
-        } catch (e) {
-          logger.debug(`[Node:RetrieveMemory] Profile.get fallback failed: ${e.message}`);
-        }
-      }
-    }
 
     // ── Cross-session semantic search fallback ──────────────────────────────────
     // When no memories found and query looks like "what was that conversation about X",

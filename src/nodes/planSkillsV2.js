@@ -271,7 +271,7 @@ function _buildSystemPrompt(userMessage, state) {
   const base = _loadPromptFile(baseFile) || _loadPromptFile('plan-skills.md');
   if (!base) return null;
 
-  let result = base;
+  let result = `## PRIMACY RULE\nThe CURRENT USER REQUEST below is the source of truth. Prior conversation and screen context are provided ONLY for pronoun resolution ("it", "that", "this"). If the current request names a specific task, service, or topic, plan for THAT task — do not continue prior tasks.\n\n` + base;
   const appendices = [];
 
   // Domain appendices are appended in skill-preference order: shell/CLI → app → browser.
@@ -379,8 +379,15 @@ function _buildSystemPrompt(userMessage, state) {
   // Inject live screen context so the planner knows which app is actually active.
   // _screenContextNote is built by resolveReferencesV2 from getRecentOcr and contains
   // the real focused app name, category, window title, and URL (if any).
+  // Skip when the active window is ThinkDrop itself — the window title may contain
+  // plan file names that leak stale context into the planning prompt.
   const _screenNote = state._screenContextNote;
-  if (_screenNote && typeof _screenNote === 'string' && _screenNote.length > 0) {
+  const _screenIsStale = state._priorScreenContext && (
+    state._priorScreenContext.appName === 'Electron' ||
+    state._priorScreenContext.appName === 'ThinkDrop' ||
+    (state._priorScreenContext.windowTitle || '').toLowerCase().includes('thinkdrop —')
+  );
+  if (_screenNote && !_screenIsStale && typeof _screenNote === 'string' && _screenNote.length > 0) {
     result += `\n\n## ACTIVE SCREEN CONTEXT (live — use this app as the target for screen-related tasks)\n\n${_screenNote}`;
   }
 
@@ -736,7 +743,7 @@ async function planSkillsV2(state) {
   // ── Conversation history context ──────────────────────────────────────────
   let conversationNote = '';
   if (conversationHistory && conversationHistory.length > 0) {
-    const recentTurns = conversationHistory.slice(-10);
+    const recentTurns = conversationHistory.slice(-5);
     const systemEvents = conversationHistory.filter(m => m.role === 'system' || m.sender === 'system').slice(-5);
     let systemNote = '';
     if (systemEvents.length > 0) {
