@@ -637,6 +637,45 @@ describe('_extractTargetName — entity PERSON only, no regex fallback', () => {
   });
 });
 
+// ── Plan cache context helpers (from utils/planCacheHelpers.js) ──────────────
+const {
+  extractPlanContext,
+  getCurrentBrowserContext,
+  contextMismatch,
+  findHardcodedDesktopFilename,
+  suggestFilenameFromTitle,
+} = require('../src/utils/planCacheHelpers');
+
+describe('planCacheHelpers — context mismatch detection', () => {
+  const PLAN_CONTENT = 'original_prompt: "I need you to copy all the text on this site and paste it into a textedit file and save to my desktop (Context from prior turn: Safety Comparison Shenzhen vs Hong Kong - Google Search)"';
+
+  it('extractPlanContext parses the original prompt and context title', () => {
+    const ctx = extractPlanContext(PLAN_CONTENT);
+    expect(ctx.title).toBe('Safety Comparison Shenzhen vs Hong Kong');
+  });
+
+  it('contextMismatch returns true when the page title changes', () => {
+    const planCtx = extractPlanContext(PLAN_CONTENT);
+    const currentCtx = getCurrentBrowserContext({ _priorScreenContext: { windowTitle: 'SpaceX IPO - Google Search' } });
+    expect(contextMismatch(planCtx, currentCtx)).toBe(true);
+  });
+
+  it('contextMismatch returns false when the page title is the same', () => {
+    const planCtx = extractPlanContext(PLAN_CONTENT);
+    const currentCtx = getCurrentBrowserContext({ _priorScreenContext: { windowTitle: 'Safety Comparison Shenzhen vs Hong Kong - Google Search' } });
+    expect(contextMismatch(planCtx, currentCtx)).toBe(false);
+  });
+
+  it('findHardcodedDesktopFilename returns the desktop path', () => {
+    const plan = [{ skill: 'shell.run', args: { goal: 'pbpaste > ~/Desktop/Safety_Comparison_Shenzhen_vs_Hong_Kong.txt' } }];
+    expect(findHardcodedDesktopFilename(plan)).toBe('~/Desktop/Safety_Comparison_Shenzhen_vs_Hong_Kong.txt');
+  });
+
+  it('suggestFilenameFromTitle derives a safe filename from the title', () => {
+    expect(suggestFilenameFromTitle('SpaceX IPO - Google Search')).toBe('spacex_ipo.txt');
+  });
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 console.log('\n' + '='.repeat(70));
 console.log('  TEST SUMMARY');

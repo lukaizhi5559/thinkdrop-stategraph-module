@@ -56,9 +56,16 @@ Field rules:
   - "query": question, lookup, retrieve memory, general knowledge — includes asking about or locating UI elements in a desktop app ("show me where X is in Slack", "where is the toolbar in Figma"). Use for tasks that ask to find, describe, or explain something without sending or modifying anything. NOT "query" when the task is an imperative action ON the screen (highlight, scroll, capture, monitor, annotate) — those are "local_system". NOT "query" when the task explicitly asks to use an app's AI assistant — those are "app_automation".
   - "ambiguous": genuinely unclear even with history
 
-- isFollowUp: true when message contains "that folder", "it", "the file", "there", "that one", "the result", "that directory", "that script", "that code", "that python", "the previous", or any pronoun/demonstrative referring to something established in RECENT CONVERSATION
+- isFollowUp: true when the message refers to something established in RECENT CONVERSATION via any of these signal CATEGORIES (examples are illustrative, not exhaustive):
+  1. Pronouns & demonstratives: it, this, that, these, those, they, them, one, same, such, the former, the latter, there, here
+  2. Definite-article references to prior context: "the file", "the folder", "the result", "the script", "the code", "the project", "the email", "the document", "the previous [X]", "the above", "that [X]" (e.g. "that folder", "that python", "that directory")
+  3. Temporal/additive continuation signals: "now [action]" (e.g. "now email that"), "also", "as well", "too", "what about [X]", "how about [X]"
+  If the message uses ANY word/phrase that refers back to something established in RECENT CONVERSATION, set isFollowUp:true — even if the specific word is not listed above.
+  - META-QUESTION EXCEPTION: Set isFollowUp to FALSE when the user is asking ABOUT THE CONVERSATION ITSELF — i.e., meta-questions that request the assistant to inspect, recall, or summarize prior turns of the chat transcript. Signals: "what did I (just) ask", "what did I say", "what did we talk about", "what was my last question", "what did you just say", "what did I ask you (two messages ago / earlier / before)", "summarize our conversation", "what have we been discussing", "repeat what I said". These are NOT topic continuations — they are requests to read the transcript. Do NOT resolve a followUpTarget for these.
 
 - followUpTarget: if isFollowUp is true AND recent conversation clearly shows what it refers to, provide the resolved concrete subject. This includes: a file path from a prior command, a topic/subject discussed (e.g. "Vietnam weather", "the Python script", "SpaceX stock"), a named entity, or any other concrete referent established in the conversation. Set to null only when the referent genuinely cannot be determined from history.
+  - CRITICAL: Set followUpTarget to null when isFollowUp is false (including the META-QUESTION EXCEPTION above). A non-null followUpTarget with isFollowUp=false is invalid.
+  - Never set followUpTarget to the user's own prior message text when the user is asking ABOUT that message (e.g., "what did I just ask" → followUpTarget must be null, NOT "what did I just ask").
 
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
   - WHO to send to (messaging tasks with no recipient anywhere)
@@ -97,6 +104,20 @@ Field rules:
   3. isFollowUp is true (message uses deictic terms or refers to something from context without naming it) OR taskType is "ambiguous"
   This means: the user is referring to something they see on screen, but we have no cached screen data — we need to grab it.
   Set false when isScreenFollowUp is already true (we already have context), or when followUpTarget is already resolved from conversation history, or when the message has a concrete named subject.
+
+EXAMPLES (meta-questions — isFollowUp MUST be false, followUpTarget MUST be null):
+  User: "what did I just ask you two messages ago" → {"taskType":"query","isFollowUp":false,"followUpTarget":null}
+  User: "what have we been talking about" → {"taskType":"query","isFollowUp":false,"followUpTarget":null}
+  User: "what did I say earlier" → {"taskType":"query","isFollowUp":false,"followUpTarget":null}
+  User: "summarize our conversation" → {"taskType":"query","isFollowUp":false,"followUpTarget":null}
+
+EXAMPLES (genuine follow-ups — isFollowUp true, followUpTarget resolved):
+  User: "what about that" (after discussing Vietnam weather) → {"taskType":"query","isFollowUp":true,"followUpTarget":"Vietnam weather"}
+  User: "email it to me" (after retrieving family info) → {"taskType":"messaging","isFollowUp":true,"followUpTarget":"family info"}
+  User: "open that folder" (after listing ~/Downloads) → {"taskType":"local_file","isFollowUp":true,"followUpTarget":"~/Downloads"}
+  User: "what are they about" (after retrieving memories) → {"taskType":"query","isFollowUp":true,"followUpTarget":"retrieved memories"}
+  User: "now email that to me" (after retrieving info) → {"taskType":"messaging","isFollowUp":true,"followUpTarget":"retrieved info"}
+  User: "I need the links for these as well" (after listing videos) → {"taskType":"query","isFollowUp":true,"followUpTarget":"video links"}
 
 No explanation. No markdown. Only the JSON object.`;
 
