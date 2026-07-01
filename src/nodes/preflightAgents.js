@@ -10,8 +10,13 @@
  *   3. Agent registry + trained recipes (agent.list + trainer.agent)
  *   4. Installed skills list
  *   5. Disk-scan fallback for trained recipes
- *   6. Browser agent auth check (session profile exists?)
+ *   6. Browser agent auth check (session profile exists + cookie validity?)
  *   7. App agent build (app.agent build_agent — Phase 2)
+ *   8. vet CLI presence check (secure script installer)
+ *   9. Monthly CLI version validation (timestamp-gated, calls validate_agent)
+ *  10. MCP service health ping
+ *  11. PATH health check
+ *  12. Stale agent detection (registered agent whose CLI is gone)
  *
  * Emits progress events with agent favicon icons for visual UI feedback.
  * When auth is needed, emits preflight:auth_required so UI can route user to AgentsTab.
@@ -28,12 +33,55 @@
  *     trainedRecipeMap,       // { variant: { agentId, skillName, agentType } }
  *     installedSkillsList,    // array
  *     agents,                 // array of readiness info with iconUrl
+ *     vetAvailable,           // boolean — vet CLI installed?
+ *     warnings,               // array of { type, message } non-fatal warnings
  *   }
  */
 
 const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
+
+// ── Preflight state file (monthly validation persistence) ────────────────────
+const PREFLIGHT_STATE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-state.json');
+const VALIDATION_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+const BROWSER_SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days for cookie staleness
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function _loadPreflightState() {
+  try {
+    if (fs.existsSync(PREFLIGHT_STATE_FILE)) {
+      return JSON.parse(fs.readFileSync(PREFLIGHT_STATE_FILE, 'utf8'));
+    }
+  } catch (_) {}
+  return { lastValidatedAt: null, cliVersions: {} };
+}
+
+function _savePrefflightState(data) {
+  try {
+    const dir = path.dirname(PREFLIGHT_STATE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(PREFLIGHT_STATE_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (_) {}
+}
+
+function _whichSync(cmd) {
+  try {
+    const { execSync } = require('child_process');
+    const p = execSync(`which ${cmd} 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+    return p || null;
+  } catch (_) {
+    for (const p of [
+      `/usr/local/bin/${cmd}`,
+      `/opt/homebrew/bin/${cmd}`,
+      `/usr/bin/${cmd}`,
+    ]) {
+      if (fs.existsSync(p)) return p;
+    }
+    return null;
+  }
+}
 
 // ── Icon resolution ──────────────────────────────────────────────────────────
 
@@ -111,6 +159,12 @@ module.exports = async function preflightAgents(state) {
   const progressCallback = state.progressCallback || null;
   const userMessage = state.resolvedMessage || state.message || '';
   const recoveryContext = state.recoveryContext || null;
+  const confirmInstallCallback = state.confirmInstallCallback || null;
+
+  // _emitProgress — safe wrapper that no-ops if progressCallback is null
+  const _emitProgress = (data) => {
+    if (progressCallback) progressCallback(data);
+  };
 
   logger.info(`[Node:PreflightAgents] Running preflight for: "${userMessage.slice(0, 80)}"`);
 
@@ -120,9 +174,7 @@ module.exports = async function preflightAgents(state) {
   }
 
   // Emit start
-  if (progressCallback) {
-    progressCallback({ type: 'preflight:start', message: 'Preparing agents for your task...' });
-  }
+  _emitProgress({ type: 'preflight:start', message: 'Preparing agents for your task...' });
 
   // Initialize result containers
   let skillContractNote = '';
@@ -135,6 +187,9 @@ module.exports = async function preflightAgents(state) {
   let installedSkillsList = [];
   let _trainedRecipeMap = {};
   const agentReadiness = []; // { type, agentId, ready, authed, iconUrl, ... }
+  let vetAvailable = false;
+  let vetPath = null;
+  const warnings = []; // { type, message } non-fatal warnings
 
   // ── Parallel preflight fetches ──────────────────────────────────────────────
   await Promise.all([
@@ -166,15 +221,13 @@ module.exports = async function preflightAgents(state) {
     (async () => {
       if (recoveryContext) return;
       try {
-        if (progressCallback) {
-          progressCallback({
-            type: 'preflight:building_agent',
-            agentType: 'cli',
-            agentId: 'cli.preflight',
-            message: 'Checking CLI tools and authentication...',
-            iconUrl: null, // CLI preflight is generic, no specific icon
-          });
-        }
+        _emitProgress({
+          type: 'preflight:building_agent',
+          agentType: 'cli',
+          agentId: 'cli.preflight',
+          message: 'Checking CLI tools and authentication...',
+          iconUrl: null, // CLI preflight is generic, no specific icon
+        });
 
         const pfRes = await mcpAdapter.callService('command', 'command.automate', { skill: 'cli.agent', args: { action: 'preflight_check', task: userMessage } }, { timeoutMs: 5000 }).catch(() => null);
         const pf = pfRes?.data || pfRes;
@@ -194,8 +247,8 @@ module.exports = async function preflightAgents(state) {
                 lines.push(`${c.service}: ${provider} — use browser.agent { action: 'build_agent' } then { action: 'run' }`);
                 agentReadiness.push({ type: 'cli', agentId: `${c.service}.agent`, ready: false, authed: false, iconUrl, service: c.service, reason: provider });
                 // Surface API-key or OAuth requirements to the UI during preflight.
-                if (progressCallback && (c.isApiKey || c.isOAuth)) {
-                  progressCallback({
+                if (c.isApiKey || c.isOAuth) {
+                  _emitProgress({
                     type: 'preflight:auth_required',
                     agentId: `${c.service}.agent`,
                     serviceName: c.service,
@@ -211,16 +264,14 @@ module.exports = async function preflightAgents(state) {
                 lines.push(`${c.service}: ${c.cli} NOT INSTALLED — install: ${installCmd}`);
                 agentReadiness.push({ type: 'cli', agentId: `${c.service}.agent`, ready: false, authed: false, iconUrl, service: c.service, reason: 'not installed' });
                 // Surface CLI install requirement to the UI during preflight.
-                if (progressCallback) {
-                  progressCallback({
-                    type: 'preflight:auth_required',
-                    agentId: `${c.service}.agent`,
-                    serviceName: c.service,
-                    authType: 'cli_install',
-                    iconUrl,
-                    message: `${c.service} is not installed — run: ${installCmd}`,
-                  });
-                }
+                _emitProgress({
+                  type: 'preflight:auth_required',
+                  agentId: `${c.service}.agent`,
+                  serviceName: c.service,
+                  authType: 'cli_install',
+                  iconUrl,
+                  message: `${c.service} is not installed — run: ${installCmd}`,
+                });
               } else {
                 const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : '');
                 lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
@@ -229,16 +280,14 @@ module.exports = async function preflightAgents(state) {
 
                 if (!authed) {
                   // Emit auth required for CLI token
-                  if (progressCallback) {
-                    progressCallback({
-                      type: 'preflight:auth_required',
-                      agentId: `${c.service}.agent`,
-                      serviceName: c.service,
-                      authType: 'cli_token',
-                      iconUrl,
-                      message: `${c.service} requires authentication`,
-                    });
-                  }
+                  _emitProgress({
+                    type: 'preflight:auth_required',
+                    agentId: `${c.service}.agent`,
+                    serviceName: c.service,
+                    authType: 'cli_token',
+                    iconUrl,
+                    message: `${c.service} requires authentication`,
+                  });
                 }
               }
             }
@@ -299,38 +348,81 @@ module.exports = async function preflightAgents(state) {
               }
             }
 
-            // ── Browser agent auth check ────────────────────────────────
+            // ── Browser agent auth check (session profile + cookie validity) ──
             if (a.type === 'browser') {
               const iconUrl = agentIdToIconUrl(a.id);
               const BROWSER_SESSIONS_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-sessions');
               const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
               const profileDir = `${svcKey}_agent`;
-              const hasSession = fs.existsSync(path.join(BROWSER_SESSIONS_DIR, profileDir));
+              const profilePath = path.join(BROWSER_SESSIONS_DIR, profileDir);
+              const hasSession = fs.existsSync(profilePath);
+
+              // Check cookie file age for session validity
+              let sessionStale = false;
+              if (hasSession) {
+                try {
+                  const cookieFile = path.join(profilePath, 'Cookies');
+                  if (fs.existsSync(cookieFile)) {
+                    const stat = fs.statSync(cookieFile);
+                    const ageMs = Date.now() - stat.mtimeMs;
+                    if (ageMs > BROWSER_SESSION_MAX_AGE_MS) {
+                      sessionStale = true;
+                      warnings.push({
+                        type: 'browser_session_stale',
+                        message: `${a.id} session cookies last modified ${Math.round(ageMs / (24*60*60*1000))}d ago — may need re-auth`,
+                      });
+                    }
+                  }
+                } catch (_) {}
+              }
+
+              const authed = hasSession && !sessionStale;
 
               agentReadiness.push({
                 type: 'browser',
                 agentId: a.id,
                 ready: true,
-                authed: hasSession,
+                authed,
                 iconUrl,
                 startUrl: a.start_url,
                 needsLogin: !hasSession,
+                sessionStale,
               });
 
-              if (!hasSession && a.start_url) {
-                if (progressCallback) {
-                  progressCallback({
-                    type: 'preflight:auth_required',
-                    agentId: a.id,
-                    serviceName: svcKey,
-                    authType: 'browser_oauth',
-                    iconUrl,
-                    message: `${a.id} requires browser login`,
-                  });
-                }
+              if ((!hasSession || sessionStale) && a.start_url) {
+                _emitProgress({
+                  type: 'preflight:auth_required',
+                  agentId: a.id,
+                  serviceName: svcKey,
+                  authType: sessionStale ? 'browser_reauth' : 'browser_oauth',
+                  iconUrl,
+                  message: sessionStale
+                    ? `${a.id} session may have expired — re-login recommended`
+                    : `${a.id} requires browser login`,
+                });
               }
             } else if (a.type === 'cli') {
               // CLI agents already handled in preflight_check above
+              // Stale agent detection: registered CLI agent whose CLI is no longer installed
+              const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
+              const cliInfo = _preflightCliMap[svcKey];
+              if (cliInfo && !cliInfo.hasCli) {
+                const iconUrl = agentIdToIconUrl(a.id);
+                agentReadiness.push({
+                  type: 'cli',
+                  agentId: a.id,
+                  ready: false,
+                  authed: false,
+                  iconUrl,
+                  service: svcKey,
+                  reason: 'stale — CLI no longer installed',
+                  stale: true,
+                });
+                warnings.push({
+                  type: 'stale_agent',
+                  message: `${a.id} registered but its CLI is no longer detected — consider rebuilding or removing`,
+                });
+              }
             }
           }
 
@@ -350,6 +442,234 @@ module.exports = async function preflightAgents(state) {
         const il = ilRes?.data || ilRes || [];
         if (Array.isArray(il)) installedSkillsList = il;
       } catch (_) {}
+    })(),
+
+    // ── vet CLI presence check + auto-install ────────────────────────────
+    (async () => {
+      try {
+        vetPath = _whichSync('vet');
+        vetAvailable = !!vetPath;
+
+        if (!vetAvailable) {
+          logger.info('[Node:PreflightAgents] vet CLI not found — attempting auto-install');
+
+          // Step A: Try brew install
+          const brewPath = _whichSync('brew');
+          if (brewPath) {
+            _emitProgress({
+              type: 'preflight:building_agent',
+              agentType: 'cli',
+              agentId: 'vet',
+              message: 'Installing vet CLI via Homebrew...',
+              iconUrl: null,
+            });
+            try {
+              const { execSync } = require('child_process');
+              execSync('brew tap vet-run/vet', { encoding: 'utf8', timeout: 30000, stdio: 'pipe' });
+              execSync('brew install vet-run', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
+              vetPath = _whichSync('vet');
+              vetAvailable = !!vetPath;
+              if (vetAvailable) {
+                logger.info(`[Node:PreflightAgents] vet CLI installed via brew at ${vetPath}`);
+              }
+            } catch (brewErr) {
+              logger.warn(`[Node:PreflightAgents] vet brew install failed: ${brewErr.message}`);
+            }
+          }
+
+          // Step B: Script download + UI approval (brew unavailable or failed)
+          if (!vetAvailable) {
+            const { execSync } = require('child_process');
+            const tmpFile = path.join(os.tmpdir(), `vet-install-${Date.now()}.sh`);
+            try {
+              execSync(`curl -fsSL https://getvet.sh/install.sh -o ${tmpFile}`, { encoding: 'utf8', timeout: 15000, stdio: 'pipe' });
+              const scriptContent = fs.readFileSync(tmpFile, 'utf8');
+
+              if (confirmInstallCallback) {
+                _emitProgress({
+                  type: 'preflight:vet_script_review',
+                  scriptContent,
+                  scriptUrl: 'https://getvet.sh/install.sh',
+                  tempPath: tmpFile,
+                  message: 'vet CLI requires manual installation. Please review the install script below.',
+                });
+                const approved = await confirmInstallCallback('vet');
+                if (approved) {
+                  _emitProgress({
+                    type: 'preflight:building_agent',
+                    agentType: 'cli',
+                    agentId: 'vet',
+                    message: 'Installing vet CLI from reviewed script...',
+                    iconUrl: null,
+                  });
+                  execSync(`sh ${tmpFile}`, { encoding: 'utf8', timeout: 60000, stdio: 'pipe' });
+                  vetPath = _whichSync('vet');
+                  vetAvailable = !!vetPath;
+                  if (vetAvailable) {
+                    logger.info(`[Node:PreflightAgents] vet CLI installed via script at ${vetPath}`);
+                  } else {
+                    logger.warn('[Node:PreflightAgents] vet script install completed but vet not found in PATH');
+                  }
+                } else {
+                  logger.info('[Node:PreflightAgents] User declined vet script install');
+                }
+              } else {
+                // No callback available (bridge mode, etc.) — skip auto-install
+                logger.info('[Node:PreflightAgents] No confirmInstallCallback — cannot prompt for vet script approval');
+              }
+            } catch (scriptErr) {
+              logger.warn(`[Node:PreflightAgents] vet script download/install failed: ${scriptErr.message}`);
+            } finally {
+              try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (_) {}
+            }
+          }
+
+          // Step C: Fallback warning if still not installed
+          if (!vetAvailable) {
+            warnings.push({
+              type: 'vet_not_installed',
+              message: 'vet CLI not installed — secure script installation unavailable. Install with: brew tap vet-run/vet && brew install vet-run',
+            });
+            _emitProgress({
+              type: 'preflight:auth_required',
+              agentId: 'vet',
+              serviceName: 'vet',
+              authType: 'cli_install',
+              iconUrl: null,
+              message: 'vet CLI not installed — recommended for secure installations: brew tap vet-run/vet && brew install vet-run',
+            });
+          }
+        }
+
+        logger.info(`[Node:PreflightAgents] vet CLI: ${vetAvailable ? 'installed at ' + vetPath : 'NOT INSTALLED'}`);
+      } catch (vetBlockErr) {
+        logger.warn(`[Node:PreflightAgents] vet auto-install block error: ${vetBlockErr.message}`);
+      }
+    })(),
+
+    // ── MCP service health check ─────────────────────────────────────────
+    (async () => {
+      try {
+        const services = ['command', 'user-memory'];
+        for (const svc of services) {
+          try {
+            await mcpAdapter.callService(svc, 'ping', {}, { timeoutMs: 2000 });
+          } catch (pingErr) {
+            const isTimeout = pingErr?.message?.includes('timeout') || pingErr?.code === 'TIMEOUT';
+            if (!isTimeout) {
+              // Service responded with error — it's alive but unhealthy
+              warnings.push({
+                type: 'mcp_unhealthy',
+                message: `MCP service "${svc}" responded with error: ${pingErr.message?.slice(0, 100)}`,
+              });
+            }
+            // Timeout = service may be down — already caught by .catch(() => null) in each block
+          }
+        }
+      } catch (_) {}
+    })(),
+
+    // ── PATH health check ────────────────────────────────────────────────
+    (async () => {
+      try {
+        const envPath = process.env.PATH || '';
+        const criticalPaths = ['/usr/local/bin', '/opt/homebrew/bin'];
+        const missing = criticalPaths.filter(p => !envPath.includes(p));
+        if (missing.length > 0) {
+          warnings.push({
+            type: 'path_issue',
+            message: `PATH missing critical directories: ${missing.join(', ')}. Some CLIs may not be found.`,
+          });
+          logger.warn(`[Node:PreflightAgents] PATH missing: ${missing.join(', ')}`);
+        }
+      } catch (_) {}
+    })(),
+
+    // ── Monthly CLI version validation ───────────────────────────────────
+    (async () => {
+      if (recoveryContext) return;
+      try {
+        const pfState = _loadPreflightState();
+        const now = Date.now();
+        const lastVal = pfState.lastValidatedAt ? new Date(pfState.lastValidatedAt).getTime() : 0;
+        const needsValidation = (now - lastVal) > VALIDATION_INTERVAL_MS;
+
+        if (!needsValidation) {
+          logger.info(`[Node:PreflightAgents] Monthly validation skipped — last validated ${pfState.lastValidatedAt}`);
+          return;
+        }
+
+        _emitProgress({
+          type: 'preflight:building_agent',
+          agentType: 'cli',
+          agentId: 'cli.validation',
+          message: 'Monthly CLI validation running...',
+          iconUrl: null,
+        });
+
+        // Get current CLI versions from preflight_check
+        const pfRes = await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'cli.agent',
+          args: { action: 'preflight_check', task: userMessage },
+        }, { timeoutMs: 8000 }).catch(() => null);
+        const pf = pfRes?.data || pfRes;
+        if (!pf?.ok || !Array.isArray(pf.detectedClis)) {
+          logger.warn('[Node:PreflightAgents] Monthly validation: preflight_check returned no data');
+          return;
+        }
+
+        const currentVersions = {};
+        const driftedClis = [];
+        for (const c of pf.detectedClis) {
+          if (c.installed && c.cli && c.version) {
+            const svcKey = c.service.toLowerCase();
+            currentVersions[svcKey] = c.version;
+            const prevVersion = pfState.cliVersions?.[svcKey];
+            if (prevVersion && prevVersion !== c.version) {
+              driftedClis.push({ service: svcKey, cli: c.cli, oldVersion: prevVersion, newVersion: c.version });
+            }
+          }
+        }
+
+        // For each drifted CLI, call validate_agent to check health
+        for (const drifted of driftedClis) {
+          const agentId = `${drifted.service}.agent`;
+          const iconUrl = serviceToIconUrl(drifted.service);
+          logger.info(`[Node:PreflightAgents] Version drift: ${drifted.cli} ${drifted.oldVersion} → ${drifted.newVersion}`);
+          try {
+            const valRes = await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'cli.agent',
+              args: { action: 'validate_agent', id: agentId },
+            }, { timeoutMs: 30000 }).catch(() => null);
+            const val = valRes?.data || valRes;
+            if (val?.verdict && val.verdict !== 'healthy') {
+              _emitProgress({
+                type: 'preflight:auth_required',
+                agentId,
+                serviceName: drifted.service,
+                authType: 'cli_update_needed',
+                iconUrl,
+                message: `${drifted.cli} updated (${drifted.oldVersion} → ${drifted.newVersion}) — validation: ${val.verdict}`,
+              });
+              warnings.push({
+                type: 'cli_version_drift',
+                message: `${drifted.cli} (${drifted.service}): ${drifted.oldVersion} → ${drifted.newVersion} — validate_agent: ${val.verdict}`,
+              });
+            }
+          } catch (valErr) {
+            logger.warn(`[Node:PreflightAgents] validate_agent failed for ${agentId}: ${valErr.message}`);
+          }
+        }
+
+        // Update state file with current versions + timestamp
+        _savePrefflightState({
+          lastValidatedAt: new Date().toISOString(),
+          cliVersions: { ...pfState.cliVersions, ...currentVersions },
+        });
+        logger.info(`[Node:PreflightAgents] Monthly validation complete: ${Object.keys(currentVersions).length} CLIs checked, ${driftedClis.length} drifted`);
+      } catch (valErr) {
+        logger.warn(`[Node:PreflightAgents] Monthly validation error: ${valErr.message}`);
+      }
     })(),
   ]);
 
@@ -450,21 +770,22 @@ module.exports = async function preflightAgents(state) {
     trainedRecipeMap: _trainedRecipeMap,
     installedSkillsList,
     agents: agentReadiness,
+    vetAvailable,
+    warnings,
   };
 
   // Emit complete
-  if (progressCallback) {
-    progressCallback({
-      type: 'preflight:complete',
-      agents: agentReadiness.map(a => ({
-        type: a.type,
-        agentId: a.agentId,
-        ready: a.ready,
-        authed: a.authed,
-        iconUrl: a.iconUrl,
-      })),
-    });
-  }
+  _emitProgress({
+    type: 'preflight:complete',
+    agents: agentReadiness.map(a => ({
+      type: a.type,
+      agentId: a.agentId,
+      ready: a.ready,
+      authed: a.authed,
+      iconUrl: a.iconUrl,
+    })),
+    warnings,
+  });
 
   logger.info(`[Node:PreflightAgents] Preflight complete: ${agentReadiness.length} agents checked, ${agentReadiness.filter(a => !a.ready).length} not ready, ${agentReadiness.filter(a => !a.authed).length} need auth`);
 
