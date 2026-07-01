@@ -42,7 +42,6 @@ const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
 const planSkillsNode = require('./nodes/planSkillsV2');
-const recoverSkillNode = require('./nodes/recoverSkill');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
 
@@ -78,7 +77,6 @@ module.exports = {
     webSearch: webSearchNode,
     executeCommand: executeCommandNode,
     planSkills: planSkillsNode,
-    recoverSkill: recoverSkillNode,
     screenIntelligence: screenIntelligenceNode,
     logConversation: logConversationNode
   }

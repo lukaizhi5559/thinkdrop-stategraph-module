@@ -217,6 +217,47 @@ function _readAppDescriptorForPlanner(appName) {
 
 const _URL_RE = /https?:\/\/\S+/i;
 
+// ---------------------------------------------------------------------------
+// CLI registry keyword detection — used to decide whether to append the
+// CLI-first appendix. Reads the same cli-registry.json that cli.agent.cjs
+// loads, so phrases like "convert to pdf" trigger CLI-first planning.
+// ---------------------------------------------------------------------------
+
+function _loadCliRegistryForConversionDetection() {
+  try {
+    let dir = __dirname;
+    for (let i = 0; i < 8; i++) {
+      const candidate = path.join(dir, 'mcp-services', 'command-service', 'src', 'cli-registry.json');
+      if (fs.existsSync(candidate)) {
+        return JSON.parse(fs.readFileSync(candidate, 'utf8'));
+      }
+      dir = path.dirname(dir);
+    }
+  } catch (_) {}
+  return null;
+}
+
+function _registryKeywordMatch(userMessage) {
+  const registry = _loadCliRegistryForConversionDetection();
+  if (!registry) return false;
+  const msg = userMessage.toLowerCase();
+  for (const serviceDef of Object.values(registry)) {
+    const keywords = Array.isArray(serviceDef.keywords) ? serviceDef.keywords : [];
+    if (keywords.some(k => k && msg.includes(k.toLowerCase()))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// If preflight already detected a CLI tool (registry, seed map, or LLM-discovered),
+// make sure the planner loads the CLI-first appendix.
+function _preflightImpliesCli(state) {
+  const map = state?.preflightResult?.preflightCliMap;
+  if (!map || typeof map !== 'object') return false;
+  return Object.values(map).some(entry => entry?.hasCli);
+}
+
 function _buildSystemPrompt(userMessage, state) {
   const isWindows = process.platform === 'win32';
 
@@ -263,7 +304,9 @@ function _buildSystemPrompt(userMessage, state) {
     || _tc?.targetService?.startsWith('cli:')
     || ['gh', 'aws', 'yt-dlp', 'ffmpeg', 'pandoc', 'imagemagick'].some(t =>
       userMessage.toLowerCase().includes(t)
-    );
+    )
+    || _registryKeywordMatch(userMessage)
+    || _preflightImpliesCli(state);
 
   const _isMacOS = process.platform === 'darwin';
 
@@ -827,7 +870,10 @@ async function planSkillsV2(state) {
     } catch (_) {}
   }
 
-  // ── Parallel pre-LLM fetches ──────────────────────────────────────────────
+  // ── Read preflight results from preflightAgents node ──────────────────────
+  // preflightAgents node runs between gatherPlanContext → planSkills and populates
+  // state.preflightResult with skill contracts, CLI checks, agent registry, trained recipes.
+  // Fallback: if preflightResult is missing (e.g. recovery path skipped preflight), do inline fetch.
   let skillContractNote = '';
   let _shellContractMd = null;
   let _preflightCliMap = {};
@@ -836,9 +882,28 @@ async function planSkillsV2(state) {
   let _registeredAgentServiceMap = {};
   const shellSkillNames = new Set();
   let installedSkillsList = [];
-  let _trainedRecipeMap = {}; // hoisted for fast-path access after Promise.all
+  let _trainedRecipeMap = {};
 
-  if (mcpAdapter) {
+  if (state.preflightResult) {
+    // ── Fast path: use preflightAgents results ──────────────────────────────
+    const pf = state.preflightResult;
+    skillContractNote = pf.skillContractNote || '';
+    _shellContractMd = pf.shellContractMd || null;
+    cliPreflightNote = pf.cliPreflightNote || '';
+    agentContextNote = pf.agentContextNote || '';
+    _preflightCliMap = pf.preflightCliMap || {};
+    _registeredAgentServiceMap = pf.registeredAgentServiceMap || {};
+    _trainedRecipeMap = pf.trainedRecipeMap || {};
+    installedSkillsList = pf.installedSkillsList || [];
+    for (const name of (pf.shellSkillNames || [])) shellSkillNames.add(name);
+    const mapSize = Object.keys(_trainedRecipeMap).length;
+    logger.info(`[Node:PlanSkillsV2] Preflight result found: ${mapSize} recipe variants, ${Object.keys(_registeredAgentServiceMap).length} registered agents`);
+    if (mapSize > 0) {
+      state._trainedRecipeMap = _trainedRecipeMap;
+    }
+  } else if (mcpAdapter) {
+    // ── Fallback: inline preflight fetches (recovery path or skipped preflight) ──
+    logger.info('[Node:PlanSkillsV2] No preflightResult — running inline preflight fetches');
     await Promise.all([
       // ── Skill contract ────────────────────────────────────────────────────
       (async () => {
@@ -851,8 +916,6 @@ async function planSkillsV2(state) {
             const _fmMatch = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
             const _isNodeSkill = _fmMatch && /exec_type:\s*node\b/i.test(_fmMatch[1]);
             const _isPythonSkill = _fmMatch && /exec_type:\s*python\b/i.test(_fmMatch[1]);
-            // Shell contract: exec_type:shell where exec_path points to a .md file
-            // (defines curl/bash commands inline). Node and Python skills run via external.skill.
             const _isShellContract = !_isNodeSkill && !_isPythonSkill;
             if (_isNodeSkill || _isPythonSkill) {
               const _runtimeType = _isPythonSkill ? 'Python' : 'Node.js';
@@ -915,7 +978,6 @@ async function planSkillsV2(state) {
               const svc = (a.id || '').replace('.agent', '').toLowerCase();
               if (svc) _registeredAgentServiceMap[svc] = a.id;
 
-              // ── Fetch trained recipes for this agent ─────────────────────
               if (a.type === 'browser' || a.type === 'cli') {
                 try {
                   const tsRes = await mcpAdapter.callService('command', 'command.automate', {
@@ -928,7 +990,6 @@ async function planSkillsV2(state) {
                     const agentTypeSkill = a.type === 'cli' ? 'cli.agent' : 'browser.agent';
                     trainedRecipeLines.push(`- ${a.id}: [${skillNames}] → use ${agentTypeSkill} { action: "run", agentId: "${a.id}" }`);
 
-                    // Build fuzzy matching map
                     for (const s of skills) {
                       const baseName = s.name.toLowerCase();
                       const variants = [
@@ -937,7 +998,7 @@ async function planSkillsV2(state) {
                         baseName.replace(/\./g, ' '),
                         baseName.replace(/_/g, ' '),
                         baseName.replace(/\./g, '_'),
-                        baseName.replace(/^[^.]+\./, ''), // remove domain prefix (e.g., "theeditor")
+                        baseName.replace(/^[^.]+\./, ''),
                       ];
                       for (const v of variants) {
                         if (!_trainedRecipeMap[v]) {
@@ -970,11 +1031,8 @@ async function planSkillsV2(state) {
         } catch (_) {}
       })(),
     ]);
-    
-    // ── Disk-scan fallback: load recipes directly from filesystem ────────────
-    // Runs after trainer.agent pass regardless of success. Merges in any recipe
-    // not already present (trainer.agent data takes priority). This ensures the
-    // fast-path works even when agents.db is locked and agent.list returns [].
+
+    // ── Disk-scan fallback ────────────────────────────────────────────────────
     try {
       const skillsRoot = path.join(os.homedir(), '.thinkdrop', 'skills');
       if (fs.existsSync(skillsRoot)) {
@@ -992,7 +1050,7 @@ async function planSkillsV2(state) {
               const recipe = JSON.parse(fs.readFileSync(path.join(recipeDir, recipeFile), 'utf8'));
               if (!recipe.name) continue;
               const inferredAgentId = recipe.agentId || `${agentDir}.agent`;
-              const agentType = 'browser.agent'; // recipes are always browser-based
+              const agentType = 'browser.agent';
               const baseName = recipe.name.toLowerCase();
               const variants = [
                 baseName,
@@ -1000,7 +1058,7 @@ async function planSkillsV2(state) {
                 baseName.replace(/\./g, ' '),
                 baseName.replace(/_/g, ' '),
                 baseName.replace(/\./g, '_'),
-                baseName.replace(/^[^.]+\./, ''), // no-prefix: "w3schools.theeditor" → "theeditor"
+                baseName.replace(/^[^.]+\./, ''),
               ];
               for (const v of variants) {
                 if (!_trainedRecipeMap[v]) {
@@ -1019,7 +1077,6 @@ async function planSkillsV2(state) {
       logger.warn(`[Node:PlanSkillsV2] Disk-scan fallback error: ${diskErr.message}`);
     }
 
-    // After parallel fetches + disk-scan, save trained recipe map to state for fast-path
     const mapSize = Object.keys(_trainedRecipeMap).length;
     logger.info(`[Node:PlanSkillsV2] Trained recipe map built: ${mapSize} variants`);
     if (mapSize > 0) {

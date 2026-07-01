@@ -18,7 +18,6 @@ const storeMemoryNode = require('./nodes/storeMemory');
 const webSearchNode = require('./nodes/webSearch');
 const executeCommandNode = require('./nodes/executeCommand');
 const planSkillsNode = require('./nodes/planSkillsV2');
-const recoverSkillNode = require('./nodes/recoverSkill');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
 const resolveReferencesNode = require('./nodes/resolveReferencesV2');
@@ -42,6 +41,7 @@ const executeIntrospectNode = require('./nodes/executeIntrospect');
 const executeSettingsNode = require('./nodes/executeSettings');
 const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
 const planExecutorNode = require('./nodes/planExecutor');
+const preflightAgentsNode = require('./nodes/preflightAgents');
 
 /**
  * Assess risk level of a user request using LLM classification
@@ -376,9 +376,9 @@ class StateGraphBuilder {
       mcpFillGaps: (state) => mcpFillGapsNode({ ...state, logger, mcpAdapter, llmBackend }),
       gatherContext: (state) => gatherContextNode({ ...state, logger, mcpAdapter, llmBackend }),
       creatorPlanning: (state) => creatorPlanningNode({ ...state, logger, mcpAdapter }),
+      preflightAgents: (state) => preflightAgentsNode({ ...state, logger, mcpAdapter }),
       planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter, llmBackend }),
-      recoverSkill: (state) => recoverSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       evaluateSkills: (state) => evaluateSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
       reviewExecution: (state) => reviewExecutionNode({ ...state, logger, mcpAdapter, llmBackend }),
       screenIntelligence: (state) => screenIntelligenceNode({ ...state, logger, mcpAdapter }),
@@ -637,9 +637,15 @@ class StateGraphBuilder {
       // gatherPlanContext asks up to 3 clarifying questions for ambiguous command_automate tasks.
       resolveUserContext: 'gatherPlanContext',
 
-      // gatherPlanContext: always proceeds to planSkills (Q&A handled inline via gatherAnswerCallback)
+      // gatherPlanContext: proceeds to preflightAgents (agent readiness checks) then planSkills
       gatherPlanContext: () => {
-        logger.debug('[StateGraph:Router] gatherPlanContext → planSkills');
+        logger.debug('[StateGraph:Router] gatherPlanContext → preflightAgents');
+        return 'preflightAgents';
+      },
+
+      // preflightAgents: always proceeds to planSkills (readiness data attached to state)
+      preflightAgents: () => {
+        logger.debug('[StateGraph:Router] preflightAgents → planSkills');
         return 'planSkills';
       },
 
@@ -660,7 +666,8 @@ class StateGraphBuilder {
           logger.debug('[StateGraph:Router] gatherContext grill-mode — routing to gatherPlanContext');
           return 'gatherPlanContext';
         }
-        return 'planSkills';
+        logger.debug('[StateGraph:Router] gatherContext non-grill — routing to preflightAgents');
+        return 'preflightAgents';
       },
       creatorPlanning: () => 'planSkills',
 
@@ -697,19 +704,36 @@ class StateGraphBuilder {
 
       // executeCommand cycle: next step, recover on failure, or done
       executeCommand: (state) => {
-        // Step failed — route to recovery
+        // Thin recovery handler already ran inline in executeCommand and set recoveryAction.
+        // Route based on recoveryAction instead of going through recoverSkill node.
+        if (state.recoveryAction === 'auto_patch') {
+          logger.debug('[StateGraph:Router] executeCommand: auto_patch → retry executeCommand');
+          return 'executeCommand';
+        }
+        if (state.recoveryAction === 'replan' || state.recoveryAction === 'replan_step') {
+          logger.debug(`[StateGraph:Router] executeCommand: ${state.recoveryAction} → evaluateSkills (failure judge) → planSkills`);
+          return 'evaluateSkills';
+        }
+        if (state.recoveryAction === 'ask_user') {
+          logger.debug('[StateGraph:Router] executeCommand: ask_user → logConversation');
+          return 'logConversation';
+        }
+        // Fallback: failedStep set without recoveryAction (e.g. smartFill, project.builder)
+        // Route to evaluateSkills for default recovery/replan
         if (state.failedStep) {
-          return 'recoverSkill';
+          logger.warn(`[StateGraph:Router] executeCommand: failedStep without recoveryAction → evaluateSkills (fallback)`);
+          state.recoveryAction = 'replan';
+          state.recoveryContext = { failedSkill: state.failedStep.skill, failureReason: state.failedStep.error };
+          return 'evaluateSkills';
         }
         // Scout card is waiting for user provider selection — stop looping, surface ASK_USER
-        // Also short-circuit for CLI/browser agent ask_user and needsLogin so recoverSkill is not invoked.
         if (state.scoutPending || state.pendingQuestion?._isScoutSelect || state.pendingQuestion?._isAgentAskUser) {
           return 'logConversation';
         }
-        // Plan ordering error — route to recovery instead of looping forever
+        // Plan ordering error — route to evaluateSkills for replan
         if (state.planError) {
-          logger.warn(`[StateGraph:Router] executeCommand planError → recoverSkill: ${state.planError}`);
-          return 'recoverSkill';
+          logger.warn(`[StateGraph:Router] executeCommand planError → evaluateSkills: ${state.planError}`);
+          return 'evaluateSkills';
         }
         // More steps remaining — loop back
         if (Array.isArray(state.skillPlan) && state.skillCursor < state.skillPlan.length) {
@@ -722,12 +746,14 @@ class StateGraphBuilder {
         return 'reviewExecution';
       },
 
-      // reviewExecution: FAILED → recoverSkill (hollow result replan), ASK_USER → surface to user, else → evaluateSkills
+      // reviewExecution: FAILED → evaluateSkills (hollow result replan), ASK_USER → surface to user, else → evaluateSkills
       reviewExecution: (state) => {
         const verdict = state.reviewVerdict;
         if (verdict === 'FAILED') {
-          logger.info(`[StateGraph:Router] reviewExecution FAILED → recoverSkill (hollow result — attempt REPLAN)`);
-          return 'recoverSkill';
+          logger.info(`[StateGraph:Router] reviewExecution FAILED → evaluateSkills (hollow result — attempt REPLAN)`);
+          state.recoveryAction = 'replan';
+          state.recoveryContext = { failureReason: 'Hollow result — review judged execution as FAILED' };
+          return 'evaluateSkills';
         }
         if (verdict === 'ASK_USER') {
           logger.info('[StateGraph:Router] reviewExecution ASK_USER → logConversation');
@@ -769,25 +795,6 @@ class StateGraphBuilder {
         return 'logConversation';
       },
 
-      // recoverSkill → retry step, replan (via evaluateSkills for FIX rule), or surface question to user
-      recoverSkill: (state) => {
-        const action = state.recoveryAction;
-        if (action === 'auto_patch') {
-          logger.debug('[StateGraph:Router] Recovery: auto_patch → retry executeCommand');
-          return 'executeCommand';
-        }
-        if (action === 'replan' || action === 'replan_step') {
-          // Route through evaluateSkills so it can judge the failure and save a context rule.
-          // evaluateSkills detects evaluationFromFailure=true and uses the failure-path prompt.
-          // From there: FIX → planSkills (with saved rule), PASS → planSkills, ASK_USER → logConversation.
-          // replan_step: single-step replan preserves completed steps, regenerates only failed step.
-          logger.debug(`[StateGraph:Router] Recovery: ${action} → evaluateSkills (failure judge) → planSkills`);
-          return 'evaluateSkills';
-        }
-        // ask_user: state.answer is already set with the question
-        logger.debug('[StateGraph:Router] Recovery: ask_user → logConversation');
-        return 'logConversation';
-      },
       
       // Screen intelligence path
       screenIntelligence: (state) => {

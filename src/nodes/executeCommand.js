@@ -3,11 +3,11 @@
  *
  * Executes ONE skill step per graph pass, then signals the graph to:
  *   - Loop back here if more steps remain (skillCursor < skillPlan.length)
- *   - Route to recoverSkill if the step failed (failedStep is set)
+ *   - Route to evaluateSkills if the step failed (recoveryAction is set by inline _thinPostFailureHandler)
  *   - Finish if all steps are done (commandExecuted = true)
  *
  * This single-step design enables the adaptive cycle:
- *   planSkills → executeCommand → recoverSkill → (auto_patch → executeCommand)
+ *   planSkills → executeCommand → (inline thin recovery) → (auto_patch → executeCommand)
  *                                              → (replan    → planSkills)
  *                                              → (ask_user  → surface to user)
  *
@@ -25,9 +25,9 @@
  *   state.answer          — summary when done
  *
  * State outputs (failure):
- *   state.failedStep     — { step, skill, args, error, exitCode, stderr }
+ *   state.recoveryAction — 'auto_patch' | 'replan' | 'replan_step' | 'ask_user'
  *   state.skillResults   — appended with failed result
- *   (graph routes to recoverSkill)
+ *   (graph routes based on recoveryAction: auto_patch→executeCommand, replan→evaluateSkills, ask_user→logConversation)
  */
 
 const os = require('os');
@@ -36,6 +36,127 @@ const path = require('path');
 
 // Skill thinking helper for generating human-readable thinking messages
 const { generateSkillThinking } = require('../utils/skillThinking');
+
+// ── Thin post-failure handler ──────────────────────────────────────────────
+// Replaces the heavy recoverSkill node. Does a quick LLM assessment of the
+// failure and sets recoveryAction directly: auto_patch, replan, replan_step,
+// or ask_user. With preflight validation and step-level self-healing in agents,
+// most failures are now handled at the agent level — this is just a fallback.
+const THIN_RECOVERY_PROMPT = `You are an automation recovery agent. A skill step failed.
+Decide: AUTO_PATCH (fix args inline), REPLAN_STEP (regenerate just this step), REPLAN (rebuild entire plan), or ASK_USER (need human input).
+Be conservative: prefer ASK_USER over guessing.
+
+AUTO_PATCH: { "action": "AUTO_PATCH", "patchedArgs": {...}, "note": "one-line explanation" }
+REPLAN_STEP: { "action": "REPLAN_STEP", "suggestion": "what to do differently for this step", "constraint": "what to avoid" }
+REPLAN: { "action": "REPLAN", "suggestion": "what to do differently", "constraint": "what to avoid" }
+ASK_USER: { "action": "ASK_USER", "question": "clear question", "options": ["option A", "option B"] }
+
+Prefer REPLAN_STEP over REPLAN when prior steps completed successfully.
+If the error is about missing auth/credentials, use ASK_USER.
+Output ONLY valid JSON. No explanation, no markdown fences.`;
+
+async function _thinPostFailureHandler(state) {
+  const { failedStep, skillPlan, skillCursor, skillResults = [], llmBackend, message, resolvedMessage, stepRetryCount = 0, replanCount = 0, patchHistory = [] } = state;
+  const logger = state.logger || console;
+
+  if (!failedStep) return state;
+
+  // OAuth failure short-circuit — same as recoverSkill
+  if (failedStep.needsOAuth) {
+    const skillLabel = failedStep.args?.name || failedStep.skill || 'this skill';
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      triggerOAuthRepair: { skillName: skillLabel },
+      pendingQuestion: { question: `OAuth reconnection required for **${skillLabel}**. Open the Skills tab to reconnect.`, _isOAuthGuidance: true },
+      commandExecuted: false,
+    };
+  }
+
+  // Agent ask_user short-circuit — pass through directly
+  if (failedStep.askUser || failedStep.needsLogin) {
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      pendingQuestion: { question: failedStep.question || failedStep.error, options: failedStep.options || [] },
+      commandExecuted: false,
+    };
+  }
+
+  // No LLM backend — surface to user
+  if (!llmBackend) {
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      pendingQuestion: { question: `Step "${failedStep.skill}" failed: ${failedStep.error}`, options: [] },
+      commandExecuted: false,
+    };
+  }
+
+  // Quick LLM assessment
+  const priorSteps = (skillResults || []).filter(r => r.ok).map(r => `✓ ${r.skill}: ${r.stdout?.slice(0, 100) || 'ok'}`).join('\n');
+  const failedInfo = `Skill: ${failedStep.skill}\nError: ${failedStep.error}\nArgs: ${JSON.stringify(failedStep.args || {}).slice(0, 500)}`;
+  const userMsg = `## User Request\n${resolvedMessage || message}\n\n## Completed Steps\n${priorSteps || '(none)'}\n\n## Failed Step (cursor=${skillCursor})\n${failedInfo}\n\n## Previous Recovery Attempts\n${patchHistory.length > 0 ? patchHistory.map((p, i) => `${i + 1}. ${p.action}: ${p.note || p.suggestion || ''}`).join('\n') : '(none)'}\n\n## Retry Count: ${stepRetryCount}, Replan Count: ${replanCount}\n\n## Next Action\nOutput a single JSON action object.`;
+
+  try {
+    const llmRaw = await llmBackend.generateAnswer(THIN_RECOVERY_PROMPT, userMsg, { temperature: 0.1, maxTokens: 300 });
+    const m = llmRaw?.match(/\{[\s\S]*\}/);
+    if (m) {
+      const decision = JSON.parse(m[0]);
+      const action = decision.action?.toUpperCase();
+
+      if (action === 'AUTO_PATCH' && decision.patchedArgs) {
+        const patchedPlan = [...skillPlan];
+        if (patchedPlan[skillCursor]) {
+          patchedPlan[skillCursor] = { ...patchedPlan[skillCursor], args: { ...patchedPlan[skillCursor].args, ...decision.patchedArgs } };
+        }
+        logger.info(`[ExecuteCommand:ThinRecovery] AUTO_PATCH: ${decision.note || 'patching args'}`);
+        return {
+          ...state,
+          recoveryAction: 'auto_patch',
+          skillPlan: patchedPlan,
+          recoveryNote: decision.note || '',
+          patchHistory: [...patchHistory, { action: 'AUTO_PATCH', note: decision.note, attempt: stepRetryCount + 1 }],
+          stepRetryCount: stepRetryCount + 1,
+          failedStep: null,
+          commandExecuted: false,
+        };
+      }
+
+      if (action === 'REPLAN_STEP') {
+        logger.info(`[ExecuteCommand:ThinRecovery] REPLAN_STEP: ${decision.suggestion || ''}`);
+        return {
+          ...state,
+          recoveryAction: 'replan_step',
+          recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: failedStep.error, suggestion: decision.suggestion, constraint: decision.constraint },
+          replanCount: replanCount + 1,
+          commandExecuted: false,
+        };
+      }
+
+      if (action === 'REPLAN') {
+        logger.info(`[ExecuteCommand:ThinRecovery] REPLAN: ${decision.suggestion || ''}`);
+        return {
+          ...state,
+          recoveryAction: 'replan',
+          recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: failedStep.error, suggestion: decision.suggestion, constraint: decision.constraint },
+          replanCount: replanCount + 1,
+          commandExecuted: false,
+        };
+      }
+    }
+  } catch (err) {
+    logger.warn(`[ExecuteCommand:ThinRecovery] LLM assessment failed: ${err.message}`);
+  }
+
+  // Default: ask_user
+  return {
+    ...state,
+    recoveryAction: 'ask_user',
+    pendingQuestion: { question: `Step "${failedStep.skill}" failed: ${failedStep.error}. Would you like to retry or skip?`, options: ['Retry', 'Skip this step'] },
+    commandExecuted: false,
+  };
+}
 
 // Read sessionLanguage from voice journal (single source of truth).
 // Returns e.g. 'zh', 'es', or 'en'. Never throws.
@@ -5515,14 +5636,14 @@ Please try again or search with different terms.`;
         userAllowlistHint: enrichedStepResult.userAllowlistHint || false,
         commandName: enrichedStepResult.commandName || null,
       });
-      return {
+      return await _thinPostFailureHandler({
         ...state,
         skillResults: updatedResults,
         stepContracts: updatedStepContracts,
         skillCursor,           // cursor stays at failed step
         failedStep: enrichedStepResult,
         commandExecuted: false
-      };
+      });
     }
 
     if (!stepResult.ok && optional) {
@@ -6167,7 +6288,7 @@ Please try again or search with different terms.`;
     if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, skill, description: description || skill, error: stepResult.error, stderr: null });
 
     const failContract = generateStepContract(stepResult, skillCursor);
-    return {
+    const failState = {
       ...state,
       skillResults: [...skillResults, stepResult],
       stepContracts: [...stepContracts, failContract],
@@ -6175,5 +6296,7 @@ Please try again or search with different terms.`;
       failedStep: stepResult,
       commandExecuted: false
     };
+    // Thin post-failure handler replaces recoverSkill node — does quick LLM assessment inline
+    return await _thinPostFailureHandler(failState);
   }
 };
