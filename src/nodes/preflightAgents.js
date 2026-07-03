@@ -189,6 +189,7 @@ module.exports = async function preflightAgents(state) {
   const agentReadiness = []; // { type, agentId, ready, authed, iconUrl, ... }
   let vetAvailable = false;
   let vetPath = null;
+  let discoveredToolNote = '';
   const warnings = []; // { type, message } non-fatal warnings
 
   // ── Parallel preflight fetches ──────────────────────────────────────────────
@@ -769,6 +770,95 @@ module.exports = async function preflightAgents(state) {
       }
     })(),
 
+    // ── Tool discovery pre-flight ───────────────────────────────────────
+    // Assesses whether browser.agent can handle the task well; if not,
+    // searches for external AI tools and injects a note for the planner.
+    (async () => {
+      if (recoveryContext) return;
+      if (!userMessage || userMessage.length < 10) return;
+      try {
+        // Step 1: Assess — can browser.agent do this task well?
+        const assessRes = await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'tool.discover',
+          args: { action: 'assess', task: userMessage },
+        }, { timeoutMs: 12000 }).catch(() => null);
+
+        const assess = assessRes?.data || assessRes;
+        if (!assess?.ok || !assess?.shouldDelegate) return;
+
+        logger.info(`[Node:PreflightAgents] Tool discovery: shouldDelegate=true (${assess.reason})`);
+
+        // Step 2: Recall — check for cached tool (playbook)
+        const recallRes = await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'tool.discover',
+          args: { action: 'recall', task: userMessage },
+        }, { timeoutMs: 5000 }).catch(() => null);
+
+        const recall = recallRes?.data || recallRes;
+        let bestTool = recall?.ok ? recall.tool : null;
+
+        // Step 3: Discover — web search for best tool (if no cache)
+        if (!bestTool) {
+          _emitProgress({
+            type: 'preflight:building_agent',
+            agentType: 'tool_discover',
+            agentId: 'tool.discover',
+            message: 'Searching for AI tools that can help with this task...',
+            iconUrl: null,
+          });
+
+          const discoverRes = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'tool.discover',
+            args: { action: 'discover', task: userMessage },
+          }, { timeoutMs: 25000 }).catch(() => null);
+
+          const discover = discoverRes?.data || discoverRes;
+          if (!discover?.ok) return;
+
+          // Paid tool → ASK_USER
+          if (discover.askUser) {
+            _emitProgress({
+              type: 'preflight:tool_approval',
+              tools: discover.tools,
+              message: 'Only paid AI tools found — user approval needed',
+            });
+            // Still inject a note so the planner can surface the question
+            const toolList = (discover.tools || []).map(t => `- ${t.name}: ${t.url} (${t.tier})`).join('\n');
+            discoveredToolNote = `\n\nDISCOVERED AI TOOLS (PAID — user approval needed before proceeding):\n${toolList}\n\nAsk the user which tool to use, or if they want to proceed with a paid tool.`;
+            return;
+          }
+
+          bestTool = discover.bestTool || null;
+        }
+
+        if (bestTool) {
+          const tierLabel = bestTool.tier === 'free_no_account' ? 'free, no account'
+            : bestTool.tier === 'free_account' ? 'free, account needed'
+            : bestTool.tier === 'free_no_auth' ? 'free CLI, no auth'
+            : bestTool.tier === 'free_api_key' ? 'free CLI, API key needed'
+            : 'paid';
+
+          const agentSkill = bestTool.type === 'cli' ? 'cli.agent' : 'browser.agent';
+          discoveredToolNote = `\n\nDISCOVERED AI TOOL (use this tool for the task — browser.agent cannot do it well):\n` +
+            `Tool: ${bestTool.name}\nURL: ${bestTool.url}\nType: ${bestTool.type}\nTier: ${tierLabel}\n` +
+            `Usage: ${bestTool.howToUse || 'Navigate to the tool and interact with it.'}\n` +
+            `Plan: ${agentSkill} { action: 'build_agent', service: '${bestTool.serviceName}' } then ${agentSkill} { action: 'run', agentId: '${bestTool.serviceName}.agent', task: '...' }`;
+
+          _emitProgress({
+            type: 'preflight:building_agent',
+            agentType: bestTool.type,
+            agentId: `${bestTool.serviceName}.agent`,
+            message: `Found AI tool: ${bestTool.name} (${tierLabel})`,
+            iconUrl: bestTool.iconUrl || null,
+          });
+
+          logger.info(`[Node:PreflightAgents] Tool discovery: found ${bestTool.name} (${bestTool.tier}) at ${bestTool.url}`);
+        }
+      } catch (e) {
+        logger.warn(`[Node:PreflightAgents] Tool discovery error: ${e.message}`);
+      }
+    })(),
+
     // ── ffmpeg system dependency check + auto-install ─────────────────────
     // yt-dlp uses ffmpeg for subtitle conversion. Also used by video processing skills.
     // Detects both missing AND broken installs (dylib drift on macOS) and auto-fixes.
@@ -932,6 +1022,7 @@ module.exports = async function preflightAgents(state) {
     shellSkillNames: Array.from(shellSkillNames),
     cliPreflightNote,
     agentContextNote,
+    discoveredToolNote,
     preflightCliMap: _preflightCliMap,
     registeredAgentServiceMap: _registeredAgentServiceMap,
     trainedRecipeMap: _trainedRecipeMap,
