@@ -4619,22 +4619,6 @@ Please try again or search with different terms.`;
           }}
         : resolvedArgs;
 
-    // ── Pre-execution guard: external.skill existence check ─────────────────
-    // If external.skill is about to run but the skill doesn't exist, fail fast
-    // with a clear error instead of waiting for the MCP call to fail.
-    if (skill === 'external.skill') {
-      const skillName = resolvedArgs.name || args.name;
-      if (skillName) {
-        const skillPath = path.join(os.homedir(), '.thinkdrop', 'skills', skillName, 'index.cjs');
-        const skillMdPath = path.join(os.homedir(), '.thinkdrop', 'skills', skillName, 'skill.md');
-        if (!fs.existsSync(skillPath) && !fs.existsSync(skillMdPath)) {
-          const errorMsg = `Skill "${skillName}" not found at ~/.thinkdrop/skills/${skillName}/. Use browser.agent or cli.agent instead.`;
-          logger.error(`[Node:ExecuteCommand] external.skill pre-check failed: ${errorMsg}`);
-          throw new Error(errorMsg);
-        }
-      }
-    }
-
     // ── Phase 2: Smart Routing — Skip shell.run if app already focused ───────
     // Detects shell.run steps that open apps and skips them if the app is already
     // open and focused. Reduces unnecessary process spawning.

@@ -28,7 +28,6 @@ const enrichIntentNode = require('./nodes/enrichIntentV2');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
 const reviewExecutionNode = require('./nodes/reviewExecution');
 const creatorPlanningNode = require('./nodes/creatorPlanning');
-const gatherContextNode = require('./nodes/gatherContextV2');
 const appControlNode = require('./nodes/appControl');
 const storeConstraintNode = require('./nodes/storeConstraint');
 const liftConstraintNode  = require('./nodes/liftConstraint');
@@ -36,99 +35,13 @@ const parseProjectNode = require('./nodes/parseProject');
 const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
 const resolveUserContextNode = require('./nodes/resolveUserContext');
 const gatherPlanContextNode = require('./nodes/gatherPlanContext');
-const mcpFillGapsNode = require('./nodes/mcpFillGaps');
 const executeIntrospectNode = require('./nodes/executeIntrospect');
 const executeSettingsNode = require('./nodes/executeSettings');
 const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
 const planExecutorNode = require('./nodes/planExecutor');
 const preflightAgentsNode = require('./nodes/preflightAgents');
 
-/**
- * Assess risk level of a user request using LLM classification
- * Returns: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
- */
-async function assessRisk(message, intent, llmBackend, conversationHistory = []) {
-  // Fast-path: not command_automate = low risk
-  if (intent !== 'command_automate') return 'LOW';
-  
-  // Fast-path: obvious safe queries
-  const safePatterns = [
-    /\b(who|what|when|where|why|how)\b/i,
-    /\b(find|search|look up|check|get info about)\b/i,
-    /\b(what is|what's|tell me about)\b/i,
-  ];
-  if (safePatterns.some(p => p.test(message))) return 'LOW';
-
-  // Build recent context from last 3 exchanges (user + assistant interleaved) so the
-  // LLM can see what was just requested AND completed — critical for follow-up detection.
-  const recentTurns = (conversationHistory || [])
-    .slice(-6)
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 200)}`)
-    .join('\n');
-  const contextSection = recentTurns
-    ? `\n\nRecent conversation:\n${recentTurns}\n\nIMPORTANT: If the current request is clearly a follow-up or continuation of a task shown above (e.g. "open that folder", "now do it", "move it back", "undo that"), the target is already established — rate it LOW.`
-    : '';
-
-  const riskPrompt = `Classify the risk level of this user request:
-
-User request: "${message}"${contextSection}
-
-Risk definitions:
-- CRITICAL: File deletion, irreversible changes, mass data loss, system-level modifications (rm -rf, wipe, format)
-- HIGH: File moves/copies with potential overwrite conflicts, software installs, browser automation requiring login, external API calls with side effects
-- MEDIUM: Single-file operations with clear scope, simple navigation, queries
-- LOW: Questions, information lookup, read-only ops (open/show/list a file or folder), follow-up to a just-completed task where the target is already established in conversation
-
-Consider:
-1. Could this delete, corrupt, or overwrite data?
-2. Does it require authentication or credentials not yet available?
-3. Are there ambiguous terms with potentially large scope ("everything", "all files")?
-4. Is this a simple follow-up where the target was named in a prior turn?
-
-Output ONLY one word: CRITICAL | HIGH | MEDIUM | LOW`;
-
-  try {
-    const risk = await llmBackend.generateAnswer(riskPrompt, { temperature: 0, maxTokens: 10 });
-    const riskLevel = (risk || '').trim().toUpperCase();
-    
-    if (['CRITICAL', 'HIGH', 'MEDIUM', 'LOW'].includes(riskLevel)) {
-      return riskLevel;
-    }
-  } catch (e) {
-    // If LLM fails, use fallback heuristic
-    console.warn(`[StateGraphBuilder] Risk assessment LLM failed: ${e.message}`);
-  }
-  
-  // Fallback: check for high-risk keywords
-  const highRiskKeywords = /\b(mv|cp|rm|move|copy|delete|remove|install|uninstall|purge)\b.*\b(file|folder|directory)\b/i;
-  const criticalRiskKeywords = /\b(rm -rf|delete all|remove everything|format|wipe)\b/i;
-  
-  if (criticalRiskKeywords.test(message)) return 'CRITICAL';
-  if (highRiskKeywords.test(message)) return 'HIGH';
-  
-  return 'MEDIUM';
-}
-
-/**
- * Detect operation type for grill mode context
- */
-function detectOperationType(message) {
-  const msg = message.toLowerCase();
-  
-  if (/\b(mv|cp|rm|move|copy|delete|install|uninstall)\b/i.test(msg)) {
-    return 'file';
-  }
-  if (/\b(browser|navigate|click|fill|form|login|screenshot)\b/i.test(msg)) {
-    return 'browser';
-  }
-  if (/\b(api|webhook|curl|post|get|request)\b/i.test(msg)) {
-    return 'api';
-  }
-  if (/\b(sudo|brew|npm|system|config|permission)\b/i.test(msg)) {
-    return 'system';
-  }
-  return 'general';
-}
+// assessRisk and detectOperationType removed — grill-mode pipeline deleted
 
 /**
  * Extract the most useful short result string from a completed intent step.
@@ -373,8 +286,7 @@ class StateGraphBuilder {
       storeConstraint: (state) => storeConstraintNode({ ...state, logger, mcpAdapter }),
       liftConstraint:  (state) => liftConstraintNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
-      mcpFillGaps: (state) => mcpFillGapsNode({ ...state, logger, mcpAdapter, llmBackend }),
-      gatherContext: (state) => gatherContextNode({ ...state, logger, mcpAdapter, llmBackend }),
+      gatherContext: (state) => gatherPlanContextNode({ ...state, logger, mcpAdapter, llmBackend }),
       creatorPlanning: (state) => creatorPlanningNode({ ...state, logger, mcpAdapter }),
       preflightAgents: (state) => preflightAgentsNode({ ...state, logger, mcpAdapter }),
       planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -489,57 +401,16 @@ class StateGraphBuilder {
         }
 
         // ── planMode step short-circuit ────────────────────────────────────
-        // planExecutor already set intent+message for this step — skip assessRisk,
+        // planExecutor already set intent+message for this step — skip
         // resolveUserContext, gatherPlanContext and go straight to planSkills.
         if (intentType === 'command_automate' && state._planMode && state._planFile) {
           logger.debug('[StateGraph:Router] enrichIntent: _planMode step — skipping to planSkills');
           return 'planSkills';
         }
 
-        // MODE B re-route: enrichIntent stored answers and set intent=command_automate
-        // or MODE A success: command_automate with profile complete — proceed to plan
         if (intentType === 'command_automate') {
-          // ── Risk Assessment for Grill Mode ─────────────────────────────────
-          // Run LLM-based risk assessment BEFORE routing to mcpFillGaps
-          let riskLevel = 'LOW';
-          let needsGrill = false;
-          
-          if (state.llmBackend && !state.matchedSkillName && !state._skillPlan) {
-            riskLevel = await assessRisk(state.message || '', intentType, state.llmBackend, state.conversationHistory || []);
-            needsGrill = ['CRITICAL', 'HIGH'].includes(riskLevel);
-            
-            if (needsGrill) {
-              logger.info(`[StateGraph:Router] Grill mode enabled (${riskLevel}) for: ${state.message}`);
-              // Set grill mode flag so mcpFillGaps will run
-              state._grillMode = true;
-              state._riskLevel = riskLevel;
-              state._riskContext = {
-                level: riskLevel,
-                operationType: detectOperationType(state.message || '')
-              };
-              
-              // Emit progress event for UI
-              if (state.progressCallback) {
-                state.progressCallback({
-                  type: 'gather:grill_start',
-                  message: `Deep analysis needed for this ${riskLevel.toLowerCase()} risk operation...`,
-                  riskLevel,
-                  riskContext: state._riskContext
-                });
-              }
-            }
-          }
-          
-          // For high-risk operations, enable grill mode with MCP pre-fill
-          // Route through mcpFillGaps → gatherContext for thorough Q&A
-          // Skip if _skillPlan is already set (post-approval re-run) — plan is done, go execute.
-          if (needsGrill && !state.matchedSkillName && !state._skillPlan) {
-            logger.info('[StateGraph:Router] enrichIntent: High-risk operation detected — routing to mcpFillGaps → gatherContext');
-            return 'mcpFillGaps';
-          }
-          
-          // Skill already installed (parseSkill matched) — skip gatherContext + creatorPlanning,
-          // go straight to resolveUserContext → planSkills.
+          // Skill already installed (parseSkill matched) — skip creatorPlanning,
+          // go straight to resolveUserContext → gatherPlanContext → planSkills.
           // BUT: if the skill is a stub (no index.cjs on disk), we must go through gatherContext
           // first so credentials/service info are collected before the skill build kicks off.
           if (state.matchedSkillName) {
@@ -630,11 +501,7 @@ class StateGraphBuilder {
       // Skill creation from history → logConversation → end
       createSkillFromHistory: 'logConversation',
 
-      // mcpFillGaps → gatherContext for grill mode operations
-      mcpFillGaps: 'gatherContext',
-
-      // resolveUserContext → gatherPlanContext → planSkills
-      // gatherPlanContext asks up to 3 clarifying questions for ambiguous command_automate tasks.
+      // resolveUserContext → gatherPlanContext → preflightAgents → planSkills
       resolveUserContext: 'gatherPlanContext',
 
       // gatherPlanContext: proceeds to preflightAgents (agent readiness checks) then planSkills
@@ -649,26 +516,8 @@ class StateGraphBuilder {
         return 'planSkills';
       },
 
-      // gatherContext bypassed — kept for future re-enable
-      // gatherContext: () => 'creatorPlanning',
-      // creatorPlanning → planSkills (pass/warnings) or logConversation (reviewer fail)
-      // creatorPlanning: (state) => {
-      //   if (state.planError) {
-      //     logger.debug(`[StateGraph:Router] creatorPlanning reviewer blocked: ${state.planError}`);
-      //     return 'logConversation';
-      //   }
-      //   return 'planSkills';
-      // },
-      // gatherContext: grill-mode routes to gatherPlanContext (Q&A + history resolution);
-      // non-grill EXECUTE tasks go straight to planSkills.
-      gatherContext: (state) => {
-        if (state._grillMode) {
-          logger.debug('[StateGraph:Router] gatherContext grill-mode — routing to gatherPlanContext');
-          return 'gatherPlanContext';
-        }
-        logger.debug('[StateGraph:Router] gatherContext non-grill — routing to preflightAgents');
-        return 'preflightAgents';
-      },
+      // gatherContext node (alias for gatherPlanContext — retained for compat)
+      gatherContext: () => 'preflightAgents',
       creatorPlanning: () => 'planSkills',
 
       // planSkills → end (awaiting approval) or executeCommand (plan ready) or logConversation (plan error)

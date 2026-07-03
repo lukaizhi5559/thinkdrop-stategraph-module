@@ -880,6 +880,7 @@ async function planSkillsV2(state) {
   let cliPreflightNote = '';
   let agentContextNote = '';
   let discoveredToolNote = '';
+  let orphanedSkillsNote = '';
   let _registeredAgentServiceMap = {};
   const shellSkillNames = new Set();
   let installedSkillsList = [];
@@ -893,6 +894,7 @@ async function planSkillsV2(state) {
     cliPreflightNote = pf.cliPreflightNote || '';
     agentContextNote = pf.agentContextNote || '';
     discoveredToolNote = pf.discoveredToolNote || '';
+    orphanedSkillsNote = pf.orphanedSkillsNote || '';
     _preflightCliMap = pf.preflightCliMap || {};
     _registeredAgentServiceMap = pf.registeredAgentServiceMap || {};
     _trainedRecipeMap = pf.trainedRecipeMap || {};
@@ -1409,6 +1411,7 @@ The user's request does NOT match any installed skill.
     cliPreflightNote,
     agentContextNote,
     discoveredToolNote,
+    orphanedSkillsNote,
     externalSkillProhibition,
     smsGatewayNote,
     dateRangeNote,

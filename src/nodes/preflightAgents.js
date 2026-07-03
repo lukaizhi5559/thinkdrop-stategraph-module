@@ -191,6 +191,8 @@ module.exports = async function preflightAgents(state) {
   let vetPath = null;
   let discoveredToolNote = '';
   const warnings = []; // { type, message } non-fatal warnings
+  let orphanedSkills = [];  // skill names registered in user-memory but missing on disk
+  let orphanedSkillsNote = '';  // injected into planSkills prompt
 
   // ── Parallel preflight fetches ──────────────────────────────────────────────
   await Promise.all([
@@ -436,12 +438,43 @@ module.exports = async function preflightAgents(state) {
       } catch (_) {}
     })(),
 
-    // ── Installed skills list ─────────────────────────────────────────────
+    // ── Installed skills list + orphan sweep ────────────────────────────
     (async () => {
       try {
         const ilRes = await mcpAdapter.callService('user-memory', 'skill.list', {}, { timeoutMs: 3000 }).catch(() => null);
         const il = ilRes?.data || ilRes || [];
-        if (Array.isArray(il)) installedSkillsList = il;
+        if (Array.isArray(il)) {
+          installedSkillsList = il;
+          // Sweep: find skills registered in user-memory that have no file on disk.
+          // Checks 3 directory name forms (dot, underscore, kebab) to match external.skill.cjs.
+          const SKILLS_BASE_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
+          for (const skill of installedSkillsList) {
+            const name = skill.name || skill.id;
+            if (!name) continue;
+            const candidates = [
+              name,
+              name.replace(/\./g, '_'),
+              name.replace(/\./g, '-'),
+            ];
+            const exists = candidates.some(c => {
+              const d = path.join(SKILLS_BASE_DIR, c);
+              return fs.existsSync(path.join(d, 'index.cjs')) ||
+                     fs.existsSync(path.join(d, 'index.py')) ||
+                     fs.existsSync(path.join(d, 'skill.md')) ||
+                     fs.existsSync(path.join(d, 'api.json')) ||
+                     fs.existsSync(path.join(d, 'cli.json'));
+            });
+            if (!exists) orphanedSkills.push(name);
+          }
+          if (orphanedSkills.length > 0) {
+            warnings.push({
+              type: 'orphaned_skills',
+              message: `Skills registered but missing on disk: ${orphanedSkills.join(', ')}`,
+            });
+            orphanedSkillsNote = `\n\nORPHANED SKILLS (registered in user-memory but NO file on disk — do NOT use external.skill for these): ${orphanedSkills.join(', ')}\nFor these skills, use browser.agent or cli.agent instead of external.skill.`;
+            logger.warn(`[Node:PreflightAgents] Orphaned skills detected (${orphanedSkills.length}): ${orphanedSkills.join(', ')}`);
+          }
+        }
       } catch (_) {}
     })(),
 
@@ -1030,6 +1063,8 @@ module.exports = async function preflightAgents(state) {
     agents: agentReadiness,
     vetAvailable,
     warnings,
+    orphanedSkills,
+    orphanedSkillsNote,
   };
 
   // Emit complete
