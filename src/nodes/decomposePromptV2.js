@@ -217,15 +217,18 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
   } catch (e) {
     logger.warn(`[Node:DecomposePromptV2] JSON parse failed: ${e.message}`);
     
-    // Attempt to extract intent from malformed JSON as fallback
-    // This handles cases like: {"subPrompts=[{"text":"...","estimatedIntent":"web_search"...}]}
-    const intentMatch = sanitized.match(/["']estimatedIntent["']\s*[:=]\s*["']([^"']+)["']/);
+    // Attempt to extract intent from malformed JSON as fallback.
+    // Handles: closed strings like "command_automate" AND truncated/unclosed strings like "command_automat
+    // The regex allows an optional closing quote so truncated LLM responses are still recoverable.
+    const intentMatch = sanitized.match(/["']estimatedIntent["']\s*[:=]\s*["']([^"'\n,}\]]{3,30})["']?/);
     if (intentMatch) {
-      const extractedIntent = intentMatch[1];
-      logger.info(`[Node:DecomposePromptV2] Extracted intent from malformed JSON: ${extractedIntent}`);
-      // Return a minimal subPrompt with the extracted intent so it's not lost
+      const extractedRaw = intentMatch[1].trim();
+      // Snap to nearest known intent to handle partial truncation (e.g. "command_automat" → "command_automate")
+      const KNOWN_INTENTS = ['command_automate', 'screen_intelligence', 'web_search', 'memory_store', 'memory_retrieve', 'general_knowledge', 'greeting'];
+      const extractedIntent = KNOWN_INTENTS.find(i => i.startsWith(extractedRaw) || extractedRaw.startsWith(i.slice(0, 10))) || extractedRaw;
+      logger.info(`[Node:DecomposePromptV2] Extracted intent from malformed JSON: "${extractedRaw}" → "${extractedIntent}"`);
       return [{
-        text: message, // Use original message
+        text: message,
         estimatedIntent: extractedIntent,
         confidence: 0.70,
         order: 0,
@@ -235,6 +238,7 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
       }];
     }
     
+    logger.warn(`[Node:DecomposePromptV2] Malformed JSON recovery failed — no estimatedIntent found in response snippet: ${sanitized.slice(0, 120)}`);
     return null;
   }
 }

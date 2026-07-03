@@ -55,7 +55,7 @@ function _loadPreflightState() {
       return JSON.parse(fs.readFileSync(PREFLIGHT_STATE_FILE, 'utf8'));
     }
   } catch (_) {}
-  return { lastValidatedAt: null, cliVersions: {} };
+  return { lastValidatedAt: null, cliVersions: {}, failedInstalls: {} };
 }
 
 function _savePrefflightState(data) {
@@ -451,6 +451,17 @@ module.exports = async function preflightAgents(state) {
         vetAvailable = !!vetPath;
 
         if (!vetAvailable) {
+          // Check if a previous install attempt failed — skip retrying until cache expires (7 days)
+          const pfState = _loadPreflightState();
+          const failedInstalls = pfState.failedInstalls || {};
+          const vetFailedAt = failedInstalls['vet'];
+          const INSTALL_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+          if (vetFailedAt && (Date.now() - new Date(vetFailedAt).getTime()) < INSTALL_RETRY_MS) {
+            logger.info(`[Node:PreflightAgents] vet install previously failed (${vetFailedAt}) — skipping retry for 7 days`);
+            warnings.push({ type: 'vet_not_installed', message: 'vet CLI not installed — install with: brew tap vet-run/vet && brew install vet-run' });
+            vetAvailable = false;
+          } else {
+
           logger.info('[Node:PreflightAgents] vet CLI not found — attempting auto-install');
 
           // Step A: Try brew install
@@ -466,7 +477,7 @@ module.exports = async function preflightAgents(state) {
             try {
               const { execSync } = require('child_process');
               execSync('brew tap vet-run/vet', { encoding: 'utf8', timeout: 30000, stdio: 'pipe' });
-              execSync('brew install vet-run', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
+              execSync('brew install vet-run/vet/vet-run', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
               vetPath = _whichSync('vet');
               vetAvailable = !!vetPath;
               if (vetAvailable) {
@@ -502,7 +513,10 @@ module.exports = async function preflightAgents(state) {
                     message: 'Installing vet CLI from reviewed script...',
                     iconUrl: null,
                   });
-                  execSync(`sh ${tmpFile}`, { encoding: 'utf8', timeout: 60000, stdio: 'pipe' });
+                  // Use INSTALL_DIR to target Homebrew's writable bin (avoids /usr/local/bin permission error on macOS)
+                  const brewBin = _whichSync('brew');
+                  const installDir = brewBin ? require('path').dirname(brewBin) : '/usr/local/bin';
+                  execSync(`INSTALL_DIR=${installDir} sh ${tmpFile}`, { encoding: 'utf8', timeout: 60000, stdio: 'pipe' });
                   vetPath = _whichSync('vet');
                   vetAvailable = !!vetPath;
                   if (vetAvailable) {
@@ -538,7 +552,16 @@ module.exports = async function preflightAgents(state) {
               iconUrl: null,
               message: 'vet CLI not installed — recommended for secure installations: brew tap vet-run/vet && brew install vet-run',
             });
+            // Cache the install failure so we don't retry every run (7-day cooldown)
+            try {
+              const _pfStateCurrent = _loadPreflightState();
+              _savePrefflightState({
+                ..._pfStateCurrent,
+                failedInstalls: { ...(_pfStateCurrent.failedInstalls || {}), vet: new Date().toISOString() },
+              });
+            } catch (_) {}
           }
+          } // close else (not in cooldown period)
         }
 
         logger.info(`[Node:PreflightAgents] vet CLI: ${vetAvailable ? 'installed at ' + vetPath : 'NOT INSTALLED'}`);
@@ -669,6 +692,150 @@ module.exports = async function preflightAgents(state) {
         logger.info(`[Node:PreflightAgents] Monthly validation complete: ${Object.keys(currentVersions).length} CLIs checked, ${driftedClis.length} drifted`);
       } catch (valErr) {
         logger.warn(`[Node:PreflightAgents] Monthly validation error: ${valErr.message}`);
+      }
+    })(),
+
+    // ── Ad-block list refresh (every N days, configurable via ADBLOCK_REFRESH_DAYS) ──
+    (async () => {
+      try {
+        const result = await mcpAdapter.callService('command', 'adblock.refresh', {}, { timeoutMs: 30000 });
+        const r = result?.data || result;
+        if (r?.refreshed) {
+          logger.info(`[Node:PreflightAgents] Ad-block list refreshed: ${r.count} domains (${r.source})`);
+        }
+      } catch (_) {}
+    })(),
+
+    // ── yt-dlp system dependency check + auto-install ────────────────────
+    // video.agent uses yt-dlp to extract subtitles without downloading video.
+    // Auto-install/upgrade silently so new open-source installs work out of the box.
+    (async () => {
+      try {
+        const { execSync } = require('child_process');
+        const INSTALL_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+        const pfState = _loadPreflightState();
+        const failedInstalls = pfState.failedInstalls || {};
+
+        // Detect current yt-dlp state
+        let ytdlpInstalled = false;
+        let ytdlpStale = false;
+        try {
+          const verOut = execSync('yt-dlp --version 2>/dev/null', { encoding: 'utf8', timeout: 5000 }).trim();
+          // version format: "2026.06.09"
+          const m = verOut.match(/(\d{4})\.(\d{2})\.(\d{2})/);
+          if (m) {
+            ytdlpInstalled = true;
+            const vDate = new Date(`${m[1]}-${m[2]}-${m[3]}`);
+            const ageDays = Math.floor((Date.now() - vDate.getTime()) / 86400000);
+            ytdlpStale = ageDays > 60;
+            logger.info(`[Node:PreflightAgents] yt-dlp version ${verOut} (${ageDays}d old)${ytdlpStale ? ' — stale, will upgrade' : ' ✓'}`);
+          }
+        } catch (_) {
+          ytdlpInstalled = false;
+        }
+
+        if (!ytdlpInstalled) {
+          // Check 7-day cooldown
+          const ytdlpFailedAt = failedInstalls['ytdlp'];
+          if (ytdlpFailedAt && (Date.now() - new Date(ytdlpFailedAt).getTime()) < INSTALL_RETRY_MS) {
+            logger.info(`[Node:PreflightAgents] yt-dlp install previously failed (${ytdlpFailedAt}) — skipping retry for 7 days`);
+            warnings.push({ type: 'ytdlp_not_installed', message: 'yt-dlp not installed — install with: pip3 install yt-dlp' });
+            return;
+          }
+
+          logger.info('[Node:PreflightAgents] yt-dlp not found — attempting pip3 install...');
+          try {
+            execSync('pip3 install yt-dlp --quiet --user', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
+            logger.info('[Node:PreflightAgents] yt-dlp installed successfully via pip3');
+          } catch (installErr) {
+            logger.warn(`[Node:PreflightAgents] yt-dlp pip3 install failed: ${installErr.message?.slice(0, 100)}`);
+            warnings.push({ type: 'ytdlp_not_installed', message: 'yt-dlp could not be installed — run: pip3 install yt-dlp' });
+            // Cache the failure so we skip retrying for 7 days
+            try {
+              _savePrefflightState({ ...pfState, failedInstalls: { ...failedInstalls, ytdlp: new Date().toISOString() } });
+            } catch (_) {}
+          }
+        } else if (ytdlpStale) {
+          logger.info('[Node:PreflightAgents] yt-dlp is stale — upgrading via pip3...');
+          try {
+            execSync('pip3 install --upgrade yt-dlp --quiet', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
+            logger.info('[Node:PreflightAgents] yt-dlp upgraded successfully');
+          } catch (upgradeErr) {
+            logger.warn(`[Node:PreflightAgents] yt-dlp pip3 upgrade failed (non-fatal): ${upgradeErr.message?.slice(0, 100)}`);
+          }
+        }
+      } catch (ytdlpBlockErr) {
+        logger.warn(`[Node:PreflightAgents] yt-dlp check block error: ${ytdlpBlockErr.message}`);
+      }
+    })(),
+
+    // ── ffmpeg system dependency check + auto-install ─────────────────────
+    // yt-dlp uses ffmpeg for subtitle conversion. Also used by video processing skills.
+    // Detects both missing AND broken installs (dylib drift on macOS) and auto-fixes.
+    (async () => {
+      try {
+        const { execSync } = require('child_process');
+        const INSTALL_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+        const pfState = _loadPreflightState();
+        const failedInstalls = pfState.failedInstalls || {};
+
+        // Detect current ffmpeg state: check both presence AND runtime health
+        let ffmpegMissing = false;
+        let ffmpegBroken = false;
+        const ffmpegPath = _whichSync('ffmpeg');
+
+        if (!ffmpegPath) {
+          ffmpegMissing = true;
+        } else {
+          // Binary exists — test it actually runs (dylib errors show up here)
+          try {
+            execSync(`${ffmpegPath} -version`, { encoding: 'utf8', timeout: 5000, stdio: 'pipe' });
+            logger.info(`[Node:PreflightAgents] ffmpeg ✓ (${ffmpegPath})`);
+          } catch (testErr) {
+            const errText = (testErr.stderr || testErr.message || '').toLowerCase();
+            if (/library not loaded|dylib|no such file|symbol not found/i.test(errText)) {
+              ffmpegBroken = true;
+              logger.warn(`[Node:PreflightAgents] ffmpeg binary broken (dylib error) at ${ffmpegPath} — will reinstall`);
+            } else {
+              // Some other error — still log but don't attempt reinstall
+              logger.warn(`[Node:PreflightAgents] ffmpeg test failed (non-dylib): ${errText.slice(0, 120)}`);
+            }
+          }
+        }
+
+        if (!ffmpegMissing && !ffmpegBroken) return; // healthy
+
+        // Check 7-day cooldown
+        const ffmpegFailedAt = failedInstalls['ffmpeg'];
+        if (ffmpegFailedAt && (Date.now() - new Date(ffmpegFailedAt).getTime()) < INSTALL_RETRY_MS) {
+          logger.info(`[Node:PreflightAgents] ffmpeg install previously failed (${ffmpegFailedAt}) — skipping retry for 7 days`);
+          warnings.push({ type: 'ffmpeg_not_installed', message: 'ffmpeg not available — install with: brew install ffmpeg' });
+          return;
+        }
+
+        const brewPath = _whichSync('brew');
+        if (!brewPath) {
+          warnings.push({ type: 'ffmpeg_not_installed', message: 'ffmpeg not available and brew not found — install Homebrew then run: brew install ffmpeg' });
+          return;
+        }
+
+        const installCmd = ffmpegBroken ? 'brew reinstall ffmpeg' : 'brew install ffmpeg';
+        const logVerb = ffmpegBroken ? 'Reinstalling broken' : 'Installing missing';
+        logger.info(`[Node:PreflightAgents] ${logVerb} ffmpeg via: ${installCmd}`);
+
+        try {
+          execSync(installCmd, { encoding: 'utf8', timeout: 300000, stdio: 'pipe' });
+          logger.info(`[Node:PreflightAgents] ffmpeg ${ffmpegBroken ? 'reinstalled' : 'installed'} successfully`);
+        } catch (installErr) {
+          logger.warn(`[Node:PreflightAgents] ffmpeg ${installCmd} failed: ${installErr.message?.slice(0, 100)}`);
+          warnings.push({ type: 'ffmpeg_not_installed', message: `ffmpeg could not be installed — run: ${installCmd}` });
+          // Cache failure so we skip retrying for 7 days
+          try {
+            _savePrefflightState({ ...pfState, failedInstalls: { ...failedInstalls, ffmpeg: new Date().toISOString() } });
+          } catch (_) {}
+        }
+      } catch (ffmpegBlockErr) {
+        logger.warn(`[Node:PreflightAgents] ffmpeg check block error: ${ffmpegBlockErr.message}`);
       }
     })(),
   ]);

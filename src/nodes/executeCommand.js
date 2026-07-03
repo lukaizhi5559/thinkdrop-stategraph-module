@@ -2334,7 +2334,11 @@ module.exports = async function executeCommand(state) {
     // Gather all getPageText results from prior steps
     logger.debug(`[Node:ExecuteCommand] synthesize: skillResults has ${skillResults.length} entries`);
     skillResults.forEach((r, i) => {
-      logger.debug(`[Node:ExecuteCommand]   [${i}] skill=${r.skill} action=${r.args?.action} ok=${r.ok} stdout_len=${r.stdout?.length ?? 'null'} result=${r.result ? String(r.result).substring(0, 80) : 'null'}`);
+      if (r.skill === 'video.agent') {
+        logger.debug(`[Node:ExecuteCommand]   [${i}] skill=video.agent ok=${r.ok} steps=${Array.isArray(r.steps) ? r.steps.length : 'none'} transcription_len=${r.transcription?.length ?? r.result?.transcription?.length ?? 'null'} pageTitle=${r.pageTitle || r.result?.pageTitle || 'none'} stdout_len=${r.stdout?.length ?? 'null'}`);
+      } else {
+        logger.debug(`[Node:ExecuteCommand]   [${i}] skill=${r.skill} action=${r.args?.action} ok=${r.ok} stdout_len=${r.stdout?.length ?? 'null'} result=${r.result ? String(r.result).substring(0, 80) : 'null'}`);
+      }
     });
     // Scope to results AFTER the last synthesize step so each synthesize in a
     // multi-stage pipeline (e.g. read email → synthesize → ask AI → synthesize → reply)
@@ -2349,14 +2353,40 @@ module.exports = async function executeCommand(state) {
         (r.skill === 'app.agent' && r.args?.action === 'get_recent_ocr' &&
           ((r.result && typeof r.result === 'string' && r.result.trim().length > 50) ||
            (r.text && typeof r.text === 'string' && r.text.trim().length > 50))) ||
-        (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:'))
+        (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:')) ||
+        (r.skill === 'video.agent' && r.ok &&
+          ((Array.isArray(r.steps) && r.steps.length > 0) ||
+           (Array.isArray(r.result?.steps) && r.result.steps.length > 0) ||
+           (r.transcription && typeof r.transcription === 'string' && r.transcription.length > 50) ||
+           (r.result?.transcription && r.result.transcription.length > 50) ||
+           (typeof r.stdout === 'string' && r.stdout.trim().length > 50)))
       ) && r.ok
         && ((r.result && typeof r.result === 'string' && r.result.trim().length > 0) ||
-            (r.text && typeof r.text === 'string' && r.text.trim().length > 0))
+            (r.text && typeof r.text === 'string' && r.text.trim().length > 0) ||
+            (r.skill === 'video.agent'))
         && r.step > lastSynthesizeStep)
       .map(r => {
-        const _rawText = (typeof r.result === 'string' && r.result) || r.text || '';
-        const analysis = analyzePageContent(_rawText, r.url, r.args?.agentId);
+        // video.agent: prefer top-level steps[] > transcription > pageContent.description > stdout
+        let _rawText;
+        if (r.skill === 'video.agent') {
+          const stepsArr = r.steps || r.result?.steps || [];
+          const stepsText = Array.isArray(stepsArr) && stepsArr.length > 0
+            ? stepsArr.map((s, i) => `${i + 1}. ${s.text || s}`).join('\n')
+            : null;
+          const transcription = r.transcription || r.result?.transcription || null;
+          const pageTitle = r.pageTitle || r.result?.pageTitle || '';
+          const desc = r.pageContent?.description || r.result?.pageContent?.description || '';
+          const parts = [];
+          if (pageTitle) parts.push(`Title: ${pageTitle}`);
+          if (desc) parts.push(`Description: ${desc.substring(0, 500)}`);
+          if (transcription) parts.push(`Transcript:\n${transcription}`);
+          if (stepsText) parts.push(`Steps:\n${stepsText}`);
+          if (parts.length === 0) parts.push(r.stdout || '');
+          _rawText = parts.join('\n\n');
+        } else {
+          _rawText = (typeof r.result === 'string' && r.result) || r.text || '';
+        }
+        const analysis = analyzePageContent(_rawText, r.url || r.result?.videoUrl || r.args?.videoUrl, r.args?.agentId);
         let processedText = _rawText;
         
         // If we have UI chrome but also real content, add clarifying note
@@ -2374,8 +2404,10 @@ module.exports = async function executeCommand(state) {
         }
         
         return { 
-          source: r.args?.sessionId || r.args?.agentId || (r.skill === 'app.agent' ? 'app.agent' : 'browser.agent'), 
-          url: r.url || '', 
+          source: r.skill === 'video.agent'
+            ? ('video.agent:' + (r.pageTitle || r.result?.pageTitle || r.args?.videoUrl || r.args?.url || 'video'))
+            : (r.args?.sessionId || r.args?.agentId || (r.skill === 'app.agent' ? 'app.agent' : 'browser.agent')),
+          url: r.url || r.result?.videoUrl || r.args?.videoUrl || r.args?.url || '', 
           text: processedText,
           _analysis: analysis // for debugging
         };
@@ -2670,8 +2702,21 @@ module.exports = async function executeCommand(state) {
 
     // Include video.agent results — video transcript/content
     const videoAgentResults = skillResults
-      .filter(r => r.skill === 'video.agent' && r.ok && r.stdout)
-      .map(r => `=== Video Content (${r.args?.videoUrl || 'video.agent'}) ===\n${r.stdout}`);
+      .filter(r => r.skill === 'video.agent' && r.ok && r.step > lastSynthesizeStep)
+      .map(r => {
+        const stepsArr = r.steps || r.result?.steps || [];
+        const stepLines = Array.isArray(stepsArr) && stepsArr.length > 0
+          ? stepsArr.map((s, i) => `${i + 1}. ${s.text || s}`).join('\n')
+          : null;
+        const pageContent = r.result?.pageContent || r.result?.pageTitle || null;
+        const parts = [`=== Video Content (${r.args?.videoUrl || r.args?.url || 'video.agent'}) ===`];
+        if (r.result?.pageTitle) parts.push(`Title: ${r.result.pageTitle}`);
+        if (r.result?.pageContent?.description) parts.push(`Description: ${r.result.pageContent.description.substring(0, 500)}`);
+        if (r.result?.transcription) parts.push(`Transcript:\n${r.result.transcription}`);
+        if (stepLines) parts.push(`Steps:\n${stepLines}`);
+        if (!stepLines && !r.result?.transcription && r.stdout) parts.push(r.stdout);
+        return parts.join('\n');
+      });
 
     // Include screen.capture results — screen OCR text
     const screenCaptureResults = skillResults
@@ -4965,7 +5010,8 @@ Please try again or search with different terms.`;
       exitCode: raw.exitCode ?? null,
       result: raw.result
         ?? (skill === 'user.agent' ? { resolved: raw.resolved, summary: raw.summary, action: raw.action } : null)
-        ?? (skill === 'file.watch' ? raw : null),
+        ?? (skill === 'file.watch' ? raw : null)
+        ?? (skill === 'video.agent' ? { steps: raw.steps, pageTitle: raw.pageTitle, pageContent: raw.pageContent, transcription: raw.transcription, confidence: raw.confidence, platform: raw.platform, source: raw.source } : null),
       watchId: skill === 'file.watch' ? (raw.watchId || null) : null,
       _raw: (skill === 'file.bridge' || skill === 'fs.read') ? raw : undefined,
       url: raw.url ?? null,
@@ -5007,6 +5053,11 @@ Please try again or search with different terms.`;
       scrolls:         skill === 'app.agent' ? (raw.scrolls         ?? null) : undefined,
       accumulatedText: skill === 'app.agent' ? (raw.accumulatedText || null) : undefined,
       aborted:         skill === 'app.agent' ? (raw.aborted         ?? false) : undefined,
+      steps:        skill === 'video.agent' ? (raw.steps       || null) : undefined,
+      pageTitle:    skill === 'video.agent' ? (raw.pageTitle   || null) : undefined,
+      pageContent:  skill === 'video.agent' ? (raw.pageContent || null) : undefined,
+      transcription: skill === 'video.agent' ? (raw.transcription || null) : undefined,
+      confidence:   skill === 'video.agent' ? (raw.confidence  ?? null) : undefined,
     };
 
     // Defensive fallback: app.agent extract_content_via_clipboard returns the

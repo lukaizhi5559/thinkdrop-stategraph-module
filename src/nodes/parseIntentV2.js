@@ -291,13 +291,17 @@ module.exports = async function parseIntentV2(state) {
     fallbackIntent = 'command_automate';
     logger.info(`[Node:ParseIntentV2] taskClassification override (browser follow-up) → command_automate: "${classifyMessage.slice(0, 60)}"`);
   }
+  else if (tc?.isBrowseOnly === true) {
+    fallbackIntent = 'command_automate';
+    logger.info(`[Node:ParseIntentV2] taskClassification override (isBrowseOnly) → command_automate: "${classifyMessage.slice(0, 60)}"`);
+  }
   else if (tc?.taskType === 'app_automation') {
     fallbackIntent = 'command_automate';
     logger.info(`[Node:ParseIntentV2] taskClassification override (app_automation) → command_automate: "${classifyMessage.slice(0, 60)}"`);
   }
   else if (/\b(remember|my name is|i am|my email|note that|store that|save that)\b/.test(lower)) fallbackIntent = 'memory_store';
   else if (/\b(what did i|do you know my|recall|retrieve|look up my|what was)\b/.test(lower)) fallbackIntent = 'memory_retrieve';
-  else if (/\b(goto|go to|navigate|open|close|quit|exit|minimize|hide|show|stop|kill|launch|start|visit|click|run|execute|install|send|create|rename|move|delete|download|resize|maximize|scroll|type|press|drag)\b/.test(lower)) fallbackIntent = 'command_automate';
+  else if (/\b(goto|go to|navigate|open|close|quit|exit|minimize|hide|show|stop|kill|launch|start|visit|click|run|execute|install|send|create|rename|move|delete|download|resize|maximize|scroll|type|press|drag|watch|stream|play|view|browse|load|fetch|scrape|automate|interact)\b/.test(lower)) fallbackIntent = 'command_automate';
   // NEW: Content discovery on named platforms → command_automate (browser automation needed)
   else if (hasContentDiscovery && hasNamedPlatform) {
     fallbackIntent = 'command_automate';
