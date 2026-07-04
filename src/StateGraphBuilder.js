@@ -40,6 +40,7 @@ const executeSettingsNode = require('./nodes/executeSettings');
 const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
 const planExecutorNode = require('./nodes/planExecutor');
 const preflightAgentsNode = require('./nodes/preflightAgents');
+const resolveAgentNode = require('./nodes/resolveAgent');
 
 // assessRisk and detectOperationType removed — grill-mode pipeline deleted
 
@@ -288,6 +289,7 @@ class StateGraphBuilder {
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
       gatherContext: (state) => gatherPlanContextNode({ ...state, logger, mcpAdapter, llmBackend }),
       creatorPlanning: (state) => creatorPlanningNode({ ...state, logger, mcpAdapter }),
+      resolveAgent: (state) => resolveAgentNode({ ...state, logger, mcpAdapter, llmBackend }),
       preflightAgents: (state) => preflightAgentsNode({ ...state, logger, mcpAdapter }),
       planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeCommand: (state) => executeCommandNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -501,23 +503,30 @@ class StateGraphBuilder {
       // Skill creation from history → logConversation → end
       createSkillFromHistory: 'logConversation',
 
-      // resolveUserContext → gatherPlanContext → preflightAgents → planSkills
-      resolveUserContext: 'gatherPlanContext',
+      // resolveUserContext → resolveAgent → preflightAgents → gatherPlanContext → planSkills
+      // resolveAgent picks the agents; preflightAgents checks their auth status
+      resolveUserContext: 'resolveAgent',
 
-      // gatherPlanContext: proceeds to preflightAgents (agent readiness checks) then planSkills
-      gatherPlanContext: () => {
-        logger.debug('[StateGraph:Router] gatherPlanContext → preflightAgents');
+      // resolveAgent: selects agents, then proceeds to preflightAgents
+      resolveAgent: () => {
+        logger.debug('[StateGraph:Router] resolveAgent → preflightAgents');
         return 'preflightAgents';
       },
 
-      // preflightAgents: always proceeds to planSkills (readiness data attached to state)
+      // preflightAgents: proceeds to gatherPlanContext (with auth data now in state)
       preflightAgents: () => {
-        logger.debug('[StateGraph:Router] preflightAgents → planSkills');
+        logger.debug('[StateGraph:Router] preflightAgents → gatherPlanContext');
+        return 'gatherPlanContext';
+      },
+
+      // gatherPlanContext: now auth-aware — proceeds to planSkills
+      gatherPlanContext: () => {
+        logger.debug('[StateGraph:Router] gatherPlanContext → planSkills');
         return 'planSkills';
       },
 
       // gatherContext node (alias for gatherPlanContext — retained for compat)
-      gatherContext: () => 'preflightAgents',
+      gatherContext: () => 'planSkills',
       creatorPlanning: () => 'planSkills',
 
       // planSkills → end (awaiting approval) or executeCommand (plan ready) or logConversation (plan error)

@@ -186,6 +186,19 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'VERIFIED' };
   }
 
+  // ── meta-skill short-circuit ──────────────────────────────────────────────
+  // api_suggest, needs_skill, schedule, ask_user are UI card primitives — they surface
+  // a question/offer to the user and return ok:true. They produce no browser page output
+  // by design. If the entire plan consists of meta-skills and at least one api_suggest or
+  // needs_skill card was successfully surfaced, the task is VERIFIED (the card IS the result).
+  const _META_SKILLS_SET = new Set(['synthesize', 'ask_user', 'schedule', 'needs_skill', 'api_suggest', 'project.launcher', 'project.stopper']);
+  const _allMetaSkills = skillResults.length > 0 && skillResults.every(r => _META_SKILLS_SET.has(r.skill));
+  const _hasUiCardSuccess = skillResults.some(r => (r.skill === 'api_suggest' || r.skill === 'needs_skill') && r.ok !== false);
+  if (_allMetaSkills && _hasUiCardSuccess) {
+    logger.info('[Node:ReviewExecution] api_suggest/needs_skill surfaced successfully — skipping hollow check (UI card, no page output expected)');
+    return { ...state, reviewVerdict: 'VERIFIED' };
+  }
+
   // ── video.agent short-circuit ─────────────────────────────────────────────
   // video.agent returns a structured result (transcript, steps, stdout) — not browser
   // page text. Content-based hollow checks must never fire on these results.

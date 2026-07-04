@@ -743,7 +743,15 @@ async function planSkillsV2(state) {
   // ── Recovery / correction notes ───────────────────────────────────────────
   let recoveryNote = '';
   if (recoveryContext) {
-    recoveryNote = `\n\nRECOVERY CONTEXT (previous attempt failed — DO NOT repeat the same plan):\n- Failed step: ${recoveryContext.failedSkill} (step ${recoveryContext.failedStep})\n- Failure reason: ${recoveryContext.failureReason}\n- Actual URL reached: ${recoveryContext.actualUrl || 'unknown'}\n- Suggestion: ${recoveryContext.suggestion}\n- Constraint: ${recoveryContext.constraint || 'none'}\nYou MUST produce a DIFFERENT plan. RECOVERY TOOL CONSTRAINT: Any step that previously used browser.agent { action: "run" } MUST continue to use browser.agent { action: "run" } in the recovery plan.`;
+    const _isMetaSkillFailure = ['api_suggest', 'needs_skill'].includes(recoveryContext.failedSkill);
+    if (_isMetaSkillFailure) {
+      // api_suggest/needs_skill are UI card primitives — "no page content" is expected, not a real failure.
+      // The previous plan correctly avoided [NEEDS AUTH] agents. Do NOT fall back to a browser agent that
+      // requires authentication. Use a REST API alternative (build_agent) or surface the offer again.
+      recoveryNote = `\n\nRECOVERY CONTEXT:\n- Previous plan used ${recoveryContext.failedSkill} (a UI information card — NOT a task executor). The card surfaced correctly; the plan is not truly failed.\n- Failure reason reported: ${recoveryContext.failureReason}\n⚠️ CRITICAL AUTH CONSTRAINT: The registered browser agents for this service are marked [NEEDS AUTH] and cannot execute tasks. DO NOT use browser.agent { action: "run" } with any [NEEDS AUTH] agent. You MUST use browser.agent { action: "build_agent", service: "sendgrid" } (or mailgun) to set up a REST API sender, OR surface api_suggest again if the user has not yet chosen a provider.`;
+    } else {
+      recoveryNote = `\n\nRECOVERY CONTEXT (previous attempt failed — DO NOT repeat the same plan):\n- Failed step: ${recoveryContext.failedSkill} (step ${recoveryContext.failedStep})\n- Failure reason: ${recoveryContext.failureReason}\n- Actual URL reached: ${recoveryContext.actualUrl || 'unknown'}\n- Suggestion: ${recoveryContext.suggestion}\n- Constraint: ${recoveryContext.constraint || 'none'}\nYou MUST produce a DIFFERENT plan. RECOVERY TOOL CONSTRAINT: Any step that previously used browser.agent { action: "run" } MUST continue to use browser.agent { action: "run" } in the recovery plan.`;
+    }
     if (recoveryContext.constraint?.includes('USE GOAL MODE')) {
       recoveryNote += '\n⚠️ GOAL MODE REQUIRED: For any shell.run step, emit { "skill": "shell.run", "args": { "goal": "<plain English description>" } }. Do NOT write args.cmd or args.argv.';
     }

@@ -18,7 +18,7 @@ tool.discover|args:{action:string,task?:string}|[tool_discovery_agent]_Discovers
 
 1. **CLI agent** — CLI-backed services (gh, aws, heroku) AND known CLI tools (ffmpeg, pandoc, imagemagick, yt-dlp, etc.). Check AVAILABLE AGENTS; if found, `cli.agent { action: 'run', agentId, task }`. If not found, `cli.agent { action: 'build_agent', service }` then run.
 2. **shell.run** — generic local file ops, Python scripts, git, and simple system commands that do not require installing a specific third-party CLI tool.
-3. **browser.agent** — web navigation, OAuth services, REST API services, AI chatbots. Preflight ensures agents are ready and authed.
+3. **browser.agent** — web navigation, OAuth services, REST API services, AI chatbots. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
 
 **Exceptions:** pure navigation → browser.agent directly. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
 
@@ -79,6 +79,7 @@ tool.discover|args:{action:string,task?:string}|[tool_discovery_agent]_Discovers
 | OAuth service (Gmail, Slack, Notion, etc.) | `browser.agent { action: 'run', agentId, task }` — handles OAuth internally |
 | CLI-backed service (gh, aws, heroku) | `cli.agent { action: 'run', agentId, task }` |
 | Service in AVAILABLE AGENTS [browser] | `browser.agent { action: 'run', agentId, task }` — NEVER raw `browser.act` |
+| Service in AVAILABLE AGENTS [browser] marked `[NEEDS AUTH]` | Do NOT use directly. Use a REST API alternative (`browser.agent { action: 'build_agent', service: '<app-service>' }` or `<app-service>`, etc.) OR output `api_suggest` to let the user pick an authenticated provider. NEVER silently trigger a browser login flow. |
 | Service in AVAILABLE AGENTS [api_key] | `browser.agent` or `cli.agent` run — api_key agents are API-only, cannot navigate |
 | AI chatbot (ChatGPT, Claude, Perplexity, Gemini, Grok) | `browser.agent { action: 'run', agentId, task }` — chat interface, NOT developer API |
 | Discovery on a known agent (unknown nav path) | `browser.agent { action: 'explore', agentId, goal }` |
@@ -105,11 +106,11 @@ tool.discover|args:{action:string,task?:string}|[tool_discovery_agent]_Discovers
 
 **AI service routing:** Chat/research → plain service name (`deepseek.agent`, `perplexity.agent`). Developer API → `*platform` variant (`deepseekplatform.agent`).
 
-**SMS routing:** When `smsGatewayTarget` is provided, send via `gmail.agent` email (free carrier gateway). Never use paid SMS APIs.
+**SMS routing:** When `smsGatewayTarget` is provided AND `gmail.agent` is NOT marked `[NEEDS AUTH]`, send via `gmail.agent` email (free carrier gateway). If `gmail.agent` is `[NEEDS AUTH]`, use `api_suggest` or `browser.agent { action: 'build_agent', service: 'sendgrid' }` instead.
 
 **user.agent:** Use `resolve_form` before tasks needing personal data. Use `resolve_context` before generating personalized content. Pass `summary` into following `synthesize` step.
 
-**Registered agents:** Use EXACT agentId from AVAILABLE AGENTS block. User's explicit service names always override inferred context.
+**Registered agents:** Use EXACT agentId from AVAILABLE AGENTS block. User's explicit service names always override inferred context. **NEVER use an agent marked `[NEEDS AUTH]` for automatic execution** — it will open a browser login screen. Use a REST API alternative or ask the user which authenticated service to use.
 
 **`synthesize` ordering rules:**
 

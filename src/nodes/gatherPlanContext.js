@@ -27,14 +27,16 @@
 'use strict';
 
 const MAX_ROUNDS = 3;
+const MAX_AUTH_ROUNDS = 10; // auth sign-ins don't count against Q&A budget
 
 const SYSTEM_PROMPT = `You are a task readiness checker for a desktop automation system.
 
 Given a user's request and what is already known, decide if the task is ready to execute — or if one critical piece of information is missing.
 
-Respond with ONLY valid JSON in exactly one of these two shapes:
+Respond with ONLY valid JSON in exactly one of these three shapes:
 {"complete": true}
 {"complete": false, "question": "<one concise question, 15 words max>"}
+{"complete": false, "question": "<one concise question, 15 words max>", "authAgentId": "<agentId from UNAUTHENTICATED AGENTS>"}
 
 Rules:
 - Return {"complete": true} if the task can proceed as-is.
@@ -48,9 +50,11 @@ Rules:
 - Extraction tasks with a named site + topic → always {"complete": true}.
 - If KNOWN FACTS already answer what's missing → {"complete": true}.
 - If RECENT CONVERSATION resolves any pronoun ("it", "that folder", "the file") → {"complete": true}.
-- Ask only one question. Never combine two into one.`;
+- Ask only one question. Never combine two into one.
+- CRITICAL AUTH RULE: If the task requires a service AND that service's agent appears in UNAUTHENTICATED AGENTS below (marked [NEEDS AUTH]), return {"complete": false, "question": "<service> requires sign-in. Sign in to <service>, or use a different provider?", "authAgentId": "<the exact agentId from the list e.g. gmail.agent>"} — NEVER assume it can run silently.
+- When authAgentId is set, the system will show a dedicated sign-in button — keep the question short (under 12 words).`;
 
-async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, logger) {
+async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger) {
   const priorBlock = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
@@ -73,6 +77,14 @@ async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHi
     ? `\n\nKNOWN FACTS (do NOT ask about these):\n${knownLines.join('\n')}`
     : '';
 
+  // Inject unauthenticated agents from preflightResult so the LLM can block on auth before planning
+  const unauthedAgents = (preflightResult?.agents || [])
+    .filter(a => a.authed === false && (a.type === 'browser' || a.type === 'cli'))
+    .map(a => `- ${a.agentId} [NEEDS AUTH]`);
+  const unauthedBlock = unauthedAgents.length > 0
+    ? `\n\nUNAUTHENTICATED AGENTS (require sign-in before they can execute tasks):\n${unauthedAgents.join('\n')}`
+    : '';
+
   const tc = resolvedSelfContext?._taskClassification || {};
   const followUpTarget = tc.isFollowUp && !tc.isScreenFollowUp ? tc.followUpTarget : null;
   const followUpBlock = followUpTarget
@@ -80,7 +92,7 @@ async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHi
     : '';
 
   const prompt = `REQUEST: "${originalMsg}"
-TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}
+TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}
 
 Is this task ready to execute, or is one critical piece missing?`;
 
@@ -155,13 +167,14 @@ module.exports = async function gatherPlanContext(state) {
   const gatherAnswerCallback = state.gatherAnswerCallback || null;
   const answers = [...priorAnswers];
   let round = currentRound;
+  let authRound = 0; // separate counter — auth sign-ins don't consume Q&A rounds
 
   // ── Inline Q&A loop (max MAX_ROUNDS) ─────────────────────────────────────────
   while (round < MAX_ROUNDS) {
     if (progressCallback) progressCallback({ type: 'thinking', message: 'Checking task details…' });
     logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
 
-    const result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, logger);
+    const result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger);
 
     if (result.complete) {
       let enriched = baseMsg;
@@ -176,7 +189,45 @@ module.exports = async function gatherPlanContext(state) {
 
     const question = result.question || 'Could you provide more details about this task?';
     logger.info(`[Node:GatherPlanContext] Asking Q${round + 1}: "${question}"`);
-    if (progressCallback) progressCallback({ type: 'ask_user', question, source: 'gatherPlanContext' });
+
+    // ── Auth-action card: if LLM returned authAgentId, match against preflightResult
+    // and emit gather_auth_action instead of a plain text question so the UI can
+    // show actionable sign-in / open-agents-tab buttons.
+    const _authAgentId = result.authAgentId || null;
+    const _agents = state.preflightResult?.agents || [];
+    // Normalize both sides — strip .agent suffix so "gmail" matches "gmail.agent" and vice versa
+    const _normalizedAuthId = (_authAgentId || '').replace('.agent', '').toLowerCase();
+    const _unauthedAgent = _normalizedAuthId
+      ? _agents.find(a => a.agentId.replace('.agent', '').toLowerCase() === _normalizedAuthId && a.authed === false)
+      : _agents.find(a => a.authed === false && (a.type === 'browser' || a.type === 'cli') &&
+          question.toLowerCase().includes(a.agentId.replace('.agent', '').toLowerCase()));
+
+    if (_unauthedAgent && progressCallback) {
+      const _authType = _unauthedAgent.type === 'cli' ? 'cli_token' : (_unauthedAgent.sessionStale ? 'browser_reauth' : 'browser_oauth');
+      const _actions = _unauthedAgent.type === 'browser'
+        ? [
+            { label: `Sign in to ${_unauthedAgent.agentId.replace('.agent', '')}`, value: 'auth_browser', primary: true },
+            { label: 'Use a different service', value: 'use_api', primary: false },
+          ]
+        : [
+            { label: 'Open Agents tab to add credentials', value: 'open_agents_tab', primary: true },
+            { label: 'Use a different service', value: 'use_api', primary: false },
+          ];
+      logger.info(`[Node:GatherPlanContext] Auth-action card for ${_unauthedAgent.agentId} (${_authType})`);
+      if (progressCallback) progressCallback({
+        type: 'gather_auth_action',
+        question,
+        agentId: _unauthedAgent.agentId,
+        agentType: _unauthedAgent.type,
+        authType: _authType,
+        iconUrl: _unauthedAgent.iconUrl || null,
+        startUrl: _unauthedAgent.startUrl || null,
+        actions: _actions,
+        source: 'gatherPlanContext',
+      });
+    } else {
+      if (progressCallback) progressCallback({ type: 'ask_user', question, source: 'gatherPlanContext' });
+    }
 
     if (!gatherAnswerCallback) {
       logger.warn('[Node:GatherPlanContext] No gatherAnswerCallback — passing through');
@@ -185,7 +236,26 @@ module.exports = async function gatherPlanContext(state) {
 
     try {
       const answer = await gatherAnswerCallback(question);
-      if (answer) {
+      if (answer === 'authenticated') {
+        // User completed sign-in — mark only this specific agent as authed so the next
+        // LLM round no longer sees it in UNAUTHENTICATED AGENTS. Other agents remain
+        // unauthed and will each get their own sequential prompt.
+        const agentLabel = _unauthedAgent?.agentId?.replace('.agent', '') || 'the service';
+        logger.info(`[Node:GatherPlanContext] Auth completed for ${agentLabel} (authRound ${authRound + 1}) — re-checking task readiness`);
+        if (state.preflightResult?.agents && _unauthedAgent) {
+          const idx = state.preflightResult.agents.findIndex(
+            a => a.agentId.toLowerCase() === _unauthedAgent.agentId.toLowerCase()
+          );
+          if (idx >= 0) state.preflightResult.agents[idx] = { ...state.preflightResult.agents[idx], authed: true };
+        }
+        // Inject into priorQA so LLM sees explicit auth confirmation next round
+        answers.push({ question, answer: `authenticated — ${agentLabel} is now signed in` });
+        if (progressCallback) progressCallback({ type: 'gather_answer_received' });
+        authRound++;
+        if (authRound >= MAX_AUTH_ROUNDS) break; // safety ceiling
+        // Do NOT increment round — auth doesn't count against Q&A budget
+        continue;
+      } else if (answer) {
         answers.push({ question, answer });
         logger.info(`[Node:GatherPlanContext] Answer Q${round + 1}: "${String(answer).slice(0, 80)}"`);
         if (progressCallback) progressCallback({ type: 'gather_answer_received' });

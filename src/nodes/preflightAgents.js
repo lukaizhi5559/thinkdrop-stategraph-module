@@ -194,6 +194,48 @@ module.exports = async function preflightAgents(state) {
   let orphanedSkills = [];  // skill names registered in user-memory but missing on disk
   let orphanedSkillsNote = '';  // injected into planSkills prompt
 
+  // ── ResolveAgent result: which agents to preflight and which to create ─────
+  const resolveAgentResult = state.resolveAgentResult || null;
+  const selectedAgentIds = new Set();
+  const createAgentSpecs = [];
+  if (resolveAgentResult && Array.isArray(resolveAgentResult.agents)) {
+    for (const a of resolveAgentResult.agents) {
+      if (!a || !a.agentId) continue;
+      const idLower = a.agentId.toLowerCase();
+      selectedAgentIds.add(idLower);
+      if (a.create) {
+        createAgentSpecs.push(a);
+      }
+    }
+  }
+
+  // ── Create any agents marked create:true by resolveAgent ───────────────────
+  if (createAgentSpecs.length > 0) {
+    for (const spec of createAgentSpecs) {
+      const skillName = spec.type === 'cli' ? 'cli.agent' : (spec.type === 'app' ? 'app.agent' : 'browser.agent');
+      try {
+        _emitProgress({
+          type: 'preflight:building_agent',
+          agentType: spec.type,
+          agentId: spec.agentId,
+          message: `Building ${spec.service} agent…`,
+          iconUrl: serviceToIconUrl(spec.service),
+        });
+        const buildRes = await mcpAdapter.callService('command', skillName, {
+          action: 'build_agent',
+          service: spec.service,
+        }, { timeoutMs: 30000 }).catch(() => null);
+        if (buildRes?.ok) {
+          logger.info(`[Node:PreflightAgents] Created ${skillName} agent: ${spec.agentId}`);
+        } else {
+          logger.warn(`[Node:PreflightAgents] Failed to create ${spec.agentId}: ${buildRes?.error || 'unknown'}`);
+        }
+      } catch (err) {
+        logger.warn(`[Node:PreflightAgents] Agent creation failed for ${spec.agentId}: ${err.message}`);
+      }
+    }
+  }
+
   // ── Parallel preflight fetches ──────────────────────────────────────────────
   await Promise.all([
     // ── Skill contract ────────────────────────────────────────────────────
@@ -304,14 +346,27 @@ module.exports = async function preflightAgents(state) {
     (async () => {
       try {
         const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
-        const agents = agRes?.data || agRes || [];
+        const allAgents = agRes?.data || agRes || [];
+        // Filter to task-relevant agents only — don't check auth for agents
+        // the user's task doesn't need (e.g. youtube when sending gmail).
+        // If resolveAgent selected agents, always include those regardless of task text.
+        const taskLower = userMessage.toLowerCase();
+        const chosenSvc = (state.chosenService || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const agents = Array.isArray(allAgents) ? allAgents.filter(a => {
+          if (a.type !== 'browser' && a.type !== 'cli') return true; // keep non-agent entries
+          const idLower = (a.id || '').toLowerCase();
+          const svcKey = idLower.replace('.agent', '').replace(/[^a-z0-9]/g, '');
+          if (selectedAgentIds.size > 0 && selectedAgentIds.has(idLower)) return true;
+          if (chosenSvc && svcKey === chosenSvc) return true;
+          if (taskLower.includes(svcKey)) return true;
+          return false;
+        }) : [];
         if (Array.isArray(agents) && agents.length > 0) {
           const agentLines = [];
           const trainedRecipeLines = [];
 
           for (const a of agents) {
-            const baseLine = `- ${a.id}: ${a.type} agent${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`;
-            agentLines.push(baseLine);
+            const _agentBaseDesc = `${a.type} agent${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`;
             const svc = (a.id || '').replace('.agent', '').toLowerCase();
             if (svc) _registeredAgentServiceMap[svc] = a.id;
 
@@ -352,6 +407,7 @@ module.exports = async function preflightAgents(state) {
             }
 
             // ── Browser agent auth check (session profile + cookie validity) ──
+            // NOTE: agentLines.push() is deferred to after auth is determined below
             if (a.type === 'browser') {
               const iconUrl = agentIdToIconUrl(a.id);
               const BROWSER_SESSIONS_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-sessions');
@@ -380,6 +436,8 @@ module.exports = async function preflightAgents(state) {
               }
 
               const authed = hasSession && !sessionStale;
+              const _authTag = authed ? '' : ' [NEEDS AUTH — user must authenticate before this agent can run]';
+              agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_authTag}`);
 
               agentReadiness.push({
                 type: 'browser',
@@ -409,6 +467,9 @@ module.exports = async function preflightAgents(state) {
               // Stale agent detection: registered CLI agent whose CLI is no longer installed
               const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
               const cliInfo = _preflightCliMap[svcKey];
+              const _cliAuthed = cliInfo ? (!!cliInfo.authUser || cliInfo.authStatus === 'authenticated') : false;
+              const _cliAuthTag = _cliAuthed ? '' : ' [NEEDS AUTH]';
+              agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_cliAuthTag}`);
               if (cliInfo && !cliInfo.hasCli) {
                 const iconUrl = agentIdToIconUrl(a.id);
                 agentReadiness.push({
@@ -426,6 +487,9 @@ module.exports = async function preflightAgents(state) {
                   message: `${a.id} registered but its CLI is no longer detected — consider rebuilding or removing`,
                 });
               }
+            } else {
+              // Other agent types — push without auth tag
+              agentLines.push(`- ${a.id}: ${_agentBaseDesc}`);
             }
           }
 
@@ -806,9 +870,14 @@ module.exports = async function preflightAgents(state) {
     // ── Tool discovery pre-flight ───────────────────────────────────────
     // Assesses whether browser.agent can handle the task well; if not,
     // searches for external AI tools and injects a note for the planner.
+    // Skip when resolveAgent already selected (or created) agents — avoid inventing fake tools.
     (async () => {
       if (recoveryContext) return;
       if (!userMessage || userMessage.length < 10) return;
+      if (selectedAgentIds.size > 0) {
+        logger.info('[Node:PreflightAgents] resolveAgent selected agents — skipping tool discovery');
+        return;
+      }
       try {
         // Step 1: Assess — can browser.agent do this task well?
         const assessRes = await mcpAdapter.callService('command', 'command.automate', {
