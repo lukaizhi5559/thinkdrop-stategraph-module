@@ -277,10 +277,10 @@ module.exports = async function answer(state) {
   if ((state._needsContextInterpretation || _isConversationFollowUp) && conversationHistory.length > 0) {
     const recentHistory = conversationHistory.slice(-5); // Last 5 messages
     const historyBlock = recentHistory.map((msg, i) => {
-      const role = msg.role === 'assistant' ? 'ThinkDrop' : 'User';
+      const role = msg.role === 'assistant' ? 'Previous AI Response (may contain errors)' : 'User';
       return `[${i + 1}] ${role}: ${msg.content?.substring(0, 300) || 'No content'}`;
     }).join('\n');
-    systemInstructions += `\n\n=== RECENT CONVERSATION HISTORY ===\n${historyBlock}\n=== END HISTORY ===`;
+    systemInstructions += `\n\n=== RECENT CONVERSATION HISTORY ===\n${historyBlock}\n=== END HISTORY ===\n\nCRITICAL: The conversation history above contains previous AI responses that may contain hallucinations or errors. For temporal queries (dates, times, "yesterday", "today", etc.), prioritize the actual memory data provided below over any dates mentioned in conversation history. Conversation history is only for context, not factual accuracy.`;
   }
 
   systemInstructions += '\n\nRules:';
@@ -302,7 +302,7 @@ module.exports = async function answer(state) {
     } else if (intentType === 'command_automate') {
       systemInstructions += '\n- Summarize what was automated and the outcome of each step\n- If any step failed or was skipped, explain clearly\n- Be concise — one line per step';
     } else if (intentType === 'memory_store' || intentType === 'memory_retrieve') {
-      systemInstructions += '\n- Answer using the provided Conversation History and Screen Activity & User Memories\n- The Conversation History contains the actual chat messages — use these to answer questions about past conversations\n- The Memories contain screen captures and activity — use these to answer questions about what the user was doing\n- Be specific: quote or summarize actual messages/topics from the history\n- Do NOT say you lack information if Conversation History or Memories are present in the prompt\n- When referencing specific memories, ALWAYS cite the date using the formattedDate field (e.g., "On March 8, 2026 at 7:04 PM (two days ago), you viewed...")\n- Each memory has a formattedDate with "absolute" (human-readable) and "relative" (e.g., "2 days ago") - use both for temporal context\n- IMPORTANT: Cite EACH memory individually with its specific timestamp. Do NOT aggregate multiple memories into time ranges like "between 5:24-7:35 PM".\n- MEMORY TYPE PRIORITY (highest to lowest): personal_profile > user_memory > synthesis > screen_capture. When types conflict, personal_profile is ground truth; screen_capture is context only.';
+      systemInstructions += '\n- CRITICAL MULTI-DAY REPORTING RULE: When memories span multiple days, you MUST report findings from EACH day that has relevant activity, not just the day with the most matches. Example: If user asks about "the past week" and you have memories from Date A, Date B, Date C, and Date D, you MUST report activity from ALL FOUR dates, not just Date A. This is a non-negotiable requirement.\n- Answer using the provided Conversation History and Screen Activity & User Memories\n- The Conversation History contains the actual chat messages — use these to answer questions about past conversations\n- The Memories contain screen captures and activity — use these to answer questions about what the user was doing\n- Be specific: quote or summarize actual messages/topics from the history\n- Do NOT say you lack information if Conversation History or Memories are present in the prompt\n- When referencing specific memories, ALWAYS cite the date using the formattedDate field (e.g., "On <month> <date>, <year> at <HH:MM> <AM|PM> (N days ago), you viewed...")\n- Each memory has a formattedDate with "absolute" (human-readable) and "relative" (e.g., "N days ago") - use both for temporal context\n- IMPORTANT: Cite EACH memory individually with its specific timestamp. Do NOT aggregate multiple memories into time ranges like "between <HH:MM>-<HH:MM> <AM|PM>".\n- MEMORY TYPE PRIORITY (highest to lowest): personal_profile > user_memory > synthesis > screen_capture. When types conflict, personal_profile is ground truth; screen_capture is context only.\n- For activity queries (watching, listening, reading, browsing): examine each screen capture\'s appName, windowTitle, url, and source_text to determine if it matches the user\'s activity intent — regardless of platform. A capture showing a video player on a <generic> website counts just as much as one on <Famous Social Media Video Platform>.\n- Use precise language: say "you visited" or "you had X open" rather than "you watched" unless the capture clearly shows active video playback. Screen captures are momentary snapshots, not proof of sustained activity.\n- Group related captures (same site/app within minutes) and summarize rather than listing every individual capture. If 5 captures show the same video within 10 minutes, report it as one viewing session, not 5 separate entries.';
     } else {
       systemInstructions += '\n- Use the provided context\n- Be helpful and concise';
     }
@@ -316,7 +316,15 @@ module.exports = async function answer(state) {
       const date = mem.formattedDate?.absolute || mem.created_at || 'Unknown date';
       const rel = mem.formattedDate?.relative || '';
       const type = mem.metadata?.type || mem.type || 'memory';
-      return `[Memory ${i + 1} — ${date}${rel ? ' ' + rel : ''}] (${type}): ${mem.text?.substring(0, 200) || 'No text'}`;
+      const isScreenCapture = type === 'screen_capture';
+      const app = mem.metadata?.appName || '';
+      const win = mem.metadata?.windowTitle || '';
+      const url = mem.metadata?.url || '';
+      const metaLine = isScreenCapture && (app || win || url)
+        ? `App: ${app}${win ? ' | Window: ' + win : ''}${url ? ' | URL: ' + url : ''}\n`
+        : '';
+      const textLimit = isScreenCapture ? 500 : 200;
+      return `[Memory ${i + 1} — ${date}${rel ? ' ' + rel : ''}] (${type}):\n${metaLine}${mem.text?.substring(0, textLimit) || 'No text'}`;
     }).join('\n');
     systemInstructions += `\n\n=== SCREEN ACTIVITY & MEMORIES ===\n${memoryBlock}\n=== END MEMORIES ===`;
   }

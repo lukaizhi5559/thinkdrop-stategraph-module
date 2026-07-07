@@ -91,64 +91,144 @@ function buildSearchQuery(message, resolvedMessage) {
 }
 
 /**
- * Detect whether a message is asking for a known personal attribute.
- * Returns the normalized attribute name (e.g. 'name', 'email', 'phone') or null.
+ * Build a cleaned keyword query for episodic BM25 ranking.
+ * Strips temporal phrases, pronouns, articles and filler so that only
+ * content-bearing keywords remain (e.g. "watch videos").  The date
+ * filtering is handled separately by startDate/endDate in the WHERE
+ * clause — this only affects relevance *ranking* within that window.
  */
-function _detectPersonalAttribute(message) {
-  const q = (message || '').toLowerCase().trim();
+function buildEpisodicSearchQuery(query) {
+  let q = (query || '').toLowerCase().trim();
+  q = q
+    .replace(/\b(over|during|in|for)\s+(the\s+)?(past|last|next)\s+(\d+\s+)?(days?|weeks?|months?|hours?)\b/gi, '')
+    .replace(/\b(the\s+)?(past|last|next)\s+(week|month|few\s+days?|couple\s+(of\s+)?days?)\b/gi, '')
+    .replace(/\b(today|yesterday|this\s+(morning|afternoon|evening|week|month)|last\s+night|recently|lately)\b/gi, '')
+    .replace(/\b(did|do|have|has|was|were|am|is|are)\s+i\b/gi, '')
+    .replace(/\b(i|me|my|any|some|the|a|an|on|at|to|of|it|that|this|what|about|nothing|anything|something)\b/gi, '')
+    .replace(/[?.!,]+/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
 
-  // Direct identity questions
-  if (/\b(what('?s|\s+is)\s+(my\s+name|your\s+name)|who\s+am\s+i|what\s+did\s+you\s+call\s+me|what\s+name\s+(did\s+you\s+say|do\s+you\s+have)\b)/i.test(q)) {
-    return 'name';
-  }
+  if (!q || q.length < 3) return 'activity screen apps websites';
 
-  const match = q.match(
-    /\b(?:my|what(?:'s|\s+is)\s+my)\s+(name|email|e-mail|username|favorite\s*\w+|birthday|birthdate|date\s+of\s+birth|location|timezone|phone|phone\s+number|cell|cellphone|mobile|number|occupation|job|company|employer|github|git|language|home\s+address|work\s+address|address)\b/i
-  );
-  if (match) {
-    let attr = match[1].toLowerCase().replace(/\s+/g, '_');
-    if (attr === 'e-mail') attr = 'email';
-    if (attr === 'phone_number' || attr === 'cell' || attr === 'cellphone' || attr === 'mobile') attr = 'phone';
-    if (attr === 'birthdate' || attr === 'date_of_birth') attr = 'birthday';
-    if (attr === 'employer') attr = 'company';
-    if (attr === 'git') attr = 'github';
-    if (attr === 'home_address' || attr === 'work_address') attr = 'address';
-    return attr;
-  }
-
-  return null;
+  return q;
 }
 
 /**
- * Detect a canonical app name in the user's query so episodic search can
- * filter by appName when the user asks about a specific app (e.g. "VS Code",
- * "Chrome", "Slack"). This is much more reliable than BM25 keyword matching
- * because generic terms like "Code" otherwise match many unrelated captures.
+ * LLM-driven personal attribute detection.
+ * Replaces the old regex + if/else chain with a single LLM call that can handle
+ * any phrasing the user might use.
+ * Only called on short messages containing "my" or "your" to avoid LLM calls on every message.
+ * Returns the normalized attribute name (e.g. 'name', 'email', 'phone') or null.
  */
-function _extractAppNameFilter(message) {
-  const q = (message || '').toLowerCase();
+async function _llmDetectPersonalAttribute(message, llmBackend, logger) {
+  const q = (message || '').trim();
 
-  const appPatterns = [
-    { aliases: ['vs code', 'visual studio code', 'vscode'], appName: 'VS Code' },
-    { aliases: ['google chrome', 'chrome'], appName: 'Google Chrome' },
-    { aliases: ['safari'], appName: 'Safari' },
-    { aliases: ['firefox'], appName: 'Firefox' },
-    { aliases: ['slack'], appName: 'Slack' },
-    { aliases: ['spotify'], appName: 'Spotify' },
-    { aliases: ['figma'], appName: 'Figma' },
-    { aliases: ['warp'], appName: 'Warp' },
-    { aliases: ['devin'], appName: 'Devin' },
-    { aliases: ['calendar'], appName: 'Calendar' },
-    { aliases: ['github'], appName: 'GitHub' },
-    { aliases: ['terminal'], appName: 'Terminal' },
-  ];
-
-  for (const { aliases, appName } of appPatterns) {
-    if (aliases.some(alias => q.includes(alias))) {
-      return appName;
-    }
+  // Quick pre-filter: only run LLM on short messages with possessive pronouns
+  if (!/\b(my|your)\b/i.test(q) || q.split(/\s+/).length > 15) {
+    return null;
   }
-  return null;
+
+  if (!llmBackend || !llmBackend.generateAnswer) return null;
+
+  const prompt = `Extract personal attribute from this message. Return ONLY one of: name, email, phone, birthday, location, timezone, company, occupation, github, username, address, language, or null. Message: "${q}"`;
+  try {
+    const raw = await llmBackend.generateAnswer(prompt, {
+      query: prompt,
+      context: { systemInstructions: 'You extract personal attributes. Return only the attribute name or null.' },
+    }, { maxTokens: 50, temperature: 0, fastMode: true });
+    if (!raw) return null;
+    const cleaned = raw.trim().toLowerCase().replace(/^```.*\n?/gm, '').replace(/```$/g, '').trim();
+    const validAttributes = ['name', 'email', 'phone', 'birthday', 'location', 'timezone', 'company', 'occupation', 'github', 'username', 'address', 'language'];
+    if (validAttributes.includes(cleaned)) {
+      logger.debug(`[Node:RetrieveMemory] LLM detected personal attribute: ${cleaned}`);
+      return cleaned;
+    }
+    return null;
+  } catch (e) {
+    logger.debug(`[Node:RetrieveMemory] LLM personal attribute detection failed: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * Detect whether a message is asking about past screen activity / content consumption.
+ * Covers any platform — YouTube, Netflix, Twitch, Spotify, Apple Music, podcasts, news, reading, browsing.
+ * No platform names hardcoded; relies on generic activity verbs and nouns.
+ */
+function _isActivityQuery(message) {
+  const q = (message || '').toLowerCase().trim();
+  return /\b(watch|watched|watching|video|videos|stream|streaming|movie|movies|show|shows|episode|play|playing|listen|listening|music|song|podcast|read|reading|article|news|browse|browsing|what\s+did\s+i\s+do|what\s+was\s+i\s+doing|activity|screen)\b/i.test(q);
+}
+
+/**
+ * Lightweight LLM fallback to extract a date range when regex and decompose LLM both return null.
+ * Uses minimal tokens (maxTokens: 100, temperature: 0) to keep latency low.
+ */
+async function _llmDateFallback(message, llmBackend, logger) {
+  if (!llmBackend || !llmBackend.generateAnswer) return null;
+  const prompt = `Extract a date range from this message. Return ONLY JSON {"startDate":"YYYY-MM-DD HH:MM:SS","endDate":"YYYY-MM-DD HH:MM:SS"} or null if no date reference. For relative ranges like "past week" or "last 7 days", startDate = 7 days ago at 00:00:00, endDate = today at 23:59:59. For single days like "a specific date", both start and end are that day. Message: "${message}"`;
+  try {
+    const raw = await llmBackend.generateAnswer(prompt, {
+      query: prompt,
+      context: { systemInstructions: 'You extract date ranges. Return only JSON or null.' },
+    }, { maxTokens: 100, temperature: 0, fastMode: true });
+    if (!raw) return null;
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    const parsed = JSON.parse(cleaned);
+    if (parsed && parsed.startDate && parsed.endDate) {
+      logger.debug(`[Node:RetrieveMemory] LLM fallback dateRange: ${JSON.stringify(parsed)}`);
+      return parsed;
+    }
+    return null;
+  } catch (e) {
+    logger.debug(`[Node:RetrieveMemory] LLM date fallback failed: ${e.message}`);
+    return null;
+  }
+}
+
+/**
+ * DB-driven app name discovery.
+ * Queries episodic_memory for distinct app names the user has actually used,
+ * then matches the user's message against them (case-insensitive substring).
+ * Falls back to null on error — same as the old hardcoded list returning null.
+ */
+async function _extractAppNameFilter(message, mcpAdapter, dateRange, context, logger) {
+  const q = (message || '').toLowerCase();
+  if (!mcpAdapter) return null;
+
+  // Use the date range if available, otherwise default to 30 days for activity queries
+  let startDate = null;
+  let endDate = null;
+  if (dateRange) {
+    startDate = dateRange.startDate;
+    endDate = dateRange.endDate;
+  } else {
+    const s = new Date(); s.setDate(s.getDate() - 30);
+    const pad = n => String(n).padStart(2, '0');
+    startDate = `${s.getFullYear()}-${pad(s.getMonth() + 1)}-${pad(s.getDate())} 00:00:00`;
+    endDate = `${new Date().getFullYear()}-${pad(new Date().getMonth() + 1)}-${pad(new Date().getDate())} 23:59:59`;
+  }
+
+  try {
+    const result = await mcpAdapter.callService('user-memory', 'episodic.apps', {
+      startDate,
+      endDate,
+      userId: context?.userId,
+    }, { timeoutMs: 5000 });
+    const data = result?.data || result;
+    const apps = data?.apps || [];
+    for (const appName of apps) {
+      if (appName && q.includes(appName.toLowerCase())) {
+        logger.debug(`[Node:RetrieveMemory] DB-driven app filter matched: ${appName}`);
+        return appName;
+      }
+    }
+    return null;
+  } catch (e) {
+    logger.debug(`[Node:RetrieveMemory] episodic.apps lookup failed: ${e.message}`);
+    return null;
+  }
 }
 
 /**
@@ -205,8 +285,24 @@ module.exports = async function retrieveMemory(state) {
     };
   }
 
+  const now = new Date();
+
   try {
-    let dateRange = parseDateRange(resolvedMessage || message);
+    // ── Layer 1: Use dateRange from decomposePromptV2 LLM call (zero latency) ──
+    let dateRange = state._llmDateRange || null;
+    logger.debug(`[Node:RetrieveMemory] Layer 1 - _llmDateRange from state: ${dateRange ? JSON.stringify(dateRange) : 'null'}`);
+    logger.debug(`[Node:RetrieveMemory] State keys: ${Object.keys(state).filter(k => k.includes('Date') || k.includes('date')).join(', ')}`);
+    
+    // ── Layer 2: Regex fast-path ──
+    if (!dateRange) {
+      dateRange = parseDateRange(resolvedMessage || message);
+      logger.debug(`[Node:RetrieveMemory] Layer 2 - parseDateRange result: ${dateRange ? JSON.stringify(dateRange) : 'null'}`);
+    }
+
+    // ── Layer 3: LLM fallback when both layers return null ──
+    if (!dateRange && state.llmBackend) {
+      dateRange = await _llmDateFallback(resolvedMessage || message, state.llmBackend, logger);
+    }
 
     // If no dateRange and this is a short continuation, inherit the dateRange from the
     // most recent prior user message that had one. This keeps follow-ups in the same
@@ -246,16 +342,17 @@ module.exports = async function retrieveMemory(state) {
       }
     }
 
+    const isActivityQuery = _isActivityQuery(resolvedMessage || message);
     const searchQuery = buildSearchQuery(message, resolvedMessage);
-    const minSimilarity = dateRange ? 0.1 : 0.25;
+    const minSimilarity = (dateRange || isActivityQuery) ? 0.1 : 0.25;
 
-    logger.debug(`[Node:RetrieveMemory] Search query: "${searchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | minSimilarity: ${minSimilarity}`);
+    logger.debug(`[Node:RetrieveMemory] Search query: "${searchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | isActivityQuery: ${isActivityQuery} | minSimilarity: ${minSimilarity}`);
 
     // ── Primary profile lookup for personal-attribute queries ───────────────
     // Before running noisy semantic search across thousands of screen captures,
     // check the structured user_profile KV store for known personal attributes.
     let profileFallback = null;
-    const personalAttribute = _detectPersonalAttribute(resolvedMessage || message);
+    const personalAttribute = await _llmDetectPersonalAttribute(resolvedMessage || message, state.llmBackend, logger);
     if (personalAttribute && !dateRange) {
       const profileKeys = _profileKeysForAttribute(personalAttribute);
       for (const key of profileKeys) {
@@ -290,7 +387,35 @@ module.exports = async function retrieveMemory(state) {
 
     // Extract a canonical app name from the query so episodic search can filter
     // exactly when the user asks about a specific app (e.g. "VS Code yesterday").
-    const episodicAppName = _extractAppNameFilter(resolvedMessage || message);
+    // Now DB-driven: queries episodic_memory for actual app names the user has used.
+    const episodicAppName = await _extractAppNameFilter(resolvedMessage || message, mcpAdapter, dateRange, context, logger);
+
+    // ── DB keyword enrichment for BM25 ──────────────────────────────────────
+    // Fetch top app/window pairs from the date range to enrich the BM25 query
+    // with the actual vocabulary present in the data. This replaces hardcoded
+    // platform names (YouTube, Netflix, etc.) with dynamic discovery.
+    let dbKeywords = [];
+    try {
+      const episodicDateRangeForKeywords = dateRange || (isActivityQuery ? (() => {
+        const s = new Date(now); s.setDate(s.getDate() - 30);
+        const pad = n => String(n).padStart(2, '0');
+        const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        const e = new Date(now); e.setHours(23, 59, 59, 999);
+        return { startDate: iso(s), endDate: iso(e) };
+      })() : null);
+      if (episodicDateRangeForKeywords) {
+        const kwResult = await mcpAdapter.callService('user-memory', 'episodic.keywords', {
+          startDate: episodicDateRangeForKeywords.startDate,
+          endDate: episodicDateRangeForKeywords.endDate,
+          userId: context?.userId,
+          limit: 20,
+        }, { timeoutMs: 5000 });
+        const kwData = kwResult?.data || kwResult;
+        dbKeywords = (kwData?.keywords || []).map(k => [k.appName, k.windowTitle]).flat().filter(Boolean);
+      }
+    } catch (e) {
+      logger.debug(`[Node:RetrieveMemory] episodic.keywords lookup failed: ${e.message}`);
+    }
 
     const [conversationResult, crossSessionResult, memoriesResult, episodicResult] = await Promise.all([
       // Current session conversation history
@@ -337,24 +462,71 @@ module.exports = async function retrieveMemory(state) {
         : Promise.resolve({ results: [] }),
 
       // Episodic memory search for date-range activity / screen capture queries
-      dateRange && intent?.type !== 'context_query'
-        ? mcpAdapter.callService('user-memory', 'episodic.search', {
-            query: searchQuery,
-            limit: 10,
-            userId: context?.userId,
-            startDate: dateRange.startDate,
-            endDate: dateRange.endDate,
-            filters: {
-              type: 'screen_capture',
-              excludeOverlay: true,
-              ...(episodicAppName ? { appName: episodicAppName } : {})
-            },
-            dedup: true
-          }).catch(err => {
-            logger.warn('[Node:RetrieveMemory] Episodic search failed:', err.message);
-            return { results: [] };
-          })
-        : Promise.resolve({ results: [] })
+      // Also fires for activity queries (watch, listen, read, browse, etc.) with a 30-day default
+      // window when no explicit dateRange was found — ensures content-consumption recall works
+      // even when temporal phrasing isn't parsed by any layer.
+      (() => {
+        if (intent?.type === 'context_query') return Promise.resolve({ results: [] });
+        const episodicDateRange = dateRange || (isActivityQuery ? (() => {
+          const s = new Date(now); s.setDate(s.getDate() - 30);
+          const pad = n => String(n).padStart(2, '0');
+          const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+          const e = new Date(now); e.setHours(23, 59, 59, 999);
+          return { startDate: iso(s), endDate: iso(e) };
+        })() : null);
+        if (!episodicDateRange) return Promise.resolve({ results: [] });
+        // For activity queries, use a broad query so BM25 doesn't filter out relevant captures.
+        // The answer LLM will classify which captures match the user's intent (video, music, etc.)
+        // from source_text, appName, windowTitle, and url — no keyword enumeration needed.
+        const cleanedQuery = buildEpisodicSearchQuery(searchQuery);
+        const episodicQuery = isActivityQuery
+          ? 'activity screen apps websites browser video music read'
+          : (dbKeywords.length > 0 ? `${cleanedQuery} ${dbKeywords.join(' ')}` : cleanedQuery);
+        const rangeMs = new Date(episodicDateRange.endDate) - new Date(episodicDateRange.startDate);
+        const isWideRange = rangeMs > 86400000; // > 1 day
+        let episodicLimit = 10;
+        if (isActivityQuery) {
+          const rangeDays = isWideRange ? Math.ceil(rangeMs / 86400000) : 0;
+          if (rangeDays === 0) episodicLimit = 10;
+          else if (rangeDays <= 7) episodicLimit = 100;  // Increased from 50 to ensure multi-day coverage
+          else if (rangeDays <= 30) episodicLimit = 150; // Increased from 50
+          else if (rangeDays <= 90) episodicLimit = 200; // Increased from 75
+          else if (rangeDays <= 365) episodicLimit = 300; // Increased from 100
+          else episodicLimit = 500; // Increased from 200
+        }
+        logger.debug(`[Node:RetrieveMemory] Episodic dateRange: start=${episodicDateRange.startDate} end=${episodicDateRange.endDate} | rangeMs=${rangeMs} (${Math.round(rangeMs/86400000)} days) | wideRange=${isWideRange} | limit=${episodicLimit}`);
+        logger.debug(`[Node:RetrieveMemory] Episodic BM25 query: "${episodicQuery}" | limit: ${episodicLimit} | wideRange: ${isWideRange}`);
+        return mcpAdapter.callService('user-memory', 'episodic.search', {
+          query: episodicQuery,
+          limit: episodicLimit,
+          userId: context?.userId,
+          startDate: episodicDateRange.startDate,
+          endDate: episodicDateRange.endDate,
+          filters: {
+            type: 'screen_capture',
+            excludeOverlay: true,
+            ...(episodicAppName ? { appName: episodicAppName } : {})
+          },
+          dedup: true,
+          diverseDays: isWideRange
+        }).then(result => {
+          // Log temporal diversity of retrieved memories
+          if (result && result.data && result.data.results) {
+            const uniqueDates = new Set();
+            result.data.results.forEach(mem => {
+              if (mem.created_at) {
+                const date = mem.created_at.split(' ')[0]; // Extract YYYY-MM-DD
+                uniqueDates.add(date);
+              }
+            });
+            logger.debug(`[Node:RetrieveMemory] Retrieved ${result.data.results.length} memories spanning ${uniqueDates.size} unique dates: ${Array.from(uniqueDates).sort().join(', ')}`);
+          }
+          return result;
+        }).catch(err => {
+          logger.warn('[Node:RetrieveMemory] Episodic search failed:', err.message);
+          return { results: [] };
+        });
+      })()
     ]);
 
     // MCP protocol wraps responses in 'data' field

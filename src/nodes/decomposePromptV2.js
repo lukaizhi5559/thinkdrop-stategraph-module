@@ -49,8 +49,9 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - PRIORITY RULE - IMAGE/PICTURE/ICON SEARCH (high priority, checked before REAL-TIME DATA ACCESS): When the request is to show, find, display, look up, search for, or retrieve images/pictures/icons/logos/thumbnails/photos/artwork for something (app, product, person, place, concept, etc.) WITHOUT the user specifying a particular website to navigate TO or interact WITH, use web_search — NOT command_automate. The web_search intent handles image retrieval natively. ONLY use command_automate for image tasks when the user explicitly names a site to navigate to, download from, or interact with (e.g. "download from [some-site].com", "open flickr and find X", "log into X images"). EXAMPLES of web_search: "show picture of X app" → web_search | "find icon logos online" → web_search | "show me images for these apps" → web_search | "what does X look like" → web_search | "show me the image icons for each one" → web_search | "find some icon logo online so I can see the images" → web_search | "what about the icon logos for each show me images" → web_search | "can I see the app icon" → web_search.
 - PRIORITY RULE - SCREEN INTELLIGENCE (check this BEFORE all other rules): When the user asks to SEE, SHOW, DESCRIBE, or IDENTIFY what is currently ON SCREEN — including the active app, window, UI elements, visible text, or current display state — use screen_intelligence. This is pure OBSERVATION with no action, navigation, or external service required. Key distinction: "what IS on screen now" → screen_intelligence. "DO something WITH the screen" → command_automate. EXAMPLES of screen_intelligence: "what app am I in" → screen_intelligence | "what type of app is this" → screen_intelligence | "what's on my screen" → screen_intelligence | "what am I looking at" → screen_intelligence | "what window is open" → screen_intelligence | "what's the active app" → screen_intelligence | "what app is currently open" → screen_intelligence | "describe what's on my screen" → screen_intelligence | "what is currently displayed" → screen_intelligence | "read what's on screen" → screen_intelligence | "what does my screen show" → screen_intelligence | "what app is focused" → screen_intelligence | "what program is running" → screen_intelligence | "which application am I using" → screen_intelligence | "what can you see on my screen" → screen_intelligence. EXAMPLES that are NOT screen_intelligence (have an action): "click the button on my screen" → command_automate | "type into the field I can see" → command_automate | "search for X in the app I'm using" → command_automate. CRITICAL EXCEPTION — spatial/layout/region analysis is NOT screen_intelligence even though it mentions the screen — use command_automate: "what regions are on my screen" → command_automate | "what sections can you see on screen" → command_automate | "describe the screen layout" → command_automate | "what areas/zones are visible on my screen" → command_automate | "what's the spatial grid on screen" → command_automate | "what UI zones are present" → command_automate | "show me the screen regions" → command_automate | "what regions can you see right now" → command_automate. These require a spatial grid analysis tool call (analyze_spatial_grid) that returns structured coordinate data — they are NOT plain passive observation. The distinction: asking WHAT CONTENT is on screen → screen_intelligence. Asking about the STRUCTURAL LAYOUT, REGIONS, or SECTIONS of the screen → command_automate.
 - PRIORITY RULE - REAL-TIME DATA ACCESS: Requests for current, live, or real-time information from specific services that require navigation → command_automate.
+- DATE RANGE EXTRACTION: If the message contains any temporal reference (e.g. "yesterday", "last week", "past 7 days", "over the past week", "a specific date", "this morning", "a couple days ago", "during the last month"), extract a dateRange object with startDate and endDate in "YYYY-MM-DD HH:MM:SS" format. startDate = beginning of the earliest referenced time, endDate = end of the latest referenced time. For relative ranges like "past week" or "last 7 days", startDate = 7 days ago at 00:00:00, endDate = today at 23:59:59. For single days like "a specific date", both start and end are that day. Set dateRange to null when NO temporal reference is present.
 
-JSON shape: {"subPrompts":[{"text":"...","estimatedIntent":"command_automate","order":0,"dependsOn":[],"isLongRunning":false}]}`;
+JSON shape: {"subPrompts":[{"text":"...","estimatedIntent":"command_automate","order":0,"dependsOn":[],"isLongRunning":false}],"dateRange":{"startDate":"2026-06-29 00:00:00","endDate":"2026-07-06 23:59:59"}}`;
 
 function collapseLinearCAChain(plan, originalMessage, logger) {
   if (!Array.isArray(plan) || plan.length <= 1) return plan;
@@ -174,11 +175,14 @@ function collapseUserInfoQuery(plan, originalMessage, logger) {
 }
 
 async function llmDecompose(message, llmBackend, conversationHistory, logger, onParsed = null) {
+  const now = new Date();
+  const currentDate = now.toISOString().split('T')[0]; // YYYY-MM-DD format
+  const currentTime = now.toTimeString().split(' ')[0].substring(0, 5); // HH:MM format
   const recentCtx = (conversationHistory || []).slice(-4)
     .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
   const contextBlock = recentCtx ? `\nRecent conversation (for context/grounding only - DO NOT include in decomposition):\n${recentCtx}\n` : '';
-  const userPrompt = `Decompose ONLY the NEW user message below into ordered single-intent sub-prompts.${contextBlock}\nNEW MESSAGE TO DECOMPOSE:\n"${message}"`;
+  const userPrompt = `CURRENT DATE AND TIME: ${currentDate} ${currentTime}\n\nDecompose ONLY the NEW user message below into ordered single-intent sub-prompts.${contextBlock}\nNEW MESSAGE TO DECOMPOSE:\n"${message}"`;
 
   let raw;
   try {
@@ -205,7 +209,11 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
       logger.warn(`[Node:DecomposePromptV2] No valid subPrompts array found - parsed.subPrompts: ${JSON.stringify(parsed.subPrompts)}, parsed.sub_prompts: ${JSON.stringify(parsed.sub_prompts)}`);
       return null;
     }
-    return subPrompts.map((sp, i) => ({
+    const llmDateRange = parsed.dateRange || null;
+    if (llmDateRange) {
+      logger.debug(`[Node:DecomposePromptV2] LLM extracted dateRange: ${JSON.stringify(llmDateRange)}`);
+    }
+    const mapped = subPrompts.map((sp, i) => ({
       text:            String(sp.text || '').trim().slice(0, 300),
       estimatedIntent: sp.estimatedIntent || sp.estimated_intent || 'general_knowledge',
       confidence:      typeof sp.confidence === 'number' ? sp.confidence : 0.70,
@@ -214,6 +222,8 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
       isLongRunning:   Boolean(sp.isLongRunning || sp.is_long_running),
       dataTemplate:    sp.dataTemplate || sp.data_template || null,
     }));
+    mapped._llmDateRange = llmDateRange;
+    return mapped;
   } catch (e) {
     logger.warn(`[Node:DecomposePromptV2] JSON parse failed: ${e.message}`);
     
@@ -234,7 +244,8 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
         order: 0,
         dependsOn: [],
         isLongRunning: false,
-        dataTemplate: null
+        dataTemplate: null,
+        _llmDateRange: null,
       }];
     }
     
@@ -264,6 +275,13 @@ module.exports = async function decomposePromptV2(state) {
   let subPrompts = await llmDecompose(message, llmBackend, conversationHistory, logger, (parsed) => {
     parsedJson = parsed; // Capture the parsed JSON
   });
+
+  // Extract _llmDateRange from the subPrompts array (attached by llmDecompose)
+  let llmDateRange = null;
+  if (subPrompts && subPrompts._llmDateRange) {
+    llmDateRange = subPrompts._llmDateRange;
+    delete subPrompts._llmDateRange; // clean up — don't let it pollute the array
+  }
 
   // Guard: llmDecompose returns null on LLM failure or JSON parse error — pass-through
   if (!subPrompts) {
@@ -323,6 +341,7 @@ module.exports = async function decomposePromptV2(state) {
       return { 
         ...state, 
         _decomposedIntent: originalIntent,
+        ...(llmDateRange ? { _llmDateRange: llmDateRange } : {}),
         intentPlan: [{ text: message, estimatedIntent: originalIntent, order: 0, dependsOn: [], isLongRunning: false }]
       };
     }
@@ -348,6 +367,7 @@ module.exports = async function decomposePromptV2(state) {
       ...state,
       _decomposedIntent: sp.estimatedIntent,
       _decomposedBy: 'llm',
+      ...(llmDateRange ? { _llmDateRange: llmDateRange } : {}),
       intentPlan: [sp],
     };
   }
@@ -369,6 +389,7 @@ module.exports = async function decomposePromptV2(state) {
     ...state,
     _decomposedIntent: collapsed[0]?.estimatedIntent,
     _decomposedBy: 'llm',
+    ...(llmDateRange ? { _llmDateRange: llmDateRange } : {}),
     intentPlan: collapsed,
   };
 };

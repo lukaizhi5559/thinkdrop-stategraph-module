@@ -47,6 +47,27 @@ const PREFLIGHT_STATE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-st
 const VALIDATION_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const BROWSER_SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days for cookie staleness
 
+// ── Session-level auth cache (persists across StateGraph runs within same process) ──
+// Key: agentId (lowercase)  Value: { ts, authed }
+// TTL: 30 minutes — re-check filesystem after this expires
+const PREFLIGHT_AUTH_CACHE_TTL_MS = 30 * 60 * 1000;
+const _authCache = new Map();
+
+function markAgentAuthed(agentId) {
+  if (!agentId) return;
+  _authCache.set(agentId.toLowerCase(), { ts: Date.now(), authed: true });
+}
+
+function _getCachedAuth(agentId) {
+  const entry = _authCache.get(agentId.toLowerCase());
+  if (!entry) return null;
+  if (Date.now() - entry.ts > PREFLIGHT_AUTH_CACHE_TTL_MS) {
+    _authCache.delete(agentId.toLowerCase());
+    return null;
+  }
+  return entry;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _loadPreflightState() {
@@ -410,17 +431,18 @@ module.exports = async function preflightAgents(state) {
             // NOTE: agentLines.push() is deferred to after auth is determined below
             if (a.type === 'browser') {
               const iconUrl = agentIdToIconUrl(a.id);
-              const BROWSER_SESSIONS_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-sessions');
+              const BROWSER_PROFILES_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-profiles');
               const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
               const profileDir = `${svcKey}_agent`;
-              const profilePath = path.join(BROWSER_SESSIONS_DIR, profileDir);
+              const profilePath = path.join(BROWSER_PROFILES_DIR, profileDir);
               const hasSession = fs.existsSync(profilePath);
 
               // Check cookie file age for session validity
+              // Chrome persistent profiles store cookies under Default/Cookies
               let sessionStale = false;
               if (hasSession) {
                 try {
-                  const cookieFile = path.join(profilePath, 'Cookies');
+                  const cookieFile = path.join(profilePath, 'Default', 'Cookies');
                   if (fs.existsSync(cookieFile)) {
                     const stat = fs.statSync(cookieFile);
                     const ageMs = Date.now() - stat.mtimeMs;
@@ -435,7 +457,9 @@ module.exports = async function preflightAgents(state) {
                 } catch (_) {}
               }
 
-              const authed = hasSession && !sessionStale;
+              // Check session-level auth cache (persists across StateGraph runs)
+              const _cachedAuth = _getCachedAuth(a.id);
+              const authed = _cachedAuth?.authed === true || (hasSession && !sessionStale);
               const _authTag = authed ? '' : ' [NEEDS AUTH — user must authenticate before this agent can run]';
               agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_authTag}`);
 
@@ -1158,3 +1182,5 @@ module.exports = async function preflightAgents(state) {
     _trainedRecipeMap: mapSize > 0 ? _trainedRecipeMap : state._trainedRecipeMap,
   };
 };
+
+module.exports.markAgentAuthed = markAgentAuthed;

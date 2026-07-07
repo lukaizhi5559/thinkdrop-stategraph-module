@@ -26,6 +26,8 @@
 
 'use strict';
 
+const { markAgentAuthed } = require('./preflightAgents');
+
 const MAX_ROUNDS = 3;
 const MAX_AUTH_ROUNDS = 10; // auth sign-ins don't count against Q&A budget
 
@@ -248,6 +250,9 @@ module.exports = async function gatherPlanContext(state) {
           );
           if (idx >= 0) state.preflightResult.agents[idx] = { ...state.preflightResult.agents[idx], authed: true };
         }
+        // Persist auth in preflight's session-level cache so subsequent StateGraph runs
+        // (e.g. follow-up prompts) don't re-trigger the sign-in card.
+        if (_unauthedAgent) markAgentAuthed(_unauthedAgent.agentId);
         // Inject into priorQA so LLM sees explicit auth confirmation next round
         answers.push({ question, answer: `authenticated — ${agentLabel} is now signed in` });
         if (progressCallback) progressCallback({ type: 'gather_answer_received' });

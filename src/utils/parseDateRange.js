@@ -52,8 +52,10 @@ function parseDateRange(message) {
 
   const pad = n => String(n).padStart(2, '0');
   const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  const startOf = d => { const r = new Date(d); r.setHours(0, 0, 0, 0); return r; };
-  const endOf   = d => { const r = new Date(d); r.setHours(23, 59, 59, 999); return r; };
+  // ±12h margin: DB stores UTC timestamps but we compute in local time.
+  // This prevents missing captures at day boundaries (e.g., 1 AM local = 5 AM UTC).
+  const startOf = d => { const r = new Date(d); r.setHours(0, 0, 0, 0); r.setTime(r.getTime() - 12 * 3600000); return r; };
+  const endOf   = d => { const r = new Date(d); r.setHours(23, 59, 59, 999); r.setTime(r.getTime() + 12 * 3600000); return r; };
 
   function parseTimeOfDay(str) {
     if (/\bnoon\b/.test(str)) return { hour: 12, minute: 0 };
@@ -198,8 +200,8 @@ function parseDateRange(message) {
     return { startDate: iso(new Date(now.getTime() - hrs * 3600000)), endDate: iso(now) };
   }
 
-  // last N days
-  const daysMatch = q.match(/\blast\s+(\d+)\s+days?\b/);
+  // last N days / past N days / over the past N days
+  const daysMatch = q.match(/\b(?:last|past|over\s+(?:the\s+)?past|during\s+(?:the\s+)?(?:last|past)|in\s+(?:the\s+)?past)\s+(\d+)\s*days?\b/);
   if (daysMatch) {
     const start = new Date(now); start.setDate(start.getDate() - parseInt(daysMatch[1]));
     return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
@@ -256,17 +258,33 @@ function parseDateRange(message) {
     };
   }
 
-  // last N weeks
-  const weeksMatch = q.match(/\blast\s+(\d+)\s+weeks?\b/);
+  // last N weeks / past N weeks / over the past N weeks
+  const weeksMatch = q.match(/\b(?:last|past|over\s+(?:the\s+)?past)\s+(\d+)\s*weeks?\b/);
   if (weeksMatch) {
     const start = new Date(now); start.setDate(start.getDate() - parseInt(weeksMatch[1]) * 7);
     return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
   }
 
-  // last N months
-  const monthsMatch = q.match(/\blast\s+(\d+)\s+months?\b/);
+  // last N months / past N months / over the past N months
+  const monthsMatch = q.match(/\b(?:last|past|over\s+(?:the\s+)?past)\s+(\d+)\s*months?\b/);
   if (monthsMatch) {
     const start = new Date(now); start.setMonth(start.getMonth() - parseInt(monthsMatch[1]));
+    return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
+  }
+
+  // past week / over the past week (no digit — defaults to 7 days)
+  if (/\b(?:past|over\s+(?:the\s+)?past)\s+week\b/.test(q)) {
+    const start = new Date(now); start.setDate(start.getDate() - 7);
+    return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
+  }
+
+  // past few days / past couple of days / over the past few weeks (vague quantifiers)
+  const fewMatch = q.match(/\b(?:past|over\s+(?:the\s+)?past)\s+(few|couple(?:\s+of)?)\s+(days?|weeks?)\b/);
+  if (fewMatch) {
+    const isFew = fewMatch[1] === 'few';
+    const isWeeks = /week/.test(fewMatch[2]);
+    const n = isWeeks ? (isFew ? 3 : 2) : (isFew ? 3 : 2);
+    const start = new Date(now); start.setDate(start.getDate() - n * (isWeeks ? 7 : 1));
     return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
   }
 
@@ -339,6 +357,14 @@ function parseDateRange(message) {
     }
     const singleDay = q.match(/\b(\d{1,2})(?:st|nd|rd|th)\b/);
     if (singleDay) {
+      const multiDay = [...q.matchAll(/\b(\d{1,2})(?:st|nd|rd|th)\b/g)].map(m => parseInt(m[1]));
+      if (multiDay.length > 1) {
+        const d1 = Math.min(...multiDay), d2 = Math.max(...multiDay);
+        return {
+          startDate: iso(startOf(new Date(targetYear, monthIdx, d1))),
+          endDate:   iso(endOf(new Date(targetYear, monthIdx, d2))),
+        };
+      }
       const d = parseInt(singleDay[1]);
       return {
         startDate: iso(startOf(new Date(targetYear, monthIdx, d))),

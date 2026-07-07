@@ -2855,7 +2855,17 @@ module.exports = async function executeCommand(state) {
         })()
       : _rawSynthesisContext;
 
-    const synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
+    // Check if this is an email-related synthesis task
+    const isEmailTask = /email|mail|send|draft|message/i.test(synthesisPrompt) || 
+                        /email|mail|send|draft|message/i.test(_userQuestion || '');
+    
+    let synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
+    
+    // Add specific instructions for email tasks to use actual memories
+    if (isEmailTask && userAgentResults.length > 0) {
+      synthesisPrompt = `${synthesisPrompt}\n\nIMPORTANT: When drafting email content, you MUST use the actual work activities and information from the "Memories:" section in the User Context below. Do NOT invent or hallucinate work activities. If no specific work activities are mentioned in the memories, acknowledge that and ask for clarification rather than making up generic activities.`;
+    }
+    
     const skippedStepsNote = skippedStepNotes.length > 0
       ? `\n\nNOTE — The following steps were skipped because the service was unavailable or not ready:\n${skippedStepNotes.join('\n')}\nPlease acknowledge these gaps in the summary.`
       : '';
