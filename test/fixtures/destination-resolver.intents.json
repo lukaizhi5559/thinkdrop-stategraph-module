@@ -1,0 +1,180 @@
+{
+  "description": "Representative task phrases and URLs for destination-resolver intent classification. Regex fallback tests use these phrases; they are chosen to be unambiguous under the conservative regex patterns.",
+  "classifyTaskIntent": {
+    "chat": [
+      "ask ChatGPT about quantum computing",
+      "talk to Claude",
+      "have a conversation with Grok",
+      "message the AI assistant",
+      "prompt it to summarize this"
+    ],
+    "research": [
+      "what is photosynthesis",
+      "research vegan diets",
+      "find information about Mars",
+      "investigate the latest AI news",
+      "learn about TypeScript generics"
+    ],
+    "search": [
+      "search Google for best sushi",
+      "google cheap flights",
+      "search YouTube for lo-fi",
+      "site:reddit.com how to learn python"
+    ],
+    "docs": [
+      "show me the React docs",
+      "how to use git rebase",
+      "read the API documentation",
+      "open the documentation page"
+    ],
+    "console": [
+      "create an OpenAI API key",
+      "go to the developer console",
+      "generate a bearer token",
+      "show me my API keys"
+    ],
+    "settings": [
+      "update my profile",
+      "change billing info",
+      "open the account settings page",
+      "manage my subscription"
+    ],
+    "mail": [
+      "send an email to Bob",
+      "compose a new email",
+      "reply to the email",
+      "forward the newsletter"
+    ],
+    "social": [
+      "post on X",
+      "comment on Instagram",
+      "tweet this link",
+      "follow Elon on X",
+      "send a DM on Discord"
+    ],
+    "commerce": [
+      "add headphones to cart",
+      "checkout on Amazon",
+      "buy this item now",
+      "place an order for the shoes"
+    ],
+    "content_create": [
+      "write a blog post on Medium",
+      "upload a YouTube video",
+      "publish an article",
+      "create a new page on Notion"
+    ],
+    "scheduling": [
+      "book a table on OpenTable",
+      "schedule a Zoom meeting",
+      "reserve a room",
+      "add a calendar event"
+    ],
+    "maps": [
+      "directions to the airport",
+      "find nearby gas stations",
+      "navigate to Times Square",
+      "map of downtown Boston"
+    ],
+    "download": [
+      "download the PDF",
+      "export the report",
+      "save the image",
+      "download the file"
+    ],
+    "support": [
+      "open a support ticket",
+      "contact customer support",
+      "report an issue",
+      "visit the help center"
+    ],
+    "dashboard": [
+      "show my dashboard",
+      "view analytics",
+      "open the admin panel",
+      "show my stats"
+    ],
+    "home": [
+      "go to github.com",
+      "open Slack",
+      "visit the homepage",
+      "go to the website"
+    ]
+  },
+  "classifyTaskIntentNegative": {
+    "chat": ["download the PDF", "buy this item now"],
+    "research": ["add to cart", "checkout on Amazon"],
+    "search": ["open the account settings page", "show my dashboard"],
+    "docs": ["show my dashboard", "view analytics"],
+    "console": ["tweet this link", "post on X"],
+    "settings": ["search Google for best sushi", "google cheap flights"],
+    "mail": ["post on X", "comment on Instagram"],
+    "social": ["compose a new email", "forward the newsletter"],
+    "commerce": ["schedule a Zoom meeting", "book a table on OpenTable"],
+    "content_create": ["buy this item now", "add headphones to cart"],
+    "scheduling": ["download the file", "export the report"],
+    "maps": ["publish an article", "write a blog post on Medium"],
+    "download": ["book a table on OpenTable", "reserve a room"],
+    "support": ["view analytics", "show my stats"],
+    "dashboard": ["contact customer support", "report an issue"],
+    "home": ["create an OpenAI API key", "generate a bearer token"]
+  },
+  "classifyUrlType": {
+    "mail": [
+      "https://mail.google.com",
+      "https://outlook.live.com/mail/"
+    ],
+    "social": [
+      "https://twitter.com/compose",
+      "https://www.reddit.com/submit"
+    ],
+    "content_create": [
+      "https://www.youtube.com/upload",
+      "https://medium.com/new"
+    ],
+    "commerce": [
+      "https://www.amazon.com/gp/cart",
+      "https://www.ebay.com/itm/123"
+    ],
+    "scheduling": [
+      "https://calendly.com/schedule",
+      "https://www.opentable.com/book"
+    ],
+    "maps": [
+      "https://www.google.com/maps",
+      "https://maps.google.com/dir"
+    ],
+    "download": [
+      "https://example.com/download/file.pdf",
+      "https://example.com/export/data"
+    ],
+    "support": [
+      "https://example.com/support",
+      "https://example.com/help/ticket"
+    ],
+    "dashboard": [
+      "https://example.com/dashboard",
+      "https://example.com/analytics/overview"
+    ],
+    "console": [
+      "https://platform.openai.com/api-keys",
+      "https://console.cloud.google.com"
+    ],
+    "settings": [
+      "https://example.com/settings/profile",
+      "https://example.com/account/billing"
+    ],
+    "chat": [
+      "https://chat.openai.com",
+      "https://claude.ai/new"
+    ],
+    "docs": [
+      "https://docs.example.com",
+      "https://example.com/documentation"
+    ],
+    "home": [
+      "https://example.com",
+      "https://example.com/landing"
+    ]
+  }
+}

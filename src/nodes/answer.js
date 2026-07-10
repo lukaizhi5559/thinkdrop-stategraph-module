@@ -274,7 +274,12 @@ module.exports = async function answer(state) {
   // This is critical for queries like "check for me now" where the raw message has no topic
   // signal and the LLM must rely on prior turns to understand what is being asked.
   const _isConversationFollowUp = !!(state._taskClassification?.isFollowUp && state._taskClassification?.followUpTarget);
-  if ((state._needsContextInterpretation || _isConversationFollowUp) && conversationHistory.length > 0) {
+  const _isMemoryRetrieve = intentType === 'memory_retrieve';
+  
+  // Apply conversation history with hallucination warnings for:
+  // 1. Follow-up queries that need context interpretation
+  // 2. ALL memory_retrieve queries (to prevent date hallucinations)
+  if ((state._needsContextInterpretation || _isConversationFollowUp || _isMemoryRetrieve) && conversationHistory.length > 0) {
     const recentHistory = conversationHistory.slice(-5); // Last 5 messages
     const historyBlock = recentHistory.map((msg, i) => {
       const role = msg.role === 'assistant' ? 'Previous AI Response (may contain errors)' : 'User';
@@ -478,7 +483,7 @@ module.exports = async function answer(state) {
       ? `Interpret this command output:\n\n${String(commandOutput).substring(0, 5000)}`
       : finalQuery,
     context: {
-      conversationHistory: isCommandWithOutput ? [] : filteredConversationHistory,
+      conversationHistory: (isCommandWithOutput || _isMemoryRetrieve) ? [] : filteredConversationHistory,
       sessionFacts: isCommandWithOutput ? [] : sessionFacts,
       sessionEntities: isCommandWithOutput ? [] : sessionEntities,
       memories: isCommandWithOutput ? [] : filteredMemories,

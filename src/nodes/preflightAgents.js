@@ -45,7 +45,7 @@ const os   = require('os');
 // ── Preflight state file (monthly validation persistence) ────────────────────
 const PREFLIGHT_STATE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-state.json');
 const VALIDATION_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const BROWSER_SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days for cookie staleness
+const BROWSER_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days for cookie staleness
 
 // ── Session-level auth cache (persists across StateGraph runs within same process) ──
 // Key: agentId (lowercase)  Value: { ts, authed }
@@ -66,6 +66,13 @@ function _getCachedAuth(agentId) {
     return null;
   }
   return entry;
+}
+
+function _deriveAgentAuthType(descriptor) {
+  const m = String(descriptor || '').match(/^type:\s*(\S+)/m);
+  const type = m ? m[1].toLowerCase() : 'browser';
+  if (type === 'api_key' || type === 'bearer' || type === 'basic') return type;
+  return 'browser_oauth';
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -181,6 +188,8 @@ module.exports = async function preflightAgents(state) {
   const userMessage = state.resolvedMessage || state.message || '';
   const recoveryContext = state.recoveryContext || null;
   const confirmInstallCallback = state.confirmInstallCallback || null;
+  const gatherAnswerCallback = state.gatherAnswerCallback || null;
+  const gatherCredentialCallback = state.gatherCredentialCallback || null;
 
   // _emitProgress — safe wrapper that no-ops if progressCallback is null
   const _emitProgress = (data) => {
@@ -232,6 +241,7 @@ module.exports = async function preflightAgents(state) {
 
   // ── Create any agents marked create:true by resolveAgent ───────────────────
   if (createAgentSpecs.length > 0) {
+    const failedCreates = [];
     for (const spec of createAgentSpecs) {
       const skillName = spec.type === 'cli' ? 'cli.agent' : (spec.type === 'app' ? 'app.agent' : 'browser.agent');
       try {
@@ -242,18 +252,57 @@ module.exports = async function preflightAgents(state) {
           message: `Building ${spec.service} agent…`,
           iconUrl: serviceToIconUrl(spec.service),
         });
-        const buildRes = await mcpAdapter.callService('command', skillName, {
+        const buildArgs = {
           action: 'build_agent',
           service: spec.service,
-        }, { timeoutMs: 30000 }).catch(() => null);
+        };
+        if (spec.startUrl) buildArgs.startUrl = spec.startUrl;
+        const buildRes = await mcpAdapter.callService('command', skillName, buildArgs, { timeoutMs: 30000 }).catch(() => null);
         if (buildRes?.ok) {
           logger.info(`[Node:PreflightAgents] Created ${skillName} agent: ${spec.agentId}`);
         } else {
-          logger.warn(`[Node:PreflightAgents] Failed to create ${spec.agentId}: ${buildRes?.error || 'unknown'}`);
+          const errMsg = buildRes?.error || 'unknown error';
+          logger.warn(`[Node:PreflightAgents] Failed to create ${spec.agentId}: ${errMsg}`);
+          failedCreates.push({ agentId: spec.agentId, error: errMsg });
         }
       } catch (err) {
         logger.warn(`[Node:PreflightAgents] Agent creation failed for ${spec.agentId}: ${err.message}`);
+        failedCreates.push({ agentId: spec.agentId, error: err.message });
       }
+    }
+
+    if (failedCreates.length > 0) {
+      warnings.push({
+        type: 'agent_create_failed',
+        message: `Failed to create agent(s): ${failedCreates.map(c => c.agentId).join(', ')}`,
+      });
+      // If every requested agent failed, surface a plan error so we don't proceed to planning.
+      if (failedCreates.length === createAgentSpecs.length) {
+        const planError = `I couldn't create the required agent(s): ${failedCreates.map(c => `${c.agentId} (${c.error})`).join('; ')}.`;
+        logger.error(`[Node:PreflightAgents] ${planError}`);
+        _emitProgress({ type: 'preflight:agent_create_failed', message: planError, failures: failedCreates });
+        return {
+          ...state,
+          preflightDone: true,
+          planError,
+          preflightResult: {
+            warnings,
+            agents: agentReadiness,
+            agentContextNote: '',
+          },
+        };
+      }
+    }
+
+    // Re-query the registry so the agent-list filter below sees the newly built agents.
+    try {
+      const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+      const freshAgents = (agRes?.data || agRes || []).filter(a => a && a.id);
+      for (const a of freshAgents) {
+        if (a.id) selectedAgentIds.add(a.id.toLowerCase());
+      }
+    } catch (e) {
+      logger.warn(`[Node:PreflightAgents] Failed to refresh agent list after creation: ${e.message}`);
     }
   }
 
@@ -374,7 +423,7 @@ module.exports = async function preflightAgents(state) {
         const taskLower = userMessage.toLowerCase();
         const chosenSvc = (state.chosenService || '').toLowerCase().replace(/[^a-z0-9]/g, '');
         const agents = Array.isArray(allAgents) ? allAgents.filter(a => {
-          if (a.type !== 'browser' && a.type !== 'cli') return true; // keep non-agent entries
+          if (a.type !== 'browser' && a.type !== 'cli' && a.type !== 'api_key' && a.type !== 'bearer' && a.type !== 'basic') return true; // keep non-agent entries
           const idLower = (a.id || '').toLowerCase();
           const svcKey = idLower.replace('.agent', '').replace(/[^a-z0-9]/g, '');
           if (selectedAgentIds.size > 0 && selectedAgentIds.has(idLower)) return true;
@@ -457,35 +506,63 @@ module.exports = async function preflightAgents(state) {
                 } catch (_) {}
               }
 
-              // Check session-level auth cache (persists across StateGraph runs)
+              // Always verify browser sessions live during preflight. Profile/cookie
+              // age is not a reliable proxy for an active session (Google can expire
+              // server-side and serve workspace.google.com marketing pages instead of
+              // mail.google.com). The auth loop below calls browser.agent authenticate.
               const _cachedAuth = _getCachedAuth(a.id);
-              const authed = _cachedAuth?.authed === true || (hasSession && !sessionStale);
+              const authed = _cachedAuth?.authed === true;
               const _authTag = authed ? '' : ' [NEEDS AUTH — user must authenticate before this agent can run]';
               agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_authTag}`);
 
+              const _agentAuthType = _deriveAgentAuthType(a.descriptor);
               agentReadiness.push({
                 type: 'browser',
                 agentId: a.id,
                 ready: true,
                 authed,
+                authType: _agentAuthType,
                 iconUrl,
                 startUrl: a.start_url,
                 needsLogin: !hasSession,
                 sessionStale,
               });
 
-              if ((!hasSession || sessionStale) && a.start_url) {
+              if (!authed && a.start_url) {
                 _emitProgress({
                   type: 'preflight:auth_required',
                   agentId: a.id,
                   serviceName: svcKey,
-                  authType: sessionStale ? 'browser_reauth' : 'browser_oauth',
+                  authType: sessionStale ? 'browser_reauth' : _agentAuthType,
                   iconUrl,
                   message: sessionStale
                     ? `${a.id} session may have expired — re-login recommended`
-                    : `${a.id} requires browser login`,
+                    : `${a.id} requires ${_agentAuthType === 'browser_oauth' ? 'browser login' : _agentAuthType} before planning`,
                 });
               }
+            } else if (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') {
+              // Credential agents are not browser-authenticated; they need a stored token.
+              const iconUrl = agentIdToIconUrl(a.id);
+              const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
+              agentLines.push(`- ${a.id}: ${_agentBaseDesc} [NEEDS CREDENTIAL]`);
+              agentReadiness.push({
+                type: a.type,
+                agentId: a.id,
+                ready: true,
+                authed: false,
+                authType: a.type,
+                iconUrl,
+                startUrl: a.start_url,
+                needsLogin: true,
+              });
+              _emitProgress({
+                type: 'preflight:auth_required',
+                agentId: a.id,
+                serviceName: svcKey,
+                authType: a.type,
+                iconUrl,
+                message: `${a.id} requires ${a.type} credentials before planning`,
+              });
             } else if (a.type === 'cli') {
               // CLI agents already handled in preflight_check above
               // Stale agent detection: registered CLI agent whose CLI is no longer installed
@@ -1055,6 +1132,222 @@ module.exports = async function preflightAgents(state) {
       }
     })(),
   ]);
+
+  // ── Browser / credential agent authentication (Phase 1.5) ─────────────────
+  // Any selected browser or credential agent that is not authenticated must
+  // complete auth BEFORE planning. Browser agents open the browser and wait for
+  // OAuth or stored credentials. Credential agents (api_key/bearer/basic) verify
+  // a stored token. Planning is blocked until all agents are authenticated or
+  // auth fails.
+  const _AUTH_AGENT_TYPES = new Set(['browser', 'api_key', 'bearer', 'basic']);
+  const browserAgentsNeedingAuth = agentReadiness.filter(
+    a => _AUTH_AGENT_TYPES.has(a.type) && !a.authed
+  );
+
+  async function _authenticateBrowserAgent(a) {
+    const svcKey = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
+    const iconUrl = a.iconUrl || agentIdToIconUrl(a.agentId);
+    _emitProgress({
+      type: 'preflight:auth_required',
+      agentId: a.agentId,
+      serviceName: svcKey,
+      authType: a.sessionStale ? 'browser_reauth' : (a.authType || 'browser_oauth'),
+      iconUrl,
+      message: `${a.agentId} requires ${a.authType && a.authType !== 'browser_oauth' ? a.authType : 'login'} before planning`,
+    });
+    try {
+      const authRes = await mcpAdapter.callService('command', 'browser.agent', {
+        action: 'authenticate',
+        agentId: a.agentId,
+        task: `Authenticate to ${a.agentId}`,
+        url: a.startUrl,
+      }, { timeoutMs: 10 * 60 * 1000 }).catch(() => null);
+      return authRes;
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  }
+
+  const authFailures = [];
+  for (const a of browserAgentsNeedingAuth) {
+    let attempts = 0;
+    let authRes = null;
+    while (attempts < 2) {
+      authRes = await _authenticateBrowserAgent(a);
+      if (authRes?.ok) {
+        markAgentAuthed(a.agentId);
+        a.authed = true;
+        a.ready = true;
+        _emitProgress({
+          type: 'preflight:agent_ready',
+          agentId: a.agentId,
+          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
+          message: `${a.agentId} authenticated`,
+        });
+        break;
+      }
+
+      if (authRes?.askUser) {
+        // Credential-style question (email / API key / bearer / basic)
+        if (authRes.needsCredentials) {
+          if (!authRes.credentialKey) {
+            logger.warn(`[Node:PreflightAgents] ${a.agentId} requested credentials but did not supply a credentialKey`);
+            _emitProgress({
+              type: 'preflight:auth_failed',
+              agentId: a.agentId,
+              message: `${a.agentId} requested credentials but did not provide a storage key.`,
+            });
+            break;
+          }
+          if (!gatherCredentialCallback) {
+            logger.warn(`[Node:PreflightAgents] ${a.agentId} requires credentials but no gatherCredentialCallback is available`);
+            const noCallbackErr = `${a.agentId} requires a credential, but the UI credential prompt is not available.`;
+            _emitProgress({
+              type: 'preflight:auth_failed',
+              agentId: a.agentId,
+              message: noCallbackErr,
+            });
+            authRes = { ok: false, error: noCallbackErr };
+            break;
+          }
+          _emitProgress({
+            type: 'gather_credential',
+            key: authRes.credentialKey,
+            message: authRes.question,
+          });
+          let credentialStored = false;
+          try {
+            const credResult = await gatherCredentialCallback(authRes.credentialKey);
+            credentialStored = credResult && (credResult.stored === true || credResult.stored === undefined);
+          } catch (credErr) {
+            logger.warn(`[Node:PreflightAgents] Credential gather failed for ${a.agentId}: ${credErr.message}`);
+          }
+          if (!credentialStored) {
+            logger.warn(`[Node:PreflightAgents] Credential for ${a.agentId} was not stored — aborting auth`);
+            _emitProgress({
+              type: 'preflight:auth_failed',
+              agentId: a.agentId,
+              message: `${a.agentId} credential was not provided or not stored.`,
+            });
+            break;
+          }
+          attempts++;
+          continue;
+        }
+        // Plain question
+        if (!gatherAnswerCallback) {
+          logger.warn(`[Node:PreflightAgents] ${a.agentId} asks a question but no gatherAnswerCallback is available`);
+          const noCallbackErr = `${a.agentId} needs input, but the UI question prompt is not available.`;
+          _emitProgress({
+            type: 'preflight:auth_failed',
+            agentId: a.agentId,
+            message: noCallbackErr,
+          });
+          authRes = { ok: false, error: noCallbackErr };
+          break;
+        }
+        _emitProgress({
+          type: 'ask_user',
+          question: authRes.question,
+          source: 'preflightAgents',
+        });
+        try {
+          const answer = await gatherAnswerCallback(authRes.question);
+          if (!answer) break;
+        } catch (ansErr) {
+          logger.warn(`[Node:PreflightAgents] Answer gather failed for ${a.agentId}: ${ansErr.message}`);
+          break;
+        }
+        attempts++;
+        continue;
+      }
+
+      // Non-OK, non-askUser result is a hard auth failure.
+      break;
+    }
+
+    if (!a.authed) {
+      const failureReason = authRes?.error || 'auth did not complete';
+      a.ready = false;
+      a.reason = failureReason;
+      logger.error(`[Node:PreflightAgents] I couldn't authenticate ${a.agentId} before planning: ${failureReason}`);
+      _emitProgress({
+        type: 'preflight:auth_failed',
+        agentId: a.agentId,
+        message: `I couldn't authenticate ${a.agentId}: ${failureReason}`,
+      });
+      authFailures.push({ agentId: a.agentId, reason: failureReason });
+    }
+  }
+
+  if (authFailures.length > 0) {
+    const planError = `I couldn't authenticate before planning: ${authFailures
+      .map(f => `${f.agentId} (${f.reason})`)
+      .join('; ')}`;
+    return {
+      ...state,
+      preflightDone: true,
+      planError,
+      preflightResult: {
+        warnings,
+        agents: agentReadiness,
+        agentContextNote: '',
+      },
+    };
+  }
+
+  // ── Task-specific deep-link resolution for authenticated browser agents ─────
+  // Resolves a direct URL once per agent so planSkillsV2 can start browser.act
+  // steps at the right page instead of relying on click/scroll navigation.
+  async function _resolveDeepLinkForAgent(a, task) {
+    if (!a.startUrl) return null;
+    const baseHost = (() => {
+      try { return new URL(a.startUrl).hostname.replace(/^www\./, ''); }
+      catch (_) { return ''; }
+    })();
+    if (!baseHost) return null;
+
+    // Fast heuristic for site-search tasks
+    const searchQueryMatch = task.match(/\bsearch\s+(?:for\s+)?(.+?)(?:\s+on\s+\w+)?$/i) ||
+                             task.match(/\bgoogle\s+(.+)$/i) ||
+                             task.match(/\b(?:find|look\s+up)\s+(.+?)(?:\s+on\s+\w+)?$/i);
+    if (searchQueryMatch) {
+      const q = encodeURIComponent(searchQueryMatch[1].trim().replace(/[?.!]+$/g, ''));
+      if (baseHost === 'google.com') return `https://www.google.com/search?q=${q}`;
+      if (baseHost === 'youtube.com') return `https://www.youtube.com/results?search_query=${q}`;
+      if (baseHost === 'w3schools.com') return `https://www.w3schools.com/search/search.asp?q=${q}`;
+    }
+
+    // General discovery via web.agent
+    try {
+      const webRes = await mcpAdapter.callService('command', 'web.agent', {
+        action: 'discover_task_url',
+        domain: baseHost,
+        task,
+      }, { timeoutMs: 12000 }).catch(() => null);
+      const webResult = webRes?.data || webRes;
+      if (webResult?.ok && webResult?.taskUrl) {
+        const candidateHost = (() => {
+          try { return new URL(webResult.taskUrl).hostname.replace(/^www\./, ''); }
+          catch (_) { return ''; }
+        })();
+        if (candidateHost === baseHost || candidateHost.endsWith('.' + baseHost)) {
+          return webResult.taskUrl;
+        }
+      }
+    } catch (err) {
+      logger.debug(`[Node:PreflightAgents] deep-link resolution failed for ${a.agentId}: ${err.message}`);
+    }
+    return null;
+  }
+
+  for (const a of agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
+    const deepLink = await _resolveDeepLinkForAgent(a, userMessage);
+    if (deepLink) {
+      a.deepLinkUrl = deepLink;
+      logger.info(`[Node:PreflightAgents] Deep-link for ${a.agentId}: ${deepLink}`);
+    }
+  }
 
   // ── App agent build (Phase 2) ──────────────────────────────────────────
   // For registered app-type agents, call app.agent build_agent to ensure

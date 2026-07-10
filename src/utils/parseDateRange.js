@@ -51,11 +51,11 @@ function parseDateRange(message) {
   const m = now.getMonth();
 
   const pad = n => String(n).padStart(2, '0');
-  const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  // ±12h margin: DB stores UTC timestamps but we compute in local time.
-  // This prevents missing captures at day boundaries (e.g., 1 AM local = 5 AM UTC).
-  const startOf = d => { const r = new Date(d); r.setHours(0, 0, 0, 0); r.setTime(r.getTime() - 12 * 3600000); return r; };
-  const endOf   = d => { const r = new Date(d); r.setHours(23, 59, 59, 999); r.setTime(r.getTime() + 12 * 3600000); return r; };
+  // iso() outputs UTC string to match DuckDB's UTC-stored timestamps (now() = UTC).
+  // All date math is done in local time first, then converted to UTC for the DB query.
+  const iso = d => d.toISOString().slice(0, 19).replace('T', ' ');
+  const startOf = d => { const r = new Date(d); r.setHours(0, 0, 0, 0); return r; };
+  const endOf   = d => { const r = new Date(d); r.setHours(23, 59, 59, 999); return r; };
 
   function parseTimeOfDay(str) {
     if (/\bnoon\b/.test(str)) return { hour: 12, minute: 0 };

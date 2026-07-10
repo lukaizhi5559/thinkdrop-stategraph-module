@@ -53,7 +53,8 @@ Rules:
 - If KNOWN FACTS already answer what's missing → {"complete": true}.
 - If RECENT CONVERSATION resolves any pronoun ("it", "that folder", "the file") → {"complete": true}.
 - Ask only one question. Never combine two into one.
-- CRITICAL AUTH RULE: If the task requires a service AND that service's agent appears in UNAUTHENTICATED AGENTS below (marked [NEEDS AUTH]), return {"complete": false, "question": "<service> requires sign-in. Sign in to <service>, or use a different provider?", "authAgentId": "<the exact agentId from the list e.g. gmail.agent>"} — NEVER assume it can run silently.
+- CRITICAL AUTH RULE: If the task requires a service AND that service's agent appears in UNAUTHENTICATED AGENTS below (marked [NEEDS AUTH]), return {"complete": false, "question": "<service> requires sign-in. Sign in to <service>, or use a different provider?", "authAgentId": "<the exact agentId from the list e.g. gmail.agent>"}.
+- If a required service is NOT listed under UNAUTHENTICATED AGENTS, you MUST return {"complete": true} and proceed — do NOT ask about sign-in, credentials, or authentication.
 - When authAgentId is set, the system will show a dedicated sign-in button — keep the question short (under 12 words).`;
 
 async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger) {
@@ -85,7 +86,9 @@ async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHi
     .map(a => `- ${a.agentId} [NEEDS AUTH]`);
   const unauthedBlock = unauthedAgents.length > 0
     ? `\n\nUNAUTHENTICATED AGENTS (require sign-in before they can execute tasks):\n${unauthedAgents.join('\n')}`
-    : '';
+    : '\n\nUNAUTHENTICATED AGENTS: none — all required services are authenticated or do not require auth.';
+
+  logger.info(`[Node:GatherPlanContext] preflightResult.agents=${JSON.stringify(preflightResult?.agents?.map(a => ({ agentId: a.agentId, type: a.type, authed: a.authed })) || [])} | unauthedAgents=${JSON.stringify(unauthedAgents)}`);
 
   const tc = resolvedSelfContext?._taskClassification || {};
   const followUpTarget = tc.isFollowUp && !tc.isScreenFollowUp ? tc.followUpTarget : null;
@@ -177,6 +180,31 @@ module.exports = async function gatherPlanContext(state) {
     logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
 
     const result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger);
+
+    // Defensive override: if the LLM returned an auth question for an agent that
+    // preflight already marked as authed, treat the task as complete. This prevents
+    // repeated sign-in prompts after the user has already authenticated.
+    if (!result.complete && (result.authAgentId || result.question)) {
+      const _agents = state.preflightResult?.agents || [];
+      const _mentionedId = (result.authAgentId || '').replace('.agent', '').toLowerCase();
+      const _questionLower = (result.question || '').toLowerCase();
+
+      // Does the question reference any agent that is actually unauthed?
+      const _matchingUnauthedAgent = _agents.find(a =>
+        a.authed === false &&
+        (a.type === 'browser' || a.type === 'cli') &&
+        (
+          a.agentId.replace('.agent', '').toLowerCase() === _mentionedId ||
+          _questionLower.includes(a.agentId.replace('.agent', '').toLowerCase())
+        )
+      );
+
+      // If no matching unauthed agent exists, the LLM is hallucinating an auth requirement
+      if (!_matchingUnauthedAgent) {
+        logger.warn(`[Node:GatherPlanContext] LLM asked auth question for ${result.authAgentId || result.question}, but no matching unauthed agent in preflight — overriding to complete=true`);
+        result.complete = true;
+      }
+    }
 
     if (result.complete) {
       let enriched = baseMsg;

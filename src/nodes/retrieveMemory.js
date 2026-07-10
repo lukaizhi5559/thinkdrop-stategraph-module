@@ -91,6 +91,25 @@ function buildSearchQuery(message, resolvedMessage) {
 }
 
 /**
+ * Extract topic keywords from recent user conversation history.
+ * Used to enrich vague follow-up queries (e.g. "what about the 5th") that strip
+ * down to nothing, but whose topic is clear from the prior user message.
+ */
+function extractTopicFromHistory(conversationHistory) {
+  if (!conversationHistory || conversationHistory.length === 0) return null;
+  const recentUserMsgs = conversationHistory
+    .filter(m => m.role === 'user')
+    .slice(-5)
+    .reverse();
+  for (const msg of recentUserMsgs) {
+    const text = (msg.content || '').toLowerCase();
+    const matches = text.match(/\b(video|videos|watch|watched|watching|youtube|netflix|movie|movies|show|shows|episode|stream|streaming|music|listen|listening|song|podcast|read|reading|article|browse|browsing|twitch|spotify)\b/g);
+    if (matches) return [...new Set(matches)].slice(0, 3).join(' ');
+  }
+  return null;
+}
+
+/**
  * Build a cleaned keyword query for episodic BM25 ranking.
  * Strips temporal phrases, pronouns, articles and filler so that only
  * content-bearing keywords remain (e.g. "watch videos").  The date
@@ -344,9 +363,22 @@ module.exports = async function retrieveMemory(state) {
 
     const isActivityQuery = _isActivityQuery(resolvedMessage || message);
     const searchQuery = buildSearchQuery(message, resolvedMessage);
+
+    // If the query stripped down to the generic fallback, try to enrich it with the
+    // topic from the prior user message (e.g. "what about the 5th" after "videos I watched")
+    const isGenericFallback = searchQuery === 'apps websites activity screen';
+    let enrichedSearchQuery = searchQuery;
+    if (isGenericFallback && state.conversationHistory && state.conversationHistory.length > 0) {
+      const topicFromHistory = extractTopicFromHistory(state.conversationHistory);
+      if (topicFromHistory) {
+        enrichedSearchQuery = topicFromHistory;
+        logger.debug(`[Node:RetrieveMemory] Enriched vague query with topic from history: "${topicFromHistory}"`);
+      }
+    }
+
     const minSimilarity = (dateRange || isActivityQuery) ? 0.1 : 0.25;
 
-    logger.debug(`[Node:RetrieveMemory] Search query: "${searchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | isActivityQuery: ${isActivityQuery} | minSimilarity: ${minSimilarity}`);
+    logger.debug(`[Node:RetrieveMemory] Search query: "${enrichedSearchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | isActivityQuery: ${isActivityQuery} | minSimilarity: ${minSimilarity}`);
 
     // ── Primary profile lookup for personal-attribute queries ───────────────
     // Before running noisy semantic search across thousands of screen captures,
@@ -448,7 +480,7 @@ module.exports = async function retrieveMemory(state) {
       // semantic search only scans user-declared facts.
       intent?.type !== 'context_query'
         ? mcpAdapter.callService('user-memory', 'memory.search', {
-            query: searchQuery,
+            query: enrichedSearchQuery,
             limit: 10,
             userId: context?.userId,
             minSimilarity,
@@ -478,7 +510,7 @@ module.exports = async function retrieveMemory(state) {
         // For activity queries, use a broad query so BM25 doesn't filter out relevant captures.
         // The answer LLM will classify which captures match the user's intent (video, music, etc.)
         // from source_text, appName, windowTitle, and url — no keyword enumeration needed.
-        const cleanedQuery = buildEpisodicSearchQuery(searchQuery);
+        const cleanedQuery = buildEpisodicSearchQuery(enrichedSearchQuery);
         const episodicQuery = isActivityQuery
           ? 'activity screen apps websites browser video music read'
           : (dbKeywords.length > 0 ? `${cleanedQuery} ${dbKeywords.join(' ')}` : cleanedQuery);

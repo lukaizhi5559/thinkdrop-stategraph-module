@@ -1573,6 +1573,29 @@ The user's request does NOT match any installed skill.
     if (!Array.isArray(skillPlan)) return { ...state, planError: `Cannot parse skill plan — no step array found` };
   }
 
+  // ── Inject direct deep-link URLs from preflight ───────────────────────────
+  // If preflight resolved a task-specific URL for a browser agent, pass it as
+  // the url arg so the browser starts at the right page.
+  if (Array.isArray(skillPlan)) {
+    const deepLinkMap = new Map();
+    const pfAgents = state?.preflightResult?.agents || [];
+    for (const a of pfAgents) {
+      if (a?.agentId && a?.deepLinkUrl) {
+        deepLinkMap.set(a.agentId.toLowerCase(), a.deepLinkUrl);
+      }
+    }
+
+    for (const step of skillPlan) {
+      if (step.skill === 'browser.agent' && step.args?.action === 'run' && step.args?.agentId && !step.args.url) {
+        const directUrl = deepLinkMap.get(step.args.agentId.toLowerCase());
+        if (directUrl) {
+          step.args.url = directUrl;
+          logger.info(`[Node:PlanSkillsV2] Injected deep-link URL for ${step.args.agentId}: ${directUrl}`);
+        }
+      }
+    }
+  }
+
   // ── Clarification / error objects from LLM ────────────────────────────────
   if (!Array.isArray(skillPlan) && skillPlan?.ask) {
     const { ask: question, options: opts = [] } = skillPlan;

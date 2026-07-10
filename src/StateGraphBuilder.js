@@ -514,7 +514,11 @@ class StateGraphBuilder {
       },
 
       // preflightAgents: proceeds to gatherPlanContext (with auth data now in state)
-      preflightAgents: () => {
+      preflightAgents: (state) => {
+        if (state.planError) {
+          logger.info('[StateGraph:Router] preflightAgents has planError → logConversation');
+          return 'logConversation';
+        }
         logger.debug('[StateGraph:Router] preflightAgents → gatherPlanContext');
         return 'gatherPlanContext';
       },
