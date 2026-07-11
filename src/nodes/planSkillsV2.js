@@ -985,10 +985,13 @@ async function planSkillsV2(state) {
             const trainedRecipeLines = [];
 
             for (const a of agents) {
-              const baseLine = `- ${a.id}: ${a.type} agent${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`;
+              const canonicalAgentId = (typeof a.id === 'string' && a.id)
+                ? (a.id.endsWith('.agent') ? a.id : `${a.id}.agent`)
+                : a.id;
+              const baseLine = `- ${canonicalAgentId}: ${a.type} agent${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`;
               agentLines.push(baseLine);
-              const svc = (a.id || '').replace('.agent', '').toLowerCase();
-              if (svc) _registeredAgentServiceMap[svc] = a.id;
+              const svc = (canonicalAgentId || '').replace('.agent', '').toLowerCase();
+              if (svc) _registeredAgentServiceMap[svc] = canonicalAgentId;
 
               if (a.type === 'browser' || a.type === 'cli') {
                 try {
@@ -1000,7 +1003,7 @@ async function planSkillsV2(state) {
                   if (skills.length > 0) {
                     const skillNames = skills.map(s => s.name).join(', ');
                     const agentTypeSkill = a.type === 'cli' ? 'cli.agent' : 'browser.agent';
-                    trainedRecipeLines.push(`- ${a.id}: [${skillNames}] → use ${agentTypeSkill} { action: "run", agentId: "${a.id}" }`);
+                    trainedRecipeLines.push(`- ${canonicalAgentId}: [${skillNames}] → use ${agentTypeSkill} { action: "run", agentId: "${canonicalAgentId}" }`);
 
                     for (const s of skills) {
                       const baseName = s.name.toLowerCase();
@@ -1014,7 +1017,7 @@ async function planSkillsV2(state) {
                       ];
                       for (const v of variants) {
                         if (!_trainedRecipeMap[v]) {
-                          _trainedRecipeMap[v] = { agentId: a.id, skillName: s.name, agentType: a.type === 'cli' ? 'cli.agent' : 'browser.agent' };
+                          _trainedRecipeMap[v] = { agentId: canonicalAgentId, skillName: s.name, agentType: a.type === 'cli' ? 'cli.agent' : 'browser.agent' };
                         }
                       }
                     }
@@ -1061,7 +1064,8 @@ async function planSkillsV2(state) {
             try {
               const recipe = JSON.parse(fs.readFileSync(path.join(recipeDir, recipeFile), 'utf8'));
               if (!recipe.name) continue;
-              const inferredAgentId = recipe.agentId || `${agentDir}.agent`;
+              const inferredRawAgentId = recipe.agentId || `${agentDir}.agent`;
+              const inferredAgentId = inferredRawAgentId.endsWith('.agent') ? inferredRawAgentId : `${inferredRawAgentId}.agent`;
               const agentType = 'browser.agent';
               const baseName = recipe.name.toLowerCase();
               const variants = [
@@ -1274,9 +1278,13 @@ async function planSkillsV2(state) {
     
     if (matchedRecipe) {
       logger.info(`[Node:PlanSkillsV2] Trained recipe fast-path: "${matchedVariant}" → ${matchedRecipe.agentId} (${matchedRecipe.skillName})`);
+      const normalizedMatchedAgentId =
+        (typeof matchedRecipe.agentId === 'string' && matchedRecipe.agentId)
+          ? (matchedRecipe.agentId.endsWith('.agent') ? matchedRecipe.agentId : `${matchedRecipe.agentId}.agent`)
+          : matchedRecipe.agentId;
       const fastPlan = [{
         skill: matchedRecipe.agentType,
-        args: { action: 'run', agentId: matchedRecipe.agentId, task: userMessage },
+        args: { action: 'run', agentId: normalizedMatchedAgentId, task: userMessage },
         description: `Execute trained recipe: ${matchedRecipe.skillName}`
       }];
       if (progressCallback) progressCallback({ type: 'plan_ready', steps: fastPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });

@@ -527,19 +527,6 @@ module.exports = async function preflightAgents(state) {
                 needsLogin: !hasSession,
                 sessionStale,
               });
-
-              if (!authed && a.start_url) {
-                _emitProgress({
-                  type: 'preflight:auth_required',
-                  agentId: a.id,
-                  serviceName: svcKey,
-                  authType: sessionStale ? 'browser_reauth' : _agentAuthType,
-                  iconUrl,
-                  message: sessionStale
-                    ? `${a.id} session may have expired — re-login recommended`
-                    : `${a.id} requires ${_agentAuthType === 'browser_oauth' ? 'browser login' : _agentAuthType} before planning`,
-                });
-              }
             } else if (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') {
               // Credential agents are not browser-authenticated; they need a stored token.
               const iconUrl = agentIdToIconUrl(a.id);
@@ -776,17 +763,7 @@ module.exports = async function preflightAgents(state) {
         for (const svc of services) {
           try {
             await mcpAdapter.callService(svc, 'ping', {}, { timeoutMs: 2000 });
-          } catch (pingErr) {
-            const isTimeout = pingErr?.message?.includes('timeout') || pingErr?.code === 'TIMEOUT';
-            if (!isTimeout) {
-              // Service responded with error — it's alive but unhealthy
-              warnings.push({
-                type: 'mcp_unhealthy',
-                message: `MCP service "${svc}" responded with error: ${pingErr.message?.slice(0, 100)}`,
-              });
-            }
-            // Timeout = service may be down — already caught by .catch(() => null) in each block
-          }
+          } catch (_) {}
         }
       } catch (_) {}
     })(),
@@ -1144,24 +1121,45 @@ module.exports = async function preflightAgents(state) {
     a => _AUTH_AGENT_TYPES.has(a.type) && !a.authed
   );
 
+  if (browserAgentsNeedingAuth.some(a => a.type === 'browser')) {
+    _emitProgress({
+      type: 'preflight:building_agent',
+      agentType: 'browser',
+      agentId: 'browser.preflight',
+      message: 'Checking browser authentication sessions...',
+      iconUrl: null,
+    });
+  }
+
   async function _authenticateBrowserAgent(a) {
     const svcKey = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
     const iconUrl = a.iconUrl || agentIdToIconUrl(a.agentId);
-    _emitProgress({
-      type: 'preflight:auth_required',
-      agentId: a.agentId,
-      serviceName: svcKey,
-      authType: a.sessionStale ? 'browser_reauth' : (a.authType || 'browser_oauth'),
-      iconUrl,
-      message: `${a.agentId} requires ${a.authType && a.authType !== 'browser_oauth' ? a.authType : 'login'} before planning`,
-    });
     try {
-      const authRes = await mcpAdapter.callService('command', 'browser.agent', {
-        action: 'authenticate',
-        agentId: a.agentId,
-        task: `Authenticate to ${a.agentId}`,
-        url: a.startUrl,
-      }, { timeoutMs: 10 * 60 * 1000 }).catch(() => null);
+      const authRes = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'browser.agent',
+        args: {
+          action: 'authenticate',
+          agentId: a.agentId,
+          task: `Authenticate to ${a.agentId}`,
+          url: a.startUrl,
+          manualLogin: true,
+          preflightProbe: true,
+        },
+      }, { timeoutMs: 10 * 60 * 1000 }).catch((err) => ({
+        ok: false,
+        error: `auth check transport error: ${err?.message || 'unknown error'}`,
+      }));
+      const authPayload = authRes?.data || authRes || {};
+      if (!authPayload.ok) {
+        _emitProgress({
+          type: 'preflight:auth_required',
+          agentId: a.agentId,
+          serviceName: svcKey,
+          authType: a.sessionStale ? 'browser_reauth' : (a.authType || 'browser_oauth'),
+          iconUrl,
+          message: `${a.agentId} requires ${a.authType && a.authType !== 'browser_oauth' ? a.authType : 'login'} before planning`,
+        });
+      }
       return authRes;
     } catch (err) {
       return { ok: false, error: err.message };
@@ -1174,7 +1172,8 @@ module.exports = async function preflightAgents(state) {
     let authRes = null;
     while (attempts < 2) {
       authRes = await _authenticateBrowserAgent(a);
-      if (authRes?.ok) {
+      const authPayload = authRes?.data || authRes || {};
+      if (authPayload.ok) {
         markAgentAuthed(a.agentId);
         a.authed = true;
         a.ready = true;
@@ -1187,10 +1186,10 @@ module.exports = async function preflightAgents(state) {
         break;
       }
 
-      if (authRes?.askUser) {
+      if (authPayload.askUser) {
         // Credential-style question (email / API key / bearer / basic)
-        if (authRes.needsCredentials) {
-          if (!authRes.credentialKey) {
+        if (authPayload.needsCredentials) {
+          if (!authPayload.credentialKey) {
             logger.warn(`[Node:PreflightAgents] ${a.agentId} requested credentials but did not supply a credentialKey`);
             _emitProgress({
               type: 'preflight:auth_failed',
@@ -1212,12 +1211,12 @@ module.exports = async function preflightAgents(state) {
           }
           _emitProgress({
             type: 'gather_credential',
-            key: authRes.credentialKey,
-            message: authRes.question,
+            key: authPayload.credentialKey,
+            message: authPayload.question,
           });
           let credentialStored = false;
           try {
-            const credResult = await gatherCredentialCallback(authRes.credentialKey);
+            const credResult = await gatherCredentialCallback(authPayload.credentialKey);
             credentialStored = credResult && (credResult.stored === true || credResult.stored === undefined);
           } catch (credErr) {
             logger.warn(`[Node:PreflightAgents] Credential gather failed for ${a.agentId}: ${credErr.message}`);
@@ -1248,11 +1247,11 @@ module.exports = async function preflightAgents(state) {
         }
         _emitProgress({
           type: 'ask_user',
-          question: authRes.question,
+          question: authPayload.question,
           source: 'preflightAgents',
         });
         try {
-          const answer = await gatherAnswerCallback(authRes.question);
+          const answer = await gatherAnswerCallback(authPayload.question);
           if (!answer) break;
         } catch (ansErr) {
           logger.warn(`[Node:PreflightAgents] Answer gather failed for ${a.agentId}: ${ansErr.message}`);
@@ -1267,7 +1266,8 @@ module.exports = async function preflightAgents(state) {
     }
 
     if (!a.authed) {
-      const failureReason = authRes?.error || 'auth did not complete';
+      const authPayload = authRes?.data || authRes || {};
+      const failureReason = authPayload.error || 'auth did not complete';
       a.ready = false;
       a.reason = failureReason;
       logger.error(`[Node:PreflightAgents] I couldn't authenticate ${a.agentId} before planning: ${failureReason}`);
@@ -1358,6 +1358,15 @@ module.exports = async function preflightAgents(state) {
     // Also check registered agents that might be app type
     const registeredAppEntries = Object.entries(_registeredAgentServiceMap)
       .filter(([svc, id]) => id.includes('.app.agent'));
+    if (registeredAppEntries.length > 0 || appAgents.length > 0) {
+      _emitProgress({
+        type: 'preflight:building_agent',
+        agentType: 'app',
+        agentId: 'app.preflight',
+        message: 'Checking app agents and shortcuts...',
+        iconUrl: null,
+      });
+    }
     for (const [svc, id] of registeredAppEntries) {
       if (appAgents.some(a => a.agentId === id)) continue; // already handled
       const appName = svc;
