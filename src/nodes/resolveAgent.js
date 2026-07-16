@@ -183,7 +183,7 @@ async function _discoverVerifiedStartUrl(serviceKey, mcpAdapter, logger) {
 
 async function _resolveStartUrlForService(service, userMessage, mcpAdapter, logger) {
   if (!service) return null;
-  const key = service.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const key = service.toLowerCase().replace(/[^a-z0-9_]/g, '');
   // If the user typed a bare hostname (e.g. "w3schools.com"), use it directly.
   const hostMatch = String(userMessage || '').match(/(?:https?:\/\/)?([a-z0-9][a-z0-9-]*\.[a-z]{2,})/i);
   if (hostMatch) {

@@ -283,6 +283,10 @@ module.exports = async function preflightAgents(state) {
         }, { timeoutMs: 30000 }).catch(() => null);
         const buildPayload = buildRes?.data || buildRes || {};
         if (buildPayload?.ok) {
+          if (buildPayload.agentId && buildPayload.agentId !== spec.agentId) {
+            logger.warn(`[Node:PreflightAgents] Agent ID mismatch: requested "${spec.agentId}" but builder created "${buildPayload.agentId}" — using actual agentId`);
+            spec.agentId = buildPayload.agentId;
+          }
           logger.info(`[Node:PreflightAgents] Created ${skillName} agent: ${spec.agentId}`);
         } else {
           const errMsg = buildPayload?.error || 'unknown error';
@@ -1148,6 +1152,130 @@ module.exports = async function preflightAgents(state) {
     })(),
   ]);
 
+  // ── Route choice gate ──────────────────────────────────────────────────────
+  // When multiple execution routes (CLI/API, browser, app) are available for
+  // the same service, surface a choice to the user before authentication.
+  // Only the chosen route proceeds to auth and planning.
+  const preflightRouteChoice = {};
+  const _ROUTE_TYPE_MAP = {
+    cli_api: ['cli', 'api_key', 'bearer', 'basic'],
+    browser: ['browser'],
+    app:     ['app'],
+  };
+
+  function _svcFromAgent(a) {
+    return (a.service || (a.agentId || '').replace(/\.app\.agent$/, '').replace(/\.agent$/, '')).toLowerCase();
+  }
+
+  function _routeTypeFromAgent(a) {
+    if (['cli', 'api_key', 'bearer', 'basic'].includes(a.type)) return 'cli_api';
+    if (a.type === 'browser') return 'browser';
+    if (a.type === 'app') return 'app';
+    return null;
+  }
+
+  {
+    const _candidatesByService = new Map();
+    for (const a of agentReadiness) {
+      if (!a.ready) continue;
+      const svcKey = _svcFromAgent(a);
+      if (!svcKey) continue;
+      const routeType = _routeTypeFromAgent(a);
+      if (!routeType) continue;
+      if (!_candidatesByService.has(svcKey)) _candidatesByService.set(svcKey, []);
+      _candidatesByService.get(svcKey).push({ agent: a, routeType });
+    }
+
+    for (const [svcKey, entries] of _candidatesByService) {
+      const routeTypes = new Set(entries.map(e => e.routeType));
+      if (routeTypes.size <= 1) continue;
+
+      const iconUrl = entries[0].agent.iconUrl || serviceToIconUrl(svcKey);
+      const options = [];
+
+      if (routeTypes.has('cli_api')) {
+        const c = entries.find(e => e.routeType === 'cli_api').agent;
+        options.push({
+          route: 'cli_api',
+          label: 'CLI/API',
+          recommended: true,
+          description: 'More reliable, faster execution',
+          agentId: c.agentId,
+          authType: c.authType || (c.type === 'cli' ? 'cli_token' : c.type),
+          requiresSetup: !c.authed,
+        });
+      }
+      if (routeTypes.has('browser')) {
+        const c = entries.find(e => e.routeType === 'browser').agent;
+        options.push({
+          route: 'browser',
+          label: 'Browser Agent',
+          recommended: false,
+          description: 'Uses browser automation, may be slower',
+          agentId: c.agentId,
+          authType: c.authType || 'browser_oauth',
+          requiresSetup: !c.authed,
+        });
+      }
+      if (routeTypes.has('app')) {
+        const c = entries.find(e => e.routeType === 'app').agent;
+        options.push({
+          route: 'app',
+          label: 'Desktop App',
+          recommended: false,
+          description: 'Uses native app automation',
+          agentId: c.agentId,
+          authType: 'none',
+          requiresSetup: false,
+          appInstalled: true,
+        });
+      }
+
+      _emitProgress({
+        type: 'preflight:route_choice',
+        serviceName: svcKey,
+        iconUrl,
+        options,
+      });
+
+      if (gatherAnswerCallback) {
+        try {
+          const choiceAnswer = await gatherAnswerCallback(`route_choice:${svcKey}`);
+          const chosenRoute = String(choiceAnswer || '').trim().toLowerCase();
+
+          if (chosenRoute && routeTypes.has(chosenRoute)) {
+            preflightRouteChoice[svcKey] = chosenRoute;
+            logger.info(`[Node:PreflightAgents] Route choice for ${svcKey}: ${chosenRoute}`);
+
+            // Filter agentReadiness to keep only the chosen route for this service
+            const keepTypes = _ROUTE_TYPE_MAP[chosenRoute] || [];
+            for (let i = agentReadiness.length - 1; i >= 0; i--) {
+              const a = agentReadiness[i];
+              if (_svcFromAgent(a) === svcKey && !keepTypes.includes(a.type)) {
+                agentReadiness.splice(i, 1);
+              }
+            }
+
+            // Update selectedAgentIds: remove non-chosen, add chosen
+            for (const id of [...selectedAgentIds]) {
+              const idSvc = id.replace(/\.app\.agent$/, '').replace(/\.agent$/, '').toLowerCase();
+              if (idSvc === svcKey) {
+                const stillPresent = agentReadiness.some(a => a.agentId.toLowerCase() === id);
+                if (!stillPresent) selectedAgentIds.delete(id);
+              }
+            }
+            const chosenAgent = agentReadiness.find(a => _svcFromAgent(a) === svcKey);
+            if (chosenAgent) selectedAgentIds.add(chosenAgent.agentId.toLowerCase());
+          } else {
+            logger.info(`[Node:PreflightAgents] No valid route choice for ${svcKey} — keeping all routes`);
+          }
+        } catch (choiceErr) {
+          logger.warn(`[Node:PreflightAgents] Route choice gather failed for ${svcKey}: ${choiceErr.message}`);
+        }
+      }
+    }
+  }
+
   // ── Browser / credential agent authentication (Phase 1.5) ─────────────────
   // Any selected browser or credential agent that is not authenticated must
   // complete auth BEFORE planning. Browser agents open the browser and wait for
@@ -1180,8 +1308,9 @@ module.exports = async function preflightAgents(state) {
           agentId: a.agentId,
           task: `Authenticate to ${a.agentId}`,
           url: a.startUrl,
-          manualLogin: true,
+          manualLogin: false,
           preflightProbe: true,
+          forceAuthProbe: true,
         },
       }, { timeoutMs: 10 * 60 * 1000 }).catch((err) => ({
         ok: false,
@@ -1217,7 +1346,7 @@ module.exports = async function preflightAgents(state) {
     while (attempts < 2) {
       authRes = await _authenticateBrowserAgent(a);
       const authPayload = authRes?.data || authRes || {};
-      if (authPayload.ok) {
+      if (authPayload.ok && authPayload.authVerified === true) {
         markAgentAuthed(a.agentId);
         a.authed = true;
         a.ready = true;
@@ -1227,6 +1356,11 @@ module.exports = async function preflightAgents(state) {
           iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
           message: `${a.agentId} authenticated`,
         });
+        break;
+      }
+
+      if (authPayload.ok && authPayload.authVerified !== true) {
+        authRes = { ok: false, error: 'authentication result was not verified by the selected driver' };
         break;
       }
 
@@ -1358,6 +1492,41 @@ module.exports = async function preflightAgents(state) {
     };
   }
 
+  // ── Single-route mandate (post-auth) ──────────────────────────────────────
+  // When a service has exactly one executable route and it is now ready+
+  // authed, treat that route as authoritative. The planner is forbidden from
+  // falling back to api_suggest or alternative routes for that service.
+  const singleRouteMandate = {};
+  {
+    const _readyByService = new Map();
+    for (const a of agentReadiness) {
+      if (!a.ready || !a.authed) continue;
+      const svcKey = _svcFromAgent(a);
+      if (!svcKey) continue;
+      const routeType = _routeTypeFromAgent(a);
+      if (!routeType) continue;
+      if (!_readyByService.has(svcKey)) _readyByService.set(svcKey, []);
+      _readyByService.get(svcKey).push({ agent: a, routeType });
+    }
+
+    for (const [svcKey, entries] of _readyByService) {
+      if (entries.length !== 1) continue;
+      const { agent: a, routeType } = entries[0];
+      singleRouteMandate[svcKey] = {
+        route: routeType,
+        agentId: a.agentId,
+        authType: a.authType || (a.type === 'cli' ? 'cli_token' : a.type),
+      };
+      _emitProgress({
+        type: 'preflight:single_route_mandate',
+        serviceName: svcKey,
+        agentId: a.agentId,
+        route: routeType,
+      });
+      logger.info(`[Node:PreflightAgents] Single-route mandate for ${svcKey}: ${routeType} via ${a.agentId}`);
+    }
+  }
+
   // ── Task-specific deep-link resolution for authenticated browser agents ─────
   // Resolves a direct URL once per agent so planSkillsV2 can start browser.act
   // steps at the right page instead of relying on click/scroll navigation.
@@ -1368,19 +1537,62 @@ module.exports = async function preflightAgents(state) {
       catch (_) { return ''; }
     })();
     if (!baseHost) return null;
+    const _svc = (a.agentId || '').replace(/\.agent$/, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const _startBase = a.startUrl.replace(/\/$/, '');
 
-    // Fast heuristic for site-search tasks
-    const searchQueryMatch = task.match(/\bsearch\s+(?:for\s+)?(.+?)(?:\s+on\s+\w+)?$/i) ||
-                             task.match(/\bgoogle\s+(.+)$/i) ||
-                             task.match(/\b(?:find|look\s+up)\s+(.+?)(?:\s+on\s+\w+)?$/i);
-    if (searchQueryMatch) {
-      const q = encodeURIComponent(searchQueryMatch[1].trim().replace(/[?.!]+$/g, ''));
-      if (baseHost === 'google.com') return `https://www.google.com/search?q=${q}`;
-      if (baseHost === 'youtube.com') return `https://www.youtube.com/results?search_query=${q}`;
-      if (baseHost === 'w3schools.com') return `https://www.w3schools.com/search/search.asp?q=${q}`;
+    // Tier 1: Intent URL templates (regex-based intent classification)
+    {
+      const _t = task.toLowerCase();
+      let intent = 'home';
+      if (/\b(write[\s_-].*(?:post|blog|article)|publish[\s_-].*(?:article|post|video)|upload[\s_-].*(?:video|file|image)|create[\s_-].*(?:page|post|blog|listing))\b/i.test(task)) intent = 'content_create';
+      else if (/\b(post\s+(?:to|on)|tweet|retweet|follow\s+|comment\s+on|like\s+(?:the\s+)?post|share\s+on|send\s+a\s+dm)\b/i.test(task)) intent = 'social';
+      else if (/\b((?:send|compose|write|draft|forward|reply)(?:\s+\w+){0,3}\s+(?:email|mail)|email[\s_-]to|mail[\s_-]to)\b/i.test(task)) intent = 'mail';
+      else if (/\b(book[\s_-].*(?:appointment|reservation|table|slot)|schedule[\s_-].*(?:meeting|call|appointment))\b/i.test(task)) intent = 'scheduling';
+      else if (/\b(search\s+(?:for|on|google)?|google\s+|site:)\b/i.test(task)) intent = 'search';
+      else if (/\b(account[\s_-]?settings|billing|subscription|profile[\s_-]?settings|update\s+my\s+profile|change\s+billing|manage\s+subscription|preferences)\b/i.test(task)) intent = 'settings';
+      else if (/\b(contact\s+support|open\s+(?:a\s+)?(?:support\s+)?ticket|report\s+(?:an?\s+)?issue|help\s+center)\b/i.test(task)) intent = 'support';
+      else if (/\b(show\s+my\s+dashboard|open\s+(?:the\s+)?dashboard|view\s+(?:my\s+)?(?:dashboard|analytics|stats)|admin\s+panel)\b/i.test(task)) intent = 'dashboard';
+      else if (/\b(documentation|docs|tutorial|guide|reference|readme|manual)\b/i.test(task)) intent = 'docs';
+      else if (/\b(api[\s_-]?key|developer[\s_-]?console|create[\s_-]?token|bearer[\s_-]?token|secret[\s_-]?key|api[\s_-]?token)\b/i.test(task)) intent = 'console';
+
+      let tpl = null;
+      if (intent === 'content_create' && (_svc === 'twitter' || baseHost === 'x.com')) tpl = 'https://x.com/compose/post';
+      else if (intent === 'content_create' && (_svc === 'medium' || baseHost === 'medium.com')) tpl = 'https://medium.com/new-story';
+      else if (intent === 'content_create' && (_svc === 'linkedin' || baseHost === 'linkedin.com')) tpl = 'https://www.linkedin.com/post/new';
+      else if (intent === 'mail' && (_svc === 'gmail' || baseHost === 'mail.google.com')) tpl = 'https://mail.google.com/mail/u/0/#inbox?compose=new';
+      else if (intent === 'mail' && (_svc === 'outlook' || baseHost === 'outlook.live.com')) tpl = 'https://outlook.live.com/mail/0/deeplink/compose';
+      else if (intent === 'settings') tpl = `${_startBase}/settings`;
+      else if (intent === 'support') tpl = `${_startBase}/help`;
+      else if (intent === 'dashboard') tpl = `${_startBase}/dashboard`;
+      else if (intent === 'docs') tpl = `https://docs.${baseHost}`;
+      else if (intent === 'console') tpl = `${_startBase}/console`;
+      if (tpl) {
+        const ch = (() => { try { return new URL(tpl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
+        if (ch && (ch === baseHost || ch.endsWith('.' + baseHost) || baseHost.endsWith('.' + ch))) return tpl;
+      }
     }
 
-    // General discovery via web.agent
+    // Tier 2: Authenticated link extraction via eval
+    try {
+      const lr = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'browser.act',
+        args: { action: 'eval', sessionId: a.agentId,
+          expression: '() => JSON.stringify(Array.from(document.querySelectorAll("a[href]")).map(a=>({href:a.href,text:(a.innerText||"").trim().slice(0,80)})).filter(l=>l.href.startsWith("http")).slice(0,150))' },
+      }, { timeoutMs: 10000 }).catch(() => null);
+      const ld = lr?.data || lr;
+      if (ld?.result) {
+        let links = null;
+        const raw = String(ld.result || ld.stdout || '').trim();
+        try { links = JSON.parse(raw); } catch (_) { const m = raw.match(/\[[\s\S]*\]/); if (m) try { links = JSON.parse(m[0]); } catch (_) {} }
+        if (Array.isArray(links) && links.length > 0) {
+          const taskLower = task.toLowerCase();
+          const good = links.filter(l => { try { const lh = new URL(l.href).hostname.replace(/^www\./, ''); return (lh === baseHost || lh.endsWith('.' + baseHost)) && /\/(new|create|compose|upload|submit|settings|help|dashboard|docs|console|search)/i.test(l.href); } catch (_) { return false; } }).map(l => ({ ...l, _s: (l.text || '').toLowerCase().split(/\s+/).filter(w => w.length > 2 && taskLower.includes(w)).length })).sort((a, b) => b._s - a._s);
+          if (good.length > 0) { logger.info(`[Node:PreflightAgents] deep-link: eval extracted ${good[0].href} for ${a.agentId}`); return good[0].href; }
+        }
+      }
+    } catch (_) {}
+
+    // Tier 3: web.agent discover_task_url
     try {
       const webRes = await mcpAdapter.callService('command', 'web.agent', {
         action: 'discover_task_url',
@@ -1506,6 +1718,37 @@ module.exports = async function preflightAgents(state) {
     state._trainedRecipeMap = _trainedRecipeMap;
   }
 
+  const selectedReadinessFailures = [];
+  for (const agentId of selectedAgentIds) {
+    const agent = agentReadiness.find(a => String(a.agentId || '').toLowerCase() === agentId);
+    if (!agent) {
+      selectedReadinessFailures.push({ agentId, reason: 'selected agent did not complete preflight' });
+      continue;
+    }
+    if (!agent.ready) {
+      selectedReadinessFailures.push({ agentId, reason: agent.reason || 'agent is not ready' });
+      continue;
+    }
+    if (['browser', 'cli', 'api_key', 'bearer', 'basic'].includes(agent.type) && !agent.authed) {
+      selectedReadinessFailures.push({ agentId, reason: 'authentication is required' });
+    }
+  }
+  if (selectedReadinessFailures.length > 0) {
+    const planError = `Selected agents are not ready: ${selectedReadinessFailures.map(f => `${f.agentId} (${f.reason})`).join('; ')}`;
+    logger.error(`[Node:PreflightAgents] ${planError}`);
+    return {
+      ...state,
+      preflightDone: true,
+      planError,
+      preflightAuthRequired: selectedReadinessFailures.some(f => /authentication is required/i.test(f.reason)),
+      preflightResult: {
+        warnings,
+        agents: agentReadiness,
+        agentContextNote: '',
+      },
+    };
+  }
+
   // ── Build preflightResult ───────────────────────────────────────────────────
   const preflightResult = {
     skillContractNote,
@@ -1523,6 +1766,8 @@ module.exports = async function preflightAgents(state) {
     warnings,
     orphanedSkills,
     orphanedSkillsNote,
+    routeChoice: preflightRouteChoice,
+    singleRouteMandate,
   };
 
   // Emit complete
@@ -1543,6 +1788,7 @@ module.exports = async function preflightAgents(state) {
   return {
     ...state,
     preflightResult,
+    preflightRouteChoice,
     preflightDone: true,
     _trainedRecipeMap: mapSize > 0 ? _trainedRecipeMap : state._trainedRecipeMap,
   };

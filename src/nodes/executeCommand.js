@@ -2354,6 +2354,15 @@ module.exports = async function executeCommand(state) {
           ((r.result && typeof r.result === 'string' && r.result.trim().length > 50) ||
            (r.text && typeof r.text === 'string' && r.text.trim().length > 50))) ||
         (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:')) ||
+        (r.skill === 'cli.agent' && r.ok &&
+          ((typeof r.result === 'string' && r.result.trim().length > 0) ||
+           (typeof r.stdout === 'string' && r.stdout.trim().length > 0))) ||
+        (r.skill === 'external.skill' && r.ok &&
+          ((typeof r.result === 'string' && r.result.trim().length > 0) ||
+           (typeof r.stdout === 'string' && r.stdout.trim().length > 0))) ||
+        (r.skill === 'web.agent' && r.ok &&
+          ((typeof r.result === 'string' && r.result.trim().length > 0) ||
+           (typeof r.stdout === 'string' && r.stdout.trim().length > 0))) ||
         (r.skill === 'video.agent' && r.ok &&
           ((Array.isArray(r.steps) && r.steps.length > 0) ||
            (Array.isArray(r.result?.steps) && r.result.steps.length > 0) ||
@@ -2363,6 +2372,7 @@ module.exports = async function executeCommand(state) {
       ) && r.ok
         && ((r.result && typeof r.result === 'string' && r.result.trim().length > 0) ||
             (r.text && typeof r.text === 'string' && r.text.trim().length > 0) ||
+            (r.stdout && typeof r.stdout === 'string' && r.stdout.trim().length > 0) ||
             (r.skill === 'video.agent'))
         && r.step > lastSynthesizeStep)
       .map(r => {
@@ -2384,7 +2394,7 @@ module.exports = async function executeCommand(state) {
           if (parts.length === 0) parts.push(r.stdout || '');
           _rawText = parts.join('\n\n');
         } else {
-          _rawText = (typeof r.result === 'string' && r.result) || r.text || '';
+          _rawText = (typeof r.result === 'string' && r.result) || r.text || (typeof r.stdout === 'string' && r.stdout) || '';
         }
         const analysis = analyzePageContent(_rawText, r.url || r.result?.videoUrl || r.args?.videoUrl, r.args?.agentId);
         let processedText = _rawText;
@@ -2403,10 +2413,18 @@ module.exports = async function executeCommand(state) {
           processedText = `[PAGE NOTE: Sign-in nav detected but page has content below. Extract substantive content.]\n\n${_rawText}`;
         }
         
+        const _sourceLabel = r.skill === 'video.agent'
+          ? ('video.agent:' + (r.pageTitle || r.result?.pageTitle || r.args?.videoUrl || r.args?.url || 'video'))
+          : r.skill === 'cli.agent'
+          ? ('cli.agent:' + (r.args?.agentId || r.args?.command || 'cli'))
+          : r.skill === 'external.skill'
+          ? ('external.skill:' + (r.args?.name || 'skill'))
+          : r.skill === 'web.agent'
+          ? ('web.agent:' + (r.args?.action || r.args?.query || 'web'))
+          : (r.args?.sessionId || r.args?.agentId || (r.skill === 'app.agent' ? 'app.agent' : 'browser.agent'));
+
         return { 
-          source: r.skill === 'video.agent'
-            ? ('video.agent:' + (r.pageTitle || r.result?.pageTitle || r.args?.videoUrl || r.args?.url || 'video'))
-            : (r.args?.sessionId || r.args?.agentId || (r.skill === 'app.agent' ? 'app.agent' : 'browser.agent')),
+          source: _sourceLabel,
           url: r.url || r.result?.videoUrl || r.args?.videoUrl || r.args?.url || '', 
           text: processedText,
           _analysis: analysis // for debugging
@@ -2855,11 +2873,14 @@ module.exports = async function executeCommand(state) {
         })()
       : _rawSynthesisContext;
 
+    let synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
+
+    // ── User question — used by chunk+filter pass and synthesis prompt ────
+    const _userQuestion = state.originalMessage || state.resolvedMessage || state.message || synthesisPrompt;
+
     // Check if this is an email-related synthesis task
     const isEmailTask = /email|mail|send|draft|message/i.test(synthesisPrompt) || 
                         /email|mail|send|draft|message/i.test(_userQuestion || '');
-    
-    let synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
     
     // Add specific instructions for email tasks to use actual memories
     if (isEmailTask && userAgentResults.length > 0) {
@@ -2905,9 +2926,6 @@ module.exports = async function executeCommand(state) {
       // Detect when shell output is raw JSON from an API call (e.g. GitHub REST API, curl)
       // — needs different synthesis instructions than plain file content
       const _isJsonShellOutput = shellStdoutResults.some(s => /=== Shell output[^\n]*\n\s*[\[{]/.test(s));
-
-      // ── User question — used by chunk+filter pass and synthesis prompt ────
-      const _userQuestion = state.originalMessage || state.resolvedMessage || state.message || synthesisPrompt;
 
       // ── Chunk+filter pass for large API responses (> 60K) ─────────────────
       // Pages through items that didn't fit in the initial 50-item preview and

@@ -1396,6 +1396,42 @@ EXAMPLE - Mixed parallel sources:
   { "skill": "synthesize", "args": { "prompt": "Combine pricing and inventory data" } }
 ]`;
 
+  // ── Route choice constraint from preflightAgents ───────────────────────────
+  let routeChoiceNote = '';
+  const preflightRouteChoice = state.preflightRouteChoice || state.preflightResult?.routeChoice || {};
+  if (Object.keys(preflightRouteChoice).length > 0) {
+    const choiceLines = [];
+    for (const [svc, route] of Object.entries(preflightRouteChoice)) {
+      if (route === 'cli_api') {
+        choiceLines.push(`- ${svc}: User selected CLI/API route. Use cli.agent or shell.run with API calls. Do NOT use browser.agent for ${svc}.`);
+      } else if (route === 'browser') {
+        choiceLines.push(`- ${svc}: User selected Browser Agent route. Use browser.agent { action: "run", agentId: "${svc}.agent", task: "..." }. Do NOT use api_suggest or cli.agent for ${svc}.`);
+      } else if (route === 'app') {
+        choiceLines.push(`- ${svc}: User selected Desktop App route. Use app.agent { action: "run_agent", appName: "${svc}", task: "..." }. Do NOT use browser.agent or api_suggest for ${svc}.`);
+      }
+    }
+    routeChoiceNote = `\n\n⚠️ ROUTE CHOICE — USER SELECTED EXECUTION ROUTE (MANDATORY):\nThe user explicitly chose the following execution routes during preflight. You MUST use the selected route and MUST NOT use alternative routes or api_suggest for these services:\n${choiceLines.join('\n')}\n\nDo NOT generate api_suggest steps for services listed above — the user already chose their preferred route.`;
+    logger.info(`[Node:PlanSkillsV2] Route choice constraint injected: ${JSON.stringify(preflightRouteChoice)}`);
+  }
+
+  // ── Single-route mandate from preflightAgents ─────────────────────────────
+  let singleRouteNote = '';
+  const singleRouteMandate = state?.preflightResult?.singleRouteMandate || {};
+  if (Object.keys(singleRouteMandate).length > 0) {
+    const mandateLines = [];
+    for (const [svc, m] of Object.entries(singleRouteMandate)) {
+      if (m.route === 'cli_api') {
+        mandateLines.push(`- ${svc}: The only available and authenticated route is CLI/API via ${m.agentId}. You MUST use cli.agent { action: 'run', agentId: '${m.agentId}', task: '...' }. FORBIDDEN: api_suggest, browser.agent, browser.act, app.agent, or any other route for ${svc}.`);
+      } else if (m.route === 'browser') {
+        mandateLines.push(`- ${svc}: The only available and authenticated route is ${m.agentId} (browser). You MUST use browser.agent { action: 'run', agentId: '${m.agentId}', task: '...' }. FORBIDDEN: api_suggest, browser.act, cli.agent, app.agent, or raw API calls for ${svc}.`);
+      } else if (m.route === 'app') {
+        mandateLines.push(`- ${svc}: The only available and authenticated route is desktop app via ${m.agentId}. You MUST use app.agent { action: 'run_agent', appName: '${svc}', task: '...' }. FORBIDDEN: api_suggest, browser.agent, browser.act, cli.agent, or any other route for ${svc}.`);
+      }
+    }
+    singleRouteNote = `\n\n⚠️ SINGLE-ROUTE MANDATE — MANDATORY ROUTE FOR THESE SERVICES:\n${mandateLines.join('\n')}\n\nThese services have only one authenticated route available. You MUST use that route and MUST NOT generate api_suggest or alternative routes for them.\n`;
+    logger.info(`[Node:PlanSkillsV2] Single-route mandate injected: ${JSON.stringify(singleRouteMandate)}`);
+  }
+
   // ── External skill prohibition (when parseSkill found no match) ─────────────
   let externalSkillProhibition = '';
   if (state._noInstalledSkillMatch && !recoveryContext) {
@@ -1429,6 +1465,8 @@ The user's request does NOT match any installed skill.
     discoveredToolNote,
     orphanedSkillsNote,
     externalSkillProhibition,
+    routeChoiceNote,
+    singleRouteNote,
     smsGatewayNote,
     dateRangeNote,
     runtimeNote,

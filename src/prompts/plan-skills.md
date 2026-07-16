@@ -22,6 +22,16 @@ tool.discover|args:{action:string,task?:string}|[tool_discovery_agent]_Discovers
 
 **Exceptions:** pure navigation → browser.agent directly. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
 
+## Single-route mandate (MANDATORY)
+
+If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `api_suggest`, `browser.act`, or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.
+
+- Single browser agent available → `browser.agent { action: 'run', agentId: '<agentId>', task: '...' }`
+- Single CLI/API agent available → `cli.agent { action: 'run', agentId: '<agentId>', task: '...' }`
+- Single app agent available → `app.agent { action: 'run_agent', appName: '<service>', task: '...' }`
+
+Only use `api_suggest` when there is NO authenticated route for the service.
+
 ## Template variables
 
 **VALID TOKENS (exhaustive — this list is complete):**
