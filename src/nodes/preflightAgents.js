@@ -75,6 +75,58 @@ function _deriveAgentAuthType(descriptor) {
   return 'browser_oauth';
 }
 
+// Parse setupInfo from an agent descriptor (.md).
+// Supports two formats:
+// 1. YAML frontmatter: setupInfo: { installCmd, authCmd, credentials, setupUrl, ... }
+// 2. Markdown section: ## Setup Info\n- installCmd: ...\n- authCmd: ...
+function _parseSetupInfo(descriptor) {
+  if (!descriptor || typeof descriptor !== 'string') return null;
+  // Try YAML frontmatter setupInfo
+  const fmMatch = descriptor.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (fmMatch) {
+    const fm = fmMatch[1];
+    const siMatch = fm.match(/^setupInfo:\s*\n([\s\S]*?)(?=\n[a-z]|\n---|$)/m);
+    if (siMatch) {
+      const block = siMatch[1];
+      const info = {};
+      for (const line of block.split('\n')) {
+        const m = line.match(/^\s+(\w+):\s*(.+)$/);
+        if (m) {
+          let val = m[2].trim();
+          if (val.startsWith('[') && val.endsWith(']')) {
+            try { val = JSON.parse(val); } catch { val = val.slice(1, -1).split(',').map(s => s.trim()); }
+          }
+          info[m[1]] = val;
+        }
+      }
+      if (Object.keys(info).length > 0) return info;
+    }
+    // Single-line setupInfo
+    const singleMatch = fm.match(/^setupInfo:\s*(\{.+\})/m);
+    if (singleMatch) {
+      try { return JSON.parse(singleMatch[1]); } catch {}
+    }
+  }
+  // Try markdown ## Setup Info section
+  const mdMatch = descriptor.match(/##\s*Setup\s*Info\s*\n([\s\S]*?)(?=\n##\s|$)/i);
+  if (mdMatch) {
+    const block = mdMatch[1];
+    const info = {};
+    for (const line of block.split('\n')) {
+      const m = line.match(/^\s*[-*]\s*(\w+):\s*(.+)$/);
+      if (m) {
+        let val = m[2].trim();
+        if (val.startsWith('[') && val.endsWith(']')) {
+          try { val = JSON.parse(val); } catch { val = val.slice(1, -1).split(',').map(s => s.trim()); }
+        }
+        info[m[1]] = val;
+      }
+    }
+    if (Object.keys(info).length > 0) return info;
+  }
+  return null;
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function _loadPreflightState() {
@@ -243,13 +295,16 @@ module.exports = async function preflightAgents(state) {
   // Run CLI preflight only when CLI is actually selected (or when no explicit
   // agent selection exists and discovery mode still needs capability checks).
   let _shouldRunCliPreflight = !recoveryContext;
+  let _selectedCliAgents = []; // descriptors of selected CLI agents to pass explicitly
   if (!recoveryContext && selectedAgentIds.size > 0) {
     try {
       const agSnapshotRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
       const agSnapshot = Array.isArray(agSnapshotRes?.data) ? agSnapshotRes.data : (Array.isArray(agSnapshotRes) ? agSnapshotRes : []);
-      const selectedCli = agSnapshot.some(a => selectedAgentIds.has(String(a?.id || '').toLowerCase()) && a?.type === 'cli');
-      _shouldRunCliPreflight = selectedCli;
-      if (!selectedCli) {
+      _selectedCliAgents = agSnapshot.filter(a =>
+        selectedAgentIds.has(String(a?.id || '').toLowerCase()) && a?.type === 'cli'
+      );
+      _shouldRunCliPreflight = _selectedCliAgents.length > 0;
+      if (!_shouldRunCliPreflight) {
         logger.info('[Node:PreflightAgents] CLI preflight skipped — selected agents are non-CLI');
       }
     } catch (_) {
@@ -383,7 +438,40 @@ module.exports = async function preflightAgents(state) {
           iconUrl: null, // CLI preflight is generic, no specific icon
         });
 
-        const pfRes = await mcpAdapter.callService('command', 'command.automate', { skill: 'cli.agent', args: { action: 'preflight_check', task: userMessage } }, { timeoutMs: 5000 }).catch(() => null);
+        // Helper: enrich missing setupInfo via web.agent discover_setup
+        const _enrichSetupInfo = async (existingSetupInfo, service, cliTool) => {
+          if (existingSetupInfo && existingSetupInfo.installCmd && existingSetupInfo.authCmd && existingSetupInfo.setupUrl) {
+            return existingSetupInfo; // already complete
+          }
+          try {
+            const dsRes = await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'web.agent',
+              args: { action: 'discover_setup', service, cliTool },
+            }, { timeoutMs: 8000 }).catch(() => null);
+            const ds = dsRes?.data || dsRes;
+            if (ds?.ok && ds.setupInfo) {
+              // Merge: existing values take priority, fill missing from discovery
+              return { ...(ds.setupInfo || {}), ...(existingSetupInfo || {}) };
+            }
+          } catch (_) {}
+          return existingSetupInfo;
+        };
+
+        const pfRes = await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'cli.agent',
+          args: {
+            action: 'preflight_check',
+            task: userMessage,
+            ...(Array.isArray(_selectedCliAgents) && _selectedCliAgents.length > 0
+              ? { agents: _selectedCliAgents.map(a => ({
+                  id:            a.id,
+                  service:       a.service || (a.id || '').replace(/\.agent$/, ''),
+                  cliTool:       a.cli_tool || a.cliTool || null,
+                  setupInfo:     _parseSetupInfo(a.descriptor),
+                })) }
+              : {}),
+          },
+        }, { timeoutMs: 5000 }).catch(() => null);
         const pf = pfRes?.data || pfRes;
         if (pf?.ok) {
           const lines = [];
@@ -399,16 +487,20 @@ module.exports = async function preflightAgents(state) {
               if (!c.cli) {
                 const provider = c.isOAuth ? 'OAuth-based' : c.isApiKey ? 'API key required' : 'unknown';
                 lines.push(`${c.service}: ${provider} — use browser.agent { action: 'build_agent' } then { action: 'run' }`);
-                agentReadiness.push({ type: 'cli', agentId: `${c.service}.agent`, ready: false, authed: false, iconUrl, service: c.service, reason: provider });
+                const _agentId = c.agentId || `${c.service}.agent`;
+                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli);
+                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: false, iconUrl, service: c.service, reason: provider, setupInfo: _enrichedSetupInfo });
                 // Surface API-key or OAuth requirements to the UI during preflight.
                 if (c.isApiKey || c.isOAuth) {
                   _emitProgress({
                     type: 'preflight:auth_required',
-                    agentId: `${c.service}.agent`,
+                    agentId: _agentId,
                     serviceName: c.service,
-                    authType: c.isApiKey ? 'api_key' : 'browser_oauth',
+                    authType: 'cli_setup',
                     iconUrl,
-                    message: `${c.service} ${c.isApiKey ? 'requires an API key' : 'requires browser login'}`,
+                    message: `${c.service} needs configuration`,
+                    reason: `${c.service} requires ${provider.toLowerCase()} configuration`,
+                    setupInfo: _enrichedSetupInfo,
                   });
                 }
                 continue;
@@ -416,31 +508,39 @@ module.exports = async function preflightAgents(state) {
               if (!c.installed) {
                 const installCmd = c.installMethod === 'npm' ? `npm install -g ${c.installPkg}` : `brew install ${c.installPkg || c.cli}`;
                 lines.push(`${c.service}: ${c.cli} NOT INSTALLED — install: ${installCmd}`);
-                agentReadiness.push({ type: 'cli', agentId: `${c.service}.agent`, ready: false, authed: false, iconUrl, service: c.service, reason: 'not installed' });
+                const _agentId = c.agentId || `${c.service}.agent`;
+                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli);
+                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: false, iconUrl, service: c.service, reason: 'not installed', setupInfo: _enrichedSetupInfo });
                 // Surface CLI install requirement to the UI during preflight.
                 _emitProgress({
                   type: 'preflight:auth_required',
-                  agentId: `${c.service}.agent`,
+                  agentId: _agentId,
                   serviceName: c.service,
-                  authType: 'cli_install',
+                  authType: 'cli_setup',
                   iconUrl,
-                  message: `${c.service} is not installed — run: ${installCmd}`,
+                  message: `${c.service} needs configuration`,
+                  reason: `${c.service} CLI tool (${c.cli}) is not installed`,
+                  setupInfo: _enrichedSetupInfo,
                 });
               } else {
                 const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : '');
                 lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
                 const authed = !!c.authUser || c.authStatus === 'authenticated';
-                agentReadiness.push({ type: 'cli', agentId: `${c.service}.agent`, ready: true, authed, iconUrl, service: c.service });
+                const _agentId = c.agentId || `${c.service}.agent`;
+                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli);
+                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: true, authed, iconUrl, service: c.service, setupInfo: _enrichedSetupInfo });
 
                 if (!authed) {
-                  // Emit auth required for CLI token
+                  // Emit auth required for CLI setup — redirect to Agents tab
                   _emitProgress({
                     type: 'preflight:auth_required',
-                    agentId: `${c.service}.agent`,
+                    agentId: _agentId,
                     serviceName: c.service,
-                    authType: 'cli_token',
+                    authType: 'cli_setup',
                     iconUrl,
-                    message: `${c.service} requires authentication`,
+                    message: `${c.service} needs authentication`,
+                    reason: `${c.service} CLI tool (${c.cli}) is installed but not authenticated`,
+                    setupInfo: _enrichedSetupInfo,
                   });
                 }
               }
@@ -568,6 +668,7 @@ module.exports = async function preflightAgents(state) {
                 startUrl: a.start_url,
                 needsLogin: !hasSession,
                 sessionStale,
+                authedAt: a.authedAt || null,
               });
             } else if (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') {
               // Credential agents are not browser-authenticated; they need a stored token.
@@ -1152,10 +1253,10 @@ module.exports = async function preflightAgents(state) {
     })(),
   ]);
 
-  // ── Route choice gate ──────────────────────────────────────────────────────
+  // ── Route choice gate (CLI-first) ──────────────────────────────────────────
   // When multiple execution routes (CLI/API, browser, app) are available for
-  // the same service, surface a choice to the user before authentication.
-  // Only the chosen route proceeds to auth and planning.
+  // the same service, CLI takes precedence. Only surface a choice to the user
+  // when CLI is not available or cannot be configured. Browser/app are fallback.
   const preflightRouteChoice = {};
   const _ROUTE_TYPE_MAP = {
     cli_api: ['cli', 'api_key', 'bearer', 'basic'],
@@ -1190,6 +1291,33 @@ module.exports = async function preflightAgents(state) {
       const routeTypes = new Set(entries.map(e => e.routeType));
       if (routeTypes.size <= 1) continue;
 
+      // CLI-first: if a CLI/API route exists, auto-select it and suppress browser/app
+      if (routeTypes.has('cli_api')) {
+        const cliAgent = entries.find(e => e.routeType === 'cli_api').agent;
+        preflightRouteChoice[svcKey] = 'cli_api';
+        logger.info(`[Node:PreflightAgents] CLI-first routing for ${svcKey}: auto-selected ${cliAgent.agentId} (suppressing ${[...routeTypes].filter(r => r !== 'cli_api').join(', ')})`);
+
+        // Remove non-CLI routes for this service from agentReadiness
+        const keepTypes = _ROUTE_TYPE_MAP['cli_api'] || [];
+        for (let i = agentReadiness.length - 1; i >= 0; i--) {
+          const a = agentReadiness[i];
+          if (_svcFromAgent(a) === svcKey && !keepTypes.includes(a.type)) {
+            agentReadiness.splice(i, 1);
+          }
+        }
+        // Update selectedAgentIds
+        for (const id of [...selectedAgentIds]) {
+          const idSvc = id.replace(/\.app\.agent$/, '').replace(/\.agent$/, '').toLowerCase();
+          if (idSvc === svcKey) {
+            const stillPresent = agentReadiness.some(a => a.agentId.toLowerCase() === id);
+            if (!stillPresent) selectedAgentIds.delete(id);
+          }
+        }
+        selectedAgentIds.add(cliAgent.agentId.toLowerCase());
+        continue; // Skip user route choice — CLI is authoritative
+      }
+
+      // No CLI route — surface remaining routes to user
       const iconUrl = entries[0].agent.iconUrl || serviceToIconUrl(svcKey);
       const options = [];
 
@@ -1334,14 +1462,17 @@ module.exports = async function preflightAgents(state) {
 
   const authFailures = [];
   for (const a of browserAgentsNeedingAuth) {
-    // ── Newly-built agent invariant: skip probe, force auth ──────────────────
-    // A just-built agent has no browser profile, no cookies, no session.
+    // ── Unauthenticated agent invariant: skip probe, force auth ─────────────
+    // An agent that has never been authenticated (authed_at is NULL) has no
+    // browser session. This covers both newly built agents and agents built
+    // in a previous session where the user cancelled before signing in.
     // The probe can only produce false positives on public landing pages.
-    // Force auth immediately without calling browser.agent authenticate.
-    if (a._newlyCreated) {
+    const _forceAuth = a._newlyCreated || !a.authedAt;
+    if (_forceAuth) {
       const _svcKey = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
       const _iconUrl = a.iconUrl || agentIdToIconUrl(a.agentId);
-      logger.info(`[Node:PreflightAgents] ${a.agentId} is newly built — forcing auth without probe`);
+      const _reason = a._newlyCreated ? 'newly built' : 'never authenticated';
+      logger.info(`[Node:PreflightAgents] ${a.agentId} is ${_reason} — forcing auth without probe`);
       _emitProgress({
         type: 'preflight:auth_required',
         agentId: a.agentId,
@@ -1349,10 +1480,11 @@ module.exports = async function preflightAgents(state) {
         authType: a.authType || 'browser_oauth',
         iconUrl: _iconUrl,
         message: `${a.agentId}`,
+        _newlyCreated: !!a._newlyCreated,
       });
       a.authed = false;
       a.ready = false;
-      a.reason = 'newly built — authentication required';
+      a.reason = `${_reason} — authentication required`;
       authFailures.push({ agentId: a.agentId, reason: 'auth required' });
       continue;
     }
