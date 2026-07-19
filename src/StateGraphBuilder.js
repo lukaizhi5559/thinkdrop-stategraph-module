@@ -750,10 +750,12 @@ class StateGraphBuilder {
           logger.info('[StateGraph:Router] Single-intent ask_user pause — surfacing question');
           if (typeof state.progressCallback === 'function') {
             try {
+              const _pqOpts = state.pendingQuestion.options || [];
+              const _pqLabels = _pqOpts.map(o => (typeof o === 'string' ? o : o?.label || String(o)));
               state.progressCallback({
                 type:    'ask_user',
                 question: state.pendingQuestion.question,
-                options:  state.pendingQuestion.options || [],
+                options:  _pqLabels,
                 source:  'single_intent_pause',
               });
             } catch (_) {}
@@ -769,10 +771,12 @@ class StateGraphBuilder {
           logger.info('[StateGraph:Router] Multi-intent ask_user pause (mid-pipeline) — surfacing question');
           if (typeof state.progressCallback === 'function') {
             try {
+              const _mqOpts = state.pendingQuestion.options || [];
+              const _mqLabels = _mqOpts.map(o => (typeof o === 'string' ? o : o?.label || String(o)));
               state.progressCallback({
                 type:    'ask_user',
                 question: state.pendingQuestion.question,
-                options:  state.pendingQuestion.options || [],
+                options:  _mqLabels,
                 source:  'multi_intent_pause',
               });
             } catch (_) {}

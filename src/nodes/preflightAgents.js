@@ -548,12 +548,12 @@ module.exports = async function preflightAgents(state) {
                 } catch (_) {}
               }
 
-              // Always verify browser sessions live during preflight. Profile/cookie
-              // age is not a reliable proxy for an active session (Google can expire
-              // server-side and serve workspace.google.com marketing pages instead of
-              // mail.google.com). The auth loop below calls browser.agent authenticate.
+              // Trust the Chrome persistent profile as the source of truth.
+              // If DuckDB has an authed_at record, the agent was previously authenticated
+              // and the session persists until the service itself expires it (detected
+              // during task execution, not during preflight). No arbitrary expiration timer.
               const _cachedAuth = _getCachedAuth(a.id);
-              const authed = _cachedAuth?.authed === true;
+              const authed = _cachedAuth?.authed === true || !!a.authedAt;
               const _authTag = authed ? '' : ' [NEEDS AUTH — user must authenticate before this agent can run]';
               agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_authTag}`);
 
@@ -1310,7 +1310,6 @@ module.exports = async function preflightAgents(state) {
           url: a.startUrl,
           manualLogin: false,
           preflightProbe: true,
-          forceAuthProbe: true,
         },
       }, { timeoutMs: 10 * 60 * 1000 }).catch((err) => ({
         ok: false,
@@ -1335,6 +1334,29 @@ module.exports = async function preflightAgents(state) {
 
   const authFailures = [];
   for (const a of browserAgentsNeedingAuth) {
+    // ── Newly-built agent invariant: skip probe, force auth ──────────────────
+    // A just-built agent has no browser profile, no cookies, no session.
+    // The probe can only produce false positives on public landing pages.
+    // Force auth immediately without calling browser.agent authenticate.
+    if (a._newlyCreated) {
+      const _svcKey = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
+      const _iconUrl = a.iconUrl || agentIdToIconUrl(a.agentId);
+      logger.info(`[Node:PreflightAgents] ${a.agentId} is newly built — forcing auth without probe`);
+      _emitProgress({
+        type: 'preflight:auth_required',
+        agentId: a.agentId,
+        serviceName: _svcKey,
+        authType: a.authType || 'browser_oauth',
+        iconUrl: _iconUrl,
+        message: `${a.agentId}`,
+      });
+      a.authed = false;
+      a.ready = false;
+      a.reason = 'newly built — authentication required';
+      authFailures.push({ agentId: a.agentId, reason: 'auth required' });
+      continue;
+    }
+
     // Emit actual agentId so main.js cancel handler can derive the correct session
     _emitProgress({
       type: 'preflight:auth_starting',
@@ -1528,86 +1550,40 @@ module.exports = async function preflightAgents(state) {
   }
 
   // ── Task-specific deep-link resolution for authenticated browser agents ─────
-  // Resolves a direct URL once per agent so planSkillsV2 can start browser.act
-  // steps at the right page instead of relying on click/scroll navigation.
+  // Delegates to browser.agent's resolve_deep_link action which has the full
+  // resolution chain: intent templates → authenticated eval → web.agent → web.crawl → LLM.
+  // Results are cached per agentId+taskHash (5min TTL) to avoid re-resolution.
+  const _deepLinkCache = new Map();
+  const _DEEP_LINK_CACHE_TTL = 5 * 60 * 1000;
+
   async function _resolveDeepLinkForAgent(a, task) {
     if (!a.startUrl) return null;
-    const baseHost = (() => {
-      try { return new URL(a.startUrl).hostname.replace(/^www\./, ''); }
-      catch (_) { return ''; }
-    })();
-    if (!baseHost) return null;
-    const _svc = (a.agentId || '').replace(/\.agent$/, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const _startBase = a.startUrl.replace(/\/$/, '');
 
-    // Tier 1: Intent URL templates (regex-based intent classification)
-    {
-      const _t = task.toLowerCase();
-      let intent = 'home';
-      if (/\b(write[\s_-].*(?:post|blog|article)|publish[\s_-].*(?:article|post|video)|upload[\s_-].*(?:video|file|image)|create[\s_-].*(?:page|post|blog|listing))\b/i.test(task)) intent = 'content_create';
-      else if (/\b(post\s+(?:to|on)|tweet|retweet|follow\s+|comment\s+on|like\s+(?:the\s+)?post|share\s+on|send\s+a\s+dm)\b/i.test(task)) intent = 'social';
-      else if (/\b((?:send|compose|write|draft|forward|reply)(?:\s+\w+){0,3}\s+(?:email|mail)|email[\s_-]to|mail[\s_-]to)\b/i.test(task)) intent = 'mail';
-      else if (/\b(book[\s_-].*(?:appointment|reservation|table|slot)|schedule[\s_-].*(?:meeting|call|appointment))\b/i.test(task)) intent = 'scheduling';
-      else if (/\b(search\s+(?:for|on|google)?|google\s+|site:)\b/i.test(task)) intent = 'search';
-      else if (/\b(account[\s_-]?settings|billing|subscription|profile[\s_-]?settings|update\s+my\s+profile|change\s+billing|manage\s+subscription|preferences)\b/i.test(task)) intent = 'settings';
-      else if (/\b(contact\s+support|open\s+(?:a\s+)?(?:support\s+)?ticket|report\s+(?:an?\s+)?issue|help\s+center)\b/i.test(task)) intent = 'support';
-      else if (/\b(show\s+my\s+dashboard|open\s+(?:the\s+)?dashboard|view\s+(?:my\s+)?(?:dashboard|analytics|stats)|admin\s+panel)\b/i.test(task)) intent = 'dashboard';
-      else if (/\b(documentation|docs|tutorial|guide|reference|readme|manual)\b/i.test(task)) intent = 'docs';
-      else if (/\b(api[\s_-]?key|developer[\s_-]?console|create[\s_-]?token|bearer[\s_-]?token|secret[\s_-]?key|api[\s_-]?token)\b/i.test(task)) intent = 'console';
-
-      let tpl = null;
-      if (intent === 'content_create' && (_svc === 'twitter' || baseHost === 'x.com')) tpl = 'https://x.com/compose/post';
-      else if (intent === 'content_create' && (_svc === 'medium' || baseHost === 'medium.com')) tpl = 'https://medium.com/new-story';
-      else if (intent === 'content_create' && (_svc === 'linkedin' || baseHost === 'linkedin.com')) tpl = 'https://www.linkedin.com/post/new';
-      else if (intent === 'mail' && (_svc === 'gmail' || baseHost === 'mail.google.com')) tpl = 'https://mail.google.com/mail/u/0/#inbox?compose=new';
-      else if (intent === 'mail' && (_svc === 'outlook' || baseHost === 'outlook.live.com')) tpl = 'https://outlook.live.com/mail/0/deeplink/compose';
-      else if (intent === 'settings') tpl = `${_startBase}/settings`;
-      else if (intent === 'support') tpl = `${_startBase}/help`;
-      else if (intent === 'dashboard') tpl = `${_startBase}/dashboard`;
-      else if (intent === 'docs') tpl = `https://docs.${baseHost}`;
-      else if (intent === 'console') tpl = `${_startBase}/console`;
-      if (tpl) {
-        const ch = (() => { try { return new URL(tpl).hostname.replace(/^www\./, ''); } catch (_) { return ''; } })();
-        if (ch && (ch === baseHost || ch.endsWith('.' + baseHost) || baseHost.endsWith('.' + ch))) return tpl;
-      }
+    // Check cache
+    const _cacheKey = `${a.agentId}:${task.slice(0, 100)}`;
+    const _cached = _deepLinkCache.get(_cacheKey);
+    if (_cached && (Date.now() - _cached.ts) < _DEEP_LINK_CACHE_TTL) {
+      logger.info(`[Node:PreflightAgents] deep-link: cache hit for ${a.agentId} → ${_cached.url}`);
+      return { url: _cached.url, source: _cached.source || null };
     }
 
-    // Tier 2: Authenticated link extraction via eval
+    // Delegate to browser.agent resolve_deep_link
     try {
-      const lr = await mcpAdapter.callService('command', 'command.automate', {
-        skill: 'browser.act',
-        args: { action: 'eval', sessionId: a.agentId,
-          expression: '() => JSON.stringify(Array.from(document.querySelectorAll("a[href]")).map(a=>({href:a.href,text:(a.innerText||"").trim().slice(0,80)})).filter(l=>l.href.startsWith("http")).slice(0,150))' },
-      }, { timeoutMs: 10000 }).catch(() => null);
-      const ld = lr?.data || lr;
-      if (ld?.result) {
-        let links = null;
-        const raw = String(ld.result || ld.stdout || '').trim();
-        try { links = JSON.parse(raw); } catch (_) { const m = raw.match(/\[[\s\S]*\]/); if (m) try { links = JSON.parse(m[0]); } catch (_) {} }
-        if (Array.isArray(links) && links.length > 0) {
-          const taskLower = task.toLowerCase();
-          const good = links.filter(l => { try { const lh = new URL(l.href).hostname.replace(/^www\./, ''); return (lh === baseHost || lh.endsWith('.' + baseHost)) && /\/(new|create|compose|upload|submit|settings|help|dashboard|docs|console|search)/i.test(l.href); } catch (_) { return false; } }).map(l => ({ ...l, _s: (l.text || '').toLowerCase().split(/\s+/).filter(w => w.length > 2 && taskLower.includes(w)).length })).sort((a, b) => b._s - a._s);
-          if (good.length > 0) { logger.info(`[Node:PreflightAgents] deep-link: eval extracted ${good[0].href} for ${a.agentId}`); return good[0].href; }
-        }
-      }
-    } catch (_) {}
-
-    // Tier 3: web.agent discover_task_url
-    try {
-      const webRes = await mcpAdapter.callService('command', 'web.agent', {
-        action: 'discover_task_url',
-        domain: baseHost,
-        task,
-      }, { timeoutMs: 12000 }).catch(() => null);
-      const webResult = webRes?.data || webRes;
-      if (webResult?.ok && webResult?.taskUrl) {
-        const candidateHost = (() => {
-          try { return new URL(webResult.taskUrl).hostname.replace(/^www\./, ''); }
-          catch (_) { return ''; }
-        })();
-        if (candidateHost === baseHost || candidateHost.endsWith('.' + baseHost)) {
-          return webResult.taskUrl;
-        }
+      const res = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'browser.agent',
+        args: {
+          action: 'resolve_deep_link',
+          agentId: a.agentId,
+          serviceKey: (a.agentId || '').replace(/\.agent$/, ''),
+          startUrl: a.startUrl,
+          task,
+          sessionId: (a.agentId || '').replace(/\.agent$/, '_agent'),
+        },
+      }, { timeoutMs: 30000 }).catch(() => null);
+      const result = res?.data || res;
+      if (result?.ok && result?.deepLinkUrl) {
+        _deepLinkCache.set(_cacheKey, { url: result.deepLinkUrl, source: result.deepLinkSource || null, ts: Date.now() });
+        return { url: result.deepLinkUrl, source: result.deepLinkSource || null };
       }
     } catch (err) {
       logger.debug(`[Node:PreflightAgents] deep-link resolution failed for ${a.agentId}: ${err.message}`);
@@ -1618,8 +1594,9 @@ module.exports = async function preflightAgents(state) {
   for (const a of agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
     const deepLink = await _resolveDeepLinkForAgent(a, userMessage);
     if (deepLink) {
-      a.deepLinkUrl = deepLink;
-      logger.info(`[Node:PreflightAgents] Deep-link for ${a.agentId}: ${deepLink}`);
+      a.deepLinkUrl = deepLink.url || deepLink;
+      a.deepLinkSource = deepLink.source || null;
+      logger.info(`[Node:PreflightAgents] Deep-link for ${a.agentId}: ${a.deepLinkUrl} (source=${a.deepLinkSource})`);
     }
   }
 

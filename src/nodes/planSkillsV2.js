@@ -1627,16 +1627,16 @@ The user's request does NOT match any installed skill.
     const pfAgents = state?.preflightResult?.agents || [];
     for (const a of pfAgents) {
       if (a?.agentId && a?.deepLinkUrl) {
-        deepLinkMap.set(a.agentId.toLowerCase(), a.deepLinkUrl);
+        deepLinkMap.set(a.agentId.toLowerCase(), { url: a.deepLinkUrl, source: a.deepLinkSource || null });
       }
     }
 
     for (const step of skillPlan) {
       if (step.skill === 'browser.agent' && step.args?.action === 'run' && step.args?.agentId && !step.args.url) {
-        const directUrl = deepLinkMap.get(step.args.agentId.toLowerCase());
-        if (directUrl) {
-          step.args.url = directUrl;
-          logger.info(`[Node:PlanSkillsV2] Injected deep-link URL for ${step.args.agentId}: ${directUrl}`);
+        const dl = deepLinkMap.get(step.args.agentId.toLowerCase());
+        if (dl?.url) {
+          step.args.url = dl.url;
+          logger.info(`[Node:PlanSkillsV2] Injected deep-link URL for ${step.args.agentId}: ${dl.url} (source=${dl.source || 'unknown'})`);
         }
       }
     }

@@ -2271,12 +2271,15 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
         (failedStep.args?.agentId && failedStep.args.agentId.endsWith('.agent'))
       );
       let options = decision.options || [];
-      if (_isBrowserFailure && !options.some(o => /train/i.test(o))) {
-        options = [...options, 'Train me to navigate this path'];
+      if (_isBrowserFailure && !options.some(o => {
+        const txt = typeof o === 'string' ? o : (o?.label || o?.value || '');
+        return /train/i.test(txt) || txt === 'open_agents_training';
+      })) {
+        options = [...options, { label: 'Train me to navigate this path', value: 'open_agents_training' }];
       }
 
       const optionsList = options
-        .map((o, i) => `${i + 1}. ${o}`)
+        .map((o, i) => `${i + 1}. ${typeof o === 'string' ? o : (o?.label || o?.value || String(o))}`)
         .join('\n');
       // Emit immediately so the UI shows the question card in real-time,
       // without waiting for the full graph to exit and main.js finalState handler.
@@ -2299,6 +2302,7 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
           options,
           context: failedStep,
           offerTraining: _isBrowserFailure,
+          trainingHandoff: _isBrowserFailure,
           agentId: failedStep?.args?.agentId,
         },
         commandExecuted: false,

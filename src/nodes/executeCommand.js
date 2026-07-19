@@ -1526,6 +1526,49 @@ module.exports = async function executeCommand(state) {
       sensitive = false,
     } = args;
 
+    // ── trainingHandoff / recipeRequired: surface as question card ──────────
+    // When a browser.agent mutation step is replaced with an ask_user offering
+    // to train a recipe, surface it as a question card with options — NOT as a
+    // credential gather input. trainingHandoff routes to the Agents tab.
+    if (args.recipeRequired || args.trainingHandoff) {
+      const _isHandoff = !!args.trainingHandoff;
+      logger.info(`[Node:ExecuteCommand] ask_user (${_isHandoff ? 'trainingHandoff' : 'recipeRequired'}): "${askQuestion.slice(0, 80)}"`);
+      const askUserStep = {
+        step: skillCursor + 1, skill, args, description,
+        ok: false, askUser: true, error: askQuestion,
+      };
+      const _rawOptions = args.options || [];
+      const _labelOptions = _rawOptions.map(o => (typeof o === 'string' ? o : o?.label || String(o)));
+      if (progressCallback) {
+        progressCallback({
+          type: 'ask_user',
+          question: askQuestion,
+          options: _labelOptions,
+          stepIndex: skillCursor,
+          skill,
+          description: description || skill,
+          source: _isHandoff ? 'training_handoff' : 'recipe_required',
+          agentId: args.agentId || null,
+        });
+      }
+      return {
+        ...state,
+        skillResults: [...skillResults, askUserStep],
+        skillCursor,
+        failedStep: null,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: askQuestion,
+          options: args.options || [],
+          context: `${description || skill} (step ${skillCursor + 1})`,
+          _isAgentAskUser: true,
+          agentId: args.agentId || null,
+          ...(_isHandoff ? { trainingHandoff: true } : { recipeRequired: true }),
+        },
+        commandExecuted: false,
+      };
+    }
+
     logger.info(`[Node:ExecuteCommand] ask_user: "${askQuestion.slice(0, 80)}"`);
 
     const gatherCredentialCallback = state.gatherCredentialCallback || null;
@@ -4805,6 +4848,47 @@ Please try again or search with different terms.`;
       raw.question = raw.question || `${(raw.agentId || skill).replace('.agent', '')} requires sign-in. A browser window has been opened — please sign in there.`;
       raw.options = raw.options || [];
       logger.info(`[Node:ExecuteCommand] normalized loginWallDetected → askUser for ${raw.agentId || skill}`);
+    }
+
+    // ── Training handoff short-circuit ────────────────────────────────────────
+    // When browser.agent returns trainingHandoff: true, surface as an ask_user
+    // with a source that the UI can intercept to open the Agents tab instead of
+    // enqueuing text or injecting trainer.agent.
+    if (raw.agentId && raw.askUser === true && raw.trainingHandoff === true) {
+      logger.info(`[Node:ExecuteCommand] training handoff: "${String(raw.question).slice(0, 80)}"`);
+      const askUserStep = {
+        step: skillCursor + 1, skill, args: resolvedArgs, description,
+        ok: false, askUser: true, error: raw.question,
+      };
+      const _rawOptions = raw.options || [];
+      if (progressCallback) {
+        progressCallback({
+          type: 'ask_user',
+          question: raw.question,
+          options: _rawOptions,
+          stepIndex: skillCursor,
+          skill,
+          description: description || skill,
+          source: 'training_handoff',
+          agentId: raw.agentId || null,
+        });
+      }
+      return {
+        ...state,
+        skillResults: [...skillResults, askUserStep],
+        skillCursor,
+        failedStep: null,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: raw.question,
+          options: _rawOptions,
+          context: `${description || skill} (step ${skillCursor + 1})`,
+          _isAgentAskUser: true,
+          agentId: raw.agentId || null,
+          trainingHandoff: true,
+        },
+        commandExecuted: false,
+      };
     }
 
     // ── Agent ask_user short-circuit ──────────────────────────────────────────
