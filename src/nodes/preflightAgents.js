@@ -281,11 +281,13 @@ module.exports = async function preflightAgents(state) {
   const resolveAgentResult = state.resolveAgentResult || null;
   const selectedAgentIds = new Set();
   const createAgentSpecs = [];
+  const _resolverTypeMap = {}; // agentId (lowercase) → declared type from resolver
   if (resolveAgentResult && Array.isArray(resolveAgentResult.agents)) {
     for (const a of resolveAgentResult.agents) {
       if (!a || !a.agentId) continue;
       const idLower = a.agentId.toLowerCase();
       selectedAgentIds.add(idLower);
+      if (a.type) _resolverTypeMap[idLower] = a.type;
       if (a.create) {
         createAgentSpecs.push(a);
       }
@@ -296,6 +298,7 @@ module.exports = async function preflightAgents(state) {
   // agent selection exists and discovery mode still needs capability checks).
   let _shouldRunCliPreflight = !recoveryContext;
   let _selectedCliAgents = []; // descriptors of selected CLI agents to pass explicitly
+  let _isGenericPreflight = false; // true when running discovery scan without typed CLI agents
   if (!recoveryContext && selectedAgentIds.size > 0) {
     try {
       const agSnapshotRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
@@ -305,21 +308,30 @@ module.exports = async function preflightAgents(state) {
       );
       _shouldRunCliPreflight = _selectedCliAgents.length > 0;
       if (!_shouldRunCliPreflight) {
-        // Check if any selected agent IDs look like CLI agents (end with .agent)
-        // but aren't in the registry yet. Run preflight anyway so the general scan
-        // can detect installed CLIs and add them to agentReadiness.
-        const _unregisteredCliCandidates = [...selectedAgentIds].filter(id => id.endsWith('.agent'));
+        // Check if any selected agent IDs are unregistered AND could be CLI.
+        // Use the resolver's declared type — if the resolver explicitly said
+        // type: 'browser' or type: 'app', do NOT treat it as a CLI candidate.
+        const _unregisteredCliCandidates = [...selectedAgentIds].filter(id => {
+          if (!id.endsWith('.agent')) return false;
+          const declaredType = _resolverTypeMap[id];
+          return !declaredType || declaredType === 'cli';
+        });
         if (_unregisteredCliCandidates.length > 0) {
           _shouldRunCliPreflight = true;
+          _isGenericPreflight = _unregisteredCliCandidates.length > 0 && _selectedCliAgents.length === 0;
           logger.info(`[Node:PreflightAgents] CLI preflight enabled for unregistered agent(s): ${_unregisteredCliCandidates.join(', ')}`);
         } else {
+          _shouldRunCliPreflight = false;
           logger.info('[Node:PreflightAgents] CLI preflight skipped — selected agents are non-CLI');
         }
       }
     } catch (_) {
       // Keep safe default (run) if snapshot is unavailable.
       _shouldRunCliPreflight = true;
+      _isGenericPreflight = true;
     }
+  } else if (!recoveryContext && selectedAgentIds.size === 0) {
+    _isGenericPreflight = true;
   }
 
   // ── Create any agents marked create:true by resolveAgent ───────────────────
@@ -441,10 +453,10 @@ module.exports = async function preflightAgents(state) {
       try {
         _emitProgress({
           type: 'preflight:building_agent',
-          agentType: 'cli',
-          agentId: 'cli.preflight',
-          message: 'Checking CLI tools and authentication...',
-          iconUrl: null, // CLI preflight is generic, no specific icon
+          agentType: _isGenericPreflight ? 'preflight' : 'cli',
+          agentId: _isGenericPreflight ? 'preflight' : 'cli.preflight',
+          message: _isGenericPreflight ? 'Checking tools and authentication...' : 'Checking CLI tools and authentication...',
+          iconUrl: null,
         });
 
         // Helper: enrich missing setupInfo via web.agent discover_setup (fallback only)

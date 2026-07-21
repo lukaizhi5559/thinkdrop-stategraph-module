@@ -759,11 +759,10 @@ class StateGraphBuilder {
           if (typeof state.progressCallback === 'function') {
             try {
               const _pqOpts = state.pendingQuestion.options || [];
-              const _pqLabels = _pqOpts.map(o => (typeof o === 'string' ? o : o?.label || String(o)));
               state.progressCallback({
                 type:    'ask_user',
                 question: state.pendingQuestion.question,
-                options:  _pqLabels,
+                options:  _pqOpts,
                 stepIndex: state.pendingQuestion.stepIndex,
                 agentId: state.pendingQuestion.agentId || null,
                 source:  'single_intent_pause',
@@ -782,11 +781,10 @@ class StateGraphBuilder {
           if (typeof state.progressCallback === 'function') {
             try {
               const _mqOpts = state.pendingQuestion.options || [];
-              const _mqLabels = _mqOpts.map(o => (typeof o === 'string' ? o : o?.label || String(o)));
               state.progressCallback({
                 type:    'ask_user',
                 question: state.pendingQuestion.question,
-                options:  _mqLabels,
+                options:  _mqOpts,
                 stepIndex: state.pendingQuestion.stepIndex,
                 agentId: state.pendingQuestion.agentId || null,
                 source:  'multi_intent_pause',

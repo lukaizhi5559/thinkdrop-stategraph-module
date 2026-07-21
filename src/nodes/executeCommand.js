@@ -1538,12 +1538,11 @@ module.exports = async function executeCommand(state) {
         ok: false, askUser: true, error: askQuestion,
       };
       const _rawOptions = args.options || [];
-      const _labelOptions = _rawOptions.map(o => (typeof o === 'string' ? o : o?.label || String(o)));
       if (progressCallback) {
         progressCallback({
           type: 'ask_user',
           question: askQuestion,
-          options: _labelOptions,
+          options: _rawOptions,
           stepIndex: skillCursor,
           skill,
           description: description || skill,
