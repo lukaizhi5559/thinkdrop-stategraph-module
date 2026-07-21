@@ -341,6 +341,48 @@ describe('server.cjs healthCheck skill list', () => {
   }
 });
 
+describe('ASK_USER run-group resume regressions', () => {
+  const executeSrc = fs.readFileSync(path.join(__dirname, '../src/nodes/executeCommand.js'), 'utf8');
+  const builderSrc = fs.readFileSync(path.join(__dirname, '../src/StateGraphBuilder.js'), 'utf8');
+  const mainSrc = fs.readFileSync(path.join(__dirname, '../../src/main/main.js'), 'utf8');
+  const rendererSrc = fs.readFileSync(path.join(__dirname, '../../src/renderer/components/AutomationProgress.tsx'), 'utf8');
+
+  it('retains the original zero-based run-group index', () => {
+    expect(executeSrc).toContain('idx: r.idx,');
+    expect(executeSrc).toContain('stepIndex: agentQuestion.idx,');
+  });
+
+  it('builds pendingQuestion from flattened CLI step metadata', () => {
+    expect(executeSrc).toContain('skill: agentQuestion.skill,');
+    expect(executeSrc).toContain('originalTask: agentQuestion.args?.task || agentQuestion.args?.goal,');
+  });
+
+  it('preserves the original UI index across repeated questions', () => {
+    expect(executeSrc).toContain('uiStepIndex: state._resumeStepIndex ?? agentQuestion.idx,');
+    expect(mainSrc).toContain('_resumeStepIndex: _uiStepIdx,');
+  });
+
+  it('does not emit the destructive prompt reset for ASK_USER resumes', () => {
+    expect(mainSrc).toContain("if (!_skillPlan && !isAskUserResume) safeSendUnified('unified:set-prompt', prompt);");
+  });
+
+  it('does not default a missing resumed agent skill to browser.agent', () => {
+    const start = mainSrc.indexOf('const _resumeSkill = paused.pendingQuestion?.skill');
+    const snippet = mainSrc.slice(start, start + 500);
+    expect(snippet).toContain('paused.skillResults?.find');
+    if (snippet.includes("|| 'browser.agent'")) throw new Error('ASK_USER resume still defaults to browser.agent');
+  });
+
+  it('forwards the blocked step index from final pause events', () => {
+    expect(builderSrc).toContain('stepIndex: state.pendingQuestion.stepIndex,');
+  });
+
+  it('changes only the blocked renderer step back to running', () => {
+    expect(rendererSrc).toContain("s.status === 'needs_input' && (blockedStepIndex == null || s.index === blockedStepIndex)");
+    expect(rendererSrc).toContain("s.status === 'needs_input' && (typeof data.stepIndex !== 'number' || s.index === data.stepIndex)");
+  });
+});
+
 // ─── Summary ──────────────────────────────────────────────────────────────────
 console.log('\n' + '='.repeat(70));
 console.log('  TEST SUMMARY');

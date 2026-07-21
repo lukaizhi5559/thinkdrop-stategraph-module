@@ -305,7 +305,16 @@ module.exports = async function preflightAgents(state) {
       );
       _shouldRunCliPreflight = _selectedCliAgents.length > 0;
       if (!_shouldRunCliPreflight) {
-        logger.info('[Node:PreflightAgents] CLI preflight skipped — selected agents are non-CLI');
+        // Check if any selected agent IDs look like CLI agents (end with .agent)
+        // but aren't in the registry yet. Run preflight anyway so the general scan
+        // can detect installed CLIs and add them to agentReadiness.
+        const _unregisteredCliCandidates = [...selectedAgentIds].filter(id => id.endsWith('.agent'));
+        if (_unregisteredCliCandidates.length > 0) {
+          _shouldRunCliPreflight = true;
+          logger.info(`[Node:PreflightAgents] CLI preflight enabled for unregistered agent(s): ${_unregisteredCliCandidates.join(', ')}`);
+        } else {
+          logger.info('[Node:PreflightAgents] CLI preflight skipped — selected agents are non-CLI');
+        }
       }
     } catch (_) {
       // Keep safe default (run) if snapshot is unavailable.
@@ -438,10 +447,18 @@ module.exports = async function preflightAgents(state) {
           iconUrl: null, // CLI preflight is generic, no specific icon
         });
 
-        // Helper: enrich missing setupInfo via web.agent discover_setup
-        const _enrichSetupInfo = async (existingSetupInfo, service, cliTool) => {
-          if (existingSetupInfo && existingSetupInfo.installCmd && existingSetupInfo.authCmd && existingSetupInfo.setupUrl) {
-            return existingSetupInfo; // already complete
+        // Helper: enrich missing setupInfo via web.agent discover_setup (fallback only)
+        // --help discovery is already done in cli.agent preflight_check, so web search
+        // is only needed when setupInfo is still incomplete AND the CLI isn't installed.
+        const _enrichSetupInfo = async (existingSetupInfo, service, cliTool, isInstalled) => {
+          // If --help already provided authCmd or initCmd + instructions, that's enough
+          if (existingSetupInfo && (existingSetupInfo.authCmd || existingSetupInfo.initCmd) && existingSetupInfo.instructions) {
+            return existingSetupInfo;
+          }
+          // Only do web search for CLIs that aren't installed (can't run --help)
+          // or when --help didn't yield enough info
+          if (isInstalled && existingSetupInfo && (existingSetupInfo.authCmd || existingSetupInfo.initCmd)) {
+            return existingSetupInfo; // --help gave us the key commands, good enough
           }
           try {
             const dsRes = await mcpAdapter.callService('command', 'command.automate', {
@@ -455,6 +472,28 @@ module.exports = async function preflightAgents(state) {
             }
           } catch (_) {}
           return existingSetupInfo;
+        };
+
+        // Helper: generate specific reason message from authStatus + setupInfo
+        const _buildReason = (service, cli, authStatus, setupInfo) => {
+          const creds = setupInfo?.credentials || [];
+          const cmd = setupInfo?.initCmd || setupInfo?.authCmd;
+          if (authStatus === 'oauth_required' || creds.includes('oauth')) {
+            return `${service} requires OAuth client ID and secret${cmd ? ` — run '${cmd}' to configure` : ''}`;
+          }
+          if (authStatus === 'api_key_required' || creds.includes('api_key')) {
+            return `${service} requires API key${cmd ? ` — run '${cmd}' to configure` : ''}`;
+          }
+          if (authStatus === 'init_required' || setupInfo?.initCmd) {
+            return `${service} needs initialization — run '${setupInfo.initCmd}' to configure`;
+          }
+          if (authStatus === 'not_installed') {
+            return `${service} CLI tool (${cli}) is not installed`;
+          }
+          if (authStatus === 'not_authenticated') {
+            return `${service} CLI tool (${cli}) is installed but not authenticated${cmd ? ` — run '${cmd}'` : ''}`;
+          }
+          return `${service} CLI tool (${cli}) is installed but not authenticated${cmd ? ` — run '${cmd}'` : ''}`;
         };
 
         const pfRes = await mcpAdapter.callService('command', 'command.automate', {
@@ -488,8 +527,9 @@ module.exports = async function preflightAgents(state) {
                 const provider = c.isOAuth ? 'OAuth-based' : c.isApiKey ? 'API key required' : 'unknown';
                 lines.push(`${c.service}: ${provider} — use browser.agent { action: 'build_agent' } then { action: 'run' }`);
                 const _agentId = c.agentId || `${c.service}.agent`;
-                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli);
-                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: false, iconUrl, service: c.service, reason: provider, setupInfo: _enrichedSetupInfo });
+                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli, false);
+                const _reason = _buildReason(c.service, c.cli, c.authStatus, _enrichedSetupInfo);
+                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: false, iconUrl, service: c.service, reason: _reason, setupInfo: _enrichedSetupInfo });
                 // Surface API-key or OAuth requirements to the UI during preflight.
                 if (c.isApiKey || c.isOAuth) {
                   _emitProgress({
@@ -499,7 +539,7 @@ module.exports = async function preflightAgents(state) {
                     authType: 'cli_setup',
                     iconUrl,
                     message: `${c.service} needs configuration`,
-                    reason: `${c.service} requires ${provider.toLowerCase()} configuration`,
+                    reason: _reason,
                     setupInfo: _enrichedSetupInfo,
                   });
                 }
@@ -509,8 +549,9 @@ module.exports = async function preflightAgents(state) {
                 const installCmd = c.installMethod === 'npm' ? `npm install -g ${c.installPkg}` : `brew install ${c.installPkg || c.cli}`;
                 lines.push(`${c.service}: ${c.cli} NOT INSTALLED — install: ${installCmd}`);
                 const _agentId = c.agentId || `${c.service}.agent`;
-                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli);
-                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: false, iconUrl, service: c.service, reason: 'not installed', setupInfo: _enrichedSetupInfo });
+                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli, false);
+                const _reason = _buildReason(c.service, c.cli, 'not_installed', _enrichedSetupInfo);
+                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: false, iconUrl, service: c.service, reason: _reason, setupInfo: _enrichedSetupInfo });
                 // Surface CLI install requirement to the UI during preflight.
                 _emitProgress({
                   type: 'preflight:auth_required',
@@ -519,18 +560,19 @@ module.exports = async function preflightAgents(state) {
                   authType: 'cli_setup',
                   iconUrl,
                   message: `${c.service} needs configuration`,
-                  reason: `${c.service} CLI tool (${c.cli}) is not installed`,
+                  reason: _reason,
                   setupInfo: _enrichedSetupInfo,
                 });
               } else {
-                const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : '');
+                const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : (c.authStatus === 'configured' ? ' — configured' : ''));
                 lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
-                const authed = !!c.authUser || c.authStatus === 'authenticated';
+                const authed = !!c.authUser || c.authStatus === 'authenticated' || c.authStatus === 'configured';
                 const _agentId = c.agentId || `${c.service}.agent`;
-                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli);
+                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli, true);
                 agentReadiness.push({ type: 'cli', agentId: _agentId, ready: true, authed, iconUrl, service: c.service, setupInfo: _enrichedSetupInfo });
 
                 if (!authed) {
+                  const _reason = _buildReason(c.service, c.cli, c.authStatus, _enrichedSetupInfo);
                   // Emit auth required for CLI setup — redirect to Agents tab
                   _emitProgress({
                     type: 'preflight:auth_required',
@@ -538,8 +580,8 @@ module.exports = async function preflightAgents(state) {
                     serviceName: c.service,
                     authType: 'cli_setup',
                     iconUrl,
-                    message: `${c.service} needs authentication`,
-                    reason: `${c.service} CLI tool (${c.cli}) is installed but not authenticated`,
+                    message: `${c.service} agent`,
+                    reason: _reason,
                     setupInfo: _enrichedSetupInfo,
                   });
                 }

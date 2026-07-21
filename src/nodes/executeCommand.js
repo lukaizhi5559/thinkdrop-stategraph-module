@@ -1563,6 +1563,10 @@ module.exports = async function executeCommand(state) {
           context: `${description || skill} (step ${skillCursor + 1})`,
           _isAgentAskUser: true,
           agentId: args.agentId || null,
+          skill: 'browser.agent',
+          stepIndex: skillCursor,
+          uiStepIndex: state._resumeStepIndex ?? skillCursor,
+          originalTask: args.task || args.goal || '',
           ...(_isHandoff ? { trainingHandoff: true } : { recipeRequired: true }),
         },
         commandExecuted: false,
@@ -4354,19 +4358,34 @@ Please try again or search with different terms.`;
 
           // Send immediate progress for failed steps before Promise.allSettled completes
           if (raw?.ok === false && progressCallback) {
-            logger.warn(`[Node:ExecuteCommand] runGroup step ${idx} (${gs.skill}) failed: ${raw?.error || 'unknown error'}`);
-            progressCallback({
-              type: 'step_failed',
-              stepIndex: idx,
-              totalSteps: skillPlan.length,
-              skill: gs.skill,
-              description: gs.description,
-              error: raw?.error || 'Step failed',
-              runGroup: groupId,
-            });
+            const _isAskUser = raw?.askUser === true || raw?.needsLogin === true;
+            if (_isAskUser) {
+              logger.info(`[Node:ExecuteCommand] runGroup step ${idx} (${gs.skill}) requires user input — emitting ask_user`);
+              progressCallback({
+                type: 'ask_user',
+                stepIndex: idx,
+                totalSteps: skillPlan.length,
+                skill: gs.skill,
+                description: gs.description,
+                question: raw?.question || raw?.error || 'Action required',
+                options: raw?.options || [],
+                runGroup: groupId,
+              });
+            } else {
+              logger.warn(`[Node:ExecuteCommand] runGroup step ${idx} (${gs.skill}) failed: ${raw?.error || 'unknown error'}`);
+              progressCallback({
+                type: 'step_failed',
+                stepIndex: idx,
+                totalSteps: skillPlan.length,
+                skill: gs.skill,
+                description: gs.description,
+                error: raw?.error || 'Step failed',
+                runGroup: groupId,
+              });
+            }
           }
           // Send immediate progress for successful steps before Promise.allSettled completes
-          if (raw?.ok !== false && progressCallback) {
+          if (raw?.ok === true && progressCallback) {
             progressCallback({
               type: 'step_done',
               stepIndex: idx,
@@ -4377,7 +4396,22 @@ Please try again or search with different terms.`;
               runGroup: groupId,
             });
           }
-          return { idx, step: gs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, raw };
+          return {
+            idx,
+            step: gs,
+            ok: raw?.ok === true,
+            result: raw?.result ?? raw?.stdout ?? null,
+            stdout: raw?.stdout ?? null,
+            error: raw?.error ?? null,
+            stderr: raw?.stderr ?? null,
+            exitCode: raw?.exitCode ?? null,
+            askUser: raw?.askUser === true,
+            question: raw?.question ?? null,
+            options: raw?.options ?? [],
+            needsCredentials: raw?.needsCredentials === true,
+            needsLogin: raw?.needsLogin === true,
+            raw,
+          };
         } catch (err) {
           // On exception, also retry once if first attempt
           if (!isRetry) {
@@ -4398,34 +4432,52 @@ Please try again or search with different terms.`;
               runGroup: groupId,
             });
           }
-          return { idx, step: gs, ok: false, error: err.message, result: null, stdout: null, raw: null };
+          return {
+            idx,
+            step: gs,
+            ok: false,
+            error: err.message,
+            stderr: err.stack || null,
+            result: null,
+            stdout: null,
+            askUser: false,
+            question: null,
+            options: [],
+            needsCredentials: false,
+            needsLogin: false,
+            raw: null,
+          };
         }
       };
 
       return attemptStep(false); // Start with isRetry=false
     };
 
-    // Execute different agent groups in parallel, but same agent groups sequentially
-    // This prevents Chrome session conflicts while maintaining performance
+    // Execute different agent groups in parallel via Promise.allSettled.
+    // Each agent gets its own lane; steps within the same agent run sequentially
+    // to avoid session conflicts. Browser agents already have isolated profiles
+    // (browser.agent.cjs: profile = `${agentId}_agent`), so concurrent lanes are safe.
+    const lanePromises = [...agentGroups.entries()].map(([agentId, steps]) => (async () => {
+      if (steps.length > 1) {
+        logger.info(`[Node:ExecuteCommand] Executing ${steps.length} steps for agent "${agentId}" sequentially within lane`);
+      }
+      const results = [];
+      for (const step of steps) {
+        results.push(await _dispatchGroupStep(step));
+      }
+      return results;
+    })());
+
+    const settledLanes = await Promise.allSettled(lanePromises);
     const allResults = [];
-    for (const [agentId, steps] of agentGroups) {
-      if (steps.length === 1) {
-        // Single step - execute directly
-        const result = await _dispatchGroupStep(steps[0]);
-        allResults.push({ status: 'fulfilled', value: result });
+    for (const lane of settledLanes) {
+      if (lane.status === 'fulfilled') {
+        lane.value.forEach(v => allResults.push({ status: 'fulfilled', value: v }));
       } else {
-        // Multiple steps with same agentId - execute sequentially
-        logger.info(`[Node:ExecuteCommand] Executing ${steps.length} steps for agent "${agentId}" sequentially to avoid session conflicts`);
-        for (const step of steps) {
-          const result = await _dispatchGroupStep(step);
-          allResults.push({ status: 'fulfilled', value: result });
-        }
+        allResults.push({ status: 'rejected', reason: lane.reason });
       }
     }
-    
-    // For agent groups that can run in parallel (different agentIds), 
-    // we would need more complex logic, but for now all execute sequentially
-    // to guarantee no session conflicts
+
     let settled = allResults;
 
     // ── Parallel login wall detection ─────────────────────────────────────────
@@ -4523,6 +4575,7 @@ Please try again or search with different terms.`;
       const r = outcome.status === 'fulfilled' ? outcome.value : { ...outcome.reason, ok: false };
       const stepEntry = {
         step: r.idx + 1,
+        idx: r.idx,
         skill: r.step?.skill,
         args: r.step?.args || {},
         description: r.step?.description,
@@ -4531,17 +4584,34 @@ Please try again or search with different terms.`;
         result: r.result,
         stdout: r.stdout,
         error: r.error || null,
+        stderr: r.stderr || null,
+        exitCode: r.exitCode ?? null,
+        askUser: r.askUser === true,
+        question: r.question || null,
+        options: r.options || [],
+        needsCredentials: r.needsCredentials === true,
+        needsLogin: r.needsLogin === true,
+        raw: r.raw || null,
         runGroup: groupId,
       };
       groupResults.push(stepEntry);
+      const _isAskUserFinal = r.askUser === true || r.needsLogin === true;
       if (progressCallback) progressCallback({
-        type: r.ok ? 'step_done' : r.skipped ? 'step_skipped' : 'step_failed',
+        type: r.ok ? 'step_done' : r.skipped ? 'step_skipped' : _isAskUserFinal ? 'ask_user' : 'step_failed',
         stepIndex: r.idx, totalSteps: skillPlan.length,
         skill: r.step?.skill, description: r.step?.description,
         stdout: r.stdout, error: r.error, runGroup: groupId,
+        ...(r.askUser ? { question: r.question || r.error, options: r.options || [] } : {}),
       });
       if (_rawProgressCallback && state._skillPlanFile) {
-        _rawProgressCallback({ type: r.ok ? 'plan:step_done' : 'plan:step_done', stepIndex: r.idx, totalSteps: skillPlan.length, skill: r.step?.skill, description: r.step?.description });
+        _rawProgressCallback({
+          type: r.ok ? 'plan:step_done' : r.skipped ? 'plan:step_skipped' : _isAskUserFinal ? 'plan:ask_user' : 'plan:step_failed',
+          stepIndex: r.idx,
+          totalSteps: skillPlan.length,
+          skill: r.step?.skill,
+          description: r.step?.description,
+          error: r.error || null,
+        });
       }
       if (!r.ok && !r.skipped && !r.step?.optional && !firstFailure) firstFailure = stepEntry;
     }
@@ -4586,6 +4656,30 @@ Please try again or search with different terms.`;
           logger.info(`[Node:ExecuteCommand] runGroup web.agent: captured bestUrl=${r.raw.bestUrl}`);
         }
       }
+    }
+
+    const agentQuestion = groupResults.find(r => r.askUser && !r.skipped);
+    if (agentQuestion) {
+      return {
+        ...state,
+        skillResults: newResults,
+        stepContracts: newStepContracts,
+        webAgentBestUrl: newWebAgentBestUrl,
+        skillCursor: nextCursor,
+        commandExecuted: false,
+        failedStep: null,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: agentQuestion.question || agentQuestion.error || `Step "${agentQuestion.skill}" requires your input.`,
+          options: agentQuestion.options || [],
+          agentId: agentQuestion.args?.agentId || null,
+          _isAgentAskUser: true,
+          skill: agentQuestion.skill,
+          stepIndex: agentQuestion.idx,
+          uiStepIndex: state._resumeStepIndex ?? agentQuestion.idx,
+          originalTask: agentQuestion.args?.task || agentQuestion.args?.goal,
+        },
+      };
     }
 
     if (firstFailure && succeededCount === 0) {
@@ -4885,6 +4979,10 @@ Please try again or search with different terms.`;
           context: `${description || skill} (step ${skillCursor + 1})`,
           _isAgentAskUser: true,
           agentId: raw.agentId || null,
+          skill: skill,
+          stepIndex: skillCursor,
+          uiStepIndex: state._resumeStepIndex ?? skillCursor,
+          originalTask: resolvedArgs?.task || resolvedArgs?.goal,
           trainingHandoff: true,
         },
         commandExecuted: false,
@@ -4912,6 +5010,7 @@ Please try again or search with different terms.`;
           skill,
           description: description || skill,
           source: 'agent_ask_user',
+          freeText: raw.freeText === true || (raw.options || []).length === 0,
         });
       }
       return {
@@ -4926,6 +5025,10 @@ Please try again or search with different terms.`;
           context:  `${description || skill} (step ${skillCursor + 1})`,
           _isAgentAskUser: true,
           agentId: raw.agentId || null,
+          skill: skill,
+          stepIndex: skillCursor,
+          uiStepIndex: state._resumeStepIndex ?? skillCursor,
+          originalTask: resolvedArgs?.task || resolvedArgs?.goal,
           needsCredentials: raw.needsCredentials || false,
         },
         commandExecuted: false,

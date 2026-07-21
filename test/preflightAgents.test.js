@@ -460,22 +460,76 @@ async function runTests() {
     if (cliAgentInReadiness.ready) throw new Error('Expected gcalcli.agent to be not ready (not installed)');
   });
 
-  await it('enriches incomplete setupInfo via web.agent discover_setup before emitting auth_required', async () => {
-    const state = makeState({
-      agents: [],
-      userMessage: 'list my calendar events with gcalcli',
-    });
+  await it('enriches incomplete setupInfo via web search when CLI not installed', async () => {
+    const state = makeState({ agents: [], userMessage: 'list my calendar events with gcalcli' });
     let discoverSetupCalled = false;
     state.mcpAdapter.callService = async function(service, action, payload, opts) {
       if (service === 'command' && action === 'agent.list') return { data: [] };
       if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
         return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
-          { service: 'gcalcli', cli: 'gcalcli', installed: false, authStatus: 'unknown', agentId: 'gcalcli.agent', setupInfo: { installCmd: 'pip install gcalcli' } },
+          { service: 'gcalcli', cli: 'gcalcli', installed: false, authStatus: 'not_installed', agentId: 'gcalcli.agent', setupInfo: { installCmd: 'pip install gcalcli' } },
         ] } };
       }
       if (service === 'command' && action === 'command.automate' && payload?.skill === 'web.agent' && payload?.args?.action === 'discover_setup') {
         discoverSetupCalled = true;
-        return { data: { ok: true, setupInfo: { authCmd: 'gcalcli auth', setupUrl: 'https://github.com/insanum/gcalcli#authorization', credentials: ['oauth'] }, sources: [{ url: 'https://github.com/insanum/gcalcli', title: 'gcalcli README' }] } };
+        return { data: { ok: true, setupInfo: { authCmd: 'gcalcli auth', setupUrl: 'https://github.com/insanum/gcalcli', credentials: ['oauth'] } } };
+      }
+      if (service === 'command' && action === 'ping') return { ok: true };
+      if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+      return null;
+    };
+    await preflightAgents(state);
+    if (!discoverSetupCalled) throw new Error('Expected web.agent discover_setup when CLI not installed');
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.serviceName === 'gcalcli');
+    if (authEvents.length === 0) throw new Error('Expected preflight:auth_required event');
+    const si = authEvents[0].setupInfo;
+    if (si.installCmd !== 'pip install gcalcli') throw new Error('Descriptor installCmd should be preserved');
+    if (si.authCmd !== 'gcalcli auth') throw new Error('Discovered authCmd should be filled');
+    if (!si.setupUrl) throw new Error('Discovered setupUrl should be filled');
+  });
+
+  await it('skips web search when --help discovery provided rich setupInfo', async () => {
+    const state = makeState({ agents: [], userMessage: 'list my calendar events with gcalcli' });
+    let discoverSetupCalled = false;
+    state.mcpAdapter.callService = async function(service, action, payload, opts) {
+      if (service === 'command' && action === 'agent.list') return { data: [] };
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+        return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
+          { service: 'gcalcli', cli: 'gcalcli', installed: true, authStatus: 'oauth_required', agentId: 'gcalcli.agent',
+            setupInfo: { initCmd: 'gcalcli init', authCmd: 'gcalcli init', credentials: ['oauth'], instructions: 'Requires OAuth client ID and secret. Run `gcalcli init` to configure.' } },
+        ] } };
+      }
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'web.agent' && payload?.args?.action === 'discover_setup') {
+        discoverSetupCalled = true;
+        return { data: { ok: true, setupInfo: { authCmd: 'should not be used' } } };
+      }
+      if (service === 'command' && action === 'ping') return { ok: true };
+      if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+      return null;
+    };
+    await preflightAgents(state);
+    if (discoverSetupCalled) throw new Error('web.agent discover_setup should NOT be called when --help provided rich setupInfo');
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.serviceName === 'gcalcli');
+    if (authEvents.length === 0) throw new Error('Expected preflight:auth_required event');
+    if (!authEvents[0].reason.includes('OAuth')) throw new Error(`Expected reason to mention OAuth, got '${authEvents[0].reason}'`);
+    if (!authEvents[0].reason.includes('gcalcli init')) throw new Error(`Expected reason to include command, got '${authEvents[0].reason}'`);
+    const si = authEvents[0].setupInfo;
+    if (si.authCmd !== 'gcalcli init') throw new Error('--help authCmd should be preserved, not overwritten by web search');
+  });
+
+  await it('CLI agent with authStatus configured (credential file found) passes preflight', async () => {
+    const cliAgent = { id: 'gcalcli.agent', type: 'cli', service: 'gcalcli', cli_tool: 'gcalcli', capabilities: ['list_events'], status: 'healthy' };
+    const state = makeState({
+      agents: [cliAgent],
+      userMessage: 'list my calendar events',
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'gcalcli.agent', create: false }] };
+    state.mcpAdapter.callService = async function(service, action, payload, opts) {
+      if (service === 'command' && action === 'agent.list') return { data: [cliAgent] };
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+        return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
+          { service: 'gcalcli', cli: 'gcalcli', installed: true, authStatus: 'configured', authed: true, authUser: null, agentId: 'gcalcli.agent', setupInfo: { initCmd: 'gcalcli init', credentials: ['oauth'] } },
+        ] } };
       }
       if (service === 'command' && action === 'ping') return { ok: true };
       if (service === 'user-memory' && action === 'skill.list') return { data: [] };
@@ -484,21 +538,93 @@ async function runTests() {
     state.mcpAdapter.calls = [];
 
     const result = await preflightAgents(state);
-    if (!discoverSetupCalled) throw new Error('Expected web.agent discover_setup to be called for incomplete setupInfo');
+    if (result.planError) throw new Error(`Unexpected planError for configured CLI: ${result.planError}`);
+    if (result.preflightAuthRequired) throw new Error('Expected preflightAuthRequired to be false for configured CLI');
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'gcalcli.agent');
+    if (authEvents.length > 0) throw new Error('Did not expect preflight:auth_required event for configured CLI');
+    const cliAgentResult = (result.preflightResult?.agents || []).find(a => a.agentId === 'gcalcli.agent');
+    if (!cliAgentResult) throw new Error('Expected gcalcli.agent in preflightResult');
+    if (!cliAgentResult.authed) throw new Error('Expected gcalcli.agent authed=true for configured status');
+    if (!cliAgentResult.ready) throw new Error('Expected gcalcli.agent ready=true for configured status');
+  });
 
-    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.serviceName === 'gcalcli');
-    if (authEvents.length === 0) throw new Error('Expected preflight:auth_required event for gcalcli');
-    if (authEvents[0].authType !== 'cli_setup') throw new Error(`Expected authType 'cli_setup', got '${authEvents[0].authType}'`);
-    if (!authEvents[0].reason) throw new Error('Expected reason field in auth_required event');
+  await it('CLI agent with authStatus authenticated via discovered verifyCmd passes preflight', async () => {
+    const cliAgent = { id: 'gcalcli.agent', type: 'cli', service: 'gcalcli', cli_tool: 'gcalcli', capabilities: ['list_events'], status: 'healthy' };
+    const state = makeState({
+      agents: [cliAgent],
+      userMessage: 'list my calendar events',
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'gcalcli.agent', create: false }] };
+    state.mcpAdapter.callService = async function(service, action, payload, opts) {
+      if (service === 'command' && action === 'agent.list') return { data: [cliAgent] };
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+        return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
+          { service: 'gcalcli', cli: 'gcalcli', installed: true, authStatus: 'authenticated', authed: true, authUser: null, agentId: 'gcalcli.agent', setupInfo: { verifyCmd: ['list'], initCmd: 'gcalcli init', credentials: ['oauth'] } },
+        ] } };
+      }
+      if (service === 'command' && action === 'ping') return { ok: true };
+      if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+      return null;
+    };
+    state.mcpAdapter.calls = [];
 
-    const si = authEvents[0].setupInfo;
-    if (!si) throw new Error('Expected setupInfo in auth_required event');
-    // Descriptor value should be preserved
-    if (si.installCmd !== 'pip install gcalcli') throw new Error(`Expected descriptor installCmd 'pip install gcalcli' to be preserved, got '${si.installCmd}'`);
-    // Discovered values should fill missing fields
-    if (si.authCmd !== 'gcalcli auth') throw new Error(`Expected discovered authCmd 'gcalcli auth', got '${si.authCmd}'`);
-    if (!si.setupUrl) throw new Error('Expected discovered setupUrl to be filled');
-    if (!Array.isArray(si.credentials) || si.credentials.length === 0) throw new Error('Expected discovered credentials to be filled');
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError for authenticated CLI: ${result.planError}`);
+    if (result.preflightAuthRequired) throw new Error('Expected preflightAuthRequired to be false for authenticated CLI');
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'gcalcli.agent');
+    if (authEvents.length > 0) throw new Error('Did not expect preflight:auth_required event for authenticated CLI');
+  });
+
+  await it('CLI agent with auth-failure patterns in verifyCmd output emits auth_required', async () => {
+    const cliAgent = { id: 'gcalcli.agent', type: 'cli', service: 'gcalcli', cli_tool: 'gcalcli', capabilities: ['list_events'], status: 'healthy' };
+    const state = makeState({
+      agents: [cliAgent],
+      userMessage: 'list my calendar events',
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'gcalcli.agent', create: false }] };
+    state.mcpAdapter.callService = async function(service, action, payload, opts) {
+      if (service === 'command' && action === 'agent.list') return { data: [cliAgent] };
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+        return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
+          { service: 'gcalcli', cli: 'gcalcli', installed: true, authStatus: 'not_authenticated', authed: false, authUser: null, agentId: 'gcalcli.agent', setupInfo: { verifyCmd: ['list'], initCmd: 'gcalcli init', credentials: ['oauth'] } },
+        ] } };
+      }
+      if (service === 'command' && action === 'ping') return { ok: true };
+      if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+      return null;
+    };
+    state.mcpAdapter.calls = [];
+
+    const result = await preflightAgents(state);
+    if (!result.preflightAuthRequired) throw new Error('Expected preflightAuthRequired to be true for not_authenticated CLI');
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'gcalcli.agent');
+    if (authEvents.length === 0) throw new Error('Expected preflight:auth_required event for not_authenticated CLI');
+  });
+
+  await it('CLI agent with authStatus unknown and no credential files emits auth_required', async () => {
+    const cliAgent = { id: 'unknowntool.agent', type: 'cli', service: 'unknowntool', cli_tool: 'unknowntool', capabilities: ['stuff'], status: 'healthy' };
+    const state = makeState({
+      agents: [cliAgent],
+      userMessage: 'do stuff with unknowntool',
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'unknowntool.agent', create: false }] };
+    state.mcpAdapter.callService = async function(service, action, payload, opts) {
+      if (service === 'command' && action === 'agent.list') return { data: [cliAgent] };
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+        return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
+          { service: 'unknowntool', cli: 'unknowntool', installed: true, authStatus: 'unknown', authed: null, authUser: null, agentId: 'unknowntool.agent', setupInfo: null },
+        ] } };
+      }
+      if (service === 'command' && action === 'ping') return { ok: true };
+      if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+      return null;
+    };
+    state.mcpAdapter.calls = [];
+
+    const result = await preflightAgents(state);
+    if (!result.preflightAuthRequired) throw new Error('Expected preflightAuthRequired for unknown auth status CLI');
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'unknowntool.agent');
+    if (authEvents.length === 0) throw new Error('Expected preflight:auth_required event for unknown auth status CLI');
   });
 
   console.log(`\n${'─'.repeat(72)}`);

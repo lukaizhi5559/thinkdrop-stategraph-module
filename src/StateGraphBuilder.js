@@ -402,6 +402,14 @@ class StateGraphBuilder {
           return 'createSkillFromHistory';
         }
 
+        // ── _skillPlan resume fast-path ──────────────────────────────────────
+        // Plan is pre-built (e.g. ask_user resume) — skip resolveUserContext,
+        // resolveAgent, preflightAgents, gatherPlanContext and go straight to planSkills.
+        if (intentType === 'command_automate' && state._skillPlan && !state.recoveryContext) {
+          logger.debug('[StateGraph:Router] enrichIntent: _skillPlan resume — skipping to planSkills');
+          return 'planSkills';
+        }
+
         // ── planMode step short-circuit ────────────────────────────────────
         // planExecutor already set intent+message for this step — skip
         // resolveUserContext, gatherPlanContext and go straight to planSkills.
@@ -756,6 +764,8 @@ class StateGraphBuilder {
                 type:    'ask_user',
                 question: state.pendingQuestion.question,
                 options:  _pqLabels,
+                stepIndex: state.pendingQuestion.stepIndex,
+                agentId: state.pendingQuestion.agentId || null,
                 source:  'single_intent_pause',
               });
             } catch (_) {}
@@ -777,6 +787,8 @@ class StateGraphBuilder {
                 type:    'ask_user',
                 question: state.pendingQuestion.question,
                 options:  _mqLabels,
+                stepIndex: state.pendingQuestion.stepIndex,
+                agentId: state.pendingQuestion.agentId || null,
                 source:  'multi_intent_pause',
               });
             } catch (_) {}

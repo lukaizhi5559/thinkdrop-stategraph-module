@@ -115,6 +115,23 @@ Example: [{"skill": "web.agent", "args": {"action": "...", "query": "..."}, "run
       SEQUENTIAL_ONLY_SKILLS.has(step.skill) ? { ...step, runGroup: undefined } : step
     );
 
+    // Deterministic merge: if every step is independent (no {{variable}} dependencies)
+    // and none are sequential-only, collapse all parallelizable steps into a single
+    // runGroup. This guarantees that independent multi-agent plans execute concurrently
+    // regardless of how the LLM split runGroups (e.g. g1, g2, g1 → all g1).
+    const hasTemplateDeps = analyzedPlan.some(step => {
+      const stepText = JSON.stringify(step.args || {}) + ' ' + (step.description || '');
+      return /\{\{[^}]+\}\}/.test(stepText);
+    });
+    const hasSequentialOnly = analyzedPlan.some(step => SEQUENTIAL_ONLY_SKILLS.has(step.skill));
+
+    if (!hasTemplateDeps && !hasSequentialOnly && analyzedPlan.length > 1) {
+      analyzedPlan = analyzedPlan.map(step =>
+        SEQUENTIAL_ONLY_SKILLS.has(step.skill) ? step : { ...step, runGroup: 'g1' }
+      );
+      logger.info('[Node:PlanSkillsV2] Deterministic merge: all independent steps collapsed into runGroup g1');
+    }
+
     // Count how many runGroups were added
     const runGroupsAdded = analyzedPlan.filter(s => s.runGroup).length;
     if (runGroupsAdded > 0) {
@@ -675,8 +692,8 @@ async function planSkillsV2(state) {
         : JSON.parse(Buffer.from(state._skillPlan, 'base64').toString('utf8'));
       if (Array.isArray(decoded) && decoded.length > 0) {
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${decoded.length} steps`);
-        if (progressCallback) progressCallback({ type: 'plan_ready', steps: decoded.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
-        return { ...state, skillPlan: decoded, skillCursor: 0, planError: null, recoveryContext: null };
+        if (progressCallback) progressCallback({ type: 'plan_ready', steps: decoded.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
+        return { ...state, skillPlan: decoded, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanIsResume: false };
       }
     } catch (err) {
       logger.warn(`[Node:PlanSkillsV2] _skillPlan fast-path decode failed: ${err.message} — falling through to LLM`);
@@ -728,7 +745,9 @@ async function planSkillsV2(state) {
   }
 
   const _osName  = process.platform === 'darwin' ? 'macOS' : process.platform === 'win32' ? 'Windows' : 'Linux';
-  const _agentIdentity = `AGENT IDENTITY: You are ThinkDrop, a desktop automation agent running on ${_osName} (${os.release()}). You have FULL system access: shell commands, filesystem read/write, app control, and native ${_osName} APIs. You are NOT a web chatbot. Your job is to output a JSON skill plan.`;
+  const _now = new Date();
+  const _currentDate = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-${String(_now.getDate()).padStart(2, '0')}`;
+  const _agentIdentity = `AGENT IDENTITY: You are ThinkDrop, a desktop automation agent running on ${_osName} (${os.release()}). You have FULL system access: shell commands, filesystem read/write, app control, and native ${_osName} APIs. You are NOT a web chatbot. Your job is to output a JSON skill plan.\n\nCURRENT DATE: ${_currentDate} — always use the current year (${_now.getFullYear()}) when generating dates for calendar events, deadlines, or any time-sensitive commands. Never use past years.`;
 
   // ── Creator planning context ──────────────────────────────────────────────
   let creatorContextNote = '';
@@ -1936,6 +1955,43 @@ The user's request does NOT match any installed skill.
           description: `Save script as ${skillName}`,
           args: { name: skillName, code: pythonCode, language: 'python' },
         }];
+      }
+    }
+  }
+
+  // ── Fallback browser cleanup ──────────────────────────────────────────────
+  // Close any Playwright browsers left open by preflight auth probes or deep-link
+  // resolution. The persistent profile retains cookies; only the browser process is killed.
+  if (mcpAdapter) {
+    try {
+      await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'browser.act',
+        args: { action: 'close-all' },
+      }, { timeoutMs: 8000 }).catch(() => {});
+      logger.debug('[Node:PlanSkillsV2] Fallback browser cleanup: close-all sent');
+    } catch (_) {}
+  }
+
+  // ── Date year fixer ────────────────────────────────────────────────────────
+  // Deterministic safety net: replace past years in date-like strings within the plan
+  // with the current year. Catches cases where the LLM generates "2023-07-15" instead of "2026-07-15".
+  {
+    const _currentYear = new Date().getFullYear();
+    const _pastYearRe = new RegExp(`\\b(20[0-9]{2})-(0?[1-9]|1[0-2])-(0?[1-9]|[12][0-9]|3[01])\\b`, 'g');
+    for (const step of skillPlan) {
+      if (!step.args) continue;
+      for (const key of ['task', 'goal', 'cmd', 'command']) {
+        if (typeof step.args[key] === 'string') {
+          step.args[key] = step.args[key].replace(_pastYearRe, (match, year, mo, day) => {
+            const y = parseInt(year, 10);
+            if (y < _currentYear && y >= 2020) {
+              const fixed = `${_currentYear}-${mo.padStart(2, '0')}-${day.padStart(2, '0')}`;
+              logger.info(`[Node:PlanSkillsV2] Date fixer: ${match} → ${fixed} in step.args.${key}`);
+              return fixed;
+            }
+            return match;
+          });
+        }
       }
     }
   }
