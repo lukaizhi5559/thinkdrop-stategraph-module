@@ -533,6 +533,251 @@ async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = n
   return null;
 }
 
+// ── Follow-up plan correction helpers ─────────────────────────────────────────
+
+const DOMAIN_ALIASES = {
+  'x.com': 'twitter',
+  'twitter.com': 'twitter',
+  'twitter': 'twitter',
+  'tweet': 'twitter',
+  'gmail.com': 'email',
+  'gmail': 'email',
+  'outlook': 'email',
+  'mail': 'email',
+  'email': 'email',
+  'github.com': 'github',
+  'github': 'github',
+  'gitlab.com': 'gitlab',
+  'bitbucket.org': 'bitbucket',
+  'facebook.com': 'facebook',
+  'facebook': 'facebook',
+  'instagram.com': 'instagram',
+  'instagram': 'instagram',
+  'linkedin.com': 'linkedin',
+  'linkedin': 'linkedin',
+  'reddit.com': 'reddit',
+  'reddit': 'reddit',
+  'youtube.com': 'youtube',
+  'youtube': 'youtube',
+  'tiktok.com': 'tiktok',
+  'tiktok': 'tiktok',
+  'slack.com': 'slack',
+  'slack': 'slack',
+  'discord.com': 'discord',
+  'discord.gg': 'discord',
+  'discord': 'discord',
+  'telegram': 'telegram',
+  'whatsapp': 'whatsapp',
+  'notion.so': 'notion',
+  'notion': 'notion',
+  'spotify.com': 'spotify',
+  'spotify': 'spotify',
+  'netflix.com': 'netflix',
+  'netflix': 'netflix',
+  'twitch.tv': 'twitch',
+  'twitch': 'twitch',
+  'amazon.com': 'amazon',
+  'amazon': 'amazon',
+  'ebay.com': 'ebay',
+  'ebay': 'ebay',
+  'pinterest.com': 'pinterest',
+  'pinterest': 'pinterest',
+  'yelp.com': 'yelp',
+  'yelp': 'yelp',
+  'tripadvisor.com': 'tripadvisor',
+  'tripadvisor': 'tripadvisor',
+  'imdb.com': 'imdb',
+  'imdb': 'imdb',
+  'chatgpt': 'chatgpt',
+  'gemini': 'gemini',
+  'perplexity': 'perplexity',
+  'claude': 'claude',
+  'grok': 'grok',
+  'deepseek': 'deepseek',
+  'mistral': 'mistral',
+  'copilot': 'copilot',
+  'midjourney': 'midjourney',
+  'suno': 'suno',
+  'biblegateway': 'biblegateway',
+  'wikipedia': 'wikipedia',
+  'duckduckgo': 'duckduckgo',
+  'stackoverflow': 'stackoverflow',
+  'google': 'google',
+  'bing': 'bing',
+  'yahoo': 'yahoo',
+};
+
+const _ACTION_VERBS = [
+  'post', 'send', 'tweet', 'email', 'message', 'share', 'publish',
+  'search', 'find', 'look', 'check', 'browse', 'open', 'navigate',
+  'create', 'write', 'generate', 'make', 'build', 'edit', 'update',
+  'delete', 'remove', 'rename', 'move', 'copy', 'download', 'upload',
+  'schedule', 'remind', 'set', 'get', 'read', 'view', 'watch',
+];
+
+function _extractDomainTokens(text) {
+  if (!text || typeof text !== 'string') return new Set();
+  const lower = text.toLowerCase();
+  const tokens = new Set();
+  for (const [alias, canonical] of Object.entries(DOMAIN_ALIASES)) {
+    if (lower.includes(alias)) tokens.add(canonical);
+  }
+  return tokens;
+}
+
+function _extractActionVerbs(text) {
+  if (!text || typeof text !== 'string') return new Set();
+  const lower = text.toLowerCase();
+  const verbs = new Set();
+  for (const verb of _ACTION_VERBS) {
+    const re = new RegExp(`\\b${verb}\\b`, 'i');
+    if (re.test(lower)) verbs.add(verb);
+  }
+  return verbs;
+}
+
+function domainsMatch(followUpTarget, targetService, previousPlan) {
+  if (!previousPlan) return false;
+
+  const fuText = `${followUpTarget || ''} ${targetService || ''}`;
+  const fuDomains = _extractDomainTokens(fuText);
+
+  const planPrompt = previousPlan.originalPrompt || '';
+  const planStepsText = Array.isArray(previousPlan.skillPlan)
+    ? previousPlan.skillPlan.map(s => `${s.skill || ''} ${JSON.stringify(s.args || {})}`).join(' ')
+    : '';
+  const planText = `${planPrompt} ${planStepsText}`;
+  const planDomains = _extractDomainTokens(planText);
+
+  if (fuDomains.size === 0 || planDomains.size === 0) return false;
+
+  let domainOverlap = false;
+  for (const d of fuDomains) {
+    if (planDomains.has(d)) { domainOverlap = true; break; }
+  }
+  if (!domainOverlap) return false;
+
+  const fuVerbs = _extractActionVerbs(fuText);
+  const planVerbs = _extractActionVerbs(planText);
+
+  if (fuVerbs.size === 0 || planVerbs.size === 0) return true;
+
+  let verbOverlap = false;
+  for (const v of fuVerbs) {
+    if (planVerbs.has(v)) { verbOverlap = true; break; }
+  }
+  return verbOverlap;
+}
+
+const CORRECTION_SIGNALS = [
+  'actually', 'should be', 'change it to', 'no wait', 'update the',
+  'the actual', 'i meant', 'instead of', 'replace', 'use a different',
+  'make it', 'rewrite', 'shorter', 'longer', 'replace the',
+  "don't use", 'try again with', 'wrong', 'fix the', 'not that',
+];
+
+const CHAINED_ACTION_SIGNALS = [
+  'also', 'then', 'after that', 'now also', 'and also', 'plus',
+  'additionally', 'as well',
+];
+
+function isCorrectionSignal(message) {
+  if (!message || typeof message !== 'string') return false;
+  const lower = message.toLowerCase();
+
+  const hasCorrection = CORRECTION_SIGNALS.some(s => lower.includes(s));
+  if (hasCorrection) return true;
+
+  const hasChained = CHAINED_ACTION_SIGNALS.some(s => lower.includes(s));
+  if (hasChained) return false;
+
+  return true;
+}
+
+function findMostRecentPlanInSession(sessionId, logger, maxAgeMinutes = 10) {
+  try {
+    if (!fs.existsSync(PLANS_DIR)) return null;
+    let files = fs.readdirSync(PLANS_DIR)
+      .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
+      .sort().reverse();
+
+    if (sessionId) {
+      const sessionMatches = [];
+      const others = [];
+      for (const file of files) {
+        const planPath = path.join(PLANS_DIR, file);
+        try {
+          const content = fs.readFileSync(planPath, 'utf8');
+          const sidMatch = content.match(/^session_id:\s*(.+)/m);
+          const sid = sidMatch ? sidMatch[1].trim() : '';
+          if (sid === sessionId) {
+            sessionMatches.push({ file, planPath, content });
+          } else {
+            others.push({ file, planPath, content });
+          }
+        } catch (_) { /* skip */ }
+      }
+      const ordered = sessionMatches.length > 0 ? sessionMatches : others.slice(0, 10);
+      return _findPendingPlanFromList(ordered, maxAgeMinutes, logger);
+    }
+
+    const candidates = files.slice(0, 20).map(file => {
+      const planPath = path.join(PLANS_DIR, file);
+      try {
+        const content = fs.readFileSync(planPath, 'utf8');
+        return { file, planPath, content };
+      } catch (_) { return null; }
+    }).filter(Boolean);
+
+    return _findPendingPlanFromList(candidates, maxAgeMinutes, logger);
+  } catch (err) {
+    logger && logger.warn(`[PlanCache] findMostRecentPlanInSession error: ${err.message}`);
+    return null;
+  }
+}
+
+function _findPendingPlanFromList(items, maxAgeMinutes, logger) {
+  const now = Date.now();
+  const maxAgeMs = maxAgeMinutes * 60 * 1000;
+
+  for (const item of items) {
+    try {
+      const { content, planPath, file } = item;
+      const statusMatch = content.match(/^status:\s*(.+)/m);
+      if (!statusMatch) continue;
+      const status = statusMatch[1].trim();
+      if (status !== 'pending') continue;
+
+      const createdMatch = content.match(/^created:\s*(.+)/m);
+      if (createdMatch) {
+        const created = new Date(createdMatch[1].trim()).getTime();
+        if (isNaN(created) || (now - created) > maxAgeMs) continue;
+      }
+
+      const jsonMatch = content.match(/^skill_plan_json:\s*'([^']+)'/m);
+      if (!jsonMatch) continue;
+      const decoded = Buffer.from(jsonMatch[1], 'base64').toString('utf8');
+      const skillPlan = JSON.parse(decoded);
+
+      const titleMatch = content.match(/^# Plan:\s*(.+)/m);
+      const promptMatch = content.match(/^original_prompt:\s*"([^"]+)"/m);
+      const sidMatch = content.match(/^session_id:\s*(.+)/m);
+
+      logger && logger.info(`[PlanCache] findMostRecentPlanInSession: found pending plan ${file}`);
+      return {
+        planFile: planPath,
+        title: titleMatch ? titleMatch[1].trim() : file,
+        skillPlan,
+        originalPrompt: promptMatch ? promptMatch[1] : '',
+        sessionId: sidMatch ? sidMatch[1].trim() : 'unknown',
+        status,
+        createdAt: createdMatch ? createdMatch[1].trim() : null,
+      };
+    } catch (_) { continue; }
+  }
+  return null;
+}
+
 module.exports = {
   SEMANTIC_SUGGEST_THRESHOLD,
   normalizePrompt,
@@ -554,4 +799,8 @@ module.exports = {
   contextMismatch,
   findHardcodedDesktopFilename,
   suggestFilenameFromTitle,
+  findMostRecentPlanInSession,
+  domainsMatch,
+  isCorrectionSignal,
+  DOMAIN_ALIASES,
 };

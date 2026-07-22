@@ -230,7 +230,9 @@ Rules:
 - If the task is ambiguous and the service/domain cannot be inferred (e.g., "send an email" without naming a provider), return a concise question like "Which email service should I use?" and leave "agents" empty.
 - Only ask the user for clarification when the service is genuinely unknown or ambiguous. Never ask for permission to create an agent.
 - The question must be 15 words or fewer.
-- Do not include agents that are not needed for the task.`;
+- Do not include agents that are not needed for the task.
+- FOLLOW-UP CONTEXT: When a FOLLOW-UP CONTEXT block is provided, the user is revising or continuing a prior task. Reuse the same service/agent from the prior turn — do NOT ask for clarification on already-established context (e.g., do not ask "Which platform?" if the prior turn already established the platform).
+- CONVERSATION HISTORY: When a RECENT CONVERSATION block is provided, use it to resolve ambiguous references in the current message (e.g., "the message" → the content from the prior turn).`
 
 // Extract the outermost balanced JSON object from a string, ignoring surrounding text.
 function _extractBalancedJson(text) {
@@ -295,7 +297,7 @@ function _parseSelectionJson(text, logger) {
   return null;
 }
 
-async function _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorQA, logger, attempt = 1) {
+async function _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorQA, logger, attempt = 1, taskClassification = null, conversationHistory = null) {
   const agentBlock = registeredAgents.length > 0
     ? `\n\nREGISTERED AGENTS:\n${registeredAgents.map(a => {
       const caps = Array.isArray(a.capabilities) ? a.capabilities.join(', ') : '';
@@ -307,11 +309,32 @@ async function _callSelectionLLM(llmBackend, userMessage, registeredAgents, prio
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
 
+  // ── Build conversation history context block ──────────────────────────────
+  let conversationBlock = '';
+  if (Array.isArray(conversationHistory) && conversationHistory.length > 0) {
+    const recentTurns = conversationHistory.slice(-4)
+      .filter(m => m.content && m.content.trim())
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content).trim().slice(0, 300)}`)
+      .join('\n');
+    if (recentTurns) {
+      conversationBlock = `\n\nRECENT CONVERSATION:\n${recentTurns}`;
+    }
+  }
+
+  // ── Build follow-up context block (only when isFollowUp is true) ───────────
+  let followUpBlock = '';
+  if (taskClassification && taskClassification.isFollowUp) {
+    const target = taskClassification.followUpTarget || taskClassification.targetService || '';
+    if (target) {
+      followUpBlock = `\n\nFOLLOW-UP CONTEXT: The user is following up on a prior turn about: ${target}. Reuse the same service/agent from the prior turn — do NOT ask for clarification on already-established context.`;
+    }
+  }
+
   const strictInstruction = attempt > 1
     ? '\n\nCRITICAL: Return ONLY a JSON object. No markdown fences, no explanation, no bullet points, no text outside the JSON.'
     : '';
 
-  const prompt = `USER TASK: "${userMessage}"${agentBlock}${priorBlock}${strictInstruction}
+  const prompt = `USER TASK: "${userMessage}"${agentBlock}${priorBlock}${conversationBlock}${followUpBlock}${strictInstruction}
 
 Select the right agent(s) for this task, or ask the user if ambiguous.`;
 
@@ -427,7 +450,7 @@ module.exports = async function resolveAgent(state) {
     if (progressCallback) progressCallback({ type: 'thinking', message: 'Selecting the right agent…' });
     logger.info(`[Node:ResolveAgent] Round ${round + 1}/${MAX_ROUNDS} — selecting agents for: "${userMessage.slice(0, 80)}"`);
 
-    const result = await _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorAnswers, logger);
+    const result = await _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorAnswers, logger, 1, state._taskClassification, state.conversationHistory);
     const normalized = await _normalizeAgentResult(result, registeredAgents, userMessage, mcpAdapter, logger);
 
     logger.info(`[Node:ResolveAgent] Selection: ${normalized.agents.length} agent(s), question: ${normalized.question || 'none'}`);

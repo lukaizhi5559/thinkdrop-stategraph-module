@@ -158,7 +158,7 @@ const {
   deriveSkillName,
 } = require('../utils/planSkillsHelpers');
 const { buildBridgeReminderPlan } = require('../utils/buildBridgeReminderPlan');
-const { findSimilarCompletePlan }  = require('../utils/planCacheHelpers');
+const { findSimilarCompletePlan, findMostRecentPlanInSession, domainsMatch, isCorrectionSignal }  = require('../utils/planCacheHelpers');
 const { buildReminderSkill }       = require('../utils/buildReminderSkill');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -868,6 +868,41 @@ async function planSkillsV2(state) {
       const cLines = active.map(c => `- [${c.type || 'rule'}] ${c.description || c.rule || JSON.stringify(c)}`).join('\n');
       SKILL_SYSTEM_PROMPT += `\n\n## ACTIVE CONSTRAINTS (MUST FOLLOW):\n\n${cLines}`;
     }
+  }
+
+  // ── Follow-up plan correction fast-path (3 guards) ────────────────────────
+  // When a follow-up message is detected as a correction to a recent pending plan,
+  // activate _planCorrectionMode so the existing correction logic at line ~779
+  // rewrites the plan in place instead of generating a fresh one.
+  if (!recoveryContext && !state._planCorrectionMode && state._taskClassification?.isFollowUp) {
+    try {
+      const sessionId = state.context?.sessionId || null;
+      const prevPlan = findMostRecentPlanInSession(sessionId, logger);
+      if (prevPlan) {
+        const _followUpTarget = state._taskClassification.followUpTarget || null;
+        const _targetService = state._taskClassification.targetService || null;
+        // Guard 2: domain + action-type match
+        if (domainsMatch(_followUpTarget, _targetService, prevPlan)) {
+          // Guard 3: correction signal vs chained action
+          if (isCorrectionSignal(userMessage)) {
+            logger.info(`[Node:PlanSkillsV2] Follow-up correction detected — activating plan correction mode for: ${prevPlan.planFile}`);
+            const _skillPlanJson = Buffer.from(JSON.stringify(prevPlan.skillPlan)).toString('base64');
+            state = {
+              ...state,
+              _planCorrectionMode: true,
+              _planCorrectionText: userMessage,
+              _planCorrectionSourcePrompt: prevPlan.originalPrompt,
+              _basePlanFile: prevPlan.planFile,
+              _skillPlanJson,
+            };
+          } else {
+            logger.info(`[Node:PlanSkillsV2] Follow-up domain match but chained-action signal — treating as new request`);
+          }
+        } else {
+          logger.info(`[Node:PlanSkillsV2] Follow-up domain mismatch — treating as new request`);
+        }
+      }
+    } catch (_e) { logger.debug(`[Node:PlanSkillsV2] Follow-up correction check error: ${_e.message}`); }
   }
 
   // ── Semantic cache check ──────────────────────────────────────────────────
