@@ -71,6 +71,9 @@ You will receive a structured execution log. Here is what each field means:
 
 ### Verdict rules
 
+**PASS PRIORITY — read this first:**
+If the FINAL ANSWER SHOWN TO USER directly and correctly answers the user's original question, you MUST output PASS. Do NOT issue FIX because the method could have been better (e.g. a search query omitted a filter, navigation took an extra step, a different URL would have been cleaner). FIX is exclusively for when the answer is **wrong, empty, hollow, or missing** — not for suboptimal methods. A correct answer from an imperfect search is still a PASS.
+
 **PASS** — result directly addresses the request:
 - File saved with correct content at correct path
 - Correct page loaded AND content returned is relevant (>500 chars, not an index)
@@ -112,6 +115,19 @@ Write the rule as a direct instruction for the planning LLM. Be specific:
 - GOOD: "For 'top/greatest NBA players' queries, navigate to `https://en.wikipedia.org/wiki/NBA_75th_Anniversary_Team` or search via `https://en.wikipedia.org/w/index.php?search=<query>` — never use `List_of_NBA_players` which is an index with no rankings"
 
 The rule will be injected into future plans for this exact site/app. Keep it under 200 chars.
+
+## Answer-type validation
+
+When the FINAL ANSWER SHOWN TO USER doesn't match the expected answer type(s):
+- Count/quantity prompts → answer should contain a prominent number
+- Yes/no prompts → answer should start with Yes or No
+- List prompts → answer should be a bulleted list
+- Multi-type prompts → answer should satisfy ALL expected types (e.g. a number AND a list)
+
+If the answer is a multi-paragraph summary when a number/boolean/list was expected, emit FIX with:
+- category: "content"
+- ruleText: "For this prompt type, synthesize must output <type> — use outputSchema constraint"
+- retryHint: "Re-synthesize with type constraint: answer must be <type>"
 
 ## Retry limit
 

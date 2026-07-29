@@ -158,6 +158,32 @@ async function _thinPostFailureHandler(state) {
   };
 }
 
+// ── Heartbeat wrapper for long-running MCP calls ───────────────────────────
+// Prevents the UI from showing a frozen "thinking" spinner for tens of seconds
+// by re-emitting a skill:thinking event every intervalMs until the promise settles.
+function runWithHeartbeat(promise, progressCallback, makeEvent, intervalMs = 15000) {
+  if (!progressCallback) return promise;
+  let settled = false;
+  let timer = null;
+  const tick = () => {
+    if (settled) return;
+    try {
+      const evt = makeEvent();
+      if (evt) progressCallback(evt);
+    } catch (_) {}
+    timer = setTimeout(tick, intervalMs);
+  };
+  timer = setTimeout(tick, intervalMs);
+  const clear = () => {
+    settled = true;
+    if (timer) { clearTimeout(timer); timer = null; }
+  };
+  return promise.then(
+    (val) => { clear(); return val; },
+    (err) => { clear(); throw err; }
+  );
+}
+
 // Read sessionLanguage from voice journal (single source of truth).
 // Returns e.g. 'zh', 'es', or 'en'. Never throws.
 function _readSessionLanguage() {
@@ -3049,7 +3075,7 @@ module.exports = async function executeCommand(state) {
       const _synthLangSuffix = (_synthLang && _synthLang !== 'en')
         ? `\n\nIMPORTANT: The user wrote in ${_SYNTH_LANG_NAMES[_synthLang] || _synthLang}. You MUST respond entirely in ${_SYNTH_LANG_NAMES[_synthLang] || _synthLang}.`
         : '';
-      const synthesisInstructions = (isFileEdit
+      let synthesisInstructions = (isFileEdit
         ? `You are a file editing assistant. The user has asked you to modify a file. You have been given the current file content. Your job is to output the COMPLETE updated file content with ONLY the requested changes applied. Output the full file text only — no preamble, no explanation, no markdown code fences, no commentary. Preserve all existing structure, headings, and formatting. Only change what was explicitly requested.`
         : _isJsonShellOutput
         ? `You are a technical analyst. You have been given data returned by a shell command or API call.\n\nThe user asked: "${_userQuestion}"\n\nAnswer their specific question directly and concisely using ONLY the relevant data. Format output in markdown — use bold for names/titles, bullet points for lists, and human-readable dates (e.g. "Monday, Jan 20 at 3:00 PM"). Skip internal IDs, raw URLs, and low-level metadata unless the user explicitly asked for them. Do NOT output raw JSON or JSON field names verbatim.`
@@ -3063,6 +3089,42 @@ module.exports = async function executeCommand(state) {
 1. If the content from a source clearly shows a login page, sign-in form, or authentication wall (e.g. it contains phrases like "Sign in", "Log in", "Create account", "Welcome back" with minimal substantive content), you MUST explicitly state that [service] required login and could not be queried.
 2. If you were asked to find video URLs (e.g., YouTube videos) but the provided content contains NO actual video links (watch?v= URLs), you MUST state that the search failed. Do NOT invent or hallucinate fake URLs like https://www.youtube.com/watch?v=dQw4w9WgXcQ or any other made-up links.
 3. A failed search with honest "no results" is infinitely better than fabricated data with fake URLs.`) + _synthLangSuffix;
+
+      // ── Output schema enforcement ─────────────────────────────────────────────
+      const _outputSchema = args.outputSchema;
+      let _schemaConstraint = '';
+      let _schemaTypes = []; // normalized array of type strings
+      if (_outputSchema?.type) {
+        // Normalize: string → [string], array → array
+        _schemaTypes = Array.isArray(_outputSchema.type) ? _outputSchema.type : [_outputSchema.type];
+
+        const _typeConstraints = {
+          INTEGER: 'Your answer MUST include the integer number in a brief, natural sentence (e.g. "There are 3 unread emails from John"). Keep it under 20 words. Do NOT output just the number alone.',
+          BOOLEAN: 'Your answer MUST start with "Yes" or "No". You may add a brief explanation after, but the first word must be Yes or No.',
+          ARRAY: 'Your answer MUST include a bulleted list. Start each item with "- ". If the list is empty, output "None found".',
+          OBJECT: 'Your answer MUST use "Field: value" format for each requested field. Put each field on its own line.',
+          STRING: 'Your answer should be a clear, concise text response.',
+        };
+
+        // Dynamically build constraint by combining all type rules
+        const _parts = _schemaTypes
+          .map(t => _typeConstraints[t])
+          .filter(Boolean);
+
+        if (_parts.length > 0) {
+          const _multiPrefix = _schemaTypes.length > 1
+            ? `CRITICAL: The user's question has ${_schemaTypes.length} parts. Your answer MUST satisfy ALL of the following requirements:\n`
+            : 'CRITICAL: ';
+          _schemaConstraint = _multiPrefix + _parts.map((p, i) => _schemaTypes.length > 1 ? `${i + 1}. ${p}` : p).join('\n');
+          synthesisInstructions = _schemaConstraint + '\n\n' + synthesisInstructions;
+          logger.info(`[Node:ExecuteCommand] synthesize: outputSchema types=[${_schemaTypes.join(',')}] — constraint injected`);
+        }
+      }
+
+      const _schemaMaxTokens = (_schemaTypes.length === 1 && (_schemaTypes[0] === 'INTEGER' || _schemaTypes[0] === 'BOOLEAN')) ? 200
+        : (_schemaTypes.length > 0 && _schemaTypes.every(t => t === 'INTEGER' || t === 'BOOLEAN')) ? 200
+        : 1500;
+
       const synthPayload = {
         query: synthesisQuery,
         context: {
@@ -3072,7 +3134,7 @@ module.exports = async function executeCommand(state) {
           userId: context?.userId,
           intent: 'command_automate'
         },
-        options: { maxTokens: 1500, temperature: 0.2, fastMode: false }
+        options: { maxTokens: _schemaMaxTokens, temperature: 0.2, fastMode: false }
       };
       // ── Progress indicator timers ────────────────────────────────────────────
       // Long synthesis calls need periodic user feedback so they don't appear hung
@@ -3133,6 +3195,56 @@ Please try again or search with different terms.`;
         _progressTimers.forEach(t => clearTimeout(t));
         logger.error('[Node:ExecuteCommand] synthesize LLM call failed:', err.message);
         synthesisAnswer = `[Synthesis failed: ${err.message}]`;
+      }
+
+      // ── Output schema validation ──────────────────────────────────────────────
+      if (_outputSchema && _schemaConstraint && _schemaTypes.length > 0 && synthesisAnswer && !synthesisAnswer.startsWith('[Synthesis')) {
+        const _validateSingleType = (answer, type) => {
+          const text = (answer || '').trim();
+          switch (type) {
+            case 'INTEGER':
+              if (/^\d+\s*$/.test(text)) return true;
+              if (text.length < 200 && /\b\d+\b/.test(text)) return true;
+              return false;
+            case 'BOOLEAN':
+              return /^(yes|no|true|false)\b/i.test(text);
+            case 'ARRAY':
+              return /^\s*[-•*]\s/m.test(text) || /^\s*\d+\.\s/m.test(text) || /^none found/i.test(text);
+            case 'OBJECT':
+              return /.+:\s*.+/m.test(text);
+            case 'STRING':
+              return true; // STRING always passes — no structural requirement
+            default:
+              return true;
+          }
+        };
+
+        // Validate against ALL expected types — every type must pass
+        const _failedTypes = _schemaTypes.filter(t => !_validateSingleType(synthesisAnswer, t));
+
+        if (_failedTypes.length > 0) {
+          logger.warn(`[Node:ExecuteCommand] synthesize: outputSchema validation FAILED for types [${_failedTypes.join(',')}] — retrying with stricter prompt`);
+          try {
+            const _strictQuery = `${_userQuestion}\n\nIMPORTANT: ${_schemaConstraint}\n\nContent:\n${synthesisContext.slice(0, 8000)}`;
+            const _strictAnswer = await llmBackend.generateAnswer(_strictQuery, {
+              query: _strictQuery,
+              context: { conversationHistory: [], systemInstructions: _schemaConstraint, intent: 'command_automate' },
+              options: { maxTokens: 500, temperature: 0.1, fastMode: true },
+            }, { maxTokens: 500, temperature: 0.1, fastMode: true }, null);
+
+            if (_strictAnswer) {
+              const _retryFailed = _schemaTypes.filter(t => !_validateSingleType(_strictAnswer, t));
+              if (_retryFailed.length === 0) {
+                synthesisAnswer = _strictAnswer;
+                logger.info(`[Node:ExecuteCommand] synthesize: schema retry succeeded — answer now matches all types [${_schemaTypes.join(',')}]`);
+              } else {
+                logger.warn(`[Node:ExecuteCommand] synthesize: schema retry still fails types [${_retryFailed.join(',')}] — keeping original answer`);
+              }
+            }
+          } catch (_schemaRetryErr) {
+            logger.warn(`[Node:ExecuteCommand] synthesize: schema retry error: ${_schemaRetryErr.message}`);
+          }
+        }
       }
 
       // ── Apology / refusal fallback: retry then pretty-print raw JSON ────────
@@ -3451,6 +3563,8 @@ Please try again or search with different terms.`;
       ? [...prevSavedFiles, synthesisFilePath]
       : prevSavedFiles;
 
+    const isSynthesizeLastStep = skillCursor + 1 >= skillPlan.length;
+
     return {
       ...state,
       skillResults: [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: synthesisAnswer, stdout: synthesisAnswer }],
@@ -3460,8 +3574,8 @@ Please try again or search with different terms.`;
       synthesisAnswerFile,      // available as {{synthesisAnswerFile}} — use in shell.run for full bash power
       savedFilePaths: newSavedFiles,  // accumulated explicit saveToFile paths for UI file links
       needsSynthesis: false,
-      commandExecuted: false,
-      answer: undefined
+      commandExecuted: isSynthesizeLastStep,
+      answer: isSynthesizeLastStep ? synthesisAnswer : undefined
     };
   }
 
@@ -4838,10 +4952,22 @@ Please try again or search with different terms.`;
       }
     }
 
-    const result = await mcpAdapter.callService('command', 'command.automate', {
-      skill,
-      args: _callArgs
-    }, { timeoutMs: stepTimeoutMs });
+    const result = await runWithHeartbeat(
+      mcpAdapter.callService('command', 'command.automate', {
+        skill,
+        args: _callArgs
+      }, { timeoutMs: stepTimeoutMs }),
+      progressCallback,
+      () => ({
+        type: 'skill:thinking',
+        stepIndex: skillCursor,
+        totalSteps: skillPlan.length,
+        skill,
+        thinking: `Still working on ${stepStartDescription}…`,
+        phase: 'still_running',
+      }),
+      15000
+    );
 
     const raw = result.data || result;
 
@@ -6258,7 +6384,17 @@ Please try again or search with different terms.`;
         ? (typeof pageTextResult.result === 'string' && pageTextResult.result ? pageTextResult.result : pageTextResult.stdout)
         : null;
 
-      if (imageAnalyzeResult) {
+      // ── Synthesize result — the LLM already produced a final answer for the user.
+      // Prefer this over raw page text when the last step is synthesize.
+      const synthesizeResult = [...updatedResults].reverse().find(r =>
+        r.skill === 'synthesize' && r.ok && (r.stdout || r.result)
+      );
+      const synthesisAnswerFinal = state.synthesisAnswer || (synthesizeResult && (synthesizeResult.stdout || synthesizeResult.result));
+
+      if (synthesisAnswerFinal && typeof synthesisAnswerFinal === 'string' && !synthesisAnswerFinal.startsWith('[Synthesis')) {
+        lastStepAnswer = synthesisAnswerFinal;
+        logger.info(`[Node:ExecuteCommand] isLastStep: using synthesize result as answer (${lastStepAnswer.length} chars)`);
+      } else if (imageAnalyzeResult) {
         lastStepAnswer = imageAnalyzeResult.stdout;
       } else if (lastExternalSkillResult) {
         // Node.js skill returned a string report — stream it directly.

@@ -2,6 +2,7 @@
 
 const http  = require('http');
 const https = require('https');
+const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 
 /**
  * resolveAgent.js — StateGraph node
@@ -312,10 +313,8 @@ async function _callSelectionLLM(llmBackend, userMessage, registeredAgents, prio
   // ── Build conversation history context block ──────────────────────────────
   let conversationBlock = '';
   if (Array.isArray(conversationHistory) && conversationHistory.length > 0) {
-    const recentTurns = conversationHistory.slice(-4)
-      .filter(m => m.content && m.content.trim())
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content).trim().slice(0, 300)}`)
-      .join('\n');
+    const isFollowUp = !!(taskClassification?.isFollowUp);
+    const recentTurns = formatHistoryTurns(conversationHistory, { isFollowUp, maxTurns: 4 });
     if (recentTurns) {
       conversationBlock = `\n\nRECENT CONVERSATION:\n${recentTurns}`;
     }

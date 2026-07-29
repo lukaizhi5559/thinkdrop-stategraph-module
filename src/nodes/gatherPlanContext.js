@@ -27,6 +27,7 @@
 'use strict';
 
 const { markAgentAuthed } = require('./preflightAgents');
+const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 
 const MAX_ROUNDS = 3;
 const MAX_AUTH_ROUNDS = 10; // auth sign-ins don't count against Q&A budget
@@ -57,14 +58,13 @@ Rules:
 - If a required service is NOT listed under UNAUTHENTICATED AGENTS, you MUST return {"complete": true} and proceed — do NOT ask about sign-in, credentials, or authentication.
 - When authAgentId is set, the system will show a dedicated sign-in button — keep the question short (under 12 words).`;
 
-async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger) {
+async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null) {
   const priorBlock = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
 
-  const recentCtx = (conversationHistory || []).slice(-6)
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 300)}`)
-    .join('\n');
+  const isFollowUp = !!(taskClassification?.isFollowUp);
+  const recentCtx = formatHistoryTurns(conversationHistory || [], { isFollowUp, maxTurns: 6 });
   const historyBlock = recentCtx
     ? `\n\nRECENT CONVERSATION (resolve pronouns from this before deciding):\n${recentCtx}`
     : '';
@@ -179,7 +179,7 @@ module.exports = async function gatherPlanContext(state) {
     if (progressCallback) progressCallback({ type: 'thinking', message: 'Checking task details…' });
     logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
 
-    const result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger);
+    const result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null);
 
     // Defensive override: if the LLM returned an auth question for an agent that
     // preflight already marked as authed, treat the task as complete. This prevents

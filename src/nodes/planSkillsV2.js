@@ -19,6 +19,7 @@ const fs   = require('fs');
 const os   = require('os');
 
 const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../utils/planHelpers');
+const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 
 /**
  * Analyzes a skill plan and adds runGroup properties for parallel execution.
@@ -273,6 +274,20 @@ function _preflightImpliesCli(state) {
   const map = state?.preflightResult?.preflightCliMap;
   if (!map || typeof map !== 'object') return false;
   return Object.values(map).some(entry => entry?.hasCli);
+}
+
+function _inferOutputSchemaFallback(userMessage) {
+  const msg = userMessage || '';
+  // Only infer for very obvious single-type patterns.
+  // Multi-type detection is left to the LLM — the regex is intentionally conservative
+  // to avoid false positives that would enforce the wrong type.
+  if (/\b(how many|count the|number of|how much|how long)\b/i.test(msg))
+    return { type: 'INTEGER' };
+  if (/\b(is there|are there|check if|can i|do i have)\b/i.test(msg))
+    return { type: 'BOOLEAN' };
+  if (/\b(list all|list every|show all|show me all|enumerate|find all|name all)\b/i.test(msg))
+    return { type: 'ARRAY' };
+  return null;
 }
 
 function _buildSystemPrompt(userMessage, state) {
@@ -831,19 +846,19 @@ async function planSkillsV2(state) {
       ? recentTurns.filter(m => m.role === 'user' || m.role === 'system' || m.sender === 'system')
       : recentTurns;
 
-    const turnLines = historyTurnsForPlanning
+    // Apply node-specific filters (poison/recovery) before formatting with timestamps
+    const filteredTurns = historyTurnsForPlanning
       .filter(m => (m.role !== 'system' && m.sender !== 'system') && m.content?.trim())
       .filter(m => {
         if (m.role !== 'assistant') return true;
         const c = (m.content || '').trim();
         if (c.includes('Step outputs:')) return true;
         return !_POISON.test(c) && !_RECOVERY_CONTENT.test(c);
-      })
-      .map(m => {
-        const role = m.role === 'user' ? 'User' : 'Assistant';
-        const limit = m.role === 'assistant' && m.content?.includes('Step outputs:') ? 2000 : 300;
-        return `${role}: ${(m.content || '').trim().substring(0, limit)}`;
       });
+
+    const _isFollowUp = !!(state._taskClassification?.isFollowUp);
+    const turnLinesStr = formatHistoryTurns(filteredTurns, { isFollowUp: _isFollowUp, maxTurns: 5 });
+    const turnLines = turnLinesStr ? turnLinesStr.split('\n').filter(Boolean) : [];
     if (turnLines.length > 0 || systemNote) {
       conversationNote = `${systemNote}\n\nRECENT CONVERSATION:\n${turnLines.join('\n')}`;
     }
@@ -2031,6 +2046,29 @@ The user's request does NOT match any installed skill.
     }
   }
 
+  // ── Output schema fallback ────────────────────────────────────────────────
+  // If the LLM didn't set outputSchema on the synthesize step, try to infer it
+  // from the user's prompt as a conservative safety net.
+  // The regex is intentionally limited to obvious patterns — if neither the LLM
+  // nor the regex sets outputSchema, no enforcement happens (backward compatible).
+  if (Array.isArray(skillPlan)) {
+    for (let i = skillPlan.length - 1; i >= 0; i--) {
+      if (skillPlan[i].skill === 'synthesize') {
+        if (!skillPlan[i].args?.outputSchema) {
+          const _fallback = _inferOutputSchemaFallback(userMessage);
+          if (_fallback) {
+            skillPlan[i].args = skillPlan[i].args || {};
+            skillPlan[i].args.outputSchema = _fallback;
+            logger.info(`[Node:PlanSkillsV2] Output schema fallback: ${_fallback.type} → synthesize step ${i + 1}`);
+          }
+        } else {
+          logger.info(`[Node:PlanSkillsV2] Output schema already set by LLM: ${JSON.stringify(skillPlan[i].args.outputSchema.type)} → synthesize step ${i + 1}`);
+        }
+        break;
+      }
+    }
+  }
+
   // ── Save plan to disk ─────────────────────────────────────────────────────
   let _skillPlanFile = state._skillPlanFile || null;
   let _planId = null;
@@ -2107,3 +2145,4 @@ The user's request does NOT match any installed skill.
 }
 
 module.exports = planSkillsV2;
+module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;

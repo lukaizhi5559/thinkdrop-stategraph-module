@@ -26,6 +26,55 @@ Your job: analyze WHY it failed and derive a permanent FIX rule to save so this 
 Always output FIX (save a rule) or ASK_USER (if human input is truly needed). Never output PASS for a failure.
 Output ONLY valid JSON: { "verdict": "FIX"|"ASK_USER", "reason": "...", "contextKey": "hostname", "contextType": "site"|"app", "category": "interaction|auth|navigation|timing|content|general", "ruleText": "permanent rule <200 chars", "retryHint": "what to do differently next time" }`;
 
+// ── Answer-type validation ─────────────────────────────────────────────────
+// Reads outputSchema from the synthesize step in the plan (set by LLM during
+// planning). Falls back to conservative regex inference only if the plan
+// didn't set it. Returns an array of type strings (normalized).
+function _getExpectedAnswerTypes(skillPlan, userMessage) {
+  // Primary: read from plan's synthesize step args
+  if (Array.isArray(skillPlan)) {
+    for (let i = skillPlan.length - 1; i >= 0; i--) {
+      if (skillPlan[i].skill === 'synthesize' && skillPlan[i].args?.outputSchema?.type) {
+        const t = skillPlan[i].args.outputSchema.type;
+        return Array.isArray(t) ? t : [t];
+      }
+    }
+  }
+  // Fallback: conservative regex inference (only obvious single-type patterns)
+  const msg = userMessage || '';
+  if (/\b(how many|count the|number of|how much|how long)\b/i.test(msg)) return ['INTEGER'];
+  if (/\b(is there|are there|check if|can i|do i have)\b/i.test(msg)) return ['BOOLEAN'];
+  if (/\b(list all|list every|show all|show me all|enumerate|find all|name all)\b/i.test(msg)) return ['ARRAY'];
+  return null;
+}
+
+function _validateSingleType(answer, type) {
+  const text = String(answer || '').trim();
+  if (!text) return false;
+  switch (type) {
+    case 'INTEGER':
+      if (/^\d+\s*$/.test(text)) return true;
+      if (text.length < 200 && /\b\d+\b/.test(text)) return true;
+      return false;
+    case 'BOOLEAN':
+      return /^(yes|no|true|false)\b/i.test(text);
+    case 'ARRAY':
+      return /^\s*[-•*]\s/m.test(text) || /^\s*\d+\.\s/m.test(text) || /^none found/i.test(text);
+    case 'OBJECT':
+      return /.+:\s*.+/m.test(text);
+    case 'STRING':
+      return true;
+    default:
+      return true;
+  }
+}
+
+function validateAnswerTypes(answer, expectedTypes) {
+  if (!expectedTypes || expectedTypes.length === 0) return true;
+  // ALL types must pass — answer must satisfy every expected type
+  return expectedTypes.every(type => _validateSingleType(answer, type));
+}
+
 module.exports = async function evaluateSkills(state) {
   const {
     mcpAdapter, llmBackend, useOnlineMode = false,
@@ -44,8 +93,23 @@ module.exports = async function evaluateSkills(state) {
     return { ...state, evaluationVerdict: 'ASK_USER' };
   }
 
+  // ── Answer-type validation bypass ──────────────────────────────────────────
+  // Read expected types from the plan's outputSchema (set by LLM during planning).
+  // If the answer doesn't match ANY expected type, force LLM evaluation.
+  const _expectedAnswerTypes = _getExpectedAnswerTypes(skillPlan, userMessage);
+  let _answerTypeValid = true; // default: no type check = allow skips
+  if (_expectedAnswerTypes && _expectedAnswerTypes.length > 0 && !evaluationFromFailure) {
+    _answerTypeValid = validateAnswerTypes(answer, _expectedAnswerTypes);
+    if (!_answerTypeValid) {
+      logger.info(`[Node:EvaluateSkills] Answer-type mismatch: expected [${_expectedAnswerTypes.join(',')}], answer doesn't match — forcing evaluation (bypassing skip conditions)`);
+    } else {
+      logger.info(`[Node:EvaluateSkills] Answer-type validation passed: expected [${_expectedAnswerTypes.join(',')}]`);
+    }
+  }
+  const _bypassSkips = _expectedAnswerTypes && _expectedAnswerTypes.length > 0 && !_answerTypeValid;
+
   // Failure path: called from recoverSkill REPLAN — skip PASS shortcut, always judge the failure
-  if (!evaluationFromFailure) {
+  if (!_bypassSkips && !evaluationFromFailure) {
     if (!skillPlan || skillPlan.length === 0) return state;
     if (evaluationRetryCount >= MAX_EVAL_RETRIES) {
       logger.info(`[Node:EvaluateSkills] Retry cap reached — passing through`);
@@ -435,3 +499,8 @@ Output ONLY valid JSON.`;
   // Fallback
   return { ...state, evaluationVerdict: 'PASS' };
 };
+
+// Export helper functions for testing
+module.exports._getExpectedAnswerTypes = _getExpectedAnswerTypes;
+module.exports._validateSingleType = _validateSingleType;
+module.exports.validateAnswerTypes = validateAnswerTypes;

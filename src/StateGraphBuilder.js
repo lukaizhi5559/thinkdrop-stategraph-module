@@ -616,7 +616,7 @@ class StateGraphBuilder {
         return 'reviewExecution';
       },
 
-      // reviewExecution: FAILED → evaluateSkills (hollow result replan), ASK_USER → surface to user, else → evaluateSkills
+      // reviewExecution: FAILED → evaluateSkills (hollow result replan), ASK_USER → surface to user, CORRECTED → done with corrected answer, else → evaluateSkills
       reviewExecution: (state) => {
         const verdict = state.reviewVerdict;
         if (verdict === 'FAILED') {
@@ -627,6 +627,10 @@ class StateGraphBuilder {
         }
         if (verdict === 'ASK_USER') {
           logger.info('[StateGraph:Router] reviewExecution ASK_USER → logConversation');
+          return 'logConversation';
+        }
+        if (verdict === 'CORRECTED') {
+          logger.info('[StateGraph:Router] reviewExecution CORRECTED → logConversation (answer corrected from page text, no replan)');
           return 'logConversation';
         }
         // UNVERIFIABLE or VERIFIED — proceed to content quality evaluation

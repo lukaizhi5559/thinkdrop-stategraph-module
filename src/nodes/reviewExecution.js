@@ -12,6 +12,7 @@
  *      to confirm or disprove the stated outcome in actual system state
  *   3. Route:
  *      UNVERIFIABLE / VERIFIED  → evaluateSkills (normal path)
+ *      CORRECTED                → logConversation (answer corrected from page text, no replan)
  *      FAILED (first pass)      → patch args, reset cursor, back to executeCommand
  *      FAILED (second pass)     → buildPartialSummary → logConversation (ASK_USER)
  *      TOO_MANY_SUSPICIOUS      → buildPartialSummary → logConversation (ASK_USER)
@@ -23,7 +24,10 @@
  *   state.reviewRetryCount — how many times this node has patched already (default 0)
  *
  * State outputs:
- *   state.reviewVerdict    — 'UNVERIFIABLE' | 'VERIFIED' | 'FAILED' | 'ASK_USER'
+ *   state.reviewVerdict    — 'UNVERIFIABLE' | 'VERIFIED' | 'FAILED' | 'ASK_USER' | 'CORRECTED'
+ *   On CORRECTED:
+ *     state.answer         — corrected answer generated from fresh page text
+ *     state.skillResults   — synthesize result replaced with corrected answer
  *   On FAILED:
  *     state.skillPlan      — patched with corrected command at stepIndex
  *     state.skillCursor    — reset to patched step index
@@ -94,6 +98,60 @@ function buildPartialSummary(userMessage, skillResults, suspiciousDetails) {
 
   lines.push(`Please check the current state and let me know how you'd like to proceed.`);
   return lines.join('\n');
+}
+
+/**
+ * Detect answer-only contradictions: the page text contains the real answer
+ * but the synthesize output disagrees. If detected, generate a corrected
+ * synthesis directly from the page text — no replan needed.
+ * Returns { corrected: boolean, answer: string, reason: string } or null.
+ */
+async function assessAnswerContradiction(userMessage, synthesizeOutput, pageText, llmBackend, context, logger) {
+  if (!pageText || pageText.length < 50) return null;
+  if (!synthesizeOutput || synthesizeOutput.length < 5) return null;
+
+  const query = `USER GOAL: "${userMessage}"
+
+CURRENT PAGE TEXT (freshly captured from browser):
+${pageText.slice(0, 4000)}
+
+SYNTHESIZE OUTPUT (what the system reported to the user):
+${synthesizeOutput.slice(0, 2000)}
+
+Does the synthesize output CONTRADICT the page text? Specifically:
+- If the user asked "how many" and the page shows a different count than synthesized → CONTRADICTION
+- If the user asked for specific data and the page has it but synthesis reported wrong data → CONTRADICTION
+- If the synthesize output is vague/hollow but the page text contains the actual answer → CONTRADICTION
+- If both agree → NO CONTRADICTION
+
+If there IS a contradiction, write the CORRECT answer based ONLY on the page text.
+
+Output ONLY valid JSON:
+{ "contradiction": true, "correctedAnswer": "<the correct answer based on page text>", "reason": "<one sentence>" }
+or:
+{ "contradiction": false, "reason": "<one sentence>" }`;
+
+  try {
+    const raw = await llmBackend.generateAnswer(query, {
+      query,
+      context: {
+        systemInstructions: 'You are a fact-checking judge. Compare the synthesized answer against fresh page text. If they disagree, produce the correct answer from the page text only. Output ONLY valid JSON.',
+        sessionId: context?.sessionId,
+        userId: context?.userId || 'default_user',
+      },
+    }, { maxTokens: 300, temperature: 0.1, fastMode: true });
+
+    const match = raw.match(/\{[\s\S]*?\}/);
+    if (!match) throw new Error('no JSON in response');
+    const parsed = JSON.parse(match[0]);
+    if (parsed.contradiction === true && parsed.correctedAnswer) {
+      return { corrected: true, answer: String(parsed.correctedAnswer), reason: String(parsed.reason || '') };
+    }
+    return { corrected: false, reason: String(parsed.reason || '') };
+  } catch (err) {
+    logger.warn(`[Node:ReviewExecution] assessAnswerContradiction failed: ${err.message}`);
+    return null;
+  }
 }
 
 /**
@@ -360,6 +418,35 @@ module.exports = async function reviewExecution(state) {
     }
 
     if (isHollow) {
+      // ── Answer-only contradiction check ──────────────────────────────────────
+      // Before triggering a replan, check if the page text actually contains the
+      // answer the user asked for but the synthesis got it wrong. If so, correct
+      // the answer directly from page text — no replan needed.
+      if (snapshot && llmBackend && synthesizeOutput) {
+        const contradiction = await assessAnswerContradiction(
+          userMessage, synthesizeOutput, snapshot, llmBackend, context, logger
+        );
+        if (contradiction?.corrected) {
+          logger.info(`[Node:ReviewExecution] Answer-only contradiction detected — correcting synthesis from page text: ${contradiction.reason}`);
+          // Replace the stale synthesize result with the corrected answer
+          const _synthIdx = skillResults.findIndex(r => r.skill === 'synthesize');
+          if (_synthIdx >= 0) {
+            skillResults[_synthIdx] = {
+              ...skillResults[_synthIdx],
+              stdout: contradiction.answer,
+              result: contradiction.answer,
+              _correctedByReview: true,
+            };
+          }
+          return {
+            ...state,
+            reviewVerdict: 'CORRECTED',
+            answer: contradiction.answer,
+            skillResults,
+          };
+        }
+      }
+
       if (reviewRetryCount === 0) {
         // First pass: give recoverSkill a chance to REPLAN with a better strategy.
         // Build a synthetic failedStep from the last browser/agent step so recoverSkill

@@ -137,6 +137,29 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 **NEVER** use placeholder text like `[ChatGPT response]` in step args. Use `{{synthesisAnswer}}` as the sole body content token.
 **NEVER** use `saveToFile` in synthesize and reference that path in a browser.agent task — browser agent cannot read filesystem files.
 
+## Output Schema for synthesize steps
+
+When the user's request expects a specific answer type, include `outputSchema` in the FINAL synthesize step's `args`. The `type` field can be a single type string or an array of types for multi-part questions.
+
+**Available types:**
+- `INTEGER` — a count, number, or quantity ("how many", "count", "number of", "total", "how much", "how long")
+- `BOOLEAN` — a yes/no answer ("is there", "does it", "check if", "can I", "will it", "is X enabled/disabled")
+- `ARRAY` — a list of items ("list all", "show all", "enumerate", "find all", "name all", "what are the")
+- `OBJECT` — structured data with named fields ("get the X and Y of Z", "what is the X and Y")
+- `STRING` — free-form text (summaries, explanations, comparisons) — omit outputSchema for this
+
+**Multi-type prompts:** If the user asks for multiple types of output, set `type` to an array:
+- "How many X and list their Y" → `{ "outputSchema": { "type": ["INTEGER", "ARRAY"] } }`
+- "Is X available and how many Y" → `{ "outputSchema": { "type": ["BOOLEAN", "INTEGER"] } }`
+- "Count the X, check if Y exists, and list all Z" → `{ "outputSchema": { "type": ["INTEGER", "BOOLEAN", "ARRAY"] } }`
+
+**Guidelines:**
+- Classify based on the user's INTENT, not exact wording — "give me the total" means INTEGER, "tell me if" means BOOLEAN
+- Only set outputSchema when the expected answer type is clear from the prompt
+- If the prompt is ambiguous or expects a free-form summary/explanation/comparison, omit outputSchema entirely
+- outputSchema only applies to the FINAL synthesize step (the one that produces the user-facing answer)
+- The system has a conservative regex fallback for obvious cases, but you should set outputSchema yourself when the type is clear
+
 ## Skill Creation Pattern
 
 When user wants to "create a skill": `synthesize(saveToFile: '~/.thinkdrop/skills/[name]/skill.md')` → `skill.install`. Skill name must match `/^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/`.

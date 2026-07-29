@@ -237,7 +237,16 @@ module.exports = async function preflightAgents(state) {
   const logger = state.logger || console;
   const mcpAdapter = state.mcpAdapter;
   const progressCallback = state.progressCallback || null;
-  const userMessage = state.resolvedMessage || state.message || '';
+  let userMessage = state.resolvedMessage || state.message || '';
+  // Inject follow-up target context so preflight consumers (deep-link resolution,
+  // cli preflight_check, tool.discover, agent-relevance filter) see the full task
+  // context, not just a vague follow-up like "I need you to check again".
+  // gatherPlanContext does the same injection later, but preflight runs BEFORE it.
+  const _tc = state._taskClassification || {};
+  if (_tc.isFollowUp && _tc.followUpTarget && !_tc.isScreenFollowUp) {
+    userMessage = `${userMessage}\n\n(Context from prior turn: ${_tc.followUpTarget})`;
+    logger.info(`[Node:PreflightAgents] Follow-up target injected: "${_tc.followUpTarget}"`);
+  }
   const recoveryContext = state.recoveryContext || null;
   const confirmInstallCallback = state.confirmInstallCallback || null;
   const gatherAnswerCallback = state.gatherAnswerCallback || null;
