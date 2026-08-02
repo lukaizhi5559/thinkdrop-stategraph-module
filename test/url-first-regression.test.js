@@ -1255,7 +1255,7 @@ describe('trainingHandoff payload', () => {
       trainingHandoff: true,
       question: "I couldn't find a direct route for this task in notion. Would you like to train a recipe?",
       options: [
-        { label: 'Open notion agent training', value: 'open_agents_training' },
+        { label: 'Record notion recipe from beginning', value: 'record_recipe' },
         { label: 'Cancel', value: 'cancel' },
       ],
     };
@@ -1271,21 +1271,21 @@ describe('trainingHandoff payload', () => {
     }
   });
 
-  it('open_agents_training option value is interceptable by UI', () => {
+  it('record_recipe option value is interceptable by UI', () => {
     const options = [
-      { label: 'Open notion agent training', value: 'open_agents_training' },
+      { label: 'Record notion recipe from beginning', value: 'record_recipe' },
       { label: 'Cancel', value: 'cancel' },
     ];
 
-    const trainOption = options.find(o => o.value === 'open_agents_training');
+    const trainOption = options.find(o => o.value === 'record_recipe');
     if (!trainOption) {
-      throw new Error('Should find open_agents_training option');
+      throw new Error('Should find record_recipe option');
     }
 
-    // UI intercepts this value to emit preflight:open-agents-tab IPC
+    // UI intercepts this value to emit agents:open-training IPC
     const _value = trainOption.value;
-    if (_value !== 'open_agents_training') {
-      throw new Error(`Expected "open_agents_training", got "${_value}"`);
+    if (_value !== 'record_recipe') {
+      throw new Error(`Expected "record_recipe", got "${_value}"`);
     }
   });
 
@@ -1293,7 +1293,7 @@ describe('trainingHandoff payload', () => {
     const pendingQuestion = {
       question: 'Train a recipe?',
       options: [
-        { label: 'Open notion agent training', value: 'open_agents_training' },
+        { label: 'Record notion recipe from beginning', value: 'record_recipe' },
         { label: 'Cancel', value: 'cancel' },
       ],
       _isAgentAskUser: true,
@@ -1435,11 +1435,19 @@ describe('planSkillsV2 recipeRequired invariant removed', () => {
 // 17. Training handoff resume routing (main.js)
 // ════════════════════════════════════════════════════════════════════════════
 describe('training handoff resume routing', () => {
-  it('detects open_agents_training choice correctly', () => {
-    const chosenOption = 'open_agents_training';
-    const _wantsTrain = /open|train/i.test(chosenOption) || chosenOption === 'open_agents_training' || chosenOption === 'train_recipe';
+  it('detects record_recipe choice correctly', () => {
+    const chosenOption = 'record_recipe';
+    const _wantsTrain = chosenOption === 'open_agents_training' || chosenOption === 'open_agents_training_here' || chosenOption === 'train_recipe' || chosenOption === 'record_recipe' || (/open|train/i.test(chosenOption) && chosenOption !== 'correct_and_retry');
     if (!_wantsTrain) {
-      throw new Error('Should detect open_agents_training as wantsTrain');
+      throw new Error('Should detect record_recipe as wantsTrain');
+    }
+  });
+
+  it('correct_and_retry does NOT trigger wantsTrain', () => {
+    const chosenOption = 'correct_and_retry';
+    const _wantsTrain = chosenOption === 'open_agents_training' || chosenOption === 'open_agents_training_here' || chosenOption === 'train_recipe' || chosenOption === 'record_recipe' || (/open|train/i.test(chosenOption) && chosenOption !== 'correct_and_retry');
+    if (_wantsTrain) {
+      throw new Error('correct_and_retry should NOT match wantsTrain');
     }
   });
 
@@ -1451,11 +1459,11 @@ describe('training handoff resume routing', () => {
     }
   });
 
-  it('open_agents_training does NOT trigger wantsAbort', () => {
-    const chosenOption = 'open_agents_training';
+  it('record_recipe does NOT trigger wantsAbort', () => {
+    const chosenOption = 'record_recipe';
     const wantsAbort = /\b(abort|cancel|stop)\b/i.test(chosenOption) || /^no$/i.test(chosenOption.trim());
     if (wantsAbort) {
-      throw new Error('open_agents_training should NOT match wantsAbort regex');
+      throw new Error('record_recipe should NOT match wantsAbort regex');
     }
   });
 

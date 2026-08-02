@@ -2273,9 +2273,9 @@ async function applyRecovery(decision, state, skillPlan, cursor, stepRetryCount,
       let options = decision.options || [];
       if (_isBrowserFailure && !options.some(o => {
         const txt = typeof o === 'string' ? o : (o?.label || o?.value || '');
-        return /train/i.test(txt) || txt === 'open_agents_training';
+        return /train|record/i.test(txt) || txt === 'record_recipe';
       })) {
-        options = [...options, { label: 'Train me to navigate this path', value: 'open_agents_training' }];
+        options = [...options, { label: 'Record recipe from beginning', value: 'record_recipe' }];
       }
 
       const optionsList = options

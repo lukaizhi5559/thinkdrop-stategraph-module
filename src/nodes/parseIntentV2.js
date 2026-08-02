@@ -301,6 +301,11 @@ module.exports = async function parseIntentV2(state) {
   }
   else if (/\b(remember|my name is|i am|my email|note that|store that|save that)\b/.test(lower)) fallbackIntent = 'memory_store';
   else if (/\b(what did i|do you know my|recall|retrieve|look up my|what was)\b/.test(lower)) fallbackIntent = 'memory_retrieve';
+  // Social media actions on named platforms → command_automate (verb+platform avoids false positives)
+  else if (hasNamedPlatform && /\b(post|tweet|share|publish|comment|reply|message|dm|upload|like|follow|retweet|schedule)\b/.test(lower)) {
+    fallbackIntent = 'command_automate';
+    logger.info(`[Node:ParseIntentV2] Social media action on named platform → command_automate: "${classifyMessage.slice(0, 60)}"`);
+  }
   else if (/\b(goto|go to|navigate|open|close|quit|exit|minimize|hide|show|stop|kill|launch|start|visit|click|run|execute|install|send|create|rename|move|delete|download|resize|maximize|scroll|type|press|drag|watch|stream|play|view|browse|load|fetch|scrape|automate|interact)\b/.test(lower)) fallbackIntent = 'command_automate';
   // NEW: Content discovery on named platforms → command_automate (browser automation needed)
   else if (hasContentDiscovery && hasNamedPlatform) {

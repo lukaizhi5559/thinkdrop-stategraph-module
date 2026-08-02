@@ -369,6 +369,7 @@ module.exports = async function reviewExecution(state) {
     let isHollow = regexHollow;
     let hollowReason = 'Synthesize reported it could not retrieve the requested information (possibly stuck on a login page or auth wall)';
 
+    let snapshot = null;
     // LLM + snapshot — primary judge when backend is available
     if (mcpAdapter && llmBackend) {
       // Derive sessionId from the last browser.act step, or from browser.agent as fallback
@@ -383,7 +384,6 @@ module.exports = async function reviewExecution(state) {
       // Capture current page text for fulfillment judgment.
       // getPageText returns visible page content (vs. ARIA tree from scanCurrentPage which
       // is often only a few hundred chars and too sparse for the LLM to judge correctly).
-      let snapshot = null;
       if (browserSessionId) {
         try {
           const snapRes = await mcpAdapter.callService('command', 'command.automate', {
@@ -466,6 +466,12 @@ module.exports = async function reviewExecution(state) {
         };
 
         logger.warn(`[Node:ReviewExecution] Hollow result (pass 1) — routing to recoverSkill for REPLAN: ${hollowReason}`);
+        if (progressCallback) {
+          progressCallback({
+            type: 'replanning',
+            message: `Task partially completed but verification found issues — re-planning to fix: ${hollowReason}`,
+          });
+        }
         return {
           ...state,
           reviewVerdict: 'FAILED',

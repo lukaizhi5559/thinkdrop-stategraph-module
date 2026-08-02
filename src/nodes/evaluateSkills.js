@@ -398,12 +398,35 @@ Output ONLY valid JSON.`;
   }
 
   if (verdict.verdict === 'ASK_USER') {
+    // Agent-aware ASK_USER: if the failure was on a browser.agent/cli.agent step,
+    // include the agentId + train options so the user can correct or train the
+    // agent (same UX as a hard failure). Free-text answers route through the
+    // _isAgentAskUser resume path (re-run same agent with [Resume context: Q&A]).
+    const _failedStep = state.failedStep || {};
+    const _failedAgentId = _failedStep.args?.agentId || _failedStep.args?.agent || null;
+    const _failedSkill = _failedStep.skill || null;
+    const _isAgentFailure = _failedAgentId && (_failedSkill === 'browser.agent' || _failedSkill === 'cli.agent' || _failedSkill === 'playwright.agent');
+    const _baseQuestion = `I ran into an issue and need your help: ${verdict.reason}`;
     return {
       ...state,
       evaluationVerdict: 'ASK_USER',
       recoveryAction: 'ask_user',
-      pendingQuestion: { question: verdict.reason, options: [] },
-      answer: `I ran into an issue and need your help: ${verdict.reason}`
+      pendingQuestion: _isAgentFailure ? {
+        question: `${verdict.reason}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
+        options: [
+          { label: 'Try again', value: 'try_again' },
+          { label: 'Correct and retry (tell me what was missed)', value: 'correct_and_retry' },
+          { label: 'Record recipe from beginning', value: 'record_recipe' },
+        ],
+        _isAgentAskUser: true,
+        agentId: _failedAgentId,
+        skill: _failedSkill,
+        stepIndex: state.skillCursor ?? 0,
+        uiStepIndex: state._resumeStepIndex ?? state.skillCursor ?? 0,
+        originalTask: _failedStep.args?.task || _failedStep.args?.goal || state.message || null,
+        trainingHandoff: true,
+      } : { question: verdict.reason, options: [] },
+      answer: _baseQuestion
     };
   }
 

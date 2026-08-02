@@ -150,6 +150,41 @@ async function _thinPostFailureHandler(state) {
   }
 
   // Default: ask_user
+  // When the failed step belonged to an agent (browser.agent/cli.agent with an
+  // agentId), emit an agent-aware question so a free-text answer flows through
+  // the _isAgentAskUser resume path in main.js (re-running the SAME agent step
+  // with [Resume context: Q&A]) instead of being re-classified as a brand-new
+  // task — which would loop back through service detection and pick the wrong
+  // agent. Also offer train-from-current-page / train-from-beginning so the
+  // user can demonstrate the missing steps.
+  const _failedAgentId = failedStep.args?.agentId || failedStep.args?.agent || null;
+  const _failedSkill = failedStep.skill || null;
+  const _failedOriginalTask = failedStep.args?.task || failedStep.args?.goal || null;
+  if (_failedAgentId && (_failedSkill === 'browser.agent' || _failedSkill === 'cli.agent' || _failedSkill === 'playwright.agent')) {
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      pendingQuestion: {
+        question: `Step "${_failedSkill}" failed: ${failedStep.error}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
+        options: [
+          { label: 'Try again', value: 'try_again' },
+          { label: 'Correct and retry (tell me what was missed)', value: 'correct_and_retry' },
+          { label: 'Record recipe from beginning', value: 'record_recipe' },
+          { label: 'Skip this step', value: 'Skip this step' },
+        ],
+        context: `${_failedSkill} (step ${(skillCursor ?? 0) + 1})`,
+        _isAgentAskUser: true,
+        agentId: _failedAgentId,
+        skill: _failedSkill,
+        stepIndex: skillCursor ?? 0,
+        uiStepIndex: state._resumeStepIndex ?? skillCursor ?? 0,
+        originalTask: _failedOriginalTask,
+        trainingHandoff: true,
+      },
+      commandExecuted: false,
+    };
+  }
+
   return {
     ...state,
     recoveryAction: 'ask_user',
@@ -5090,6 +5125,13 @@ Please try again or search with different terms.`;
           description: description || skill,
           source: 'training_handoff',
           agentId: raw.agentId || null,
+          // Train-from-current-page context — forwarded to the renderer so the
+          // "Train from current page" option can attach the trainer to the live
+          // session at the exact page the failure occurred on.
+          currentUrl: raw.currentUrl || null,
+          keepSession: raw.keepSession === true,
+          originalTask: raw.originalTask || resolvedArgs?.task || resolvedArgs?.goal || null,
+          freeText: true,
         });
       }
       return {
@@ -5098,6 +5140,9 @@ Please try again or search with different terms.`;
         skillCursor,
         failedStep: null,
         recoveryAction: 'ask_user',
+        // Keep the live playwright session on state so it survives the ASK_USER
+        // pause — main.js closes it if the user aborts, reuses it otherwise.
+        activeBrowserSessionId: raw.sessionId || state.activeBrowserSessionId || null,
         pendingQuestion: {
           question: raw.question,
           options: _rawOptions,
@@ -5107,8 +5152,12 @@ Please try again or search with different terms.`;
           skill: skill,
           stepIndex: skillCursor,
           uiStepIndex: state._resumeStepIndex ?? skillCursor,
-          originalTask: resolvedArgs?.task || resolvedArgs?.goal,
+          originalTask: raw.originalTask || resolvedArgs?.task || resolvedArgs?.goal,
           trainingHandoff: true,
+          // Train-from-current-page context: the page the failure occurred on
+          // and whether the playwright session was kept alive.
+          currentUrl: raw.currentUrl || null,
+          keepSession: raw.keepSession === true,
         },
         commandExecuted: false,
       };
@@ -5144,6 +5193,9 @@ Please try again or search with different terms.`;
         skillCursor,
         failedStep: null,
         recoveryAction: 'ask_user',
+        // Keep the live playwright session on state so it survives the ASK_USER
+        // pause — main.js closes it if the user aborts, reuses it otherwise.
+        activeBrowserSessionId: raw.sessionId || state.activeBrowserSessionId || null,
         pendingQuestion: {
           question: raw.question,
           options:  raw.options || [],
@@ -6587,6 +6639,56 @@ Please try again or search with different terms.`;
     const newWebAgentBestUrl = (skill === 'web.agent' && stepResult.ok && raw.bestUrl)
       ? raw.bestUrl
       : (state.webAgentBestUrl || null);
+
+    // ── Save-as-named-skill offer (Phase 3) ──────────────────────────────────
+    // browser.agent returns saveSkillOffer after a verified mutation success.
+    // Surface it as an ask_user (free-text name input) so the user can name +
+    // confirm before the recipe is saved. The cursor still advances so remaining
+    // steps continue after the user answers. On resume, main.js detects
+    // _isSaveSkillOffer in pendingQuestion and calls trainerAgent.saveAutoRecipe
+    // with the user's chosen name + the stashed transcript.
+    if (raw.saveSkillOffer && raw.saveSkillOffer.transcriptPath) {
+      const _offer = raw.saveSkillOffer;
+      logger.info(`[Node:ExecuteCommand] saveSkillOffer — suggested "${_offer.suggestedName}" for ${_offer.agentId}`);
+      if (progressCallback) {
+        progressCallback({
+          type: 'ask_user',
+          question: `This flow completed successfully. Save it as a named skill so it runs deterministically next time?\n\nSuggested name: ${_offer.suggestedName}\n\nType a name (dot-separated, e.g. ${_offer.suggestedName}) or "Skip".`,
+          options: [{ label: `Save as ${_offer.suggestedName}`, value: _offer.suggestedName }, { label: 'Skip', value: 'Skip' }],
+          stepIndex: skillCursor,
+          skill,
+          description: description || skill,
+          source: 'save_skill_offer',
+          agentId: _offer.agentId || null,
+          freeText: true,
+        });
+      }
+      return {
+        ...state,
+        skillPlan: patchedSkillPlan,
+        skillResults: updatedResults,
+        stepContracts: updatedStepContracts,
+        skillCursor: skillCursor + 1,  // advance past the completed step
+        failedStep: null,
+        activeBrowserSessionId,
+        activeBrowserUrl,
+        lastOpenedFilePath,
+        webAgentBestUrl: newWebAgentBestUrl,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: `Save this flow as a named skill? Suggested: ${_offer.suggestedName}`,
+          options: [{ label: `Save as ${_offer.suggestedName}`, value: _offer.suggestedName }, { label: 'Skip', value: 'Skip' }],
+          _isSaveSkillOffer: true,
+          saveSkillOffer: _offer,
+          agentId: _offer.agentId || null,
+          skill,
+          stepIndex: skillCursor,
+        },
+        commandExecuted: false,  // pause — don't mark done yet
+        answer: lastStepAnswer,
+      };
+    }
+
     return {
       ...state,
       skillPlan: patchedSkillPlan,   // carry forward the (possibly patched) plan with real image paths

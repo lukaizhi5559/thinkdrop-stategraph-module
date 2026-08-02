@@ -514,6 +514,9 @@ module.exports = async function preflightAgents(state) {
           if (authStatus === 'not_authenticated') {
             return `${service} CLI tool (${cli}) is installed but not authenticated${cmd ? ` — run '${cmd}'` : ''}`;
           }
+          if (authStatus === 'token_expired') {
+            return `${service} CLI tool (${cli}) token has expired — re-authentication required${cmd ? ` — run '${cmd}'` : ''}`;
+          }
           return `${service} CLI tool (${cli}) is installed but not authenticated${cmd ? ` — run '${cmd}'` : ''}`;
         };
 
