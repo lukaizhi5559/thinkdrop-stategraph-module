@@ -6643,13 +6643,48 @@ Please try again or search with different terms.`;
     // ── Save-as-named-skill offer (Phase 3) ──────────────────────────────────
     // browser.agent returns saveSkillOffer after a verified mutation success.
     // Surface it as an ask_user (free-text name input) so the user can name +
-    // confirm before the recipe is saved. The cursor still advances so remaining
-    // steps continue after the user answers. On resume, main.js detects
+    // confirm before the recipe is saved. On resume, main.js detects
     // _isSaveSkillOffer in pendingQuestion and calls trainerAgent.saveAutoRecipe
     // with the user's chosen name + the stashed transcript.
-    if (raw.saveSkillOffer && raw.saveSkillOffer.transcriptPath) {
-      const _offer = raw.saveSkillOffer;
-      logger.info(`[Node:ExecuteCommand] saveSkillOffer — suggested "${_offer.suggestedName}" for ${_offer.agentId}`);
+    //
+    // IMPORTANT: The offer is DEFERRED until the last step of the plan. Surfacing
+    // it mid-plan would pause the workflow before subsequent steps (e.g. synthesize)
+    // run, and the resume path is fragile. For non-last steps, stash the offer in
+    // state.deferredSaveSkillOffer and continue the plan; surface the ask_user
+    // pause only when isLastStep is true (preferring the freshest offer).
+    const _incomingOffer = (raw.saveSkillOffer && raw.saveSkillOffer.transcriptPath)
+      ? raw.saveSkillOffer
+      : null;
+    const _stashedOffer = state.deferredSaveSkillOffer || null;
+    // Freshest offer wins — a later step's offer is more representative of the
+    // complete flow than an earlier step's.
+    const _offer = _incomingOffer || _stashedOffer;
+
+    // Not the last step: stash the offer (if any) and continue the plan uninterrupted.
+    if (!isLastStep) {
+      if (_incomingOffer) {
+        logger.info(`[Node:ExecuteCommand] saveSkillOffer deferred — stashing "${_incomingOffer.suggestedName}" for ${_incomingOffer.agentId} (step ${skillCursor + 1}/${(patchedSkillPlan || skillPlan).length}, will surface after plan completes)`);
+      }
+      return {
+        ...state,
+        skillPlan: patchedSkillPlan,
+        skillResults: updatedResults,
+        stepContracts: updatedStepContracts,
+        skillCursor: skillCursor + 1,
+        failedStep: null,
+        activeBrowserSessionId,
+        activeBrowserUrl,
+        lastOpenedFilePath,
+        webAgentBestUrl: newWebAgentBestUrl,
+        deferredSaveSkillOffer: _incomingOffer || _stashedOffer || null,
+        commandExecuted: isLastStep,
+        answer: lastStepAnswer,
+      };
+    }
+
+    // Last step: surface the deferred save-skill offer (if any) as an ask_user pause.
+    if (_offer && _offer.transcriptPath) {
+      logger.info(`[Node:ExecuteCommand] saveSkillOffer — surfacing "${_offer.suggestedName}" for ${_offer.agentId} (plan complete)`);
       if (progressCallback) {
         progressCallback({
           type: 'ask_user',
@@ -6674,6 +6709,7 @@ Please try again or search with different terms.`;
         activeBrowserUrl,
         lastOpenedFilePath,
         webAgentBestUrl: newWebAgentBestUrl,
+        deferredSaveSkillOffer: null,  // consumed — clear the stash
         recoveryAction: 'ask_user',
         pendingQuestion: {
           question: `Save this flow as a named skill? Suggested: ${_offer.suggestedName}`,
