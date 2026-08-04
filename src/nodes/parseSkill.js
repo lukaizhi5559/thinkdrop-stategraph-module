@@ -452,6 +452,12 @@ module.exports = async function parseSkill(state) {
   const semanticPrompt = `User request: "${classifyMessage}"\n\nInstalled skills:\n${skillMenu}\n\nDoes any skill clearly match this request? Return "skill-name|HIGH" or "null".
 Examples: "gcal.event|HIGH" or "null"`;
 
+  // ── Surface progress: semantic fallback is an LLM call that can take a few seconds
+  if (state.progressCallback) {
+    try { state.progressCallback({ type: 'planning', message: 'Matching skills…' }); }
+    catch (_) { /* progress callback must never block execution */ }
+  }
+
   try {
     const raw = await Promise.race([
       llmBackend.generateAnswer(semanticPrompt, {

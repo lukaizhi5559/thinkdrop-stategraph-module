@@ -446,7 +446,7 @@ module.exports = async function resolveAgent(state) {
 
   // ── Inline Q&A loop (max MAX_ROUNDS) ───────────────────────────────────────
   for (let round = 0; round < MAX_ROUNDS; round++) {
-    if (progressCallback) progressCallback({ type: 'thinking', message: 'Selecting the right agent…' });
+    if (progressCallback) progressCallback({ type: 'planning', message: 'Selecting the right agent…' });
     logger.info(`[Node:ResolveAgent] Round ${round + 1}/${MAX_ROUNDS} — selecting agents for: "${userMessage.slice(0, 80)}"`);
 
     const result = await _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorAnswers, logger, 1, state._taskClassification, state.conversationHistory);

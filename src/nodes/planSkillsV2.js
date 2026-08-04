@@ -168,10 +168,21 @@ const { buildReminderSkill }       = require('../utils/buildReminderSkill');
 
 const PROMPTS_DIR = path.join(__dirname, '..', 'prompts');
 
+// Module-level cache for prompt files. Keyed by absolute path; invalidated when
+// the file's mtime changes so edits to prompt files are picked up without a
+// restart. Saves repeated disk I/O for the hot plan-skills* files.
+const _promptFileCache = new Map();
+
 function _loadPromptFile(filename) {
   try {
     const p = path.join(PROMPTS_DIR, filename);
-    return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null;
+    if (!fs.existsSync(p)) return null;
+    const mtime = fs.statSync(p).mtimeMs;
+    const cached = _promptFileCache.get(p);
+    if (cached && cached.mtime === mtime) return cached.content;
+    const content = fs.readFileSync(p, 'utf8');
+    _promptFileCache.set(p, { mtime, content });
+    return content;
   } catch (_) { return null; }
 }
 
@@ -342,9 +353,56 @@ function _buildSystemPrompt(userMessage, state) {
 
   const _isMacOS = process.platform === 'darwin';
 
-  const baseFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
-  const base = _loadPromptFile(baseFile) || _loadPromptFile('plan-skills.md');
+  // ── Prompt tier selection ────────────────────────────────────────────────
+  // Tier 1 (simple): core prompt only — pure query/knowledge tasks with no
+  //   follow-up, recurrence, named service, recovery, or creator context.
+  // Tier 2 (standard, default): core prompt + relevant domain appendices.
+  // Tier 3 (complex/recovery): full original plan-skills.md + appendices —
+  //   byte-identical to pre-tier behavior. Used for recovery, creator, and
+  //   plan-correction flows where the full reference catalog is valuable.
+  // Windows always uses Tier 3 (no windows core variant). Any ambiguity or
+  // core-file load failure falls back to the full original prompt (Tier 3).
+  const _isRecoveryOrComplex = !!(
+    state.recoveryContext ||
+    state.creatorPlanMd ||
+    state.creatorAgentsMd ||
+    state._planCorrectionMode
+  );
+  const _isSimpleQuery = !!(
+    _tc?.taskType === 'query' &&
+    !_tc?.isFollowUp &&
+    !_tc?.isRecurring &&
+    !_tc?.targetService &&
+    !_tc?.requiresDOM &&
+    !_tc?.isAppUiInspection &&
+    !_tc?.isSpatialAnalysis
+  );
+
+  let _promptTier;
+  let baseFile;
+  let _skipAppendices = false;
+  if (isWindows || _isRecoveryOrComplex) {
+    _promptTier = 3;
+    baseFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
+  } else if (_isSimpleQuery && !_hasLocalSignals) {
+    _promptTier = 1;
+    baseFile = 'plan-skills-core.md';
+    _skipAppendices = true; // simple single-intent query — no domain appendices needed
+  } else {
+    _promptTier = 2;
+    baseFile = 'plan-skills-core.md';
+  }
+
+  // Load base; if the core file is missing, fall back to the full original prompt.
+  let base = _loadPromptFile(baseFile);
+  if (!base && baseFile === 'plan-skills-core.md') {
+    _promptTier = 3;
+    baseFile = isWindows ? 'plan-skills-windows.md' : 'plan-skills.md';
+    base = _loadPromptFile(baseFile);
+  }
+  base = base || _loadPromptFile('plan-skills.md');
   if (!base) return null;
+  state._promptTier = _promptTier;
 
   let result = `## PRIMACY RULE\nThe CURRENT USER REQUEST below is the source of truth. Prior conversation and screen context are provided ONLY for pronoun resolution ("it", "that", "this"). If the current request names a specific task, service, or topic, plan for THAT task — do not continue prior tasks.\n\n` + base;
   const appendices = [];
@@ -352,7 +410,7 @@ function _buildSystemPrompt(userMessage, state) {
   // Domain appendices are appended in skill-preference order: shell/CLI → app → browser.
   // Skip them when local signals or recovery context are present to avoid confusing the
   // planner with extra context during complex flows; the base prompt still applies.
-  if (!_hasLocalSignals && !state.recoveryContext && !isWindows) {
+  if (!_skipAppendices && !_hasLocalSignals && !state.recoveryContext && !isWindows) {
     if (_needsShell) appendices.push('plan-skills-shell.md');
     if (_needsCli) appendices.push('plan-skills-cli-first.md');
     if (_isMacOS) appendices.push('plan-skills-macos.md');
@@ -388,8 +446,8 @@ function _buildSystemPrompt(userMessage, state) {
     result += `\n\n## CRITICAL: APP-AI AUTOMATION\n\nThis task asks to use a named app's built-in AI assistant. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
   }
 
-  const _skipReason = _hasLocalSignals ? ' (appendices skipped: local_signals)' : state.recoveryContext ? ' (appendices skipped: recovery)' : '';
-  console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile}${_skipReason} appendices:[${appendices.join(',')}] taskType:${_tc?.taskType || 'unknown'}`);
+  const _skipReason = _skipAppendices ? ' (appendices skipped: tier1_simple)' : _hasLocalSignals ? ' (appendices skipped: local_signals)' : state.recoveryContext ? ' (appendices skipped: recovery)' : '';
+  console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile} tier:${_promptTier}${_skipReason} appendices:[${appendices.join(',')}] taskType:${_tc?.taskType || 'unknown'}`);
 
   if (state.grilledConstraints) {
     result += `\n\n## GRILLED CONSTRAINTS (User Confirmed)\n\nThese constraints were confirmed through detailed questioning. You MUST follow them:\n\n\`\`\`json\n${JSON.stringify(state.grilledConstraints, null, 2)}\n\`\`\``;
@@ -1421,49 +1479,10 @@ async function planSkillsV2(state) {
   // When steps are clearly independent (e.g. scraping two sites, resolving user
   // info while browsing), instruct the LLM to mark them with the same runGroup
   // value so executeCommand.js can fan them out with Promise.allSettled.
-  const parallelNote = `\n\n## PARALLEL EXECUTION (runGroup) - GOAL-ORIENTED OPTIMIZATION
-When two or more steps are completely independent (no data dependency between them), add "runGroup": "<group_id>" to each step in the group. Steps sharing the same runGroup value will be executed in parallel using Promise.allSettled.
-
-GOAL: Minimize total execution time by parallelizing independent work. ANY plan with 3+ steps MUST be analyzed for parallel opportunities.
-
-MUST PARALLELIZE when:
-1. User asks for MULTIPLE distinct things ("find A, B, and C")
-2. Multiple independent searches on the same service (finding 3 different YouTube videos)
-3. Data gathering from different sources (web + CLI + file system)
-4. Independent lookups or checks ("check status of X, Y, Z")
-5. Any steps that don't use {{variable}} dependencies from other steps
-
-PARALLEL EXECUTION RULES:
-- Use short IDs like "g1", "g2" etc.
-- Only group steps that do NOT depend on each other's output (no {{variable}} references)
-- Grouped steps MUST be consecutive in the plan array
-- Do NOT group synthesize, schedule, or shell.run steps (these are sequential)
-- When in doubt: if steps are independent, PARALLELIZE them
-
-PARALLELIZABLE AGENTS/SKILLS (when independent):
-- cli.agent - CLI tool automation and command execution
-- browser.agent - Web browser automation and site interaction  
-- browser.act - Browser actions and navigation
-- screen.capture - Screen capture and visual analysis
-- system.introspect - System information and diagnostics
-- web.crawl - Web crawling and data extraction
-- external.skill - External skill execution
-- image.analyze - Image analysis and processing
-
-EXAMPLE - Parallel data gathering:
-[
-  { "skill": "web.agent", "args": { "action": "search", "query": "product A reviews" }, "runGroup": "g1", "description": "Search product A" },
-  { "skill": "web.agent", "args": { "action": "search", "query": "product B reviews" }, "runGroup": "g1", "description": "Search product B" },
-  { "skill": "web.agent", "args": { "action": "search", "query": "product C reviews" }, "runGroup": "g1", "description": "Search product C" },
-  { "skill": "synthesize", "args": { "prompt": "Compare all three products" } }
-]
-
-EXAMPLE - Mixed parallel sources:
-[
-  { "skill": "browser.agent", "args": { "task": "Get pricing from website" }, "runGroup": "g1", "description": "Web pricing" },
-  { "skill": "cli.agent", "args": { "command": "get local inventory" }, "runGroup": "g1", "description": "Local inventory" },
-  { "skill": "synthesize", "args": { "prompt": "Combine pricing and inventory data" } }
-]`;
+  const parallelNote = `\n\n## PARALLEL EXECUTION (runGroup)
+When 2+ steps are independent (no {{variable}} dependency between them), add the same "runGroup": "<id>" (e.g. "g1") to each so they execute in parallel via Promise.allSettled. Any plan with 3+ steps MUST be analyzed for parallel opportunities (multiple distinct requests, independent searches/lookups, data from different sources).
+RULES: only group steps with NO {{variable}} references to each other; grouped steps MUST be consecutive; do NOT group synthesize/schedule/shell.run (sequential). When in doubt, parallelize independent steps.
+EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A reviews" }, "runGroup": "g1" }, { "skill": "web.agent", "args": { "action": "search", "query": "B reviews" }, "runGroup": "g1" }, { "skill": "synthesize", "args": { "prompt": "Compare A and B" } } ]`;
 
   // ── Route choice constraint from preflightAgents ───────────────────────────
   let routeChoiceNote = '';

@@ -270,6 +270,12 @@ module.exports = async function decomposePromptV2(state) {
     return state;
   }
 
+  // ── Surface progress before the LLM decomposition call (can take several seconds)
+  if (state.progressCallback) {
+    try { state.progressCallback({ type: 'planning', message: 'Breaking down your request…' }); }
+    catch (_) { /* progress callback must never block execution */ }
+  }
+
   const t0 = Date.now();
   let parsedJson = null; // Store parsed JSON for intent preservation
   let subPrompts = await llmDecompose(message, llmBackend, conversationHistory, logger, (parsed) => {

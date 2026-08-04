@@ -392,6 +392,14 @@ module.exports = async function resolveUserContext(state) {
 
   const msg = state.resolvedMessage || state.message || '';
 
+  // ── Surface progress: this node does MCP I/O (profile/memory/conversation
+  // lookups) that can take a few seconds. Emit before the quick-exit check so
+  // the user sees status even for the fast pass-through path.
+  if (state.progressCallback) {
+    try { state.progressCallback({ type: 'planning', message: 'Resolving your context…' }); }
+    catch (_) { /* progress callback must never block execution */ }
+  }
+
   // ── Quick-exit: nothing self-referential in this message ─────────────────
   if (!_hasSelfReferentialContext(state, msg)) {
     // Bridge/cron prompts never trigger the full resolver, but planSkills needs

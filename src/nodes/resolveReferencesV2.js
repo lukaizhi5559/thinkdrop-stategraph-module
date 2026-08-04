@@ -79,6 +79,13 @@ module.exports = async function resolveReferencesV2(state) {
     return { ...state, resolvedMessage: message, originalMessage: message, conversationHistory: [] };
   }
 
+  // ── Surface progress: this is the first node in the graph, so the user sees
+  // this message while we fetch conversation history + run classifyTask.
+  if (state.progressCallback) {
+    try { state.progressCallback({ type: 'planning', message: 'Understanding your request…' }); }
+    catch (_) { /* progress callback must never block execution */ }
+  }
+
   // ── Fetch conversation history (sliding window) ────────────────────────────
   let conversationHistory = [];
   try {
