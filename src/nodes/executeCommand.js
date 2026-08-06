@@ -2460,7 +2460,7 @@ module.exports = async function executeCommand(state) {
         (r.skill === 'app.agent' && r.args?.action === 'get_recent_ocr' &&
           ((r.result && typeof r.result === 'string' && r.result.trim().length > 50) ||
            (r.text && typeof r.text === 'string' && r.text.trim().length > 50))) ||
-        (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 50 && !r.result.startsWith('Completed:')) ||
+        (r.skill === 'browser.agent' && r.result && typeof r.result === 'string' && r.result.trim().length > 0 && !r.result.startsWith('Completed:')) ||
         (r.skill === 'cli.agent' && r.ok &&
           ((typeof r.result === 'string' && r.result.trim().length > 0) ||
            (typeof r.stdout === 'string' && r.stdout.trim().length > 0))) ||
@@ -2953,6 +2953,14 @@ module.exports = async function executeCommand(state) {
       logger.info(`[Node:ExecuteCommand] synthesize: external-skill-only — returning output directly (${_directAnswer.length} chars)`);
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'synthesize', description: description || 'Skill result', stdout: _directAnswer, isSynthesisResult: true });
       if (typeof streamCallback === 'function') streamCallback(_directAnswer);
+
+      // Emit all_done if synthesize is the last step — otherwise the UI spinner never dismisses
+      const _isExtOnlyLast = skillCursor + 1 >= skillPlan.length;
+      if (_isExtOnlyLast && progressCallback) {
+        const _extUpdatedResults = [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: _directAnswer, stdout: _directAnswer }];
+        progressCallback({ type: 'all_done', completedCount: skillCursor + 1, totalCount: skillPlan.length, skillResults: _extUpdatedResults, savedFilePaths: state.savedFilePaths || [], planFile: state._skillPlanFile || null });
+      }
+
       return {
         ...state,
         skillResults: [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: _directAnswer, stdout: _directAnswer }],
@@ -3123,7 +3131,8 @@ module.exports = async function executeCommand(state) {
 ⚠️ ANTI-HALLUCINATION RULES:
 1. If the content from a source clearly shows a login page, sign-in form, or authentication wall (e.g. it contains phrases like "Sign in", "Log in", "Create account", "Welcome back" with minimal substantive content), you MUST explicitly state that [service] required login and could not be queried.
 2. If you were asked to find video URLs (e.g., YouTube videos) but the provided content contains NO actual video links (watch?v= URLs), you MUST state that the search failed. Do NOT invent or hallucinate fake URLs like https://www.youtube.com/watch?v=dQw4w9WgXcQ or any other made-up links.
-3. A failed search with honest "no results" is infinitely better than fabricated data with fake URLs.`) + _synthLangSuffix;
+3. A failed search with honest "no results" is infinitely better than fabricated data with fake URLs.
+4. If the page text contains an "AI Overview" or auto-generated summary section (e.g. Gmail's AI Overview, Google Search AI Overview), do NOT trust its claims about the presence or absence of results. The AI Overview may state "no results found" or "no unread emails" even when actual results/email rows are clearly listed below it. Always verify against the actual list items, email rows, or data entries in the page text — not the AI Overview's summary. When the AI Overview contradicts the actual list items, trust the list items.`) + _synthLangSuffix;
 
       // ── Output schema enforcement ─────────────────────────────────────────────
       const _outputSchema = args.outputSchema;
@@ -3599,6 +3608,12 @@ Please try again or search with different terms.`;
       : prevSavedFiles;
 
     const isSynthesizeLastStep = skillCursor + 1 >= skillPlan.length;
+
+    // Emit all_done if synthesize is the last step — otherwise the UI spinner never dismisses
+    if (isSynthesizeLastStep && progressCallback) {
+      const _synthUpdatedResults = [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: synthesisAnswer, stdout: synthesisAnswer }];
+      progressCallback({ type: 'all_done', completedCount: skillCursor + 1, totalCount: skillPlan.length, skillResults: _synthUpdatedResults, savedFilePaths: newSavedFiles, planFile: state._skillPlanFile || null });
+    }
 
     return {
       ...state,
