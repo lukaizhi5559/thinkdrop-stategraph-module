@@ -294,6 +294,29 @@ async function runTests() {
     if (listCalls.length !== 0) throw new Error(`Expected cache hit, but agent.list was called ${listCalls.length} times`);
   });
 
+  await it('skips agent selection for local_system tasks (no LLM, no fake agent)', async () => {
+    const userMessage = 'check the time on my computer';
+    const adapter = makeMcpAdapter({});
+    const llmBackend = {
+      async generateAnswer() { throw new Error('LLM should not be called for local_system tasks'); },
+    };
+    const state = {
+      intent: { type: 'command_automate' },
+      message: userMessage,
+      resolvedMessage: userMessage,
+      llmBackend,
+      mcpAdapter: adapter,
+      logger: console,
+      _taskClassification: { taskType: 'local_system', isFollowUp: true, followUpTarget: 'current system time' },
+    };
+    const result = await resolveAgent(state);
+    const agents = result.resolveAgentResult?.agents || [];
+    if (agents.length !== 0) throw new Error(`Expected 0 agents for local_system, got ${agents.length}: ${JSON.stringify(agents)}`);
+    if (result.resolveAgentResult?.question !== null) throw new Error('Expected question: null for local_system');
+    const listCalls = adapter.calls.filter(c => c.service === 'command' && c.action === 'agent.list');
+    if (listCalls.length !== 0) throw new Error(`Expected no agent.list call for local_system, got ${listCalls.length}`);
+  });
+
   console.log(`\n${'─'.repeat(72)}`);
   if (_failed === 0) {
     console.log(`✅ All ${_passed} tests passed.`);

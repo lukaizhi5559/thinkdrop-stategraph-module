@@ -178,8 +178,14 @@ module.exports = async function planExecutor(state) {
     planError:        null,
     recoveryAction:   null,
     conversationLogged: false,
-    isMultiIntent:    false,
-    intentQueue:      [],
+    // Restore multi-intent context (was hardcoded to false/[]) so mixed-intent
+    // queues survive the plan approval gate. When plan:approve re-enqueues with
+    // _resumeMultiIntent, the remaining intentQueue + prior intentResults/dataContext
+    // are restored so logConversation can pop the next step after this plan executes.
+    isMultiIntent:    state._resumeMultiIntent || false,
+    intentQueue:      state._resumeIntentQueue || [],
+    intentResults:    state._resumeIntentResults || [],
+    dataContext:      state._resumeDataContext || {},
     originalPrompt,
   };
 };

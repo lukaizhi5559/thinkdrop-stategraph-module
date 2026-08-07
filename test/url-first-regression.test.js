@@ -68,7 +68,7 @@ function expect(actual) {
 }
 
 // ── INTENTS constants (from destination-resolver.cjs) ─────────────────────────
-const { INTENTS } = require('../../mcp-services/command-service/src/skill-helpers/destination-resolver.cjs');
+const { INTENTS, isAuthFlowUrl } = require('../../mcp-services/command-service/src/skill-helpers/destination-resolver.cjs');
 
 // ── Inlined pure functions from browser.agent.cjs ─────────────────────────────
 // These are re-implemented here to avoid loading the full browser.agent module
@@ -82,10 +82,19 @@ function _isUnsafeDeepLinkUrl(candidateUrl, expectedHost = '') {
   if (lower.includes('chrome-extension://') || lower.includes('chrome-extension%3a%2f%2f')) {
     return true;
   }
+  if (/\bpii_|%5bpii|\[redacted\]|\[placeholder\]/i.test(candidate)) {
+    return true;
+  }
+  if (/[?&](su|to|body|subject|bcc|cc)=/i.test(candidate) && /[?&](view=cm|tf=cm|tf=1)/i.test(candidate)) {
+    return true;
+  }
   if (String(expectedHost || '').replace(/^www\./, '') === 'mail.google.com') {
     if (/mail\.google\.com\/mail(?:\/u\/\d+)?\/?\?body=/i.test(candidate)) {
       return true;
     }
+  }
+  if (isAuthFlowUrl(candidate)) {
+    return true;
   }
   return false;
 }
@@ -426,6 +435,26 @@ describe('_isUnsafeDeepLinkUrl — detects unsafe URLs', () => {
     expect(_isUnsafeDeepLinkUrl('https://notion.so/new', 'notion.so')).toBe(false);
   });
 
+  it('claude.ai/magic-link → unsafe (auth-flow path)', () => {
+    expect(_isUnsafeDeepLinkUrl('https://claude.ai/magic-link', 'claude.ai')).toBe(true);
+  });
+
+  it('claude.ai/login → unsafe (auth-flow path)', () => {
+    expect(_isUnsafeDeepLinkUrl('https://claude.ai/login', 'claude.ai')).toBe(true);
+  });
+
+  it('accounts.google.com/signin → unsafe (auth-flow path)', () => {
+    expect(_isUnsafeDeepLinkUrl('https://accounts.google.com/signin/v2/identifier', 'accounts.google.com')).toBe(true);
+  });
+
+  it('github.com/login → unsafe (auth-flow path)', () => {
+    expect(_isUnsafeDeepLinkUrl('https://github.com/login', 'github.com')).toBe(true);
+  });
+
+  it('claude.ai/new → safe (not an auth-flow path)', () => {
+    expect(_isUnsafeDeepLinkUrl('https://claude.ai/new', 'claude.ai')).toBe(false);
+  });
+
   it('empty string → unsafe', () => {
     expect(_isUnsafeDeepLinkUrl('')).toBe(true);
   });
@@ -439,6 +468,25 @@ describe('_isUnsafeDeepLinkUrl — detects unsafe URLs', () => {
 // 4. _classifyDiscoveryCandidate — search candidate classification
 // ══════════════════════════════════════════════════════════════════════════════
 describe('_classifyDiscoveryCandidate — classifies search results', () => {
+
+  it('auth-flow URL (magic-link) → pageClass=auth', () => {
+    const r = _classifyDiscoveryCandidate({
+      url: 'https://claude.ai/magic-link',
+      title: 'Claude',
+      snippet: '',
+    }, 'claude.ai');
+    expect(r.pageClass).toBe('auth');
+    expect(r.onServiceDomain).toBe(true);
+  });
+
+  it('auth-flow URL (login) → pageClass=auth', () => {
+    const r = _classifyDiscoveryCandidate({
+      url: 'https://claude.ai/login',
+      title: 'Log in',
+      snippet: '',
+    }, 'claude.ai');
+    expect(r.pageClass).toBe('auth');
+  });
 
   it('documentation URL → pageClass=documentation', () => {
     const r = _classifyDiscoveryCandidate({
@@ -1490,6 +1538,237 @@ describe('training handoff resume routing', () => {
     if (!isHandoff) {
       throw new Error('Legacy recipeRequired should still trigger handoff branch');
     }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 8. SERVICE_CHAT_URLS — chatbot intent template coverage
+// ══════════════════════════════════════════════════════════════════════════════
+describe('SERVICE_CHAT_URLS — chatbot services have deterministic chat URLs', () => {
+  const { SERVICE_CHAT_URLS } = require('../../mcp-services/command-service/src/skill-helpers/destination-resolver.cjs');
+
+  it('claude → claude.ai/new', () => {
+    expect(SERVICE_CHAT_URLS.claude).toBe('https://claude.ai/new');
+  });
+
+  it('chatgpt → chatgpt.com/', () => {
+    expect(SERVICE_CHAT_URLS.chatgpt).toBe('https://chatgpt.com/');
+  });
+
+  it('perplexity → perplexity.ai/', () => {
+    expect(SERVICE_CHAT_URLS.perplexity).toBe('https://www.perplexity.ai/');
+  });
+
+  it('deepseek → chat.deepseek.com/', () => {
+    expect(SERVICE_CHAT_URLS.deepseek).toBe('https://chat.deepseek.com/');
+  });
+
+  it('mistral → chat.mistral.ai/', () => {
+    expect(SERVICE_CHAT_URLS.mistral).toBe('https://chat.mistral.ai/');
+  });
+
+  it('qwen → chat.qwenlm.ai/', () => {
+    expect(SERVICE_CHAT_URLS.qwen).toBe('https://chat.qwenlm.ai/');
+  });
+
+  it('groq → groq.com/', () => {
+    expect(SERVICE_CHAT_URLS.groq).toBe('https://groq.com/');
+  });
+
+  it('huggingface → huggingface.co/chat/', () => {
+    expect(SERVICE_CHAT_URLS.huggingface).toBe('https://huggingface.co/chat/');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 9. MEDIA_PLAY intent — new intent for play/stream tasks
+// ══════════════════════════════════════════════════════════════════════════════
+describe('MEDIA_PLAY intent — enum and pattern coverage', () => {
+
+  it('MEDIA_PLAY exists in INTENTS enum', () => {
+    expect(INTENTS.MEDIA_PLAY).toBe('media_play');
+  });
+
+  it('MEDIA_PLAY → not mutation', () => {
+    expect(_isMutationIntent(INTENTS.MEDIA_PLAY)).toBe(false);
+  });
+
+  // Test the MEDIA_PLAY regex pattern from INTENT_PATTERNS
+  const _mediaPlayRe = /\b(play\s+(?:\w+\s+)*(?:playlist|song|track|album|music|video|movie|show|episode|first\s+result)|stream\s+(?:\w+\s+)*(?:video|movie|show|song|track|music)|watch\s+(?:\w+\s+)*(?:video|movie|show|episode|first\s+result))\b/i;
+
+  it('"play my Spotify playlist" → matches MEDIA_PLAY', () => {
+    expect(_mediaPlayRe.test('play my Spotify playlist')).toBe(true);
+  });
+
+  it('"play the first result on YouTube" → matches MEDIA_PLAY', () => {
+    expect(_mediaPlayRe.test('play the first result on YouTube')).toBe(true);
+  });
+
+  it('"watch a YouTube video" → matches MEDIA_PLAY', () => {
+    expect(_mediaPlayRe.test('watch a YouTube video')).toBe(true);
+  });
+
+  it('"stream the movie on Netflix" → matches MEDIA_PLAY', () => {
+    expect(_mediaPlayRe.test('stream the movie on Netflix')).toBe(true);
+  });
+
+  it('"play a game on Steam" → does NOT match MEDIA_PLAY (no media noun)', () => {
+    expect(_mediaPlayRe.test('play a game on Steam')).toBe(false);
+  });
+
+  it('"open Spotify" → does NOT match MEDIA_PLAY (no play verb)', () => {
+    expect(_mediaPlayRe.test('open Spotify')).toBe(false);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 10. Expanded _INTENT_EVAL_PATTERNS — layer 2 URL path matching
+// ══════════════════════════════════════════════════════════════════════════════
+describe('Expanded _INTENT_EVAL_PATTERNS — new URL path terms', () => {
+  // These mirror the patterns in browser.agent.cjs _INTENT_EVAL_PATTERNS
+
+  const _patterns = {
+    [INTENTS.SEARCH]:         /\/(search|find|browse|explore|discover)/i,
+    [INTENTS.CONTENT_CREATE]: /\/(new|create|compose|upload|publish|submit|add|draft|editor|write)/i,
+    [INTENTS.SOCIAL]:         /\/(compose|post|share|submit|tweet|message|comment|reply|feed)/i,
+    [INTENTS.SETTINGS]:       /\/(settings|account|preferences|profile|billing|subscription|security|privacy)/i,
+    [INTENTS.SUPPORT]:        /\/(help|support|contact|ticket|faq|community|forum)/i,
+    [INTENTS.DASHBOARD]:      /\/(dashboard|admin|overview|home|console|analytics|stats|reports)/i,
+    [INTENTS.DOCS]:           /\/(docs|documentation|guide|tutorial|help|reference|manual|learn|wiki)/i,
+    [INTENTS.CONSOLE]:        /\/(console|developer|api|platform|settings|keys|tokens)/i,
+    [INTENTS.SCHEDULING]:     /\/(calendar|schedule|book|event|new|appointment|reserve|meeting)/i,
+    [INTENTS.CHAT]:           /\/(chat|conversation|prompt|ask|new)/i,
+    [INTENTS.RESEARCH]:       /\/(chat|conversation|prompt|ask|new|search)/i,
+    [INTENTS.DOWNLOAD]:       /\/(download|export|save|archive)/i,
+    [INTENTS.COMMERCE]:       /\/(cart|checkout|order|product|buy|shop|store|wishlist)/i,
+    [INTENTS.MEDIA_PLAY]:     /\/(watch|listen|player|now-playing|queue|album|track|playlist|episode|stream)/i,
+  };
+
+  // SEARCH — new terms
+  it('SEARCH matches /browse (Amazon browse URL)', () => {
+    expect(_patterns[INTENTS.SEARCH].test('https://amazon.com/browse/123')).toBe(true);
+  });
+  it('SEARCH matches /explore (Instagram explore)', () => {
+    expect(_patterns[INTENTS.SEARCH].test('https://instagram.com/explore')).toBe(true);
+  });
+  it('SEARCH matches /discover (Spotify discover)', () => {
+    expect(_patterns[INTENTS.SEARCH].test('https://spotify.com/discover')).toBe(true);
+  });
+
+  // CHAT — new intent (layer 2 for unknown chatbot services)
+  it('CHAT matches /chat (unknown AI service chat)', () => {
+    expect(_patterns[INTENTS.CHAT].test('https://unknownai.com/chat')).toBe(true);
+  });
+  it('CHAT matches /conversation (AI conversation page)', () => {
+    expect(_patterns[INTENTS.CHAT].test('https://unknownai.com/conversation/new')).toBe(true);
+  });
+  it('CHAT matches /prompt (AI prompt page)', () => {
+    expect(_patterns[INTENTS.CHAT].test('https://unknownai.com/prompt')).toBe(true);
+  });
+  it('CHAT matches /new (new chat link)', () => {
+    expect(_patterns[INTENTS.CHAT].test('https://unknownai.com/new')).toBe(true);
+  });
+
+  // RESEARCH — new intent (same as CHAT on AI services, plus /search)
+  it('RESEARCH matches /chat (AI research = chat)', () => {
+    expect(_patterns[INTENTS.RESEARCH].test('https://unknownai.com/chat')).toBe(true);
+  });
+  it('RESEARCH matches /search (research via search)', () => {
+    expect(_patterns[INTENTS.RESEARCH].test('https://unknownai.com/search')).toBe(true);
+  });
+
+  // CONTENT_CREATE — new terms
+  it('CONTENT_CREATE matches /draft (Medium draft)', () => {
+    expect(_patterns[INTENTS.CONTENT_CREATE].test('https://medium.com/draft/new')).toBe(true);
+  });
+  it('CONTENT_CREATE matches /editor (Notion editor)', () => {
+    expect(_patterns[INTENTS.CONTENT_CREATE].test('https://notion.so/editor/page123')).toBe(true);
+  });
+
+  // SOCIAL — new terms
+  it('SOCIAL matches /message (Twitter DMs)', () => {
+    expect(_patterns[INTENTS.SOCIAL].test('https://twitter.com/message/compose')).toBe(true);
+  });
+  it('SOCIAL matches /feed (Reddit feed)', () => {
+    expect(_patterns[INTENTS.SOCIAL].test('https://reddit.com/feed')).toBe(true);
+  });
+
+  // SETTINGS — new terms
+  it('SETTINGS matches /billing (Stripe billing)', () => {
+    expect(_patterns[INTENTS.SETTINGS].test('https://dashboard.stripe.com/billing')).toBe(true);
+  });
+  it('SETTINGS matches /security (GitHub security)', () => {
+    expect(_patterns[INTENTS.SETTINGS].test('https://github.com/settings/security')).toBe(true);
+  });
+
+  // SUPPORT — new terms
+  it('SUPPORT matches /faq', () => {
+    expect(_patterns[INTENTS.SUPPORT].test('https://example.com/faq')).toBe(true);
+  });
+  it('SUPPORT matches /forum (GitHub forum)', () => {
+    expect(_patterns[INTENTS.SUPPORT].test('https://github.com/forum')).toBe(true);
+  });
+
+  // DASHBOARD — new terms
+  it('DASHBOARD matches /analytics (Google Analytics)', () => {
+    expect(_patterns[INTENTS.DASHBOARD].test('https://analytics.google.com/analytics')).toBe(true);
+  });
+  it('DASHBOARD matches /reports (SaaS reports)', () => {
+    expect(_patterns[INTENTS.DASHBOARD].test('https://app.example.com/reports')).toBe(true);
+  });
+
+  // DOCS — new terms
+  it('DOCS matches /reference (Stripe API reference)', () => {
+    expect(_patterns[INTENTS.DOCS].test('https://stripe.com/docs/reference')).toBe(true);
+  });
+  it('DOCS matches /learn (GitHub learn)', () => {
+    expect(_patterns[INTENTS.DOCS].test('https://github.com/learn')).toBe(true);
+  });
+
+  // CONSOLE — new terms
+  it('CONSOLE matches /keys (OpenAI API keys)', () => {
+    expect(_patterns[INTENTS.CONSOLE].test('https://platform.openai.com/keys')).toBe(true);
+  });
+  it('CONSOLE matches /tokens (GitHub tokens)', () => {
+    expect(_patterns[INTENTS.CONSOLE].test('https://github.com/settings/tokens')).toBe(true);
+  });
+
+  // SCHEDULING — new terms
+  it('SCHEDULING matches /appointment (Calendly)', () => {
+    expect(_patterns[INTENTS.SCHEDULING].test('https://calendly.com/appointment/new')).toBe(true);
+  });
+  it('SCHEDULING matches /meeting (Zoom meeting)', () => {
+    expect(_patterns[INTENTS.SCHEDULING].test('https://zoom.us/meeting/new')).toBe(true);
+  });
+
+  // DOWNLOAD — new intent
+  it('DOWNLOAD matches /download', () => {
+    expect(_patterns[INTENTS.DOWNLOAD].test('https://example.com/download/file.pdf')).toBe(true);
+  });
+  it('DOWNLOAD matches /export', () => {
+    expect(_patterns[INTENTS.DOWNLOAD].test('https://app.example.com/export/data')).toBe(true);
+  });
+
+  // COMMERCE — new intent
+  it('COMMERCE matches /store (Apple Store)', () => {
+    expect(_patterns[INTENTS.COMMERCE].test('https://apple.com/store')).toBe(true);
+  });
+  it('COMMERCE matches /wishlist (Amazon wishlist)', () => {
+    expect(_patterns[INTENTS.COMMERCE].test('https://amazon.com/wishlist')).toBe(true);
+  });
+
+  // MEDIA_PLAY — new intent
+  it('MEDIA_PLAY matches /watch (YouTube watch)', () => {
+    expect(_patterns[INTENTS.MEDIA_PLAY].test('https://youtube.com/watch?v=abc')).toBe(true);
+  });
+  it('MEDIA_PLAY matches /playlist (Spotify playlist)', () => {
+    expect(_patterns[INTENTS.MEDIA_PLAY].test('https://spotify.com/playlist/123')).toBe(true);
+  });
+  it('MEDIA_PLAY matches /album (Spotify album)', () => {
+    expect(_patterns[INTENTS.MEDIA_PLAY].test('https://spotify.com/album/456')).toBe(true);
+  });
+  it('MEDIA_PLAY matches /stream (Twitch stream)', () => {
+    expect(_patterns[INTENTS.MEDIA_PLAY].test('https://twitch.tv/stream/user')).toBe(true);
   });
 });
 

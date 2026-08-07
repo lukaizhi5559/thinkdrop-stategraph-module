@@ -232,6 +232,7 @@ Rules:
 - Only ask the user for clarification when the service is genuinely unknown or ambiguous. Never ask for permission to create an agent.
 - The question must be 15 words or fewer.
 - Do not include agents that are not needed for the task.
+- LOCAL MACHINE QUERIES: NEVER create or select an agent for local OS / shell queries — current time or date, system uptime, disk space, memory/CPU/battery usage, hardware info, running processes, hostname, OS version, environment variables, screen capture, or any task that runs against the local machine itself. These need NO service agent — return an empty "agents" array and "question": null. They are handled by generic shell/system skills, not by service agents.
 - FOLLOW-UP CONTEXT: When a FOLLOW-UP CONTEXT block is provided, the user is revising or continuing a prior task. Reuse the same service/agent from the prior turn — do NOT ask for clarification on already-established context (e.g., do not ask "Which platform?" if the prior turn already established the platform).
 - CONVERSATION HISTORY: When a RECENT CONVERSATION block is provided, use it to resolve ambiguous references in the current message (e.g., "the message" → the content from the prior turn).`
 
@@ -431,6 +432,27 @@ module.exports = async function resolveAgent(state) {
   if (!mcpAdapter) {
     logger.warn('[Node:ResolveAgent] No mcpAdapter — passthrough');
     return { ...state, resolveAgentResult: { agents: [], reasoning: 'No MCP adapter', question: null } };
+  }
+
+  // ── Skip: local_system tasks need no service agent ──────────────────────────
+  // taskType 'local_system' (from classifyTask) covers OS/shell queries — current
+  // time/date, uptime, disk space, battery, hardware info, screen UI interactions.
+  // These are handled by generic skills (shell.run, app.agent, screen.capture)
+  // chosen by planSkills — never by registered service agents. Letting the LLM
+  // selection run here caused it to hallucinate fake service agents like
+  // "system_time.agent" / "time_is.agent" that then crashed preflight.
+  if (state._taskClassification?.taskType === 'local_system') {
+    logger.info(`[Node:ResolveAgent] local_system task — skipping agent selection (no service agent needed): "${userMessage.slice(0, 80)}"`);
+    return {
+      ...state,
+      resolveAgentResult: {
+        agents: [],
+        reasoning: 'Local system task — no service agent needed',
+        question: null,
+        _message: userMessage,
+      },
+      resolveAgentAnswers: Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [],
+    };
   }
 
   const priorAnswers = Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [];

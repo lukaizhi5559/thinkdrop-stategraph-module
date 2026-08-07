@@ -346,6 +346,7 @@ module.exports = async function preflightAgents(state) {
   // ── Create any agents marked create:true by resolveAgent ───────────────────
   if (createAgentSpecs.length > 0) {
     const failedCreates = [];
+    const noCliFailures = []; // CLI agent builds that failed because no CLI exists for the service
     for (const spec of createAgentSpecs) {
       const skillName = spec.type === 'cli' ? 'cli.agent' : (spec.type === 'app' ? 'app.agent' : 'browser.agent');
       try {
@@ -376,11 +377,18 @@ module.exports = async function preflightAgents(state) {
         } else {
           const errMsg = buildPayload?.error || 'unknown error';
           logger.warn(`[Node:PreflightAgents] Failed to create ${spec.agentId}: ${errMsg}`);
-          failedCreates.push({ agentId: spec.agentId, error: errMsg });
+          const failure = { agentId: spec.agentId, error: errMsg, type: spec.type };
+          failedCreates.push(failure);
+          // cli.agent returns noCli: true when the LLM lookup found no CLI tool for
+          // the service (e.g. a hallucinated "system_time" service). Soft-fail these
+          // so planning can fall back to generic shell.run instead of hard-crashing.
+          if (spec.type === 'cli' && buildPayload?.noCli === true) {
+            noCliFailures.push(failure);
+          }
         }
       } catch (err) {
         logger.warn(`[Node:PreflightAgents] Agent creation failed for ${spec.agentId}: ${err.message}`);
-        failedCreates.push({ agentId: spec.agentId, error: err.message });
+        failedCreates.push({ agentId: spec.agentId, error: err.message, type: spec.type });
       }
     }
 
@@ -389,8 +397,13 @@ module.exports = async function preflightAgents(state) {
         type: 'agent_create_failed',
         message: `Failed to create agent(s): ${failedCreates.map(c => c.agentId).join(', ')}`,
       });
-      // If every requested agent failed, surface a plan error so we don't proceed to planning.
-      if (failedCreates.length === createAgentSpecs.length) {
+      // Hard-fail only when every requested agent failed AND none of the failures
+      // were noCli soft-fails. noCli failures mean the resolver hallucinated a CLI
+      // service that doesn't exist — planning should fall back to generic shell.run
+      // rather than aborting the whole pipeline with "Automation failed".
+      const allFailed = failedCreates.length === createAgentSpecs.length;
+      const allNoCli = noCliFailures.length === failedCreates.length && noCliFailures.length > 0;
+      if (allFailed && !allNoCli) {
         const planError = `I couldn't create the required agent(s): ${failedCreates.map(c => `${c.agentId} (${c.error})`).join('; ')}.`;
         logger.error(`[Node:PreflightAgents] ${planError}`);
         _emitProgress({ type: 'preflight:agent_create_failed', message: planError, failures: failedCreates });
@@ -404,6 +417,21 @@ module.exports = async function preflightAgents(state) {
             agentContextNote: '',
           },
         };
+      }
+      if (noCliFailures.length > 0) {
+        logger.info(`[Node:PreflightAgents] noCli soft-fail for ${noCliFailures.length} agent(s): ${noCliFailures.map(c => c.agentId).join(', ')} — falling back to generic shell.run planning`);
+        _emitProgress({
+          type: 'preflight:agent_create_skipped',
+          message: `No CLI agent available for ${noCliFailures.map(c => c.agentId).join(', ')} — will plan with generic shell commands.`,
+          failures: noCliFailures,
+        });
+        // Drop noCli-failed agents from the selected set so the downstream
+        // readiness check ("Selected agents are not ready") doesn't block
+        // planning. These agents were never built, so they have no readiness
+        // state — planning should proceed with generic shell.run instead.
+        for (const f of noCliFailures) {
+          selectedAgentIds.delete(String(f.agentId).toLowerCase());
+        }
       }
     }
 

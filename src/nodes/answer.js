@@ -236,7 +236,12 @@ module.exports = async function answer(state) {
   const intentType = intent?.type || 'question';
 
   const baseInstruction = ANSWER_PROMPTS?.base || 'Answer using the provided context. Be direct and natural.';
-  let systemInstructions = `${langOverridePrefix}${pipelineContextBlock}${baseInstruction}\n\nContext:`;
+  // Inject the current local time so temporal queries ("what time is it", "what's
+  // today's date") are answered directly from the device clock instead of being
+  // deflected to "I don't have access to your local time — visit time.is".
+  const _now = new Date();
+  const _localTimeString = `CURRENT LOCAL TIME: ${_now.toLocaleString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone || 'local timezone'})`;
+  let systemInstructions = `${langOverridePrefix}${pipelineContextBlock}${baseInstruction}\n\n${_localTimeString}\n\nContext:`;
 
   const contextSources = [];
   if (filteredMemories.length > 0) contextSources.push(`- ${filteredMemories.length} user memories`);

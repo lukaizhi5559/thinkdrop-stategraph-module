@@ -2127,6 +2127,12 @@ The user's request does NOT match any installed skill.
         planId: _planId,
         content: planContent,
         skillPlanJson,
+        // Preserve multi-intent context so plan:approve can restore the queue
+        // after the graph exits at the approval gate (planApprovalMode: 'always').
+        isMultiIntent: state.isMultiIntent || false,
+        intentQueue:   state.intentQueue || [],
+        intentResults: state.intentResults || [],
+        dataContext:   state.dataContext || {},
       });
     }
     return {

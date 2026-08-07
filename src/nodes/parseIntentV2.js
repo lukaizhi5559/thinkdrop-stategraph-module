@@ -133,23 +133,78 @@ module.exports = async function parseIntentV2(state) {
   if (intentPlan && Array.isArray(intentPlan) && intentPlan.length > 1) {
     logger.info(`[Node:ParseIntentV2] intentPlan (${intentPlan.length} sub-prompts) — processing multi-intent pipeline`);
 
-    const firstSub    = intentPlan[0];
-    const firstResult = await module.exports({
-      ...state,
-      message:         firstSub.text,
-      resolvedMessage: firstSub.text,
-      intentPlan:      [firstSub],
-    });
+    // ── 3a. Group consecutive command_automate sub-prompts into merged entries ──
+    // Consecutive command_automate sub-prompts (e.g. "post on Twitter", "share on
+    // Facebook", "share on LinkedIn") target different agents for the SAME goal.
+    // Merging them ensures resolveAgent sees ALL agents, preflightAgents checks ALL
+    // agents, and planSkillsV2 generates ONE unified plan with a step per agent.
+    // Non-consecutive command_automate sub-prompts stay separate — each is a
+    // single-agent task with data flowing between steps via dependsOn.
+    const grouped = [];
+    let _gi = 0;
+    while (_gi < intentPlan.length) {
+      const sp = intentPlan[_gi];
+      if ((sp.estimatedIntent || 'command_automate') === 'command_automate') {
+        const group = [sp];
+        let _gj = _gi + 1;
+        while (_gj < intentPlan.length &&
+               (intentPlan[_gj].estimatedIntent || 'command_automate') === 'command_automate') {
+          group.push(intentPlan[_gj]);
+          _gj++;
+        }
+        if (group.length === 1) {
+          grouped.push(group[0]);
+        } else {
+          const mergedText = group.map(g => g.text).join('; ');
+          const mergedDependsOn = [...new Set(group.flatMap(g => g.dependsOn || []))].sort((a, b) => a - b);
+          const anyLongRunning = group.some(g => g.isLongRunning);
+          grouped.push({
+            text:            mergedText,
+            estimatedIntent: 'command_automate',
+            confidence:      0.90,
+            order:           group[0].order,
+            dependsOn:       mergedDependsOn,
+            isLongRunning:   anyLongRunning,
+            dataTemplate:    group[0].dataTemplate || null,
+          });
+          logger.info(`[Node:ParseIntentV2] Merged ${group.length} consecutive command_automate sub-prompts into one: "${mergedText.slice(0, 80)}"`);
+        }
+        _gi = _gj;
+      } else {
+        grouped.push(sp);
+        _gi++;
+      }
+    }
 
-    const intentQueue = intentPlan.slice(1).map(sp => ({
-      ...sp,
-      intent:     sp.estimatedIntent || 'command_automate',
-      confidence: typeof sp.confidence === 'number' ? sp.confidence : 0.70,
-    }));
+    // ── 3b. If grouping collapsed everything to a single entry, use single-intent path ──
+    // This handles the pure multi-agent case (all command_automate → one group →
+    // single intent with merged text). Falls through to section 4 below.
+    if (grouped.length === 1) {
+      logger.info(`[Node:ParseIntentV2] All sub-prompts collapsed to single unified intent — using single-intent path`);
+      intentPlan = [grouped[0]];
+      // Fall through to section 4 (single intentPlan passthrough)
+    } else {
+      // Mixed intents: use grouped array for multi-intent pipeline
+      intentPlan = grouped;
 
-    intentQueue.forEach(sp => logger.debug(`[Node:ParseIntentV2] Queue [${sp.order}] "${sp.text.slice(0, 60)}" → ${sp.intent}`));
+      const firstSub    = intentPlan[0];
+      const firstResult = await module.exports({
+        ...state,
+        message:         firstSub.text,
+        resolvedMessage: firstSub.text,
+        intentPlan:      [firstSub],
+      });
 
-    return { ...firstResult, intentQueue, intentResults: [], dataContext: {}, isMultiIntent: true, originalPrompt: message };
+      const intentQueue = intentPlan.slice(1).map(sp => ({
+        ...sp,
+        intent:     sp.estimatedIntent || 'command_automate',
+        confidence: typeof sp.confidence === 'number' ? sp.confidence : 0.70,
+      }));
+
+      intentQueue.forEach(sp => logger.debug(`[Node:ParseIntentV2] Queue [${sp.order}] "${sp.text.slice(0, 60)}" → ${sp.intent}`));
+
+      return { ...firstResult, intentQueue, intentResults: [], dataContext: {}, isMultiIntent: true, originalPrompt: message };
+    }
   }
 
   // ── 4. Trust decomposePromptV2 intentPlan (single sub-prompt) ───────────────

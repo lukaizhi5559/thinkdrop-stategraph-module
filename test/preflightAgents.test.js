@@ -627,6 +627,41 @@ async function runTests() {
     if (authEvents.length === 0) throw new Error('Expected preflight:auth_required event for unknown auth status CLI');
   });
 
+  await it('noCli build failure soft-fails to shell.run fallback instead of planError', async () => {
+    // Resolver hallucinated a CLI agent for a service that has no CLI tool.
+    // cli.agent build_agent returns { ok: false, noCli: true, error: 'No CLI found...' }.
+    // preflight should NOT set planError — it should warn and let planning fall back
+    // to generic shell.run.
+    const state = makeState({
+      agents: [],
+      userMessage: 'check the time on my computer',
+    });
+    state.resolveAgentResult = {
+      agents: [{ agentId: 'system_time.agent', create: true, type: 'cli', service: 'system_time' }],
+    };
+    state.mcpAdapter.callService = async function(service, action, payload, opts) {
+      if (service === 'command' && action === 'agent.list') return { data: [] };
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'build_agent') {
+        return { data: { ok: false, noCli: true, service: 'system_time', error: 'No CLI found for "system_time". LLM lookup returned no CLI or install method.' } };
+      }
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+        return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [] } };
+      }
+      if (service === 'command' && action === 'ping') return { ok: true };
+      if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+      return null;
+    };
+    state.mcpAdapter.calls = [];
+
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Expected no planError for noCli soft-fail, got: ${result.planError}`);
+    const skipEvents = state._progressEvents.filter(e => e.type === 'preflight:agent_create_skipped');
+    if (skipEvents.length === 0) throw new Error('Expected preflight:agent_create_skipped event for noCli failure');
+    const warnings = result.preflightResult?.warnings || [];
+    const createFailedWarnings = warnings.filter(w => w.type === 'agent_create_failed');
+    if (createFailedWarnings.length === 0) throw new Error('Expected agent_create_failed warning in preflightResult');
+  });
+
   console.log(`\n${'─'.repeat(72)}`);
   if (_failed === 0) {
     console.log(`✅ All ${_passed} tests passed.`);

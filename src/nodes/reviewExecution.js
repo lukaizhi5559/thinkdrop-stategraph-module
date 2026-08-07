@@ -423,12 +423,48 @@ module.exports = async function reviewExecution(state) {
       // answer the user asked for but the synthesis got it wrong. If so, correct
       // the answer directly from page text — no replan needed.
       if (snapshot && llmBackend && synthesizeOutput) {
-        const contradiction = await assessAnswerContradiction(
+        let contradiction = await assessAnswerContradiction(
           userMessage, synthesizeOutput, snapshot, llmBackend, context, logger
         );
         if (contradiction?.corrected) {
           logger.info(`[Node:ReviewExecution] Answer-only contradiction detected — correcting synthesis from page text: ${contradiction.reason}`);
-          // Replace the stale synthesize result with the corrected answer
+
+          // ── Truncation recovery ──────────────────────────────────────────
+          // If the corrected answer indicates the AI response was truncated/incomplete
+          // ("has not yet been generated", "cuts off at", etc.), the initial page text
+          // capture may have been too early. Wait a few seconds, re-capture getPageText,
+          // and re-run the contradiction check with the fresh text. One-shot — no loop.
+          const TRUNCATION_INDICATORS = /has not yet been generated|cuts off at|not yet been generated|still generating|still streaming|response is incomplete|partially generated|hasn't been generated|not yet generated|response hasn't/i;
+
+          if (TRUNCATION_INDICATORS.test(contradiction.answer) && browserSessionId && mcpAdapter) {
+            logger.info(`[Node:ReviewExecution] Truncation detected in corrected answer — waiting 5s and re-capturing page text`);
+            await new Promise(r => setTimeout(r, 5000));
+            try {
+              const reSnapRes = await mcpAdapter.callService('command', 'command.automate', {
+                skill: 'browser.act',
+                args: { action: 'getPageText', sessionId: browserSessionId },
+              }, { timeoutMs: 12000 });
+              const reSnapData = reSnapRes?.data || reSnapRes;
+              const reSnapRaw = reSnapData?.result?.stdout || reSnapData?.stdout || reSnapData?.result || null;
+              const reSnapshot = reSnapRaw ? String(reSnapRaw) : null;
+
+              if (reSnapshot && reSnapshot.length > (snapshot || '').length) {
+                logger.info(`[Node:ReviewExecution] Re-captured page text: ${reSnapshot.length} chars (was ${(snapshot || '').length} chars) — re-running contradiction check`);
+                const reContradiction = await assessAnswerContradiction(
+                  userMessage, synthesizeOutput, reSnapshot, llmBackend, context, logger
+                );
+                if (reContradiction?.corrected && !TRUNCATION_INDICATORS.test(reContradiction.answer)) {
+                  logger.info(`[Node:ReviewExecution] Re-capture recovery succeeded — full response obtained`);
+                  contradiction = reContradiction;
+                  snapshot = reSnapshot;
+                }
+              }
+            } catch (reSnapErr) {
+              logger.warn(`[Node:ReviewExecution] Re-capture failed: ${reSnapErr.message}`);
+            }
+          }
+
+          // Replace the stale synthesize result with the (possibly recovered) corrected answer
           const _synthIdx = skillResults.findIndex(r => r.skill === 'synthesize');
           if (_synthIdx >= 0) {
             skillResults[_synthIdx] = {
