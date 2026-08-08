@@ -1532,6 +1532,7 @@ module.exports = async function preflightAgents(state) {
           url: a.startUrl,
           manualLogin: false,
           preflightProbe: true,
+          requireCookieConfirmation: !!a._requireCookieConfirmation,
         },
       }, { timeoutMs: 10 * 60 * 1000 }).catch((err) => ({
         ok: false,
@@ -1557,15 +1558,23 @@ module.exports = async function preflightAgents(state) {
   const authFailures = [];
   for (const a of browserAgentsNeedingAuth) {
     // ── Unauthenticated agent invariant: skip probe, force auth ─────────────
-    // An agent that has never been authenticated (authed_at is NULL) has no
-    // browser session. This covers both newly built agents and agents built
-    // in a previous session where the user cancelled before signing in.
-    // The probe can only produce false positives on public landing pages.
-    const _forceAuth = a._newlyCreated || !a.authedAt;
+    // A newly built agent has no persistent profile yet — the probe can only
+    // produce false positives on public landing pages, so force auth directly.
+    //
+    // An agent that has never recorded authed_at (authedAt is null) but was
+    // built in a previous session MAY have valid session cookies in its
+    // persistent Chrome profile (e.g. the user logged in directly via Chrome,
+    // or a previous auth attempt failed before recording authed_at). For these,
+    // let the silent preflight probe run with requireCookieConfirmation=true
+    // so the cookie sniff can detect existing auth and skip the auth banner.
+    const _forceAuth = a._newlyCreated;
+    // Never-authenticated (but not newly created) agents require cookie
+    // confirmation before the probe may declare them authenticated.
+    a._requireCookieConfirmation = !a.authedAt && !a._newlyCreated;
     if (_forceAuth) {
       const _svcKey = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
       const _iconUrl = a.iconUrl || agentIdToIconUrl(a.agentId);
-      const _reason = a._newlyCreated ? 'newly built' : 'never authenticated';
+      const _reason = 'newly built';
       logger.info(`[Node:PreflightAgents] ${a.agentId} is ${_reason} — forcing auth without probe`);
       _emitProgress({
         type: 'preflight:auth_required',

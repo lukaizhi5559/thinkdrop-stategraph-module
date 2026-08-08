@@ -227,7 +227,7 @@ function buildRuntimeParams(userMessage, profileContext, priorSynthesizedContent
     const myPhone = profileContext.facts.find(f => f.field === 'my_phone');
     if (myPhone?.value) { params.TO = myPhone.value; params.PHONE = myPhone.value; }
     const myEmail = profileContext.facts.find(f => f.field === 'my_email');
-    if (myEmail?.value && !params.EMAIL) params.EMAIL = myEmail.value;
+    if (myEmail?.value && !params.MY_EMAIL) params.MY_EMAIL = myEmail.value;
   }
   if (priorSynthesizedContent && !params.BODY) {
     params.BODY = priorSynthesizedContent
