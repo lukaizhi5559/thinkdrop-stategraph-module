@@ -186,6 +186,9 @@ module.exports = async function planExecutor(state) {
     intentQueue:      state._resumeIntentQueue || [],
     intentResults:    state._resumeIntentResults || [],
     dataContext:      state._resumeDataContext || {},
+    // Restore priorSynthesizedContent so executeCommand can substitute {{BODY}}
+    // and other buildRuntimeParams tokens in agent-path steps.
+    priorSynthesizedContent: state._resumePriorSynthesizedContent || '',
     originalPrompt,
   };
 };

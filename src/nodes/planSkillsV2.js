@@ -2133,6 +2133,10 @@ The user's request does NOT match any installed skill.
         intentQueue:   state.intentQueue || [],
         intentResults: state.intentResults || [],
         dataContext:   state.dataContext || {},
+        // Preserve priorSynthesizedContent so executeCommand can substitute
+        // {{BODY}} (and other buildRuntimeParams tokens) in agent-path steps
+        // after the plan:approve round-trip.
+        priorSynthesizedContent: priorSynthesizedContent || '',
       });
     }
     return {
@@ -2143,6 +2147,7 @@ The user's request does NOT match any installed skill.
       skillCursor: 0,
       planError: null,
       recoveryContext: null,
+      priorSynthesizedContent: priorSynthesizedContent || '',
     };
   }
 
@@ -2166,6 +2171,7 @@ The user's request does NOT match any installed skill.
     planError: null,
     recoveryContext: null,
     _skillPlanFile,
+    priorSynthesizedContent: priorSynthesizedContent || '',
   };
 }
 

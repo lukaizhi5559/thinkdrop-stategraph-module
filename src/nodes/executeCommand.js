@@ -36,6 +36,9 @@ const path = require('path');
 
 // Skill thinking helper for generating human-readable thinking messages
 const { generateSkillThinking } = require('../utils/skillThinking');
+// Runtime param builder + token substitution for {{BODY}}, {{EMAIL}}, {{PHONE}},
+// {{URL}}, {{AMOUNT}}, {{ZIP}}, {{FILENAME}}, {{TO}}, {{TIME_MIN/MAX}}, etc.
+const { buildRuntimeParams, substituteTokens } = require('../utils/planSkillsHelpers');
 
 // ── Thin post-failure handler ──────────────────────────────────────────────
 // Replaces the heavy recoverSkill node. Does a quick LLM assessment of the
@@ -3669,6 +3672,24 @@ Please try again or search with different terms.`;
     resolvedArgs = JSON.parse(argsJson);
   }
 
+  // ── {{BODY}}, {{EMAIL}}, {{PHONE}}, {{URL}}, {{AMOUNT}}, ... ──────────────
+  // buildRuntimeParams knows how to resolve these from the user message +
+  // priorSynthesizedContent. Wired into the agent path (browser.agent/cli.agent/
+  // user.agent) so the LLM planner can use {{BODY}} in task strings.
+  // NOTE: profileContext is NOT in executeCommand state (it's planning-time only
+  // in planSkillsV2). Pass {} — the profile-facts fallback for {{EMAIL}}/{{PHONE}}
+  // won't fire here, but {{BODY}} (from priorSynthesizedContent) and {{URL}}/
+  // {{AMOUNT}}/{{ZIP}}/{{FILENAME}} (from the user message) still resolve.
+  // Profile-based credentials use {{service:field}} keychain tokens, which
+  // resolveStepCredentials handles later.
+  const _priorSynth = state.priorSynthesizedContent || '';
+  const _runtimeParams = buildRuntimeParams(state.resolvedMessage || state.message || '', {}, _priorSynth);
+  if (_runtimeParams && Object.keys(_runtimeParams).length > 0) {
+    let _rtArgsJson = JSON.stringify(resolvedArgs);
+    _rtArgsJson = substituteTokens(_rtArgsJson, _runtimeParams, logger);
+    resolvedArgs = JSON.parse(_rtArgsJson);
+  }
+
   // ── Guard: fail fast if a URL arg still contains an unresolved template token ─────────────
   // Prevents navigating to literal "{{prev_stdout}}" when the prior step returned nothing.
   // Regex catches template variables including dot notation (e.g., {{prev_stdout.besturl}})
@@ -3748,6 +3769,38 @@ Please try again or search with different terms.`;
       mcpAdapter,
       state._gatheredVars || {}
     );
+  }
+
+  // ── Guard: fail fast if ANY unresolved {{placeholder}} remains ───────────────
+  // Catches {{BODY}}, {{result}}, {{content}}, {{answer}}, and any other token
+  // the LLM emitted that no substitution rule matched. Prevents the literal
+  // placeholder text from being typed into a form field (the Facebook bug where
+  // "{{BODY}}" was typed into the composer and Enter was pressed, creating a
+  // newline instead of submitting).
+  // Intentional late-resolved tokens are excluded:
+  //   {{service:field}}  — colon form; resolved by resolveStepCredentials above
+  //                        (or routed to auth_wall sub-plan for browser.act fill)
+  //   {{_varName}}       — underscore prefix; resolved from _gatheredVars
+  //                        (or collected by an ask_user sub-plan)
+  {
+    // Match {{identifier}} but exclude {{_...}} (underscore prefix).
+    // The colon form {{service:field}} is matched here but filtered out below
+    // so the auth-wall handler at line ~4388 can still own that case.
+    const _UNRESOLVED_RE = /\{\{(?!_)[a-zA-Z][a-zA-Z0-9_]*(?::[a-zA-Z0-9_]+)?\}\}/g;
+    const _SERVICE_CRED_TOKEN = /\{\{[a-z0-9_.-]+:[a-z0-9_]+\}\}/i;
+    const _argsJson = JSON.stringify(resolvedArgs);
+    const _allMatches = _argsJson.match(_UNRESOLVED_RE) || [];
+    const _unresolved = [...new Set(_allMatches)].filter(t => !_SERVICE_CRED_TOKEN.test(t));
+    if (_unresolved.length > 0) {
+      const _placeholderError = `Unresolved placeholder(s) in step args: ${_unresolved.join(', ')}. No substitution rule matched — the plan is malformed. Please retry.`;
+      logger.error(`[Node:ExecuteCommand] Step ${skillCursor + 1} (${skill}) — ${_placeholderError}`);
+      return {
+        ...state,
+        planError: _placeholderError,
+        failedStep: { step: skillCursor + 1, skill, description, error: _placeholderError, args: args || {} },
+        commandExecuted: false,
+      };
+    }
   }
 
   // Normalize shell.run args: LLM sometimes generates 'command' instead of 'cmd'.
