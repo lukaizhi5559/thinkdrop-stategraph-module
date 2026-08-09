@@ -770,6 +770,15 @@ class StateGraphBuilder {
                 stepIndex: state.pendingQuestion.stepIndex,
                 agentId: state.pendingQuestion.agentId || null,
                 source:  'single_intent_pause',
+                // Forward ALL pendingQuestion fields so the renderer can show
+                // PartialFailureCard for agent failures (not just the generic banner).
+                _isAgentAskUser: state.pendingQuestion._isAgentAskUser === true,
+                partialProgress: state.pendingQuestion.partialProgress || null,
+                currentUrl: state.pendingQuestion.currentUrl || null,
+                keepSession: state.pendingQuestion.keepSession === true,
+                originalTask: state.pendingQuestion.originalTask || null,
+                skill: state.pendingQuestion.skill || null,
+                freeText: true,
               });
             } catch (_) {}
           }
@@ -792,6 +801,13 @@ class StateGraphBuilder {
                 stepIndex: state.pendingQuestion.stepIndex,
                 agentId: state.pendingQuestion.agentId || null,
                 source:  'multi_intent_pause',
+                _isAgentAskUser: state.pendingQuestion._isAgentAskUser === true,
+                partialProgress: state.pendingQuestion.partialProgress || null,
+                currentUrl: state.pendingQuestion.currentUrl || null,
+                keepSession: state.pendingQuestion.keepSession === true,
+                originalTask: state.pendingQuestion.originalTask || null,
+                skill: state.pendingQuestion.skill || null,
+                freeText: true,
               });
             } catch (_) {}
           }

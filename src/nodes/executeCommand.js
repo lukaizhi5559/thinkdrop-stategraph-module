@@ -164,6 +164,11 @@ async function _thinPostFailureHandler(state) {
   const _failedSkill = failedStep.skill || null;
   const _failedOriginalTask = failedStep.args?.task || failedStep.args?.goal || null;
   if (_failedAgentId && (_failedSkill === 'browser.agent' || _failedSkill === 'cli.agent' || _failedSkill === 'playwright.agent')) {
+    // Derive current URL and sessionId from state or failedStep so the
+    // PartialFailureCard can show context and the resume handler can reuse
+    // the live browser session.
+    const _currentUrl = state.activeBrowserUrl || failedStep.args?.url || failedStep.loginUrl || null;
+    const _sessionId = state.activeBrowserSessionId || failedStep.args?.sessionId || failedStep.sessionId || null;
     return {
       ...state,
       recoveryAction: 'ask_user',
@@ -183,6 +188,14 @@ async function _thinPostFailureHandler(state) {
         uiStepIndex: state._resumeStepIndex ?? skillCursor ?? 0,
         originalTask: _failedOriginalTask,
         trainingHandoff: true,
+        // PartialFailureCard fields — render the new card for all agent failures.
+        // partialProgress is null here (no LLM-generated summary for generic
+        // failures), but the renderer will still show the PartialFailureCard
+        // because _isAgentAskUser is true.
+        partialProgress: null,
+        currentUrl: _currentUrl,
+        sessionId: _sessionId,
+        keepSession: true,
       },
       commandExecuted: false,
     };
@@ -1315,7 +1328,7 @@ module.exports = async function executeCommand(state) {
     }
 
     // ── {{PREV_OUTPUT_FILE}} — for browser.agent steps that need bulk content ──
-    // browser.agent task strings are capped at 300 chars, so we can't inline content.
+    // browser.agent task strings should stay focused on intent, not bulk content.
     // Write the prior step's output to a temp file and substitute the path marker.
     if (skill === 'browser.agent' && prevStdout) {
       const _tmpFile = `/tmp/thinkdrop_pipe_${Date.now()}.txt`;
@@ -3717,24 +3730,20 @@ Please try again or search with different terms.`;
     throw new Error(`Unresolved template variable ${unresolvedToken} in URL — prior step returned no output. Check that the preceding step succeeded and produced a URL.`);
   }
 
-  // ── browser.agent task-description cap ───────────────────────────────────────
+  // ── browser.agent task-description cleanup ──────────────────────────────────
   // The {{synthesisAnswer}} token expands to the full prior synthesize output, which
   // may include failure diagnostics, markdown reports, or [DATA FROM PRIOR STEP]
   // blocks.  These are injected into the browser.agent `task` string that playwright.agent
-  // sees as its planning goal — long or contradictory narratives cause the LLM to
-  // skip steps like pasteAttachment. Cap the task field at 300 chars for browser.agent
-  // steps so the planner sees only the intent, not the full payload.
-  // The actual email body content is delivered via the `type` step at runtime.
+  // sees as its planning goal. Strip those payload blocks so the planner sees only the
+  // intent. The actual bulk content is delivered via {{PREV_OUTPUT_FILE}} (temp file)
+  // or the `type` step at runtime — no cap needed on the remaining task description.
+  // Previously a 300-char cap here truncated legitimate multi-entity goals like
+  // "Repeat this process for artists KB and Newsboys" — dropping entities silently.
   if (skill === 'browser.agent' && resolvedArgs && typeof resolvedArgs.task === 'string') {
     let _task = resolvedArgs.task;
     // Strip [DATA FROM PRIOR STEP] and [CONTENT OF ...] injection blocks
     _task = _task.replace(/\[DATA FROM PRIOR STEP\][^[]*?(?=\[|$)/gs, '').trim();
     _task = _task.replace(/\[CONTENT OF [^\]]*\][^[]*?(?=\[|$)/gs, '').trim();
-    // Cap remaining task description at 300 chars
-    if (_task.length > 300) {
-      _task = _task.slice(0, 297) + '...';
-      logger.debug(`[Node:ExecuteCommand] browser.agent task description capped at 300 chars`);
-    }
     if (_task !== resolvedArgs.task) {
       resolvedArgs = { ...resolvedArgs, task: _task };
     }
@@ -5200,6 +5209,11 @@ Please try again or search with different terms.`;
           currentUrl: raw.currentUrl || null,
           keepSession: raw.keepSession === true,
           originalTask: raw.originalTask || resolvedArgs?.task || resolvedArgs?.goal || null,
+          // PartialFailureCard fields — so the renderer shows the new card
+          // (with completed/remaining lists + action buttons) instead of the
+          // old generic "Action required" banner.
+          _isAgentAskUser: true,
+          partialProgress: raw.partialProgress || null,
           freeText: true,
         });
       }
