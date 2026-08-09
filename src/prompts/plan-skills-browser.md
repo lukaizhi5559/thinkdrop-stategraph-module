@@ -47,3 +47,24 @@ Lowercase service name + `.agent` suffix:
   { "skill": "synthesize", "args": { "prompt": "Summarize the Mars news article" }, "description": "Summarize the article" }
 ]
 ```
+
+### Content creation tasks (playlists, documents, posts, boards)
+
+When the user asks to CREATE something on a web service (playlist, document, board, post, event), the `task` string MUST be step-by-step — not a high-level description. The browser agent fills forms and clicks buttons; it cannot infer multi-step workflows from a vague task.
+
+**Wrong (too vague — the agent will just search, not create):**
+```json
+{ "skill": "browser.agent", "args": { "action": "run", "agentId": "spotify.agent", "task": "Create a playlist named 'Christian Music' and add top songs from Lecrae, KB, and Newsboys" } }
+```
+
+**Right (step-by-step — the agent knows exactly what to do):**
+```json
+{ "skill": "browser.agent", "args": { "action": "run", "agentId": "spotify.agent", "task": "Go to https://open.spotify.com/. Click the '+' or 'Create playlist' button in the left sidebar. A new playlist will appear — click its title/name field and rename it to 'Christian Music'. Then for each artist (Lecrae, KB, Newsboys): click the search bar, type the artist name, press Enter, click on the artist, find their top 3 songs, and click the '...' menu → 'Add to playlist' → 'Christian Music' for each song." } }
+```
+
+**Key rules for content creation tasks:**
+- ALWAYS start with the navigation step (go to the service's main page)
+- ALWAYS include the "create" step explicitly (click Create/New/+, name the item)
+- ALWAYS include each sub-step as a separate instruction (search for X, add Y, select Z)
+- Use the gathered answers from prior context (e.g., playlist name, artist list, song preferences) directly in the task string
+- The task string can be long — that's fine. Precision beats brevity for browser agents.

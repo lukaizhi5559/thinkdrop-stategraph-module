@@ -1,0 +1,57 @@
+{
+  "_comment": "Per-service desktop app capability map for route probing. Used by probeDesktopApp.js to determine if a service's desktop app supports AppleScript automation. Services not listed default to { applescript: false } — desktop route only viable for pure 'open/activate the app' tasks. Add entries only for apps with documented AppleScript suites.",
+  "spotify": {
+    "appName": "Spotify",
+    "applescript": true,
+    "verbs": ["play", "play track", "play playlist", "next track", "previous track", "pause", "playpause"],
+    "loginProbe": "tell application \"Spotify\" to get player state",
+    "loginSuccessValues": ["playing", "paused", "stopped"]
+  },
+  "apple_music": {
+    "appName": "Music",
+    "applescript": true,
+    "verbs": ["play", "play track", "play playlist", "next track", "previous track", "pause"],
+    "loginProbe": "tell application \"Music\" to get player state",
+    "loginSuccessValues": ["playing", "paused", "stopped"]
+  },
+  "youtube": {
+    "appName": null,
+    "applescript": false
+  },
+  "notion": {
+    "appName": "Notion",
+    "applescript": false
+  },
+  "slack": {
+    "appName": "Slack",
+    "applescript": false
+  },
+  "discord": {
+    "appName": "Discord",
+    "applescript": false
+  },
+  "zoom": {
+    "appName": "zoom.us",
+    "applescript": false
+  },
+  "gmail": {
+    "appName": null,
+    "applescript": false
+  },
+  "github": {
+    "appName": null,
+    "applescript": false
+  },
+  "perplexity": {
+    "appName": null,
+    "applescript": false
+  },
+  "chatgpt": {
+    "appName": null,
+    "applescript": false
+  },
+  "claude": {
+    "appName": null,
+    "applescript": false
+  }
+}

@@ -4894,6 +4894,7 @@ Please try again or search with different terms.`;
           stepIndex: agentQuestion.idx,
           uiStepIndex: state._resumeStepIndex ?? agentQuestion.idx,
           originalTask: agentQuestion.args?.task || agentQuestion.args?.goal,
+          partialProgress: agentQuestion.partialProgress || null,
         },
       };
     }
@@ -5222,6 +5223,11 @@ Please try again or search with different terms.`;
           uiStepIndex: state._resumeStepIndex ?? skillCursor,
           originalTask: raw.originalTask || resolvedArgs?.task || resolvedArgs?.goal,
           trainingHandoff: true,
+          // Partial-progress summary (from playwright.agent via browser.agent).
+          // When present, the renderer shows a partial-failure QuestionCard with
+          // "Try to finish" / "Train me with a recipe" / "Other" instead of the
+          // generic failure banner.
+          partialProgress: raw.partialProgress || null,
           // Train-from-current-page context: the page the failure occurred on
           // and whether the playwright session was kept alive.
           currentUrl: raw.currentUrl || null,
@@ -5274,6 +5280,7 @@ Please try again or search with different terms.`;
           stepIndex: skillCursor,
           uiStepIndex: state._resumeStepIndex ?? skillCursor,
           originalTask: resolvedArgs?.task || resolvedArgs?.goal,
+          partialProgress: raw.partialProgress || null,
           needsCredentials: raw.needsCredentials || false,
         },
         commandExecuted: false,

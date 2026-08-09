@@ -32,6 +32,10 @@ const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const MAX_ROUNDS = 3;
 const MAX_AUTH_ROUNDS = 10; // auth sign-ins don't count against Q&A budget
 
+// ── Grill-Me Phase B: batched question constants ─────────────────────────────
+const GRILL_MAX_ROUNDS = 5;
+const GRILL_MODE = process.env.THINKDROP_GRILL_MODE === '1';
+
 const SYSTEM_PROMPT = `You are a task readiness checker for a desktop automation system.
 
 Given a user's request and what is already known, decide if the task is ready to execute — or if one critical piece of information is missing.
@@ -156,6 +160,20 @@ module.exports = async function gatherPlanContext(state) {
   if (!llmBackend) {
     logger.warn('[Node:GatherPlanContext] No llmBackend — skipping');
     return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  }
+
+  // ── Grill-Me Phase B: batched questioning path ──────────────────────────────
+  // When THINKDROP_GRILL_MODE=1, use the new memory-first batched Q&A loop
+  // instead of the legacy single-question loop. Falls back to legacy if the
+  // grill loop fails for any reason.
+  if (GRILL_MODE) {
+    try {
+      logger.info('[Node:GatherPlanContext] Grill-Me mode enabled — running batched Q&A loop');
+      return await _runGrillLoop(state, logger);
+    } catch (grillErr) {
+      logger.warn(`[Node:GatherPlanContext] Grill-Me loop failed (${grillErr.message}) — falling back to legacy loop`);
+      // Fall through to legacy loop
+    }
   }
 
   // ── Inject follow-up target into resolvedMessage for downstream nodes ────────
@@ -309,3 +327,359 @@ module.exports = async function gatherPlanContext(state) {
   }
   return { ...state, resolvedMessage: enriched, planGatheringComplete: true, planGatheringRound: round, planGatheringAnswers: answers };
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Grill-Me Phase B: memory-first batched questioning
+// ─────────────────────────────────────────────────────────────────────────────
+
+const GRILL_SYSTEM_PROMPT = `You are a task readiness griller for a desktop automation system.
+
+Your job: given a user's request, what's already known (memory, probes, route decision), and prior clarifications, generate the FRONTIER of questions — every question whose prerequisites are already settled. Don't ask questions that depend on answers you haven't heard yet.
+
+Respond with ONLY valid JSON in exactly this shape:
+{
+  "complete": false,
+  "requiredInputs": [
+    { "name": "<input_slot>", "why": "<why needed>", "memoryQuery": "<search query for user-memory>" }
+  ],
+  "questions": [
+    {
+      "id": "q1",
+      "text": "<question text, 15 words max>",
+      "type": "confirm" | "text" | "choice",
+      "options": [{ "label": "<short>", "value": "<value>", "primary": true|false, "description": "<optional>" }],
+      "freeText": true|false,
+      "memoryResolved": true|false,
+      "memoryText": "<factual statement to store in memory if user confirms>",
+      "memoryTextTemplate": "<factual statement with {answer} placeholder, for free-text questions>"
+    }
+  ],
+  "routeConfirmation": {
+    "service": "<service name>",
+    "route": "<route from ROUTE DECISION>",
+    "reason": "<human-readable reason>",
+    "question": "<confirmation question, 12 words max>"
+  }
+}
+OR: {"complete": true} when everything is resolved.
+
+Rules:
+- ALWAYS include routeConfirmation if a ROUTE DECISION is provided and hasn't been confirmed yet.
+- ALWAYS include at least one question on round 1 — never return complete:true on the first round.
+- For each requiredInput, the system has already run memoryQuery and attached results in MEMORY RESULTS. If memory found enough data, set memoryResolved:true and ask a CONFIRMATION question (e.g. "I found N songs in your memory. Use these?"). If memory found nothing or too little, ask a from-scratch question.
+- BATCH AGGRESSIVELY: Ask ALL questions you need answered in ONE batch — even if some answers might influence other questions' context. The user can answer them all at once. Do NOT split related questions across multiple rounds.
+- Questions about the same topic (e.g., playlist name, genre, artists, songs) MUST be in the same batch — never ask them one at a time.
+- Only defer a question to a later round if it TRULY cannot be asked without a prior answer (e.g., "Which specific album by [artist]?" when you don't know the artist yet). Even then, prefer asking "Which artist and album?" as one question.
+- NEVER ask about things the system can look up (timezone, credentials, installed apps, auth status — these are in PROBE RESULTS).
+- NEVER ask about things already answered in PRIOR CLARIFICATIONS.
+- If a PRIOR CLARIFICATION answer starts with "yes —" or "accepted", it is a CONFIRMED answer — do NOT ask that question again.
+- If the ROUTE DECISION block is empty or all routes are confirmed, do NOT include a routeConfirmation.
+- Questions should be concise (15 words max). Options should be short labels.
+- memoryText/memoryTextTemplate: a clean factual statement for future memory storage. Example: "User's preferred Spotify playlist name is '{answer}'". This will be stored as type 'gather_clarification' so future tasks can find it.
+- Max 5 questions per batch.`;
+
+/**
+ * Phase B1: Search user-memory for each required input slot.
+ * @param {array} requiredInputs - [{ name, memoryQuery }] from the LLM
+ * @param {object} mcpAdapter
+ * @param {string} userId
+ * @param {object} logger
+ * @returns {Promise<object>} { slotName: { found: number, snippets: string[] } }
+ */
+async function _resolveTaskInputsFromMemory(requiredInputs, mcpAdapter, userId, logger) {
+  if (!requiredInputs || requiredInputs.length === 0) return {};
+  const results = {};
+  await Promise.all(requiredInputs.map(async (input) => {
+    if (!input.memoryQuery) {
+      results[input.name] = { found: 0, snippets: [] };
+      return;
+    }
+    try {
+      const res = await mcpAdapter.callService('user-memory', 'memory.search', {
+        query: input.memoryQuery,
+        userId,
+        limit: 10,
+        filters: {},
+      }).catch(() => null);
+      const data = res?.data || res;
+      const hits = Array.isArray(data?.results) ? data.results : [];
+      const snippets = hits.slice(0, 5).map(h => h.text || h.content || '').filter(t => t.length > 5);
+      results[input.name] = { found: snippets.length, snippets };
+      logger.info(`[Node:GatherPlanContext:Grill] Memory search for "${input.memoryQuery}" → ${snippets.length} hits`);
+    } catch (e) {
+      results[input.name] = { found: 0, snippets: [] };
+      logger.debug(`[Node:GatherPlanContext:Grill] Memory search failed for "${input.memoryQuery}": ${e.message}`);
+    }
+  }));
+  return results;
+}
+
+/**
+ * Phase B2: Ask the LLM to generate a batch of questions (the frontier).
+ */
+async function _askLLMBatch(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, routeDecision, memoryResults, logger, taskClassification) {
+  const priorBlock = priorQA.length > 0
+    ? '\n\nPRIOR CLARIFICATIONS:\n' + priorQA.map(qa => {
+        const displayAnswer = qa.confirmed ? `yes — ${qa.answer}` : qa.answer;
+        return `Q: ${qa.question}\nA: ${displayAnswer}`;
+      }).join('\n')
+    : '';
+
+  const isFollowUp = !!(taskClassification?.isFollowUp);
+  const recentCtx = formatHistoryTurns(conversationHistory || [], { isFollowUp, maxTurns: 6 });
+  const historyBlock = recentCtx ? `\n\nRECENT CONVERSATION:\n${recentCtx}` : '';
+
+  // Route decision block — only include routes that haven't been confirmed yet.
+  // Confirmed routes are tracked via rd.confirmed=true (set when user accepts).
+  const unconfirmedRoutes = routeDecision
+    ? Object.entries(routeDecision).filter(([_, rd]) => !rd.confirmed)
+    : [];
+  const routeBlock = unconfirmedRoutes.length > 0
+    ? '\n\nROUTE DECISION (from preflight probes — confirm this with the user):\n' +
+      unconfirmedRoutes.map(([svc, rd]) =>
+        `- ${svc}: route=${rd.route}, reason="${rd.reason}"`
+      ).join('\n')
+    : '';
+
+  // Memory results block
+  const memoryBlock = memoryResults && Object.keys(memoryResults).length > 0
+    ? '\n\nMEMORY RESULTS (already searched — use these, don\'t re-ask):\n' +
+      Object.entries(memoryResults).map(([slot, mr]) =>
+        `- ${slot}: ${mr.found} hit(s)${mr.snippets.length > 0 ? ` — ${mr.snippets.slice(0, 3).join(' | ').slice(0, 200)}` : ''}`
+      ).join('\n')
+    : '';
+
+  // Unauthed agents (for auth questions)
+  const unauthedAgents = (preflightResult?.agents || [])
+    .filter(a => a.authed === false && (a.type === 'browser' || a.type === 'cli'))
+    .map(a => `- ${a.agentId} [NEEDS AUTH]`);
+  const unauthedBlock = unauthedAgents.length > 0
+    ? `\n\nUNAUTHENTICATED AGENTS:\n${unauthedAgents.join('\n')}`
+    : '';
+
+  const prompt = `REQUEST: "${originalMsg}"
+TASK: "${userMsg}"${priorBlock}${historyBlock}${routeBlock}${memoryBlock}${unauthedBlock}
+
+Generate the frontier of questions for this task.`;
+
+  try {
+    const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: GRILL_SYSTEM_PROMPT } }, { maxTokens: 600, temperature: 0 });
+    const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
+    const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const jsonMatch = stripped.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      logger.warn(`[Node:GatherPlanContext:Grill] No JSON in LLM response: "${text.slice(0, 100)}" — treating as complete`);
+      return { complete: true };
+    }
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (typeof parsed.complete !== 'boolean' && !parsed.questions) throw new Error('invalid response shape');
+    return parsed;
+  } catch (err) {
+    logger.warn(`[Node:GatherPlanContext:Grill] LLM call failed (${err.message}) — passing through`);
+    return { complete: true };
+  }
+}
+
+/**
+ * Phase B5: Record gather answers to user-memory as clean factual statements.
+ * Fire-and-forget — doesn't block planning.
+ */
+async function _recordGatherAnswersToMemory(questions, answers, mcpAdapter, userId, logger) {
+  if (!questions || !answers || !mcpAdapter) return;
+  for (const q of questions) {
+    const answer = answers[q.id];
+    if (!answer || answer.startsWith('route_')) continue; // skip route confirmations
+    let memoryText = q.memoryText || q.memoryTextTemplate;
+    if (!memoryText) continue;
+    if (memoryText.includes('{answer}')) {
+      memoryText = memoryText.replace(/\{answer\}/g, String(answer));
+    }
+    // If memoryText is a fixed statement (confirm questions), only store if user confirmed
+    if (q.memoryText && answer !== q.options?.[0]?.value) continue;
+    try {
+      await mcpAdapter.callService('user-memory', 'memory.store', {
+        text: memoryText,
+        type: 'gather_clarification',
+        userId,
+        tags: ['gather', 'clarification'],
+      }).catch(() => {});
+      logger.info(`[Node:GatherPlanContext:Grill] Recorded to memory: "${memoryText.slice(0, 80)}"`);
+    } catch (e) {
+      logger.debug(`[Node:GatherPlanContext:Grill] memory.store failed: ${e.message}`);
+    }
+  }
+}
+
+/**
+ * Phase B3: Run the batched Q&A loop (grill mode).
+ */
+async function _runGrillLoop(state, logger) {
+  const { intent, message, resolvedMessage, llmBackend, mcpAdapter } = state;
+  const progressCallback = state.progressCallback || null;
+  const gatherAnswerCallback = state.gatherAnswerCallback || null;
+  const userId = state.context?.userId || 'local_user';
+
+  const tc = state._taskClassification || {};
+  let baseMsg = resolvedMessage || message || '';
+  if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp) {
+    baseMsg = `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
+  }
+  const originalMsg = state.originalMessage || state.message || baseMsg;
+  const priorAnswers = Array.isArray(state.planGatheringAnswers) ? state.planGatheringAnswers : [];
+  const answers = [...priorAnswers];
+  const routeDecision = state.routeDecision || state.preflightResult?.routeDecision || {};
+  let round = 0;
+  let batchCounter = 0;
+  let memoryResults = {}; // populated on round 0, used to substitute confirmation answers
+
+  while (round < GRILL_MAX_ROUNDS) {
+    if (progressCallback) progressCallback({ type: 'gathering', message: 'Checking task details…' });
+    logger.info(`[Node:GatherPlanContext:Grill] Round ${round + 1}/${GRILL_MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
+
+    // B2: Ask LLM for the frontier of questions
+    const result = await _askLLMBatch(
+      llmBackend, baseMsg, originalMsg, answers,
+      state.conversationHistory || [], state.resolvedSelfContext || null,
+      state.preflightResult || null, routeDecision, null,
+      logger, tc
+    );
+
+    if (result.complete) {
+      logger.info('[Node:GatherPlanContext:Grill] Task fully specified — passing through');
+      break;
+    }
+
+    // B1: Resolve required inputs from memory (first round only)
+    // Keep memoryResults accessible throughout the loop so we can substitute
+    // confirmation answers ("yes") with the actual memory data.
+    if (round === 0 && result.requiredInputs && mcpAdapter) {
+      memoryResults = await _resolveTaskInputsFromMemory(result.requiredInputs, mcpAdapter, userId, logger);
+      // Re-ask with memory results so the LLM can generate memory-informed questions
+      const resultWithMemory = await _askLLMBatch(
+        llmBackend, baseMsg, originalMsg, answers,
+        state.conversationHistory || [], state.resolvedSelfContext || null,
+        state.preflightResult || null, routeDecision, memoryResults,
+        logger, tc
+      );
+      if (!resultWithMemory.complete) {
+        Object.assign(result, resultWithMemory);
+      }
+    }
+
+    const questions = result.questions || [];
+    const routeConfirmation = result.routeConfirmation || null;
+
+    if (questions.length === 0 && !routeConfirmation) {
+      logger.info('[Node:GatherPlanContext:Grill] No questions to ask — complete');
+      break;
+    }
+
+    // Emit batch to UI via gatherAnswerCallback (batch mode)
+    if (!gatherAnswerCallback) {
+      logger.warn('[Node:GatherPlanContext:Grill] No gatherAnswerCallback — passing through');
+      break;
+    }
+
+    const batchId = `grill_${Date.now()}_${batchCounter++}`;
+    logger.info(`[Node:GatherPlanContext:Grill] Asking batch ${batchId}: ${questions.length} question(s)${routeConfirmation ? ' + route confirmation' : ''}`);
+
+    try {
+      const batchAnswers = await gatherAnswerCallback({
+        batch: true,
+        batchId,
+        questions,
+        routeConfirmation,
+      });
+
+      if (!batchAnswers || Object.keys(batchAnswers).length === 0) {
+        logger.warn('[Node:GatherPlanContext:Grill] Empty batch answers — proceeding');
+        break;
+      }
+
+      // Process answers
+      for (const q of questions) {
+        let ans = batchAnswers[q.id];
+        if (ans) {
+          // B4: If this is a memory-resolved confirmation question and the user
+          // confirmed ("yes", "use_found", "use_*", "confirm", "accept", "true"),
+          // substitute the actual memory data instead of storing "yes" as the answer.
+          // Keep the original answer for the LLM's prior clarifications so it sees
+          // a clear "yes" and stops re-asking the confirmation.
+          let confirmed = false;
+          if (q.memoryResolved && /^(yes|use_found|use_|confirm|accept|true)/i.test(ans)) {
+            confirmed = true;
+            // Prefer memoryText (fixed factual statement with the value embedded),
+            // fall back to joining memory snippets for the matching slot.
+            if (q.memoryText) {
+              ans = q.memoryText;
+            } else if (q.memorySlot && memoryResults[q.memorySlot]?.snippets?.length > 0) {
+              ans = memoryResults[q.memorySlot].snippets.join('; ');
+            }
+            logger.info(`[Node:GatherPlanContext:Grill] Memory-resolved ${q.id} — substituted actual value`);
+          }
+          answers.push({ question: q.text, answer: ans, confirmed });
+          logger.info(`[Node:GatherPlanContext:Grill] Answer ${q.id}: "${String(ans).slice(0, 80)}"`);
+        }
+      }
+
+      // Handle route confirmation
+      if (routeConfirmation && batchAnswers['__route__']) {
+        const routeAns = batchAnswers['__route__'];
+        if (routeAns.startsWith('route_reject:')) {
+          const svc = routeAns.split(':')[1];
+          logger.info(`[Node:GatherPlanContext:Grill] User rejected ${svc} route=${routeConfirmation.route} — will re-probe`);
+          // Mark route as rejected — future rounds won't re-confirm this route
+          if (routeDecision[svc]) {
+            routeDecision[svc] = { ...routeDecision[svc], route: 'rejected_by_user' };
+          }
+          answers.push({ question: routeConfirmation.question, answer: 'rejected — user wants different route' });
+        } else {
+          // Mark this route as confirmed in routeDecision so it stops appearing
+          // in the ROUTE DECISION block on future rounds.
+          const svc = routeConfirmation.service;
+          if (svc && routeDecision[svc]) {
+            routeDecision[svc] = { ...routeDecision[svc], confirmed: true };
+          }
+          answers.push({ question: routeConfirmation.question, answer: 'accepted', confirmed: true });
+        }
+      }
+
+      // B5: Record answers to memory (fire-and-forget)
+      if (mcpAdapter) {
+        _recordGatherAnswersToMemory(questions, batchAnswers, mcpAdapter, userId, logger);
+      }
+
+      if (progressCallback) progressCallback({ type: 'gather_answer_received' });
+    } catch (err) {
+      logger.warn(`[Node:GatherPlanContext:Grill] Batch callback threw: ${err.message} — proceeding`);
+      break;
+    }
+
+    round++;
+  }
+
+  // B6: Enrich resolvedMessage
+  let enriched = baseMsg;
+  const enrichmentParts = [];
+  if (Object.keys(routeDecision).length > 0) {
+    const routeParts = Object.entries(routeDecision)
+      .filter(([_, rd]) => rd.route && rd.route !== 'rejected_by_user')
+      .map(([svc, rd]) => `${svc}: ${rd.route}`);
+    if (routeParts.length > 0) enrichmentParts.push(`Route: ${routeParts.join(', ')}`);
+  }
+  if (answers.length > 0) {
+    enrichmentParts.push(answers.map(qa => `${qa.question}: ${qa.answer}`).join('; '));
+  }
+  if (enrichmentParts.length > 0) {
+    enriched = `${enriched}\n[Additional context: ${enrichmentParts.join('; ')}]`;
+  }
+
+  return {
+    ...state,
+    resolvedMessage: enriched,
+    planGatheringComplete: true,
+    planGatheringRound: round,
+    planGatheringAnswers: answers,
+    routeDecision,
+  };
+}

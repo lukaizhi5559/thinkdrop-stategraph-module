@@ -25,7 +25,8 @@ function writeIntentLog(entry) {
  */
 
 module.exports = async function parseIntentV2(state) {
-  const { message, resolvedMessage, intentPlan, conversationHistory } = state;
+  const { message, resolvedMessage, conversationHistory } = state;
+  let   intentPlan = state.intentPlan;
   const logger = state.logger || console;
   const classifyMessage = resolvedMessage || message || '';
 

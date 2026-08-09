@@ -459,6 +459,25 @@ function _buildSystemPrompt(userMessage, state) {
     result += `\n\n## PRE-FLIGHT RESOLVED FACTS (user confirmed — use these exact values)\n\n${_lines}`;
   }
 
+  // ── Grill-Me: inject batched Q&A answers + route decision ────────────────
+  // The grill loop stores answers as [{ question, answer }] in planGatheringAnswers
+  // and route decisions in routeDecision. Inject both so the planner generates
+  // step-by-step browser agent tasks using the confirmed values.
+  const _planGatheringAnswers = state.planGatheringAnswers;
+  if (Array.isArray(_planGatheringAnswers) && _planGatheringAnswers.length > 0) {
+    const _qaLines = _planGatheringAnswers.map(qa => `- ${qa.question}: ${qa.answer}`).join('\n');
+    result += `\n\n## USER-CONFIRMED DETAILS (from pre-planning Q&A — use these exact values)\n\n${_qaLines}`;
+  }
+  const _routeDecision = state.routeDecision;
+  if (_routeDecision && Object.keys(_routeDecision).length > 0) {
+    const _rdLines = Object.entries(_routeDecision)
+      .filter(([_, rd]) => rd.route && rd.route !== 'rejected_by_user')
+      .map(([svc, rd]) => `- ${svc}: route=${rd.route} (${rd.reason})`);
+    if (_rdLines.length > 0) {
+      result += `\n\n## ROUTE DECISIONS (from preflight probes — mandatory)\n\n${_rdLines.join('\n')}`;
+    }
+  }
+
   // Inject resolved user context (from resolveUserContext node) so planner knows what's available.
   // resolvedSelfContext has FLAT keys: { email, phone, memories, conversation }
   // (resolvedSelfContext.self is never populated — flat keys are the real data)

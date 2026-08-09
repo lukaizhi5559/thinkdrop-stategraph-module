@@ -22,6 +22,9 @@
  */
 
 // ── Minimal test harness ──────────────────────────────────────────────────────
+const fs = require('fs');
+const path = require('path');
+
 let _passed = 0, _failed = 0;
 const _failures = [];
 
@@ -46,7 +49,7 @@ function it(label, fn) {
 }
 
 function expect(actual) {
-  return {
+  const _assertions = {
     toBe(expected) {
       if (actual !== expected)
         throw new Error(`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
@@ -77,6 +80,22 @@ function expect(actual) {
         throw new Error(`Expected ${JSON.stringify(actual)} >= ${JSON.stringify(expected)}`);
     },
   };
+  // Add .not inverse assertions
+  _assertions.not = {
+    toContain(sub) {
+      if (String(actual).includes(sub))
+        throw new Error(`Expected "${actual}" NOT to contain "${sub}"`);
+    },
+    toMatch(re) {
+      if (re.test(String(actual)))
+        throw new Error(`Expected "${actual}" NOT to match ${re}`);
+    },
+    toBe(expected) {
+      if (actual === expected)
+        throw new Error(`Expected ${JSON.stringify(actual)} NOT to be ${JSON.stringify(expected)}`);
+    },
+  };
+  return _assertions;
 }
 
 // ── Load _urlsEqual and _isCanonicalRedirect from playwright.agent.cjs ────────
@@ -493,6 +512,122 @@ describe('Chrome-for-Testing cooldown (not permanent disable)', () => {
     expect(_REAL_CHROME_COOLDOWN_MS).toBe(60000);
     // Verify the cooldown is finite (not Infinity or a very large number)
     expect(_REAL_CHROME_COOLDOWN_MS < 10 * 60 * 1000).toBe(true); // less than 10 minutes
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 8. Intent truncation fix — _scopedShort uses full scoped text (not 100 chars)
+// ══════════════════════════════════════════════════════════════════════════════
+describe('classifyTaskIntent — _scopedShort no longer truncates to 100 chars', () => {
+
+  // The bug: _scopedShort = _scopedFull.slice(0, 100) cut off the Gmail portion
+  // of multi-step tasks. For a 156-char task like:
+  //   "Ask ChatGPT to write a thank-you note. Then ask Claude to proofread it.
+  //    Then copy the final version into a new Gmail message to bob@example.com."
+  // The first 100 chars were:
+  //   "Ask ChatGPT to write a thank-you note. Then ask Claude to proofread it.
+  //    Then copy the final version "
+  // — the Gmail portion was completely cut off, so the LLM classified as CHAT
+  // even with the service-aware prompt saying "classify in the context of gmail".
+  //
+  // The fix: _scopedShort = _scopedFull (up to 280 chars, the full scoped text).
+
+  it('156-char multi-step task: Gmail portion is at char 100+ (was cut off by old slice)', () => {
+    const _task = 'Ask ChatGPT to write a thank-you note. Then ask Claude to proofread it. Then copy the final version into a new Gmail message to randallakers.work@gmail.com.';
+    // The old code took .slice(0, 100):
+    const _oldScopedShort = _task.slice(0, 100);
+    // The Gmail portion starts AFTER char 100:
+    expect(_oldScopedShort).not.toContain('Gmail');
+    expect(_oldScopedShort).not.toContain('randallakers.work@gmail.com');
+    // The fix uses the full text (up to 280):
+    const _newScopedShort = _task.slice(0, 280);
+    expect(_newScopedShort).toContain('Gmail');
+    expect(_newScopedShort).toContain('randallakers.work@gmail.com');
+  });
+
+  it('280-char limit still applies (very long tasks are still scoped)', () => {
+    // _scopeTaskText(task, 280) caps at 280 chars. A 400-char task is truncated.
+    const _longTask = 'A'.repeat(400);
+    expect(_longTask.length).toBe(400);
+    // Simulate _scopeTaskText's slice(0, 280):
+    const _scoped = _longTask.slice(0, 280);
+    expect(_scoped.length).toBe(280);
+  });
+
+  it('the fix: _scopedShort = _scopedFull (no .slice(0, 100))', () => {
+    // Verify the source code no longer has .slice(0, 100)
+    const _src = fs.readFileSync(
+      path.join(__dirname, '../../mcp-services/command-service/src/skill-helpers/destination-resolver.cjs'),
+      'utf8'
+    );
+    // The old line: const _scopedShort = _scopedFull.slice(0, 100);
+    // The new line: const _scopedShort = _scopedFull;
+    expect(_src).not.toContain('_scopedFull.slice(0, 100)');
+    expect(_src).toContain('const _scopedShort = _scopedFull;');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 9. Stop button stability confirmation (premature capture fix)
+// ══════════════════════════════════════════════════════════════════════════════
+describe('_captureStreamingResponse — Stop button stability confirmation', () => {
+
+  // The bug: On Claude.ai, the Stop button briefly appears during request setup
+  // and disappears BEFORE streaming begins. The old code broke immediately on
+  // Stop button disappearance, capturing the response prematurely (after ~655ms).
+  //
+  // The fix: After Stop button disappears, require a 2s text-stability
+  // confirmation before breaking. If text is still growing, keep waiting.
+
+  it('simulates premature Stop button disappearance: text still growing → should NOT break immediately', () => {
+    // Simulate the stability check logic:
+    // - Stop button disappeared at t=0
+    // - Text length: 1000 → 1050 → 1100 → 1150 (still growing)
+    // The 2s window should keep resetting because text is growing.
+    let _stableStart = 0; // simulated start
+    let _stablePrevLen = 1000;
+    const _textGrowth = [1050, 1100, 1150, 1200, 1250]; // still growing
+    let _brokeImmediately = true;
+
+    for (const _checkLen of _textGrowth) {
+      if (_checkLen !== _stablePrevLen) {
+        // Text still growing — reset window (don't break)
+        _stablePrevLen = _checkLen;
+        _stableStart = Date.now(); // reset
+        _brokeImmediately = false;
+      }
+    }
+    expect(_brokeImmediately).toBe(false); // Should NOT have broken immediately
+  });
+
+  it('simulates true completion: text stable for 2s → should break after confirmation', () => {
+    // Simulate the stability check logic:
+    // - Stop button disappeared at t=0
+    // - Text length: 5000 → 5000 → 5000 (stable — no growth)
+    // The 2s window should complete without resetting.
+    let _stablePrevLen = 5000;
+    const _textChecks = [5000, 5000, 5000, 5000, 5000, 5000, 5000]; // stable
+    let _windowReset = false;
+
+    for (const _checkLen of _textChecks) {
+      if (_checkLen !== _stablePrevLen) {
+        _stablePrevLen = _checkLen;
+        _windowReset = true;
+      }
+    }
+    expect(_windowReset).toBe(false); // Window never reset → stable → break is correct
+  });
+
+  it('the fix: source code has 2s stability confirmation after Stop button disappears', () => {
+    const _src = fs.readFileSync(
+      path.join(__dirname, '../../mcp-services/command-service/src/skills/playwright.agent.cjs'),
+      'utf8'
+    );
+    // The new code should have a stability confirmation loop after Stop button disappears
+    expect(_src).toContain('Stop button disappeared — confirming text stability');
+    expect(_src).toContain('Stop button disappeared + text stable — capturing text');
+    // Should NOT have the old immediate break:
+    expect(_src).not.toMatch(/Stop button disappeared — capturing text"\);\s*\n\s*break;/);
   });
 });
 

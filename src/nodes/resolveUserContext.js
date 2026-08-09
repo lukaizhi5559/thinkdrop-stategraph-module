@@ -65,6 +65,54 @@ function isValidPhoneForCommunication(phone) {
   return true;
 }
 
+/**
+ * Extract a real phone number from a text snippet, guarding against digit runs
+ * embedded in URLs / IDs (e.g. facebook.com/messages/t/36327,2227039302/ where
+ * 2227039302 is a Messenger thread ID, not a phone). Returns the matched phone
+ * string or null.
+ *
+ * Guards:
+ *   - Match must start on a clean token boundary (preceded by start, whitespace,
+ *     or a phone-friendly separator like ( ) - . +). Rejects matches preceded
+ *     by a digit, letter, ',', '/', '=', ':', '@', '_', or '&'.
+ *   - Rejects matches that live inside a URL path/query (the surrounding
+ *     non-space run contains 'http', 'www.', '://' or a '/' after 'http').
+ *   - Runs the result through isValidPhoneForCommunication.
+ */
+function _extractPhoneFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  // Area code must start with 2-9 — prevents timestamp false-matches
+  const PHONE_RE = /(\+?1[\s.-]?)?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g;
+  let m;
+  while ((m = PHONE_RE.exec(text)) !== null) {
+    const matchStart = m.index;
+    const matchText  = m[0];
+    // ── Boundary guard: check the char immediately before the match ──────────
+    if (matchStart > 0) {
+      const prev = text[matchStart - 1];
+      // Allowed predecessors: whitespace, opening paren, phone separators, '+'
+      if (!/[\s().\-+]/.test(prev)) {
+        // Reject digits, letters, and URL/ID delimiters
+        continue;
+      }
+    }
+    // ── URL guard: if the match is inside a URL-like token, reject ───────────
+    // Look at the whitespace-delimited token containing the match.
+    let tokStart = matchStart;
+    while (tokStart > 0 && !/\s/.test(text[tokStart - 1])) tokStart--;
+    let tokEnd = matchStart + matchText.length;
+    while (tokEnd < text.length && !/\s/.test(text[tokEnd])) tokEnd++;
+    const token = text.slice(tokStart, tokEnd);
+    if (/https?:\/\//i.test(token) || /www\./i.test(token) || /^https?:/i.test(token)) {
+      continue; // match is inside a URL — skip
+    }
+    if (isValidPhoneForCommunication(matchText)) {
+      return matchText.trim();
+    }
+  }
+  return null;
+}
+
 const MEMORY_URL = process.env.MCP_USER_MEMORY_URL    || 'http://127.0.0.1:3001';
 const MEMORY_KEY = process.env.MCP_USER_MEMORY_API_KEY || '';
 const CONV_URL   = process.env.MCP_CONVERSATION_URL   || 'http://127.0.0.1:3004';
@@ -144,9 +192,9 @@ async function _resolveField(mcpAdapter, profileKey, searchQuery, userId, logger
   const _isEmailQ = searchQuery.toLowerCase().includes('email');
   for (const snippet of snippets) {
     if (_isPhoneQ) {
-      // Area code must start with 2-9 — prevents timestamp false-matches (e.g. 11644473600)
-      const pm = snippet.match(/(\+?1[\s.-]?)?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}/);
-      if (pm) { value = pm[0].trim(); break; }
+      // Use guarded extractor — rejects digit runs embedded in URLs/IDs
+      const pm = _extractPhoneFromText(snippet);
+      if (pm) { value = pm; break; }
       continue; // no valid phone in this snippet — try next
     }
     if (_isEmailQ) {
@@ -219,9 +267,11 @@ async function _memorySearch(mcpAdapter, query, type, userId, logger) {
       if (!text) continue;
 
       if (isPhoneQ) {
-        // Area code must start with 2-9 — prevents timestamp false-matches (e.g. 11644473600)
-        const phoneMatch = text.match(/(\+?1[\s.-]?)?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}/);
-        if (phoneMatch) return phoneMatch[0].trim();
+        // Use guarded extractor — rejects digit runs embedded in URLs/IDs
+        // (e.g. facebook.com/messages/t/36327,2227039302/ where 2227039302 is a
+        // Messenger thread ID, not a phone number).
+        const phoneMatch = _extractPhoneFromText(text);
+        if (phoneMatch) return phoneMatch;
         continue; // no valid phone in this memory entry — try next
       }
 
@@ -435,11 +485,27 @@ module.exports = async function resolveUserContext(state) {
     return { ...state, resolveUserContextDone: true };
   }
 
-  // Derive context needs from NLI signals + light regex (no topic bucketing)
-  const needsSmsPhone = !!(state._smsTagSignal ||
-    /\b(text me|sms me|send me a (text|sms)|my phone|my number|my cell|daily sms|sms summary|sms update|sms report|sms alert|text message|via text|via sms|by text|by sms|send.*text)\b/i.test(msg));
-  const needsEmail = !!(state._emailTagSignal ||
-    /\b(email me|send me an email|mail me|my email)\b/i.test(msg));
+  // Derive context needs from NLI signals + light regex (no topic bucketing).
+  // NLI (_smsTagSignal/_emailTagSignal) is noisy — never let it alone trigger
+  // self:phone/email resolution. Require corroboration: a messaging keyword in
+  // the message OR an explicit sms_send intent. (enrichIntentV2 already
+  // suppresses the signal when targetService refutes it; this is defense-in-depth
+  // so a stray NLI tag can't resolve self:phone for a non-messaging prompt.)
+  const _SMS_KW_RE  = /\b(text me|sms me|send me a (text|sms)|my phone|my number|my cell|daily sms|sms summary|sms update|sms report|sms alert|text message|via text|via sms|by text|by sms|send.*text)\b/i;
+  const _EMAIL_KW_RE = /\b(email me|send me an email|mail me|my email)\b/i;
+  const _smsKwHit   = _SMS_KW_RE.test(msg);
+  const _emailKwHit = _EMAIL_KW_RE.test(msg);
+  const _smsIntent  = state.intent?.type === 'sms_send';
+  const needsSmsPhone = !!(_smsIntent || _smsKwHit ||
+    (state._smsTagSignal && (_smsKwHit || _smsIntent)));
+  const needsEmail = !!(_emailKwHit ||
+    (state._emailTagSignal && _emailKwHit));
+  if (state._smsTagSignal && !needsSmsPhone) {
+    logger.info('[Node:ResolveUserContext] NLI sms signal ignored — no message keyword or sms_send intent to corroborate');
+  }
+  if (state._emailTagSignal && !needsEmail) {
+    logger.info('[Node:ResolveUserContext] NLI email signal ignored — no message keyword to corroborate');
+  }
   const resolvedSelfContext = {};
   let smsGatewayTarget = state.smsGatewayTarget || null;
 
@@ -562,3 +628,7 @@ module.exports = async function resolveUserContext(state) {
     ...(Object.keys(resolvedSelfContext).length > 0 && { resolvedSelfContext }),
   };
 };
+
+// ── Test exports ─────────────────────────────────────────────────────────────
+module.exports._extractPhoneFromText = _extractPhoneFromText;
+module.exports._hasSelfReferentialContext = _hasSelfReferentialContext;

@@ -106,14 +106,34 @@ module.exports = async function enrichIntentV2(state) {
   }
 
   // ── SMS / email signal flags ────────────────────────────────────────────────
+  // NLI (domain.extract) is noisy — a "Spotify playlist" prompt can spuriously
+  // score ≥0.35 on 'sms'/'text-message'/'phone-call'. NLI alone must NOT trigger
+  // self-SMS/email resolution downstream (resolveUserContext). Suppress the
+  // signal when the task classifier already chose a concrete non-messaging
+  // target service (e.g. spotify, notion, github) — that's a strong refutation.
   const _SMS_NLI   = new Set(['sms', 'text-message', 'phone-call']);
   const _CHAT_NLI  = new Set(['slack', 'discord']);
+  const _MESSAGING_SERVICES = new Set([
+    'twilio', 'clicksend', 'sinch', 'vonage', 'sendgrid', 'mailgun', 'smtp',
+    'gmail', 'slack', 'discord',
+  ]);
   let _smsTagSignal   = false;
   let _emailTagSignal = false;
   if (domainTags?.tags) {
     const _noChatOverride = !domainTags.tags.some(t => _CHAT_NLI.has(t));
-    _smsTagSignal   = _noChatOverride && domainTags.tags.some(t => _SMS_NLI.has(t));
-    _emailTagSignal = domainTags.tags.includes('email');
+    const _nliSms   = _noChatOverride && domainTags.tags.some(t => _SMS_NLI.has(t));
+    const _nliEmail = domainTags.tags.includes('email');
+    // Suppress when the classifier picked a concrete non-messaging target service
+    const _targetSvc = (tc.targetService || '').toLowerCase();
+    const _suppressedByTarget = _targetSvc && !_MESSAGING_SERVICES.has(_targetSvc);
+    _smsTagSignal   = _nliSms   && !_suppressedByTarget;
+    _emailTagSignal = _nliEmail && !_suppressedByTarget;
+    if (_nliSms && _suppressedByTarget) {
+      logger.info(`[Node:EnrichIntentV2] Suppressing NLI sms signal — targetService "${_targetSvc}" is non-messaging`);
+    }
+    if (_nliEmail && _suppressedByTarget) {
+      logger.info(`[Node:EnrichIntentV2] Suppressing NLI email signal — targetService "${_targetSvc}" is non-messaging`);
+    }
   }
 
   // Agent/service selection is now handled by the resolveAgent node so it can use
