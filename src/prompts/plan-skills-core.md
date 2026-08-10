@@ -5,6 +5,7 @@ cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub
 app.agent|args:{action:string,appName?:string,goal?:string,searchText?:string,filePath?:string,prompt?:string}|[desktop_app_agent]_native_macOS_app_automation_via_shortcuts_+_OCR.__action:run_agent_uses_an_app's_built-in_AI_assistant.
 web.agent|args:{action:string,query?:string,domain?:string}|[web_search_agent]_searches_web_via_MCP.__Use_when_site_blocks_bots_or_URL_is_unknown.__action:search_and_navigate_returns_{bestUrl,title,snippet}.
 video.agent|args:{action:string,videoUrl?:string,platform?:string,query?:string,goal:string}|[video_agent]_watch/transcribe_video.__ALWAYS_wins_over_ytdlp.agent_for_"watch"/"transcribe"_verbs.
+provider.discovery|args:{action:string,provider?:string,modelId?:string,taskType?:string,query?:string,name?:string,baseURL?:string,envKey?:string}|[provider_management_agent]_Manages_LLM_providers_and_models.__actions:_list_models,_model_info,_switch_model,_use_model_(discover+promote),_find_providers_(web_search),_add_provider,_remove_provider,_health_check.__Use_when_user_asks_about_models/providers/model_speed/switching_models/finding_new_providers.
 schedule|args:{time?:string,delayMs?:number,label?:string}|waits_until_clock_time_or_delay_then_continues_plan.
 user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[context_assembler]_resolves_user_personal_data_(name/phone/email/address)_from_profile+memory.__action:resolve_form_or_resolve_context.
 

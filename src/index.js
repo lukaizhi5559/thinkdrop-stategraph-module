@@ -31,7 +31,7 @@ const RealMCPAdapter = require('./adapters/RealMCPAdapter');
 // LLM Backends (pluggable answer generation)
 const LLMBackend = require('./backends/LLMBackend');
 const MCPLLMBackend = require('./backends/MCPLLMBackend');
-const VSCodeLLMBackend = require('./backends/VSCodeLLMBackend');
+const ThinkDropLLMBackend = require('./backends/ThinkDropLLMBackend');
 const ExternalLLMBackend = require('./backends/ExternalLLMBackend');
 
 // Nodes (for custom graphs)
@@ -59,13 +59,13 @@ module.exports = {
   backends: {
     LLMBackend,
     MCPLLMBackend,
-    VSCodeLLMBackend,
+    ThinkDropLLMBackend,
     ExternalLLMBackend
   },
   // Also export flat for convenience
   LLMBackend,
   MCPLLMBackend,
-  VSCodeLLMBackend,
+  ThinkDropLLMBackend,
   ExternalLLMBackend,
   
   // Nodes (for custom implementations)

@@ -7,7 +7,7 @@
  * 
  * Implementations:
  *   - MCPLLMBackend    → phi4 via MCP callService/callServiceStream
- *   - VSCodeLLMBackend → WebSocket pass-through to VS Code Copilot
+ *   - ThinkDropLLMBackend → WebSocket pass-through to VS Code Copilot
  *   - ExternalLLMBackend → HTTP endpoint (Rust/Go/Python/Node process)
  */
 

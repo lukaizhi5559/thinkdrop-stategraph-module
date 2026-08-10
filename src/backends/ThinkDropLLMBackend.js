@@ -1,5 +1,5 @@
 /**
- * VSCodeLLMBackend - WebSocket pass-through to VS Code Copilot (or any WebSocket LLM)
+ * ThinkDropLLMBackend - WebSocket pass-through to VS Code Copilot (or any WebSocket LLM)
  * 
  * Mirrors the ONLINE MODE path in the original answer.cjs:
  *   ws://localhost:4000/ws/stream with protocol:
@@ -14,7 +14,7 @@
 
 const LLMBackend = require('./LLMBackend');
 
-class VSCodeLLMBackend extends LLMBackend {
+class ThinkDropLLMBackend extends LLMBackend {
   /**
    * @param {Object} config
    * @param {string} [config.wsUrl='ws://localhost:4000/ws/stream'] - WebSocket endpoint
@@ -43,7 +43,7 @@ class VSCodeLLMBackend extends LLMBackend {
     try {
       WebSocket = require('ws');
     } catch {
-      throw new Error('[VSCodeLLMBackend] "ws" package not installed. Run: npm install ws');
+      throw new Error('[ThinkDropLLMBackend] "ws" package not installed. Run: npm install ws');
     }
 
     // Build authenticated URL
@@ -58,7 +58,7 @@ class VSCodeLLMBackend extends LLMBackend {
     await new Promise((resolve, reject) => {
       const t = setTimeout(() => {
         ws.terminate();
-        reject(new Error('[VSCodeLLMBackend] Connection timeout'));
+        reject(new Error('[ThinkDropLLMBackend] Connection timeout'));
       }, this.connectTimeoutMs);
 
       ws.on('open', () => { clearTimeout(t); resolve(); });
@@ -74,11 +74,11 @@ class VSCodeLLMBackend extends LLMBackend {
       type: 'llm_request',
       payload: {
         prompt: payload.query || prompt,
-        provider: options.provider || 'openai',
+        provider: options.provider || 'auto',
         options: {
           temperature: options.temperature || 0.7,
           stream: true,
-          taskType: 'ask'
+          taskType: options.taskType || 'planning'
         },
         context: {
           recentContext: (context.conversationHistory || []).map(msg => ({
@@ -112,14 +112,14 @@ class VSCodeLLMBackend extends LLMBackend {
     await new Promise((resolve, reject) => {
       let activeTimeout = setTimeout(() => {
         ws.terminate();
-        reject(new Error('[VSCodeLLMBackend] Response timeout'));
+        reject(new Error('[ThinkDropLLMBackend] Response timeout'));
       }, this.responseTimeoutMs);
 
       const resetTimeout = () => {
         clearTimeout(activeTimeout);
         activeTimeout = setTimeout(() => {
           ws.terminate();
-          reject(new Error('[VSCodeLLMBackend] Response timeout'));
+          reject(new Error('[ThinkDropLLMBackend] Response timeout'));
         }, this.responseTimeoutMs);
       };
 
@@ -175,7 +175,7 @@ class VSCodeLLMBackend extends LLMBackend {
       ws.on('close', () => {
         clearTimeout(activeTimeout);
         if (!streamStarted) {
-          reject(new Error('[VSCodeLLMBackend] Connection closed before stream started'));
+          reject(new Error('[ThinkDropLLMBackend] Connection closed before stream started'));
         } else {
           resolve();
         }
@@ -220,7 +220,7 @@ class VSCodeLLMBackend extends LLMBackend {
       req.on('timeout', () => { req.destroy(); });
       req.write(body);
       req.end();
-      console.log('[VSCodeLLMBackend] Circuit breaker reset triggered');
+      console.log('[ThinkDropLLMBackend] Circuit breaker reset triggered');
     } catch (_) {
       // non-fatal
     }
@@ -263,4 +263,4 @@ class VSCodeLLMBackend extends LLMBackend {
   }
 }
 
-module.exports = VSCodeLLMBackend;
+module.exports = ThinkDropLLMBackend;

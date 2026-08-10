@@ -6,7 +6,7 @@
  * 
  * Backend priority:
  *   1. state.llmBackend   - explicitly injected backend (from StateGraphService/Builder)
- *   2. useOnlineMode=true - VSCodeLLMBackend (bibscrip-backend ws://localhost:4000/ws/stream)
+ *   2. useOnlineMode=true - ThinkDropLLMBackend (bibscrip-backend ws://localhost:4000/ws/stream)
  *   3. mcpAdapter present - MCPLLMBackend (local phi4 service)
  *   4. Placeholder        - graceful degradation when nothing is available
  * 
