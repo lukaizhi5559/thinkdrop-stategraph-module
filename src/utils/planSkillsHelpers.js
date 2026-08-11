@@ -281,7 +281,7 @@ Output ONLY valid JSON with the best matching template index (0-based):
       query,
       context: { conversationHistory: [], systemInstructions: 'You are a command template selector. Pick the best matching template index and output only { "index": N }. Do not output anything else.', intent: 'command_automate' },
       options: { maxTokens: 20, temperature: 0, fastMode: true },
-    }, { maxTokens: 20, temperature: 0, fastMode: true }, null);
+    }, { maxTokens: 20, temperature: 0, fastMode: true, taskType: 'classification' }, null);
 
     const jsonMatch = raw.match(/\{[\s\S]*\}/);
     if (!jsonMatch) return null;

@@ -1681,7 +1681,7 @@ The user's request does NOT match any installed skill.
       conversationHistory: [],
       intent: intent?.type || 'command_automate',
     },
-    options: { maxTokens: _maxTokens, temperature: 0.1 },
+    options: { maxTokens: _maxTokens, temperature: 0.1, taskType: 'complex' },
     messages: [{ role: 'user', content: planningQuery }],
   };
 

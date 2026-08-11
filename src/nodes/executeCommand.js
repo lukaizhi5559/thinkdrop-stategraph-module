@@ -1951,7 +1951,7 @@ module.exports = async function executeCommand(state) {
           query: fieldMapQuery,
           context: { systemInstructions: SMART_FILL_SYSTEM_PROMPT, sessionId: context?.sessionId, userId: context?.userId, intent: 'command_automate' },
           options: { maxTokens: 300, temperature: 0.0, fastMode: true }
-        }, { maxTokens: 300, temperature: 0.0, fastMode: true }, null);
+        }, { maxTokens: 300, temperature: 0.0, fastMode: true, taskType: 'complex' }, null);
 
         logger.debug(`[Node:ExecuteCommand] smartFill: LLM selector map raw: ${raw.substring(0, 300)}`);
 
@@ -3077,7 +3077,7 @@ module.exports = async function executeCommand(state) {
                 query: filterPmt,
                 context: { conversationHistory: [], systemInstructions: 'You are a JSON filter. Output only a valid JSON array, no explanation.', intent: 'command_automate' },
                 options: { maxTokens: 2000, temperature: 0, fastMode: true }
-              }, { maxTokens: 2000, temperature: 0, fastMode: true }, null);
+              }, { maxTokens: 2000, temperature: 0, fastMode: true, taskType: 'complex' }, null);
               const jMatch = filterResult.match(/\[[\s\S]*\]/);
               if (jMatch) _relevantItems.push(...JSON.parse(jMatch[0]));
             } catch (e) {
@@ -3194,7 +3194,7 @@ module.exports = async function executeCommand(state) {
           userId: context?.userId,
           intent: 'command_automate'
         },
-        options: { maxTokens: _schemaMaxTokens, temperature: 0.2, fastMode: false }
+        options: { maxTokens: _schemaMaxTokens, temperature: 0.2, fastMode: false, taskType: 'complex' }
       };
       // ── Progress indicator timers ────────────────────────────────────────────
       // Long synthesis calls need periodic user feedback so they don't appear hung
@@ -3290,7 +3290,7 @@ Please try again or search with different terms.`;
               query: _strictQuery,
               context: { conversationHistory: [], systemInstructions: _schemaConstraint, intent: 'command_automate' },
               options: { maxTokens: 500, temperature: 0.1, fastMode: true },
-            }, { maxTokens: 500, temperature: 0.1, fastMode: true }, null);
+            }, { maxTokens: 500, temperature: 0.1, fastMode: true, taskType: 'complex' }, null);
 
             if (_strictAnswer) {
               const _retryFailed = _schemaTypes.filter(t => !_validateSingleType(_strictAnswer, t));
@@ -3322,7 +3322,7 @@ Please try again or search with different terms.`;
             query: _retryQuery,
             context: { conversationHistory: [], systemInstructions: _retrySysInstr, intent: 'command_automate' },
             options: { maxTokens: 1500, temperature: 0.3, fastMode: false },
-          }, { maxTokens: 1500, temperature: 0.3 }, null);
+          }, { maxTokens: 1500, temperature: 0.3, taskType: 'complex' }, null);
           if (_retryAnswer && !_APOLOGY_RE.test(_retryAnswer.trim())) {
             synthesisAnswer = _retryAnswer;
             _retrySucceeded = true;
@@ -5660,7 +5660,7 @@ Please try again or search with different terms.`;
                 intent: 'command_automate',
               },
               options: { maxTokens: 300, temperature: 0, fastMode: true },
-            }, { maxTokens: 300, temperature: 0, fastMode: true }, null);
+            }, { maxTokens: 300, temperature: 0, fastMode: true, taskType: 'complex' }, null);
 
             // Parse — must be valid JSON; on any error we fail open (no-op)
             const _jsonMatch = _pcRaw.match(/\{[\s\S]*\}/);
@@ -6566,7 +6566,7 @@ Please try again or search with different terms.`;
                 },
                 options: { maxTokens: 300, temperature: 0.3 },
               },
-              { maxTokens: 300, temperature: 0.3 },
+              { maxTokens: 300, temperature: 0.3, taskType: 'complex' },
               null
             ).catch(() => null);
             if (synthesized && synthesized.trim()) {
@@ -6626,7 +6626,7 @@ Please try again or search with different terms.`;
                     },
                     options: { maxTokens: 400, temperature: 0.2 },
                   },
-                  { maxTokens: 400, temperature: 0.2 },
+                  { maxTokens: 400, temperature: 0.2, taskType: 'complex' },
                   null
                 ).catch(() => null);
                 lastStepAnswer = (summarized && summarized.trim()) ? summarized.trim() : out.slice(0, 4000);
@@ -6694,7 +6694,7 @@ Please try again or search with different terms.`;
           const translated = await state.llmBackend.generateAnswer(
             lastStepAnswer,
             { query: lastStepAnswer, context: { systemInstructions: `Translate the following text to ${langName}. Output ONLY the translation, nothing else.`, conversationHistory: [], intent: 'command_automate' }, options: { maxTokens: 100, temperature: 0 } },
-            { maxTokens: 100, temperature: 0 },
+            { maxTokens: 100, temperature: 0, taskType: 'complex' },
             null
           ).catch(() => lastStepAnswer);
           if (translated && translated.trim()) lastStepAnswer = translated.trim();

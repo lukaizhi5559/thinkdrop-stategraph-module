@@ -53,7 +53,7 @@ module.exports = async function synthesizeNode(state) {
     // Skill contract writes need more room — a full skill.md with ## Auth,
     // ## Commands, curl examples etc. easily exceeds 1500 tokens and gets
     // truncated mid-code-block, producing corrupted stored contracts.
-    options: { maxTokens: synthesisFilePath?.endsWith('.md') ? 4096 : 1500, temperature: 0.2, fastMode: false }
+    options: { maxTokens: synthesisFilePath?.endsWith('.md') ? 4096 : 1500, temperature: 0.2, fastMode: false, taskType: 'complex' }
   };
 
   try {

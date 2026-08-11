@@ -335,10 +335,11 @@ module.exports = async function planGenerator(state) {
 
       await llmBackend.generateAnswer(
         userPrompt,
-        systemPrompt,
+        { query: userPrompt, context: { systemInstructions: systemPrompt, intent: 'command_automate' } },
         {
           maxTokens: 1200,
           temperature: 0.0,
+          taskType: 'complex',
           streamCallback: (token) => {
             chunks.push(token);
             if (typeof progressCallback === 'function') {

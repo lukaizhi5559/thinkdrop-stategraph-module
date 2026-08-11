@@ -111,10 +111,9 @@ Output JSON only:
 
   try {
     const response = await llmBackend.generateAnswer(prompt, {
-      temperature: 0.1,
-      maxTokens: 100,
-      systemInstructions: 'You are a JSON-only classifier. Output valid JSON with no markdown fences.'
-    });
+      query: prompt,
+      context: { systemInstructions: 'You are a JSON-only classifier. Output valid JSON with no markdown fences.' },
+    }, { temperature: 0.1, maxTokens: 100, taskType: 'classification' });
 
     const text = response.trim().replace(/^```json\s*/, '').replace(/\s*```$/, '');
     const result = JSON.parse(text);

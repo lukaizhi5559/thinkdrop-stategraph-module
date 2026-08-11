@@ -674,7 +674,8 @@ Decide the recovery strategy.`;
     options: {
       maxTokens: 400,
       temperature: 0.1,
-      fastMode: false
+      fastMode: false,
+      taskType: 'complex'
     }
   };
 

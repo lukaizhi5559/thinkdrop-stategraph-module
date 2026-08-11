@@ -88,8 +88,8 @@ Output ONLY JSON:
   try {
     const response = await llmBackend.generateAnswer(
       prompt,
-      { query: prompt, context: { systemInstructions: SYSTEM_PROMPT } },
-      { maxTokens: 400, temperature: 0.2 }
+      { query: prompt, context: { systemInstructions: SYSTEM_PROMPT, intent: 'command_automate' } },
+      { maxTokens: 400, temperature: 0.2, taskType: 'complex' }
     );
 
     // Parse JSON response

@@ -652,8 +652,8 @@ What is the CORRECT intent for the previous message? Choose one:
 Respond with ONLY valid JSON: {"correctIntent":"<intent>"}`;
 
               const raw = await backend.generateAnswer(correctionPrompt, {
-                context: { systemInstructions: 'You are an intent classifier. Respond with ONLY valid JSON.' },
-              }, { maxTokens: 30, temperature: 0, fastMode: true });
+                context: { systemInstructions: 'You are an intent classifier. Respond with ONLY valid JSON.', intent: intentType },
+              }, { maxTokens: 30, temperature: 0, fastMode: true, taskType: 'classification' });
 
               const cleaned = (raw || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
               const jsonMatch = cleaned.match(/\{[\s\S]*?\}/);

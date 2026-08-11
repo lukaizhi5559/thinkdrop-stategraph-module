@@ -191,7 +191,7 @@ async function _llmDateFallback(message, llmBackend, logger) {
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
       context: { systemInstructions: 'You extract date ranges. Return only JSON or null.' },
-    }, { maxTokens: 100, temperature: 0, fastMode: true });
+    }, { maxTokens: 100, temperature: 0, fastMode: true, taskType: 'classification' });
     if (!raw) return null;
     const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
     const parsed = JSON.parse(cleaned);

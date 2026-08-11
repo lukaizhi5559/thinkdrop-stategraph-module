@@ -599,8 +599,9 @@ Output ONLY valid JSON.`;
         systemInstructions: REVIEW_SYSTEM_PROMPT,
         sessionId: context?.sessionId,
         userId: context?.userId || 'default_user',
+        intent: state.intent?.type || 'command_automate',
       }
-    }, { maxTokens: 300, temperature: 0.1, fastMode: false });
+    }, { maxTokens: 300, temperature: 0.1, fastMode: false, taskType: 'complex' });
   } catch (llmErr) {
     logger.warn(`[Node:ReviewExecution] LLM call failed (non-fatal): ${llmErr.message} — skipping`);
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };

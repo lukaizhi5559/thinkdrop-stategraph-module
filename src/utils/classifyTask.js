@@ -169,7 +169,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
       context: { systemInstructions: CLASSIFY_SYSTEM_PROMPT },
-    }, { maxTokens: 120, temperature: 0, fastMode: true });
+    }, { maxTokens: 120, temperature: 0, fastMode: true, taskType: 'classification' });
 
     const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
     const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();

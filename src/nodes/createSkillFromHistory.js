@@ -181,8 +181,8 @@ Rules:
   try {
     const response = await llmBackend.generateAnswer(
       prompt,
-      { query: prompt, context: { systemInstructions: 'You are a skill extraction specialist. Output ONLY valid JSON.' } },
-      { maxTokens: 600, temperature: 0.1 }
+      { query: prompt, context: { systemInstructions: 'You are a skill extraction specialist. Output ONLY valid JSON.', intent: 'command_automate' } },
+      { maxTokens: 600, temperature: 0.1, taskType: 'complex' }
     );
     
     // Extract JSON
@@ -440,8 +440,8 @@ Output ONLY JSON with runtime, skillName, description, inputs, and code.`;
   try {
     const response = await llmBackend.generateAnswer(
       prompt,
-      { query: prompt, context: { systemInstructions: SYSTEM_PROMPT } },
-      { maxTokens: 2000, temperature: 0.2 }
+      { query: prompt, context: { systemInstructions: SYSTEM_PROMPT, intent: 'command_automate' } },
+      { maxTokens: 2000, temperature: 0.2, taskType: 'complex' }
     );
     
     const jsonMatch = response.match(/\{[\s\S]*\}/);
