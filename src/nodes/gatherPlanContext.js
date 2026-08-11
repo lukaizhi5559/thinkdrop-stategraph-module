@@ -367,13 +367,15 @@ Rules:
 - ALWAYS include routeConfirmation if a ROUTE DECISION is provided and hasn't been confirmed yet.
 - ALWAYS include at least one question on round 1 — never return complete:true on the first round.
 - For each requiredInput, the system has already run memoryQuery and attached results in MEMORY RESULTS. If memory found enough data, set memoryResolved:true and ask a CONFIRMATION question (e.g. "I found N songs in your memory. Use these?"). If memory found nothing or too little, ask a from-scratch question.
+- CONFIRMATION questions (memoryResolved:true OR type "confirm") MUST have at least 2 options OR set freeText:true. Always give the user a way to accept the suggested value AND a way to reject or type a different value. For example: [{ "label": "Yes", "value": "<suggested value>", "primary": true }, { "label": "No, use different", "value": "use_different" }] with "freeText": true.
 - BATCH AGGRESSIVELY: Ask ALL questions you need answered in ONE batch — even if some answers might influence other questions' context. The user can answer them all at once. Do NOT split related questions across multiple rounds.
 - Questions about the same topic (e.g., playlist name, genre, artists, songs) MUST be in the same batch — never ask them one at a time.
 - Only defer a question to a later round if it TRULY cannot be asked without a prior answer (e.g., "Which specific album by [artist]?" when you don't know the artist yet). Even then, prefer asking "Which artist and album?" as one question.
 - NEVER ask about things the system can look up (timezone, credentials, installed apps, auth status — these are in PROBE RESULTS).
-- NEVER ask about things already answered in PRIOR CLARIFICATIONS.
-- If a PRIOR CLARIFICATION answer starts with "yes —" or "accepted", it is a CONFIRMED answer — do NOT ask that question again.
-- If the ROUTE DECISION block is empty or all routes are confirmed, do NOT include a routeConfirmation.
+- NEVER ask about things already answered in PRIOR CLARIFICATIONS. Every entry in PRIOR CLARIFICATIONS is a SETTLED answer — do NOT re-ask it, even with different wording.
+- If a PRIOR CLARIFICATION answer starts with "yes —", it is a CONFIRMED answer — do NOT ask that question again.
+- If the ROUTE DECISION block is empty or all routes are marked [CONFIRMED], do NOT include a routeConfirmation. Confirmed routes are locked in.
+- If ALL required inputs have been answered in PRIOR CLARIFICATIONS and all routes are confirmed, return {"complete": true}.
 - Questions should be concise (15 words max). Options should be short labels.
 - memoryText/memoryTextTemplate: a clean factual statement for future memory storage. Example: "User's preferred Spotify playlist name is '{answer}'". This will be stored as type 'gather_clarification' so future tasks can find it.
 - Max 5 questions per batch.`;
@@ -429,15 +431,23 @@ async function _askLLMBatch(llmBackend, userMsg, originalMsg, priorQA, conversat
   const recentCtx = formatHistoryTurns(conversationHistory || [], { isFollowUp, maxTurns: 6 });
   const historyBlock = recentCtx ? `\n\nRECENT CONVERSATION:\n${recentCtx}` : '';
 
-  // Route decision block — only include routes that haven't been confirmed yet.
-  // Confirmed routes are tracked via rd.confirmed=true (set when user accepts).
+  // Route decision block — show both pending (need user confirmation) and
+  // confirmed routes so the LLM knows which routes are locked in and doesn't
+  // re-generate routeConfirmation questions for them.
   const unconfirmedRoutes = routeDecision
     ? Object.entries(routeDecision).filter(([_, rd]) => !rd.confirmed)
     : [];
-  const routeBlock = unconfirmedRoutes.length > 0
-    ? '\n\nROUTE DECISION (from preflight probes — confirm this with the user):\n' +
+  const confirmedRoutes = routeDecision
+    ? Object.entries(routeDecision).filter(([_, rd]) => rd.confirmed)
+    : [];
+  const routeBlock = (unconfirmedRoutes.length > 0 || confirmedRoutes.length > 0)
+    ? '\n\nROUTE DECISION (from preflight probes — confirmed routes are locked in, do NOT re-confirm them):\n' +
       unconfirmedRoutes.map(([svc, rd]) =>
-        `- ${svc}: route=${rd.route}, reason="${rd.reason}"`
+        `- ${svc}: route=${rd.route}, reason="${rd.reason}" [PENDING — confirm with user]`
+      ).join('\n') +
+      (unconfirmedRoutes.length > 0 && confirmedRoutes.length > 0 ? '\n' : '') +
+      confirmedRoutes.map(([svc, rd]) =>
+        `- ${svc}: route=${rd.route}, reason="${rd.reason}" [CONFIRMED]`
       ).join('\n')
     : '';
 
@@ -463,7 +473,7 @@ TASK: "${userMsg}"${priorBlock}${historyBlock}${routeBlock}${memoryBlock}${unaut
 Generate the frontier of questions for this task.`;
 
   try {
-    const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: GRILL_SYSTEM_PROMPT } }, { maxTokens: 600, temperature: 0 });
+    const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: GRILL_SYSTEM_PROMPT } }, { maxTokens: 600, temperature: 0, taskType: 'super-heavy' });
     const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
     const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
     const jsonMatch = stripped.match(/\{[\s\S]*\}/);
@@ -572,7 +582,51 @@ async function _runGrillLoop(state, logger) {
     }
 
     const questions = result.questions || [];
-    const routeConfirmation = result.routeConfirmation || null;
+    let routeConfirmation = result.routeConfirmation || null;
+
+    // Fix B: Strip routeConfirmation if all routes are already confirmed.
+    // The LLM may still emit a routeConfirmation even though the route is
+    // marked [CONFIRMED] in the prompt — don't trust it, check the code state.
+    if (routeConfirmation) {
+      const _unconfirmed = routeDecision
+        ? Object.entries(routeDecision).filter(([_, rd]) => !rd.confirmed)
+        : [];
+      if (_unconfirmed.length === 0) {
+        logger.info('[Node:GatherPlanContext:Grill] All routes confirmed — stripping LLM routeConfirmation');
+        routeConfirmation = null;
+      }
+    }
+
+    // Fix C: Force complete if there are no new questions to ask and no
+    // unconfirmed routes. The LLM may keep generating questions that were
+    // already answered — check if any question is truly new (not already in
+    // prior answers by text similarity).
+    if (questions.length > 0 && answers.length > 0) {
+      const _newQuestions = questions.filter(q => {
+        // A question is "new" if its text doesn't match any already-answered question
+        const _qText = (q.text || '').toLowerCase().trim();
+        return !answers.some(a => {
+          const _aText = (a.question || '').toLowerCase().trim();
+          // Match by exact text or by shared keywords (>60% word overlap)
+          if (_qText === _aText) return true;
+          const _qWords = new Set(_qText.split(/\s+/).filter(w => w.length > 3));
+          const _aWords = new Set(_aText.split(/\s+/).filter(w => w.length > 3));
+          if (_qWords.size === 0 || _aWords.size === 0) return false;
+          let _overlap = 0;
+          for (const w of _qWords) if (_aWords.has(w)) _overlap++;
+          return _overlap / Math.min(_qWords.size, _aWords.size) > 0.6;
+        });
+      });
+      if (_newQuestions.length === 0 && !routeConfirmation) {
+        logger.info(`[Node:GatherPlanContext:Grill] All ${questions.length} LLM question(s) already answered — forcing complete`);
+        break;
+      }
+      if (_newQuestions.length === 0 && routeConfirmation) {
+        // Only the route confirmation is new — keep it, drop the duplicate questions
+        logger.info(`[Node:GatherPlanContext:Grill] Dropping ${questions.length} duplicate question(s), keeping route confirmation`);
+        questions.length = 0;
+      }
+    }
 
     if (questions.length === 0 && !routeConfirmation) {
       logger.info('[Node:GatherPlanContext:Grill] No questions to ask — complete');
@@ -606,24 +660,39 @@ async function _runGrillLoop(state, logger) {
         let ans = batchAnswers[q.id];
         if (ans) {
           // B4: If this is a memory-resolved confirmation question and the user
-          // confirmed ("yes", "use_found", "use_*", "confirm", "accept", "true"),
-          // substitute the actual memory data instead of storing "yes" as the answer.
-          // Keep the original answer for the LLM's prior clarifications so it sees
-          // a clear "yes" and stops re-asking the confirmation.
+          // confirmed, substitute the actual memory data instead of storing "yes"
+          // as the answer. Keep the original answer for the LLM's prior
+          // clarifications so it sees a clear "yes" and stops re-asking.
+          //
+          // Confirmation is detected when:
+          //   - The answer matches the primary option's value (the "Yes, use this"
+          //     button), OR
+          //   - The answer text starts with yes/use_found/use_/confirm/accept/true
           let confirmed = false;
-          if (q.memoryResolved && /^(yes|use_found|use_|confirm|accept|true)/i.test(ans)) {
-            confirmed = true;
-            // Prefer memoryText (fixed factual statement with the value embedded),
-            // fall back to joining memory snippets for the matching slot.
-            if (q.memoryText) {
-              ans = q.memoryText;
-            } else if (q.memorySlot && memoryResults[q.memorySlot]?.snippets?.length > 0) {
-              ans = memoryResults[q.memorySlot].snippets.join('; ');
+          if (q.memoryResolved) {
+            const _primaryOpt = q.options?.find(o => o.primary) || q.options?.[0];
+            const _primaryValue = _primaryOpt?.value;
+            const _primaryMatch = _primaryValue != null && String(ans).trim() === String(_primaryValue).trim();
+            const _yesMatch = /^(yes|use_found|use_|confirm|accept|true)/i.test(String(ans));
+            if (_primaryMatch || _yesMatch) {
+              confirmed = true;
+              // Prefer memoryText (fixed factual statement with the value embedded),
+              // fall back to joining memory snippets for the matching slot.
+              if (q.memoryText) {
+                ans = q.memoryText;
+              } else if (q.memorySlot && memoryResults[q.memorySlot]?.snippets?.length > 0) {
+                ans = memoryResults[q.memorySlot].snippets.join('; ');
+              }
+              logger.info(`[Node:GatherPlanContext:Grill] Memory-resolved ${q.id} — substituted actual value (confirmed via ${_primaryMatch ? 'primary option' : 'yes-match'})`);
             }
-            logger.info(`[Node:GatherPlanContext:Grill] Memory-resolved ${q.id} — substituted actual value`);
+          }
+          // Any non-empty answer is a settled answer — tell the next LLM round
+          // not to re-ask it. The prompt shows "yes — <answer>" for confirmed answers.
+          if (ans && String(ans).trim() !== '') {
+            confirmed = true;
           }
           answers.push({ question: q.text, answer: ans, confirmed });
-          logger.info(`[Node:GatherPlanContext:Grill] Answer ${q.id}: "${String(ans).slice(0, 80)}"`);
+          logger.info(`[Node:GatherPlanContext:Grill] Answer ${q.id}: "${String(ans).slice(0, 80)}"${confirmed ? ' [confirmed]' : ''}`);
         }
       }
 
@@ -645,7 +714,7 @@ async function _runGrillLoop(state, logger) {
           if (svc && routeDecision[svc]) {
             routeDecision[svc] = { ...routeDecision[svc], confirmed: true };
           }
-          answers.push({ question: routeConfirmation.question, answer: 'accepted', confirmed: true });
+          answers.push({ question: routeConfirmation.question, answer: routeConfirmation.route, confirmed: true });
         }
       }
 

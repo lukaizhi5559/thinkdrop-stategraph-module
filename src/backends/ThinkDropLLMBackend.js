@@ -79,7 +79,8 @@ class ThinkDropLLMBackend extends LLMBackend {
         options: {
           temperature: options.temperature || 0.7,
           stream: true,
-          taskType: options.taskType || 'planning'
+          // command_automate planning needs paid providers (complex) — free models can't handle complex JSON
+          taskType: options.taskType || (context.intent === 'command_automate' ? 'complex' : 'planning')
         },
         context: {
           recentContext: (context.conversationHistory || []).map(msg => ({
