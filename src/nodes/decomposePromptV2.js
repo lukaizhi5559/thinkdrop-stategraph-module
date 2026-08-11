@@ -190,7 +190,7 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
     raw = await llmBackend.generateAnswer(userPrompt, {
       query: userPrompt,
       context: { systemInstructions: DECOMPOSE_SYSTEM_PROMPT },
-    }, { maxTokens: 400, temperature: 0.1, fastMode: true });
+    }, { maxTokens: 400, temperature: 0.1, fastMode: true, taskType: 'classification' });
   } catch (e) {
     logger.warn(`[Node:DecomposePromptV2] LLM call failed: ${e.message}`);
     return null;

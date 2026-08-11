@@ -54,6 +54,14 @@ Return "null" when there is NO clear match or when confidence is not HIGH. Never
 // Skill name fragments that indicate a one-shot event-creation skill (not a daemon)
 const ONE_SHOT_EVENT_MARKERS = ['calendar', '.event', 'booking', 'meeting', 'webex', 'zoom.schedule'];
 
+// ── Semantic match cache ────────────────────────────────────────────────────
+// The semantic LLM call (strategy 3) is deterministic for the same
+// (message + installed skills) pair. Cache the raw LLM response for 5 minutes
+// to avoid redundant LLM calls when the user re-sends or slightly edits a
+// similar request within a short window.
+const SEMANTIC_CACHE = new Map(); // key: semanticPrompt → { value: string, expiresAt: number }
+const SEMANTIC_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
 module.exports = async function parseSkill(state) {
   const { mcpAdapter, message, resolvedMessage, llmBackend } = state;
   const logger = state.logger || console;
@@ -459,14 +467,26 @@ Examples: "gcal.event|HIGH" or "null"`;
   }
 
   try {
-    const raw = await Promise.race([
-      llmBackend.generateAnswer(semanticPrompt, {
-        systemInstructions: SEMANTIC_SYSTEM_PROMPT,
-        conversationHistory: [],
-        intent: 'command_automate'
-      }, { maxTokens: 60, temperature: 0, fastMode: true }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('semantic timeout')), 5000)),
-    ]);
+    // ── Check semantic cache before making LLM call ────────────────────────
+    const _cached = SEMANTIC_CACHE.get(semanticPrompt);
+    let raw;
+    if (_cached && _cached.expiresAt > Date.now()) {
+      logger.debug('[Node:ParseSkill] Semantic cache HIT — skipping LLM call');
+      raw = _cached.value;
+    } else {
+      raw = await Promise.race([
+        llmBackend.generateAnswer(semanticPrompt, {
+          systemInstructions: SEMANTIC_SYSTEM_PROMPT,
+          conversationHistory: [],
+          intent: 'command_automate'
+        }, { maxTokens: 60, temperature: 0, fastMode: true, taskType: 'classification' }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('semantic timeout')), 5000)),
+      ]);
+      // Store in cache (only if we got a non-empty response)
+      if (raw && typeof raw === 'string' && raw.trim()) {
+        SEMANTIC_CACHE.set(semanticPrompt, { value: raw, expiresAt: Date.now() + SEMANTIC_CACHE_TTL_MS });
+      }
+    }
 
     // Parse format: "skill-name|HIGH" or legacy plain "skill-name" or "null"
     const rawTrimmed = (raw || '').trim().replace(/^["`']|["`']$/g, '');

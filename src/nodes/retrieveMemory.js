@@ -155,7 +155,7 @@ async function _llmDetectPersonalAttribute(message, llmBackend, logger) {
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
       context: { systemInstructions: 'You extract personal attributes. Return only the attribute name or null.' },
-    }, { maxTokens: 50, temperature: 0, fastMode: true });
+    }, { maxTokens: 50, temperature: 0, fastMode: true, taskType: 'classification' });
     if (!raw) return null;
     const cleaned = raw.trim().toLowerCase().replace(/^```.*\n?/gm, '').replace(/```$/g, '').trim();
     const validAttributes = ['name', 'email', 'phone', 'birthday', 'location', 'timezone', 'company', 'occupation', 'github', 'username', 'address', 'language'];

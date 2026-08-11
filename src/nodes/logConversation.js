@@ -317,7 +317,8 @@ async function _extractAndStoreFacts(mcpAdapter, llmBackend, message, answer, co
       query: exchange,
       context: { systemInstructions: prompt },
       options: { maxTokens: 300, temperature: 0.1 }
-    }
+    },
+    { maxTokens: 300, temperature: 0.1, taskType: 'classification' }
   );
   if (!raw) return;
 

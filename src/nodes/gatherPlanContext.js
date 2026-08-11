@@ -106,7 +106,7 @@ TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${una
 Is this task ready to execute, or is one critical piece missing?`;
 
   try {
-    const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: SYSTEM_PROMPT } }, { maxTokens: 80, temperature: 0 });
+    const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: SYSTEM_PROMPT } }, { maxTokens: 80, temperature: 0, taskType: 'classification' });
     const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
     const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
     const jsonMatch = stripped.match(/\{[\s\S]*?\}/) || stripped.match(/\{[\s\S]*\}/);
@@ -487,15 +487,20 @@ Generate the frontier of questions for this task.`;
 async function _recordGatherAnswersToMemory(questions, answers, mcpAdapter, userId, logger) {
   if (!questions || !answers || !mcpAdapter) return;
   for (const q of questions) {
-    const answer = answers[q.id];
+    let answer = answers[q.id];
+    if (answer == null) continue;
+    // Coerce to string — answers may arrive as numbers/booleans from the UI
+    // and .startsWith would throw TypeError on non-strings.
+    answer = String(answer).trim();
     if (!answer || answer.startsWith('route_')) continue; // skip route confirmations
     let memoryText = q.memoryText || q.memoryTextTemplate;
     if (!memoryText) continue;
     if (memoryText.includes('{answer}')) {
-      memoryText = memoryText.replace(/\{answer\}/g, String(answer));
+      memoryText = memoryText.replace(/\{answer\}/g, answer);
     }
     // If memoryText is a fixed statement (confirm questions), only store if user confirmed
-    if (q.memoryText && answer !== q.options?.[0]?.value) continue;
+    const _confirmValue = q.options?.[0]?.value != null ? String(q.options[0].value) : '';
+    if (q.memoryText && answer !== _confirmValue) continue;
     try {
       await mcpAdapter.callService('user-memory', 'memory.store', {
         text: memoryText,
@@ -646,7 +651,9 @@ async function _runGrillLoop(state, logger) {
 
       // B5: Record answers to memory (fire-and-forget)
       if (mcpAdapter) {
-        _recordGatherAnswersToMemory(questions, batchAnswers, mcpAdapter, userId, logger);
+        _recordGatherAnswersToMemory(questions, batchAnswers, mcpAdapter, userId, logger).catch(e => {
+          logger.warn(`[Node:GatherPlanContext:Grill] _recordGatherAnswersToMemory failed: ${e.message}`);
+        });
       }
 
       if (progressCallback) progressCallback({ type: 'gather_answer_received' });

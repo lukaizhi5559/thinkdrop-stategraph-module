@@ -1,5 +1,5 @@
 /**
- * ThinkDropLLMBackend - WebSocket pass-through to VS Code Copilot (or any WebSocket LLM)
+ * ThinkDropLLMBackend - WebSocket pass-through to the ThinkDrop backend LLM router
  * 
  * Mirrors the ONLINE MODE path in the original answer.cjs:
  *   ws://localhost:4000/ws/stream with protocol:
@@ -9,7 +9,8 @@
  *              { type: 'llm_stream_end' }
  *              { type: 'error', payload: { message } }
  * 
- * Can also be used for any WebSocket-based LLM backend (not just VS Code).
+ * Connects to the ThinkDrop backend's WebSocket LLM endpoint, which routes
+ * requests to free/paid LLM providers based on taskType hints.
  */
 
 const LLMBackend = require('./LLMBackend');
@@ -254,9 +255,9 @@ class ThinkDropLLMBackend extends LLMBackend {
 
   getInfo() {
     return {
-      name: 'VS Code / WebSocket LLM',
-      type: 'vscode',
-      model: 'copilot',
+      name: 'ThinkDrop WebSocket LLM',
+      type: 'thinkdrop',
+      model: 'auto-routed',
       provider: 'websocket',
       wsUrl: this.wsUrl
     };

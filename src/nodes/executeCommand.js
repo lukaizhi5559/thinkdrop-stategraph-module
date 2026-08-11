@@ -102,7 +102,7 @@ async function _thinPostFailureHandler(state) {
   const userMsg = `## User Request\n${resolvedMessage || message}\n\n## Completed Steps\n${priorSteps || '(none)'}\n\n## Failed Step (cursor=${skillCursor})\n${failedInfo}\n\n## Previous Recovery Attempts\n${patchHistory.length > 0 ? patchHistory.map((p, i) => `${i + 1}. ${p.action}: ${p.note || p.suggestion || ''}`).join('\n') : '(none)'}\n\n## Retry Count: ${stepRetryCount}, Replan Count: ${replanCount}\n\n## Next Action\nOutput a single JSON action object.`;
 
   try {
-    const llmRaw = await llmBackend.generateAnswer(THIN_RECOVERY_PROMPT, userMsg, { temperature: 0.1, maxTokens: 300 });
+    const llmRaw = await llmBackend.generateAnswer(THIN_RECOVERY_PROMPT, userMsg, { temperature: 0.1, maxTokens: 300, taskType: 'classification' });
     const m = llmRaw?.match(/\{[\s\S]*\}/);
     if (m) {
       const decision = JSON.parse(m[0]);

@@ -139,7 +139,7 @@ or:
         sessionId: context?.sessionId,
         userId: context?.userId || 'default_user',
       },
-    }, { maxTokens: 300, temperature: 0.1, fastMode: true });
+    }, { maxTokens: 300, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
     const match = raw.match(/\{[\s\S]*?\}/);
     if (!match) throw new Error('no JSON in response');
@@ -190,7 +190,7 @@ or: { "fulfilled": false, "reason": "one sentence explaining why not" }`;
         sessionId: context?.sessionId,
         userId: context?.userId || 'default_user',
       },
-    }, { maxTokens: 150, temperature: 0.1, fastMode: true });
+    }, { maxTokens: 150, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
     const match = raw.match(/\{[\s\S]*?\}/);
     if (!match) throw new Error('no JSON in response');

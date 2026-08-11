@@ -371,7 +371,8 @@ Output ONLY valid JSON.`;
     raw = await backend.generateAnswer(evalQuery, evalPayload, {
       maxTokens: 400,
       temperature: 0.1,
-      fastMode: false
+      fastMode: false,
+      taskType: 'classification'
     });
   } catch (llmErr) {
     logger.warn(`[Node:EvaluateSkills] LLM failed (non-fatal): ${llmErr.message}`);

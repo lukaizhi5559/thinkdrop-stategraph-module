@@ -342,7 +342,7 @@ Select the right agent(s) for this task, or ask the user if ambiguous.`;
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
       context: { systemInstructions: SYSTEM_PROMPT },
-    }, { maxTokens: 350, temperature: 0 });
+    }, { maxTokens: 350, temperature: 0, taskType: 'classification' });
 
     const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
     logger.info(`[Node:ResolveAgent] LLM raw response (attempt ${attempt}, ${text.length} chars): ${text.slice(0, 200).replace(/\n/g, ' ')}`);
