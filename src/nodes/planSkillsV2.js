@@ -161,6 +161,7 @@ const {
 const { buildBridgeReminderPlan } = require('../utils/buildBridgeReminderPlan');
 const { findSimilarCompletePlan, findMostRecentPlanInSession, domainsMatch, isCorrectionSignal }  = require('../utils/planCacheHelpers');
 const { buildReminderSkill }       = require('../utils/buildReminderSkill');
+const { IncrementalJsonArrayParser } = require('../utils/incrementalJsonParser');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Prompt loader
@@ -1687,7 +1688,33 @@ The user's request does NOT match any installed skill.
 
   let rawPlan;
   try {
-    rawPlan = await backend.generateAnswer(planningQuery, payload, payload.options, null);
+    // ── Stream plan tokens to frontend with incremental JSON parsing ──────────
+    // As the LLM emits tokens, the IncrementalJsonArrayParser detects complete
+    // step objects and emits plan:step_revealed events so the user sees each
+    // step appear one-by-one with skill icons instead of a static spinner.
+    if (progressCallback) progressCallback({ type: 'plan:stream_start' });
+
+    let _revealedStepIndex = 0;
+    const _planParser = new IncrementalJsonArrayParser((step) => {
+      if (progressCallback) {
+        progressCallback({
+          type: 'plan:step_revealed',
+          stepIndex: _revealedStepIndex++,
+          skill: step.skill || 'unknown',
+          description: step.description || buildStepDescription(step),
+          args: step.args || {},
+          runGroup: step.runGroup || undefined,
+        });
+      }
+    });
+
+    rawPlan = await backend.generateAnswer(
+      planningQuery,
+      payload,
+      payload.options,
+      typeof progressCallback === 'function' ? (token) => { _planParser.feed(token); } : null
+    );
+    logger.info(`[Node:PlanSkillsV2] Plan stream complete — ${_planParser.getObjectCount()} step(s) revealed incrementally`);
   } catch (err) {
     logger.error(`[Node:PlanSkillsV2] LLM call failed: ${err.message}`);
     return { ...state, planError: `LLM planning failed: ${err.message}` };
