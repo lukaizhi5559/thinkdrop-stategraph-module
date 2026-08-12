@@ -132,7 +132,8 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 | Multi-stage pipeline | extract → `synthesize` → use result → `synthesize` → deliver | Each `synthesize` sees only its preceding stage |
 | browser.agent → shell.run | No `synthesize` — use `{{PREV_OUTPUT}}` in goal | shell.run NEVER uses `{{synthesisAnswer}}` |
 | browser.agent → cli.agent | No `synthesize` — use `{{PREV_OUTPUT}}` in goal | — |
-| browser.agent → browser.agent | `synthesize` → `{{synthesisAnswer}}` in task | — |
+| browser.agent → browser.agent (DEPENDENT) | `synthesize` → `{{synthesisAnswer}}` in task | Step 2 needs step 1's text output |
+| browser.agent → browser.agent (SAME-AGENT or INDEPENDENT) | NO `synthesize` between steps | Browser state carries over automatically |
 | Any retrieval step → display | Append `synthesize` after retrieval | Retrieval: "what is", "list", "show me", "find" |
 
 **NEVER** use placeholder text like `[ChatGPT response]` in step args. Use `{{synthesisAnswer}}` as the sole body content token.
@@ -177,7 +178,85 @@ When user wants to "create a skill": `synthesize(saveToFile: '~/.thinkdrop/skill
 
 ## Sub-agents — reasoning loops
 
-Sub-agents accept ONE high-level goal and run their own internal loop. Emit ONE step — do NOT pre-plan sub-steps. `playwright.agent` and `browser.act` are internal primitives — NEVER emit them directly.
+Sub-agents (browser.agent, cli.agent, app.agent) run their own internal loop. For SIMPLE tasks (one action), emit ONE step. For COMPLEX multi-action tasks (create X, then add Y, then add Z), break into MULTIPLE steps — each with a single, clear action. This ensures each step is independently verifiable and recoverable. `playwright.agent` and `browser.act` are internal primitives — NEVER emit them directly.
+
+### Multi-Step Task Decomposition
+
+When a sub-agent task involves multiple distinct actions, break it into multiple steps. Each step should have ONE clear action. This applies to ALL sub-agents: `browser.agent`, `cli.agent`, and `app.agent`.
+
+**When to decompose:** A task has multiple distinct actions connected by "then", "and", commas, or numbered steps.
+**When NOT to decompose:** A single navigation + interaction, or a single CLI command, or a single app action.
+
+#### Case 1: Same-agent, state carries over (NO synthesize between steps)
+
+**BAD (one monolithic browser.agent step — agent gets stuck):**
+```json
+[{"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Open Spotify, create a playlist named Christian Music, and add top songs from Lecrae, KB, and Newsboys"}}]
+```
+
+**GOOD (decomposed — browser state carries over between steps):**
+```json
+[
+  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Open Spotify and create a new playlist named Christian Music"},"description":"Create Spotify playlist"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for Lecrae and add 3 top songs to the Christian Music playlist"},"description":"Add Lecrae songs"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for KB and add 3 top songs to the Christian Music playlist"},"description":"Add KB songs"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for Newsboys and add 3 top songs to the Christian Music playlist"},"description":"Add Newsboys songs"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the Christian Music playlist was created with songs from Lecrae, KB, and Newsboys."},"description":"Confirm playlist"}
+]
+```
+
+**app.agent example (app state carries over):**
+```json
+[
+  {"skill":"app.agent","args":{"action":"run_agent","appName":"<app-name>","task":"open auth.js and refactor the authentication module to use async/await"},"description":"Refactor auth.js"},
+  {"skill":"app.agent","args":{"action":"run_agent","appName":"<app-name>","task":"run the test suite and fix any failures"},"description":"Fix tests"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the auth.js refactoring is complete and tests pass."},"description":"Confirm"}
+]
+```
+
+#### Case 2: Same-agent, data passing needed (synthesize between steps)
+
+**cli.agent example (data passing):**
+```json
+[
+  {"skill":"cli.agent","args":{"action":"run","agentId":"[name].agent","task":"List all open pull requests with their numbers and titles"},"description":"List open PRs"},
+  {"skill":"synthesize","args":{"prompt":"Extract the PR number of the oldest open pull request from: {{PREV_OUTPUT}}"},"description":"Extract oldest PR number"},
+  {"skill":"cli.agent","args":{"action":"run","agentId":"[name].agent","task":"Checkout pull request {{synthesisAnswer}} and run the test suite"},"description":"Checkout PR and test"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the PR was checked out and tests ran."},"description":"Confirm"}
+]
+```
+
+#### Case 3: Different agents, independent (NO synthesize between steps)
+
+**Multi-agent browser.agent example:**
+```json
+[
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
+  {"skill":"synthesize","args":{"prompt":"Compare the answers from <app-name>, <app-name>, and <app-name> about the best vegan foods."},"description":"Compare all answers"}
+]
+```
+
+#### Case 4: Different agents, data passing needed (synthesize between steps)
+
+**browser.agent → shell.run example:**
+```json
+[
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling laptops and their prices"},"description":"Scrape Amazon laptops"},
+  {"skill":"synthesize","args":{"prompt":"Format the laptop data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
+  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/laptops.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the laptop data was saved to ~/Desktop/laptops.csv."},"description":"Confirm"}
+]
+```
+
+### Decomposition Rules
+- Each step should have ONE clear action — if the task has "then", "and", or multiple verbs, decompose it
+- Same-agent consecutive steps reuse state automatically (browser session, app window) — no synthesize between them
+- Different-agent steps are independent — no synthesize between them unless data is needed
+- Use `synthesize` between steps ONLY when step 2 needs step 1's text output (use `{{synthesisAnswer}}`)
+- Always add a final `synthesize` step to confirm the overall task
+- If a step fails, the recovery system retries just that step — not the entire task
 
 | Sub-agent | When to use |
 |---|---|

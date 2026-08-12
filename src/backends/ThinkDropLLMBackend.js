@@ -111,18 +111,25 @@ class ThinkDropLLMBackend extends LLMBackend {
     let accumulated = '';
     let streamStarted = false;
 
+    // Dynamic timeout based on taskType — complex/super-heavy need much more time
+    const _taskType = options.taskType || (context.intent === 'command_automate' ? 'complex' : 'planning');
+    const _dynamicTimeoutMs = _taskType === 'complex' ? 240_000
+      : _taskType === 'super-heavy' ? 180_000
+      : _taskType === 'heavy' ? 90_000
+      : this.responseTimeoutMs; // light/planning — keep default 60s
+
     await new Promise((resolve, reject) => {
       let activeTimeout = setTimeout(() => {
         ws.terminate();
         reject(new Error('[ThinkDropLLMBackend] Response timeout'));
-      }, this.responseTimeoutMs);
+      }, _dynamicTimeoutMs);
 
       const resetTimeout = () => {
         clearTimeout(activeTimeout);
         activeTimeout = setTimeout(() => {
           ws.terminate();
           reject(new Error('[ThinkDropLLMBackend] Response timeout'));
-        }, this.responseTimeoutMs);
+        }, _dynamicTimeoutMs);
       };
 
       ws.on('message', (data) => {
