@@ -131,6 +131,9 @@ EXAMPLES (genuine follow-ups — isFollowUp true, followUpTarget resolved):
 
 No explanation. No markdown. Only the JSON object.`;
 
+// Extract and parse JSON from LLM output using the shared parseLlmJson utility.
+const { parseLlmJson } = require('./parseLlmJson');
+
 /**
  * Classify the user's task using the LLM.
  *
@@ -172,14 +175,14 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     }, { maxTokens: 120, temperature: 0, fastMode: true, taskType: 'classification' });
 
     const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
-    const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-    const jsonMatch = stripped.match(/\{[\s\S]*?\}/) || stripped.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+
+    // Use the shared parseLlmJson utility — handles markdown fences, missing
+    // boolean values, dangling commas, unterminated strings, and jsonrepair fallback.
+    const parsed = parseLlmJson(text, logger, 'classifyTask');
+    if (!parsed) {
       logger.debug('[classifyTask] No JSON in response — using default');
       return _default;
     }
-
-    const parsed = JSON.parse(jsonMatch[0]);
 
     return {
       taskType:            parsed.taskType           || _default.taskType,

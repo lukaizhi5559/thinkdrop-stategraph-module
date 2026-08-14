@@ -7,6 +7,8 @@
 
 'use strict';
 
+const { parseLlmJson } = require('./parseLlmJson');
+
 /**
  * Generate a replacement step for the failed step
  * @param {Object} options
@@ -93,16 +95,8 @@ Output ONLY JSON:
     );
 
     // Parse JSON response
-    let parsed;
-    try {
-      // Try to extract JSON from response (might have markdown fences)
-      const jsonMatch = response.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        parsed = JSON.parse(jsonMatch[0]);
-      } else {
-        throw new Error('No JSON found in response');
-      }
-    } catch (parseErr) {
+    let parsed = parseLlmJson(response, console, 'SingleStepPlanner');
+    if (!parsed) {
       console.error('[SingleStepPlanner] Failed to parse LLM response:', response.slice(0, 200));
       // Fallback: return modified failed step
       return {

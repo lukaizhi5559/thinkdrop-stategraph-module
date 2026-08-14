@@ -2,6 +2,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeDecomposeLog(entry) {
@@ -201,8 +202,9 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
   const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
   const sanitized = cleaned.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, ' ');
   logger.debug(`[Node:DecomposePromptV2] Cleaned response: ${sanitized.slice(0, 200)}...`);
-  try {
-    const parsed = JSON.parse(sanitized);
+
+  const parsed = parseLlmJson(sanitized, logger, 'Node:DecomposePromptV2');
+  if (parsed) {
     logger.debug(`[Node:DecomposePromptV2] Parsed JSON: ${JSON.stringify(parsed).slice(0, 200)}...`);
     if (onParsed) onParsed(parsed); // Pass parsed JSON to main function
     const subPrompts = parsed.subPrompts || parsed.sub_prompts;
@@ -225,34 +227,33 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
     }));
     mapped._llmDateRange = llmDateRange;
     return mapped;
-  } catch (e) {
-    logger.warn(`[Node:DecomposePromptV2] JSON parse failed: ${e.message}`);
-    
-    // Attempt to extract intent from malformed JSON as fallback.
-    // Handles: closed strings like "command_automate" AND truncated/unclosed strings like "command_automat
-    // The regex allows an optional closing quote so truncated LLM responses are still recoverable.
-    const intentMatch = sanitized.match(/["']estimatedIntent["']\s*[:=]\s*["']([^"'\n,}\]]{3,30})["']?/);
-    if (intentMatch) {
-      const extractedRaw = intentMatch[1].trim();
-      // Snap to nearest known intent to handle partial truncation (e.g. "command_automat" → "command_automate")
-      const KNOWN_INTENTS = ['command_automate', 'screen_intelligence', 'web_search', 'memory_store', 'memory_retrieve', 'general_knowledge', 'greeting'];
-      const extractedIntent = KNOWN_INTENTS.find(i => i.startsWith(extractedRaw) || extractedRaw.startsWith(i.slice(0, 10))) || extractedRaw;
-      logger.info(`[Node:DecomposePromptV2] Extracted intent from malformed JSON: "${extractedRaw}" → "${extractedIntent}"`);
-      return [{
-        text: message,
-        estimatedIntent: extractedIntent,
-        confidence: 0.70,
-        order: 0,
-        dependsOn: [],
-        isLongRunning: false,
-        dataTemplate: null,
-        _llmDateRange: null,
-      }];
-    }
-    
-    logger.warn(`[Node:DecomposePromptV2] Malformed JSON recovery failed — no estimatedIntent found in response snippet: ${sanitized.slice(0, 120)}`);
-    return null;
   }
+
+  // parseLlmJson failed — attempt to extract intent from malformed JSON as fallback.
+  // Handles: closed strings like "command_automate" AND truncated/unclosed strings like "command_automat
+  // The regex allows an optional closing quote so truncated LLM responses are still recoverable.
+  logger.warn(`[Node:DecomposePromptV2] JSON parse failed — attempting intent extraction fallback`);
+  const intentMatch = sanitized.match(/["']estimatedIntent["']\s*[:=]\s*["']([^"'\n,}\]]{3,30})["']?/);
+  if (intentMatch) {
+    const extractedRaw = intentMatch[1].trim();
+    // Snap to nearest known intent to handle partial truncation (e.g. "command_automat" → "command_automate")
+    const KNOWN_INTENTS = ['command_automate', 'screen_intelligence', 'web_search', 'memory_store', 'memory_retrieve', 'general_knowledge', 'greeting'];
+    const extractedIntent = KNOWN_INTENTS.find(i => i.startsWith(extractedRaw) || extractedRaw.startsWith(i.slice(0, 10))) || extractedRaw;
+    logger.info(`[Node:DecomposePromptV2] Extracted intent from malformed JSON: "${extractedRaw}" → "${extractedIntent}"`);
+    return [{
+      text: message,
+      estimatedIntent: extractedIntent,
+      confidence: 0.70,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+      _llmDateRange: null,
+    }];
+  }
+
+  logger.warn(`[Node:DecomposePromptV2] Malformed JSON recovery failed — no estimatedIntent found in response snippet: ${sanitized.slice(0, 120)}`);
+  return null;
 }
 
 module.exports = async function decomposePromptV2(state) {

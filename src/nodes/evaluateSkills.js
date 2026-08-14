@@ -9,6 +9,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 const MAX_EVAL_RETRIES = 4;
 
 function loadEvalPrompt() {
@@ -382,9 +383,8 @@ Output ONLY valid JSON.`;
   // Parse JSON from LLM output
   let verdict;
   try {
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('no JSON found');
-    verdict = JSON.parse(jsonMatch[0]);
+    verdict = parseLlmJson(raw, logger, 'Node:EvaluateSkills');
+    if (!verdict) throw new Error('no JSON found');
   } catch (parseErr) {
     logger.warn(`[Node:EvaluateSkills] JSON parse failed: ${parseErr.message} — treating as PASS`);
     return { ...state, evaluationVerdict: 'PASS' };

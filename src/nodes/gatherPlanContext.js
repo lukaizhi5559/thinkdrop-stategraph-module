@@ -28,6 +28,7 @@
 
 const { markAgentAuthed } = require('./preflightAgents');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 const MAX_ROUNDS = 3;
 const MAX_AUTH_ROUNDS = 10; // auth sign-ins don't count against Q&A budget
@@ -108,13 +109,11 @@ Is this task ready to execute, or is one critical piece missing?`;
   try {
     const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: SYSTEM_PROMPT } }, { maxTokens: 80, temperature: 0, taskType: 'classification' });
     const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
-    const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-    const jsonMatch = stripped.match(/\{[\s\S]*?\}/) || stripped.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    const parsed = parseLlmJson(text, logger, 'Node:GatherPlanContext');
+    if (!parsed) {
       logger.warn(`[Node:GatherPlanContext] No JSON in LLM response: "${text.slice(0, 100)}" — treating as complete`);
       return { complete: true };
     }
-    const parsed = JSON.parse(jsonMatch[0]);
     if (typeof parsed.complete !== 'boolean') throw new Error('missing "complete" key');
     return parsed;
   } catch (err) {
@@ -475,13 +474,11 @@ Generate the frontier of questions for this task.`;
   try {
     const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: GRILL_SYSTEM_PROMPT } }, { maxTokens: 600, temperature: 0, taskType: 'super-heavy' });
     const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
-    const stripped = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-    const jsonMatch = stripped.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    const parsed = parseLlmJson(text, logger, 'Node:GatherPlanContext:Grill');
+    if (!parsed) {
       logger.warn(`[Node:GatherPlanContext:Grill] No JSON in LLM response: "${text.slice(0, 100)}" — treating as complete`);
       return { complete: true };
     }
-    const parsed = JSON.parse(jsonMatch[0]);
     if (typeof parsed.complete !== 'boolean' && !parsed.questions) throw new Error('invalid response shape');
     return parsed;
   } catch (err) {
@@ -543,9 +540,27 @@ async function _runGrillLoop(state, logger) {
   const priorAnswers = Array.isArray(state.planGatheringAnswers) ? state.planGatheringAnswers : [];
   const answers = [...priorAnswers];
   const routeDecision = state.routeDecision || state.preflightResult?.routeDecision || {};
+
+  // ── Auto-confirm single-route mandates ────────────────────────────────────
+  // When preflight determined only one viable route exists for a service (e.g.
+  // spotify → browser), there is nothing for the user to choose — confirm it
+  // automatically so the grill loop doesn't ask a redundant route confirmation.
+  // This was previously masked because the old JSON parser failed on the grill
+  // LLM output (returning {complete:true}), skipping the route confirmation
+  // entirely. With parseLlmJson now succeeding, the confirmation is asked but
+  // the fragile matching failed to mark it confirmed, causing an infinite loop.
+  const _mandate = state.preflightResult?.singleRouteMandate || {};
+  for (const [svc, m] of Object.entries(_mandate)) {
+    if (routeDecision[svc] && !routeDecision[svc].confirmed) {
+      routeDecision[svc] = { ...routeDecision[svc], confirmed: true };
+      logger.info(`[Node:GatherPlanContext:Grill] Auto-confirmed single-route mandate for ${svc}: ${m.route}`);
+    }
+  }
+
   let round = 0;
   let batchCounter = 0;
   let memoryResults = {}; // populated on round 0, used to substitute confirmation answers
+  let _lastRouteConfirmKey = null; // tracks repeated route confirmations for loop guard
 
   while (round < GRILL_MAX_ROUNDS) {
     if (progressCallback) progressCallback({ type: 'gathering', message: 'Checking task details…' });
@@ -595,6 +610,29 @@ async function _runGrillLoop(state, logger) {
         logger.info('[Node:GatherPlanContext:Grill] All routes confirmed — stripping LLM routeConfirmation');
         routeConfirmation = null;
       }
+    }
+
+    // Fix B2: Infinite-loop guard for route confirmation.
+    // If the LLM emits the same routeConfirmation (same service+route) as the
+    // previous round after the user already accepted it, the matching code
+    // failed to mark it confirmed. Force-confirm by service name lookup and
+    // strip the routeConfirmation so the loop can proceed.
+    if (routeConfirmation) {
+      const _rcKey = `${(routeConfirmation.service || '').toLowerCase()}:${routeConfirmation.route || ''}`;
+      if (_lastRouteConfirmKey && _lastRouteConfirmKey === _rcKey) {
+        logger.warn(`[Node:GatherPlanContext:Grill] Route confirmation repeated (${_rcKey}) — force-confirming to break loop`);
+        const _svcNorm = String(routeConfirmation.service || '').toLowerCase().replace(/\.agent$/, '');
+        for (const [k, rd] of Object.entries(routeDecision)) {
+          if (k.toLowerCase() === _svcNorm || k.toLowerCase().replace(/\.agent$/, '') === _svcNorm) {
+            routeDecision[k] = { ...rd, confirmed: true };
+            break;
+          }
+        }
+        routeConfirmation = null;
+      }
+      _lastRouteConfirmKey = _rcKey;
+    } else {
+      _lastRouteConfirmKey = null;
     }
 
     // Fix C: Force complete if there are no new questions to ask and no
@@ -696,23 +734,56 @@ async function _runGrillLoop(state, logger) {
         }
       }
 
-      // Handle route confirmation
+      // Handle route confirmation — robust matching with normalization
       if (routeConfirmation && batchAnswers['__route__']) {
         const routeAns = batchAnswers['__route__'];
+        // Helper: normalize a service name for comparison (lowercase, strip .agent)
+        const _normSvc = (s) => String(s || '').toLowerCase().replace(/\.agent$/, '').trim();
+        // Helper: find a routeDecision key matching a normalized service name
+        const _findRouteKey = (svc) => {
+          const norm = _normSvc(svc);
+          if (!norm) return null;
+          // Exact match
+          if (routeDecision[svc]) return svc;
+          if (routeDecision[norm]) return norm;
+          // Normalized match
+          for (const k of Object.keys(routeDecision)) {
+            if (_normSvc(k) === norm) return k;
+          }
+          return null;
+        };
+
         if (routeAns.startsWith('route_reject:')) {
-          const svc = routeAns.split(':')[1];
-          logger.info(`[Node:GatherPlanContext:Grill] User rejected ${svc} route=${routeConfirmation.route} — will re-probe`);
-          // Mark route as rejected — future rounds won't re-confirm this route
-          if (routeDecision[svc]) {
-            routeDecision[svc] = { ...routeDecision[svc], route: 'rejected_by_user' };
+          // Extract service from the answer value (route_reject:<svc>) — this is
+          // the authoritative source since it comes from the UI option value.
+          const svcFromAns = routeAns.split(':').slice(1).join(':');
+          const routeKey = _findRouteKey(svcFromAns) || _findRouteKey(routeConfirmation.service);
+          logger.info(`[Node:GatherPlanContext:Grill] User rejected route for ${svcFromAns} (matched key: ${routeKey}) route=${routeConfirmation.route} — will re-probe`);
+          if (routeKey && routeDecision[routeKey]) {
+            routeDecision[routeKey] = { ...routeDecision[routeKey], route: 'rejected_by_user' };
           }
           answers.push({ question: routeConfirmation.question, answer: 'rejected — user wants different route' });
         } else {
-          // Mark this route as confirmed in routeDecision so it stops appearing
-          // in the ROUTE DECISION block on future rounds.
-          const svc = routeConfirmation.service;
-          if (svc && routeDecision[svc]) {
-            routeDecision[svc] = { ...routeDecision[svc], confirmed: true };
+          // Accept: extract service from the answer value (route_accept:<svc>)
+          // as the primary source, fall back to routeConfirmation.service.
+          const svcFromAns = routeAns.startsWith('route_accept:')
+            ? routeAns.split(':').slice(1).join(':')
+            : '';
+          const routeKey = _findRouteKey(svcFromAns) || _findRouteKey(routeConfirmation.service);
+          if (routeKey && routeDecision[routeKey]) {
+            routeDecision[routeKey] = { ...routeDecision[routeKey], confirmed: true };
+            logger.info(`[Node:GatherPlanContext:Grill] Route confirmed for ${routeKey}: ${routeConfirmation.route} (matched via ${svcFromAns ? 'answer value' : 'routeConfirmation.service'})`);
+          } else {
+            // No match found — log loudly so we can diagnose, and try matching
+            // by route type as a last resort.
+            const _rcRoute = routeConfirmation.route;
+            const _fallbackKey = Object.entries(routeDecision).find(([_, rd]) => rd.route === _rcRoute)?.[0];
+            if (_fallbackKey) {
+              routeDecision[_fallbackKey] = { ...routeDecision[_fallbackKey], confirmed: true };
+              logger.warn(`[Node:GatherPlanContext:Grill] Route confirmed via fallback route-match for ${_fallbackKey}: ${_rcRoute} (svcFromAns=${svcFromAns}, routeConfirmation.service=${routeConfirmation.service})`);
+            } else {
+              logger.warn(`[Node:GatherPlanContext:Grill] Could not match route confirmation to any routeDecision key — svcFromAns=${svcFromAns}, routeConfirmation.service=${routeConfirmation.service}, routeDecision keys=${Object.keys(routeDecision).join(',')}`);
+            }
           }
           answers.push({ question: routeConfirmation.question, answer: routeConfirmation.route, confirmed: true });
         }

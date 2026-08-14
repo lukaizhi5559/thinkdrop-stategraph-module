@@ -17,6 +17,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 const USER_SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 
@@ -186,12 +187,12 @@ Rules:
     );
     
     // Extract JSON
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) {
+    const parsed = parseLlmJson(response, logger, 'Node:createSkillFromHistory:identify');
+    if (!parsed) {
       throw new Error('No JSON in LLM response');
     }
-    
-    return JSON.parse(jsonMatch[0]);
+
+    return parsed;
   } catch (e) {
     logger.warn('[Node:createSkillFromHistory] LLM identification failed:', e.message);
     throw e;
@@ -444,10 +445,10 @@ Output ONLY JSON with runtime, skillName, description, inputs, and code.`;
       { maxTokens: 2000, temperature: 0.2, taskType: 'complex' }
     );
     
-    const jsonMatch = response.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON in LLM response');
-    
-    return JSON.parse(jsonMatch[0]);
+    const parsed = parseLlmJson(response, logger, 'Node:createSkillFromHistory:generate');
+    if (!parsed) throw new Error('No JSON in LLM response');
+
+    return parsed;
   } catch (e) {
     logger.error('[Node:createSkillFromHistory] Failed to generate skill from description:', e.message);
     throw e;

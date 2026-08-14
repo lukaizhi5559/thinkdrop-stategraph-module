@@ -1,5 +1,7 @@
 'use strict';
 
+const { parseLlmJson } = require('./parseLlmJson');
+
 /**
  * planSkillsHelpers.js — contract-driven execution helpers extracted from planSkills.js
  *
@@ -283,9 +285,8 @@ Output ONLY valid JSON with the best matching template index (0-based):
       options: { maxTokens: 20, temperature: 0, fastMode: true },
     }, { maxTokens: 20, temperature: 0, fastMode: true, taskType: 'classification' }, null);
 
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return null;
-    const parsed = JSON.parse(jsonMatch[0]);
+    const parsed = parseLlmJson(raw, null, 'planSkillsHelpers:selectCommandTemplate');
+    if (!parsed) return null;
     if (typeof parsed.index !== 'number' || parsed.index < 0 || parsed.index >= commands.length) return null;
     return { index: parsed.index, substitutions: [], params: {} };
   } catch (_) {

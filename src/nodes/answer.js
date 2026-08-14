@@ -19,6 +19,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 // Load intent rules from answer.md at startup — editable without touching code
 function loadAnswerPrompts() {
@@ -655,10 +656,8 @@ Respond with ONLY valid JSON: {"correctIntent":"<intent>"}`;
                 context: { systemInstructions: 'You are an intent classifier. Respond with ONLY valid JSON.', intent: intentType },
               }, { maxTokens: 30, temperature: 0, fastMode: true, taskType: 'classification' });
 
-              const cleaned = (raw || '').replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-              const jsonMatch = cleaned.match(/\{[\s\S]*?\}/);
-              if (!jsonMatch) return;
-              const parsed = JSON.parse(jsonMatch[0]);
+              const parsed = parseLlmJson(raw, logger, 'Node:Answer:intentCorrection');
+              if (!parsed) return;
               const correctIntent = parsed.correctIntent;
 
               if (correctIntent && correctIntent !== wrongIntent) {

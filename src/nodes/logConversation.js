@@ -19,6 +19,7 @@ const os   = require('os');
 const path = require('path');
 
 const { storePersonalProfileFact } = require('../utils/personalProfile');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 let EXTRACT_PROMPT = null;
 function loadExtractPrompt() {
@@ -324,8 +325,8 @@ async function _extractAndStoreFacts(mcpAdapter, llmBackend, message, answer, co
 
   let parsed;
   try {
-    const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim();
-    parsed = JSON.parse(cleaned);
+    parsed = parseLlmJson(raw, logger, 'Node:LogConversation');
+    if (!parsed) throw new Error('no JSON in response');
   } catch (e) {
     logger.warn(`[Node:LogConversation] Auto-extraction parse failed: ${e.message}`);
     return;

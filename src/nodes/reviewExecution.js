@@ -39,6 +39,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 function loadReviewPrompt() {
   try {
@@ -141,9 +142,8 @@ or:
       },
     }, { maxTokens: 300, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
-    const match = raw.match(/\{[\s\S]*?\}/);
-    if (!match) throw new Error('no JSON in response');
-    const parsed = JSON.parse(match[0]);
+    const parsed = parseLlmJson(raw, logger, 'Node:ReviewExecution:assessAnswer');
+    if (!parsed) throw new Error('no JSON in response');
     if (parsed.contradiction === true && parsed.correctedAnswer) {
       return { corrected: true, answer: String(parsed.correctedAnswer), reason: String(parsed.reason || '') };
     }
@@ -192,9 +192,8 @@ or: { "fulfilled": false, "reason": "one sentence explaining why not" }`;
       },
     }, { maxTokens: 150, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
-    const match = raw.match(/\{[\s\S]*?\}/);
-    if (!match) throw new Error('no JSON in response');
-    const parsed = JSON.parse(match[0]);
+    const parsed = parseLlmJson(raw, logger, 'Node:ReviewExecution:assessBrowser');
+    if (!parsed) throw new Error('no JSON in response');
     if (typeof parsed.fulfilled !== 'boolean') throw new Error('missing fulfilled field');
     return { fulfilled: parsed.fulfilled, reason: String(parsed.reason || '') };
   } catch (err) {
@@ -609,9 +608,8 @@ Output ONLY valid JSON.`;
 
   let review;
   try {
-    const jsonMatch = raw.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('no JSON found');
-    review = JSON.parse(jsonMatch[0]);
+    review = parseLlmJson(raw, logger, 'Node:ReviewExecution');
+    if (!review) throw new Error('no JSON found');
   } catch (parseErr) {
     logger.warn(`[Node:ReviewExecution] JSON parse failed: ${parseErr.message} — skipping`);
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };

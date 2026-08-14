@@ -8,6 +8,7 @@
  */
 
 const { parseDateRange } = require('../utils/parseDateRange');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 /**
  * Format an ISO timestamp into human-readable absolute + relative date
@@ -193,8 +194,7 @@ async function _llmDateFallback(message, llmBackend, logger) {
       context: { systemInstructions: 'You extract date ranges. Return only JSON or null.' },
     }, { maxTokens: 100, temperature: 0, fastMode: true, taskType: 'classification' });
     if (!raw) return null;
-    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-    const parsed = JSON.parse(cleaned);
+    const parsed = parseLlmJson(raw, logger, 'Node:RetrieveMemory:dateFallback');
     if (parsed && parsed.startDate && parsed.endDate) {
       logger.debug(`[Node:RetrieveMemory] LLM fallback dateRange: ${JSON.stringify(parsed)}`);
       return parsed;

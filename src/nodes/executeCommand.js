@@ -36,6 +36,7 @@ const path = require('path');
 
 // Skill thinking helper for generating human-readable thinking messages
 const { generateSkillThinking } = require('../utils/skillThinking');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 // Runtime param builder + token substitution for {{BODY}}, {{EMAIL}}, {{PHONE}},
 // {{URL}}, {{AMOUNT}}, {{ZIP}}, {{FILENAME}}, {{TO}}, {{TIME_MIN/MAX}}, etc.
 const { buildRuntimeParams, substituteTokens } = require('../utils/planSkillsHelpers');
@@ -4595,6 +4596,15 @@ Please try again or search with different terms.`;
                 question: raw?.question || raw?.error || 'Action required',
                 options: raw?.options || [],
                 runGroup: groupId,
+                // Agent failure fields — so the renderer shows the PartialFailureCard
+                // (QuestionCard.tsx) instead of the generic "Action required" banner.
+                _isAgentAskUser: true,
+                agentId: raw?.agentId || null,
+                partialProgress: raw?.partialProgress || null,
+                currentUrl: raw?.currentUrl || null,
+                keepSession: raw?.keepSession === true,
+                originalTask: raw?.originalTask || gs.args?.task || gs.args?.goal || null,
+                freeText: raw?.freeText === true || (raw?.options || []).length === 0,
               });
             } else {
               logger.warn(`[Node:ExecuteCommand] runGroup step ${idx} (${gs.skill}) failed: ${raw?.error || 'unknown error'}`);
@@ -5264,6 +5274,9 @@ Please try again or search with different terms.`;
       if (progressCallback) {
         // Emit ask_user (amber question card) instead of step_failed (red error badge).
         // The question is an expected clarification request, not a system failure.
+        // Include full agent context so the renderer can render the richer
+        // PartialFailureCard (QuestionCard.tsx) with "Try to finish" / "Train me"
+        // instead of the generic Action required banner.
         progressCallback({
           type: 'ask_user',
           question: raw.question,
@@ -5273,6 +5286,12 @@ Please try again or search with different terms.`;
           description: description || skill,
           source: 'agent_ask_user',
           freeText: raw.freeText === true || (raw.options || []).length === 0,
+          _isAgentAskUser: true,
+          agentId: raw.agentId || null,
+          partialProgress: raw.partialProgress || null,
+          currentUrl: raw.currentUrl || null,
+          keepSession: raw.keepSession === true,
+          originalTask: resolvedArgs?.task || resolvedArgs?.goal,
         });
       }
       return {
@@ -5663,9 +5682,8 @@ Please try again or search with different terms.`;
             }, { maxTokens: 300, temperature: 0, fastMode: true, taskType: 'complex' }, null);
 
             // Parse — must be valid JSON; on any error we fail open (no-op)
-            const _jsonMatch = _pcRaw.match(/\{[\s\S]*\}/);
-            if (_jsonMatch) {
-              const _pcVerdict = JSON.parse(_jsonMatch[0]);
+            const _pcVerdict = parseLlmJson(_pcRaw, logger, 'Node:ExecuteCommand:payloadCheck');
+            if (_pcVerdict) {
               logger.debug(`[Node:ExecuteCommand] payload.check verdict: ${_pcVerdict.verdict} (${_pcVerdict.errorType || 'none'})`);
 
               if (_pcVerdict.verdict === 'APP_ERROR') {

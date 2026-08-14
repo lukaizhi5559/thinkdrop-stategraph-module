@@ -3,6 +3,7 @@
 const http  = require('http');
 const https = require('https');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 /**
  * resolveAgent.js — StateGraph node
@@ -276,26 +277,90 @@ function _stripMarkdownFences(text) {
     .trim();
 }
 
-function _parseSelectionJson(text, logger) {
-  const stripped = _stripMarkdownFences(text);
+// Repair common LLM partial-output errors in the agent-selection JSON before parsing.
+// This prevents an unambiguous task from failing just because the model omitted a
+// boolean value or left a dangling comma.
+function _repairSelectionJson(text) {
+  if (!text || typeof text !== 'string') return text;
+  let repaired = text;
 
-  // 1. Try to parse the whole stripped response.
-  try {
-    const parsed = JSON.parse(stripped);
-    if (parsed && typeof parsed === 'object') return parsed;
-  } catch (_) {}
+  // 1. Fill in dangling key names with missing values. Examples:
+  //    "create": }   ->  "create": false }
+  //    "exists": ,   ->  "exists": false ,
+  //    "role": "...", "create": }  ->  "create": false }
+  repaired = repaired.replace(/"(create|exists)":\s*([}\],])/g, '"$1": false$2');
 
-  // 2. Find the outermost balanced JSON object.
-  const balanced = _extractBalancedJson(stripped);
-  if (balanced) {
-    try {
-      const parsed = JSON.parse(balanced);
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch (err) {
-      logger.warn(`[Node:ResolveAgent] Balanced JSON still failed: ${err.message}`);
+  // 2. Remove dangling commas before closing braces/brackets.
+  //    { "a": 1, }  ->  { "a": 1 }
+  //    [1, 2, ]     ->  [1, 2 ]
+  // Apply twice to handle nested patterns like "a": { "b": 1, },
+  repaired = repaired.replace(/,\s*([}\]])/g, '$1');
+  repaired = repaired.replace(/,\s*([}\]])/g, '$1');
+
+  // 3. If the text ends inside an unterminated string, close that string first.
+  //    "reasoning": "The user is following up...   ->   "reasoning": "..."
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < repaired.length; i++) {
+    const ch = repaired[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{' || ch === '[') {
+      depth++;
+    } else if (ch === '}' || ch === ']') {
+      depth--;
     }
   }
+  if (inString) {
+    repaired += '"';
+  }
 
+  // 4. If the object starts but does not end, close remaining braces/brackets.
+  //    { "agents": [ ...    ->  add ]} as needed
+  while (depth > 0) {
+    if (repaired.trim().endsWith('[')) {
+      repaired += ']';
+    } else {
+      repaired += '}';
+    }
+    depth--;
+  }
+
+  // 4. Ensure top-level keys are present with sensible defaults so downstream
+  //    code does not throw on undefined properties.
+  try {
+    const parsed = JSON.parse(repaired);
+    if (parsed && typeof parsed === 'object') {
+      if (!Array.isArray(parsed.agents)) parsed.agents = [];
+      if (typeof parsed.reasoning !== 'string') parsed.reasoning = '';
+      if (parsed.question !== null && typeof parsed.question !== 'string') parsed.question = null;
+      return parsed;
+    }
+  } catch (_) {}
+
+  return repaired;
+}
+
+function _parseSelectionJson(text, logger) {
+  const parsed = parseLlmJson(text, logger, 'Node:ResolveAgent');
+  if (parsed && typeof parsed === 'object') {
+    // Ensure required fields have sensible defaults
+    if (!Array.isArray(parsed.agents)) parsed.agents = [];
+    if (typeof parsed.reasoning !== 'string') parsed.reasoning = '';
+    if (parsed.question !== null && typeof parsed.question !== 'string') parsed.question = null;
+    return parsed;
+  }
   return null;
 }
 
@@ -353,8 +418,8 @@ Select the right agent(s) for this task, or ask the user if ambiguous.`;
         logger.warn(`[Node:ResolveAgent] Could not parse JSON on attempt 1 — retrying with stricter prompt`);
         return _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorQA, logger, attempt + 1);
       }
-      logger.warn(`[Node:ResolveAgent] Could not parse JSON after retry — treating as ambiguous`);
-      return { agents: [], reasoning: 'No structured selection returned.', question: 'Which service or agent should I use?' };
+      logger.warn(`[Node:ResolveAgent] Could not parse JSON after retry — attempting targetService fallback`);
+      return _targetServiceFallback(registeredAgents, taskClassification, 'No structured selection returned.');
     }
     if (!Array.isArray(parsed.agents)) throw new Error('missing "agents" array');
     return {
@@ -363,9 +428,35 @@ Select the right agent(s) for this task, or ask the user if ambiguous.`;
       question: parsed.question || null,
     };
   } catch (err) {
-    logger.warn(`[Node:ResolveAgent] LLM call failed (${err.message}) — treating as ambiguous`);
-    return { agents: [], reasoning: 'LLM selection failed.', question: 'Which service or agent should I use?' };
+    logger.warn(`[Node:ResolveAgent] LLM call failed (${err.message}) — attempting targetService fallback`);
+    return _targetServiceFallback(registeredAgents, taskClassification, 'LLM selection failed.');
   }
+}
+
+// Fallback: when the LLM fails but the taskClassification already pinpoints a
+// service, auto-select the matching registered agent instead of asking the user.
+function _targetServiceFallback(registeredAgents, taskClassification, reasoning) {
+  const targetService = (taskClassification?.targetService || taskClassification?.followUpTarget || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+  if (targetService && Array.isArray(registeredAgents)) {
+    const match = registeredAgents.find(a =>
+      (a.service || '').toLowerCase() === targetService ||
+      a.id?.toLowerCase() === `${targetService}.agent` ||
+      a.id?.toLowerCase() === targetService
+    );
+    if (match) {
+      return {
+        agents: [{
+          agentId: match.id,
+          role: `use ${match.id}`,
+          exists: true,
+          create: false,
+        }],
+        reasoning: `${reasoning} Using targetService fallback: ${match.id}`,
+        question: null,
+      };
+    }
+  }
+  return { agents: [], reasoning: reasoning, question: 'Which service or agent should I use?' };
 }
 
 async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpAdapter, logger) {

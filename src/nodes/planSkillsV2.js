@@ -20,6 +20,7 @@ const os   = require('os');
 
 const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../utils/planHelpers');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
+const { parseLlmJson } = require('../utils/parseLlmJson');
 
 /**
  * Analyzes a skill plan and adds runGroup properties for parallel execution.
@@ -1470,13 +1471,13 @@ async function planSkillsV2(state) {
       const _jsonMatch = _sanitizedBody.match(/```json\n([\s\S]*?)\n```/) ||
                          _sanitizedBody.match(/\[shell\.run\]:\n*([\s\S]+)/);
       if (_jsonMatch) {
-        try {
-          const _parsed = JSON.parse(_jsonMatch[1].trim());
+        const _parsed = parseLlmJson(_jsonMatch[1], logger, 'Node:PlanSkillsV2:messagingBody');
+        if (_parsed) {
           const _items = Array.isArray(_parsed) ? _parsed : (_parsed?.items || []);
           if (_items.length > 0) {
             _sanitizedBody = _items.map(item => `• ${item.summary || item.title || JSON.stringify(item)}`).join('\n');
           }
-        } catch (_) {}
+        }
       }
     }
     messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${_sanitizedBody}\n---\nDo NOT add a user.agent step to re-fetch this content — it is already provided above. Only add steps to resolve the recipient address (if unknown) and to send the email.`;
