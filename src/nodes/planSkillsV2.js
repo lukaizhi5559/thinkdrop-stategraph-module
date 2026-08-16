@@ -1444,6 +1444,56 @@ async function planSkillsV2(state) {
     logger.info(`[Node:PlanSkillsV2] No trained recipes available in map`);
   }
 
+  // ── Training gate: multi-step browser content-creation requires a trained recipe ──
+  // If the task is a browser mutation (content creation/editing) that requires DOM
+  // interaction AND is multi-step AND no trained recipe matched, surface an ask_user
+  // card offering guided training instead of attempting brittle automation.
+  // Signals: _taskClassification.requiresDOM (LLM-classified, already computed by
+  // resolveReferencesV2 via classifyTask) — NOT regex, which is fragile (false
+  // positives on "new"/"book"/"post" in read contexts, false negatives on gerunds
+  // like "creating"/"adding").
+  if (!recoveryContext && !state._planCorrectionMode) {
+    const _tc = state._taskClassification;
+    const _isBrowserMutation = _tc?.taskType === 'browser'
+      && _tc?.requiresDOM === true
+      && _tc?.isBrowseOnly !== true;
+    // Multi-step signal: decomposePrompt subPrompts > 1, or 2+ distinct mutation
+    // action clauses joined by "and" (e.g. "create a playlist and add X, Y, Z").
+    const _subPrompts = Array.isArray(state.subPrompts) ? state.subPrompts : null;
+    const _hasMultiSubPrompts = _subPrompts && _subPrompts.length > 1;
+    const _hasAndConjunction = /\b(?:and|then|also)\b/i.test(userMessage)
+      && /\b(?:create|make|build|add|post|share|send|write|edit|update|delete|remove|upload|publish|submit|compose|draft)\b/i.test(userMessage);
+    const _isMultiStep = !!(_hasMultiSubPrompts || _hasAndConjunction);
+
+    if (_isBrowserMutation && _isMultiStep) {
+      const _targetService = _tc?.targetService || null;
+      const _agentId = _targetService ? `${_targetService}.agent` : null;
+      logger.info(`[Node:PlanSkillsV2] Training gate: browser mutation + multi-step + no trained recipe — surfacing guided training offer (service=${_targetService || 'unknown'})`);
+      const _gatePlan = [{
+        skill: 'ask_user',
+        description: `Training required for: ${userMessage.slice(0, 80)}`,
+        args: {
+          question: `This task (${userMessage.slice(0, 120)}) requires multiple steps on ${_targetService || 'this service'} that I haven't been trained on yet. I can't perform it reliably without training. Would you like to train me?`,
+          options: [
+            { label: 'Start guided training', value: 'guided_train' },
+            { label: 'Cancel', value: 'cancel' },
+          ],
+          trainingHandoff: true,
+          trainingTask: userMessage,
+          trainingAgentId: _agentId,
+        },
+      }];
+      if (progressCallback) {
+        progressCallback({
+          type: 'plan_ready',
+          steps: _gatePlan.map((s, i) => ({ index: i, ...s })),
+          intent: state.intent?.type || 'command_automate',
+        });
+      }
+      return { ...state, skillPlan: _gatePlan, skillCursor: 0, planError: null, recoveryContext: null };
+    }
+  }
+
   // ── Build the LLM planning query ──────────────────────────────────────────
   const runtimeNote = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, priorSynthesizedContent)
     ? (() => {
@@ -1537,7 +1587,7 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
         mandateLines.push(`- ${svc}: The only available and authenticated route is desktop app via ${m.agentId}. You MUST use app.agent { action: 'run_agent', appName: '${svc}', task: '...' }. FORBIDDEN: api_suggest, browser.agent, browser.act, cli.agent, or any other route for ${svc}.`);
       }
     }
-    singleRouteNote = `\n\n⚠️ SINGLE-ROUTE MANDATE — MANDATORY ROUTE FOR THESE SERVICES:\n${mandateLines.join('\n')}\n\nThese services have only one authenticated route available. You MUST use that route and MUST NOT generate api_suggest or alternative routes for them.\n`;
+    singleRouteNote = `\n\n⚠️ SINGLE-ROUTE MANDATE — MANDATORY ROUTE FOR THESE SERVICES:\n${mandateLines.join('\n')}\n\nThese services have only one authenticated route available. You MUST use that route and MUST NOT generate api_suggest or alternative routes for them.\n\nIMPORTANT: The single-route mandate specifies WHICH agent to use, NOT how many steps. If the task involves multiple distinct actions (e.g., create X, then add Y, then add Z), emit one step per action — all using the same agentId. State carries over automatically between consecutive same-agent steps. Do NOT combine multiple distinct actions into one monolithic task string.\n`;
     logger.info(`[Node:PlanSkillsV2] Single-route mandate injected: ${JSON.stringify(singleRouteMandate)}`);
   }
 
@@ -1675,7 +1725,11 @@ The user's request does NOT match any installed skill.
   // ── LLM call ──────────────────────────────────────────────────────────────
   if (progressCallback) progressCallback({ type: 'planning', message: 'Planning steps…' });
 
-  const _maxTokens = Math.min(3000, Math.max(800, 4000 - Math.round(planningQuery.length / 4)));
+  // Flat token budget — the old formula (4000 - len/4, floor 800) was backwards:
+  // it penalized long prompts by clamping to 800 tokens, which is barely enough
+  // for 2 steps. A 10-step decomposition needs ~850-1275 tokens. 2000 gives
+  // comfortable headroom for 12-15 steps with detailed task strings.
+  const _maxTokens = 2000;
   const payload = {
     query: planningQuery,
     context: {

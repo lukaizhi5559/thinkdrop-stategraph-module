@@ -44,11 +44,11 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 
 **SKILL ROUTING (core):**
 - REST API service (api_key/bearer) → `browser.agent { action: 'build_agent', service }` then `run`
-- OAuth service (Gmail, Slack, Notion) → `browser.agent { action: 'run', agentId, task }`
+- OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) → `browser.agent { action: 'run', agentId, task }`
 - CLI-backed service → `cli.agent { action: 'run', agentId, task }`
 - Service in AVAILABLE AGENTS [browser] → `browser.agent { action: 'run', agentId, task }` (NEVER raw `browser.act`)
 - Service marked `[NEEDS AUTH]` → do NOT use directly; use a REST API alternative or `api_suggest`
-- AI chatbot (ChatGPT, Claude, Perplexity, Gemini, Grok) → `browser.agent { action: 'run', agentId, task }`
+- AI chatbot (`<chatbot-service>`) → `browser.agent { action: 'run', agentId, task }`
 - Bot-blocking site or uncertain URL → `web.agent search_and_navigate` → `browser.agent run with url:'{{bestUrl}}'`
 - Local file ops / scripts / git → `shell.run`
 - Desktop app interaction (shortcuts, scroll, OCR) → `app.agent`
@@ -64,7 +64,7 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 - Sub-agent → sub-agent (SAME-AGENT or INDEPENDENT — reusing state or different agents): NO synthesize between steps — state carries over automatically
 - Any retrieval ("what is", "list", "show me", "find") → append `synthesize` after retrieval
 
-**NEVER** use placeholder text like `[ChatGPT response]` in step args. Use `{{synthesisAnswer}}` as the sole body content token.
+**NEVER** use placeholder text like `[<chatbot-service> response]` in step args. Use `{{synthesisAnswer}}` as the sole body content token.
 
 ## Output Schema for synthesize steps
 
@@ -109,19 +109,19 @@ When a sub-agent task involves multiple distinct actions, break it into multiple
 
 Consecutive same-agent steps reuse the same session/state automatically. No synthesize needed between steps — the state (browser tab, CLI context, app window) carries over.
 
-**BAD (one monolithic browser.agent step — agent gets stuck):**
+**BAD (one monolithic browser.agent step — agent gets stuck). This applies even when a single-route mandate restricts you to one agent — the mandate specifies WHICH agent, not HOW MANY steps:**
 ```json
-[{"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Open Spotify, create a playlist named Christian Music, and add top songs from Lecrae, KB, and Newsboys"}}]
+[{"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service>, create a <collection> named <name>, and add top <items> from <source-A>, <source-B>, and <source-C>"}}]
 ```
 
 **GOOD (decomposed — browser state carries over between steps):**
 ```json
 [
-  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Open Spotify and create a new playlist named Christian Music"},"description":"Create Spotify playlist"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for Lecrae and add 3 top songs to the Christian Music playlist"},"description":"Add Lecrae songs"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for KB and add 3 top songs to the Christian Music playlist"},"description":"Add KB songs"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for Newsboys and add 3 top songs to the Christian Music playlist"},"description":"Add Newsboys songs"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the Christian Music playlist was created with songs from Lecrae, KB, and Newsboys."},"description":"Confirm playlist"}
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <collection> named <name>"},"description":"Create <collection>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-A> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-A> <items>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-B> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-B> <items>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-C> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-C> <items>"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the <name> <collection> was created with <items> from <source-A>, <source-B>, and <source-C>."},"description":"Confirm <collection>"}
 ]
 ```
 
@@ -166,13 +166,13 @@ When steps use different agents and are independent, no synthesize needed betwee
 
 When step 2 (different agent) needs the text output of step 1, insert `synthesize` and use `{{synthesisAnswer}}`.
 
-**browser.agent → cli.agent example:**
+**browser.agent → shell.run example:**
 ```json
 [
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling laptops and their prices"},"description":"Scrape Amazon laptops"},
-  {"skill":"synthesize","args":{"prompt":"Format the laptop data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
-  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/laptops.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the laptop data was saved to ~/Desktop/laptops.csv."},"description":"Confirm"}
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling <items> and their prices"},"description":"Scrape <ecommerce-service> for <items>"},
+  {"skill":"synthesize","args":{"prompt":"Format the <items> data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
+  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/<items>.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the <items> data was saved to ~/Desktop/<items>.csv."},"description":"Confirm"}
 ]
 ```
 

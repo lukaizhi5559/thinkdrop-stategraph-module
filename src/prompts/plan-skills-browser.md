@@ -4,37 +4,37 @@ Domain-specific guidance for `browser.agent` and `web.agent`. General skill list
 
 ### When to use `web.agent` before `browser.agent`
 
-- **Known bot blockers / CAPTCHA:** stackoverflow, reddit, twitter/X, paywalled news
+- **Known bot blockers / CAPTCHA:** sites that block automated browsing or present CAPTCHA challenges
 - **Unknown or uncertain domain:** the LLM may guess the wrong URL
 - **Pattern:** `web.agent search_and_navigate` → `browser.agent { action: 'run', url: '{{bestUrl}}' }` → `synthesize`
 
 ### Agent ID naming
 
 Lowercase service name + `.agent` suffix:
-`biblegateway.agent`, `google.agent`, `duckduckgo.agent`, `wikipedia.agent`, `reddit.agent`, `chatgpt.agent`, `gemini.agent`, `perplexity.agent`
+`<service>.agent` (e.g., `<search-service>.agent`, `<wiki-service>.agent`, `<social-service>.agent`, `<chatbot-service>.agent`)
 
 ### Examples
 
 **Search a named site:**
 ```json
 [
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "biblegateway.agent", "task": "look up john 3:16" }, "description": "Look up John 3:16 on Bible Gateway" },
-  { "skill": "synthesize", "args": { "prompt": "Present the Bible verse text clearly to the user" }, "description": "Summarize the Bible Gateway results" }
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "look up <query>" }, "description": "Look up <query> on <service>" },
+  { "skill": "synthesize", "args": { "prompt": "Present the results clearly to the user" }, "description": "Summarize the <service> results" }
 ]
 ```
 
 **Ask an AI chatbot:**
 ```json
 [
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "chatgpt.agent", "task": "ask what the benefits of meditation are" }, "description": "Ask ChatGPT about meditation benefits" },
-  { "skill": "synthesize", "args": { "prompt": "Present the AI's answer clearly" }, "description": "Present ChatGPT's response" }
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<chatbot-service>.agent", "task": "ask <question>" }, "description": "Ask <chatbot-service> <question>" },
+  { "skill": "synthesize", "args": { "prompt": "Present the AI's answer clearly" }, "description": "Present <chatbot-service> response" }
 ]
 ```
 
 **Read a raw URL:**
 ```json
 [
-  { "skill": "browser.agent", "args": { "action": "run", "task": "read and extract the main content from the page", "url": "https://some-random-site.com/page" }, "description": "Navigate and read the URL" },
+  { "skill": "browser.agent", "args": { "action": "run", "task": "read and extract the main content from the page", "url": "https://<site>/page" }, "description": "Navigate and read the URL" },
   { "skill": "synthesize", "args": { "prompt": "Summarize the page content for the user" }, "description": "Summarize page content" }
 ]
 ```
@@ -42,29 +42,39 @@ Lowercase service name + `.agent` suffix:
 **Bypass a bot blocker:**
 ```json
 [
-  { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "latest mars news site:space.com", "preferDomain": "space.com" }, "description": "Find a direct article URL on Space.com" },
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "space.com.agent", "task": "extract the main article text", "url": "{{bestUrl}}" }, "description": "Read the article directly" },
-  { "skill": "synthesize", "args": { "prompt": "Summarize the Mars news article" }, "description": "Summarize the article" }
+  { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "<search query> site:<site>", "preferDomain": "<site>" }, "description": "Find a direct article URL on <site>" },
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "extract the main article text", "url": "{{bestUrl}}" }, "description": "Read the article directly" },
+  { "skill": "synthesize", "args": { "prompt": "Summarize the article" }, "description": "Summarize the article" }
 ]
 ```
 
 ### Content creation tasks (playlists, documents, posts, boards)
 
-When the user asks to CREATE something on a web service (playlist, document, board, post, event), the `task` string MUST be step-by-step — not a high-level description. The browser agent fills forms and clicks buttons; it cannot infer multi-step workflows from a vague task.
+When the user asks to CREATE something on a web service (playlist, document, board, post, event), DECOMPOSE the task into MULTIPLE `browser.agent` steps — each with ONE clear action. The browser agent fills forms and clicks buttons; a single monolithic step with many actions will get stuck. Breaking it into steps ensures each action is independently verifiable and recoverable.
 
-**Wrong (too vague — the agent will just search, not create):**
+**WRONG (one monolithic step — agent gets stuck):**
 ```json
-{ "skill": "browser.agent", "args": { "action": "run", "agentId": "spotify.agent", "task": "Create a playlist named 'Christian Music' and add top songs from Lecrae, KB, and Newsboys" } }
+[
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Open <service>, create a <collection> named <name>, and add <items> from <source-A>, <source-B>, and <source-C>" }, "description": "Create <collection> and add <items>" }
+]
 ```
 
-**Right (step-by-step — the agent knows exactly what to do):**
+**RIGHT (decomposed — browser state carries over between steps):**
 ```json
-{ "skill": "browser.agent", "args": { "action": "run", "agentId": "spotify.agent", "task": "Go to https://open.spotify.com/. Click the '+' or 'Create playlist' button in the left sidebar. A new playlist will appear — click its title/name field and rename it to 'Christian Music'. Then for each artist (Lecrae, KB, Newsboys): click the search bar, type the artist name, press Enter, click on the artist, find their top 3 songs, and click the '...' menu → 'Add to playlist' → 'Christian Music' for each song." } }
+[
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Open <service> and create a new <collection> named <name>" }, "description": "Create <collection>" },
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Search for <source-A> and add 3 top <items> to the <name> <collection>" }, "description": "Add <source-A> <items>" },
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Search for <source-B> and add 3 top <items> to the <name> <collection>" }, "description": "Add <source-B> <items>" },
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Search for <source-C> and add 3 top <items> to the <name> <collection>" }, "description": "Add <source-C> <items>" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the <name> <collection> was created with <items> from <source-A>, <source-B>, and <source-C>." }, "description": "Confirm <collection>" }
+]
 ```
 
 **Key rules for content creation tasks:**
-- ALWAYS start with the navigation step (go to the service's main page)
-- ALWAYS include the "create" step explicitly (click Create/New/+, name the item)
-- ALWAYS include each sub-step as a separate instruction (search for X, add Y, select Z)
-- Use the gathered answers from prior context (e.g., playlist name, artist list, song preferences) directly in the task string
-- The task string can be long — that's fine. Precision beats brevity for browser agents.
+- ALWAYS decompose into multiple `browser.agent` steps — one step per distinct action
+- ALWAYS start with the navigation + creation step (go to the service, click Create/New/+, name the item)
+- ALWAYS include each sub-action as a separate step (search for X, add Y, select Z)
+- Consecutive same-agent steps reuse the same browser session automatically — no synthesize between them
+- Use the gathered answers from prior context (e.g., collection name, item list, preferences) directly in the task strings
+- Each task string should be clear and specific — the browser agent follows it literally
+- Always add a final `synthesize` step to confirm the overall task

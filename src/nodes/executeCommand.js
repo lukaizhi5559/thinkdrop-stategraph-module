@@ -4571,7 +4571,7 @@ Please try again or search with different terms.`;
       // Inner function to attempt step with optional retry
       const attemptStep = async (isRetry = false) => {
         try {
-          const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: stepTimeoutMs });
+          const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: stepTimeoutMs, signal: state.abortSignal });
           const raw = res?.data || res;
 
           // If browser crashed and this is first attempt, retry once immediately
@@ -4783,7 +4783,7 @@ Please try again or search with different terms.`;
 
         logger.info(`[Node:ExecuteCommand] parallel login: re-dispatching ${svc?.agentId} (decision=${decision})`);
         try {
-          const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: 300000 });
+          const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: 300000, signal: state.abortSignal });
           const raw = res?.data || res;
           return { idx: r.idx, step: gs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, raw };
         } catch (err) {
@@ -5079,7 +5079,7 @@ Please try again or search with different terms.`;
       mcpAdapter.callService('command', 'command.automate', {
         skill,
         args: _callArgs
-      }, { timeoutMs: stepTimeoutMs }),
+      }, { timeoutMs: stepTimeoutMs, signal: state.abortSignal }),
       progressCallback,
       () => ({
         type: 'skill:thinking',
@@ -6848,6 +6848,24 @@ Please try again or search with different terms.`;
     };
 
   } catch (error) {
+    // ── Abort short-circuit ────────────────────────────────────────────────
+    // If the user cancelled, the in-flight command.automate HTTP request was
+    // destroyed (signal → req.destroy) and re-threw as 'aborted'. Treat this
+    // as a clean cancel — do NOT run the failure/recovery path, which would
+    // surface a confusing "step failed" card and trigger LLM recovery.
+    if (state.abortSignal?.aborted || /aborted/i.test(error.message || '')) {
+      logger.info(`[Node:ExecuteCommand] Cancelled by user (abort signal) at step ${skillCursor + 1} (${skill})`);
+      if (progressCallback) progressCallback({ type: 'all_done', cancelled: true, totalCount: skillPlan.length, skillResults });
+      return {
+        ...state,
+        cancelled: true,
+        error: 'Cancelled by user',
+        skillResults: [...skillResults, { step: skillCursor + 1, skill, args, ok: false, error: 'Cancelled by user', cancelled: true }],
+        skillCursor: skillPlan.length,
+        commandExecuted: true,
+        failedStep: null,
+      };
+    }
     // Check if this is a search command that exited with code 1 (no results) — treat as soft failure
     const SEARCH_CMDS_CATCH = ['mdfind', 'find', 'grep', 'locate'];
     const _isGoalModeCatch = skill === 'shell.run' && !!args.goal && !args.cmd;

@@ -56,7 +56,11 @@ class StateGraph {
       currentNode: this.startNode,
       mcpAdapter: this.mcpAdapter, // Inject adapter into state for nodes
       logger: capturingLogger,     // Override with capturing proxy
-      runLog                       // Shared reference — nodes append via logger, evaluateSkills reads
+      runLog,                      // Shared reference — nodes append via logger, evaluateSkills reads
+      // Expose the abort signal so long-running nodes (executeCommand) can
+      // thread it into MCP callService options — destroying the in-flight
+      // HTTP request when the user cancels, instead of waiting for a timeout.
+      abortSignal: abortSignal || null,
     };
 
     let currentNode = this.startNode;

@@ -376,7 +376,7 @@ Rules:
 - If the ROUTE DECISION block is empty or all routes are marked [CONFIRMED], do NOT include a routeConfirmation. Confirmed routes are locked in.
 - If ALL required inputs have been answered in PRIOR CLARIFICATIONS and all routes are confirmed, return {"complete": true}.
 - Questions should be concise (15 words max). Options should be short labels.
-- memoryText/memoryTextTemplate: a clean factual statement for future memory storage. Example: "User's preferred Spotify playlist name is '{answer}'". This will be stored as type 'gather_clarification' so future tasks can find it.
+- memoryText/memoryTextTemplate: a clean factual statement for future memory storage. Example: "User's preferred <app-name> playlist name is '{answer}'". This will be stored as type 'gather_clarification' so future tasks can find it.
 - Max 5 questions per batch.`;
 
 /**

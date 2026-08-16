@@ -87,12 +87,12 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 | Task | Correct skill |
 |------|---------------|
 | REST API service (api_key/bearer) | `browser.agent { action: 'build_agent', service }` then `run` |
-| OAuth service (Gmail, Slack, Notion, etc.) | `browser.agent { action: 'run', agentId, task }` — handles OAuth internally |
+| OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) | `browser.agent { action: 'run', agentId, task }` — handles OAuth internally |
 | CLI-backed service (gh, aws, heroku) | `cli.agent { action: 'run', agentId, task }` |
 | Service in AVAILABLE AGENTS [browser] | `browser.agent { action: 'run', agentId, task }` — NEVER raw `browser.act` |
 | Service in AVAILABLE AGENTS [browser] marked `[NEEDS AUTH]` | Do NOT use directly. Use a REST API alternative (`browser.agent { action: 'build_agent', service: '<app-service>' }` or `<app-service>`, etc.) OR output `api_suggest` to let the user pick an authenticated provider. NEVER silently trigger a browser login flow. |
 | Service in AVAILABLE AGENTS [api_key] | `browser.agent` or `cli.agent` run — api_key agents are API-only, cannot navigate |
-| AI chatbot (ChatGPT, Claude, Perplexity, Gemini, Grok) | `browser.agent { action: 'run', agentId, task }` — chat interface, NOT developer API |
+| AI chatbot (`<chatbot-service>`) | `browser.agent { action: 'run', agentId, task }` — chat interface, NOT developer API |
 | Discovery on a known agent (unknown nav path) | `browser.agent { action: 'explore', agentId, goal }` |
 | Public/anonymous content | `browser.agent { action: 'run', agentId, task }` |
 | Bot-blocking site or uncertain URL | `web.agent search_and_navigate` → `browser.agent run with url:'{{bestUrl}}'` |
@@ -101,7 +101,7 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 | Tool-based file conversion (PDF, images, video, audio) | `cli.agent` — `build_agent` if agent missing, then `run` |
 | Desktop app interaction (shortcuts, scroll, OCR) | `app.agent` |
 | App's built-in AI assistant | `app.agent { action: 'run_agent', appName, filePath, prompt }` |
-| Search videos on a platform | `browser.agent { action: 'run', agentId: 'youtube.agent', task }` → `synthesize` |
+| Search videos on a platform | `browser.agent { action: 'run', agentId: '<video-platform>.agent', task }` → `synthesize` |
 | Watch/transcribe a specific video | `video.agent { action: 'watch_video', videoUrl, goal }` — ALWAYS wins over ytdlp.agent |
 | Find and watch tutorial video | `video.agent { action: 'find_and_watch_tutorial', platform, query, goal }` |
 
@@ -109,7 +109,7 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 
 - "watch", "transcribe", "get transcript", "extract from video" → `video.agent` (always wins over ytdlp.agent)
 - "download video", "convert to mp3" → `cli.agent { action: 'run', agentId: 'ytdlp.agent' }`
-- "search YouTube for X" → `browser.agent { action: 'run', agentId: 'youtube.agent' }` → `synthesize`
+- "search <video-platform> for X" → `browser.agent { action: 'run', agentId: '<video-platform>.agent' }` → `synthesize`
 - "goto", "visit", "open site" → `browser.agent`
 - "convert", "process file" → CLI first (but NOT "transcribe video" → `video.agent`)
 
@@ -117,7 +117,7 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 
 **AI service routing:** Chat/research → plain service name (`deepseek.agent`, `perplexity.agent`). Developer API → `*platform` variant (`deepseekplatform.agent`).
 
-**SMS routing:** When `smsGatewayTarget` is provided AND `gmail.agent` is NOT marked `[NEEDS AUTH]`, send via `gmail.agent` email (free carrier gateway). If `gmail.agent` is `[NEEDS AUTH]`, use `api_suggest` or `browser.agent { action: 'build_agent', service: 'sendgrid' }` instead.
+**SMS routing:** When `smsGatewayTarget` is provided AND `<email-service>.agent` is NOT marked `[NEEDS AUTH]`, send via `<email-service>.agent` email (free carrier gateway). If `<email-service>.agent` is `[NEEDS AUTH]`, use `api_suggest` or `browser.agent { action: 'build_agent', service: '<email-api-service>' }` instead.
 
 **user.agent:** Use `resolve_form` before tasks needing personal data. Use `resolve_context` before generating personalized content. Pass `summary` into following `synthesize` step.
 
@@ -136,7 +136,7 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 | browser.agent → browser.agent (SAME-AGENT or INDEPENDENT) | NO `synthesize` between steps | Browser state carries over automatically |
 | Any retrieval step → display | Append `synthesize` after retrieval | Retrieval: "what is", "list", "show me", "find" |
 
-**NEVER** use placeholder text like `[ChatGPT response]` in step args. Use `{{synthesisAnswer}}` as the sole body content token.
+**NEVER** use placeholder text like `[<chatbot-service> response]` in step args. Use `{{synthesisAnswer}}` as the sole body content token.
 **NEVER** use `saveToFile` in synthesize and reference that path in a browser.agent task — browser agent cannot read filesystem files.
 
 ## Output Schema for synthesize steps
@@ -191,17 +191,17 @@ When a sub-agent task involves multiple distinct actions, break it into multiple
 
 **BAD (one monolithic browser.agent step — agent gets stuck):**
 ```json
-[{"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Open Spotify, create a playlist named Christian Music, and add top songs from Lecrae, KB, and Newsboys"}}]
+[{"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service>, create a <collection> named <name>, and add top <items> from <source-A>, <source-B>, and <source-C>"}}]
 ```
 
 **GOOD (decomposed — browser state carries over between steps):**
 ```json
 [
-  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Open Spotify and create a new playlist named Christian Music"},"description":"Create Spotify playlist"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for Lecrae and add 3 top songs to the Christian Music playlist"},"description":"Add Lecrae songs"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for KB and add 3 top songs to the Christian Music playlist"},"description":"Add KB songs"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"spotify.agent","task":"Search for Newsboys and add 3 top songs to the Christian Music playlist"},"description":"Add Newsboys songs"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the Christian Music playlist was created with songs from Lecrae, KB, and Newsboys."},"description":"Confirm playlist"}
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <collection> named <name>"},"description":"Create <collection>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-A> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-A> <items>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-B> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-B> <items>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-C> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-C> <items>"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the <name> <collection> was created with <items> from <source-A>, <source-B>, and <source-C>."},"description":"Confirm <collection>"}
 ]
 ```
 
@@ -243,10 +243,10 @@ When a sub-agent task involves multiple distinct actions, break it into multiple
 **browser.agent → shell.run example:**
 ```json
 [
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling laptops and their prices"},"description":"Scrape Amazon laptops"},
-  {"skill":"synthesize","args":{"prompt":"Format the laptop data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
-  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/laptops.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the laptop data was saved to ~/Desktop/laptops.csv."},"description":"Confirm"}
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling <items> and their prices"},"description":"Scrape <ecommerce-service> for <items>"},
+  {"skill":"synthesize","args":{"prompt":"Format the <items> data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
+  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/<items>.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the <items> data was saved to ~/Desktop/<items>.csv."},"description":"Confirm"}
 ]
 ```
 
@@ -276,7 +276,7 @@ When a sub-agent task involves multiple distinct actions, break it into multiple
 - Raw URLs: `browser.agent { action: 'run', task, url }`
 - New services: `browser.agent { action: 'build_agent', service }` then `run`
 
-**AI chatbot URLs:** Gemini→`gemini.google.com`, ChatGPT→`chat.openai.com`, Perplexity→`www.perplexity.ai`, Claude→`claude.ai`
+**AI chatbot URLs:** Each chatbot service has its own URL — use `web.agent search_and_navigate` if the URL is unknown, or check AVAILABLE AGENTS for the registered agentId.
 
 **screen vs browser:** "what's on my screen" → `screen.capture`. "extract from web page" → `browser.agent`.
 
