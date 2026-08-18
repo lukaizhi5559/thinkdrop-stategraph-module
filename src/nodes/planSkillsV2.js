@@ -1206,7 +1206,7 @@ async function planSkillsV2(state) {
         for (const agentDir of agentDirs) {
           const recipeDir = path.join(skillsRoot, agentDir);
           let recipeFiles;
-          try { recipeFiles = fs.readdirSync(recipeDir).filter(f => f.endsWith('.recipe.json')); }
+          try { recipeFiles = fs.readdirSync(recipeDir).filter(f => f.endsWith('.skill.json') || f.endsWith('.recipe.json')); }
           catch (_) { continue; }
           for (const recipeFile of recipeFiles) {
             try {
@@ -1452,11 +1452,10 @@ async function planSkillsV2(state) {
   // resolveReferencesV2 via classifyTask) — NOT regex, which is fragile (false
   // positives on "new"/"book"/"post" in read contexts, false negatives on gerunds
   // like "creating"/"adding").
-  if (!recoveryContext && !state._planCorrectionMode) {
+  if (!recoveryContext && !state._planCorrectionMode && !state._skipTrainingGate) {
     const _tc = state._taskClassification;
     const _isBrowserMutation = _tc?.taskType === 'browser'
-      && _tc?.requiresDOM === true
-      && _tc?.isBrowseOnly !== true;
+      && _tc?.requiresDOM === true;
     // Multi-step signal: decomposePrompt subPrompts > 1, or 2+ distinct mutation
     // action clauses joined by "and" (e.g. "create a playlist and add X, Y, Z").
     const _subPrompts = Array.isArray(state.subPrompts) ? state.subPrompts : null;
@@ -1473,14 +1472,15 @@ async function planSkillsV2(state) {
         skill: 'ask_user',
         description: `Training required for: ${userMessage.slice(0, 80)}`,
         args: {
-          question: `This task (${userMessage.slice(0, 120)}) requires multiple steps on ${_targetService || 'this service'} that I haven't been trained on yet. I can't perform it reliably without training. Would you like to train me?`,
+          question: `This task (${userMessage.slice(0, 120)}) requires multiple steps on ${_targetService || 'this service'} that I haven't been trained on yet. I can't guarantee it'll work without training. Would you like to train me?`,
           options: [
             { label: 'Start guided training', value: 'guided_train' },
             { label: 'Cancel', value: 'cancel' },
           ],
           trainingHandoff: true,
-          trainingTask: userMessage,
-          trainingAgentId: _agentId,
+          agentId: _agentId,
+          originalTask: userMessage,
+          trainingTask: resolvedMessage || message || userMessage,
         },
       }];
       if (progressCallback) {

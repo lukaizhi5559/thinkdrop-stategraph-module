@@ -1113,71 +1113,11 @@ module.exports = async function executeCommand(state) {
 
     if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults, savedFilePaths: [...new Set(savedFilePaths)], planFile: state._skillPlanFile || null });
 
-    // ── Composite agent synthesis (Part 3) ───────────────────────────────────
-    // After a fully successful multi-step plan with 2+ consecutive same-domain
-    // external.skill steps, synthesize a composite [name].agent skill so future
-    // runs can use a single step instead of the full sequence.
-    const _allOkForComposite = skillResults.every(r => r.ok || r.skipped);
-    if (_allOkForComposite && skillResults.length >= 2) {
-      try {
-        // Find consecutive runs of external.skill steps from the same domain
-        const _externalSteps = skillResults
-          .filter(r => r.skill === 'external.skill' && r.ok && r.args?.name)
-          .map(r => ({ skillName: r.args.name, args: r.args }));
-
-        if (_externalSteps.length >= 2) {
-          // Group by hostname prefix (e.g. 'perplexity_ai_click_history' → 'perplexity_ai')
-          const _hostname = (() => {
-            const firstName = _externalSteps[0].skillName;
-            // Try to extract domain from skill name (e.g. perplexity_ai → perplexity.ai)
-            const parts = firstName.split('_');
-            // Walk forward while parts match a domain-like segment
-            for (let n = parts.length - 1; n >= 2; n--) {
-              const candidate = parts.slice(0, n).join('.');
-              if (/^[a-z0-9]+(\.[a-z0-9]+)+$/.test(candidate.replace(/_/g, '.'))) {
-                return parts.slice(0, n).join('_');
-              }
-            }
-            return parts.slice(0, 2).join('_');
-          })();
-
-          const _allSameDomain = _externalSteps.every(s => s.skillName.startsWith(_hostname));
-          if (_allSameDomain) {
-            const { generateCompositeAgentSkill } = require('../../mcp-services/command-service/src/skills/explore.agent.cjs');
-            const _orderedActions = _externalSteps.map(s => {
-              const skillParts = s.skillName.replace(_hostname + '_', '').split('_');
-              return {
-                actionKey: s.skillName,
-                interaction: skillParts[0] || 'click',
-                locators: { primary: s.args?.selector || '', fallback_1: '', fallback_2: '' },
-                followUp: null,
-              };
-            });
-            const _domainHostname = _hostname.replace(/_/g, '.');
-            const _agentName = `${_hostname}_agent`;
-            const _composite = generateCompositeAgentSkill(_domainHostname, _agentName, _orderedActions);
-            if (_composite && !_composite.error) {
-              // Register the composite skill asynchronously (non-blocking)
-              const { _registerSkill } = require('../../mcp-services/command-service/src/skills/explore.agent.cjs');
-              if (typeof _registerSkill === 'function') {
-                _registerSkill(_composite).catch(() => {});
-              } else {
-                // Fallback: write directly to skills dir
-                const _os = require('os');
-                const _fs = require('fs');
-                const _path = require('path');
-                const _skillDir = _path.join(_os.homedir(), '.thinkdrop', 'skills', _agentName);
-                _fs.mkdirSync(_skillDir, { recursive: true });
-                _fs.writeFileSync(_path.join(_skillDir, 'index.cjs'), _composite.code, 'utf8');
-              }
-              logger.info(`[Node:ExecuteCommand] Composite agent synthesized: ${_agentName} (${_orderedActions.length} steps)`);
-            }
-          }
-        }
-      } catch (_compositeErr) {
-        logger.warn(`[Node:ExecuteCommand] Composite agent synthesis failed (non-fatal): ${_compositeErr.message}`);
-      }
-    }
+    // ── Composite agent synthesis (Part 3) — DISABLED ────────────────────────
+    // Composite skill generation has been disabled. Skills are now created via
+    // the trainer agent (recording user interactions), not by synthesizing from
+    // external_skill steps. The trainer's auto-split + recipe system replaces this.
+    // generateCompositeAgentSkill() in explore.agent.cjs is also disabled.
 
     // Archive the completed plan document
     writePlanDoc({ ...state, skillResults, skillCursor }, 'complete');

@@ -255,7 +255,10 @@ module.exports = async function parseSkill(state) {
   }
 
   // ── Strategy 5: Domain + source_action match ──────────────────────────────────
-  // Matches skills that have source_domain and source_action metadata (set by explore.agent).
+  // Matches skills that have source_domain and source_action metadata.
+  // NOTE: explore.agent skill generation is now disabled — these metadata fields are no
+  // longer populated for new skills. This strategy remains for backward compatibility with
+  // any legacy skills that still have source_domain/source_action metadata.
   // Detects the target service from the message by checking if any source_domain keyword
   // (e.g. "perplexity", "krea") appears in the message, then scores source_action tokens
   // against the message words.
@@ -422,10 +425,10 @@ module.exports = async function parseSkill(state) {
 
   // Only attempt if at least some skills have descriptions — otherwise the LLM
   // has nothing useful to compare against.
-  // Exclude goal_tied skills — they are sub-step atomics recorded by explore.agent,
-  // intended to be invoked internally by browser.agent, not matched as standalone tasks.
-  // Semantic match on these causes a domain fast-path to fire a broken single-step plan
-  // instead of delegating the full task to browser.agent.
+  // Exclude goal_tied skills — these were sub-step atomics from the now-disabled
+  // explore.agent auto-scan system. They were intended to be invoked internally by
+  // browser.agent, not matched as standalone tasks. Since auto-scan is disabled,
+  // no new goal_tied skills are created. This filter remains for backward compatibility.
   let skillsWithDesc = installedSkills.filter(s => (s.description || s.summary) && !s.goalTied);
   if (skillsWithDesc.length === 0) {
     logger.debug(`[Node:ParseSkill] No skill match (no descriptions for semantic match): "${classifyMessage.substring(0, 80)}"`);
