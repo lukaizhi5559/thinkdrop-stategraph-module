@@ -1465,9 +1465,14 @@ async function planSkillsV2(state) {
     const _isMultiStep = !!(_hasMultiSubPrompts || _hasAndConjunction);
 
     if (_isBrowserMutation && _isMultiStep) {
-      const _targetService = _tc?.targetService || null;
-      const _agentId = _targetService ? `${_targetService}.agent` : null;
-      logger.info(`[Node:PlanSkillsV2] Training gate: browser mutation + multi-step + no trained recipe — surfacing guided training offer (service=${_targetService || 'unknown'})`);
+      // For follow-up / ambiguous prompts _tc.targetService may be null even though
+      // resolveAgent already selected the right agent. Use the resolved agent as a
+      // fallback so the training gate has a real agentId to hand off to.
+      const _resolvedAgentId = state.resolveAgentResult?.agents?.[0]?.agentId || null;
+      const _targetService = _tc?.targetService
+        || (_resolvedAgentId ? _resolvedAgentId.replace(/\.agent$/i, '') : null);
+      const _agentId = _resolvedAgentId || (_targetService ? `${_targetService}.agent` : null);
+      logger.info(`[Node:PlanSkillsV2] Training gate: browser mutation + multi-step + no trained recipe — surfacing guided training offer (service=${_targetService || 'unknown'}, agentId=${_agentId || 'none'})`);
       const _gatePlan = [{
         skill: 'ask_user',
         description: `Training required for: ${userMessage.slice(0, 80)}`,
