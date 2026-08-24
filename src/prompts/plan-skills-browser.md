@@ -78,3 +78,25 @@ When the user asks to CREATE something on a web service (playlist, document, boa
 - Use the gathered answers from prior context (e.g., collection name, item list, preferences) directly in the task strings
 - Each task string should be clear and specific — the browser agent follows it literally
 - Always add a final `synthesize` step to confirm the overall task
+
+### Simple single-action exception (DO NOT decompose these)
+
+The decompose rule above applies to tasks with **multiple independent actions** where the agent must search or gather content (playlists, multi-item boards, documents with content from multiple sources). It does NOT apply to simple tasks where the user provides all content in the prompt and there is only one logical "submit" action.
+
+**Do NOT decompose these — use ONE `browser.agent` step:**
+- **Email/message**: "send email to X with subject Y and body Z"
+- **Social post**: "post 'Hello world' on <service>"
+- **Reply**: "reply to this email/thread/message with '...'"
+- **Comment**: "comment 'Nice work!' on this post/video"
+- **Status/bio update**: "update my status to '...'"
+- **Simple form fill**: "fill out this form with name=X, email=Y and submit"
+
+**RIGHT (one step — user provided all content):**
+```json
+[
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "gmail.agent", "task": "Open Gmail and send an email to <recipient> with the subject '<subject>' and the body '<body>'" }, "description": "Send the email to <recipient>" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the email was sent to <recipient>" }, "description": "Confirm email delivery" }
+]
+```
+
+**Key rule:** Only decompose if the task has multiple INDEPENDENT actions or requires the agent to SEARCH for content to add. Simple "send/post/reply/comment X to Y" does NOT need decomposition — the agent can fill all fields and submit in one continuous flow.

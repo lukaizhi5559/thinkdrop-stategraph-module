@@ -405,8 +405,10 @@ class StateGraphBuilder {
         // ── _skillPlan resume fast-path ──────────────────────────────────────
         // Plan is pre-built (e.g. ask_user resume) — skip resolveUserContext,
         // resolveAgent, preflightAgents, gatherPlanContext and go straight to planSkills.
-        if (intentType === 'command_automate' && state._skillPlan && !state.recoveryContext) {
-          logger.debug('[StateGraph:Router] enrichIntent: _skillPlan resume — skipping to planSkills');
+        // Also fast-route on _skipTrainingGate (proceed_anyway resume) so planSkills
+        // generates a real plan without re-running preflight/gather nodes.
+        if (intentType === 'command_automate' && (state._skillPlan || state._skipTrainingGate) && !state.recoveryContext) {
+          logger.debug('[StateGraph:Router] enrichIntent: _skillPlan/_skipTrainingGate resume — skipping to planSkills');
           return 'planSkills';
         }
 

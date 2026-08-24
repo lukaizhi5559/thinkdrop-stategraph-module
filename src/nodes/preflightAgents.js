@@ -392,7 +392,15 @@ module.exports = async function preflightAgents(state) {
             logger.warn(`[Node:PreflightAgents] Agent ID mismatch: requested "${spec.agentId}" but builder created "${buildPayload.agentId}" — using actual agentId`);
             spec.agentId = buildPayload.agentId;
           }
-          logger.info(`[Node:PreflightAgents] Created ${skillName} agent: ${spec.agentId}`);
+          // Track whether build_agent actually created a new agent or found an existing one.
+          // When alreadyExists=true, the agent has a persistent profile with valid cookies —
+          // don't force auth without probe (the CDP cookie check will detect existing auth).
+          spec._alreadyExisted = !!buildPayload.alreadyExists;
+          if (spec._alreadyExisted) {
+            logger.info(`[Node:PreflightAgents] Agent ${spec.agentId} already exists — skipping _newlyCreated flag`);
+          } else {
+            logger.info(`[Node:PreflightAgents] Created ${skillName} agent: ${spec.agentId}`);
+          }
         } else {
           const errMsg = buildPayload?.error || 'unknown error';
           logger.warn(`[Node:PreflightAgents] Failed to create ${spec.agentId}: ${errMsg}`);
@@ -460,8 +468,11 @@ module.exports = async function preflightAgents(state) {
   // The agent.list call inside Promise.all runs concurrently and may miss agents
   // that were just registered by build_agent (DB flush delay / race). Pre-populating
   // here guarantees every newly-created browser agent enters the auth loop.
+  // Skip agents that already existed — agent.list will pick them up and run the
+  // normal auth probe (which detects existing CDP cookies in the persistent profile).
   for (const spec of createAgentSpecs) {
     if (spec.type !== 'browser') continue;
+    if (spec._alreadyExisted) continue; // agent.list will handle it — no _newlyCreated flag
     const _newAgentId = spec.agentId.endsWith('.agent') ? spec.agentId : `${spec.agentId}.agent`;
     agentReadiness.push({
       type: 'browser',

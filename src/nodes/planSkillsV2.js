@@ -1480,6 +1480,7 @@ async function planSkillsV2(state) {
           question: `This task (${userMessage.slice(0, 120)}) requires multiple steps on ${_targetService || 'this service'} that I haven't been trained on yet. I can't guarantee it'll work without training. Would you like to train me?`,
           options: [
             { label: 'Start guided training', value: 'guided_train' },
+            { label: 'Proceed anyway', value: 'proceed_anyway' },
             { label: 'Cancel', value: 'cancel' },
           ],
           trainingHandoff: true,
@@ -2191,6 +2192,26 @@ The user's request does NOT match any installed skill.
         }
         break;
       }
+    }
+  }
+
+  // ── Inject preflight deep-link URL from proceed_anyway resume ──────────────
+  // When the user clicks "Proceed anyway" on a training handoff, main.js passes
+  // the preflight-resolved deep-link URL as _proceedDeepLinkUrl. Inject it into
+  // browser.agent steps so the generated plan starts at the right page instead
+  // of relying on the LLM's URL (which may be a generic landing page).
+  if (state._proceedDeepLinkUrl && Array.isArray(skillPlan)) {
+    let _injected = 0;
+    for (const step of skillPlan) {
+      if (step.skill === 'browser.agent' && step.args?.action === 'run') {
+        if (!step.args.url || step.args.url !== state._proceedDeepLinkUrl) {
+          step.args.url = state._proceedDeepLinkUrl;
+          _injected++;
+        }
+      }
+    }
+    if (_injected > 0) {
+      logger.info(`[Node:PlanSkillsV2] Injected preflight deep-link URL ${state._proceedDeepLinkUrl} into ${_injected} browser.agent step(s)`);
     }
   }
 
