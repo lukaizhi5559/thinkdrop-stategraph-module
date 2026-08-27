@@ -59,6 +59,39 @@ Prefer REPLAN_STEP over REPLAN when prior steps completed successfully.
 If the error is about missing auth/credentials, use ASK_USER.
 Output ONLY valid JSON. No explanation, no markdown fences.`;
 
+// ── Fast number-based decision for thin recovery ────────────────────────────
+// Modeled on browser.agent _decisionCall: "Return ONLY a single number".
+// Returns 0=REPLAN, 1=REPLAN_STEP, 2=ASK_USER, 3=AUTO_PATCH.
+// Only on 3 (AUTO_PATCH) does the caller run the full JSON generation to get
+// patchedArgs. REPLAN/REPLAN_STEP/ASK_USER can proceed immediately with defaults.
+// Safe default on parse failure/timeout: 2 (ASK_USER) — matches existing fallback.
+async function _thinRecoveryDecision(llmBackend, userMsg, logger) {
+  const systemPrompt = `You are an automation recovery agent. A skill step failed.
+Decide the recovery action. Return ONLY a single number — nothing else:
+  0 = REPLAN (rebuild the entire plan — use when the plan is fundamentally broken)
+  1 = REPLAN_STEP (regenerate just this step — use when prior steps succeeded)
+  2 = ASK_USER (need human input — use for auth/credential errors or ambiguous failures)
+  3 = AUTO_PATCH (fix args inline — use when only a small arg change is needed, e.g. URL typo)
+
+Rules:
+- Be conservative: prefer ASK_USER (2) over guessing
+- Prefer REPLAN_STEP (1) over REPLAN (0) when prior steps completed successfully
+- If the error is about missing auth/credentials → 2 (ASK_USER)
+- If the error is a small fixable arg issue (wrong URL, missing flag) → 3 (AUTO_PATCH)
+- When in doubt → 2 (ASK_USER)`;
+
+  try {
+    const raw = await llmBackend.generateAnswer(systemPrompt, userMsg, { temperature: 0.1, maxTokens: 5, taskType: 'classification' });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const result = [0, 1, 2, 3].includes(num) ? num : 2;
+    logger.info(`[ExecuteCommand:ThinRecovery] _thinRecoveryDecision: ${['REPLAN', 'REPLAN_STEP', 'ASK_USER', 'AUTO_PATCH'][result]} (raw="${(raw || '').trim()}")`);
+    return result;
+  } catch (e) {
+    logger.warn(`[ExecuteCommand:ThinRecovery] _thinRecoveryDecision failed: ${e.message} — defaulting to 2 (ASK_USER)`);
+    return 2;
+  }
+}
+
 async function _thinPostFailureHandler(state) {
   const { failedStep, skillPlan, skillCursor, skillResults = [], llmBackend, message, resolvedMessage, stepRetryCount = 0, replanCount = 0, patchHistory = [] } = state;
   const logger = state.logger || console;
@@ -100,57 +133,77 @@ async function _thinPostFailureHandler(state) {
   // Quick LLM assessment
   const priorSteps = (skillResults || []).filter(r => r.ok).map(r => `✓ ${r.skill}: ${r.stdout?.slice(0, 100) || 'ok'}`).join('\n');
   const failedInfo = `Skill: ${failedStep.skill}\nError: ${failedStep.error}\nArgs: ${JSON.stringify(failedStep.args || {}).slice(0, 500)}`;
-  const userMsg = `## User Request\n${resolvedMessage || message}\n\n## Completed Steps\n${priorSteps || '(none)'}\n\n## Failed Step (cursor=${skillCursor})\n${failedInfo}\n\n## Previous Recovery Attempts\n${patchHistory.length > 0 ? patchHistory.map((p, i) => `${i + 1}. ${p.action}: ${p.note || p.suggestion || ''}`).join('\n') : '(none)'}\n\n## Retry Count: ${stepRetryCount}, Replan Count: ${replanCount}\n\n## Next Action\nOutput a single JSON action object.`;
+  const userMsg = `## User Request\n${resolvedMessage || message}\n\n## Completed Steps\n${priorSteps || '(none)'}\n\n## Failed Step (cursor=${skillCursor})\n${failedInfo}\n\n## Previous Recovery Attempts\n${patchHistory.length > 0 ? patchHistory.map((p, i) => `${i + 1}. ${p.action}: ${p.note || p.suggestion || ''}`).join('\n') : '(none)'}\n\n## Retry Count: ${stepRetryCount}, Replan Count: ${replanCount}\n\n## Next Action\nReturn a single number (0=REPLAN, 1=REPLAN_STEP, 2=ASK_USER, 3=AUTO_PATCH).`;
 
-  try {
-    const llmRaw = await llmBackend.generateAnswer(THIN_RECOVERY_PROMPT, userMsg, { temperature: 0.1, maxTokens: 300, taskType: 'classification' });
-    const m = llmRaw?.match(/\{[\s\S]*\}/);
-    if (m) {
-      const decision = JSON.parse(m[0]);
-      const action = decision.action?.toUpperCase();
+  // ── Fast number-based decision (REPLAN/REPLAN_STEP/ASK_USER/AUTO_PATCH) ───
+  // Call the light model with "return ONLY a single number" to get a fast verdict.
+  // If REPLAN (0), REPLAN_STEP (1), or ASK_USER (2), proceed immediately with defaults
+  // — skip the 300-token JSON generation. Only on AUTO_PATCH (3) do we run the full
+  // JSON generation to get patchedArgs.
+  const _fastDecision = await _thinRecoveryDecision(llmBackend, userMsg, logger);
 
-      if (action === 'AUTO_PATCH' && decision.patchedArgs) {
-        const patchedPlan = [...skillPlan];
-        if (patchedPlan[skillCursor]) {
-          patchedPlan[skillCursor] = { ...patchedPlan[skillCursor], args: { ...patchedPlan[skillCursor].args, ...decision.patchedArgs } };
+  if (_fastDecision === 0) {
+    // REPLAN — immediate, no generation needed
+    logger.info('[ExecuteCommand:ThinRecovery] Fast decision: REPLAN — proceeding without full JSON generation');
+    return {
+      ...state,
+      recoveryAction: 'replan',
+      recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: failedStep.error, suggestion: null, constraint: null },
+      replanCount: replanCount + 1,
+      commandExecuted: false,
+    };
+  }
+
+  if (_fastDecision === 1) {
+    // REPLAN_STEP — immediate, no generation needed
+    logger.info('[ExecuteCommand:ThinRecovery] Fast decision: REPLAN_STEP — proceeding without full JSON generation');
+    return {
+      ...state,
+      recoveryAction: 'replan_step',
+      recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: failedStep.error, suggestion: null, constraint: null },
+      replanCount: replanCount + 1,
+      commandExecuted: false,
+    };
+  }
+
+  if (_fastDecision === 2) {
+    // ASK_USER — fall through to the default ask_user handler below
+    logger.info('[ExecuteCommand:ThinRecovery] Fast decision: ASK_USER — proceeding to default ask_user handler');
+  } else {
+    // AUTO_PATCH (3) — run the full JSON generation to get patchedArgs
+    logger.info('[ExecuteCommand:ThinRecovery] Fast decision: AUTO_PATCH — running full JSON generation for patchedArgs');
+    try {
+      const _genUserMsg = `## User Request\n${resolvedMessage || message}\n\n## Completed Steps\n${priorSteps || '(none)'}\n\n## Failed Step (cursor=${skillCursor})\n${failedInfo}\n\n## Previous Recovery Attempts\n${patchHistory.length > 0 ? patchHistory.map((p, i) => `${i + 1}. ${p.action}: ${p.note || p.suggestion || ''}`).join('\n') : '(none)'}\n\n## Retry Count: ${stepRetryCount}, Replan Count: ${replanCount}\n\n## Next Action\nOutput a single JSON action object.`;
+      const llmRaw = await llmBackend.generateAnswer(THIN_RECOVERY_PROMPT, _genUserMsg, { temperature: 0.1, maxTokens: 300, taskType: 'classification' });
+      const m = llmRaw?.match(/\{[\s\S]*\}/);
+      if (m) {
+        const decision = JSON.parse(m[0]);
+        const action = decision.action?.toUpperCase();
+
+        if (action === 'AUTO_PATCH' && decision.patchedArgs) {
+          const patchedPlan = [...skillPlan];
+          if (patchedPlan[skillCursor]) {
+            patchedPlan[skillCursor] = { ...patchedPlan[skillCursor], args: { ...patchedPlan[skillCursor].args, ...decision.patchedArgs } };
+          }
+          logger.info(`[ExecuteCommand:ThinRecovery] AUTO_PATCH: ${decision.note || 'patching args'}`);
+          return {
+            ...state,
+            recoveryAction: 'auto_patch',
+            skillPlan: patchedPlan,
+            recoveryNote: decision.note || '',
+            patchHistory: [...patchHistory, { action: 'AUTO_PATCH', note: decision.note, attempt: stepRetryCount + 1 }],
+            stepRetryCount: stepRetryCount + 1,
+            failedStep: null,
+            commandExecuted: false,
+          };
         }
-        logger.info(`[ExecuteCommand:ThinRecovery] AUTO_PATCH: ${decision.note || 'patching args'}`);
-        return {
-          ...state,
-          recoveryAction: 'auto_patch',
-          skillPlan: patchedPlan,
-          recoveryNote: decision.note || '',
-          patchHistory: [...patchHistory, { action: 'AUTO_PATCH', note: decision.note, attempt: stepRetryCount + 1 }],
-          stepRetryCount: stepRetryCount + 1,
-          failedStep: null,
-          commandExecuted: false,
-        };
-      }
 
-      if (action === 'REPLAN_STEP') {
-        logger.info(`[ExecuteCommand:ThinRecovery] REPLAN_STEP: ${decision.suggestion || ''}`);
-        return {
-          ...state,
-          recoveryAction: 'replan_step',
-          recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: failedStep.error, suggestion: decision.suggestion, constraint: decision.constraint },
-          replanCount: replanCount + 1,
-          commandExecuted: false,
-        };
+        // LLM didn't return AUTO_PATCH despite fast decision — fall through to default
+        logger.warn(`[ExecuteCommand:ThinRecovery] Expected AUTO_PATCH but got "${action}" — falling through to default`);
       }
-
-      if (action === 'REPLAN') {
-        logger.info(`[ExecuteCommand:ThinRecovery] REPLAN: ${decision.suggestion || ''}`);
-        return {
-          ...state,
-          recoveryAction: 'replan',
-          recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: failedStep.error, suggestion: decision.suggestion, constraint: decision.constraint },
-          replanCount: replanCount + 1,
-          commandExecuted: false,
-        };
-      }
+    } catch (err) {
+      logger.warn(`[ExecuteCommand:ThinRecovery] AUTO_PATCH generation failed: ${err.message} — falling through to default`);
     }
-  } catch (err) {
-    logger.warn(`[ExecuteCommand:ThinRecovery] LLM assessment failed: ${err.message}`);
   }
 
   // Default: ask_user
@@ -544,7 +597,7 @@ function resolveContractPath(stepContracts, path) {
  * Auto-inject missing arguments from prior step contracts.
  * Scans previous contracts to find values for missing args like filePath.
  */
-function autoInjectFromContracts(args, skill, stepContracts = []) {
+function autoInjectFromContracts(args, skill, stepContracts = [], logger) {
   if (!args || typeof args !== 'object' || stepContracts.length === 0) {
     return args;
   }
@@ -592,6 +645,34 @@ function autoInjectFromContracts(args, skill, stepContracts = []) {
         newArgs.url = contract.outputs.bestUrl.value;
         injected = true;
         break;
+      }
+    }
+  }
+
+  // Auto-inject URL from prior browser.agent step (domain continuity)
+  // If a prior browser.agent captured a finalUrl, and the current step's url
+  // is a "creation" URL (e.g. notion.new/), use the prior finalUrl instead —
+  // the page was already created, don't create a duplicate.
+  if (skill === 'browser.agent' && newArgs.url) {
+    const _isCreationUrl = /\/new\/?$|\.new\/?$/i.test(newArgs.url);
+    if (_isCreationUrl) {
+      for (let i = stepContracts.length - 1; i >= 0; i--) {
+        const contract = stepContracts[i];
+        if (contract.skill === 'browser.agent' && contract.outputs?.url?.value) {
+          const _priorUrl = contract.outputs.url.value;
+          try {
+            const _priorHost = new URL(_priorUrl).hostname;
+            const _creationHost = new URL(newArgs.url).hostname;
+            const _priorBrand = _priorHost.split('.').slice(-2, -1)[0];
+            const _creationBrand = _creationHost.split('.').slice(-2, -1)[0];
+            if (_priorHost === _creationHost || _priorBrand === _creationBrand) {
+              newArgs.url = _priorUrl;
+              injected = true;
+              logger.info(`[Node:ExecuteCommand] Auto-injected url from prior browser.agent: ${_priorUrl} (replaced creation URL)`);
+              break;
+            }
+          } catch (_) {}
+        }
       }
     }
   }
@@ -1245,7 +1326,7 @@ module.exports = async function executeCommand(state) {
   // Before template resolution, scan prior contracts to fill missing args
   let args = step.args || {};
   const stepContracts = state.stepContracts || [];
-  args = autoInjectFromContracts(args, skill, stepContracts);
+  args = autoInjectFromContracts(args, skill, stepContracts, logger);
 
   // ── {{PREV_OUTPUT}} template injection ───────────────────────────────────
   // Allows multi-step plans to pass data from one step to the next.
@@ -5603,41 +5684,80 @@ Please try again or search with different terms.`;
             const _pcFs2    = require('fs');
             const _pcPath2  = require('path');
             const _payloadStr = _pcFs2.readFileSync(stepResult._tmpPayloadFile, 'utf8');
-            const _pcPromptRaw = _pcFs2.readFileSync(
-              _pcPath2.join(__dirname, '../prompts/payload-check.md'), 'utf8'
-            );
             const _pcContext = description || step.description || 'API call via curl';
-            const _pcPrompt  = _pcPromptRaw
-              .replace('{{context}}', _pcContext)
-              .replace('{{payload}}', _payloadStr);
 
-            const _pcRaw = await _pcLlm.generateAnswer(_pcPrompt, {
-              query: _pcPrompt,
-              context: {
-                conversationHistory: [],
-                systemInstructions: 'You are a strict JSON API response validator. Output only valid JSON, no explanation.',
-                intent: 'command_automate',
-              },
-              options: { maxTokens: 300, temperature: 0, fastMode: true },
-            }, { maxTokens: 300, temperature: 0, fastMode: true, taskType: 'complex' }, null);
+            // ── Fast number-based decision (SUCCESS/APP_ERROR/PARTIAL_SUCCESS) ──
+            // Call the light model with "return ONLY a single number" to get a fast verdict.
+            // If SUCCESS (0), skip the 300-token JSON generation entirely.
+            // If APP_ERROR (1) or PARTIAL_SUCCESS (2), run the full JSON generation to get
+            // errorType, explanation, suggestion, affectedField.
+            // Safe default on failure: 0 (SUCCESS) — matches existing fail-open.
+            const _pcDecisionSystem = `You are a strict JSON API response validator. Examine the JSON payload returned by an API call and determine if the operation actually succeeded at the application level.
+Return ONLY a single number — nothing else:
+  0 = SUCCESS (no application-level errors found — HTTP 200 with valid data)
+  1 = APP_ERROR (clear application-level failure — error status, invalid recipient, rate limit, etc.)
+  2 = PARTIAL_SUCCESS (batch operation with mixed successes and failures)
 
-            // Parse — must be valid JSON; on any error we fail open (no-op)
-            const _pcVerdict = parseLlmJson(_pcRaw, logger, 'Node:ExecuteCommand:payloadCheck');
-            if (_pcVerdict) {
-              logger.debug(`[Node:ExecuteCommand] payload.check verdict: ${_pcVerdict.verdict} (${_pcVerdict.errorType || 'none'})`);
+Conservative threshold: only flag as APP_ERROR when the failure is clear and unambiguous. When in doubt → 0.`;
+            const _pcDecisionPrompt = `API call context: ${_pcContext}\n\nJSON payload:\n${_payloadStr.slice(0, 4000)}\n\nVerdict? (0, 1, or 2)`;
 
-              if (_pcVerdict.verdict === 'APP_ERROR') {
-                stepResult.ok    = false;
-                stepResult.error = _pcVerdict.explanation || 'API call returned an application-level error';
-                stepResult._payloadCheckResult = {
-                  reason:       _pcVerdict.errorType === 'user_correctable' ? 'ask_user' : 'replan',
-                  explanation:  _pcVerdict.explanation  || '',
-                  suggestion:   _pcVerdict.suggestion   || '',
-                  affectedField: _pcVerdict.affectedField || null,
-                };
-                logger.warn(`[Node:ExecuteCommand] payload.check flagged APP_ERROR (${_pcVerdict.errorType}): ${_pcVerdict.explanation}`);
+            let _pcFastVerdict = 0;
+            try {
+              const _pcDecRaw = await _pcLlm.generateAnswer(_pcDecisionPrompt, {
+                query: _pcDecisionPrompt,
+                context: {
+                  conversationHistory: [],
+                  systemInstructions: _pcDecisionSystem,
+                  intent: 'command_automate',
+                },
+                options: { maxTokens: 5, temperature: 0, fastMode: true },
+              }, { maxTokens: 5, temperature: 0, fastMode: true, taskType: 'classification' }, null);
+              const _pcNum = parseInt((_pcDecRaw || '').trim().replace(/\D/g, ''), 10);
+              _pcFastVerdict = [0, 1, 2].includes(_pcNum) ? _pcNum : 0;
+              logger.debug(`[Node:ExecuteCommand] payload.check decision: ${['SUCCESS', 'APP_ERROR', 'PARTIAL_SUCCESS'][_pcFastVerdict]} (raw="${(_pcDecRaw || '').trim()}")`);
+            } catch (_pcDecErr) {
+              logger.warn(`[Node:ExecuteCommand] payload.check decision failed (non-blocking): ${_pcDecErr.message}`);
+              _pcFastVerdict = 0; // fail open
+            }
+
+            if (_pcFastVerdict === 1 || _pcFastVerdict === 2) {
+              // Run full JSON generation to get error details
+              const _pcPromptRaw = _pcFs2.readFileSync(
+                _pcPath2.join(__dirname, '../prompts/payload-check.md'), 'utf8'
+              );
+              const _pcPrompt  = _pcPromptRaw
+                .replace('{{context}}', _pcContext)
+                .replace('{{payload}}', _payloadStr);
+
+              const _pcRaw = await _pcLlm.generateAnswer(_pcPrompt, {
+                query: _pcPrompt,
+                context: {
+                  conversationHistory: [],
+                  systemInstructions: 'You are a strict JSON API response validator. Output only valid JSON, no explanation.',
+                  intent: 'command_automate',
+                },
+                options: { maxTokens: 300, temperature: 0, fastMode: true },
+              }, { maxTokens: 300, temperature: 0, fastMode: true, taskType: 'complex' }, null);
+
+              // Parse — must be valid JSON; on any error we fail open (no-op)
+              const _pcVerdict = parseLlmJson(_pcRaw, logger, 'Node:ExecuteCommand:payloadCheck');
+              if (_pcVerdict) {
+                logger.debug(`[Node:ExecuteCommand] payload.check verdict: ${_pcVerdict.verdict} (${_pcVerdict.errorType || 'none'})`);
+
+                if (_pcVerdict.verdict === 'APP_ERROR') {
+                  stepResult.ok    = false;
+                  stepResult.error = _pcVerdict.explanation || 'API call returned an application-level error';
+                  stepResult._payloadCheckResult = {
+                    reason:       _pcVerdict.errorType === 'user_correctable' ? 'ask_user' : 'replan',
+                    explanation:  _pcVerdict.explanation  || '',
+                    suggestion:   _pcVerdict.suggestion   || '',
+                    affectedField: _pcVerdict.affectedField || null,
+                  };
+                  logger.warn(`[Node:ExecuteCommand] payload.check flagged APP_ERROR (${_pcVerdict.errorType}): ${_pcVerdict.explanation}`);
+                }
               }
             }
+            // If _pcFastVerdict === 0 (SUCCESS), skip the full JSON generation entirely
           } catch (_pcErr) {
             // Never block on LLM failure — log and continue
             logger.warn(`[Node:ExecuteCommand] payload.check LLM call failed (non-blocking): ${_pcErr.message}`);

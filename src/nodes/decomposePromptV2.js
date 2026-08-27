@@ -176,6 +176,54 @@ function collapseUserInfoQuery(plan, originalMessage, logger) {
   return plan;
 }
 
+// ── Fast number-based decision for decomposePromptV2 ─────────────────────────
+// Modeled on browser.agent _decisionCall: "Return ONLY a single number".
+// Returns 0–6 (single-step with that intent) or 7 (multi-step → full generation).
+// Safe default on parse failure/timeout: 0 (command_automate — most common, safe single-step).
+const _SINGLE_STEP_INTENTS = ['command_automate', 'screen_intelligence', 'web_search', 'memory_store', 'memory_retrieve', 'general_knowledge', 'greeting'];
+async function _decomposeDecision(message, llmBackend, conversationHistory, logger) {
+  const recentCtx = (conversationHistory || []).slice(-4)
+    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 150)}`)
+    .join('\n');
+  const contextBlock = recentCtx ? `\nRecent conversation (for context only):\n${recentCtx}\n` : '';
+
+  const systemPrompt = `You classify a user message for an LLM intent router.
+Return ONLY a single number — nothing else:
+  0 = command_automate (interact with a specific website/app/tool, external action)
+  1 = screen_intelligence (observe/describe what is currently on screen — no action)
+  2 = web_search (find information online — no specific site interaction)
+  3 = memory_store (save/store information to memory)
+  4 = memory_retrieve (recall past activity, user info, episodic memory — no external action)
+  5 = general_knowledge (math, definitions, timeless facts — no tool needed)
+  6 = greeting (hello, hi, how are you)
+  7 = MULTI_STEP (the message contains 2+ truly independent goals that need separate sub-prompts)
+
+Decision rules:
+- When in doubt → 0 (command_automate is the safest single-step default)
+- Only return 7 when the user has MULTIPLE INDEPENDENT goals (e.g., "send an email AND schedule a meeting")
+- Do NOT return 7 for multi-agent tasks that serve ONE goal (e.g., "post on Twitter, Facebook, and LinkedIn" → 0, the planner handles multiple agents)
+- Pure user info queries ("who is my wife", "what is my mom's phone") → 4
+- Past activity queries ("what was I doing yesterday", "recent activity") → 4
+- General questions ("what is blockchain", "what is 5*7") → 5
+- Current screen observation ("what app am I in", "what's on my screen") → 1`;
+
+  const userPrompt = `Message: "${message}"${contextBlock}\nIntent? (0–7)`;
+
+  try {
+    const raw = await llmBackend.generateAnswer(userPrompt, {
+      query: userPrompt,
+      context: { systemInstructions: systemPrompt },
+    }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const result = (num >= 0 && num <= 7) ? num : 0;
+    logger.info(`[Node:DecomposePromptV2] _decomposeDecision: intent=${result} (${result < 7 ? _SINGLE_STEP_INTENTS[result] : 'MULTI_STEP'}) (raw="${(raw || '').trim()}")`);
+    return result;
+  } catch (e) {
+    logger.warn(`[Node:DecomposePromptV2] _decomposeDecision failed: ${e.message} — defaulting to 0 (command_automate)`);
+    return 0;
+  }
+}
+
 async function llmDecompose(message, llmBackend, conversationHistory, logger, onParsed = null) {
   const now = new Date();
   const currentDate = now.toLocaleDateString('en-CA'); // YYYY-MM-DD in local time
@@ -280,9 +328,35 @@ module.exports = async function decomposePromptV2(state) {
 
   const t0 = Date.now();
   let parsedJson = null; // Store parsed JSON for intent preservation
-  let subPrompts = await llmDecompose(message, llmBackend, conversationHistory, logger, (parsed) => {
-    parsedJson = parsed; // Capture the parsed JSON
-  });
+
+  // ── Fast number-based decision (single-step intent / multi-step) ──────────
+  // Call the light model with "return ONLY a single number" to get a fast verdict.
+  // If 0–6 (single-step), return a single sub-prompt with that intent — skip the
+  // expensive 400-token JSON generation. Only on 7 (multi-step) do we run the full
+  // llmDecompose to get the subPrompts array with dependencies.
+  // Note: _llmDateRange is lost on the single-step path — retrieveMemory.js has a
+  // 3-layer fallback (Layer 1: _llmDateRange, Layer 2: regex parseDateRange,
+  // Layer 3: LLM fallback) so this is safe.
+  const _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger);
+  let subPrompts;
+  if (_fastDecision >= 0 && _fastDecision <= 6) {
+    logger.info(`[Node:DecomposePromptV2] Fast decision: single-step ${_SINGLE_STEP_INTENTS[_fastDecision]} — skipping full decomposition`);
+    subPrompts = [{
+      text: message,
+      estimatedIntent: _SINGLE_STEP_INTENTS[_fastDecision],
+      confidence: 0.85,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    // No _llmDateRange on fast path — retrieveMemory falls back to regex + LLM
+  } else {
+    logger.info('[Node:DecomposePromptV2] Fast decision: MULTI_STEP — running full decomposition');
+    subPrompts = await llmDecompose(message, llmBackend, conversationHistory, logger, (parsed) => {
+      parsedJson = parsed; // Capture the parsed JSON
+    });
+  }
 
   // Extract _llmDateRange from the subPrompts array (attached by llmDecompose)
   let llmDateRange = null;

@@ -63,6 +63,79 @@ Rules:
 - If a required service is NOT listed under UNAUTHENTICATED AGENTS, you MUST return {"complete": true} and proceed — do NOT ask about sign-in, credentials, or authentication.
 - When authAgentId is set, the system will show a dedicated sign-in button — keep the question short (under 12 words).`;
 
+// ── Fast number-based decision for gatherPlanContext ─────────────────────────
+// Modeled on browser.agent _decisionCall: "Return ONLY a single number".
+// Returns 0 (complete), 1 (need-question), or 2 (need-auth).
+// Only on 1/2 does the caller run the full JSON generation to get question/authAgentId.
+// Safe default on parse failure/timeout: 0 (complete) — matches existing fail-open.
+async function _askLLMDecision(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null) {
+  const priorBlock = priorQA.length > 0
+    ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
+    : '';
+
+  const isFollowUp = !!(taskClassification?.isFollowUp);
+  const recentCtx = formatHistoryTurns(conversationHistory || [], { isFollowUp, maxTurns: 6 });
+  const historyBlock = recentCtx
+    ? `\n\nRecent conversation:\n${recentCtx}`
+    : '';
+
+  const knownLines = [];
+  if (resolvedSelfContext) {
+    if (resolvedSelfContext.name) knownLines.push('- User name: already resolved');
+    if (resolvedSelfContext.email) knownLines.push('- User email: already resolved');
+    if (resolvedSelfContext.phone) knownLines.push('- User phone: already resolved');
+    const memCtx = resolvedSelfContext.memories?.context || [];
+    if (memCtx.length > 0) knownLines.push(`- User memory: ${memCtx.length} facts available`);
+  }
+  const knownBlock = knownLines.length > 0
+    ? `\n\nKNOWN FACTS (do NOT ask about these):\n${knownLines.join('\n')}`
+    : '';
+
+  const unauthedAgents = (preflightResult?.agents || [])
+    .filter(a => a.authed === false && (a.type === 'browser' || a.type === 'cli'))
+    .map(a => `- ${a.agentId} [NEEDS AUTH]`);
+  const unauthedBlock = unauthedAgents.length > 0
+    ? `\n\nUNAUTHENTICATED AGENTS (require sign-in before they can execute tasks):\n${unauthedAgents.join('\n')}`
+    : '\n\nUNAUTHENTICATED AGENTS: none — all required services are authenticated or do not require auth.';
+
+  const tc = resolvedSelfContext?._taskClassification || {};
+  const followUpTarget = tc.isFollowUp && !tc.isScreenFollowUp ? tc.followUpTarget : null;
+  const followUpBlock = followUpTarget
+    ? `\n\n(Context from prior turn: ${followUpTarget})`
+    : '';
+
+  const systemPrompt = `You are a task readiness checker for a desktop automation system.
+Given a user's request and what is already known, decide if the task is ready to execute.
+Return ONLY a single number — nothing else:
+  0 = COMPLETE (task can proceed as-is — all required info is present)
+  1 = NEED_QUESTION (a single critical piece of info is missing — recipient, time, provider name)
+  2 = NEED_AUTH (a required service agent is in UNAUTHENTICATED AGENTS and needs sign-in)
+
+Rules:
+- Return 0 if the task can proceed as-is.
+- Return 1 ONLY when a single critical piece is missing (messaging with no recipient, scheduling with no time, etc.)
+- Return 2 ONLY when a required service appears in UNAUTHENTICATED AGENTS
+- NEVER ask about: timezone, credentials, optional preferences, or things the system can look up
+- If a required service is NOT listed under UNAUTHENTICATED AGENTS, return 0 — do NOT ask about auth
+- When in doubt → 0`;
+
+  const userPrompt = `REQUEST: "${originalMsg}"
+TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}
+
+Ready? (0, 1, or 2)`;
+
+  try {
+    const raw = await llmBackend.generateAnswer(userPrompt, { query: userPrompt, context: { systemInstructions: systemPrompt } }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const result = (num === 0 || num === 1 || num === 2) ? num : 0;
+    logger.info(`[Node:GatherPlanContext] _askLLMDecision: ${['COMPLETE', 'NEED_QUESTION', 'NEED_AUTH'][result]} (raw="${(raw || '').trim()}")`);
+    return result;
+  } catch (err) {
+    logger.warn(`[Node:GatherPlanContext] _askLLMDecision failed (${err.message}) — defaulting to 0 (COMPLETE)`);
+    return 0;
+  }
+}
+
 async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null) {
   const priorBlock = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
@@ -196,7 +269,20 @@ module.exports = async function gatherPlanContext(state) {
     if (progressCallback) progressCallback({ type: 'thinking', message: 'Checking task details…' });
     logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
 
-    const result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null);
+    // ── Fast number-based decision (COMPLETE/NEED_QUESTION/NEED_AUTH) ────────
+    // Call the light model with "return ONLY a single number" to get a fast verdict.
+    // If COMPLETE (0), return immediately — skip the 80-token JSON generation.
+    // If NEED_QUESTION (1) or NEED_AUTH (2), run the full JSON generation to get
+    // the question text and/or authAgentId.
+    const _fastDecision = await _askLLMDecision(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null);
+    let result;
+    if (_fastDecision === 0) {
+      logger.info('[Node:GatherPlanContext] Fast decision: COMPLETE — skipping full JSON generation');
+      result = { complete: true };
+    } else {
+      logger.info(`[Node:GatherPlanContext] Fast decision: ${_fastDecision === 1 ? 'NEED_QUESTION' : 'NEED_AUTH'} — running full JSON generation`);
+      result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null);
+    }
 
     // Defensive override: if the LLM returned an auth question for an agent that
     // preflight already marked as authed, treat the task as complete. This prevents

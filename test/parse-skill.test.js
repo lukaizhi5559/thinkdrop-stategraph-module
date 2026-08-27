@@ -228,7 +228,7 @@ describe('Suite 3 — Description-keyword overlap (scroll/type/shortcut)', () =>
 // recurring local reminder, not a one-shot calendar event.
 // ═════════════════════════════════════════════════════════════════════════════
 describe('Suite 4 — Recurring-signal guard: no false gcal.event match', () => {
-  const llmWouldSayGcal = { llmResponse: 'gcal.event|HIGH' };
+  const llmWouldSayGcal = { llmResponse: '0' }; // index 0 = gcal.event
 
   it('cold plunge every morning', async () => {
     expect(await run('Schedule my cold plunge sessions every morning at 6am', llmWouldSayGcal)).toBeNull();
@@ -283,15 +283,15 @@ describe('Suite 4 — Recurring-signal guard: no false gcal.event match', () => 
 // ═════════════════════════════════════════════════════════════════════════════
 describe('Suite 5 — Explicit calendar calls SHOULD match gcal.event', () => {
   it('add dentist to Google Calendar', async () => {
-    const result = await run('Add a dentist appointment to my Google Calendar', { llmResponse: 'gcal.event|HIGH' });
+    const result = await run('Add a dentist appointment to my Google Calendar', { llmResponse: '0' });
     expect(result).toBe('gcal.event');
   });
   it('create a calendar event for Friday', async () => {
-    const result = await run('Create a calendar event for the team meeting on Friday', { llmResponse: 'gcal.event|HIGH' });
+    const result = await run('Create a calendar event for the team meeting on Friday', { llmResponse: '0' });
     expect(result).toBe('gcal.event');
   });
   it('"add to my calendar" phrase', async () => {
-    const result = await run('Add this to my calendar: dentist Monday 3pm', { llmResponse: 'gcal.event|HIGH' });
+    const result = await run('Add this to my calendar: dentist Monday 3pm', { llmResponse: '0' });
     expect(result).toBe('gcal.event');
   });
   it('gcal.event natural language direct call', async () => {
@@ -299,7 +299,7 @@ describe('Suite 5 — Explicit calendar calls SHOULD match gcal.event', () => {
     expect(await run('gcal event doctor Thursday 2pm')).toBe('gcal.event');
   });
   it('create calendar event — no recurring signals', async () => {
-    const result = await run('Create an event on Google Calendar for lunch with Sarah on Tuesday at noon', { llmResponse: 'gcal.event|HIGH' });
+    const result = await run('Create an event on Google Calendar for lunch with Sarah on Tuesday at noon', { llmResponse: '0' });
     expect(result).toBe('gcal.event');
   });
 });
@@ -307,33 +307,33 @@ describe('Suite 5 — Explicit calendar calls SHOULD match gcal.event', () => {
 // ═════════════════════════════════════════════════════════════════════════════
 // SUITE 6 — Semantic LLM mock: confidence parsing
 // ═════════════════════════════════════════════════════════════════════════════
-describe('Suite 6 — LLM confidence parsing (HIGH=match, other=reject)', () => {
-  it('HIGH confidence → match', async () => {
-    const r = await run('Pull up my GitHub PRs', { llmResponse: 'github.pr|HIGH' });
+describe('Suite 6 — LLM index parsing (valid index=match, -1/null=reject)', () => {
+  it('valid index → match', async () => {
+    const r = await run('Pull up my GitHub PRs', { llmResponse: '3' }); // index 3 = github.pr
     expect(r).toBe('github.pr');
   });
-  it('null response → no match', async () => {
+  it('-1 response → no match', async () => {
+    expect(await run('What is the weather today', { llmResponse: '-1' })).toBeNull();
+  });
+  it('null text response → no match', async () => {
     expect(await run('What is the weather today', { llmResponse: 'null' })).toBeNull();
   });
   it('empty response → no match', async () => {
     expect(await run('Tell me a joke', { llmResponse: '' })).toBeNull();
   });
-  it('MEDIUM confidence → rejected', async () => {
-    expect(await run('Something about calendars', { llmResponse: 'gcal.event|MEDIUM' })).toBeNull();
+  it('out-of-range index → rejected (hallucination guard)', async () => {
+    expect(await run('Do something', { llmResponse: '99' })).toBeNull();
   });
-  it('LOW confidence → rejected', async () => {
-    expect(await run('Something vague about schedule', { llmResponse: 'gcal.event|LOW' })).toBeNull();
+  it('index 0 → gcal.event', async () => {
+    const r = await run('Add to my Google Calendar', { llmResponse: '0' });
+    expect(r).toBe('gcal.event');
   });
-  it('unknown skill name from LLM → rejected (hallucination guard)', async () => {
-    expect(await run('Do something', { llmResponse: 'fake.skill.xyz|HIGH' })).toBeNull();
-  });
-  it('legacy plain name response (no pipe) → treated as HIGH', async () => {
-    // Backwards compatibility: LLM returns "slack.notify" without pipe
-    const r = await run('Notify the Slack channel', { llmResponse: 'slack.notify' });
+  it('index 4 → slack.notify', async () => {
+    const r = await run('Notify the Slack channel', { llmResponse: '4' });
     expect(r).toBe('slack.notify');
   });
-  it('LLM returns skill with surrounding quotes → still matches', async () => {
-    const r = await run('Send a Slack notification', { llmResponse: '"slack.notify|HIGH"' });
+  it('LLM returns index with surrounding whitespace → still matches', async () => {
+    const r = await run('Send a Slack notification', { llmResponse: '  4  ' });
     expect(r).toBe('slack.notify');
   });
 });
@@ -416,15 +416,15 @@ describe('Suite 8 — Edge cases: empty registry, no descriptions, single skill'
 // ═════════════════════════════════════════════════════════════════════════════
 describe('Suite 9 — WANTS_TO_CREATE guard', () => {
   it('"build a skill to send SMS" → matches clicksend.send.sms (it exists)', async () => {
-    const r = await run('build a skill to send SMS messages', { llmResponse: 'clicksend.send.sms|HIGH' });
+    const r = await run('build a skill to send SMS messages', { llmResponse: '1' }); // index 1 = clicksend.send.sms
     expect(r).toBe('clicksend.send.sms');
   });
   it('"create a tool for desktop control" → matches desktop.control (it exists)', async () => {
-    const r = await run('create a tool for desktop control', { llmResponse: 'desktop.control|HIGH' });
+    const r = await run('create a tool for desktop control', { llmResponse: '2' }); // index 2 = desktop.control
     expect(r).toBe('desktop.control');
   });
   it('"build a brand new xyz skill" → null (no such skill)', async () => {
-    expect(await run("build a brand new xyz notification skill", { llmResponse: 'null' })).toBeNull();
+    expect(await run("build a brand new xyz notification skill", { llmResponse: '-1' })).toBeNull();
   });
 });
 
@@ -434,15 +434,15 @@ describe('Suite 9 — WANTS_TO_CREATE guard', () => {
 // ═════════════════════════════════════════════════════════════════════════════
 describe('Suite 10 — Recurring + explicit "Google Calendar" → guard bypassed', () => {
   it('"sync cold plunge daily to my Google Calendar"', async () => {
-    const r = await run('Add cold plunge every morning to my Google Calendar', { llmResponse: 'gcal.event|HIGH' });
+    const r = await run('Add cold plunge every morning to my Google Calendar', { llmResponse: '0' });
     expect(r).toBe('gcal.event');
   });
   it('"create a recurring Google Calendar event for standup"', async () => {
-    const r = await run('Create a recurring calendar event for standup every day', { llmResponse: 'gcal.event|HIGH' });
+    const r = await run('Create a recurring calendar event for standup every day', { llmResponse: '0' });
     expect(r).toBe('gcal.event');
   });
   it('"add to my calendar: daily meditation at 6am"', async () => {
-    const r = await run('add to my calendar: daily meditation at 6am', { llmResponse: 'gcal.event|HIGH' });
+    const r = await run('add to my calendar: daily meditation at 6am', { llmResponse: '0' });
     expect(r).toBe('gcal.event');
   });
 });
@@ -454,15 +454,15 @@ describe('Suite 10 — Recurring + explicit "Google Calendar" → guard bypassed
 // ═════════════════════════════════════════════════════════════════════════════
 describe('Suite 11 — Multi-skill registry: no cross-contamination', () => {
   it('scroll message should not match slack.notify', async () => {
-    const r = await run('scroll down in the active window', { llmResponse: 'null' });
-    expect(r).toBe('desktop.control'); // correct skill
+    const r = await run('scroll down in the active window', { llmResponse: '-1' });
+    expect(r).toBe('desktop.control'); // correct skill via keyword match, LLM said -1
   });
   it('send Slack message should not match clicksend.send.sms', async () => {
-    const r = await run('Notify the Slack channel about the deploy', { llmResponse: 'slack.notify' });
+    const r = await run('Notify the Slack channel about the deploy', { llmResponse: '4' }); // index 4 = slack.notify
     expect(r).toBe('slack.notify'); // not sms
   });
   it('GitHub PR request should not match desktop.control', async () => {
-    const r = await run('List my open GitHub pull requests', { llmResponse: 'github.pr|HIGH' });
+    const r = await run('List my open GitHub pull requests', { llmResponse: '3' }); // index 3 = github.pr
     expect(r).toBe('github.pr');
   });
   it('"text me the PR link at 4155551234" → sms, not github.pr', async () => {
@@ -478,43 +478,43 @@ describe('Suite 11 — Multi-skill registry: no cross-contamination', () => {
 describe('Suite 12 — Real-world variety prompts', () => {
   const realWorld = [
     // Should match gcal.event (explicit calendar reference, non-recurring or guard bypassed)
-    { msg: 'Schedule a dentist appointment on Google Calendar for next Tuesday', lLLM: 'gcal.event|HIGH', expect: 'gcal.event' },
-    { msg: 'Create a Google Calendar event for my flight on March 30', lLLM: 'gcal.event|HIGH', expect: 'gcal.event' },
-    { msg: 'Book a calendar appointment with HR on Friday at 2pm', lLLM: 'gcal.event|HIGH', expect: 'gcal.event' },
-    // Should NOT match gcal.event (recurring, no explicit calendar)
-    { msg: 'Set a morning alarm every day at 6:30am', lLLM: 'gcal.event|HIGH', expect: null },
-    { msg: 'Remind me every morning to take my medication', lLLM: 'gcal.event|HIGH', expect: null },
-    { msg: 'Daily standup reminder at 9am please', lLLM: 'gcal.event|HIGH', expect: null },
-    { msg: 'Create a daily recurring reminder at 7am for my run', lLLM: 'gcal.event|HIGH', expect: null },
-    { msg: 'Set up a weekly Friday retrospective alarm', lLLM: 'gcal.event|HIGH', expect: null },
-    { msg: 'Remind me each morning to check my email', lLLM: 'gcal.event|HIGH', expect: null },
-    { msg: 'Each day at noon remind me to eat lunch', lLLM: 'gcal.event|HIGH', expect: null },
-    { msg: 'Give me a daily 8pm wind-down notification', lLLM: 'gcal.event|HIGH', expect: null },
-    { msg: 'Nightly sleep reminder at 11pm every night', lLLM: 'gcal.event|HIGH', expect: null },
-    // Should match clicksend.send.sms (phone number present)
-    { msg: 'Send a text to 4155551234 saying I am on my way', lLLM: 'null', expect: 'clicksend.send.sms' },
-    { msg: 'Text 14085551234 good morning', lLLM: 'null', expect: 'clicksend.send.sms' },
-    // Should match desktop.control (scroll + type combo)
-    { msg: 'Scroll up and type hello in the active window', lLLM: 'null', expect: 'desktop.control' },
-    { msg: 'Use keyboard shortcut cmd+S and click yes', lLLM: 'null', expect: 'desktop.control' },
+    { msg: 'Schedule a dentist appointment on Google Calendar for next Tuesday', lLLM: '0', expect: 'gcal.event' },
+    { msg: 'Create a Google Calendar event for my flight on March 30', lLLM: '0', expect: 'gcal.event' },
+    { msg: 'Book a calendar appointment with HR on Friday at 2pm', lLLM: '0', expect: 'gcal.event' },
+    // Should NOT match gcal.event (recurring, no explicit calendar) — LLM says 0 but guard blocks it
+    { msg: 'Set a morning alarm every day at 6:30am', lLLM: '0', expect: null },
+    { msg: 'Remind me every morning to take my medication', lLLM: '0', expect: null },
+    { msg: 'Daily standup reminder at 9am please', lLLM: '0', expect: null },
+    { msg: 'Create a daily recurring reminder at 7am for my run', lLLM: '0', expect: null },
+    { msg: 'Set up a weekly Friday retrospective alarm', lLLM: '0', expect: null },
+    { msg: 'Remind me each morning to check my email', lLLM: '0', expect: null },
+    { msg: 'Each day at noon remind me to eat lunch', lLLM: '0', expect: null },
+    { msg: 'Give me a daily 8pm wind-down notification', lLLM: '0', expect: null },
+    { msg: 'Nightly sleep reminder at 11pm every night', lLLM: '0', expect: null },
+    // Should match clicksend.send.sms (phone number present — keyword match, LLM says -1)
+    { msg: 'Send a text to 4155551234 saying I am on my way', lLLM: '-1', expect: 'clicksend.send.sms' },
+    { msg: 'Text 14085551234 good morning', lLLM: '-1', expect: 'clicksend.send.sms' },
+    // Should match desktop.control (scroll + type combo — keyword match, LLM says -1)
+    { msg: 'Scroll up and type hello in the active window', lLLM: '-1', expect: 'desktop.control' },
+    { msg: 'Use keyboard shortcut cmd+S and click yes', lLLM: '-1', expect: 'desktop.control' },
     // Should be null (no match, no phone, no clear skill)
-    { msg: 'What is docker', lLLM: 'null', expect: null },
-    { msg: 'How do I use git rebase', lLLM: 'null', expect: null },
-    { msg: 'Who is the CEO of Apple', lLLM: 'null', expect: null },
-    { msg: 'Find me a recipe for pasta', lLLM: 'null', expect: null },
-    { msg: 'Summarize the Wikipedia article on TypeScript', lLLM: 'null', expect: null },
-    { msg: 'What is 12 percent of 500', lLLM: 'null', expect: null },
-    { msg: 'Play some jazz music', lLLM: 'null', expect: null },
-    { msg: 'How tall is Mount Everest', lLLM: 'null', expect: null },
-    { msg: 'Write a haiku about the ocean', lLLM: 'null', expect: null },
-    { msg: 'Show me the current Bitcoin price', lLLM: 'null', expect: null },
-    // Should match github.pr via LLM
-    { msg: 'Show me all open pull requests on my repo', lLLM: 'github.pr|HIGH', expect: 'github.pr' },
-    { msg: 'Close the open PRs older than 30 days', lLLM: 'github.pr|HIGH', expect: 'github.pr' },
-    { msg: 'List pull requests assigned to me', lLLM: 'github.pr|HIGH', expect: 'github.pr' },
-    // Should match slack.notify via LLM
-    { msg: 'Post a message to the #general Slack channel', lLLM: 'slack.notify', expect: 'slack.notify' },
-    { msg: 'Notify the dev team on Slack about the release', lLLM: 'slack.notify', expect: 'slack.notify' },
+    { msg: 'What is docker', lLLM: '-1', expect: null },
+    { msg: 'How do I use git rebase', lLLM: '-1', expect: null },
+    { msg: 'Who is the CEO of Apple', lLLM: '-1', expect: null },
+    { msg: 'Find me a recipe for pasta', lLLM: '-1', expect: null },
+    { msg: 'Summarize the Wikipedia article on TypeScript', lLLM: '-1', expect: null },
+    { msg: 'What is 12 percent of 500', lLLM: '-1', expect: null },
+    { msg: 'Play some jazz music', lLLM: '-1', expect: null },
+    { msg: 'How tall is Mount Everest', lLLM: '-1', expect: null },
+    { msg: 'Write a haiku about the ocean', lLLM: '-1', expect: null },
+    { msg: 'Show me the current Bitcoin price', lLLM: '-1', expect: null },
+    // Should match github.pr via LLM (index 3)
+    { msg: 'Show me all open pull requests on my repo', lLLM: '3', expect: 'github.pr' },
+    { msg: 'Close the open PRs older than 30 days', lLLM: '3', expect: 'github.pr' },
+    { msg: 'List pull requests assigned to me', lLLM: '3', expect: 'github.pr' },
+    // Should match slack.notify via LLM (index 4)
+    { msg: 'Post a message to the #general Slack channel', lLLM: '4', expect: 'slack.notify' },
+    { msg: 'Notify the dev team on Slack about the release', lLLM: '4', expect: 'slack.notify' },
   ];
 
   for (const tc of realWorld) {

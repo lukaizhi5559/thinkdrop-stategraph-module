@@ -78,10 +78,27 @@ When the user asks to CREATE something on a web service (playlist, document, boa
 - Use the gathered answers from prior context (e.g., collection name, item list, preferences) directly in the task strings
 - Each task string should be clear and specific — the browser agent follows it literally
 - Always add a final `synthesize` step to confirm the overall task
+- **Block-based document editors** (apps where content is built from discrete blocks via slash commands, `/` menus, or Enter-to-new-block — e.g. page builders, wiki editors, note apps with structured blocks): ALWAYS separate "create the page/document" from "add structured blocks" (todo lists, tables, headings, embeds). Each block type and each set of items is a distinct step. The browser agent cannot reliably create a page AND add multiple blocks in one continuous task — the editor's focus shifts after the title is set, and the agent loses track of where to type.
+
+**WRONG (page + todo list in one step — agent gets stuck after the title):**
+```json
+[
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "[name].agent", "task": "Open <service>, create a new page called 'Weekly Goals', and add a todo list containing Buy pizza, Take out the Trash, and Go fishing" }, "description": "Create page and add todos" }
+]
+```
+
+**RIGHT (decomposed — page creation and block content are separate steps):**
+```json
+[
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "[name].agent", "task": "Open <service> and create a new page called 'Weekly Goals'", "url": "https://<service>.new" }, "description": "Create 'Weekly Goals' page" },
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "[name].agent", "task": "On the 'Weekly Goals' page, add a todo list block with the items: Buy pizza, Take out the Trash, Go fishing" }, "description": "Add todo list items" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the 'Weekly Goals' page was created with the todo items: Buy pizza, Take out the Trash, Go fishing" }, "description": "Confirm page and todos" }
+]
+```
 
 ### Simple single-action exception (DO NOT decompose these)
 
-The decompose rule above applies to tasks with **multiple independent actions** where the agent must search or gather content (playlists, multi-item boards, documents with content from multiple sources). It does NOT apply to simple tasks where the user provides all content in the prompt and there is only one logical "submit" action.
+The decompose rule above applies to tasks with **multiple independent actions** where the agent must search or gather content, OR where the task involves a block-based document editor (page builders, wiki editors, note apps with structured blocks) or structured content (lists, tables, boards, playlists). It does NOT apply to simple single-field forms where the user provides all content and there is only one logical "submit" action.
 
 **Do NOT decompose these — use ONE `browser.agent` step:**
 - **Email/message**: "send email to X with subject Y and body Z"
@@ -94,9 +111,9 @@ The decompose rule above applies to tasks with **multiple independent actions** 
 **RIGHT (one step — user provided all content):**
 ```json
 [
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "gmail.agent", "task": "Open Gmail and send an email to <recipient> with the subject '<subject>' and the body '<body>'" }, "description": "Send the email to <recipient>" },
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "[name].agent", "task": "Open <app-name> and send an email to <recipient> with the subject '<subject>' and the body '<body>'" }, "description": "Send the email to <recipient>" },
   { "skill": "synthesize", "args": { "prompt": "Confirm the email was sent to <recipient>" }, "description": "Confirm email delivery" }
 ]
 ```
 
-**Key rule:** Only decompose if the task has multiple INDEPENDENT actions or requires the agent to SEARCH for content to add. Simple "send/post/reply/comment X to Y" does NOT need decomposition — the agent can fill all fields and submit in one continuous flow.
+**Key rule:** Only decompose if the task has multiple INDEPENDENT actions, requires the agent to SEARCH for content to add, OR involves a block-based document editor where the agent must create a document and then add structured blocks. Simple "send/post/reply/comment X to Y" with a single form and submit does NOT need decomposition — the agent can fill all fields and submit in one continuous flow.

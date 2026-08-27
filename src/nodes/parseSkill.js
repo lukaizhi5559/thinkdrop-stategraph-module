@@ -25,31 +25,31 @@
  * Graceful degradation: if user-memory service is unavailable, passes through.
  */
 
-const SEMANTIC_SYSTEM_PROMPT = `You are a strict skill-matching assistant. Given a user's request and a list of installed skills, determine if any skill EXACTLY matches what the user wants to do.
+const SEMANTIC_SYSTEM_PROMPT = `You are a strict skill-matching assistant. Given a user's request and a numbered list of installed skills, determine if any skill EXACTLY matches what the user wants to do.
 
 Rules:
 - Only match if the skill's purpose DIRECTLY covers the user's request — same service, same action type, same intent.
 - Do NOT match on loose thematic similarity. Sharing a general domain does NOT qualify.
-- IMPORTANT: Even if the user says "I need to create" or "I want to build" a skill, if an existing installed skill ALREADY covers the described capability, return that skill name.
+- IMPORTANT: Even if the user says "I need to create" or "I want to build" a skill, if an existing installed skill ALREADY covers the described capability, return that skill's index.
 
 ## Recurring vs one-off — CRITICAL distinction:
 - A skill that creates ONE Google Calendar event (gcal.event) does NOT match requests for recurring local reminders like "every morning", "daily at 6am", "remind me every day".
 - Recurring/scheduled tasks that don't explicitly say "Google Calendar" or "add to my calendar" should NOT match calendar event creation skills.
 - Only match a calendar skill if the user explicitly mentions Google Calendar, or says "add/create a calendar event/appointment".
 
+## Output format:
+Return ONLY a single number — nothing else:
+  -1 = no skill matches
+  0..N = the index (from the numbered list) of the matching skill
+
 ## Matching examples:
-- "Schedule my cold plunge every morning at 6am" → null (local recurring reminder, not a calendar event)
-- "Add a dentist appointment to my Google Calendar" → gcal.event ✅
-- "Remind me daily at 7am" → null (local OS reminder, not a calendar event)
-- "Create a calendar event for the team meeting on Friday" → gcal.event ✅
-- "Send Sarah a text" → sms/clicksend skill if installed ✅
-- "Check the weather" → weather skill if installed ✅
-
-Output format — ONLY these two formats, nothing else:
-skill-name|HIGH
-null
-
-Return "null" when there is NO clear match or when confidence is not HIGH. Never return MEDIUM or LOW matches.`;
+- "Schedule my cold plunge every morning at 6am" → -1 (local recurring reminder, not a calendar event)
+- "Add a dentist appointment to my Google Calendar" → index of gcal.event
+- "Remind me daily at 7am" → -1 (local OS reminder, not a calendar event)
+- "Create a calendar event for the team meeting on Friday" → index of gcal.event
+- "Send Sarah a text" → index of sms/clicksend skill if installed
+- "Check the weather" → index of weather skill if installed
+`;
 
 // Skill name fragments that indicate a one-shot event-creation skill (not a daemon)
 const ONE_SHOT_EVENT_MARKERS = ['calendar', '.event', 'booking', 'meeting', 'webex', 'zoom.schedule'];
@@ -457,11 +457,10 @@ module.exports = async function parseSkill(state) {
   }
 
   const skillMenu = skillsWithDesc
-    .map(s => `- ${s.name}: ${(s.description || s.summary || '').slice(0, 120)}`)
+    .map((s, i) => `${i}: ${s.name} — ${(s.description || s.summary || '').slice(0, 120)}`)
     .join('\n');
 
-  const semanticPrompt = `User request: "${classifyMessage}"\n\nInstalled skills:\n${skillMenu}\n\nDoes any skill clearly match this request? Return "skill-name|HIGH" or "null".
-Examples: "gcal.event|HIGH" or "null"`;
+  const semanticPrompt = `User request: "${classifyMessage}"\n\nInstalled skills (numbered):\n${skillMenu}\n\nReturn ONLY the index number of the matching skill, or -1 if no skill matches.`;
 
   // ── Surface progress: semantic fallback is an LLM call that can take a few seconds
   if (state.progressCallback) {
@@ -482,7 +481,7 @@ Examples: "gcal.event|HIGH" or "null"`;
           systemInstructions: SEMANTIC_SYSTEM_PROMPT,
           conversationHistory: [],
           intent: 'command_automate'
-        }, { maxTokens: 60, temperature: 0, fastMode: true, taskType: 'classification' }),
+        }, { maxTokens: 10, temperature: 0, fastMode: true, taskType: 'classification' }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('semantic timeout')), 5000)),
       ]);
       // Store in cache (only if we got a non-empty response)
@@ -491,74 +490,22 @@ Examples: "gcal.event|HIGH" or "null"`;
       }
     }
 
-    // Parse format: "skill-name|HIGH" or legacy plain "skill-name" or "null"
-    const rawTrimmed = (raw || '').trim().replace(/^["`']|["`']$/g, '');
-    // Split on pipe — if HIGH confidence declared, take it; otherwise plain name treated as HIGH (backwards compat)
-    const [candidatePart, confidencePart] = rawTrimmed.split('|').map(p => p.trim().toLowerCase());
-    const candidate = candidatePart;
-    const confidence = confidencePart || 'high'; // legacy responses without pipe treated as HIGH
+    // Parse single-number response: index 0..N-1 or -1 for no match
+    // Use a regex that preserves the leading minus sign, then parseInt.
+    const rawTrim = (raw || '').trim();
+    const numMatch = rawTrim.match(/-?\d+/);
+    const idx = numMatch ? parseInt(numMatch[0], 10) : -1;
+    const validIdx = idx >= 0 && idx < skillsWithDesc.length ? idx : -1;
 
-    if (confidence !== 'high') {
-      logger.debug(`[Node:ParseSkill] Semantic LLM returned confidence "${confidence}" — skipping (only HIGH accepted)`);
-    } else if (candidate && candidate !== 'null' && candidate !== 'none' && candidate !== '') {
-      // Verify the returned name is actually an ALLOWED candidate (not filtered out by recurring guard)
-      let confirmed = skillsWithDesc.find(s => s.name.toLowerCase() === candidate);
-      if (!confirmed) {
-        // Substring rescue: LLM wrapped the skill name in prose instead of bare format.
-        // Scan the entire raw response for any installed skill name appearing verbatim.
-        // Prefer the LONGEST matching name — shorter names are often prefixes of more
-        // specific ones (e.g. "mail_google_com_settings" ⊂ "mail_google_com_gmail_settings_general_l_...").
-        const rawLower = rawTrimmed.toLowerCase();
-        
-        // Guard 1: Check for explicit rejection patterns (LLM said no match)
-        const rejectionPatterns = [
-          /\bno\s+match\b/, /\bnone\b/, /\bnull\b/, /\bdoesn'?t\s+match\b/,
-          /\bnot\s+(?:a\s+)?match\b/, /\bavailable\s+skills\s+are\b/,
-          /\bno\s+skill\s+(?:for|matches)\b/
-        ];
-        const hasRejection = rejectionPatterns.some(p => p.test(rawLower));
-        
-        // Guard 2: Check position - skill name should be early or response short
-        // Find the earliest skill name match
-        const skillPositions = skillsWithDesc.map(s => ({
-          skill: s,
-          position: rawLower.indexOf(s.name.toLowerCase())
-        })).filter(sp => sp.position >= 0);
-        
-        const earliestSkill = skillPositions.sort((a, b) => a.position - b.position)[0];
-        const earliestPosition = earliestSkill ? earliestSkill.position : -1;
-        const isEarlyPosition = earliestPosition >= 0 && earliestPosition < 30;
-        const isShortResponse = rawTrimmed.length < 80;
-        
-        // Guard 3: Check for contradiction context before the earliest skill name
-        let hasContradiction = false;
-        if (earliestPosition > 20) {
-          const beforeSkill = rawLower.substring(earliestPosition - 20, earliestPosition);
-          hasContradiction = /\b(but|however|instead|rather)\b/.test(beforeSkill);
-        }
-        
-        // Only rescue if all guards pass
-        if (!hasRejection && (isEarlyPosition || isShortResponse) && !hasContradiction) {
-          const subMatches = skillsWithDesc.filter(s => rawLower.includes(s.name.toLowerCase()));
-          confirmed = subMatches.sort((a, b) => b.name.length - a.name.length)[0] || null;
-          if (confirmed) {
-            logger.info(`[Node:ParseSkill] Semantic LLM substring rescue: extracted "${confirmed.name}" from prose response (${subMatches.length} candidate(s))`);
-          }
-        } else {
-          logger.debug(`[Node:ParseSkill] Substring rescue blocked - hasRejection:${hasRejection}, early:${isEarlyPosition}, short:${isShortResponse}, contradiction:${hasContradiction}, earliestPos:${earliestPosition}`);
-        }
-      }
-      if (confirmed) {
-        logger.info(`[Node:ParseSkill] Semantic match: "${classifyMessage.substring(0, 60)}" → skill "${confirmed.name}"${userWantsToCreate ? ' (userWantsToCreate)' : ''}`);
-        // Pass sourceDomain/sourceAction so planSkills domain fast-path fires and prepends navigate step
-        const _confirmedDomain = confirmed.sourceDomain || null;
-        const _confirmedAction = confirmed.sourceAction || null;
-        return _matchedState(state, confirmed.name, userWantsToCreate, _confirmedDomain, _confirmedAction);
-      } else {
-        logger.debug(`[Node:ParseSkill] Semantic LLM returned unknown skill "${candidate}" — ignoring`);
-      }
+    if (validIdx >= 0) {
+      const confirmed = skillsWithDesc[validIdx];
+      logger.info(`[Node:ParseSkill] Semantic match: "${classifyMessage.substring(0, 60)}" → skill "${confirmed.name}" (index ${validIdx})${userWantsToCreate ? ' (userWantsToCreate)' : ''}`);
+      // Pass sourceDomain/sourceAction so planSkills domain fast-path fires and prepends navigate step
+      const _confirmedDomain = confirmed.sourceDomain || null;
+      const _confirmedAction = confirmed.sourceAction || null;
+      return _matchedState(state, confirmed.name, userWantsToCreate, _confirmedDomain, _confirmedAction);
     } else {
-      logger.debug(`[Node:ParseSkill] Semantic LLM returned null — no match`);
+      logger.debug(`[Node:ParseSkill] Semantic LLM returned no match (raw="${rawTrim}", idx=${idx})`);
     }
   } catch (e) {
     logger.debug(`[Node:ParseSkill] Semantic match skipped: ${e.message}`);

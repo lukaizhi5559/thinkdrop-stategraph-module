@@ -106,12 +106,29 @@ function buildPartialSummary(userMessage, skillResults, suspiciousDetails) {
  * but the synthesize output disagrees. If detected, generate a corrected
  * synthesis directly from the page text — no replan needed.
  * Returns { corrected: boolean, answer: string, reason: string } or null.
+ *
+ * Uses the single-number pattern: fast call returns 0 (no contradiction) or 1 (contradiction).
+ * Only on 1 (contradiction) does it run the full JSON generation to extract correctedAnswer.
+ * Safe default on failure: null (caller falls through to replan, same as existing fail-open).
  */
 async function assessAnswerContradiction(userMessage, synthesizeOutput, pageText, llmBackend, context, logger) {
   if (!pageText || pageText.length < 50) return null;
   if (!synthesizeOutput || synthesizeOutput.length < 5) return null;
 
-  const query = `USER GOAL: "${userMessage}"
+  // ── Fast decision: is there a contradiction? ─────────────────────────────
+  const decisionSystemPrompt = `You are a fact-checking judge. Compare the synthesized answer against fresh page text.
+Return ONLY a single number — nothing else:
+  0 = NO CONTRADICTION (synthesize output agrees with page text, or both are empty/vague)
+  1 = CONTRADICTION (page text has the real answer but synthesize output disagrees, is wrong, or is hollow)
+
+Decision rules:
+- If the user asked "how many" and the page shows a different count than synthesized → 1
+- If the user asked for specific data and the page has it but synthesis reported wrong data → 1
+- If the synthesize output is vague/hollow but the page text contains the actual answer → 1
+- If both agree → 0
+- When in doubt → 0`;
+
+  const decisionUserPrompt = `USER GOAL: "${userMessage}"
 
 CURRENT PAGE TEXT (freshly captured from browser):
 ${pageText.slice(0, 4000)}
@@ -119,24 +136,49 @@ ${pageText.slice(0, 4000)}
 SYNTHESIZE OUTPUT (what the system reported to the user):
 ${synthesizeOutput.slice(0, 2000)}
 
-Does the synthesize output CONTRADICT the page text? Specifically:
-- If the user asked "how many" and the page shows a different count than synthesized → CONTRADICTION
-- If the user asked for specific data and the page has it but synthesis reported wrong data → CONTRADICTION
-- If the synthesize output is vague/hollow but the page text contains the actual answer → CONTRADICTION
-- If both agree → NO CONTRADICTION
+Contradiction? (0 or 1)`;
 
-If there IS a contradiction, write the CORRECT answer based ONLY on the page text.
+  let hasContradiction = false;
+  try {
+    const raw = await llmBackend.generateAnswer(decisionUserPrompt, {
+      query: decisionUserPrompt,
+      context: {
+        systemInstructions: decisionSystemPrompt,
+        sessionId: context?.sessionId,
+        userId: context?.userId || 'default_user',
+      },
+    }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    hasContradiction = num === 1;
+    logger.info(`[Node:ReviewExecution] assessAnswerContradiction decision: ${hasContradiction ? 'CONTRADICTION' : 'NO_CONTRADICTION'} (raw="${(raw || '').trim()}")`);
+  } catch (err) {
+    logger.warn(`[Node:ReviewExecution] assessAnswerContradiction decision failed: ${err.message}`);
+    return null;
+  }
+
+  if (!hasContradiction) {
+    return { corrected: false, reason: 'no contradiction detected' };
+  }
+
+  // ── Generation: extract the corrected answer from page text ──────────────
+  const genQuery = `USER GOAL: "${userMessage}"
+
+CURRENT PAGE TEXT (freshly captured from browser):
+${pageText.slice(0, 4000)}
+
+SYNTHESIZE OUTPUT (what the system reported to the user):
+${synthesizeOutput.slice(0, 2000)}
+
+A CONTRADICTION was detected. Write the CORRECT answer based ONLY on the page text.
 
 Output ONLY valid JSON:
-{ "contradiction": true, "correctedAnswer": "<the correct answer based on page text>", "reason": "<one sentence>" }
-or:
-{ "contradiction": false, "reason": "<one sentence>" }`;
+{ "contradiction": true, "correctedAnswer": "<the correct answer based on page text>", "reason": "<one sentence>" }`;
 
   try {
-    const raw = await llmBackend.generateAnswer(query, {
-      query,
+    const raw = await llmBackend.generateAnswer(genQuery, {
+      query: genQuery,
       context: {
-        systemInstructions: 'You are a fact-checking judge. Compare the synthesized answer against fresh page text. If they disagree, produce the correct answer from the page text only. Output ONLY valid JSON.',
+        systemInstructions: 'You are a fact-checking judge. A contradiction was detected between the synthesized answer and the page text. Produce the correct answer from the page text only. Output ONLY valid JSON.',
         sessionId: context?.sessionId,
         userId: context?.userId || 'default_user',
       },
@@ -149,7 +191,7 @@ or:
     }
     return { corrected: false, reason: String(parsed.reason || '') };
   } catch (err) {
-    logger.warn(`[Node:ReviewExecution] assessAnswerContradiction failed: ${err.message}`);
+    logger.warn(`[Node:ReviewExecution] assessAnswerContradiction generation failed: ${err.message}`);
     return null;
   }
 }
@@ -158,12 +200,27 @@ or:
  * Ask the LLM to judge whether the user's goal was fulfilled,
  * given the current page ARIA snapshot, synthesize summary, and original prompt.
  * Returns { fulfilled: boolean, reason: string } or null if the LLM call fails.
+ *
+ * Uses the single-number pattern: LLM returns 0 (FULFILLED) or 1 (NOT_FULFILLED).
+ * Safe default on failure: null (caller falls back to regex hollow check).
  */
 async function assessBrowserFulfillment(userMessage, synthesizeOutput, snapshot, llmBackend, context, logger) {
   const snapshotExcerpt = snapshot ? snapshot.slice(0, 3000) : '(no page content available)';
   const synthExcerpt = synthesizeOutput ? synthesizeOutput.slice(0, 2000) : '(none)';
 
-  const query = `USER GOAL: "${userMessage}"
+  const systemPrompt = `You are a task fulfillment judge. Evaluate whether the user's goal was achieved based on the current page state and the system's summary.
+Return ONLY a single number — nothing else:
+  0 = FULFILLED (goal achieved — page shows the right content, synthesize output is a real answer)
+  1 = NOT_FULFILLED (auth wall, wrong page, hollow/vague output, page doesn't match what was asked)
+
+Decision rules:
+- If the page shows a sign-in page, login form, or auth wall → 1
+- If the page and synthesize output clearly contain the specific data the user asked for → 0
+- If the synthesize output is vague/hollow ("no information available", "could not retrieve", etc.) → 1
+- If the page text doesn't match what was asked (e.g. user asked for channel videos but page shows search results) → 1
+- If the synthesize output is a plausible answer AND the page confirms the right content is showing → 0`;
+
+  const userPrompt = `USER GOAL: "${userMessage}"
 
 CURRENT PAGE TEXT CONTENT:
 ${snapshotExcerpt}
@@ -171,34 +228,75 @@ ${snapshotExcerpt}
 SYNTHESIZE OUTPUT (what the system reported back):
 ${synthExcerpt}
 
-Based on the current page content and synthesize output, was the user's goal FULFILLED?
-Rules:
-- If the page shows a sign-in page, login form, or auth wall → NOT fulfilled
-- If the page and synthesize output clearly contain the specific data the user asked for → FULFILLED
-- If the synthesize output is vague/hollow ("no information available", "could not retrieve", etc.) → NOT fulfilled
-- If the page text doesn't match what was asked (e.g. user asked for channel videos but page shows search results) → NOT fulfilled
-- If the synthesize output is a plausible answer AND the page confirms the right content is showing → FULFILLED
-
-Output ONLY valid JSON: { "fulfilled": true, "reason": "one sentence" }
-or: { "fulfilled": false, "reason": "one sentence explaining why not" }`;
+Fulfilled? (0 or 1)`;
 
   try {
-    const raw = await llmBackend.generateAnswer(query, {
-      query,
+    const raw = await llmBackend.generateAnswer(userPrompt, {
+      query: userPrompt,
       context: {
-        systemInstructions: 'You are a task fulfillment judge. Evaluate whether the user\'s goal was achieved based on the current page state and the system\'s summary. Output ONLY valid JSON.',
+        systemInstructions: systemPrompt,
         sessionId: context?.sessionId,
         userId: context?.userId || 'default_user',
       },
-    }, { maxTokens: 150, temperature: 0.1, fastMode: true, taskType: 'classification' });
+    }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
-    const parsed = parseLlmJson(raw, logger, 'Node:ReviewExecution:assessBrowser');
-    if (!parsed) throw new Error('no JSON in response');
-    if (typeof parsed.fulfilled !== 'boolean') throw new Error('missing fulfilled field');
-    return { fulfilled: parsed.fulfilled, reason: String(parsed.reason || '') };
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    if (isNaN(num) || (num !== 0 && num !== 1)) {
+      throw new Error(`invalid response: "${(raw || '').trim()}"`);
+    }
+    const fulfilled = num === 0;
+    logger.info(`[Node:ReviewExecution] assessBrowserFulfillment: fulfilled=${fulfilled} (raw="${(raw || '').trim()}")`);
+    return { fulfilled, reason: fulfilled ? 'goal achieved' : 'not fulfilled' };
   } catch (err) {
     logger.warn(`[Node:ReviewExecution] assessBrowserFulfillment failed: ${err.message} — falling back to regex`);
     return null;
+  }
+}
+
+/**
+ * Fast number-based LLM decision (PASS/VERIFY_NEEDED) for reviewExecution.
+ * Modeled on browser.agent _decisionCall: "Return ONLY a single number".
+ * Replaces the 300-token JSON review call for the common PASS case.
+ * Only when VERIFY_NEEDED (1) is returned does the caller run the full JSON
+ * generation to extract suspiciousSteps.
+ * Safe default on parse failure/timeout: 0 (PASS) — matches existing fail-open.
+ */
+async function _reviewDecision(llmBackend, userMessage, stepLog, context, state, logger) {
+  const systemPrompt = `You are an automation step reviewer. Did all steps produce output that proves their actions were performed correctly?
+Return ONLY a single number — nothing else:
+  0 = PASS (all steps verified — outputs match intended actions, no suspicious results)
+  1 = VERIFY_NEEDED (one or more steps have hollow/missing/contradictory output that needs verification)
+
+Decision rules:
+- If all step outputs are non-empty and consistent with the intended action → 0
+- If any step output is empty, hollow, or contradicts the expected result → 1
+- If the user goal was clearly achieved by the step results → 0
+- When in doubt → 0`;
+
+  const userPrompt = `USER GOAL: "${userMessage}"
+
+STEP RESULTS:
+${stepLog}
+
+Verdict? (0 or 1)`;
+
+  try {
+    const raw = await llmBackend.generateAnswer(userPrompt, {
+      query: userPrompt,
+      context: {
+        systemInstructions: systemPrompt,
+        sessionId: context?.sessionId,
+        userId: context?.userId || 'default_user',
+        intent: state.intent?.type || 'command_automate',
+      }
+    }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const result = (num === 0 || num === 1) ? num : 0;
+    logger.info(`[Node:ReviewExecution] _reviewDecision: verdict=${result === 0 ? 'PASS' : 'VERIFY_NEEDED'} (raw="${(raw || '').trim()}")`);
+    return result;
+  } catch (e) {
+    logger.warn(`[Node:ReviewExecution] _reviewDecision failed: ${e.message} — defaulting to 0 (PASS)`);
+    return 0;
   }
 }
 
@@ -582,6 +680,18 @@ module.exports = async function reviewExecution(state) {
     if (r.error) lines.push(`  error: ${String(r.error).slice(0, 200)}`);
     return lines.join('\n');
   }).join('\n\n');
+
+  // ── Fast number-based decision (PASS/VERIFY_NEEDED) ─────────────────────
+  // Call the light model with "return ONLY a single number" to get a fast verdict.
+  // If PASS (0), return immediately — skip the expensive 300-token JSON generation.
+  // If VERIFY_NEEDED (1), fall through to the full JSON generation to get
+  // the suspiciousSteps array with verification commands.
+  const _fastVerdict = await _reviewDecision(llmBackend, userMessage, stepLog, context, state, logger);
+  if (_fastVerdict === 0) {
+    logger.info('[Node:ReviewExecution] Fast verdict: PASS — skipping full JSON generation → UNVERIFIABLE (pass-through)');
+    return { ...state, reviewVerdict: 'UNVERIFIABLE' };
+  }
+  logger.info('[Node:ReviewExecution] Fast verdict: VERIFY_NEEDED — running full JSON generation for suspiciousSteps');
 
   const reviewQuery = `USER GOAL: "${userMessage}"
 

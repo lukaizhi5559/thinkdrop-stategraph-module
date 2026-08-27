@@ -94,23 +94,34 @@ module.exports = async function evaluateSkills(state) {
     return { ...state, evaluationVerdict: 'ASK_USER' };
   }
 
-  // ── Answer-type validation bypass ──────────────────────────────────────────
-  // Read expected types from the plan's outputSchema (set by LLM during planning).
-  // If the answer doesn't match ANY expected type, force LLM evaluation.
-  const _expectedAnswerTypes = _getExpectedAnswerTypes(skillPlan, userMessage);
-  let _answerTypeValid = true; // default: no type check = allow skips
-  if (_expectedAnswerTypes && _expectedAnswerTypes.length > 0 && !evaluationFromFailure) {
-    _answerTypeValid = validateAnswerTypes(answer, _expectedAnswerTypes);
-    if (!_answerTypeValid) {
-      logger.info(`[Node:EvaluateSkills] Answer-type mismatch: expected [${_expectedAnswerTypes.join(',')}], answer doesn't match — forcing evaluation (bypassing skip conditions)`);
-    } else {
-      logger.info(`[Node:EvaluateSkills] Answer-type validation passed: expected [${_expectedAnswerTypes.join(',')}]`);
+  // ── Synthesize short-circuit ──────────────────────────────────────────────
+  // If the last skillResult is a synthesize step with ok:true and substantial output,
+  // and all preceding steps passed, skip post-run LLM evaluation entirely.
+  // The synthesize step already ran the LLM to compose the answer from collected data —
+  // re-judging it wastes an LLM call, risks false FIX verdicts, and causes UI spinner
+  // races (evaluating event arrives after all_done, overriding the done phase).
+  // The hollow-detection logic below (lines ~201-229) still catches empty/auth-wall outputs.
+  if (!evaluationFromFailure && Array.isArray(skillResults) && skillResults.length > 0) {
+    const _lastResult = skillResults[skillResults.length - 1];
+    const _isSynthOk = _lastResult.skill === 'synthesize' && _lastResult.ok !== false;
+    const _synthOutput = String(_lastResult.stdout || _lastResult.result || '').trim();
+    if (_isSynthOk && _synthOutput.length > 50) {
+      // Verify all prior steps passed
+      const _allPriorOk = skillResults.slice(0, -1).every(r => r.ok !== false);
+      if (_allPriorOk) {
+        logger.info(`[Node:EvaluateSkills] Skipping post-run eval — synthesize produced ${_synthOutput.length} chars, all prior steps OK`);
+        return { ...state, evaluationVerdict: 'PASS' };
+      }
     }
   }
-  const _bypassSkips = _expectedAnswerTypes && _expectedAnswerTypes.length > 0 && !_answerTypeValid;
+
+  // Note: The previous answer-type regex validation (_getExpectedAnswerTypes / _validateSingleType)
+  // has been removed. It was brittle (false positives forced unnecessary evaluations, false negatives
+  // let bad answers through). Instead, a fast number-based LLM decision call (_evalDecision) now
+  // determines PASS/FIX/ASK_USER — the LLM judges answer quality, not regex.
 
   // Failure path: called from recoverSkill REPLAN — skip PASS shortcut, always judge the failure
-  if (!_bypassSkips && !evaluationFromFailure) {
+  if (!evaluationFromFailure) {
     if (!skillPlan || skillPlan.length === 0) return state;
     if (evaluationRetryCount >= MAX_EVAL_RETRIES) {
       logger.info(`[Node:EvaluateSkills] Retry cap reached — passing through`);
@@ -333,6 +344,22 @@ module.exports = async function evaluateSkills(state) {
     .slice(-80) // last 80 warn/error lines
     .join('\n');
 
+  // ── Fast number-based decision (PASS/FIX/ASK_USER) ──────────────────────
+  // Call the light model with "return ONLY a single number" to get a fast verdict.
+  // If PASS (0), return immediately — skip the expensive 400-token JSON generation.
+  // If FIX (1) or ASK_USER (2), fall through to the full JSON generation to get
+  // the fix rule / reason text.
+  const _fastVerdict = await _evalDecision(
+    backend, userMessage, stepLogs, filteredLog, answer,
+    evaluationRetryCount, isFailurePath, recoveryContext,
+    state.conversationHistory, context, logger
+  );
+  if (_fastVerdict === 0) {
+    logger.info(`[Node:EvaluateSkills] Fast verdict: PASS — skipping full JSON generation`);
+    return { ...state, evaluationVerdict: 'PASS', evaluationFromFailure: false };
+  }
+  logger.info(`[Node:EvaluateSkills] Fast verdict: ${_fastVerdict === 1 ? 'FIX' : 'ASK_USER'} — running full JSON generation for details`);
+
   const systemPrompt = isFailurePath ? FAILURE_EVAL_SYSTEM_PROMPT : EVAL_SYSTEM_PROMPT;
 
   const failureSection = isFailurePath && recoveryContext ? `
@@ -524,7 +551,77 @@ Output ONLY valid JSON.`;
   return { ...state, evaluationVerdict: 'PASS' };
 };
 
+// ── Fast number-based LLM decision (PASS/FIX/ASK_USER) ─────────────────────
+// Modeled on browser.agent _decisionCall: "Return ONLY a single number".
+// Replaces the 400-token JSON evaluation call for the common PASS case.
+// Only when FIX (1) is returned does the caller run the full JSON generation
+// to extract the fix rule, contextKey, etc.
+// Safe default on parse failure/timeout: 0 (PASS) — matches existing fail-open.
+async function _evalDecision(backend, userMessage, stepLogs, filteredLog, answer, evaluationRetryCount, isFailurePath, recoveryContext, conversationHistory, context, logger) {
+  const failureSection = isFailurePath && recoveryContext ? `
+FAILURE ANALYSIS:
+  failedSkill: ${recoveryContext.failedSkill}
+  failureReason: ${recoveryContext.failureReason}
+  suggestion: ${recoveryContext.suggestion}
+  replanCount: ${recoveryContext?.replanCount || 0}` : '';
+
+  const systemPrompt = `You are an automation quality judge. Did the result satisfy the user's intent?
+Return ONLY a single number — nothing else:
+  0 = PASS (the result satisfies the user's request)
+  1 = FIX (the result is wrong/incomplete and a correction rule should be saved)
+  2 = ASK_USER (human input is needed — neither pass nor auto-fixable)
+
+Decision rules:
+- If the final answer addresses the user's request (correct count, list, confirmation, sent email, etc.) → return 0
+- If the final answer is empty, hollow, or contradicts the step results → return 1
+- If the task failed in a way that needs human guidance (auth, ambiguity, missing info) → return 2
+- On the failure path (recoveryContext present), lean toward 1 (FIX) — derive a permanent rule
+- When in doubt → return 0`;
+
+  const userPrompt = `ORIGINAL REQUEST: "${userMessage}"
+${failureSection}
+STEP LOG:
+${stepLogs}
+
+WARN/ERROR LOG (from execution):
+${filteredLog || '(no warnings or errors)'}
+
+FINAL ANSWER SHOWN TO USER: ${String(answer || '(none)').slice(0, 500)}
+
+retryCount: ${evaluationRetryCount}
+
+Verdict? (0, 1, or 2)`;
+
+  const evalPayload = {
+    query: userPrompt,
+    context: {
+      systemInstructions: systemPrompt,
+      conversationHistory: (conversationHistory || []).slice(-6),
+      sessionId: context?.sessionId,
+      userId: context?.userId || 'default_user',
+      intent: 'command_automate'
+    }
+  };
+
+  try {
+    const raw = await backend.generateAnswer(userPrompt, evalPayload, {
+      maxTokens: 5,
+      temperature: 0.1,
+      fastMode: true,
+      taskType: 'classification'
+    });
+    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const result = [0, 1, 2].includes(num) ? num : 0;
+    logger.info(`[Node:EvaluateSkills] _evalDecision: verdict=${result} (raw="${(raw || '').trim()}")`);
+    return result;
+  } catch (e) {
+    logger.warn(`[Node:EvaluateSkills] _evalDecision failed: ${e.message} — defaulting to 0 (PASS)`);
+    return 0;
+  }
+}
+
 // Export helper functions for testing
 module.exports._getExpectedAnswerTypes = _getExpectedAnswerTypes;
 module.exports._validateSingleType = _validateSingleType;
 module.exports.validateAnswerTypes = validateAnswerTypes;
+module.exports._evalDecision = _evalDecision;

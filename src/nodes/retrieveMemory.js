@@ -151,18 +151,25 @@ async function _llmDetectPersonalAttribute(message, llmBackend, logger) {
 
   if (!llmBackend || !llmBackend.generateAnswer) return null;
 
-  const prompt = `Extract personal attribute from this message. Return ONLY one of: name, email, phone, birthday, location, timezone, company, occupation, github, username, address, language, or null. Message: "${q}"`;
+  // Single-number pattern: LLM returns index 0–11 or -1 for no attribute.
+  const ATTRIBUTES = ['name', 'email', 'phone', 'birthday', 'location', 'timezone', 'company', 'occupation', 'github', 'username', 'address', 'language'];
+  const numberedList = ATTRIBUTES.map((a, i) => `${i}: ${a}`).join('\n');
+  const systemPrompt = `You extract personal attributes from short messages. Return ONLY a single number — nothing else:
+  -1 = no personal attribute mentioned
+  0..11 = the index of the attribute from this list:
+${numberedList}`;
+  const prompt = `Message: "${q}"\n\nAttribute index (0–11 or -1):`;
   try {
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
-      context: { systemInstructions: 'You extract personal attributes. Return only the attribute name or null.' },
-    }, { maxTokens: 50, temperature: 0, fastMode: true, taskType: 'classification' });
+      context: { systemInstructions: systemPrompt },
+    }, { maxTokens: 5, temperature: 0, fastMode: true, taskType: 'classification' });
     if (!raw) return null;
-    const cleaned = raw.trim().toLowerCase().replace(/^```.*\n?/gm, '').replace(/```$/g, '').trim();
-    const validAttributes = ['name', 'email', 'phone', 'birthday', 'location', 'timezone', 'company', 'occupation', 'github', 'username', 'address', 'language'];
-    if (validAttributes.includes(cleaned)) {
-      logger.debug(`[Node:RetrieveMemory] LLM detected personal attribute: ${cleaned}`);
-      return cleaned;
+    const numMatch = (raw || '').trim().match(/-?\d+/);
+    const idx = numMatch ? parseInt(numMatch[0], 10) : -1;
+    if (idx >= 0 && idx < ATTRIBUTES.length) {
+      logger.debug(`[Node:RetrieveMemory] LLM detected personal attribute: ${ATTRIBUTES[idx]} (index ${idx})`);
+      return ATTRIBUTES[idx];
     }
     return null;
   } catch (e) {
