@@ -666,9 +666,18 @@ function autoInjectFromContracts(args, skill, stepContracts = [], logger) {
             const _priorBrand = _priorHost.split('.').slice(-2, -1)[0];
             const _creationBrand = _creationHost.split('.').slice(-2, -1)[0];
             if (_priorHost === _creationHost || _priorBrand === _creationBrand) {
-              newArgs.url = _priorUrl;
+              // Strip app-specific internal state params that trigger UI dialogs.
+              // Notion's ?showMoveTo=true&saveParent=true opens a "Move to" dialog
+              // that gets mis-detected as an overlay, confusing tier selection.
+              try {
+                const _strippedUrl = new URL(_priorUrl);
+                ['showMoveTo', 'saveParent', 'showSidebar'].forEach(p => _strippedUrl.searchParams.delete(p));
+                newArgs.url = _strippedUrl.href;
+              } catch (_) {
+                newArgs.url = _priorUrl;
+              }
               injected = true;
-              logger.info(`[Node:ExecuteCommand] Auto-injected url from prior browser.agent: ${_priorUrl} (replaced creation URL)`);
+              logger.info(`[Node:ExecuteCommand] Auto-injected url from prior browser.agent: ${newArgs.url} (replaced creation URL, stripped internal params)`);
               break;
             }
           } catch (_) {}
@@ -3170,7 +3179,8 @@ module.exports = async function executeCommand(state) {
 1. If the content from a source clearly shows a login page, sign-in form, or authentication wall (e.g. it contains phrases like "Sign in", "Log in", "Create account", "Welcome back" with minimal substantive content), you MUST explicitly state that [service] required login and could not be queried.
 2. If you were asked to find video URLs (e.g., YouTube videos) but the provided content contains NO actual video links (watch?v= URLs), you MUST state that the search failed. Do NOT invent or hallucinate fake URLs like https://www.youtube.com/watch?v=dQw4w9WgXcQ or any other made-up links.
 3. A failed search with honest "no results" is infinitely better than fabricated data with fake URLs.
-4. If the page text contains an "AI Overview" or auto-generated summary section (e.g. Gmail's AI Overview, Google Search AI Overview), do NOT trust its claims about the presence or absence of results. The AI Overview may state "no results found" or "no unread emails" even when actual results/email rows are clearly listed below it. Always verify against the actual list items, email rows, or data entries in the page text — not the AI Overview's summary. When the AI Overview contradicts the actual list items, trust the list items.`) + _synthLangSuffix;
+4. If the page text contains an "AI Overview" or auto-generated summary section (e.g. Gmail's AI Overview, Google Search AI Overview), do NOT trust its claims about the presence or absence of results. The AI Overview may state "no results found" or "no unread emails" even when actual results/email rows are clearly listed below it. Always verify against the actual list items, email rows, or data entries in the page text — not the AI Overview's summary. When the AI Overview contradicts the actual list items, trust the list items.
+5. COUNT QUESTION RULE: If the user asked "how many", "count", or "tell me how many": (a) First, search the page text for pagination, summary, or total count labels (e.g., "X-Y of N", "X of N", "Showing X results", "N items", "N matches", "No results", "Zero items"). (b) If the label shows an actual number N (e.g., "1-50 of 127", "Showing 1-10 of 23"), extract the absolute total N and report N as the definitive count (even if N is 0). Do NOT manually count individual rows — the pagination label is the source of truth. (c) If the label says "X-Y of many" (e.g., "1-50 of many", "Showing most recent 1-50 of many"), the exact total is not resolved by the app — the count is at least Y. Report the final answer as "at least Y" (e.g., "at least 50") and do NOT manually count visible rows. (d) If no total label exists, manually count only the fully visible rows/items in the page text. Report the final answer strictly as "at least N" (where N is your manual count). (e) Briefly list the first 2-3 visible item titles/subjects as supplementary context to verify you are looking at the right data. (f) Output the final count clearly at the very beginning of your response (e.g., "Count: N" or "Count: at least N").`) + _synthLangSuffix;
 
       // ── Output schema enforcement ─────────────────────────────────────────────
       const _outputSchema = args.outputSchema;
@@ -3181,7 +3191,7 @@ module.exports = async function executeCommand(state) {
         _schemaTypes = Array.isArray(_outputSchema.type) ? _outputSchema.type : [_outputSchema.type];
 
         const _typeConstraints = {
-          INTEGER: 'Your answer MUST include the integer number in a brief, natural sentence (e.g. "There are 3 unread emails from John"). Keep it under 20 words. Do NOT output just the number alone.',
+          INTEGER: 'Your answer MUST include the integer number in a brief, natural sentence (e.g. "There are 3 unread emails from John"). If the total is "many" or cannot be resolved to a precise number, the integer you report should be the guaranteed minimum from the pagination label (e.g., "There are at least 50 unread emails from John"). Keep it under 20 words. Do NOT output just the number alone.',
           BOOLEAN: 'Your answer MUST start with "Yes" or "No". You may add a brief explanation after, but the first word must be Yes or No.',
           ARRAY: 'Your answer MUST include a bulleted list. Start each item with "- ". If the list is empty, output "None found".',
           OBJECT: 'Your answer MUST use "Field: value" format for each requested field. Put each field on its own line.',
