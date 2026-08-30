@@ -31,6 +31,109 @@ class ThinkDropLLMBackend extends LLMBackend {
     this.userId = config.userId || 'default_user';
     this.connectTimeoutMs = config.connectTimeoutMs || 5000;
     this.responseTimeoutMs = config.responseTimeoutMs || 60000;
+
+    // ── Persistent WebSocket connection pool ──────────────────────────────
+    // Reuses WebSocket connections across generateAnswer() calls to eliminate
+    // ~1-2s TCP handshake + WS upgrade overhead per call. Each connection
+    // handles one request at a time; overflow requests create temporary
+    // connections that are closed after use.
+    this._maxPoolSize = 2;
+    this._wsPool = []; // Array of { ws, busy }
+  }
+
+  /**
+   * Build an authenticated WebSocket URL for a new connection.
+   * @private
+   */
+  _buildPoolUrl() {
+    const url = new URL(this.wsUrl);
+    if (this.apiKey) url.searchParams.set('apiKey', this.apiKey);
+    url.searchParams.set('userId', this.userId);
+    url.searchParams.set('clientId', `stategraph_pool_${Math.random().toString(36).slice(2, 8)}`);
+    return url.toString();
+  }
+
+  /**
+   * Acquire a WebSocket connection from the pool, or create a new one.
+   * @private
+   * @returns {Promise<{ws: WebSocket, pooled: boolean}>}
+   */
+  async _acquireWs() {
+    let WebSocket;
+    try { WebSocket = require('ws'); } catch {
+      throw new Error('[ThinkDropLLMBackend] "ws" package not installed. Run: npm install ws');
+    }
+
+    // Find a free, healthy connection in the pool
+    for (let i = this._wsPool.length - 1; i >= 0; i--) {
+      const entry = this._wsPool[i];
+      if (entry.ws.readyState !== WebSocket.OPEN) {
+        // Stale/closed connection — remove from pool
+        this._wsPool.splice(i, 1);
+        continue;
+      }
+      if (!entry.busy) {
+        entry.busy = true;
+        // Remove only message listeners from previous requests
+        entry.ws.removeAllListeners('message');
+        return { ws: entry.ws, pooled: true };
+      }
+    }
+
+    // No free connection — create a new one
+    const ws = new WebSocket(this._buildPoolUrl());
+
+    // Connect with timeout
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => {
+        ws.terminate();
+        reject(new Error('[ThinkDropLLMBackend] Connection timeout'));
+      }, this.connectTimeoutMs);
+      ws.on('open', () => { clearTimeout(t); resolve(); });
+      ws.on('error', (err) => { clearTimeout(t); reject(err); });
+    });
+
+    // If pool isn't full, add to pool for reuse; otherwise it's a temporary connection
+    const pooled = this._wsPool.length < this._maxPoolSize;
+    if (pooled) {
+      const entry = { ws, busy: true };
+      this._wsPool.push(entry);
+      // Permanent error/close handler — removes from pool on drop
+      ws.on('error', (err) => {
+        console.warn(`[ThinkDropLLMBackend] Pool connection error: ${err.message}`);
+        this._wsPool = this._wsPool.filter(e => e !== entry);
+      });
+      ws.on('close', () => {
+        this._wsPool = this._wsPool.filter(e => e !== entry);
+      });
+    }
+
+    return { ws, pooled };
+  }
+
+  /**
+   * Release a WebSocket connection back to the pool, or close it if temporary/errored.
+   * @private
+   * @param {WebSocket} ws
+   * @param {boolean} errored — if true, destroy the connection
+   */
+  _releaseWs(ws, errored = false) {
+    const entry = this._wsPool.find(e => e.ws === ws);
+    if (!entry) {
+      // Temporary connection (pool was full) — close it
+      try { ws.close(); } catch {}
+      return;
+    }
+    if (errored || ws.readyState !== 1) {
+      // Broken connection — remove from pool and close
+      this._wsPool = this._wsPool.filter(e => e !== entry);
+      try { ws.close(); } catch {}
+      return;
+    }
+    // Healthy — return to pool for reuse
+    entry.busy = false;
+    // Clean up per-request message listeners
+    ws.removeAllListeners('message');
   }
 
   /**
@@ -39,32 +142,9 @@ class ThinkDropLLMBackend extends LLMBackend {
    * If onToken provided, forwards each chunk in real time.
    */
   async generateAnswer(prompt, payload, options = {}, onToken = null) {
-    // Lazy require so this module works in environments without 'ws'
-    let WebSocket;
-    try {
-      WebSocket = require('ws');
-    } catch {
-      throw new Error('[ThinkDropLLMBackend] "ws" package not installed. Run: npm install ws');
-    }
-
-    // Build authenticated URL
-    const url = new URL(this.wsUrl);
-    if (this.apiKey) url.searchParams.set('apiKey', this.apiKey);
-    url.searchParams.set('userId', this.userId);
-    url.searchParams.set('clientId', `stategraph_${Date.now()}`);
-
-    const ws = new WebSocket(url.toString());
-
-    // Wait for connection
-    await new Promise((resolve, reject) => {
-      const t = setTimeout(() => {
-        ws.terminate();
-        reject(new Error('[ThinkDropLLMBackend] Connection timeout'));
-      }, this.connectTimeoutMs);
-
-      ws.on('open', () => { clearTimeout(t); resolve(); });
-      ws.on('error', (err) => { clearTimeout(t); reject(err); });
-    });
+    // Acquire a connection from the pool (reuses persistent connections)
+    const { ws, pooled } = await this._acquireWs();
+    let _errored = false;
 
     // Send request
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -118,78 +198,87 @@ class ThinkDropLLMBackend extends LLMBackend {
       : _taskType === 'heavy' ? 90_000
       : this.responseTimeoutMs; // light/planning — keep default 60s
 
-    await new Promise((resolve, reject) => {
-      let activeTimeout = setTimeout(() => {
-        ws.terminate();
-        reject(new Error('[ThinkDropLLMBackend] Response timeout'));
-      }, _dynamicTimeoutMs);
-
-      const resetTimeout = () => {
-        clearTimeout(activeTimeout);
-        activeTimeout = setTimeout(() => {
+    try {
+      await new Promise((resolve, reject) => {
+        let activeTimeout = setTimeout(() => {
+          _errored = true;
           ws.terminate();
           reject(new Error('[ThinkDropLLMBackend] Response timeout'));
         }, _dynamicTimeoutMs);
-      };
 
-      ws.on('message', (data) => {
-        try {
-          const msg = JSON.parse(data.toString());
+        const resetTimeout = () => {
+          clearTimeout(activeTimeout);
+          activeTimeout = setTimeout(() => {
+            _errored = true;
+            ws.terminate();
+            reject(new Error('[ThinkDropLLMBackend] Response timeout'));
+          }, _dynamicTimeoutMs);
+        };
 
-          if (msg.type === 'llm_stream_start') {
-            streamStarted = true;
-            clearTimeout(activeTimeout);
+        ws.on('message', (data) => {
+          try {
+            const msg = JSON.parse(data.toString());
 
-          } else if (msg.type === 'llm_stream_fallback') {
-            // Preferred provider failed — fallback in progress, keep connection alive
-            resetTimeout();
+            if (msg.type === 'llm_stream_start') {
+              streamStarted = true;
+              clearTimeout(activeTimeout);
 
-          } else if (msg.type === 'llm_stream_chunk') {
-            const chunk = msg.payload?.chunk || msg.payload?.text || '';
-            if (chunk) {
-              accumulated += chunk;
-              if (onToken) onToken(chunk);
+            } else if (msg.type === 'llm_stream_fallback') {
+              // Preferred provider failed — fallback in progress, keep connection alive
+              resetTimeout();
+
+            } else if (msg.type === 'llm_stream_chunk') {
+              const chunk = msg.payload?.chunk || msg.payload?.text || '';
+              if (chunk) {
+                accumulated += chunk;
+                if (onToken) onToken(chunk);
+              }
+
+            } else if (msg.type === 'llm_stream_end') {
+              clearTimeout(activeTimeout);
+              // Don't close pooled connections — release them back to the pool
+              resolve();
+
+            } else if (msg.type === 'llm_error') {
+              // Terminal error — all providers exhausted
+              clearTimeout(activeTimeout);
+              _errored = true;
+              const llmErrMsg = msg.payload?.message || 'WebSocket LLM error';
+              if (/All LLM providers failed/i.test(llmErrMsg)) {
+                this._resetCircuitBreaker();
+              }
+              reject(new Error(llmErrMsg));
+            } else if (msg.type === 'error') {
+              // Legacy/non-streaming error — treat as terminal
+              clearTimeout(activeTimeout);
+              _errored = true;
+              reject(new Error(msg.payload?.message || 'WebSocket LLM error'));
             }
-
-          } else if (msg.type === 'llm_stream_end') {
-            clearTimeout(activeTimeout);
-            ws.close();
-            resolve();
-
-          } else if (msg.type === 'llm_error') {
-            // Terminal error — all providers exhausted
-            clearTimeout(activeTimeout);
-            ws.close();
-            const llmErrMsg = msg.payload?.message || 'WebSocket LLM error';
-            if (/All LLM providers failed/i.test(llmErrMsg)) {
-              this._resetCircuitBreaker();
-            }
-            reject(new Error(llmErrMsg));
-          } else if (msg.type === 'error') {
-            // Legacy/non-streaming error — treat as terminal
-            clearTimeout(activeTimeout);
-            ws.close();
-            reject(new Error(msg.payload?.message || 'WebSocket LLM error'));
+          } catch (e) {
+            // ignore parse errors on individual messages
           }
-        } catch (e) {
-          // ignore parse errors on individual messages
-        }
-      });
+        });
 
-      ws.on('error', (err) => {
-        clearTimeout(activeTimeout);
-        reject(err);
-      });
+        ws.on('error', (err) => {
+          clearTimeout(activeTimeout);
+          _errored = true;
+          reject(err);
+        });
 
-      ws.on('close', () => {
-        clearTimeout(activeTimeout);
-        if (!streamStarted) {
-          reject(new Error('[ThinkDropLLMBackend] Connection closed before stream started'));
-        } else {
-          resolve();
-        }
+        ws.on('close', () => {
+          clearTimeout(activeTimeout);
+          if (!streamStarted) {
+            _errored = true;
+            reject(new Error('[ThinkDropLLMBackend] Connection closed before stream started'));
+          } else {
+            resolve();
+          }
+        });
       });
-    });
+    } finally {
+      // Release the connection back to the pool (or close if temporary/errored)
+      this._releaseWs(ws, _errored);
+    }
 
     const fallback = 'I apologize, but I was unable to generate a response.';
     if (!accumulated) {
