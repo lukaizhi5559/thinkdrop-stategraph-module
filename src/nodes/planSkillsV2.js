@@ -1815,8 +1815,13 @@ The user's request does NOT match any installed skill.
   }
 
   // ── Inject direct deep-link URLs from preflight ───────────────────────────
-  // If preflight resolved a task-specific URL for a browser agent, pass it as
-  // the url arg so the browser starts at the right page.
+  // The preflight deep-link is resolved per agentId using the full task context.
+  // It's always more accurate than what the LLM guessed. The deepLinkMap is keyed
+  // by agentId, so:
+  //   - Different agents → different URLs (fixes cross-agent URL contamination)
+  //   - Same agent in multiple steps → same URL → browser.agent skips re-navigation
+  // Exception: template variables ({{bestUrl}}, {{PREV_OUTPUT}}) are preserved —
+  // they come from prior step output, not the LLM's guess.
   if (Array.isArray(skillPlan)) {
     const deepLinkMap = new Map();
     const pfAgents = state?.preflightResult?.agents || [];
@@ -1826,12 +1831,38 @@ The user's request does NOT match any installed skill.
       }
     }
 
+    // Track which agents have already received a URL — only inject for the FIRST
+    // same-agent step. Subsequent steps must NOT get a creation deep-link URL
+    // because it triggers urlFirstNav=true → classifyDeepLinkType=creation →
+    // disables tiers 2,3,4 (Meta+F, Shortcuts, Tab-Map) needed for content entry.
+    const _urlInjectedAgents = new Set();
     for (const step of skillPlan) {
-      if (step.skill === 'browser.agent' && step.args?.action === 'run' && step.args?.agentId && !step.args.url) {
+      if (step.skill === 'browser.agent' && step.args?.action === 'run' && step.args?.agentId) {
         const dl = deepLinkMap.get(step.args.agentId.toLowerCase());
         if (dl?.url) {
-          step.args.url = dl.url;
-          logger.info(`[Node:PlanSkillsV2] Injected deep-link URL for ${step.args.agentId}: ${dl.url} (source=${dl.source || 'unknown'})`);
+          // Don't override template variables — they come from prior step output
+          const _isTemplateVar = step.args.url && /\{\{[^}]+\}\}/.test(step.args.url);
+          if (_isTemplateVar) {
+            logger.info(`[Node:PlanSkillsV2] Preserving template URL for ${step.args.agentId}: ${step.args.url}`);
+          } else if (_urlInjectedAgents.has(step.args.agentId.toLowerCase())) {
+            // Second+ step for same agent — strip URL so urlFirstNav=false and
+            // all tiers (Tab-Map, Shortcuts) are available for content entry
+            if (step.args.url) {
+              const _oldUrl = step.args.url;
+              delete step.args.url;
+              logger.info(`[Node:PlanSkillsV2] Stripped URL from subsequent same-agent step for ${step.args.agentId} ("${_oldUrl}" → none — would disable content-entry tiers)`);
+            }
+          } else {
+            const _hadUrl = !!step.args.url;
+            const _oldUrl = step.args.url || null;
+            step.args.url = dl.url;
+            _urlInjectedAgents.add(step.args.agentId.toLowerCase());
+            if (_hadUrl && _oldUrl !== dl.url) {
+              logger.warn(`[Node:PlanSkillsV2] Overrode LLM URL for ${step.args.agentId}: "${_oldUrl}" → "${dl.url}" (source=${dl.source || 'unknown'})`);
+            } else {
+              logger.info(`[Node:PlanSkillsV2] Injected deep-link URL for ${step.args.agentId}: ${dl.url} (source=${dl.source || 'unknown'})`);
+            }
+          }
         }
       }
     }
@@ -2197,13 +2228,16 @@ The user's request does NOT match any installed skill.
 
   // ── Inject preflight deep-link URL from proceed_anyway resume ──────────────
   // When the user clicks "Proceed anyway" on a training handoff, main.js passes
-  // the preflight-resolved deep-link URL as _proceedDeepLinkUrl. Inject it into
-  // browser.agent steps so the generated plan starts at the right page instead
-  // of relying on the LLM's URL (which may be a generic landing page).
-  if (state._proceedDeepLinkUrl && Array.isArray(skillPlan)) {
+  // the preflight-resolved deep-link URL as _proceedDeepLinkUrl. The URL was
+  // resolved for a SPECIFIC agent (the one that triggered the training gate),
+  // passed as _proceedAgentId. Inject it ONLY into browser.agent steps with
+  // that agentId — otherwise multi-agent plans get contaminated (e.g. all
+  // agents navigate to the docs URL when only the docs agent hit the gate).
+  if (state._proceedDeepLinkUrl && state._proceedAgentId && Array.isArray(skillPlan)) {
     let _injected = 0;
+    const _targetId = state._proceedAgentId.toLowerCase();
     for (const step of skillPlan) {
-      if (step.skill === 'browser.agent' && step.args?.action === 'run') {
+      if (step.skill === 'browser.agent' && step.args?.action === 'run' && step.args?.agentId?.toLowerCase() === _targetId) {
         if (!step.args.url || step.args.url !== state._proceedDeepLinkUrl) {
           step.args.url = state._proceedDeepLinkUrl;
           _injected++;
@@ -2211,7 +2245,7 @@ The user's request does NOT match any installed skill.
       }
     }
     if (_injected > 0) {
-      logger.info(`[Node:PlanSkillsV2] Injected preflight deep-link URL ${state._proceedDeepLinkUrl} into ${_injected} browser.agent step(s)`);
+      logger.info(`[Node:PlanSkillsV2] Injected proceed resume deep-link URL ${state._proceedDeepLinkUrl} into ${_injected} step(s) for ${_targetId}`);
     }
   }
 

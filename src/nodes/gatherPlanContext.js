@@ -637,9 +637,30 @@ async function _runGrillLoop(state, logger) {
   // the fragile matching failed to mark it confirmed, causing an infinite loop.
   const _mandate = state.preflightResult?.singleRouteMandate || {};
   for (const [svc, m] of Object.entries(_mandate)) {
+    // Try exact match first
     if (routeDecision[svc] && !routeDecision[svc].confirmed) {
       routeDecision[svc] = { ...routeDecision[svc], confirmed: true };
       logger.info(`[Node:GatherPlanContext:Grill] Auto-confirmed single-route mandate for ${svc}: ${m.route}`);
+      continue;
+    }
+    // Fallback: match by prefix. singleRouteMandate keys are often more specific
+    // (e.g. "google_calendar") than routeDecision keys (e.g. "google" from
+    // taskClassification.targetService). Match when the mandate key starts with
+    // the routeDecision key + "_" so "google_calendar" matches "google".
+    const _svcNorm = svc.toLowerCase().replace(/\.agent$/, '');
+    let _matched = false;
+    for (const [rdKey, rd] of Object.entries(routeDecision)) {
+      if (rd.confirmed) continue;
+      const _rdNorm = rdKey.toLowerCase().replace(/\.agent$/, '');
+      if (_svcNorm === _rdNorm || _svcNorm.startsWith(_rdNorm + '_')) {
+        routeDecision[rdKey] = { ...rd, confirmed: true };
+        logger.info(`[Node:GatherPlanContext:Grill] Auto-confirmed single-route mandate for ${svc} → matched routeDecision key "${rdKey}": ${m.route}`);
+        _matched = true;
+        break;
+      }
+    }
+    if (!_matched) {
+      logger.warn(`[Node:GatherPlanContext:Grill] Could not auto-confirm single-route mandate for ${svc} — no matching routeDecision key (keys: ${Object.keys(routeDecision).join(',')})`);
     }
   }
 

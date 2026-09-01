@@ -134,6 +134,53 @@ Consecutive same-agent steps reuse the same session/state automatically. No synt
 ]
 ```
 
+#### Case 1b: Create container + fill content (same agent, state carries over)
+
+**When to use:** A task involves creating a container (spreadsheet, document, database, list, board) AND filling it with content (cells, rows, fields, items). These are different page states — creation happens in a form dialog, content entry happens in the editor/grid. Decompose into separate steps.
+
+**Trigger phrasings** — decompose when "create <container>" is connected to content by any of these:
+- Prepositions: "with", "including", "containing", "having", "that has", "that includes", "that contains"
+- Conjunctions: "and add", "and fill", "and populate", "and insert", "and enter", "and set up", "and configure", "and put", "and place", "and write", "and list", "and include"
+
+**Content nouns (DECOMPOSE — entered into the container AFTER creation):**
+columns, rows, cells, headers, labels, items, entries, records, fields, values, data, sections, paragraphs, text, content, bullets, tasks, notes
+
+**Property nouns (DON'T decompose — filled in the creation form DURING creation):**
+title, name, date, time, description, subject, color, size, type, category, tag, to, cc, bcc, phone, email, address
+
+**Core rule:** If the "with/and" clause describes CONTENT (columns, rows, items, sections) entered into the container AFTER creation → DECOMPOSE into two steps. If it describes PROPERTIES (title, name, date) filled in the creation form DURING creation → keep as ONE step.
+
+**BAD (one monolithic step — agent confuses creation form with content grid):**
+```json
+[{"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <container> named <name> with <content-nouns> for <values>"}}]
+```
+
+**GOOD (decomposed — creation form is separate from content entry):**
+```json
+[
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <container> named <name>"},"description":"Create <container>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"In the <container>, enter <values> in <content-nouns>"},"description":"Fill <content-nouns>"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the <container> '<name>' was created with <content-nouns>: <values>."},"description":"Confirm"}
+]
+```
+
+**Concrete examples — DECOMPOSE (content entered after creation):**
+- `"create a spreadsheet named 'Trip Budget' with columns for Date, Category, Description, and Amount"` → Step 1: create spreadsheet. Step 2: enter column headers 'Date', 'Category', 'Description', 'Amount' in row 1.
+- `"create a document titled 'Report' including sections for Introduction, Methods, and Conclusion"` → Step 1: create document. Step 2: add section headings.
+- `"create a board named 'Sprint' and add columns for To Do, In Progress, and Done"` → Step 1: create board. Step 2: add columns.
+
+**CRITICAL — Preserve exact user-specified names (schema preservation):**
+If the user lists or quotes field names, column headers, categories, item names, or any ordered data schema, you MUST use the EXACT strings provided. Do NOT substitute synonyms, paraphrase, or rewrite them. The exact order and wording from the user must be preserved in the generated plan.
+- BAD: user says "columns for Date, Category, Description, and Amount" → plan says "columns for item, estimated cost, actual cost"
+- GOOD: user says "columns for Date, Category, Description, and Amount" → plan says "enter column headers 'Date', 'Category', 'Description', 'Amount' in row 1"
+This applies to ALL quoted/listed names: column headers, field names, section titles, item names, labels, tags, categories, etc.
+
+**DO NOT decompose (properties filled during creation):**
+- `"create an event with title 'Flight' and date 'July 15'"` — title and date are form fields → ONE step
+- `"create a contact with name 'John' and phone '555-1234'"` — name and phone are form fields → ONE step
+- `"create a folder named 'Projects with Files'"` — "with" is part of the name → ONE step
+- `"create a spreadsheet with 3 tabs"` — count, not content → ONE step
+
 ### Case 2: Same-agent, data passing needed (synthesize between steps)
 
 When step 2 needs the TEXT OUTPUT of step 1, insert a `synthesize` step and use `{{synthesisAnswer}}` in the next task.

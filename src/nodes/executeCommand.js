@@ -34,6 +34,27 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 
+// Resolve classifyDeepLinkType from command-service (walk up to find mcp-services)
+let _classifyDeepLinkType = null;
+try {
+  let _dir = __dirname;
+  for (let i = 0; i < 8; i++) {
+    const _candidate = path.join(_dir, 'mcp-services', 'command-service', 'src', 'skill-helpers', 'deep-link-types.cjs');
+    if (fs.existsSync(_candidate)) {
+      _classifyDeepLinkType = require(_candidate).classifyDeepLinkType;
+      break;
+    }
+    _dir = path.dirname(_dir);
+  }
+} catch (_) {}
+if (!_classifyDeepLinkType) {
+  // Fallback: simple regex-based classifier (less accurate but prevents crashes)
+  _classifyDeepLinkType = (url) => {
+    if (!url) return 'none';
+    return /\/(new|create)(\/|$|\?|#)/i.test(url) ? 'creation' : 'none';
+  };
+}
+
 // Skill thinking helper for generating human-readable thinking messages
 const { generateSkillThinking } = require('../utils/skillThinking');
 const { parseLlmJson } = require('../utils/parseLlmJson');
@@ -651,10 +672,11 @@ function autoInjectFromContracts(args, skill, stepContracts = [], logger) {
 
   // Auto-inject URL from prior browser.agent step (domain continuity)
   // If a prior browser.agent captured a finalUrl, and the current step's url
-  // is a "creation" URL (e.g. notion.new/), use the prior finalUrl instead —
-  // the page was already created, don't create a duplicate.
+  // is a "creation" URL (e.g. notion.new/, docs.google.com/spreadsheets/create),
+  // use the prior finalUrl instead — the page was already created, don't create a duplicate.
+  // Uses classifyDeepLinkType as the single source of truth for URL classification.
   if (skill === 'browser.agent' && newArgs.url) {
-    const _isCreationUrl = /\/new\/?$|\.new\/?$/i.test(newArgs.url);
+    const _isCreationUrl = _classifyDeepLinkType(newArgs.url) === 'creation';
     if (_isCreationUrl) {
       for (let i = stepContracts.length - 1; i >= 0; i--) {
         const contract = stepContracts[i];
