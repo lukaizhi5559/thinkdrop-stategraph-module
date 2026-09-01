@@ -463,7 +463,10 @@ Rules:
 - If ALL required inputs have been answered in PRIOR CLARIFICATIONS and all routes are confirmed, return {"complete": true}.
 - Questions should be concise (15 words max). Options should be short labels.
 - memoryText/memoryTextTemplate: a clean factual statement for future memory storage. Example: "User's preferred <app-name> playlist name is '{answer}'". This will be stored as type 'gather_clarification' so future tasks can find it.
-- Max 5 questions per batch.`;
+- Max 5 questions per batch.
+- CRITICAL: If type is "confirm" or "choice" and you provide NO options, you MUST set "freeText": true. A question with no options and freeText:false is unanswerable.
+- A confirm question like "Use X?" should look like: "options": [{ "label": "Yes", "value": "<use this>", "primary": true }, { "label": "No", "value": "no" }] and "freeText": false.
+- NEVER emit a question with type "confirm" and an empty options array unless freeText is true.`;
 
 /**
  * Phase B1: Search user-memory for each required input slot.
@@ -566,6 +569,46 @@ Generate the frontier of questions for this task.`;
       return { complete: true };
     }
     if (typeof parsed.complete !== 'boolean' && !parsed.questions) throw new Error('invalid response shape');
+
+    // Post-process: ensure every question has at least one answerable control.
+    // The LLM sometimes emits confirmation questions with no options and freeText:false,
+    // which leaves the UI with no input field — only Cancel/Next buttons.
+    if (Array.isArray(parsed.questions)) {
+      for (const q of parsed.questions) {
+        const _hasOptions = Array.isArray(q.options) && q.options.length > 0;
+        const _hasFreeText = q.freeText === true;
+        const _isText = q.type === 'text';
+
+        if (_isText) {
+          // Text questions must have freeText true
+          q.freeText = true;
+        } else if ((q.type === 'confirm' || q.type === 'choice') && !_hasOptions && !_hasFreeText) {
+          // Confirmation/choice with no options and no free text — coerce to text
+          q.type = 'text';
+          q.freeText = true;
+          q.options = undefined;
+          logger.warn(`[Node:GatherPlanContext:Grill] question ${q.id} had no options/freeText — coerced to text`);
+        } else if (q.type === 'confirm' && _hasOptions && q.options.length === 1) {
+          // A single-option confirm is unanswerable — add a "No" option
+          q.options.push({ label: 'No / different', value: 'no', primary: false });
+          logger.warn(`[Node:GatherPlanContext:Grill] question ${q.id} had only 1 option — added "No / different"`);
+        }
+
+        // Ensure every option has a non-empty value/label
+        if (Array.isArray(q.options)) {
+          for (let i = 0; i < q.options.length; i++) {
+            const opt = q.options[i];
+            if (opt.value == null || String(opt.value).trim() === '') {
+              opt.value = String(opt.label || `opt-${i}`);
+            }
+            if (opt.label == null || String(opt.label).trim() === '') {
+              opt.label = String(opt.value || `Option ${i + 1}`);
+            }
+          }
+        }
+      }
+    }
+
     return parsed;
   } catch (err) {
     logger.warn(`[Node:GatherPlanContext:Grill] LLM call failed (${err.message}) — passing through`);
