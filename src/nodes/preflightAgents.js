@@ -49,6 +49,7 @@ const { resolveRoute } = require('../utils/resolveRoute');
 
 // ── Preflight state file (monthly validation persistence) ────────────────────
 const PREFLIGHT_STATE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-state.json');
+const PREFLIGHT_AUTH_CACHE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-auth-cache.json');
 const VALIDATION_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const BROWSER_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days for cookie staleness
 
@@ -58,9 +59,48 @@ const BROWSER_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days for cookie
 const PREFLIGHT_AUTH_CACHE_TTL_MS = 30 * 60 * 1000;
 const _authCache = new Map();
 
+// ── Persistent auth cache (survives app restart) ─────────────────────────────
+// Key: agentId (lowercase)  Value: { ts, authed }
+// TTL: 24 hours — skip the CDP cookie-sniff probe for agents authenticated
+// within this window. The 7-day sessionStale cookie-age check still overrides
+// this (stale cookies force a probe even within 24h).
+const PREFLIGHT_AUTH_CACHE_PERSISTENT_TTL_MS = 24 * 60 * 60 * 1000;
+let _persistentAuthCache = null; // lazy-loaded
+
+function _loadPersistentAuthCache() {
+  if (_persistentAuthCache !== null) return _persistentAuthCache;
+  try {
+    if (fs.existsSync(PREFLIGHT_AUTH_CACHE_FILE)) {
+      _persistentAuthCache = JSON.parse(fs.readFileSync(PREFLIGHT_AUTH_CACHE_FILE, 'utf8'));
+    } else {
+      _persistentAuthCache = {};
+    }
+  } catch (_) {
+    _persistentAuthCache = {};
+  }
+  return _persistentAuthCache;
+}
+
+function _savePersistentAuthCache(data) {
+  try {
+    const dir = path.dirname(PREFLIGHT_AUTH_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    // Atomic write: temp file + rename to avoid corruption on crash
+    const tmpFile = `${PREFLIGHT_AUTH_CACHE_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf8');
+    fs.renameSync(tmpFile, PREFLIGHT_AUTH_CACHE_FILE);
+  } catch (_) {}
+}
+
 function markAgentAuthed(agentId) {
   if (!agentId) return;
-  _authCache.set(agentId.toLowerCase(), { ts: Date.now(), authed: true });
+  const key = agentId.toLowerCase();
+  const entry = { ts: Date.now(), authed: true };
+  _authCache.set(key, entry);
+  // Persist to disk (24h TTL)
+  const cache = _loadPersistentAuthCache();
+  cache[key] = entry;
+  _savePersistentAuthCache(cache);
 }
 
 function _getCachedAuth(agentId) {
@@ -69,6 +109,18 @@ function _getCachedAuth(agentId) {
   if (Date.now() - entry.ts > PREFLIGHT_AUTH_CACHE_TTL_MS) {
     _authCache.delete(agentId.toLowerCase());
     return null;
+  }
+  return entry;
+}
+
+// Persistent cache check — survives app restart. Returns the cache entry if
+// valid (within 24h), or null. Does NOT check the in-memory cache.
+function _getCachedAuthPersistent(agentId) {
+  const cache = _loadPersistentAuthCache();
+  const entry = cache[agentId.toLowerCase()];
+  if (!entry) return null;
+  if (Date.now() - entry.ts > PREFLIGHT_AUTH_CACHE_PERSISTENT_TTL_MS) {
+    return null; // expired
   }
   return entry;
 }
@@ -311,6 +363,43 @@ module.exports = async function preflightAgents(state) {
         createAgentSpecs.push(a);
       }
     }
+  }
+
+  // ── Fast path: no agents selected + local task → skip heavy preflight ──────
+  // When resolveAgent selected 0 agents, no agents need creating, and the task
+  // is local_file or local_system, the task runs via generic shell.run/app.agent
+  // skills — no service agents, no CLI preflight, no tool discovery, no MCP pings
+  // needed. Build a minimal empty preflight result and return early. This removes
+  // ~5s of MCP calls for local shell/file tasks.
+  if (selectedAgentIds.size === 0 && createAgentSpecs.length === 0 && !recoveryContext &&
+      (_tc.taskType === 'local_file' || _tc.taskType === 'local_system')) {
+    logger.info(`[Node:PreflightAgents] Fast path — no agents selected, taskType=${_tc.taskType} → skipping heavy preflight`);
+    // Single cheap call: installed skills list (planSkillsV2 reads this)
+    let _installedSkillsList = [];
+    try {
+      const skRes = await mcpAdapter.callService('user-memory', 'skill.listNames', {}, { timeoutMs: 3000 }).catch(() => null);
+      _installedSkillsList = Array.isArray(skRes?.data) ? skRes.data : (Array.isArray(skRes) ? skRes : []);
+    } catch (_) {}
+    const _vetPath = _whichSync('vet');
+    _emitProgress({ type: 'preflight:complete', agents: [], warnings: [] });
+    return {
+      ...state,
+      preflightDone: true,
+      preflightResult: {
+        skillContractNote: '',
+        shellContractMd: null,
+        shellSkillNames: new Set(),
+        cliPreflightNote: '',
+        agentContextNote: '',
+        preflightCliMap: {},
+        registeredAgentServiceMap: {},
+        trainedRecipeMap: {},
+        installedSkillsList: _installedSkillsList,
+        agents: [],
+        vetAvailable: !!_vetPath,
+        warnings: [],
+      },
+    };
   }
 
   // Run CLI preflight only when CLI is actually selected (or when no explicit
@@ -1673,6 +1762,29 @@ module.exports = async function preflightAgents(state) {
       a.reason = `${_reason} — authentication required`;
       authFailures.push({ agentId: a.agentId, reason: 'auth required' });
       continue;
+    }
+
+    // ── 24h persistent auth cache: skip CDP probe for recently-authed agents ──
+    // If the agent was authenticated within the last 24h (persisted to disk so
+    // it survives app restart) AND the browser session cookies are not stale
+    // (within the 7-day BROWSER_SESSION_MAX_AGE_MS window), skip the multi-second
+    // CDP cookie-sniff probe entirely. The 7-day stale check is the safety net:
+    // if cookies are old enough to be questionable, ignore the cache and probe.
+    if (!a.sessionStale) {
+      const _persistentAuth = _getCachedAuthPersistent(a.agentId);
+      if (_persistentAuth && _persistentAuth.authed) {
+        logger.info(`[Node:PreflightAgents] ${a.agentId} authed within 24h (persistent cache) — skipping CDP probe`);
+        markAgentAuthed(a.agentId); // refresh both in-memory and persistent cache
+        a.authed = true;
+        a.ready = true;
+        _emitProgress({
+          type: 'preflight:agent_ready',
+          agentId: a.agentId,
+          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
+          message: `${a.agentId} authenticated (cached)`,
+        });
+        continue;
+      }
     }
 
     // Emit actual agentId so main.js cancel handler can derive the correct session

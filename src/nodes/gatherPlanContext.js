@@ -37,6 +37,34 @@ const MAX_AUTH_ROUNDS = 10; // auth sign-ins don't count against Q&A budget
 const GRILL_MAX_ROUNDS = 5;
 const GRILL_MODE = process.env.THINKDROP_GRILL_MODE === '1';
 
+// ── Deterministic bypass gate ────────────────────────────────────────────────
+// Returns true when the task is fully specified and clarification cannot add
+// value. Used to skip both the legacy loop and the Grill loop without spending
+// an LLM call. Relies entirely on LLM-based signals from upstream nodes — no
+// regex NLU. Only bypasses when ALL of these hold:
+//   - classifyTask (LLM in resolveReferences) said needsClarification=false
+//   - resolveAgent (LLM) had no question to ask
+//   - no unauthenticated browser/cli agents are blocking (from preflight)
+//
+// If any signal is uncertain, the node falls through to the existing
+// _askLLMDecision fast call (5-token LLM: 0=COMPLETE, 1=NEED_QUESTION,
+// 2=NEED_AUTH) which is far more accurate than regex slot detection.
+function _shouldBypassGather(state) {
+  const tc = state._taskClassification || {};
+  if (tc.needsClarification === true) return false;
+
+  // resolveAgent had a question → don't bypass
+  if (state.resolveAgentResult?.question) return false;
+
+  // Unauthenticated browser/cli agents block execution → don't bypass
+  const unauthed = (state.preflightResult?.agents || []).some(
+    a => a.authed === false && (a.type === 'browser' || a.type === 'cli')
+  );
+  if (unauthed) return false;
+
+  return true;
+}
+
 const SYSTEM_PROMPT = `You are a task readiness checker for a desktop automation system.
 
 Given a user's request and what is already known, decide if the task is ready to execute — or if one critical piece of information is missing.
@@ -231,6 +259,16 @@ module.exports = async function gatherPlanContext(state) {
   // ── Skip: no LLM backend ─────────────────────────────────────────────────────
   if (!llmBackend) {
     logger.warn('[Node:GatherPlanContext] No llmBackend — skipping');
+    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  }
+
+  // ── Deterministic bypass gate ───────────────────────────────────────────────
+  // Skip clarification entirely when the task is fully specified. This avoids
+  // the LLM readiness call (and the Grill loop's forced round-1 question) for
+  // the common case where classifyTask + resolveAgent + preflight already
+  // determined nothing is missing.
+  if (_shouldBypassGather(state)) {
+    logger.info('[Node:GatherPlanContext] Bypass — task fully specified (needsClarification=false, no agent question, no unauthed agents)');
     return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
   }
 
@@ -450,7 +488,7 @@ OR: {"complete": true} when everything is resolved.
 
 Rules:
 - ALWAYS include routeConfirmation if a ROUTE DECISION is provided and hasn't been confirmed yet.
-- ALWAYS include at least one question on round 1 — never return complete:true on the first round.
+- On round 1, return {"complete": true} immediately if no critical input is missing. Only emit questions when a required slot is genuinely unanswered. Do NOT invent questions for fully-specified tasks.
 - For each requiredInput, the system has already run memoryQuery and attached results in MEMORY RESULTS. If memory found enough data, set memoryResolved:true and ask a CONFIRMATION question (e.g. "I found N songs in your memory. Use these?"). If memory found nothing or too little, ask a from-scratch question.
 - CONFIRMATION questions (memoryResolved:true OR type "confirm") MUST have at least 2 options OR set freeText:true. Always give the user a way to accept the suggested value AND a way to reject or type a different value. For example: [{ "label": "Yes", "value": "<suggested value>", "primary": true }, { "label": "No, use different", "value": "use_different" }] with "freeText": true.
 - BATCH AGGRESSIVELY: Ask ALL questions you need answered in ONE batch — even if some answers might influence other questions' context. The user can answer them all at once. Do NOT split related questions across multiple rounds.
@@ -715,6 +753,21 @@ async function _runGrillLoop(state, logger) {
   while (round < GRILL_MAX_ROUNDS) {
     if (progressCallback) progressCallback({ type: 'gathering', message: 'Checking task details…' });
     logger.info(`[Node:GatherPlanContext:Grill] Round ${round + 1}/${GRILL_MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
+
+    // ── Fast number-based decision before the expensive batch prompt ────────
+    // Ask the light model "return ONLY a single number" (0=COMPLETE, 1=NEED_QUESTION,
+    // 2=NEED_AUTH). If COMPLETE, skip the batch prompt entirely — no questions to ask.
+    // This prevents the Grill loop from inventing questions for fully-specified tasks.
+    const _fastDecision = await _askLLMDecision(
+      llmBackend, baseMsg, originalMsg, answers,
+      state.conversationHistory || [], state.resolvedSelfContext || null,
+      state.preflightResult || null, logger, tc
+    );
+    if (_fastDecision === 0) {
+      logger.info('[Node:GatherPlanContext:Grill] Fast decision: COMPLETE — skipping batch prompt');
+      break;
+    }
+    logger.info(`[Node:GatherPlanContext:Grill] Fast decision: ${_fastDecision === 1 ? 'NEED_QUESTION' : 'NEED_AUTH'} — running batch prompt`);
 
     // B2: Ask LLM for the frontier of questions
     const result = await _askLLMBatch(

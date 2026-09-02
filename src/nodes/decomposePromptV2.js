@@ -329,6 +329,69 @@ module.exports = async function decomposePromptV2(state) {
   const t0 = Date.now();
   let parsedJson = null; // Store parsed JSON for intent preservation
 
+  // ── Local single-step short-circuit (no LLM call) ──────────────────────────
+  // Use _taskClassification from resolveReferences to skip the LLM number call
+  // for obvious single-step tasks. Falls through to the LLM fast decision when
+  // the task type is ambiguous or the message shows multi-goal conjunctions.
+  const _tc = state._taskClassification || {};
+  const _msgLower = String(message || '').toLowerCase();
+  const _MULTI_GOAL_CONJUNCTIONS = /\b(and\s+then|also|after\s+that|additionally|plus|furthermore|then\s+also)\b|;\s*[a-z]/i;
+  const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower);
+  const _SINGLE_STEP_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser']);
+  if (_SINGLE_STEP_TASK_TYPES.has(_tc.taskType) && !_hasMultiGoalConjunction) {
+    logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step command_automate (taskType=${_tc.taskType}, no multi-goal conjunction) — skipping LLM decision`);
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'command_automate',
+      confidence: 0.85,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'local-short-circuit', intent: 'command_automate',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    return {
+      ...state,
+      _decomposedIntent: 'command_automate',
+      _decomposedBy: 'local-short-circuit',
+      intentPlan: subPrompts,
+    };
+  }
+  // Simple knowledge query: no action verbs, no conjunctions, no tool interaction
+  if ((_tc.taskType === 'query' || _tc.taskType === 'general_knowledge' || _tc.taskType === 'ambiguous')
+      && !_hasMultiGoalConjunction
+      && !/\b(send|email|post|share|navigate|open|create|delete|rename|move|copy|install|run|execute|schedule|remind|fill|submit|click|type|download|upload|extract|scrape)\b/.test(_msgLower)) {
+    logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step general_knowledge (taskType=${_tc.taskType}, no action verbs) — skipping LLM decision`);
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'general_knowledge',
+      confidence: 0.85,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'local-short-circuit', intent: 'general_knowledge',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'general_knowledge', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    return {
+      ...state,
+      _decomposedIntent: 'general_knowledge',
+      _decomposedBy: 'local-short-circuit',
+      intentPlan: subPrompts,
+    };
+  }
+
   // ── Fast number-based decision (single-step intent / multi-step) ──────────
   // Call the light model with "return ONLY a single number" to get a fast verdict.
   // If 0–6 (single-step), return a single sub-prompt with that intent — skip the

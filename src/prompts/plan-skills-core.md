@@ -94,7 +94,7 @@ When the user's request expects a specific answer type, include `outputSchema` i
 - **Reading/writing files** → `shell.run` with `args.goal`. NEVER emit both `goal` AND `cmd`/`argv` in the same step.
 - **Bare folder name** → `shell.run` goal: `"Find the folder named <name> (check ~/Desktop, ~/Documents, ~/Downloads, then ~/) and <task>"`.
 - **`synthesize` with `saveToFile`** → ONLY when user explicitly asks to save a file.
-- **`image.analyze`** → local image files only. **`screen.capture`** → live screenshot + OCR.
+- **`image.analyze`** → local image files only — use for "scan/analyze/describe/what's in these images". **`screen.capture`** → live screenshot + OCR. **NEVER use `shell.run` to analyze image content** — shell can only read metadata (dimensions, format, EXIF), not see what the image shows. Only `image.analyze` sends the image to a vision LLM.
 - **Sub-agents** (browser.agent, cli.agent, app.agent) run their own internal loop. For SIMPLE tasks (one action), emit ONE step. For COMPLEX multi-action tasks (create X, then add Y, then add Z), break into MULTIPLE steps — each with a single, clear action. This ensures each step is independently verifiable and recoverable. `playwright.agent` and `browser.act` are internal primitives — NEVER emit them directly.
 
 ## Multi-Step Task Decomposition

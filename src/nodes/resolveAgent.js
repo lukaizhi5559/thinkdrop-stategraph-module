@@ -234,6 +234,7 @@ Rules:
 - The question must be 15 words or fewer.
 - Do not include agents that are not needed for the task.
 - LOCAL MACHINE QUERIES: NEVER create or select an agent for local OS / shell queries — current time or date, system uptime, disk space, memory/CPU/battery usage, hardware info, running processes, hostname, OS version, environment variables, screen capture, or any task that runs against the local machine itself. These need NO service agent — return an empty "agents" array and "question": null. They are handled by generic shell/system skills, not by service agents.
+- LOCAL IMAGE ANALYSIS: NEVER create or select an agent for tasks involving local image files (png, jpg, screenshots, photos). These are handled by the generic image.analyze skill, not by a browser or REST agent. Return an empty "agents" array and "question": null.
 - FOLLOW-UP CONTEXT: When a FOLLOW-UP CONTEXT block is provided, the user is revising or continuing a prior task. Reuse the same service/agent from the prior turn — do NOT ask for clarification on already-established context (e.g., do not ask "Which platform?" if the prior turn already established the platform).
 - CONVERSATION HISTORY: When a RECENT CONVERSATION block is provided, use it to resolve ambiguous references in the current message (e.g., "the message" → the content from the prior turn).`
 
@@ -539,6 +540,25 @@ module.exports = async function resolveAgent(state) {
       resolveAgentResult: {
         agents: [],
         reasoning: 'Local system task — no service agent needed',
+        question: null,
+        _message: userMessage,
+      },
+      resolveAgentAnswers: Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [],
+    };
+  }
+
+  // ── Skip: local image analysis tasks need no service agent ─────────────────
+  // Image files on disk are analyzed by the generic `image.analyze` skill,
+  // not a registered browser/REST agent. Creating a fake "openai_vision.agent"
+  // (or similar) would trigger a browser OAuth auth wall that has no meaning
+  // for local files. Let planSkills handle it with the image.analyze skill.
+  if (state._taskClassification?.isImageAnalysis === true) {
+    logger.info(`[Node:ResolveAgent] Image analysis task — skipping agent selection (use image.analyze skill): "${userMessage.slice(0, 80)}"`);
+    return {
+      ...state,
+      resolveAgentResult: {
+        agents: [],
+        reasoning: 'Image analysis task — no service agent needed, use image.analyze skill',
         question: null,
         _message: userMessage,
       },

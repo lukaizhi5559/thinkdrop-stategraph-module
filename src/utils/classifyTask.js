@@ -20,6 +20,7 @@
  *   isRecurring: boolean,          // recurring/scheduled task signal
  *   isBrowseOnly: boolean,         // pure navigation — no messaging/send intent
  *   requiresDOM: boolean,           // browser task needing DOM access (form fill, login, scrape)
+ *   isImageAnalysis: boolean,       // task asks to analyze/describe/scan visual content of local image files
  * }
  *
  * Fails open: any error returns a safe default that never blocks execution.
@@ -42,7 +43,8 @@ Output ONLY valid JSON with exactly these fields:
   "isScreenFollowUp": true | false,
   "needsFreshScreen": true | false,
   "isAppUiInspection": true | false,
-  "isSpatialAnalysis": true | false
+  "isSpatialAnalysis": true | false,
+  "isImageAnalysis": true | false
 }
 
 Field rules:
@@ -83,6 +85,8 @@ Field rules:
 - isAppUiInspection: true when taskType is "query" AND the task is specifically asking to locate, find, show, or identify a UI element WITHIN a named desktop app (e.g. "show me where the message input area is in Slack", "where is the toolbar in Figma", "find the send button in Discord", "locate the settings panel in Notion", "point me to the search bar in Slack"). These require app.agent to capture and analyze that specific app's screen. false for all other cases, including passive screen observations ("what's on my screen") and general knowledge questions.
 
 - isSpatialAnalysis: true when the task is asking to identify, analyze, map, or describe the SPATIAL LAYOUT, REGIONS, or SECTIONS of the screen — such as headers, sidebars, footers, content areas, grid layout, bounding boxes, or UI zones. These require app.agent analyze_spatial_grid to return structured coordinate data, NOT plain OCR. Examples: "what regions are on my screen" → true | "what sections can you see" → true | "describe the screen layout" → true | "what areas are visible" → true | "show me the screen grid" → true | "what UI zones are present" → true. DISTINCTION: "what is ON my screen" (passive read of content) → false. "what REGIONS/SECTIONS/LAYOUT structure does my screen have" (spatial tool call) → true. false for all passive screen observation queries ("what app am I in", "what's on my screen", "read what's visible").
+
+- isImageAnalysis: true when the task asks to analyze, describe, scan, examine, or understand the VISUAL CONTENT of local image files (png, jpg, jpeg, webp, gif, bmp, tiff, heic, screenshots, photos, pictures). This includes phrases like "what's in these images", "scan the screenshots", "describe the photos", "analyze the images in this folder", "tell me what these files are about" (when the folder contains images). ALSO true when the user references a folder whose name clearly indicates images (e.g. "screenshots", "photos", "images") AND asks to analyze/describe/scan/examine its contents — even if they say "files" instead of "images". false for: listing files, copying/moving/deleting images, converting image formats, resizing/cropping, or any task that doesn't require understanding what the images SHOW. false for live screen capture ("what's on my screen") — that's screen.capture, not image.analyze.
 
 - requiresDOM: true when taskType is "browser" AND the task requires precise DOM-level interaction that keyboard shortcuts cannot do reliably. The following categories ALWAYS require DOM:
   1. Content creation and editing: make/create/build/edit/update/modify a playlist, document, board, post, event, collection, album, note, page, wiki article — clicking create/edit buttons, typing names, modifying content, adding items.
@@ -129,6 +133,21 @@ EXAMPLES (genuine follow-ups — isFollowUp true, followUpTarget resolved):
   User: "now email that to me" (after retrieving info) → {"taskType":"messaging","isFollowUp":true,"followUpTarget":"retrieved info"}
   User: "I need the links for these as well" (after listing videos) → {"taskType":"query","isFollowUp":true,"followUpTarget":"video links"}
 
+EXAMPLES (image analysis — isImageAnalysis MUST be true):
+  User: "scan the images and tell me what they are" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":true}
+  User: "what's in these screenshots" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":true}
+  User: "describe the photos in this folder" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":true}
+  User: "analyze the images in [Folder: ~/Desktop/screenshots]" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":true}
+  User: "I need you to analysis this files in this folder and tell me what they're about" (folder: screenshots-for-trigger-concept-dicussion) → {"taskType":"local_file","isFollowUp":true,"followUpTarget":"/Users/lukaizhi/Desktop/screenshots-for-trigger-concept-dicussion","isImageAnalysis":true}
+  User: "what do these pictures show" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":true}
+
+EXAMPLES (NOT image analysis — isImageAnalysis MUST be false):
+  User: "list the files in this folder" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":false}
+  User: "copy the images to a new folder" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":false}
+  User: "convert the png to jpg" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":false}
+  User: "what's on my screen" → {"taskType":"local_system","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":false}
+  User: "resize the screenshot to 800px" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":false}
+
 No explanation. No markdown. Only the JSON object.`;
 
 // Extract and parse JSON from LLM output using the shared parseLlmJson utility.
@@ -157,6 +176,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     needsFreshScreen: false,
     isAppUiInspection: false,
     isSpatialAnalysis: false,
+    isImageAnalysis: false,
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -197,6 +217,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       needsFreshScreen:    !!parsed.needsFreshScreen,
       isAppUiInspection:   !!parsed.isAppUiInspection,
       isSpatialAnalysis:   !!parsed.isSpatialAnalysis,
+      isImageAnalysis:     !!parsed.isImageAnalysis,
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

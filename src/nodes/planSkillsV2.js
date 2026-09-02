@@ -353,6 +353,15 @@ function _buildSystemPrompt(userMessage, state) {
     || _registryKeywordMatch(userMessage)
     || _preflightImpliesCli(state);
 
+  // ── Image-analysis detection ────────────────────────────────────────────
+  // Triggers when the LLM classifier detects an image-analysis task. Loads
+  // plan-skills-image.md so the planner knows to emit image.analyze steps
+  // instead of falling back to shell.run (which can only read metadata, not
+  // see image content). The classifier is the single source of truth — it
+  // understands context like folder names ("screenshots-for-...") and phrasing
+  // variants ("analysis this files") that regex cannot reliably match.
+  const _needsImage = _tc?.isImageAnalysis === true;
+
   const _isMacOS = process.platform === 'darwin';
 
   // ── Prompt tier selection ────────────────────────────────────────────────
@@ -409,12 +418,13 @@ function _buildSystemPrompt(userMessage, state) {
   let result = `## PRIMACY RULE\nThe CURRENT USER REQUEST below is the source of truth. Prior conversation and screen context are provided ONLY for pronoun resolution ("it", "that", "this"). If the current request names a specific task, service, or topic, plan for THAT task — do not continue prior tasks.\n\n` + base;
   const appendices = [];
 
-  // Domain appendices are appended in skill-preference order: shell/CLI → app → browser.
+  // Domain appendices are appended in skill-preference order: shell/CLI → image → app → browser.
   // Skip them when local signals or recovery context are present to avoid confusing the
   // planner with extra context during complex flows; the base prompt still applies.
   if (!_skipAppendices && !_hasLocalSignals && !state.recoveryContext && !isWindows) {
     if (_needsShell) appendices.push('plan-skills-shell.md');
     if (_needsCli) appendices.push('plan-skills-cli-first.md');
+    if (_needsImage) appendices.push('plan-skills-image.md');
     if (_isMacOS) appendices.push('plan-skills-macos.md');
     if (_needsApp) appendices.push('plan-skills-app.md');
     if (_needsBrowser) appendices.push('plan-skills-browser.md');
