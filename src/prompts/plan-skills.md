@@ -1,4 +1,3 @@
-api_suggest|args:{app:string,reason:string,apiDocsUrl?:string,apiSetupPrompt?:string,guidePrompt?:string}|surfaces_API_offer_when_task_is_better_served_by_API
 schedule|args:{time?:string,delayMs?:number,label?:string}|waits_until_clock_time_or_delay_then_continues_plan
 list_skills|args:{}|returns_full_skill_registry_including_installed_user_skills
 fs.read|args:{action:string,path?:string,paths?:string[],maxFileSize?:number,encoding?:string}|reads_one_or_more_local_files_and_returns_their_contents_(100KB_limit).__Use_for_reading_small_text_files_(md,_txt,_json,_js,_ts,_csv,_yaml,_html),_directory_trees_(action:tree),_code_search_(action:search),_or_codebase_exploration_(action:explore).__For_large_files_(>100KB)_use_shell.run_with_explicit_cmd/argv_(head,_tail,_sed,_wc,_grep)_instead.
@@ -27,13 +26,13 @@ provider.discovery|args:{action:string,provider?:string,modelId?:string,taskType
 
 ## Single-route mandate (MANDATORY)
 
-If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `api_suggest`, `browser.act`, or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.
+If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `browser.act` or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.
 
 - Single browser agent available → `browser.agent { action: 'run', agentId: '<agentId>', task: '...' }`
 - Single CLI/API agent available → `cli.agent { action: 'run', agentId: '<agentId>', task: '...' }`
 - Single app agent available → `app.agent { action: 'run_agent', appName: '<service>', task: '...' }`
 
-Only use `api_suggest` when there is NO authenticated route for the service.
+If no authenticated route exists for a service, preflight will surface auth requirements before planning. Use `browser.agent { action: 'build_agent', service }` to create a new agent if needed.
 
 ## Template variables
 
@@ -92,7 +91,7 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 | OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) | `browser.agent { action: 'run', agentId, task }` — handles OAuth internally |
 | CLI-backed service (gh, aws, heroku) | `cli.agent { action: 'run', agentId, task }` |
 | Service in AVAILABLE AGENTS [browser] | `browser.agent { action: 'run', agentId, task }` — NEVER raw `browser.act` |
-| Service in AVAILABLE AGENTS [browser] marked `[NEEDS AUTH]` | Do NOT use directly. Use a REST API alternative (`browser.agent { action: 'build_agent', service: '<app-service>' }` or `<app-service>`, etc.) OR output `api_suggest` to let the user pick an authenticated provider. NEVER silently trigger a browser login flow. |
+| Service in AVAILABLE AGENTS [browser] marked `[NEEDS AUTH]` | Do NOT use directly. Use a REST API alternative (`browser.agent { action: 'build_agent', service: '<app-service>' }` or `<app-service>`, etc.). NEVER silently trigger a browser login flow. Preflight will surface auth requirements before planning. |
 | Service in AVAILABLE AGENTS [api_key] | `browser.agent` or `cli.agent` run — api_key agents are API-only, cannot navigate |
 | AI chatbot (`<chatbot-service>`) | `browser.agent { action: 'run', agentId, task }` — chat interface, NOT developer API |
 | Discovery on a known agent (unknown nav path) | `browser.agent { action: 'explore', agentId, goal }` |
@@ -119,7 +118,7 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 
 **AI service routing:** Chat/research → plain service name (`deepseek.agent`, `perplexity.agent`). Developer API → `*platform` variant (`deepseekplatform.agent`).
 
-**SMS routing:** When `smsGatewayTarget` is provided AND `<email-service>.agent` is NOT marked `[NEEDS AUTH]`, send via `<email-service>.agent` email (free carrier gateway). If `<email-service>.agent` is `[NEEDS AUTH]`, use `api_suggest` or `browser.agent { action: 'build_agent', service: '<email-api-service>' }` instead.
+**SMS routing:** When `smsGatewayTarget` is provided AND `<email-service>.agent` is NOT marked `[NEEDS AUTH]`, send via `<email-service>.agent` email (free carrier gateway). If `<email-service>.agent` is `[NEEDS AUTH]`, use `browser.agent { action: 'build_agent', service: '<email-api-service>' }` instead.
 
 **user.agent:** Use `resolve_form` before tasks needing personal data. Use `resolve_context` before generating personalized content. Pass `summary` into following `synthesize` step.
 
@@ -330,10 +329,6 @@ This applies to ALL quoted/listed names: column headers, field names, section ti
 **AI chatbot URLs:** Each chatbot service has its own URL — use `web.agent search_and_navigate` if the URL is unknown, or check AVAILABLE AGENTS for the registered agentId.
 
 **screen vs browser:** "what's on my screen" → `screen.capture`. "extract from web page" → `browser.agent`.
-
-## api_suggest
-
-Use as FIRST step for recurring/scheduled tasks that would be fragile via UI. Skip if DOMAIN CONTEXT is present (service already known). Do NOT use for one-off tasks.
 
 ## file.bridge
 

@@ -4669,7 +4669,14 @@ Please try again or search with different terms.`;
   // When the current step has a runGroup property, collect all consecutive steps
   // sharing the same group ID and fire them in parallel via Promise.allSettled.
   // Results are merged into skillResults and cursor advances past all group steps.
-  if (step.runGroup) {
+  //
+  // Meta-skills (api_suggest, needs_skill, ask_user, synthesize, schedule,
+  // profile.store_secret, smartFill) must NEVER enter the runGroup path — they
+  // have local handlers in executeCommand and no command-service counterpart.
+  // If a meta-skill somehow has a runGroup (e.g. old plan file), skip the
+  // runGroup block and fall through to the per-skill handlers below.
+  const _META_SKILLS = new Set(['api_suggest', 'needs_skill', 'ask_user', 'synthesize', 'schedule', 'profile.store_secret', 'smartFill']);
+  if (step.runGroup && !_META_SKILLS.has(skill)) {
     const groupId = step.runGroup;
     // Collect all consecutive steps in this group starting from skillCursor
     const groupSteps = [];

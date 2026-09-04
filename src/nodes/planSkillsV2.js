@@ -55,7 +55,7 @@ ${JSON.stringify(skillPlan, null, 2)}
 RULES:
 - Steps can run in parallel ONLY if they don't depend on each other's output
 - Independent searches, fetches, or data gathering steps are good candidates
-- synthesize, schedule, and shell.run steps should NOT be parallelized
+- synthesize, schedule, shell.run, api_suggest, needs_skill, ask_user, profile.store_secret, and smartFill steps must NEVER be parallelized — they are UI/meta skills that run sequentially through the stategraph
 - Group consecutive independent steps with the same runGroup ID (g1, g2, etc.)
 - If no steps can be parallelized, return the plan unchanged
 - CRITICAL: Preserve ALL fields exactly as they are, only ADD runGroup where appropriate
@@ -112,7 +112,11 @@ Example: [{"skill": "web.agent", "args": {"action": "...", "query": "..."}, "run
     
     // Hard guard: strip runGroup from skills that must never run in parallel,
     // regardless of what the LLM returned
-    const SEQUENTIAL_ONLY_SKILLS = new Set(['synthesize', 'schedule', 'shell.run']);
+    const SEQUENTIAL_ONLY_SKILLS = new Set([
+      'synthesize', 'schedule', 'shell.run',
+      'api_suggest', 'needs_skill', 'ask_user',
+      'profile.store_secret', 'smartFill',
+    ]);
     analyzedPlan = analyzedPlan.map(step =>
       SEQUENTIAL_ONLY_SKILLS.has(step.skill) ? { ...step, runGroup: undefined } : step
     );
@@ -1855,6 +1859,64 @@ The user's request does NOT match any installed skill.
       }
     }
     if (!Array.isArray(skillPlan)) return { ...state, planError: `Cannot parse skill plan — no step array found` };
+  }
+
+  // ── api_suggest guard (deprecated skill — route selection belongs to preflight) ──
+  // api_suggest was a route-selection pseudo-skill that overlapped with preflight's
+  // route choice gate and single-route mandate. Its user-choice options were never
+  // consumed by main.js, making it non-functional. Replace any emitted api_suggest
+  // step with the mandated agent (if a route is resolved) or a build_agent fallback.
+  if (Array.isArray(skillPlan)) {
+    const _singleRouteMandate = state?.preflightResult?.singleRouteMandate || {};
+    const _routeChoice = state?.preflightRouteChoice || state?.preflightResult?.routeChoice || {};
+    const _mandatedServices = new Set([
+      ...Object.keys(_singleRouteMandate),
+      ...Object.keys(_routeChoice),
+    ]);
+
+    let _replacedCount = 0;
+    skillPlan = skillPlan.map((step) => {
+      if (step.skill !== 'api_suggest') return step;
+      const targetService = step.args?.service || step.args?.app;
+      _replacedCount++;
+
+      // If a route is mandated for this service, use it directly
+      if (targetService && _mandatedServices.has(targetService)) {
+        const mandate = _singleRouteMandate[targetService] || _routeChoice[targetService];
+        if (mandate?.route === 'browser') {
+          return {
+            skill: 'browser.agent',
+            args: { action: 'run', agentId: mandate.agentId, task: step.description || userMessage },
+            description: step.description || `Execute via ${mandate.agentId}`,
+          };
+        }
+        if (mandate?.route === 'cli_api') {
+          return {
+            skill: 'cli.agent',
+            args: { action: 'run', agentId: mandate.agentId, task: step.description || userMessage },
+            description: step.description || `Execute via ${mandate.agentId}`,
+          };
+        }
+        if (mandate?.route === 'app') {
+          return {
+            skill: 'app.agent',
+            args: { action: 'run_agent', appName: targetService, task: step.description || userMessage },
+            description: step.description || `Execute via ${targetService}`,
+          };
+        }
+      }
+
+      // No mandate — replace with a generic browser.agent build_agent
+      return {
+        skill: 'browser.agent',
+        args: { action: 'build_agent', service: targetService || 'unknown' },
+        description: step.description || `Build agent for ${targetService || 'service'}`,
+      };
+    });
+
+    if (_replacedCount > 0) {
+      logger.warn(`[Node:PlanSkillsV2] api_suggest guard: replaced ${_replacedCount} deprecated api_suggest step(s) with mandated agent or build_agent`);
+    }
   }
 
   // ── Inject direct deep-link URLs from preflight ───────────────────────────

@@ -21,13 +21,13 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 
 ## Single-route mandate (MANDATORY)
 
-If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `api_suggest`, `browser.act`, or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.
+If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `browser.act` or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.
 
 - Single browser agent available → `browser.agent { action: 'run', agentId: '<agentId>', task: '...' }`
 - Single CLI/API agent available → `cli.agent { action: 'run', agentId: '<agentId>', task: '...' }`
 - Single app agent available → `app.agent { action: 'run_agent', appName: '<service>', task: '...' }`
 
-Only use `api_suggest` when there is NO authenticated route for the service.
+If no authenticated route exists for a service, preflight will surface auth requirements before planning. Use `browser.agent { action: 'build_agent', service }` to create a new agent if needed.
 
 ## Template variables (core tokens)
 
@@ -49,7 +49,7 @@ Only use `api_suggest` when there is NO authenticated route for the service.
 - OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) → `browser.agent { action: 'run', agentId, task }`
 - CLI-backed service → `cli.agent { action: 'run', agentId, task }`
 - Service in AVAILABLE AGENTS [browser] → `browser.agent { action: 'run', agentId, task }` (NEVER raw `browser.act`)
-- Service marked `[NEEDS AUTH]` → do NOT use directly; use a REST API alternative or `api_suggest`
+- Service marked `[NEEDS AUTH]` → do NOT use directly; preflight will surface auth requirements before planning. Use `browser.agent { action: 'build_agent', service }` to create a new agent if needed.
 - AI chatbot (`<chatbot-service>`) → `browser.agent { action: 'run', agentId, task }`
 - Bot-blocking site or uncertain URL → `web.agent search_and_navigate` → `browser.agent run with url:'{{bestUrl}}'`
 - Local file ops / scripts / git → `shell.run`
