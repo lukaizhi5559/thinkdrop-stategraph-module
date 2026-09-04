@@ -44,7 +44,8 @@ Output ONLY valid JSON with exactly these fields:
   "needsFreshScreen": true | false,
   "isAppUiInspection": true | false,
   "isSpatialAnalysis": true | false,
-  "isImageAnalysis": true | false
+  "isImageAnalysis": true | false,
+  "isConversationRecall": true | false
 }
 
 Field rules:
@@ -72,9 +73,10 @@ Field rules:
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
   - WHO to send to (messaging tasks with no recipient anywhere)
   - WHICH service (when multiple equally valid options exist and user gave no hint)
+  - For scheduling tasks (reminders, alarms, cron, recurring): set needsClarification:true when the user did NOT specify how they want to be notified/delivered. Notification methods include: macOS notification, ThinkDrop in-app alert, email, text message, write to file. If the user said "email me", "text me", "notify me", "show an alert", "send a notification", "osascript notification", etc. → needsClarification:false (method is specified). If they only said "remind me to X" or "set a reminder for X" with no delivery method → needsClarification:true.
   - NEVER ask about file format, content, or preferences — the system can infer those
-  - NEVER ask when taskType is local_file, local_system, app_automation, browser, or scheduling — these are always clear enough
-  - NEVER ask when isFollowUp is true and followUpTarget is resolved
+  - NEVER ask when taskType is local_file, local_system, app_automation, or browser — these are always clear enough
+  - NEVER ask when isFollowUp is true and followUpTarget is resolved — EXCEPT for scheduling tasks where the notification/delivery method is missing (followUpTarget is the task content, not the delivery method)
 
 - targetService: the specific external service named (e.g. "gmail", "github", "youtube"). null for local tasks.
 
@@ -87,6 +89,8 @@ Field rules:
 - isSpatialAnalysis: true when the task is asking to identify, analyze, map, or describe the SPATIAL LAYOUT, REGIONS, or SECTIONS of the screen — such as headers, sidebars, footers, content areas, grid layout, bounding boxes, or UI zones. These require app.agent analyze_spatial_grid to return structured coordinate data, NOT plain OCR. Examples: "what regions are on my screen" → true | "what sections can you see" → true | "describe the screen layout" → true | "what areas are visible" → true | "show me the screen grid" → true | "what UI zones are present" → true. DISTINCTION: "what is ON my screen" (passive read of content) → false. "what REGIONS/SECTIONS/LAYOUT structure does my screen have" (spatial tool call) → true. false for all passive screen observation queries ("what app am I in", "what's on my screen", "read what's visible").
 
 - isImageAnalysis: true when the task asks to analyze, describe, scan, examine, or understand the VISUAL CONTENT of local image files (png, jpg, jpeg, webp, gif, bmp, tiff, heic, screenshots, photos, pictures). This includes phrases like "what's in these images", "scan the screenshots", "describe the photos", "analyze the images in this folder", "tell me what these files are about" (when the folder contains images). ALSO true when the user references a folder whose name clearly indicates images (e.g. "screenshots", "photos", "images") AND asks to analyze/describe/scan/examine its contents — even if they say "files" instead of "images". false for: listing files, copying/moving/deleting images, converting image formats, resizing/cropping, or any task that doesn't require understanding what the images SHOW. false for live screen capture ("what's on my screen") — that's screen.capture, not image.analyze.
+
+- isConversationRecall: true when the user is asking ABOUT THE CONVERSATION ITSELF — i.e., meta-questions that request the assistant to inspect, recall, summarize, or repeat prior turns of the chat transcript. Signals: "what did I (just) ask", "what did I say", "what did we talk about", "what was my last question", "what did you just say", "what did I ask you (two messages ago / earlier / before / three prompts ago)", "summarize our conversation", "what have we been discussing", "repeat what I said", "remind me what we were talking about", "go back to what I said earlier". These are requests to READ the transcript, NOT topic continuations. When true, isFollowUp MUST be false and followUpTarget MUST be null. IMPORTANT: isConversationRecall is FALSE for queries about the user's PAST ACTIVITY or EPISODIC MEMORY — those are about screen captures and stored facts, NOT chat prompts. Examples where isConversationRecall is FALSE: "do you have any memories from yesterday", "what did I do yesterday", "what was I doing", "what did I watch", "what did I listen to", "what did I buy", "what did I have open", "what was on my screen", "what was I working on". These should be treated as normal memory_retrieve queries.
 
 - requiresDOM: true when taskType is "browser" AND the task requires precise DOM-level interaction that keyboard shortcuts cannot do reliably. The following categories ALWAYS require DOM:
   1. Content creation and editing: make/create/build/edit/update/modify a playlist, document, board, post, event, collection, album, note, page, wiki article — clicking create/edit buttons, typing names, modifying content, adding items.
@@ -119,11 +123,20 @@ Field rules:
   This means: the user is referring to something they see on screen, but we have no cached screen data — we need to grab it.
   Set false when isScreenFollowUp is already true (we already have context), or when followUpTarget is already resolved from conversation history, or when the message has a concrete named subject.
 
-EXAMPLES (meta-questions — isFollowUp MUST be false, followUpTarget MUST be null):
-  User: "what did I just ask you two messages ago" → {"taskType":"query","isFollowUp":false,"followUpTarget":null}
-  User: "what have we been talking about" → {"taskType":"query","isFollowUp":false,"followUpTarget":null}
-  User: "what did I say earlier" → {"taskType":"query","isFollowUp":false,"followUpTarget":null}
-  User: "summarize our conversation" → {"taskType":"query","isFollowUp":false,"followUpTarget":null}
+EXAMPLES (meta-questions — isFollowUp MUST be false, followUpTarget MUST be null, isConversationRecall MUST be true):
+  User: "what did I just ask you two messages ago" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
+  User: "what have we been talking about" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
+  User: "what did I say earlier" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
+  User: "summarize our conversation" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
+  User: "what did I just ask you three prompts ago" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
+  User: "remind me what we were just talking about" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
+
+EXAMPLES (episodic memory queries — isConversationRecall MUST be false, these are NOT about the chat transcript):
+  User: "do you have any memories from yesterday" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":false}
+  User: "what did I do yesterday" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":false}
+  User: "what about this week" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":false}
+  User: "what was I doing earlier" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":false}
+  User: "what did I watch yesterday" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":false}
 
 EXAMPLES (genuine follow-ups — isFollowUp true, followUpTarget resolved):
   User: "what about that" (after discussing Vietnam weather) → {"taskType":"query","isFollowUp":true,"followUpTarget":"Vietnam weather"}
@@ -177,9 +190,28 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     isAppUiInspection: false,
     isSpatialAnalysis: false,
     isImageAnalysis: false,
+    isConversationRecall: false,
   };
 
   if (!llmBackend || !userMessage) return _default;
+
+  // ── Deterministic conversation-recall pre-check ────────────────────────────
+  // The LLM sometimes returns isConversationRecall:false for obvious meta-questions
+  // like "what did I just ask", causing answer.js to skip injecting chat history.
+  // Force-override these patterns so the user gets a reliable recall response.
+  // Keep the pattern narrow — only meta-questions about the chat transcript itself,
+  // NOT queries about past activity/episodic memory (those are memory_retrieve).
+  const CONVERSATION_RECALL_RE = /\b(?:what did i (?:just )?ask(?:ed)?|what did i (?:just )?say|what did we talk about|what was my (?:last|previous|recent) (?:question|prompt|message)|what did you (?:just )?say|what did i ask you .* ago|summarize our conversation|what have we been (?:discussing|talking about)|repeat what i said|remind me what we were talking about|go back to what i said (?:earlier|before))\b/i;
+  if (CONVERSATION_RECALL_RE.test(userMessage)) {
+    logger.info(`[classifyTask] Deterministic conversation-recall match: "${userMessage.slice(0, 80)}"`);
+    return {
+      ..._default,
+      taskType: 'query',
+      isConversationRecall: true,
+      isFollowUp: false,
+      followUpTarget: null,
+    };
+  }
 
   try {
     const recentCtx = (conversationHistory || []).slice(-6)
@@ -218,6 +250,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isAppUiInspection:   !!parsed.isAppUiInspection,
       isSpatialAnalysis:   !!parsed.isSpatialAnalysis,
       isImageAnalysis:     !!parsed.isImageAnalysis,
+      isConversationRecall: !!parsed.isConversationRecall,
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

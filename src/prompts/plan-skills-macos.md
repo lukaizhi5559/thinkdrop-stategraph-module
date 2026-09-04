@@ -24,6 +24,29 @@ open -a "System Settings"
 
 NEVER generate `browser.act` steps with `sessionId: "macos"` or similar — there is no macOS browser session.
 
+## System Information Queries (disk, memory, CPU, battery, network, OS, processes)
+
+For system/hardware info queries, pass a simple `args.goal` to `shell.run` — do NOT
+pre-generate `diskutil`/`grep`/`system_profiler` commands with specific field names.
+Field names vary across macOS versions (e.g. "Disk Size" not "Total Size"), so
+hard-coding them causes silent failures. shell.run has a built-in registry of
+pre-validated dump commands for known system queries — it classifies the goal and
+uses the right command automatically.
+
+Example (CORRECT — let shell.run pick the command):
+  { "skill": "shell.run", "args": { "goal": "Get total disk storage on the computer" } }
+
+Example (WRONG — hallucinated field name "Total Size" that doesn't exist):
+  { "skill": "shell.run", "args": { "goal": "Get total disk storage space using diskutil info / | grep 'Total Size'" } }
+
+Supported system query categories: disk/storage, memory/RAM, CPU/processor, battery/power,
+network/IP, OS version, running processes, screen/display, USB/devices, audio/sound.
+
+**IMPORTANT: Always include a shell.run step for system info queries, even on follow-up prompts.**
+System info (disk usage, battery, memory) changes constantly — never rely on prior conversation
+context for system data. Always re-run the command to get fresh values.
+Required plan: [shell.run (get system info) → synthesize (summarize for user)]
+
 ## macOS Finder Desktop Icon Arrangement
 
 NEVER use `defaults write com.apple.finder DesktopViewSettings -dict IconViewSettings '{...}'` (macOS rejects nested composite types, exits with code 1). NEVER use `osascript` to set desktop arrangement/view options — ALL AppleScript `set icon view options` / `set arrangement` / `set desktop view options` commands return error -10006 or -1728 on modern macOS (Ventura+). NEVER use `guide.step` or System Preferences/Settings UI for desktop arrangement — it is ALWAYS solvable with PlistBuddy.

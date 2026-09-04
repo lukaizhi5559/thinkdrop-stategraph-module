@@ -281,17 +281,31 @@ module.exports = async function answer(state) {
   // signal and the LLM must rely on prior turns to understand what is being asked.
   const _isConversationFollowUp = !!(state._taskClassification?.isFollowUp && state._taskClassification?.followUpTarget);
   const _isMemoryRetrieve = intentType === 'memory_retrieve';
-  
+
+  // ── Conversation-recall meta-questions ──────────────────────────────────────
+  // "what did I ask you three prompts ago", "summarize our conversation", etc.
+  // classifyTask sets isConversationRecall:true for these (and isFollowUp:false).
+  // Without this check, the LLM claims it has no access to previous prompts even
+  // though conversationHistory is loaded. Inject a larger history window for them.
+  const _isConversationRecall = !!state._taskClassification?.isConversationRecall;
+
   // Apply conversation history with hallucination warnings for:
   // 1. Follow-up queries that need context interpretation
   // 2. ALL memory_retrieve queries (to prevent date hallucinations)
-  if ((state._needsContextInterpretation || _isConversationFollowUp || _isMemoryRetrieve) && conversationHistory.length > 0) {
-    const recentHistory = conversationHistory.slice(-5); // Last 5 messages
+  // 3. Conversation-recall meta-questions ("what did I ask you three prompts ago")
+  if ((state._needsContextInterpretation || _isConversationFollowUp || _isMemoryRetrieve || _isConversationRecall) && conversationHistory.length > 0) {
+    // Recall queries need a wider window so "three prompts ago" is actually visible.
+    const recentHistory = conversationHistory.slice(_isConversationRecall ? -12 : -5);
     const historyBlock = recentHistory.map((msg, i) => {
       const role = msg.role === 'assistant' ? 'Previous AI Response (may contain errors)' : 'User';
       return `[${i + 1}] ${role}: ${msg.content?.substring(0, 300) || 'No content'}`;
     }).join('\n');
     systemInstructions += `\n\n=== RECENT CONVERSATION HISTORY ===\n${historyBlock}\n=== END HISTORY ===\n\nCRITICAL: The conversation history above contains previous AI responses that may contain hallucinations or errors. For temporal queries (dates, times, "yesterday", "today", etc.), prioritize the actual memory data provided below over any dates mentioned in conversation history. Conversation history is only for context, not factual accuracy.`;
+    // For recall queries, the LLM must USE the history — not deny access to it.
+    if (_isConversationRecall) {
+      systemInstructions += `\n\nThe conversation history is listed from OLDEST to NEWEST. The LAST entry with role "User" is the most recent prompt the user sent (immediately before this question). For "what did I just ask you" / "my last prompt" / "previous prompt", answer with that exact message. For "N prompts ago", count backward from the last User entry.`;
+      systemInstructions += `\n\nCRITICAL: The conversation history above IS your memory of past prompts. You DO have access to it. For questions about what the user asked, use the entries with role "User" in the RECENT CONVERSATION HISTORY. Quote or summarize the actual user messages. Do NOT say you cannot access previous prompts.`;
+    }
   }
 
   systemInstructions += '\n\nRules:';

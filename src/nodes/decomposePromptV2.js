@@ -189,23 +189,43 @@ async function _decomposeDecision(message, llmBackend, conversationHistory, logg
 
   const systemPrompt = `You classify a user message for an LLM intent router.
 Return ONLY a single number — nothing else:
-  0 = command_automate (interact with a specific website/app/tool, external action)
+  0 = command_automate (interact with a website/app/tool, external action, SCHEDULE a task/reminder/notification)
   1 = screen_intelligence (observe/describe what is currently on screen — no action)
   2 = web_search (find information online — no specific site interaction)
-  3 = memory_store (save/store information to memory)
+  3 = memory_store (save/store/remember/note a fact or preference for later retrieval)
   4 = memory_retrieve (recall past activity, user info, episodic memory — no external action)
   5 = general_knowledge (math, definitions, timeless facts — no tool needed)
   6 = greeting (hello, hi, how are you)
   7 = MULTI_STEP (the message contains 2+ truly independent goals that need separate sub-prompts)
 
-Decision rules:
+DECISION RULES (check in order):
+- "remind me to/in/at X" → 0 (scheduling a future action, NOT storing a memory)
+- "send me a reminder/notification/alert" → 0 (external action to trigger a notification)
+- "schedule/set up/create a reminder/task/timer" → 0 (external action)
+- "remember that/note that my X is Y" → 3 (storing a fact for later retrieval)
+- "save/store this" → 3 (storing information)
+- "who is my wife/what is my mom's phone" → 4 (retrieving user info)
+- "what did I do yesterday/recent activity" → 4 (retrieving past activity)
+- "what is blockchain/what is 5*7" → 5 (general knowledge)
+- "what app am I in/what's on my screen" → 1 (screen observation)
 - When in doubt → 0 (command_automate is the safest single-step default)
 - Only return 7 when the user has MULTIPLE INDEPENDENT goals (e.g., "send an email AND schedule a meeting")
 - Do NOT return 7 for multi-agent tasks that serve ONE goal (e.g., "post on Twitter, Facebook, and LinkedIn" → 0, the planner handles multiple agents)
-- Pure user info queries ("who is my wife", "what is my mom's phone") → 4
-- Past activity queries ("what was I doing yesterday", "recent activity") → 4
-- General questions ("what is blockchain", "what is 5*7") → 5
-- Current screen observation ("what app am I in", "what's on my screen") → 1`;
+
+EXAMPLES:
+  "remind me in 5 minutes to take out the trash" → 0
+  "send me a reminder to call mom tomorrow" → 0
+  "schedule a reminder for 3pm" → 0
+  "remember that my wife's name is Sarah" → 3
+  "note that I prefer dark mode" → 3
+  "save this conversation" → 3
+  "who is my wife" → 4
+  "what did I do yesterday" → 4
+  "what is blockchain" → 5
+  "what is 5*7" → 5
+  "what app am I in" → 1
+  "hello" → 6
+  "post on Twitter and send an email" → 7`;
 
   const userPrompt = `Message: "${message}"${contextBlock}\nIntent? (0–7)`;
 
@@ -363,14 +383,13 @@ module.exports = async function decomposePromptV2(state) {
       intentPlan: subPrompts,
     };
   }
-  // Simple knowledge query: no action verbs, no conjunctions, no tool interaction
-  if ((_tc.taskType === 'query' || _tc.taskType === 'general_knowledge' || _tc.taskType === 'ambiguous')
-      && !_hasMultiGoalConjunction
-      && !/\b(send|email|post|share|navigate|open|create|delete|rename|move|copy|install|run|execute|schedule|remind|fill|submit|click|type|download|upload|extract|scrape)\b/.test(_msgLower)) {
-    logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step general_knowledge (taskType=${_tc.taskType}, no action verbs) — skipping LLM decision`);
+  // Conversation-recall meta-questions → memory_retrieve (NOT general_knowledge)
+  // These ask about prior chat turns — web search is irrelevant and produces noise.
+  if (_tc.isConversationRecall && !_hasMultiGoalConjunction) {
+    logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step memory_retrieve (isConversationRecall=true) — skipping LLM decision`);
     const subPrompts = [{
       text: message,
-      estimatedIntent: 'general_knowledge',
+      estimatedIntent: 'memory_retrieve',
       confidence: 0.85,
       order: 0,
       dependsOn: [],
@@ -380,13 +399,13 @@ module.exports = async function decomposePromptV2(state) {
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
       ts: new Date().toISOString(), message, carriedHint: null,
-      parser: 'local-short-circuit', intent: 'general_knowledge',
+      parser: 'local-short-circuit', intent: 'memory_retrieve',
       subPromptCount: 1, durationMs,
-      subPrompts: [{ order: 0, text: message, estimatedIntent: 'general_knowledge', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'memory_retrieve', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
     return {
       ...state,
-      _decomposedIntent: 'general_knowledge',
+      _decomposedIntent: 'memory_retrieve',
       _decomposedBy: 'local-short-circuit',
       intentPlan: subPrompts,
     };

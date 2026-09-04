@@ -53,6 +53,12 @@ function _shouldBypassGather(state) {
   const tc = state._taskClassification || {};
   if (tc.needsClarification === true) return false;
 
+  // Scheduling tasks always go through the grill loop — the _askLLMDecision
+  // fast call already knows to ask about missing notification/delivery methods,
+  // and the scheduling short-circuit generates the question directly. Bypassing
+  // here would skip both, so the user would never be asked how to be notified.
+  if (tc.taskType === 'scheduling') return false;
+
   // resolveAgent had a question → don't bypass
   if (state.resolveAgentResult?.question) return false;
 
@@ -79,7 +85,8 @@ Rules:
 - Return {"complete": false, "question": "..."} ONLY when a single critical piece is missing:
   * Messaging tasks with NO named provider — ask which service (gmail, outlook, sendgrid, etc.)
   * Messaging tasks with NO recipient — ask for the address/number
-  * Scheduling tasks with NO time or frequency specified
+  * Scheduling tasks with NO time or frequency specified — ask for time
+  * Scheduling tasks with NO notification/delivery method specified — ask how (macOS notification, ThinkDrop in-app alert, email, text message, write to file)
 - NEVER ask about: timezone, credentials, optional preferences, or things the system can look up.
 - NEVER ask "which service" if the user already named one (gmail, slack, twilio, mailgun, etc.).
 - Browse / search / find / extract / navigate / look up tasks → always {"complete": true}.
@@ -132,6 +139,10 @@ async function _askLLMDecision(llmBackend, userMsg, originalMsg, priorQA, conver
     ? `\n\n(Context from prior turn: ${followUpTarget})`
     : '';
 
+  const tcBlock = taskClassification?.needsClarification === true
+    ? `\n\nTASK CLASSIFICATION: This task was already flagged as needing clarification (a critical piece is missing). Do NOT return 0 unless the missing piece is now present in PRIOR CLARIFICATIONS above.`
+    : '';
+
   const systemPrompt = `You are a task readiness checker for a desktop automation system.
 Given a user's request and what is already known, decide if the task is ready to execute.
 Return ONLY a single number — nothing else:
@@ -141,14 +152,27 @@ Return ONLY a single number — nothing else:
 
 Rules:
 - Return 0 if the task can proceed as-is.
-- Return 1 ONLY when a single critical piece is missing (messaging with no recipient, scheduling with no time, etc.)
+- Return 1 ONLY when a single critical piece is missing:
+  * messaging with no recipient
+  * scheduling (reminders, alarms, cron) with no time or frequency specified
+  * scheduling (reminders, alarms, cron) with no notification/delivery method specified (macOS notification, ThinkDrop alert, email, text, write to file)
 - Return 2 ONLY when a required service appears in UNAUTHENTICATED AGENTS
+- Examples where the notification method is MISSING — return 1:
+  "remind me to take out the trash" → 1 (no notification method)
+  "remind me in 5 minutes" → 1 (no notification method)
+  "set a reminder for 3pm" → 1 (no notification method)
+- Examples where the notification method is SPECIFIED — return 0:
+  "remind me to take out the trash via macOS notification" → 0
+  "remind me in 5 minutes with a ThinkDrop alert" → 0
+  "email me a reminder to call mom" → 0
+  "text me when it's time" → 0
+  "notify me via osascript" → 0
 - NEVER ask about: timezone, credentials, optional preferences, or things the system can look up
 - If a required service is NOT listed under UNAUTHENTICATED AGENTS, return 0 — do NOT ask about auth
 - When in doubt → 0`;
 
   const userPrompt = `REQUEST: "${originalMsg}"
-TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}
+TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}${tcBlock}
 
 Ready? (0, 1, or 2)`;
 
@@ -260,6 +284,67 @@ module.exports = async function gatherPlanContext(state) {
   if (!llmBackend) {
     logger.warn('[Node:GatherPlanContext] No llmBackend — skipping');
     return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  }
+
+  // ── Delivery-channel question for scheduling tasks ──────────────────────────
+  // For reminder/scheduling tasks, ask the user how they want the alert delivered
+  // (in-app alert vs. macOS notification vs. both) BEFORE the bypass gate, since
+  // _shouldBypassGather returns true for scheduling tasks (needsClarification=false).
+  // Skip if the user already specified a channel in their message.
+  if (
+    state._taskClassification?.taskType === 'scheduling' &&
+    !state._deliveryChannelResolved &&
+    state.intent?.type === 'command_automate'
+  ) {
+    const _userMsg = String(state.message || state.resolvedMessage || '').toLowerCase();
+    const _hasChannelKeyword = /\b(in[\s-]?app|notification|desktop\s+alert|macos\s+alert|sound|push)\b/i.test(_userMsg);
+    if (!_hasChannelKeyword) {
+      const _deliveryQuestion = 'How would you like to be alerted when the reminder fires?';
+      const _deliveryOptions = [
+        { label: 'ThinkDrop in-app alert', value: 'in-app', primary: true },
+        { label: 'macOS desktop notification', value: 'macos-notification', primary: false },
+        { label: 'Both', value: 'both', primary: false },
+      ];
+      logger.info('[Node:GatherPlanContext] Scheduling task — asking delivery channel');
+      if (progressCallback) progressCallback({
+        type: 'ask_user',
+        question: _deliveryQuestion,
+        options: _deliveryOptions,
+        source: 'gatherPlanContext',
+      });
+
+      const _gatherAnswerCallback = state.gatherAnswerCallback || null;
+      if (_gatherAnswerCallback) {
+        try {
+          const _channelAnswer = await _gatherAnswerCallback(_deliveryQuestion);
+          const _channel = String(_channelAnswer || '').toLowerCase();
+          logger.info(`[Node:GatherPlanContext] Delivery channel chosen: "${_channel}"`);
+          // Inject the chosen channel into resolvedMessage so planSkillsV2 builds the right synthesize step
+          let _channelSuffix = '';
+          if (_channel.includes('in-app') || _channel === 'in-app') _channelSuffix = ' via ThinkDrop in-app alert';
+          else if (_channel.includes('macos') || _channel === 'macos-notification') _channelSuffix = ' via macOS desktop notification';
+          else if (_channel === 'both') _channelSuffix = ' via both ThinkDrop in-app alert and macOS desktop notification';
+          const _newResolved = _channelSuffix
+            ? `${resolvedMessage || message}${_channelSuffix}`
+            : resolvedMessage || message;
+          if (progressCallback) progressCallback({ type: 'gather_answer_received' });
+          return {
+            ...state,
+            resolvedMessage: _newResolved,
+            message: _channelSuffix ? `${message}${_channelSuffix}` : message,
+            _deliveryChannelResolved: true,
+            planGatheringComplete: true,
+            planGatheringSkipped: true,
+          };
+        } catch (err) {
+          logger.warn(`[Node:GatherPlanContext] Delivery channel question failed: ${err.message} — proceeding with default`);
+        }
+      } else {
+        logger.warn('[Node:GatherPlanContext] No gatherAnswerCallback for delivery channel — proceeding with default');
+      }
+    } else {
+      logger.info('[Node:GatherPlanContext] Scheduling task — user already specified a delivery channel, skipping question');
+    }
   }
 
   // ── Deterministic bypass gate ───────────────────────────────────────────────
@@ -494,6 +579,7 @@ Rules:
 - BATCH AGGRESSIVELY: Ask ALL questions you need answered in ONE batch — even if some answers might influence other questions' context. The user can answer them all at once. Do NOT split related questions across multiple rounds.
 - Questions about the same topic (e.g., playlist name, genre, artists, songs) MUST be in the same batch — never ask them one at a time.
 - Only defer a question to a later round if it TRULY cannot be asked without a prior answer (e.g., "Which specific album by [artist]?" when you don't know the artist yet). Even then, prefer asking "Which artist and album?" as one question.
+- CRITICAL SCHEDULING RULE: For any reminder, alarm, timer, cron, or recurring task where the user did NOT specify a notification/delivery method, ask ONE question: "How do you want to be notified?" with choice options: macOS notification, ThinkDrop in-app alert, email, text message, write to file. Do NOT proceed with scheduling tasks that lack a delivery method.
 - NEVER ask about things the system can look up (timezone, credentials, installed apps, auth status — these are in PROBE RESULTS).
 - NEVER ask about things already answered in PRIOR CLARIFICATIONS. Every entry in PRIOR CLARIFICATIONS is a SETTLED answer — do NOT re-ask it, even with different wording.
 - If a PRIOR CLARIFICATION answer starts with "yes —", it is a CONFIRMED answer — do NOT ask that question again.
@@ -768,6 +854,87 @@ async function _runGrillLoop(state, logger) {
       break;
     }
     logger.info(`[Node:GatherPlanContext:Grill] Fast decision: ${_fastDecision === 1 ? 'NEED_QUESTION' : 'NEED_AUTH'} — running batch prompt`);
+
+    // ── Scheduling short-circuit ────────────────────────────────────────────
+    // For scheduling tasks (reminders, alarms, cron, recurring) that need a
+    // notification/delivery method, generate the question directly — no LLM
+    // batch call needed. We know exactly what to ask: "How do you want to be
+    // notified?" with standard options. This avoids JSON parse failures from
+    // the batch prompt and prevents irrelevant unauthed agents (e.g. gh.agent)
+    // from polluting the question.
+    if (tc.taskType === 'scheduling' && (tc.needsClarification || _fastDecision === 1)) {
+      logger.info('[Node:GatherPlanContext:Grill] Scheduling short-circuit — generating notification method question directly');
+      const schedulingResult = {
+        complete: false,
+        requiredInputs: [{ name: 'notification_method', why: 'User did not specify how they want to be notified', memoryQuery: 'reminder notification preference' }],
+        questions: [{
+          id: 'q_notif_method',
+          text: 'How do you want to be notified?',
+          type: 'choice',
+          options: [
+            { label: 'macOS notification', value: 'macos_notification', primary: true, description: 'Show a native macOS notification' },
+            { label: 'ThinkDrop alert', value: 'thinkdrop_alert', primary: false, description: 'Show an in-app alert in ThinkDrop' },
+            { label: 'Email', value: 'email', primary: false, description: 'Send an email notification' },
+            { label: 'Text message', value: 'text', primary: false, description: 'Send a text/SMS notification' },
+          ],
+          freeText: true,
+          memoryResolved: false,
+          memoryText: 'User prefers to be notified via {answer} for reminders',
+          memoryTextTemplate: 'User prefers to be notified via {answer} for reminders',
+        }],
+        routeConfirmation: null,
+      };
+
+      // Use the same question-processing flow as the normal grill loop
+      const questions = schedulingResult.questions;
+      const routeConfirmation = null;
+
+      if (!gatherAnswerCallback) {
+        logger.warn('[Node:GatherPlanContext:Grill] No gatherAnswerCallback — passing through');
+        break;
+      }
+
+      const batchId = `grill_sched_${Date.now()}_${batchCounter++}`;
+      logger.info(`[Node:GatherPlanContext:Grill] Asking scheduling batch ${batchId}: ${questions.length} question(s)`);
+
+      try {
+        const batchAnswers = await gatherAnswerCallback({
+          batch: true,
+          batchId,
+          questions,
+          routeConfirmation,
+        });
+
+        if (!batchAnswers || Object.keys(batchAnswers).length === 0) {
+          logger.warn('[Node:GatherPlanContext:Grill] Empty scheduling batch answers — proceeding');
+          break;
+        }
+
+        for (const q of questions) {
+          const ans = batchAnswers[q.id];
+          if (ans) {
+            answers.push({ question: q.text, answer: ans });
+            logger.info(`[Node:GatherPlanContext:Grill] Scheduling answer: "${q.text}" → "${String(ans).slice(0, 80)}"`);
+            if (progressCallback) progressCallback({ type: 'gather_answer_received' });
+          }
+        }
+      } catch (err) {
+        logger.warn(`[Node:GatherPlanContext:Grill] Scheduling batch callback threw: ${err.message} — proceeding`);
+        break;
+      }
+
+      // Inject answer into resolvedMessage and exit
+      let enriched = baseMsg;
+      if (answers.length > 0) {
+        enriched = `${enriched}\n[Additional context: ${answers.map(qa => `${qa.question}: ${qa.answer}`).join('; ')}]`;
+        logger.info(`[Node:GatherPlanContext:Grill] Scheduling complete — enriched with ${answers.length} answer(s)`);
+      }
+      const grilledConstraints = {
+        notification_method: String(answers[0]?.answer || ''),
+        question: answers[0]?.question || 'How do you want to be notified?',
+      };
+      return { ...state, resolvedMessage: enriched, planGatheringComplete: true, planGatheringRound: round, planGatheringAnswers: answers, grilledConstraints };
+    }
 
     // B2: Ask LLM for the frontier of questions
     const result = await _askLLMBatch(

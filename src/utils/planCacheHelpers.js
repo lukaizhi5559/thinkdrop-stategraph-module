@@ -112,11 +112,25 @@ function extractPlanContext(content) {
   const promptMatch = content.match(/^original_prompt:\s*"([^"]+)"/m);
   const prompt = promptMatch ? promptMatch[1] : '';
   const contextMatch = prompt.match(/\(Context from prior turn:\s*(.*?)\s*\)/i);
-  const title = contextMatch ? _stripCommonSuffixes(contextMatch[1]) : null;
+  const rawTitle = contextMatch ? _stripCommonSuffixes(contextMatch[1]) : null;
   const urlMatch = prompt.match(/(https?:\/\/[^\s"]+)/);
+
+  // Gate 3a: Only set title from actual "(Context from prior turn: ...)" markers
+  // — NOT from the prompt string fallback. A plan with no context marker is not
+  // browser-derived, so there is no browser page title to compare.
+  //
+  // Gate 3b: If the extracted title is a file path (starts with / or ~), it is
+  // NOT a browser page title — it's a local file context. File paths can't go
+  // stale relative to the browser, so there is no mismatch to detect. This
+  // handles mixed plans (browser + shell.run) generated from local file context.
+  let title = null;
+  if (rawTitle && !/^(\/[A-Za-z0-9_/.-]+|~\/[A-Za-z0-9_/.-]+)/.test(rawTitle.trim())) {
+    title = rawTitle;
+  }
+
   return {
     prompt,
-    title: title || prompt || null,
+    title,
     url: urlMatch ? urlMatch[1] : null,
   };
 }
@@ -148,7 +162,12 @@ function contextMismatch(planContext, currentContext) {
     } catch (_) { /* fall through to title comparison */ }
   }
 
-  const planTitle = _stripCommonSuffixes(planContext.title || planContext.prompt || '');
+  // Gate 4: If planContext.title is null, the plan was not generated from a
+  // browser page context (no context marker, or the marker was a file path).
+  // There is no browser page title to compare — return false (no mismatch).
+  if (!planContext.title) return false;
+
+  const planTitle = _stripCommonSuffixes(planContext.title);
   const currentTitle = _stripCommonSuffixes(
     currentContext.windowTitle || currentContext.contextText || ''
   );
@@ -169,7 +188,10 @@ function findHardcodedDesktopFilename(skillPlan) {
   for (const step of skillPlan) {
     if (step.skill !== 'shell.run') continue;
     const text = JSON.stringify(step.args || {});
-    const match = text.match(/(?:~|\/Users\/[^/]+)\/Desktop\/([^"'\s]+)/);
+    // Only match Desktop paths that look like output FILES (have an extension).
+    // Input directories like ~/Desktop/screenshots-for-trigger-concept-dicussion
+    // have no extension and should not be treated as hardcoded output filenames.
+    const match = text.match(/(?:~|\/Users\/[^/]+)\/Desktop\/([^"'\s]+\.[a-zA-Z0-9]{1,10})/i);
     if (match) return match[0];
   }
   return null;

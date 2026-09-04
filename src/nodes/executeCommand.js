@@ -1576,16 +1576,18 @@ module.exports = async function executeCommand(state) {
     // Determine pending steps to execute when reminder fires.
     // Notification-only steps (osascript/display notification) are excluded because main.js
     // already shows a dialog + Electron Notification on every reminder fire.
-    // Real action steps (browser.act, non-notification shell.run, etc.) are serialized and
-    // executed directly via command-service when the reminder fires — no stategraph re-run.
+    // synthesize steps are kept as deferred steps — they run via stategraph when the
+    // reminder fires so the reminder message streams to the UI and the striked-out step
+    // activates. Real action steps (browser.act, non-notification shell.run, etc.) are
+    // also serialized and executed via stategraph when the reminder fires.
     // Re-running the original prompt causes an infinite loop for time-delay reminders.
     const remainingSteps = skillPlan.slice(skillCursor + 1);
-    const isNotificationStep = (s) => s.skill === 'synthesize' ||
-      (s.skill === 'shell.run' && (
+    const isNotificationStep = (s) =>
+      s.skill === 'shell.run' && (
         s.args?.cmd === 'osascript' ||
         (s.args?.cmd === 'bash' && String(s.args?.argv || '').includes('osascript')) ||
         String(s.args?.argv || '').includes('display notification')
-      ));
+      );
     const pendingRealSteps = remainingSteps.filter(s => !isNotificationStep(s));
     const triggerIntent = pendingRealSteps.length > 0 ? 'execute_steps' : 'notify';
     // Warn if label contains action keywords but no real steps were found — likely a planner omission.
@@ -1601,7 +1603,14 @@ module.exports = async function executeCommand(state) {
       notifyMessage = cleanLabel ? `It's time to ${cleanLabel}!` : label;
     }
     const triggerPrompt = notifyMessage;
-    const pendingSteps = pendingRealSteps.length > 0 ? JSON.stringify(pendingRealSteps) : null;
+    const pendingStepsPayload = pendingRealSteps.length > 0 ? {
+      steps: skillPlan,                    // full original plan (indices match UI)
+      deferredSteps: pendingRealSteps,     // filtered steps to actually run
+      skillCursor: skillCursor + 1,        // start at next step after schedule
+      _skillPlanFile: state._skillPlanFile || null,
+      _taskClassification: state._taskClassification || null,  // preserve so deferred run skips REPLAN
+    } : null;
+    const pendingSteps = pendingStepsPayload ? JSON.stringify(pendingStepsPayload) : null;
     // POST to command-service /reminder.register (non-blocking)
     const cmdPort = 3007;
     try {
@@ -2914,7 +2923,7 @@ module.exports = async function executeCommand(state) {
 
     // Include screen.capture results — screen OCR text
     const screenCaptureResults = skillResults
-      .filter(r => r.skill === 'screen.capture' && r.success && r.text)
+      .filter(r => r.skill === 'screen.capture' && (r.ok || r.success) && r.text)
       .map(r => `=== Screen Capture (${r.appName || 'OCR'}) ===\n${r.text}`);
 
     // Include file.watch results — file watch events
@@ -3106,10 +3115,67 @@ module.exports = async function executeCommand(state) {
       const hasFileContent = shellStdoutResults.length > 0;
       const hasImageAnalysis = imageAnalyzeResults.length > 0 || crossTurnContext.includes('Image analysis:');
       const _editKeywords = /\b(edit|modify|update|change|replace|rewrite|add|remove|delete|insert|append|fix|correct|rename|move|sort|format|clean up)\b/i;
-      const isFileEdit = hasFileContent && _editKeywords.test(synthesisPrompt);
+      let isFileEdit = hasFileContent && _editKeywords.test(synthesisPrompt);
       // Detect when shell output is raw JSON from an API call (e.g. GitHub REST API, curl)
       // — needs different synthesis instructions than plain file content
       const _isJsonShellOutput = shellStdoutResults.some(s => /=== Shell output[^\n]*\n\s*[\[{]/.test(s));
+
+      // ── Classify shell.run output for targeted synthesis instructions ──────
+      // System-info output (df, diskutil, sysctl, pmset, system_profiler, sw_vers, ps)
+      // needs a different persona than file content or JSON API responses: the LLM must
+      // extract ONLY the fields relevant to the user's question, not parrot the raw dump.
+      const _SYSTEM_INFO_MARKERS = [
+        'filesystem',            // df -h
+        'disk size',             // diskutil info
+        'container total space',
+        'container free space',
+        'volume used space',
+        'hw.memsize',            // sysctl memory
+        'hw.physicalcpu',
+        'hw.logicalcpu',
+        'machdep.cpu',           // sysctl CPU
+        'internalbattery',       // pmset -g batt
+        'productname:\t\tmacos', // sw_vers
+        'buildversion:',
+        'spdisplaysdatatype',    // system_profiler display
+        'sphardwaredatatype',    // system_profiler hardware
+        'spusbdatatype',         // system_profiler USB
+        'spa audiodata type',    // system_profiler audio
+        'model name:',           // system_profiler SPHardwareDataType
+        'total number of cores',
+      ];
+      let hasSystemInfoShellOutput = shellStdoutResults.some(s => {
+        const body = s.replace(/^=== Shell output[^\n]*\n/i, '').toLowerCase();
+        return _SYSTEM_INFO_MARKERS.some(m => body.includes(m));
+      });
+      // Safety net: also detect system info in crossTurnContext / synthesisContext.
+      // On follow-up queries the planner may generate a synthesize-only plan (no
+      // shell.run step), so shellStdoutResults is empty. The raw system output
+      // comes from crossTurnContext (conversation history) instead. Without this
+      // check, the system-info instruction branch is never selected and the LLM
+      // echoes raw df/diskutil output from the conversation history.
+      if (!hasSystemInfoShellOutput) {
+        const _ctxText = (synthesisContext || crossTurnContext || '').toLowerCase();
+        if (_SYSTEM_INFO_MARKERS.some(m => _ctxText.includes(m))) {
+          hasSystemInfoShellOutput = true;
+          logger.info(`[Node:ExecuteCommand] synthesize: system info detected in crossTurnContext/synthesisContext (no shell.run step this run)`);
+        }
+      }
+      logger.info(`[Node:ExecuteCommand] synthesize: branch check — hasSystemInfo=${hasSystemInfoShellOutput} hasFileContent=${hasFileContent} isFileEdit=${isFileEdit} isJson=${_isJsonShellOutput}`);
+
+      // ── Override prompt for system-info shell output ───────────────────────
+      // The plan's synthesize step may use words like "Format" (e.g. "Format and
+      // present disk storage details"), which matches the file-edit keyword regex
+      // and selects the file-editing persona that says "Output the full file text
+      // only" — causing the LLM to echo raw df/diskutil output. Force file-edit off
+      // and use the user's actual question as the prompt, since the system-info
+      // instructions already embed "The user asked: ...". This also discards any
+      // {{PREV_OUTPUT}} that was injected into the step prompt at dispatch time.
+      if (hasSystemInfoShellOutput) {
+        isFileEdit = false;
+        synthesisPrompt = _userQuestion || description || synthesisPrompt;
+        logger.info(`[Node:ExecuteCommand] synthesize: using user question for system info prompt — "${synthesisPrompt.slice(0, 120)}", isFileEdit forced false`);
+      }
 
       // ── Chunk+filter pass for large API responses (> 60K) ─────────────────
       // Pages through items that didn't fit in the initial 50-item preview and
@@ -3146,7 +3212,9 @@ module.exports = async function executeCommand(state) {
         }
       }
 
-      const synthesisQuery = hasFileContent
+      const synthesisQuery = hasSystemInfoShellOutput
+        ? `${synthesisPrompt}${skippedStepsNote}\n\nHere is the raw output from system commands (do NOT repeat it — extract ONLY the answer):\n\n${synthesisContext}`
+        : hasFileContent
         ? `${synthesisPrompt}${skippedStepsNote}\n\nHere is the current file content:\n\n${synthesisContext}`
         : `${synthesisPrompt}${skippedStepsNote}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
       // Detect response language from the original user message (same approach as answer.js).
@@ -3189,10 +3257,42 @@ module.exports = async function executeCommand(state) {
         : '';
       let synthesisInstructions = (isFileEdit
         ? `You are a file editing assistant. The user has asked you to modify a file. You have been given the current file content. Your job is to output the COMPLETE updated file content with ONLY the requested changes applied. Output the full file text only — no preamble, no explanation, no markdown code fences, no commentary. Preserve all existing structure, headings, and formatting. Only change what was explicitly requested.`
+        : hasSystemInfoShellOutput
+        ? `You are a concise system-information assistant.
+The user asked: "${_userQuestion}"
+
+You have been given raw output from macOS system commands (df, diskutil, sysctl, pmset, system_profiler, sw_vers, ps, etc.).
+
+CRITICAL RULES:
+1. Answer ONLY the user's specific question. The raw output contains dozens of fields — extract ONLY the ones relevant to what the user asked.
+2. Do NOT repeat or quote the raw command output. Do NOT list device identifiers, UUIDs, partition types, file system details, SMART status, APFS snapshots, or other low-level metadata unless the user explicitly asked for them.
+3. Present the answer in 1-3 plain, human-readable sentences.
+4. Use friendly units: "245 GB total", "17 GB used", "50 GB free", "8 GB RAM", "Apple M1", "83% battery".
+
+EXAMPLES of good answers:
+- User asks "get disk storage" → "You have 245 GB of total disk storage, with 17 GB used and 50 GB available."
+- User asks "how much memory" → "Your Mac has 8 GB of RAM."
+- User asks "what CPU" → "Your Mac has an Apple M1 chip with 8 cores (4 performance + 4 efficiency)."
+- User asks "battery level" → "Your battery is at 83% and currently discharging."
+- User asks "OS version" → "You're running macOS 15.2 (Build 24C101)."
+
+EXAMPLES of bad answers (DO NOT DO THIS):
+- Quoting the full df table
+- Listing Volume UUID, Partition Type, SMART Status
+- Saying "The disk is an APFS Volume Snapshot with..."
+- Including device identifiers like "disk3s1s1"
+
+If the raw output is missing the specific field the user asked about, say so directly.`
         : _isJsonShellOutput
         ? `You are a technical analyst. You have been given data returned by a shell command or API call.\n\nThe user asked: "${_userQuestion}"\n\nAnswer their specific question directly and concisely using ONLY the relevant data. Format output in markdown — use bold for names/titles, bullet points for lists, and human-readable dates (e.g. "Monday, Jan 20 at 3:00 PM"). Skip internal IDs, raw URLs, and low-level metadata unless the user explicitly asked for them. Do NOT output raw JSON or JSON field names verbatim.`
         : hasFileContent
-        ? `You are a document analyst. The user has asked you to analyze, summarize, or explain the contents of one or more files. You have been given the raw file content. Your job is to provide a clear, well-structured explanation of what the file(s) contain — describe the purpose, key information, structure, and any notable details. Do NOT just repeat or list the raw content. Write in plain prose with headings where helpful. Be concise and informative.`
+        ? `You are a document analyst. The user has asked you to analyze, summarize, or explain the contents of one or more files. You have been given the raw file content.
+
+CRITICAL RULES:
+1. Provide a clear, well-structured explanation of what the file(s) contain — describe the purpose, key information, structure, and any notable details.
+2. Do NOT output the raw file content. Do NOT quote or list more than 1-2 short lines as examples.
+3. Write in plain prose with headings where helpful. Be concise and informative.
+4. Answer the user's specific question directly.`
         : hasImageAnalysis
         ? `You are a report writer. The user has analyzed a folder of images/screenshots and wants a summary. You have been given the vision AI analysis of each image. Write a clear, structured report using ONLY the actual file names and descriptions provided — do NOT invent or guess file names, sizes, or content. Use the exact file path from each "Image analysis: <path>" heading as the file name.`
         : `You are a research assistant. The user asked you to compare or summarize information from multiple websites. You have been given the text content from each site. Provide a clear, structured comparison or summary that directly answers the user's request. Use headings for each source if comparing. Be concise and factual. Never ask the user for clarification or additional information — produce the best-effort response using only the provided content. Do not output a question as your answer.

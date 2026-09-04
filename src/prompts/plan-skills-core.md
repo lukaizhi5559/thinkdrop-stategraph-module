@@ -1,4 +1,5 @@
 synthesize|args:{prompt:string,saveToFile?:string,outputSchema?:{type:string|string[]}}|runs_an_LLM_to_answer_summarize_or_generate_text.__ALWAYS_the_final_step_for_user_facing_answers.__Use_{{synthesisAnswer}}_to_pipe_a_prior_synthesize_into_a_later_one.
+fs.read|args:{action:string,path?:string,paths?:string[],maxFileSize?:number,encoding?:string}|reads_one_or_more_local_files_and_returns_their_contents_(100KB_limit).__Use_for_reading_small_text_files_(md,_txt,_json,_js,_ts,_csv,_yaml,_html),_directory_trees_(action:tree),_code_search_(action:search),_or_codebase_exploration_(action:explore).__For_large_files_(>100KB)_use_shell.run_with_explicit_cmd/argv_(head,_tail,_sed,_wc,_grep)_instead.
 shell.run|args:{goal?:string,cmd?:string,argv?:string[]}|executes_a_local_shell_command.__Use_goal_for_natural_language_file_ops_OR_cmd/argv_for_explicit_commands.__NEVER_both_goal_AND_cmd_in_the_same_step.
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string,url?:string}|[sub-agent]_ALL_web_tasks:_public_sites,_OAuth_services,_REST_API_services,_AI_chatbots.__actions:_run_(delegate),_build_agent_(create_descriptor),_explore,_list_agents.__NEVER_emit_browser.act_or_playwright.agent_directly.
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI-backed_services_(gh,_aws,_heroku)_AND_known_CLI_tools_(ffmpeg,_pandoc,_imagemagick,_yt-dlp).__actions:_run,_build_agent,_list_agents.
@@ -12,8 +13,9 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 ## Routing Priority: CLI → Shell → Browser
 
 1. **CLI agent** — CLI-backed services (gh, aws, heroku) AND known CLI tools (ffmpeg, pandoc, imagemagick, yt-dlp, etc.). Check AVAILABLE AGENTS; if found, `cli.agent { action: 'run', agentId, task }`. If not found, `cli.agent { action: 'build_agent', service }` then run.
-2. **shell.run** — generic local file ops, Python scripts, git, and simple system commands that do not require installing a specific third-party CLI tool.
-3. **browser.agent** — web navigation, OAuth services, REST API services, AI chatbots. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
+2. **fs.read** — reading the contents of local files (< 100KB), mapping directory trees, searching code, or exploring a codebase. ALWAYS use `fs.read { action: 'read', path: '/path/to/file' }` instead of `shell.run` when the goal is to read/summarize/explain file contents (e.g. "what is this about", "summarize this file"). For files > 100KB, use `shell.run` with `head`/`tail`/`sed`/`grep` (see "Handling large files" below).
+3. **shell.run** — generic local file ops, Python scripts, git, and simple system commands that do not require installing a specific third-party CLI tool. Use for listing/moving/deleting/creating files or running commands that modify the filesystem; NEVER for simply reading a small file's content (use `fs.read` instead).
+4. **browser.agent** — web navigation, OAuth services, REST API services, AI chatbots. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
 
 **Exceptions:** pure navigation → browser.agent directly. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
 
@@ -131,6 +133,57 @@ Consecutive same-agent steps reuse the same session/state automatically. No synt
   {"skill":"app.agent","args":{"action":"run_agent","appName":"<app-name>","task":"open auth.js and refactor the authentication module to use async/await"},"description":"Refactor auth.js"},
   {"skill":"app.agent","args":{"action":"run_agent","appName":"<app-name>","task":"run the test suite and fix any failures"},"description":"Fix tests"},
   {"skill":"synthesize","args":{"prompt":"Confirm the auth.js refactoring is complete and tests pass."},"description":"Confirm"}
+]
+```
+
+**fs.read example (read and explain a small file < 100KB):**
+```json
+[
+  {"skill":"fs.read","args":{"action":"read","path":"/path/to/file.md"},"description":"Read the file content"},
+  {"skill":"synthesize","args":{"prompt":"Explain what this file is about."},"description":"Explain the file"}
+]
+```
+
+### Handling large files (>100KB)
+
+The `## FILE CONTEXT` table shows each file's size. When a file exceeds 100KB, `fs.read` will fail — use `shell.run` with **explicit `cmd`/`argv`** (NEVER `goal`) to read a sample.
+
+**Tool selection — match the user's intent:**
+
+| User says | Tool | cmd | argv |
+|---|---|---|---|
+| "what is this about" / "summarize" / "explain" | First 100 lines | `head` | `["-n", "100", "/path"]` |
+| "what happened recently" / "latest" / "recent" | Last 50 lines | `tail` | `["-n", "50", "/path"]` |
+| "how big" / "how many lines" | Line count | `wc` | `["-l", "/path"]` |
+| "find X" / "search for" / "where is" | Pattern search | `grep` | `["-n", "pattern", "/path"]` |
+| "read more" / "next chunk" / "keep reading" | Next page | `sed` | `["-n", "101,200p", "/path"]` |
+
+**Default** (no specific intent): `head -n 100` — the beginning usually has the most useful overview.
+
+**Pagination with `sed`:** If the first 100 lines don't contain the info, read the next chunk:
+- Lines 1-100: `sed -n '1,100p' /path`
+- Lines 101-200: `sed -n '101,200p' /path`
+- Lines 201-300: `sed -n '201,300p' /path`
+
+**Finding specific info (grep → sed pattern):** When the user asks "find X" in a large file, use two steps:
+1. `grep -n "pattern" /path` — locates matching lines with line numbers
+2. `sed -n 'START,ENDp' /path` — reads context around the match (e.g. 20 lines before/after)
+
+**CRITICAL — always use explicit `cmd`/`argv`, NEVER `goal`.** The `goal` field triggers an internal LLM round-trip that can produce malformed commands for file paths.
+
+**Example — "what is this large file about":**
+```json
+[
+  {"skill":"shell.run","args":{"cmd":"head","argv":["-n","100","/path/to/large-file.md"]},"description":"Read first 100 lines of the file"},
+  {"skill":"synthesize","args":{"prompt":"Explain what this file appears to be about, based on the first 100 lines you read."},"description":"Summarize the file"}
+]
+```
+
+**Example — "find errors in this large log":**
+```json
+[
+  {"skill":"shell.run","args":{"cmd":"grep","argv":["-n","error","/path/to/large-log.log"]},"description":"Find lines containing 'error'"},
+  {"skill":"synthesize","args":{"prompt":"Summarize the errors found and their line numbers."},"description":"Summarize errors"}
 ]
 ```
 

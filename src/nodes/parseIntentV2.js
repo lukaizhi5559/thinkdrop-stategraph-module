@@ -238,6 +238,23 @@ module.exports = async function parseIntentV2(state) {
       finalIntent = 'command_automate';
     }
 
+    // Conversation-recall meta-questions must be memory_retrieve, not general_knowledge.
+    // decomposePromptV2 should already catch this, but override as a safety net in case
+    // the LLM fast-decision path returned general_knowledge (5).
+    if (state._taskClassification?.isConversationRecall === true && finalIntent !== 'memory_retrieve') {
+      logger.info(`[Node:ParseIntentV2] isConversationRecall override: ${finalIntent} → memory_retrieve for "${classifyMessage.slice(0, 80)}"`);
+      finalIntent = 'memory_retrieve';
+    }
+
+    // Scheduling tasks (reminders, timers, alarms, cron) must be command_automate,
+    // not memory_store. The fast-decision classifier can confuse "remind me" (action)
+    // with "remember that" (store). Override to command_automate so planSkills
+    // generates the correct scheduling plan.
+    if (state._taskClassification?.taskType === 'scheduling' && finalIntent !== 'command_automate') {
+      logger.info(`[Node:ParseIntentV2] scheduling override: ${finalIntent} → command_automate for "${classifyMessage.slice(0, 80)}"`);
+      finalIntent = 'command_automate';
+    }
+
     logger.debug(`[Node:ParseIntentV2] intentPlan passthrough → ${finalIntent} (${finalConf}): "${classifyMessage.slice(0, 80)}"`);
     writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'llm-decompose', intent: finalIntent, confidence: finalConf, subPromptCount: 1, durationMs: 0, subPrompts: [{ order: 0, text: sp.text, estimatedIntent: finalIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }] });
 

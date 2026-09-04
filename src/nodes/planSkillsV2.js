@@ -430,6 +430,15 @@ function _buildSystemPrompt(userMessage, state) {
     if (_needsBrowser) appendices.push('plan-skills-browser.md');
   }
 
+  // Always include the scheduling appendix for scheduling tasks. The user may
+  // have confirmed a notification method via grilledConstraints, which makes
+  // _hasLocalSignals true and skips the domain appendix block above. But the
+  // scheduling guidance is required to avoid `shell.run sleep` and to map the
+  // chosen method (thinkdrop_alert, macOS, email, etc.) to the correct skill.
+  if (_tc?.taskType === 'scheduling' && !appendices.includes('plan-skills-scheduling.md')) {
+    appendices.push('plan-skills-scheduling.md');
+  }
+
   for (const filename of appendices) {
     const appendix = _loadPromptFile(filename);
     if (appendix) {
@@ -611,10 +620,18 @@ When a step produces content (text, markdown, JSON, file list, etc.) that a LATE
   if (state._taskClassification?.taskType === 'local_file') {
     try {
       const homeDir = os.homedir();
+      const _rawMessage = (state.resolvedMessage || state.message || userMessage);
+
+      // Extract paths from [File: ...] / [Folder: ...] tags first (ThinkDrop attachment format)
+      const _tagRe = /\[(?:File|Folder):\s*([^\]]+)\]/gi;
+      const _tagMatches = [..._rawMessage.matchAll(_tagRe)].map(m => m[1].trim());
+
       // Match: absolute paths, ~/... paths, and bare filenames with extensions
       const _pathRe = /(?:~\/[^\s"'`,]+|\/[^\s"'`,]+|[a-zA-Z0-9_\-. ]+\.(?:pdf|md|docx?|xlsx?|csv|txt|html?|png|jpg|jpeg|mp4|mov|zip|json|yaml|yml))/gi;
-      const _rawMessage = (state.resolvedMessage || state.message || userMessage);
-      const _matches = [...new Set((_rawMessage.match(_pathRe) || []))];
+      const _strippedMessage = _rawMessage.replace(_tagRe, '');
+      const _bareMatches = (_strippedMessage.match(_pathRe) || []);
+
+      const _matches = [...new Set([..._tagMatches, ..._bareMatches])];
       const _FORMAT_MAP = {
         pdf: 'PDF (binary — cannot append text directly)',
         md: 'Markdown (plain text)',
@@ -795,9 +812,11 @@ async function planSkillsV2(state) {
         ? state._skillPlan
         : JSON.parse(Buffer.from(state._skillPlan, 'base64').toString('utf8'));
       if (Array.isArray(decoded) && decoded.length > 0) {
-        logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${decoded.length} steps`);
+        // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
+        const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < decoded.length) ? state.skillCursor : 0;
+        logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${decoded.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: decoded.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
-        return { ...state, skillPlan: decoded, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanIsResume: false };
+        return { ...state, skillPlan: decoded, skillCursor: _startCursor, planError: null, recoveryContext: null, _skillPlanIsResume: false };
       }
     } catch (err) {
       logger.warn(`[Node:PlanSkillsV2] _skillPlan fast-path decode failed: ${err.message} — falling through to LLM`);
@@ -1626,6 +1645,19 @@ The user's request does NOT match any installed skill.
     logger.info(`[Node:PlanSkillsV2] Injecting external.skill prohibition (no installed skill match)`);
   }
 
+  // ── System info fresh-data note ──────────────────────────────────────────
+  // System info (disk, memory, CPU, battery) is time-sensitive. On follow-up
+  // queries the planner may generate a synthesize-only plan relying on stale
+  // conversation history. Force it to always include a shell.run step.
+  const _SYSTEM_INFO_KEYWORDS = /\b(disk\s+(storage|space|capacity|usage|info)|memory|ram|cpu|processor|battery|power\s+level|os\s+version|macos\s+version|running\s+processes|display\s+info|screen\s+resolution|usb\s+devices|audio\s+info|sound\s+(card|device))\b/i;
+  const _isSystemInfoQuery = _SYSTEM_INFO_KEYWORDS.test(userMessage || '');
+  const _systemInfoFreshDataNote = _isSystemInfoQuery
+    ? `\n\n⚠️ SYSTEM INFO QUERY — FRESH DATA REQUIRED:\nThis is a system/hardware information query (disk, memory, CPU, battery, etc.).\nSystem info is time-sensitive — ALWAYS include a shell.run step to get CURRENT data, even on follow-up queries.\nDo NOT generate a synthesize-only plan that relies on prior conversation context — the data may be stale.\nRequired plan structure: [shell.run (get system info) → synthesize (summarize for user)]`
+    : '';
+  if (_isSystemInfoQuery) {
+    logger.info(`[Node:PlanSkillsV2] System info query detected — injecting fresh-data note to force shell.run step`);
+  }
+
   const planningQuery = [
     _agentIdentity,
     SKILL_SYSTEM_PROMPT,
@@ -1647,6 +1679,7 @@ The user's request does NOT match any installed skill.
     runtimeNote,
     messagingBodyNote,
     parallelNote,
+    _systemInfoFreshDataNote,
     `\n\nUser request: "${(runtimeParamMessage || userMessage).replace(/"/g, '\\"').slice(0, 2000)}"`,
   ].filter(Boolean).join('\n');
 

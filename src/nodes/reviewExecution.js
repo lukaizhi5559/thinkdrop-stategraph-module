@@ -378,6 +378,43 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'VERIFIED' };
   }
 
+  // ── Synthesize/notification short-circuit ───────────────────────────────────
+  // For scheduling tasks (reminders, alerts, notifications), a synthesize step
+  // that produces a non-empty message IS the deliverable. There is no browser
+  // page to verify and no shell output to inspect. Treat it as VERIFIED to avoid
+  // a false-hollow REPLAN loop.
+  //
+  // Broadened to fire whenever ALL of the following hold (independent of
+  // _taskClassification, which may be re-derived to local_system/local_file in
+  // the deferred reminder run):
+  //   1. A synthesize step produced non-empty stdout, AND
+  //   2. No browser.act / browser.agent step exists in the plan, AND
+  //   3. No getPageText / waitForStableText / get_recent_ocr result is present.
+  // This prevents REPLAN loops for reminder/notification/file-write tasks whose
+  // deliverable is the synthesize message itself.
+  const _synthStep = skillResults.find(r => r.skill === 'synthesize' && r.ok !== false);
+  const _synthOutput = String(_synthStep?.stdout || _synthStep?.result || '').trim();
+  if (_synthStep && _synthOutput.length > 0) {
+    const _hasBrowserStep = (skillPlan || []).some(s => s.skill === 'browser.act' || s.skill === 'browser.agent');
+    const _hasPageTextResult = skillResults.some(r =>
+      r.skill === 'browser.act' && (
+        r.args?.action === 'getPageText' ||
+        r.args?.action === 'waitForStableText' ||
+        r.args?.action === 'get_recent_ocr'
+      )
+    );
+    if (!_hasBrowserStep && !_hasPageTextResult) {
+      logger.info('[Node:ReviewExecution] synthesize produced a non-empty message with no browser steps to verify — skipping hollow check (message is the deliverable)');
+      return { ...state, reviewVerdict: 'VERIFIED' };
+    }
+    // Original narrow gate kept as a fallback for plans that DO have browser steps
+    // but are genuinely scheduling tasks (rare).
+    if (state._taskClassification?.taskType === 'scheduling') {
+      logger.info('[Node:ReviewExecution] synthesize produced a scheduling/notification message — skipping hollow check (scheduling taskType)');
+      return { ...state, reviewVerdict: 'VERIFIED' };
+    }
+  }
+
   // ── browser.agent short-circuit ───────────────────────────────────────────
   // If browser.agent reports success with action-completion signals in the result,
   // trust it without requiring page snapshot verification. This prevents false-hollow

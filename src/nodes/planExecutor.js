@@ -105,11 +105,18 @@ module.exports = async function planExecutor(state) {
 
   // 4b. Detect context mismatch and ask for a filename when the cached plan
   //     hardcoded a name derived from a prior browser context.
+  //     Gate 1: only run when the plan actually has browser steps — the question
+  //     "the active page has changed, what filename should I use?" only makes
+  //     sense for browser-save plans. Local file / image analysis / mixed plans
+  //     without browser steps have no browser page to go stale.
   const planContext = extractPlanContext(content);
   const currentContext = getCurrentBrowserContext(state);
   const hardcodedFilename = findHardcodedDesktopFilename(skillPlan);
+  const hasBrowserStep = skillPlan.some(
+    s => s.skill === 'browser.act' || s.skill === 'browser.agent'
+  );
 
-  if (hardcodedFilename && contextMismatch(planContext, currentContext)) {
+  if (hardcodedFilename && hasBrowserStep && contextMismatch(planContext, currentContext)) {
     logger.info(`[Node:PlanExecutor] Context mismatch — cached filename ${hardcodedFilename} may be stale`);
     const gatherAnswerCallback = state.gatherAnswerCallback;
     if (typeof gatherAnswerCallback === 'function') {
