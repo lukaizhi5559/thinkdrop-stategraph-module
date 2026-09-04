@@ -4,6 +4,7 @@ const http  = require('http');
 const https = require('https');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { fuzzyMatch } = require('../utils/fuzzyMatch');
 
 /**
  * resolveAgent.js — StateGraph node
@@ -58,6 +59,38 @@ const SERVICE_HOST_ALIASES = {
 };
 
 const NAV_START_URL_KEY_PREFIX = 'nav-start-url:';
+
+// Check if the user message mentions any registered agent, service name, or known
+// host alias — with fuzzy tolerance for misspellings (e.g. "CatGpt" → chatgpt).
+// Uses Levenshtein distance < 30% of longer token length (same threshold as
+// instruction.runner.cjs _fuzzyTextMatch).
+function _messageMentionsServiceOrAgent(userMessage, registeredAgents) {
+  if (!userMessage) return false;
+  const msg = userMessage.toLowerCase();
+  const tokens = msg.match(/[a-z0-9]+/g) || [];
+  if (tokens.length === 0) return false;
+
+  // Build the set of names to check against
+  const names = new Set();
+  for (const a of (registeredAgents || [])) {
+    if (a.id) names.add(a.id.toLowerCase().replace(/\.agent$/, '')); // "chatgpt" from "chatgpt.agent"
+    if (a.service) names.add(a.service.toLowerCase());
+  }
+  for (const [svc, aliases] of Object.entries(SERVICE_HOST_ALIASES)) {
+    names.add(svc.toLowerCase());
+    for (const alias of aliases) {
+      names.add(alias.toLowerCase().replace(/^www\./, '').replace(/\.[a-z]+$/, '')); // "chatgpt.com" → "chatgpt"
+    }
+  }
+
+  for (const token of tokens) {
+    if (token.length < 3) continue; // skip very short tokens (a, an, the)
+    for (const name of names) {
+      if (fuzzyMatch(token, name)) return true;
+    }
+  }
+  return false;
+}
 
 function _fallbackStartUrl(serviceKey) {
   return `https://www.${serviceKey}.com`;
@@ -235,6 +268,7 @@ Rules:
 - Do not include agents that are not needed for the task.
 - LOCAL MACHINE QUERIES: NEVER create or select an agent for local OS / shell queries — current time or date, system uptime, disk space, memory/CPU/battery usage, hardware info, running processes, hostname, OS version, environment variables, screen capture, or any task that runs against the local machine itself. These need NO service agent — return an empty "agents" array and "question": null. They are handled by generic shell/system skills, not by service agents.
 - LOCAL IMAGE ANALYSIS: NEVER create or select an agent for tasks involving local image files (png, jpg, screenshots, photos). These are handled by the generic image.analyze skill, not by a browser or REST agent. Return an empty "agents" array and "question": null.
+- LOCAL FILE / IMAGE TASKS: If the task references a local file ([File: ...], [Folder: ...]) or local image AND the user does NOT explicitly name an external service/provider to send, upload, post, or share to, do NOT select or create a browser/REST agent. These are handled by generic skills (fs.read, image.analyze, synthesize). Only select an agent if the user explicitly asks to send/upload/post/share the file to a specific named service (e.g. "upload this image to ChatGPT", "email this file via gmail"). For follow-up prompts, only select an agent if the conversation history establishes that an external service was being used.
 - FOLLOW-UP CONTEXT: When a FOLLOW-UP CONTEXT block is provided, the user is revising or continuing a prior task. Reuse the same service/agent from the prior turn — do NOT ask for clarification on already-established context (e.g., do not ask "Which platform?" if the prior turn already established the platform).
 - CONVERSATION HISTORY: When a RECENT CONVERSATION block is provided, use it to resolve ambiguous references in the current message (e.g., "the message" → the content from the prior turn).`
 
@@ -547,25 +581,6 @@ module.exports = async function resolveAgent(state) {
     };
   }
 
-  // ── Skip: local image analysis tasks need no service agent ─────────────────
-  // Image files on disk are analyzed by the generic `image.analyze` skill,
-  // not a registered browser/REST agent. Creating a fake "openai_vision.agent"
-  // (or similar) would trigger a browser OAuth auth wall that has no meaning
-  // for local files. Let planSkills handle it with the image.analyze skill.
-  if (state._taskClassification?.isImageAnalysis === true) {
-    logger.info(`[Node:ResolveAgent] Image analysis task — skipping agent selection (use image.analyze skill): "${userMessage.slice(0, 80)}"`);
-    return {
-      ...state,
-      resolveAgentResult: {
-        agents: [],
-        reasoning: 'Image analysis task — no service agent needed, use image.analyze skill',
-        question: null,
-        _message: userMessage,
-      },
-      resolveAgentAnswers: Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [],
-    };
-  }
-
   const priorAnswers = Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [];
 
   // ── Fetch registered agents ──────────────────────────────────────────────────
@@ -575,6 +590,32 @@ module.exports = async function resolveAgent(state) {
     registeredAgents = (agRes?.data || agRes || []).filter(a => a && a.id);
   } catch (e) {
     logger.warn(`[Node:ResolveAgent] Failed to fetch agent list: ${e.message}`);
+  }
+
+  // ── Skip: local_file / image_analysis tasks with no service mentioned ──────
+  // These tasks are handled by generic skills (fs.read, image.analyze, synthesize).
+  // Only skip when the user did NOT name a service/agent (fuzzy-checked) AND this
+  // is not a follow-up (follow-ups let the LLM selection use conversation history).
+  // Exception: "upload this image to ChatGPT" → mention detected → don't skip.
+  const _tc = state._taskClassification;
+  if (_tc && (_tc.taskType === 'local_file' || _tc.isImageAnalysis === true)) {
+    const _isFollowUp = !!_tc.isFollowUp;
+    const _hasTargetService = !!_tc.targetService;
+    const _mentionsService = _messageMentionsServiceOrAgent(userMessage, registeredAgents);
+    if (!_isFollowUp && !_hasTargetService && !_mentionsService) {
+      logger.info(`[Node:ResolveAgent] ${_tc.isImageAnalysis ? 'image_analysis' : 'local_file'} task — no service/agent mentioned, skipping agent selection: "${userMessage.slice(0, 80)}"`);
+      return {
+        ...state,
+        resolveAgentResult: {
+          agents: [],
+          reasoning: `${_tc.isImageAnalysis ? 'Image analysis' : 'Local file'} task — no service agent mentioned`,
+          question: null,
+          _message: userMessage,
+        },
+        resolveAgentAnswers: Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [],
+      };
+    }
+    logger.info(`[Node:ResolveAgent] ${_tc.isImageAnalysis ? 'image_analysis' : 'local_file'} task but service mentioned (targetService=${_tc.targetService || 'null'}, mentionsService=${_mentionsService}, isFollowUp=${_isFollowUp}) — proceeding to LLM selection`);
   }
 
   // ── Inline Q&A loop (max MAX_ROUNDS) ───────────────────────────────────────
@@ -635,3 +676,4 @@ module.exports._verifyDiscoveredUrl = _verifyDiscoveredUrl;
 module.exports._resolveStartUrlForService = _resolveStartUrlForService;
 module.exports._discoverVerifiedStartUrl = _discoverVerifiedStartUrl;
 module.exports._httpGetBody = _httpGetBody;
+module.exports._messageMentionsServiceOrAgent = _messageMentionsServiceOrAgent;
