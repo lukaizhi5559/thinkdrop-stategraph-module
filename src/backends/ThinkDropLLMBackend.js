@@ -160,7 +160,13 @@ class ThinkDropLLMBackend extends LLMBackend {
           temperature: options.temperature || 0.7,
           stream: true,
           // command_automate planning needs paid providers (complex) — free models can't handle complex JSON
-          taskType: options.taskType || (context.intent === 'command_automate' ? 'complex' : 'planning')
+          taskType: options.taskType || (context.intent === 'command_automate' ? 'complex' : 'planning'),
+          // Pass through structured output constraints (responseFormat) so the
+          // backend router can forward them to the underlying provider. The
+          // backend expects camelCase `responseFormat` (matching the wire
+          // contract in thinkdrop-backend/src/types/streaming.ts). If the
+          // provider doesn't support it, the backend gracefully degrades.
+          ...(options.responseFormat ? { responseFormat: options.responseFormat } : {}),
         },
         context: {
           recentContext: (context.conversationHistory || []).map(msg => ({

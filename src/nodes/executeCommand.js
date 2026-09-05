@@ -4332,8 +4332,9 @@ Please try again or search with different terms.`;
   // browser.agent / cli.agent: pipeline is waitForAuth (up to 120s) + playwright.agent
   // (up to 15 turns × ~3s each). 60s default kills the task mid-execution and causes
   // a retry that hijacks the same Chrome session, corrupting in-progress automation.
+  // 7 min allows Tab-Flow (up to 210s) + turn-loop recovery + Tab-Flow re-entry.
   if (skill === 'browser.agent' || skill === 'cli.agent') {
-    stepTimeoutMs = Math.max(stepTimeoutMs, 300000); // 5 min
+    stepTimeoutMs = Math.max(stepTimeoutMs, 420000); // 7 min
   }
   // app.agent long-running monitors run their own internal loop for up to maxDurationMs.
   // The MCP HTTP timeout must exceed that or the call is killed while the monitor is still running.
@@ -4725,8 +4726,8 @@ Please try again or search with different terms.`;
       const _callArgs = _isAgent
         ? { ...gsArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
         : gsArgs;
-      // Extended timeout for parallel browser steps to handle YouTube searches
-      const stepTimeoutMs = gs.skill === 'browser.agent' ? 360000 : 300000; // 6 min for browser, 5 min for CLI
+      // Extended timeout for parallel browser steps to handle YouTube searches + Tab-Flow
+      const stepTimeoutMs = gs.skill === 'browser.agent' ? 420000 : 300000; // 7 min for browser, 5 min for CLI
 
       // Inner function to attempt step with optional retry
       const attemptStep = async (isRetry = false) => {

@@ -1764,16 +1764,27 @@ module.exports = async function preflightAgents(state) {
       continue;
     }
 
-    // ── 24h persistent auth cache: skip CDP probe for recently-authed agents ──
-    // If the agent was authenticated within the last 24h (persisted to disk so
-    // it survives app restart) AND the browser session cookies are not stale
-    // (within the 7-day BROWSER_SESSION_MAX_AGE_MS window), skip the multi-second
-    // CDP cookie-sniff probe entirely. The 7-day stale check is the safety net:
-    // if cookies are old enough to be questionable, ignore the cache and probe.
+    // ── 24h persistent auth/usage cache: skip entire probe for recently-used agents ──
+    // If the agent was authenticated OR used within the last 24h (persisted to
+    // disk so it survives app restart) AND the browser session cookies are not
+    // stale (within the 7-day BROWSER_SESSION_MAX_AGE_MS window), skip the
+    // multi-second auth probe entirely — not just the CDP cookie-sniff, but the
+    // whole _authenticateBrowserAgent call. The 7-day stale check is the safety
+    // net: if cookies are old enough to be questionable, ignore the cache and probe.
+    //
+    // The `lastUsed` field is written by browser.agent.cjs actionRun on every
+    // real task execution, so agents that have been used recently (even if auth
+    // was confirmed > 24h ago) get the bypass.
     if (!a.sessionStale) {
       const _persistentAuth = _getCachedAuthPersistent(a.agentId);
-      if (_persistentAuth && _persistentAuth.authed) {
-        logger.info(`[Node:PreflightAgents] ${a.agentId} authed within 24h (persistent cache) — skipping CDP probe`);
+      const _authedRecently = _persistentAuth && _persistentAuth.authed;
+      const _usedRecently = _persistentAuth && _persistentAuth.lastUsed &&
+        (Date.now() - _persistentAuth.lastUsed < PREFLIGHT_AUTH_CACHE_PERSISTENT_TTL_MS);
+      if (_authedRecently || _usedRecently) {
+        const _reason = _usedRecently && !_authedRecently
+          ? `used within 24h (lastUsed=${new Date(_persistentAuth.lastUsed).toISOString()})`
+          : 'authed within 24h (persistent cache)';
+        logger.info(`[Node:PreflightAgents] ${a.agentId} ${_reason} — bypassing auth probe entirely`);
         markAgentAuthed(a.agentId); // refresh both in-memory and persistent cache
         a.authed = true;
         a.ready = true;
