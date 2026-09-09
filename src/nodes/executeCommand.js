@@ -5080,7 +5080,25 @@ Please try again or search with different terms.`;
     }
 
     if (firstFailure && succeededCount === 0) {
-      // All steps failed — route to recovery
+      // All steps failed — but if a synthesize step remains later in the plan,
+      // advance the cursor so synthesize runs first (assessing partial results)
+      // before reviewExecution decides whether to replan. This ensures the LLM
+      // sees what was actually accomplished before triggering a replan.
+      const _remainingPlan = skillPlan.slice(nextCursor);
+      const _hasSynthesize = _remainingPlan.some(s => s.skill === 'synthesize');
+      if (_hasSynthesize) {
+        logger.info(`[Node:ExecuteCommand] runGroup "${groupId}" failed but synthesize step remains — advancing cursor to ${nextCursor} (synthesize will assess partial results)`);
+        return {
+          ...state,
+          skillResults: newResults,
+          stepContracts: newStepContracts,
+          webAgentBestUrl: newWebAgentBestUrl,
+          skillCursor: nextCursor,
+          commandExecuted: false,
+          failedStep: null, // Don't set — let synthesize run first
+        };
+      }
+      // No synthesize remaining — route to recovery
       return {
         ...state,
         skillResults: newResults,

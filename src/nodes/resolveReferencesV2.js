@@ -81,7 +81,10 @@ module.exports = async function resolveReferencesV2(state) {
 
   // ── Surface progress: this is the first node in the graph, so the user sees
   // this message while we fetch conversation history + run classifyTask.
-  if (state.progressCallback) {
+  // Skip for plan execution runs — the user already approved the plan and the UI
+  // is already in 'executing' state (optimistic transition). A 'planning' event
+  // here would reset the UI to "Understanding your request...".
+  if (state.progressCallback && !state._planFile) {
     try { state.progressCallback({ type: 'planning', message: 'Understanding your request…' }); }
     catch (_) { /* progress callback must never block execution */ }
   }
@@ -154,13 +157,26 @@ module.exports = async function resolveReferencesV2(state) {
 
   // ── Classify task once — all downstream nodes read from _taskClassification ──────────
   // This replaces per-node NLU regex (BYPASS_PATTERNS, _LOCAL_ACTION_VERBS, etc.)
-  const _taskClassification = await classifyTask(
-    message,
-    conversationHistory,
-    state.llmBackend || null,
-    logger,
-    priorScreenSummary,
-  );
+  // Skip for plan execution runs — the plan already has all steps, so the 15+ second
+  // LLM classification call is unnecessary. planExecutor/planSkills don't need it.
+  let _taskClassification;
+  if (state._planFile) {
+    _taskClassification = {
+      taskType: 'ambiguous', isFollowUp: false, followUpTarget: null,
+      needsClarification: false, targetService: null, isRecurring: false,
+      isBrowseOnly: false, requiresDOM: false, isScreenFollowUp: false,
+      needsFreshScreen: false, isAppUiInspection: false, isSpatialAnalysis: false,
+      isImageAnalysis: false, isConversationRecall: false,
+    };
+  } else {
+    _taskClassification = await classifyTask(
+      message,
+      conversationHistory,
+      state.llmBackend || null,
+      logger,
+      priorScreenSummary,
+    );
+  }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
 
   return {

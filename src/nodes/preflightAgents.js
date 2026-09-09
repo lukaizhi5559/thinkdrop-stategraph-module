@@ -273,17 +273,23 @@ const AGENT_DOMAIN_OVERRIDES = {
   ffmpeg: 'ffmpeg.org',
 };
 
-function agentIdToDomain(agentId) {
+function agentIdToDomain(agentId, startUrl) {
+  if (startUrl) {
+    try { return new URL(startUrl).hostname; } catch (_) {}
+  }
   const base = agentId.replace(/\.agent$/i, '').toLowerCase();
   return AGENT_DOMAIN_OVERRIDES[base] || `${base}.com`;
 }
 
-function agentIdToIconUrl(agentId) {
-  const domain = agentIdToDomain(agentId);
+function agentIdToIconUrl(agentId, startUrl) {
+  const domain = agentIdToDomain(agentId, startUrl);
   return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=128`;
 }
 
-function serviceToIconUrl(service) {
+function serviceToIconUrl(service, startUrl) {
+  if (startUrl) {
+    try { return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(new URL(startUrl).hostname)}&sz=128`; } catch (_) {}
+  }
   const base = (service || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(AGENT_DOMAIN_OVERRIDES[base] || `${base}.com`)}&sz=128`;
 }
@@ -456,14 +462,23 @@ module.exports = async function preflightAgents(state) {
     const failedCreates = [];
     const noCliFailures = []; // CLI agent builds that failed because no CLI exists for the service
     for (const spec of createAgentSpecs) {
-      const skillName = spec.type === 'cli' ? 'cli.agent' : (spec.type === 'app' ? 'app.agent' : 'browser.agent');
+      // Per-service 'app' agents are not creatable through this path — the
+      // app.agent build_agent contract requires appName (not service) and the
+      // desktop route is handled by the generic app.agent skill. resolveAgent
+      // already coerces these, but guard here too for specs arriving from
+      // other callers (e.g. recoveryContext).
+      if (spec.type === 'app') {
+        logger.info(`[Node:PreflightAgents] Coercing create spec ${spec.agentId} from type 'app' → 'browser'`);
+        spec.type = 'browser';
+      }
+      const skillName = spec.type === 'cli' ? 'cli.agent' : 'browser.agent';
       try {
         _emitProgress({
           type: 'preflight:building_agent',
           agentType: spec.type,
           agentId: spec.agentId,
           message: `Building ${spec.service} agent…`,
-          iconUrl: serviceToIconUrl(spec.service),
+          iconUrl: serviceToIconUrl(spec.service, spec.startUrl),
         });
         const buildArgs = {
           action: 'build_agent',
@@ -569,7 +584,7 @@ module.exports = async function preflightAgents(state) {
       ready: true,
       authed: false,
       authType: 'browser_oauth',
-      iconUrl: agentIdToIconUrl(_newAgentId),
+      iconUrl: agentIdToIconUrl(_newAgentId, spec.startUrl),
       startUrl: spec.startUrl || null,
       needsLogin: true,
       sessionStale: false,
@@ -834,7 +849,7 @@ module.exports = async function preflightAgents(state) {
             // ── Browser agent auth check (session profile + cookie validity) ──
             // NOTE: agentLines.push() is deferred to after auth is determined below
             if (a.type === 'browser') {
-              const iconUrl = agentIdToIconUrl(a.id);
+              const iconUrl = agentIdToIconUrl(a.id, a.start_url);
               const BROWSER_PROFILES_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-profiles');
               const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
               const profileDir = `${svcKey}_agent`;
@@ -897,7 +912,7 @@ module.exports = async function preflightAgents(state) {
               });
             } else if (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') {
               // Credential agents are not browser-authenticated; they need a stored token.
-              const iconUrl = agentIdToIconUrl(a.id);
+              const iconUrl = agentIdToIconUrl(a.id, a.start_url);
               const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
               agentLines.push(`- ${a.id}: ${_agentBaseDesc} [NEEDS CREDENTIAL]`);
               agentReadiness.push({
@@ -927,7 +942,7 @@ module.exports = async function preflightAgents(state) {
               const _cliAuthTag = _cliAuthed ? '' : ' [NEEDS AUTH]';
               agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_cliAuthTag}`);
               if (cliInfo && !cliInfo.hasCli) {
-                const iconUrl = agentIdToIconUrl(a.id);
+                const iconUrl = agentIdToIconUrl(a.id, a.start_url);
                 agentReadiness.push({
                   type: 'cli',
                   agentId: a.id,

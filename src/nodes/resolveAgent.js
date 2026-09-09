@@ -60,6 +60,46 @@ const SERVICE_HOST_ALIASES = {
 
 const NAV_START_URL_KEY_PREFIX = 'nav-start-url:';
 
+// Deterministic check: does the given start_url's domain contain the targetService
+// tokens? Used in _normalizeAgentResult to reject wrong-service agent selections
+// (e.g. notion.agent selected for a Linear task).
+//
+// Examples:
+//   _domainsMatchService('https://app.notion.com', 'linear')        → false (mismatch)
+//   _domainsMatchService('https://linear.app', 'linear')            → true
+//   _domainsMatchService('https://calendar.google.com', 'google_calendar') → true
+//   _domainsMatchService('https://mail.google.com', 'gmail')        → true (alias)
+//
+// Token matching: targetService is split into tokens (e.g. "google_calendar" →
+// ["google", "calendar"]). Each service token (length >= 3) must appear in the
+// domain tokens, with bidirectional substring tolerance.
+function _domainsMatchService(startUrl, targetService) {
+  if (!startUrl || !targetService) return false;
+  let host;
+  try { host = new URL(startUrl).hostname.toLowerCase(); }
+  catch (_) { return false; }
+  const domainTokens = host.split('.').filter(t => t && t !== 'www');
+  const svcKey = targetService.toLowerCase().replace(/[^a-z0-9_]/g, '');
+  // Split targetService into tokens: "google_calendar" → ["google", "calendar"]
+  const svcTokens = svcKey
+    .split(/[_\s]+/)
+    .filter(t => t.length >= 3); // ignore short tokens
+  if (svcTokens.length === 0) return false;
+  // Check 1: all service tokens appear in the domain tokens (bidirectional substring)
+  const tokenMatch = svcTokens.every(svcTok =>
+    domainTokens.some(domTok => domTok === svcTok || domTok.includes(svcTok) || svcTok.includes(domTok))
+  );
+  if (tokenMatch) return true;
+  // Check 2: the domain matches a known alias for the service
+  // (e.g. gmail → google.com, so mail.google.com matches gmail)
+  const aliases = SERVICE_HOST_ALIASES[svcKey] || [];
+  const aliasMatch = aliases.some(alias => {
+    const a = alias.toLowerCase().replace(/^www\./, '');
+    return host === a || host.endsWith('.' + a);
+  });
+  return aliasMatch;
+}
+
 // Check if the user message mentions any registered agent, service name, or known
 // host alias — with fuzzy tolerance for misspellings (e.g. "CatGpt" → chatgpt).
 // Uses Levenshtein distance < 30% of longer token length (same threshold as
@@ -262,6 +302,7 @@ Rules:
 - If the user explicitly mentions an agent, service, or provider by name (e.g., "my gmail agent", "via gmail", "use notion"), select it.
 - If the task clearly maps to one or more registered agents, return them in the "agents" array and set "question" to null.
 - If the task clearly maps to a browser service but no matching agent is registered, emit "create": true, "type": "browser", and include "startUrl". For REST credential services, use "type": "api_key"/"bearer"/"basic" and include "startUrl". Do NOT ask the user "Would you like to create an agent?".
+- For "create": true agents, only use types "browser", "cli", "api_key", "bearer", or "basic" — never "app". Desktop-app control is handled by the generic app.agent skill and does not need a per-service agent, even when the service has a desktop app (e.g. Figma, Slack, Spotify).
 - If the task is ambiguous and the service/domain cannot be inferred (e.g., "send an email" without naming a provider), return a concise question like "Which email service should I use?" and leave "agents" empty.
 - Only ask the user for clarification when the service is genuinely unknown or ambiguous. Never ask for permission to create an agent.
 - The question must be 15 words or fewer.
@@ -403,7 +444,8 @@ async function _callSelectionLLM(llmBackend, userMessage, registeredAgents, prio
   const agentBlock = registeredAgents.length > 0
     ? `\n\nREGISTERED AGENTS:\n${registeredAgents.map(a => {
       const caps = Array.isArray(a.capabilities) ? a.capabilities.join(', ') : '';
-      return `- ${a.id} (type: ${a.type}, service: ${a.service || 'n/a'}, status: ${a.status || 'unknown'}, capabilities: ${caps || 'none'})`;
+      const url = a.start_url || a.startUrl || 'n/a';
+      return `- ${a.id} (type: ${a.type}, service: ${a.service || 'n/a'}, startUrl: ${url}, status: ${a.status || 'unknown'}, capabilities: ${caps || 'none'})`;
     }).join('\n')}`
     : '\n\nREGISTERED AGENTS: none';
 
@@ -494,7 +536,7 @@ function _targetServiceFallback(registeredAgents, taskClassification, reasoning)
   return { agents: [], reasoning: reasoning, question: 'Which service or agent should I use?' };
 }
 
-async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpAdapter, logger) {
+async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpAdapter, logger, taskClassification = null) {
   const normalized = { agents: [], reasoning: result.reasoning || '', question: result.question || null };
   const registeredIds = new Set((registeredAgents || []).map(a => a.id?.toLowerCase()).filter(Boolean));
 
@@ -505,8 +547,30 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
     if (!agentId.endsWith('.agent')) agentId += '.agent';
     const exists = registeredIds.has(agentId);
     const service = a.service || agentId.replace(/\.agent$/, '');
-    const create = !!a.create;
-    const type = a.type || 'browser';
+    let create = !!a.create;
+    let type = a.type || 'browser';
+
+    // Registry is authoritative for existence. The LLM occasionally reports
+    // exists:false / create:true for an agent that IS registered (e.g.
+    // google_calendar.agent), which would cause preflightAgents to rebuild the
+    // agent on every run and wipe its authed_at — forcing the user to
+    // re-authenticate. When the registry says the agent exists, force
+    // exists:true / create:false and log the coercion so the misreport is visible.
+    if (exists && (a.exists === false || create)) {
+      logger.info(`[Node:ResolveAgent] LLM reported exists=${a.exists === undefined ? 'n/a' : a.exists}/create=${create} for registered agent ${agentId} — coercing to exists=true/create=false (registry authoritative)`);
+      create = false;
+    }
+
+    // Never create per-service 'app' agents through this path — desktop app
+    // control is handled by the generic app.agent skill, and the app.agent
+    // build_agent contract requires appName (not service), which this pipeline
+    // doesn't supply. The LLM occasionally picks 'app' for services that have
+    // a desktop app (e.g. Figma) — coerce to 'browser' so the universal
+    // browser fallback is used instead.
+    if (create && type === 'app') {
+      logger.info(`[Node:ResolveAgent] Coercing create spec ${agentId} from type 'app' → 'browser' (per-service app agents are not creatable)`);
+      type = 'browser';
+    }
     let startUrl = a.startUrl || null;
     if (create && (type === 'browser' || type === 'api_key' || type === 'bearer' || type === 'basic') && !startUrl) {
       startUrl = await _resolveStartUrlForService(service, userMessage, mcpAdapter, logger);
@@ -515,12 +579,54 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
     normalized.agents.push({
       agentId,
       role: a.role || '',
-      exists: a.exists === undefined ? exists : !!a.exists,
+      exists,
       create,
       type,
       service,
       startUrl,
     });
+  }
+
+  // ── Post-hoc URL/domain validation ──────────────────────────────────────────
+  // Deterministic guard against the LLM picking a wrong-service registered agent
+  // (e.g. notion.agent for a Linear task). When taskClassification.targetService
+  // is set, each selected registered agent's start_url domain is compared against
+  // the targetService tokens. Mismatches are rejected and the correct agent is
+  // created instead. This makes it impossible for a wrong-service agent to be
+  // selected when the target service is known.
+  const targetService = (taskClassification?.targetService || taskClassification?.followUpTarget || '').toLowerCase();
+  if (targetService) {
+    const targetSvcKey = targetService.replace(/[^a-z0-9_]/g, '');
+    const targetAgentId = `${targetSvcKey}.agent`;
+    const targetRegistered = registeredIds.has(targetAgentId);
+    const rejected = [];
+    for (const a of normalized.agents) {
+      if (a.create) continue; // only validate registered (non-create) agents
+      const regAgent = (registeredAgents || []).find(r => r.id?.toLowerCase() === a.agentId);
+      const agentStartUrl = regAgent?.start_url || regAgent?.startUrl || null;
+      if (agentStartUrl && !_domainsMatchService(agentStartUrl, targetService)) {
+        rejected.push(a);
+      }
+    }
+    if (rejected.length > 0) {
+      logger.info(`[Node:ResolveAgent] URL/domain mismatch — rejecting ${rejected.map(a => a.agentId).join(', ')} (startUrl doesn't match targetService="${targetService}") — creating ${targetAgentId} instead`);
+      normalized.agents = normalized.agents.filter(a => !rejected.includes(a));
+      if (!normalized.agents.some(a => a.agentId === targetAgentId)) {
+        let startUrl = null;
+        if (!targetRegistered) {
+          startUrl = await _resolveStartUrlForService(targetService, userMessage, mcpAdapter, logger);
+        }
+        normalized.agents.push({
+          agentId: targetAgentId,
+          role: rejected[0]?.role || '',
+          exists: targetRegistered,
+          create: !targetRegistered,
+          type: 'browser',
+          service: targetService,
+          startUrl,
+        });
+      }
+    }
   }
 
   return normalized;
@@ -567,7 +673,12 @@ module.exports = async function resolveAgent(state) {
   // chosen by planSkills — never by registered service agents. Letting the LLM
   // selection run here caused it to hallucinate fake service agents like
   // "system_time.agent" / "time_is.agent" that then crashed preflight.
-  if (state._taskClassification?.taskType === 'local_system') {
+  //
+  // Safety net: when the classifier set targetService (e.g. "google calendar"),
+  // the task likely involves a web service even if it was misclassified as
+  // local_system. Still run agent selection so the right service agent is picked.
+  const _tcLocal = state._taskClassification;
+  if (_tcLocal?.taskType === 'local_system' && !_tcLocal?.targetService) {
     logger.info(`[Node:ResolveAgent] local_system task — skipping agent selection (no service agent needed): "${userMessage.slice(0, 80)}"`);
     return {
       ...state,
@@ -580,6 +691,9 @@ module.exports = async function resolveAgent(state) {
       resolveAgentAnswers: Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [],
     };
   }
+  if (_tcLocal?.taskType === 'local_system' && _tcLocal?.targetService) {
+    logger.info(`[Node:ResolveAgent] local_system task but targetService="${_tcLocal.targetService}" set — proceeding to agent selection (possible misclassification): "${userMessage.slice(0, 80)}"`);
+  }
 
   const priorAnswers = Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [];
 
@@ -588,6 +702,7 @@ module.exports = async function resolveAgent(state) {
   try {
     const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
     registeredAgents = (agRes?.data || agRes || []).filter(a => a && a.id);
+    logger.info(`[Node:ResolveAgent] agent.list returned ${registeredAgents.length} agent(s): ${registeredAgents.map(a => a.id).join(', ') || '(none)'}`);
   } catch (e) {
     logger.warn(`[Node:ResolveAgent] Failed to fetch agent list: ${e.message}`);
   }
@@ -624,7 +739,7 @@ module.exports = async function resolveAgent(state) {
     logger.info(`[Node:ResolveAgent] Round ${round + 1}/${MAX_ROUNDS} — selecting agents for: "${userMessage.slice(0, 80)}"`);
 
     const result = await _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorAnswers, logger, 1, state._taskClassification, state.conversationHistory);
-    const normalized = await _normalizeAgentResult(result, registeredAgents, userMessage, mcpAdapter, logger);
+    const normalized = await _normalizeAgentResult(result, registeredAgents, userMessage, mcpAdapter, logger, state._taskClassification);
 
     logger.info(`[Node:ResolveAgent] Selection: ${normalized.agents.length} agent(s), question: ${normalized.question || 'none'}`);
 
@@ -677,3 +792,4 @@ module.exports._resolveStartUrlForService = _resolveStartUrlForService;
 module.exports._discoverVerifiedStartUrl = _discoverVerifiedStartUrl;
 module.exports._httpGetBody = _httpGetBody;
 module.exports._messageMentionsServiceOrAgent = _messageMentionsServiceOrAgent;
+module.exports._domainsMatchService = _domainsMatchService;

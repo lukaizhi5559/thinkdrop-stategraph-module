@@ -595,7 +595,13 @@ class StateGraphBuilder {
         if (state.failedStep) {
           logger.warn(`[StateGraph:Router] executeCommand: failedStep without recoveryAction → evaluateSkills (fallback)`);
           state.recoveryAction = 'replan';
-          state.recoveryContext = { failedSkill: state.failedStep.skill, failureReason: state.failedStep.error };
+          state.recoveryContext = {
+            failedSkill: state.failedStep.skill,
+            failureReason: state.failedStep.error,
+            succeededSteps: (state.skillResults || [])
+              .filter(r => r.ok)
+              .map(r => ({ step: r.step, skill: r.skill, description: r.description, result: (r.stdout || r.result || '').toString().slice(0, 200) })),
+          };
           return 'evaluateSkills';
         }
         // Scout card is waiting for user provider selection — stop looping, surface ASK_USER

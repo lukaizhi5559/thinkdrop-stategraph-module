@@ -558,13 +558,16 @@ function _buildSystemPrompt(userMessage, state) {
   // the real focused app name, category, window title, and URL (if any).
   // Skip when the active window is ThinkDrop itself — the window title may contain
   // plan file names that leak stale context into the planning prompt.
+  // ALSO skip for non-follow-up command_automate intents: the OCR from a previous
+  // (often failed) attempt can falsely imply the task is already complete.
   const _screenNote = state._screenContextNote;
   const _screenIsStale = state._priorScreenContext && (
     state._priorScreenContext.appName === 'Electron' ||
     state._priorScreenContext.appName === 'ThinkDrop' ||
     (state._priorScreenContext.windowTitle || '').toLowerCase().includes('thinkdrop —')
   );
-  if (_screenNote && !_screenIsStale && typeof _screenNote === 'string' && _screenNote.length > 0) {
+  const _isNonFollowUpAutomate = state.intent?.type === 'command_automate' && !state._taskClassification?.isFollowUp;
+  if (_screenNote && !_screenIsStale && !_isNonFollowUpAutomate && typeof _screenNote === 'string' && _screenNote.length > 0) {
     result += `\n\n## ACTIVE SCREEN CONTEXT (live — use this app as the target for screen-related tasks)\n\n${_screenNote}`;
   }
 
@@ -901,6 +904,13 @@ async function planSkillsV2(state) {
     if (recoveryContext.constraint?.includes('USE GOAL MODE')) {
       recoveryNote += '\n⚠️ GOAL MODE REQUIRED: For any shell.run step, emit { "skill": "shell.run", "args": { "goal": "<plain English description>" } }. Do NOT write args.cmd or args.argv.';
     }
+    // Include already-succeeded steps so the replan LLM can skip them
+    if (Array.isArray(recoveryContext.succeededSteps) && recoveryContext.succeededSteps.length > 0) {
+      const _succeededSummary = recoveryContext.succeededSteps
+        .map(s => `  ✓ Step ${s.step}: ${s.skill} — ${s.description || ''} (result: ${(s.result || 'ok').slice(0, 100)})`)
+        .join('\n');
+      recoveryNote += `\n\nALREADY COMPLETED STEPS (DO NOT re-create these — skip them in the new plan):\n${_succeededSummary}`;
+    }
   }
 
   let correctionNote = '';
@@ -985,6 +995,16 @@ async function planSkillsV2(state) {
         priorSynthesizedContent = (synthMatch ? synthMatch[1] : after).trim().slice(0, 2000);
       }
     }
+  }
+
+  // For non-follow-up command_automate tasks, previous conversation results
+  // (assistant syntheses, system events, etc.) can falsely imply the task is
+  // already complete. The current user request is already in the User request
+  // field below, so drop the stale conversation context for fresh commands.
+  const _isNonFollowUpAutomate = state.intent?.type === 'command_automate' && !state._taskClassification?.isFollowUp;
+  if (_isNonFollowUpAutomate && conversationNote) {
+    logger.info(`[Node:PlanSkillsV2] Non-follow-up command_automate — clearing stale conversationNote from planning prompt`);
+    conversationNote = '';
   }
 
   // ── Constraint gate ───────────────────────────────────────────────────────
@@ -1485,53 +1505,53 @@ async function planSkillsV2(state) {
   // resolveReferencesV2 via classifyTask) — NOT regex, which is fragile (false
   // positives on "new"/"book"/"post" in read contexts, false negatives on gerunds
   // like "creating"/"adding").
-  if (!recoveryContext && !state._planCorrectionMode && !state._skipTrainingGate) {
-    const _tc = state._taskClassification;
-    const _isBrowserMutation = _tc?.taskType === 'browser'
-      && _tc?.requiresDOM === true;
-    // Multi-step signal: decomposePrompt subPrompts > 1, or 2+ distinct mutation
-    // action clauses joined by "and" (e.g. "create a playlist and add X, Y, Z").
-    const _subPrompts = Array.isArray(state.subPrompts) ? state.subPrompts : null;
-    const _hasMultiSubPrompts = _subPrompts && _subPrompts.length > 1;
-    const _hasAndConjunction = /\b(?:and|then|also)\b/i.test(userMessage)
-      && /\b(?:create|make|build|add|post|share|send|write|edit|update|delete|remove|upload|publish|submit|compose|draft)\b/i.test(userMessage);
-    const _isMultiStep = !!(_hasMultiSubPrompts || _hasAndConjunction);
+  // if (!recoveryContext && !state._planCorrectionMode && !state._skipTrainingGate) {
+  //   const _tc = state._taskClassification;
+  //   const _isBrowserMutation = _tc?.taskType === 'browser'
+  //     && _tc?.requiresDOM === true;
+  //   // Multi-step signal: decomposePrompt subPrompts > 1, or 2+ distinct mutation
+  //   // action clauses joined by "and" (e.g. "create a playlist and add X, Y, Z").
+  //   const _subPrompts = Array.isArray(state.subPrompts) ? state.subPrompts : null;
+  //   const _hasMultiSubPrompts = _subPrompts && _subPrompts.length > 1;
+  //   const _hasAndConjunction = /\b(?:and|then|also)\b/i.test(userMessage)
+  //     && /\b(?:create|make|build|add|post|share|send|write|edit|update|delete|remove|upload|publish|submit|compose|draft)\b/i.test(userMessage);
+  //   const _isMultiStep = !!(_hasMultiSubPrompts || _hasAndConjunction);
 
-    if (_isBrowserMutation && _isMultiStep) {
-      // For follow-up / ambiguous prompts _tc.targetService may be null even though
-      // resolveAgent already selected the right agent. Use the resolved agent as a
-      // fallback so the training gate has a real agentId to hand off to.
-      const _resolvedAgentId = state.resolveAgentResult?.agents?.[0]?.agentId || null;
-      const _targetService = _tc?.targetService
-        || (_resolvedAgentId ? _resolvedAgentId.replace(/\.agent$/i, '') : null);
-      const _agentId = _resolvedAgentId || (_targetService ? `${_targetService}.agent` : null);
-      logger.info(`[Node:PlanSkillsV2] Training gate: browser mutation + multi-step + no trained recipe — surfacing guided training offer (service=${_targetService || 'unknown'}, agentId=${_agentId || 'none'})`);
-      const _gatePlan = [{
-        skill: 'ask_user',
-        description: `Training required for: ${userMessage.slice(0, 80)}`,
-        args: {
-          question: `This task (${userMessage.slice(0, 120)}) requires multiple steps on ${_targetService || 'this service'} that I haven't been trained on yet. I can't guarantee it'll work without training. Would you like to train me?`,
-          options: [
-            { label: 'Start guided training', value: 'guided_train' },
-            { label: 'Proceed anyway', value: 'proceed_anyway' },
-            { label: 'Cancel', value: 'cancel' },
-          ],
-          trainingHandoff: true,
-          agentId: _agentId,
-          originalTask: userMessage,
-          trainingTask: resolvedMessage || message || userMessage,
-        },
-      }];
-      if (progressCallback) {
-        progressCallback({
-          type: 'plan_ready',
-          steps: _gatePlan.map((s, i) => ({ index: i, ...s })),
-          intent: state.intent?.type || 'command_automate',
-        });
-      }
-      return { ...state, skillPlan: _gatePlan, skillCursor: 0, planError: null, recoveryContext: null };
-    }
-  }
+  //   if (_isBrowserMutation && _isMultiStep) {
+  //     // For follow-up / ambiguous prompts _tc.targetService may be null even though
+  //     // resolveAgent already selected the right agent. Use the resolved agent as a
+  //     // fallback so the training gate has a real agentId to hand off to.
+  //     const _resolvedAgentId = state.resolveAgentResult?.agents?.[0]?.agentId || null;
+  //     const _targetService = _tc?.targetService
+  //       || (_resolvedAgentId ? _resolvedAgentId.replace(/\.agent$/i, '') : null);
+  //     const _agentId = _resolvedAgentId || (_targetService ? `${_targetService}.agent` : null);
+  //     logger.info(`[Node:PlanSkillsV2] Training gate: browser mutation + multi-step + no trained recipe — surfacing guided training offer (service=${_targetService || 'unknown'}, agentId=${_agentId || 'none'})`);
+  //     const _gatePlan = [{
+  //       skill: 'ask_user',
+  //       description: `Training required for: ${userMessage.slice(0, 80)}`,
+  //       args: {
+  //         question: `This task (${userMessage.slice(0, 120)}) requires multiple steps on ${_targetService || 'this service'} that I haven't been trained on yet. I can't guarantee it'll work without training. Would you like to train me?`,
+  //         options: [
+  //           { label: 'Start guided training', value: 'guided_train' },
+  //           { label: 'Proceed anyway', value: 'proceed_anyway' },
+  //           { label: 'Cancel', value: 'cancel' },
+  //         ],
+  //         trainingHandoff: true,
+  //         agentId: _agentId,
+  //         originalTask: userMessage,
+  //         trainingTask: resolvedMessage || message || userMessage,
+  //       },
+  //     }];
+  //     if (progressCallback) {
+  //       progressCallback({
+  //         type: 'plan_ready',
+  //         steps: _gatePlan.map((s, i) => ({ index: i, ...s })),
+  //         intent: state.intent?.type || 'command_automate',
+  //       });
+  //     }
+  //     return { ...state, skillPlan: _gatePlan, skillCursor: 0, planError: null, recoveryContext: null };
+  //   }
+  // }
 
   // ── Build the LLM planning query ──────────────────────────────────────────
   const runtimeNote = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, priorSynthesizedContent)
@@ -1686,6 +1706,14 @@ The user's request does NOT match any installed skill.
     _systemInfoFreshDataNote,
     `\n\nUser request: "${(runtimeParamMessage || userMessage).replace(/"/g, '\\"').slice(0, 2000)}"`,
   ].filter(Boolean).join('\n');
+
+  // Debug: write the planning prompt to a temp file so we can see exactly
+  // what prior context is being passed to the LLM.
+  try {
+    const debugPath = `/tmp/thinkdrop_plan_prompt_${Date.now()}.txt`;
+    fs.writeFileSync(debugPath, planningQuery, 'utf8');
+    logger.info(`[Node:PlanSkillsV2] Planning prompt written to ${debugPath} (length=${planningQuery.length})`);
+  } catch (_e) { /* non-fatal */ }
 
   // ── Single-step replan mode ───────────────────────────────────────────────
   // When recoverSkill decides only the failed step needs regeneration, we generate
@@ -1959,6 +1987,7 @@ The user's request does NOT match any installed skill.
   //   - Same agent in multiple steps → same URL → browser.agent skips re-navigation
   // Exception: template variables ({{bestUrl}}, {{PREV_OUTPUT}}) are preserved —
   // they come from prior step output, not the LLM's guess.
+
   if (Array.isArray(skillPlan)) {
     const deepLinkMap = new Map();
     const pfAgents = state?.preflightResult?.agents || [];

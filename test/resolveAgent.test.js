@@ -294,6 +294,44 @@ async function runTests() {
     if (listCalls.length !== 0) throw new Error(`Expected cache hit, but agent.list was called ${listCalls.length} times`);
   });
 
+  section('App-type create coercion');
+  await it("coerces create:true type:'app' to 'browser' (deleted-agent re-create path)", async () => {
+    const userMessage = "Open Figma and create a new design file called 'Church Logo Draft'";
+    const adapter = makeMcpAdapter({});
+    const llmBackend = {
+      async generateAnswer() {
+        return JSON.stringify({
+          agents: [{
+            agentId: 'figma.agent',
+            role: 'open Figma and create a new design file',
+            exists: false,
+            create: true,
+            type: 'app',
+            service: 'figma',
+          }],
+          reasoning: 'Figma has a desktop app.',
+          question: null,
+        });
+      },
+    };
+    const state = {
+      intent: { type: 'command_automate' },
+      message: userMessage,
+      resolvedMessage: userMessage,
+      llmBackend,
+      mcpAdapter: adapter,
+      logger: { info() {}, warn() {}, debug() {}, error() {} },
+      _taskClassification: { taskType: 'browser', targetService: 'figma' },
+    };
+    const result = await resolveAgent(state);
+    const agents = result.resolveAgentResult?.agents || [];
+    if (agents.length !== 1) throw new Error(`Expected 1 agent, got ${agents.length}`);
+    if (agents[0].type !== 'browser') throw new Error(`Expected type 'browser', got '${agents[0].type}'`);
+    if (agents[0].agentId !== 'figma.agent') throw new Error(`Expected figma.agent, got ${agents[0].agentId}`);
+    if (!agents[0].startUrl) throw new Error('Expected a startUrl to be resolved for the coerced browser agent');
+  });
+
+  section('Task-type guards');
   await it('skips agent selection for local_system tasks (no LLM, no fake agent)', async () => {
     const userMessage = 'check the time on my computer';
     const adapter = makeMcpAdapter({});
