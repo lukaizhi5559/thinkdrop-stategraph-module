@@ -4724,7 +4724,7 @@ Please try again or search with different terms.`;
       const gsArgs = gs.args || {};
       const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
       const _callArgs = _isAgent
-        ? { ...gsArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+        ? { ...gsArgs, _stepType: gs.stepType || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
         : gsArgs;
       // Extended timeout for parallel browser steps to handle YouTube searches + Tab-Flow
       const stepTimeoutMs = gs.skill === 'browser.agent' ? 420000 : 300000; // 7 min for browser, 5 min for CLI
@@ -4939,7 +4939,7 @@ Please try again or search with different terms.`;
         const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
         const extraArgs = decision === 'try_without' ? { skipAuth: true } : {};
         const _callArgs = _isAgent
-          ? { ...gsArgs, ...extraArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: r.idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+          ? { ...gsArgs, ...extraArgs, _stepType: gs.stepType || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: r.idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
           : { ...gsArgs, ...extraArgs };
 
         logger.info(`[Node:ExecuteCommand] parallel login: re-dispatching ${svc?.agentId} (decision=${decision})`);
@@ -5182,7 +5182,7 @@ Please try again or search with different terms.`;
       : null;
 
     const _callArgs = _isAgentSkill
-      ? { ...resolvedArgs, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, _emitThinking, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+      ? { ...resolvedArgs, _stepType: step.stepType || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, _emitThinking, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
       : _isShellRunStep
         ? { ...resolvedArgs, _progressCallback: (evt) => {
             if (!progressCallback) return;

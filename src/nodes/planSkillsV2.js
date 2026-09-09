@@ -471,6 +471,14 @@ function _buildSystemPrompt(userMessage, state) {
     result += `\n\n## CRITICAL: APP-AI AUTOMATION\n\nThis task asks to use a named app's built-in AI assistant. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
   }
 
+  // ── stepType: classify each browser.agent step's interaction mode ──────────
+  // The browser agent uses stepType to decide whether to navigate (deep-link
+  // resolution) or stay on the current page (on-page action). Without it, the
+  // agent re-infers intent from task text via regex — which misclassifies
+  // contextual phrases like "search results page" as a search command.
+  // Every browser.agent step MUST include a stepType field.
+  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser.agent steps)\n\nFor every \`browser.agent\` step, you MUST include a \`stepType\` field with one of these values:\n\n- \`"navigate"\` — step that opens a URL, searches, or goes to a page (e.g., "Search Amazon for X", "Go to YouTube", "Open Gmail")\n- \`"on-page-action"\` — step that clicks/types/selects on the CURRENT page (e.g., "Click the first result, then click Add to Cart", "Fill in the form and submit")\n- \`"verify"\` — step that confirms a result without further interaction (e.g., "Confirm item added to cart", "Check if the email was sent")\n- \`"extract"\` — step that reads/extracts content (e.g., "Read the search results", "Get the email count")\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT classify it as \`"navigate"\` just because it contains the word "search".\n\nExample: [\n  { "skill": "browser.agent", "stepType": "navigate", "args": { "action": "run", "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "browser.agent", "stepType": "on-page-action", "args": { "action": "run", "agentId": "amazon.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "synthesize", "stepType": "verify", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
+
   const _skipReason = _skipAppendices ? ' (appendices skipped: tier1_simple)' : _hasLocalSignals ? ' (appendices skipped: local_signals)' : state.recoveryContext ? ' (appendices skipped: recovery)' : '';
   console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile} tier:${_promptTier}${_skipReason} appendices:[${appendices.join(',')}] taskType:${_tc?.taskType || 'unknown'}`);
 
@@ -696,6 +704,7 @@ api_suggest: use as FIRST step when task is RECURRING or programmatic AND the se
 Policy: no sudo/su/passwd. argv is string[] — no shell interpolation.
 Output ONLY a valid JSON array. No explanation, no markdown fences.
 For synthesize steps: keep prompt strings UNDER 200 chars. Use {{EXPAND:<intent>}} for longer prompts.
+For every browser.agent step, include a "stepType" field: "navigate" (opens URL/searches), "on-page-action" (clicks/types on current page), "verify" (confirms result), or "extract" (reads content).
 If the request cannot be safely automated, output: { "error": "explain why it cannot be done" }`;
 
 const PLANS_DIR = path.join(os.homedir(), '.thinkdrop', 'plans');
@@ -1843,6 +1852,7 @@ The user's request does NOT match any installed skill.
                 args: { type: 'object' },
                 description: { type: 'string' },
                 runGroup: { type: 'string' },
+                stepType: { type: 'string', enum: ['navigate', 'on-page-action', 'verify', 'extract'] },
               },
               required: ['skill', 'args'],
               additionalProperties: false,
@@ -1872,6 +1882,7 @@ The user's request does NOT match any installed skill.
           description: step.description || buildStepDescription(step),
           args: step.args || {},
           runGroup: step.runGroup || undefined,
+          stepType: step.stepType || undefined,
         });
       }
     });
