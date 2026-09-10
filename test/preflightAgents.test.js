@@ -662,6 +662,69 @@ async function runTests() {
     if (createFailedWarnings.length === 0) throw new Error('Expected agent_create_failed warning in preflightResult');
   });
 
+  section('App not installed fail-fast (batched QuestionCard)');
+
+  await it('returns planError with a batched download-link question when target app is not installed', async () => {
+    const preflightModulePath = path.resolve(__dirname, '..', 'src/nodes/preflightAgents.js');
+    const probeDesktopPath = path.resolve(__dirname, '..', 'src/utils/probeDesktopApp.js');
+    const probeTCCPath = path.resolve(__dirname, '..', 'src/utils/probeTCC.js');
+
+    // Mock probeDesktopApp + probeTCC via require cache, then re-require preflight
+    const origProbeDesktop = require.cache[probeDesktopPath];
+    const origProbeTCC = require.cache[probeTCCPath];
+    const origPreflight = require.cache[preflightModulePath];
+
+    require.cache[probeDesktopPath] = {
+      id: probeDesktopPath, filename: probeDesktopPath, loaded: true,
+      exports: {
+        probeDesktopApp: async () => ({
+          installed: false, capability: 'none', applescriptSupported: false,
+          loggedIn: null, evidence: 'mock: Cursor not installed', appName: null,
+        }),
+        _deriveAppNames: () => ['Cursor'],
+      },
+    };
+    require.cache[probeTCCPath] = {
+      id: probeTCCPath, filename: probeTCCPath, loaded: true,
+      exports: { probeTCC: async () => ({ granted: true, needsPrompt: false, evidence: 'mock' }), clearTCCCache: () => {} },
+    };
+    delete require.cache[preflightModulePath];
+    const preflightAgentsMocked = require(preflightModulePath);
+
+    const prevGrillMode = process.env.THINKDROP_GRILL_MODE;
+    process.env.THINKDROP_GRILL_MODE = '1';
+
+    let capturedBatch = null;
+    const state = makeState({
+      agents: [],
+      userMessage: 'In Cursor, open a new file and type a JavaScript function that adds two numbers, then save it.',
+    });
+    state._taskClassification = { taskType: 'app_automation', targetService: 'cursor' };
+    state.gatherAnswerCallback = async (arg) => {
+      capturedBatch = arg;
+      return { 'app_not_installed:cursor': 'cancel' };
+    };
+
+    try {
+      const result = await preflightAgentsMocked(state);
+      if (!result.planError) throw new Error('Expected planError for missing Cursor app');
+      if (!result.planError.includes('not installed')) throw new Error(`Expected "not installed" in planError, got: ${result.planError}`);
+      if (!result.planError.includes('https://cursor.com/download')) throw new Error(`Expected download URL in planError, got: ${result.planError}`);
+      if (!capturedBatch || capturedBatch.batch !== true) throw new Error('Expected gatherAnswerCallback to receive a batch object');
+      const q = capturedBatch.questions && capturedBatch.questions[0];
+      if (!q) throw new Error('Expected one question in the batch');
+      if (!q.link || q.link.url !== 'https://cursor.com/download') throw new Error('Expected question.link.url to be the Cursor download page');
+      if (!q.options || !q.options.find(o => o.value === 'open_download')) throw new Error('Expected an "open_download" option');
+      if (!q.options || !q.options.find(o => o.value === 'cancel')) throw new Error('Expected a "cancel" option');
+    } finally {
+      process.env.THINKDROP_GRILL_MODE = prevGrillMode;
+      delete require.cache[preflightModulePath];
+      if (origPreflight) require.cache[preflightModulePath] = origPreflight;
+      if (origProbeDesktop) require.cache[probeDesktopPath] = origProbeDesktop; else delete require.cache[probeDesktopPath];
+      if (origProbeTCC) require.cache[probeTCCPath] = origProbeTCC; else delete require.cache[probeTCCPath];
+    }
+  });
+
   console.log(`\n${'─'.repeat(72)}`);
   if (_failed === 0) {
     console.log(`✅ All ${_passed} tests passed.`);

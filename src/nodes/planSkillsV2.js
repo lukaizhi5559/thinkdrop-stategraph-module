@@ -22,6 +22,39 @@ const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
+// ── Hard guard: app.agent run_app_flow must always be followed by synthesize ──
+// The LLM planner sometimes omits the synthesize step for "ask the AI" read tasks.
+// This post-processing guard appends synthesize whenever the final step is an
+// app.agent run_app_flow, ensuring the answer is always presented to the user.
+function _ensureSynthesizeForAppFlow(skillPlan, userMessage) {
+  if (!Array.isArray(skillPlan) || skillPlan.length === 0) return skillPlan;
+
+  const lastStep = skillPlan[skillPlan.length - 1];
+  if (
+    lastStep?.skill === 'app.agent' &&
+    (lastStep?.args?.action === 'run_app_flow' || lastStep?.args?.action === 'run_agent')
+  ) {
+    const alreadyHasSynthesize = skillPlan.some(s => s.skill === 'synthesize');
+    if (!alreadyHasSynthesize) {
+      const msgLower = (userMessage || '').toLowerCase();
+      const _EDIT_VERBS = /\b(add|edit|modify|write|create|update|delete|remove|insert|replace|rename|move|fix|implement|generate|build|scaffold|extract|convert|translate|format|lint|debug|patch|apply)\b/;
+      const _READ_VERBS = /\b(examine|read|summarize|explain|tell me about|what does|what is|describe|show me|review|analyze|inspect|investigate|find|locate|search|list|get|fetch|query|check|verify|confirm|report|present|ask)\b/;
+      const isEdit = _EDIT_VERBS.test(msgLower) && !_READ_VERBS.test(msgLower);
+
+      const synthesizePrompt = isEdit
+        ? `Summarize what the app did in response to: ${userMessage}`
+        : `Answer the user's original question based on the app agent's result. Original question: ${userMessage}`;
+
+      skillPlan.push({
+        skill: 'synthesize',
+        description: isEdit ? 'Summarize the app action result' : 'Present the answer to the user',
+        args: { prompt: synthesizePrompt },
+      });
+    }
+  }
+  return skillPlan;
+}
+
 /**
  * Analyzes a skill plan and adds runGroup properties for parallel execution.
  * Only called for plans with 3+ steps to avoid unnecessary LLM overhead.
@@ -472,7 +505,7 @@ function _buildSystemPrompt(userMessage, state) {
   if (_tc?.taskType === 'app_automation') {
     const _msgLower = (userMessage || '').toLowerCase();
     const _EDIT_VERBS = /\b(add|edit|modify|refactor|write|create|update|delete|remove|insert|replace|rename|move|fix|implement|generate|build|scaffold|extract|convert|translate|format|lint|debug|patch|apply)\b/;
-    const _READ_VERBS = /\b(examine|read|summarize|explain|tell me about|what does|what is|describe|show me|review|analyze|inspect|investigate|find|locate|search|list|get|fetch|query|check|verify|confirm|report|present)\b/;
+    const _READ_VERBS = /\b(examine|read|summarize|explain|tell me about|what does|what is|describe|show me|review|analyze|inspect|investigate|find|locate|search|list|get|fetch|query|check|verify|confirm|report|present|ask)\b/;
     const _isEditTask = _EDIT_VERBS.test(_msgLower);
     const _isReadTask = _READ_VERBS.test(_msgLower);
     // Default to edit path when ambiguous (both verbs present) or neither present —
@@ -830,9 +863,10 @@ async function planSkillsV2(state) {
     const { findPlanByName } = require('../utils/planCacheHelpers');
     const recalled = findPlanByName(state._recallPlanName, PLANS_DIR, logger);
     if (recalled && Array.isArray(recalled.plan) && recalled.plan.length > 0) {
-      logger.info(`[Node:PlanSkillsV2] Named plan recall: "${state._recallPlanName}" → ${recalled.plan.length} steps`);
+      const _guardedPlan = _ensureSynthesizeForAppFlow(recalled.plan, userMessage);
+      logger.info(`[Node:PlanSkillsV2] Named plan recall: "${state._recallPlanName}" → ${_guardedPlan.length} steps`);
       if (progressCallback) progressCallback({ type: 'plan:found_existing', planName: state._recallPlanName });
-      return { ...state, skillPlan: recalled.plan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: recalled.planFile };
+      return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: recalled.planFile };
     }
     logger.warn(`[Node:PlanSkillsV2] Named plan recall: "${state._recallPlanName}" not found — falling through to LLM`);
   }
@@ -847,10 +881,11 @@ async function planSkillsV2(state) {
         : JSON.parse(Buffer.from(state._skillPlan, 'base64').toString('utf8'));
       if (Array.isArray(decoded) && decoded.length > 0) {
         // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
-        const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < decoded.length) ? state.skillCursor : 0;
-        logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${decoded.length} steps (startCursor=${_startCursor})`);
-        if (progressCallback) progressCallback({ type: 'plan_ready', steps: decoded.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
-        return { ...state, skillPlan: decoded, skillCursor: _startCursor, planError: null, recoveryContext: null, _skillPlanIsResume: false };
+        const _guardedPlan = _ensureSynthesizeForAppFlow(decoded, userMessage);
+        const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
+        logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
+        if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
+        return { ...state, skillPlan: _guardedPlan, skillCursor: _startCursor, planError: null, recoveryContext: null, _skillPlanIsResume: false };
       }
     } catch (err) {
       logger.warn(`[Node:PlanSkillsV2] _skillPlan fast-path decode failed: ${err.message} — falling through to LLM`);
@@ -1087,9 +1122,14 @@ async function planSkillsV2(state) {
     try {
       const cached = await findSimilarCompletePlan(userMessage, PLANS_DIR, logger);
       if (cached && Array.isArray(cached.plan) && cached.plan.length > 0) {
-        logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}"`);
+        const _guardedPlan = _ensureSynthesizeForAppFlow(cached.plan, userMessage);
+        if (_guardedPlan.length > cached.plan.length) {
+          logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}" — appended synthesize step`);
+        } else {
+          logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}"`);
+        }
         if (progressCallback) progressCallback({ type: 'plan:found_existing', planFile: cached.planFile });
-        return { ...state, skillPlan: cached.plan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: cached.planFile };
+        return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: cached.planFile };
       }
     } catch (_e) { logger.debug(`[Node:PlanSkillsV2] Cache check error: ${_e.message}`); }
   }
@@ -1677,6 +1717,16 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
     logger.info(`[Node:PlanSkillsV2] Single-route mandate injected: ${JSON.stringify(singleRouteMandate)}`);
   }
 
+  // ── Resolved file path from preflightAgents ───────────────────────────────
+  // If preflight resolved an ambiguous file name to an absolute path, inject it
+  // into the planning prompt so the LLM uses the exact path in shell.run/app.agent steps.
+  let resolvedFileNote = '';
+  const _fileRes = state._fileResolution;
+  if (_fileRes && (_fileRes.status === 'exact' || _fileRes.status === 'fuzzy') && _fileRes.path) {
+    resolvedFileNote = `\n\n📁 RESOLVED FILE PATH (already confirmed by preflight): ${_fileRes.path}\nUse this exact absolute path in any shell.run or app.agent steps. Do NOT use the original ambiguous name "${_fileRes.originalName || ''}".\n`;
+    logger.info(`[Node:PlanSkillsV2] Resolved file path injected: ${_fileRes.path}`);
+  }
+
   // ── External skill prohibition (when parseSkill found no match) ─────────────
   let externalSkillProhibition = '';
   if (state._noInstalledSkillMatch && !recoveryContext) {
@@ -1725,6 +1775,7 @@ The user's request does NOT match any installed skill.
     externalSkillProhibition,
     routeChoiceNote,
     singleRouteNote,
+    resolvedFileNote,
     smsGatewayNote,
     dateRangeNote,
     runtimeNote,
@@ -2081,8 +2132,9 @@ The user's request does NOT match any installed skill.
         const retryRaw = await backend.generateAnswer(enrichedQuery, payload, payload.options, null);
         const retryPlan = parsePlan(retryRaw, logger);
         if (retryPlan && Array.isArray(retryPlan)) {
-          if (progressCallback) progressCallback({ type: 'plan_ready', steps: retryPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
-          return { ...state, skillPlan: retryPlan, skillCursor: 0, recoveryContext: null, planError: null };
+          const _guardedPlan = _ensureSynthesizeForAppFlow(retryPlan, userMessage);
+          if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
+          return { ...state, skillPlan: _guardedPlan, skillCursor: 0, recoveryContext: null, planError: null };
         }
       } catch (_) {}
     }
@@ -2441,6 +2493,28 @@ The user's request does NOT match any installed skill.
     }
     if (_injected > 0) {
       logger.info(`[Node:PlanSkillsV2] Injected proceed resume deep-link URL ${state._proceedDeepLinkUrl} into ${_injected} step(s) for ${_targetId}`);
+    }
+  }
+
+  // ── Synthesize guard: every app.agent run_app_flow must be followed by synthesize
+  if (Array.isArray(skillPlan)) {
+    skillPlan = _ensureSynthesizeForAppFlow(skillPlan, userMessage);
+  }
+
+  // ── Resolved file path injection: pass structured path to app.agent steps ──
+  // preflightAgents already resolved the file path; instead of relying on regex
+  // re-parsing in app.runner, inject it as a structured arg so runAppFlow can
+  // use it directly.
+  if (Array.isArray(skillPlan) && _fileRes && (_fileRes.status === 'exact' || _fileRes.status === 'fuzzy') && _fileRes.path) {
+    let _injected = 0;
+    for (const step of skillPlan) {
+      if (step.skill === 'app.agent' && step.args?.action === 'run_app_flow' && !step.args.resolvedFilePath) {
+        step.args.resolvedFilePath = _fileRes.path;
+        _injected++;
+      }
+    }
+    if (_injected > 0) {
+      logger.info(`[Node:PlanSkillsV2] Injected resolvedFilePath into ${_injected} app.agent step(s): ${_fileRes.path}`);
     }
   }
 

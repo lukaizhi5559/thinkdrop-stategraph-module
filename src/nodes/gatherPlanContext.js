@@ -87,6 +87,7 @@ Rules:
   * Messaging tasks with NO recipient — ask for the address/number
   * Scheduling tasks with NO time or frequency specified — ask for time
   * Scheduling tasks with NO notification/delivery method specified — ask how (macOS notification, ThinkDrop in-app alert, email, text message, write to file)
+  * Open/examine/edit a file in an app AND the file name is a bare basename with NO extension and NO path separator (e.g. "UnifiedOverlay", "the readme", "the config file") — ask for the exact file path or extension. Do NOT ask if the file name already has an extension (e.g. "main.py", "instruction.runner.cjs") or an absolute/relative path.
 - NEVER ask about: timezone, credentials, optional preferences, or things the system can look up.
 - NEVER ask "which service" if the user already named one (gmail, slack, twilio, mailgun, etc.).
 - Browse / search / find / extract / navigate / look up tasks → always {"complete": true}.
@@ -156,6 +157,7 @@ Rules:
   * messaging with no recipient
   * scheduling (reminders, alarms, cron) with no time or frequency specified
   * scheduling (reminders, alarms, cron) with no notification/delivery method specified (macOS notification, ThinkDrop alert, email, text, write to file)
+  * open/examine/edit a file in an app AND the file name is a bare basename with NO extension and NO path separator (e.g. "UnifiedOverlay", "the readme", "the config file") — return 1. Do NOT return 1 if the file name already has an extension (e.g. "main.py", "instruction.runner.cjs") or an absolute/relative path.
 - Return 2 ONLY when a required service appears in UNAUTHENTICATED AGENTS
 - Examples where the notification method is MISSING — return 1:
   "remind me to take out the trash" → 1 (no notification method)
@@ -345,6 +347,20 @@ module.exports = async function gatherPlanContext(state) {
     } else {
       logger.info('[Node:GatherPlanContext] Scheduling task — user already specified a delivery channel, skipping question');
     }
+  }
+
+  // ── Consume file resolution from preflightAgents ───────────────────────────
+  // If preflight already resolved a file path, enrich resolvedMessage and allow
+  // bypass. If preflight found ambiguous/none but couldn't ask (no callback),
+  // fall through to the griller/legacy loop to ask here.
+  const _fileRes = state._fileResolution;
+  if (_fileRes && (_fileRes.status === 'exact' || _fileRes.status === 'fuzzy') && _fileRes.path) {
+    let _enrichedMsg = resolvedMessage || message || '';
+    if (!_enrichedMsg.includes(`[Resolved file path: ${_fileRes.path}]`)) {
+      _enrichedMsg = `${_enrichedMsg}\n[Resolved file path: ${_fileRes.path}]`;
+    }
+    logger.info(`[Node:GatherPlanContext] File already resolved by preflight: ${_fileRes.path} (${_fileRes.status}) — bypassing`);
+    return { ...state, resolvedMessage: _enrichedMsg, planGatheringComplete: true, planGatheringSkipped: true };
   }
 
   // ── Deterministic bypass gate ───────────────────────────────────────────────
@@ -542,7 +558,9 @@ module.exports = async function gatherPlanContext(state) {
 
 const GRILL_SYSTEM_PROMPT = `You are a task readiness griller for a desktop automation system.
 
-Your job: given a user's request, what's already known (memory, probes, route decision), and prior clarifications, generate the FRONTIER of questions — every question whose prerequisites are already settled. Don't ask questions that depend on answers you haven't heard yet.
+Your job: given a user's request, what's already known (memory, probes, route decision), and prior clarifications, decide whether the task is ready to execute — or whether ANY missing, ambiguous, or unclear detail could cause the task to fail, produce wrong results, or force the system to guess.
+
+Think like a careful engineer about to hand this task to an autonomous agent. Ask yourself: "Is there anything at all — no matter how small — that could cause confusion, ambiguity, or failure?" If yes, ask about it now. A redundant question is far cheaper than a failed or wrong execution.
 
 Respond with ONLY valid JSON in exactly this shape:
 {
@@ -569,22 +587,31 @@ Respond with ONLY valid JSON in exactly this shape:
     "question": "<confirmation question, 12 words max>"
   }
 }
-OR: {"complete": true} when everything is resolved.
+OR: {"complete": true} when everything is resolved and the task can execute without guessing.
+
+Failure-risk categories — ask a question when ANY of these apply:
+- Ambiguous file, folder, or resource name: a bare name with no extension and no path (e.g. "UnifiedOverlay", "the readme", "the config file") where the system would have to guess which file you mean. Ask for the exact path or extension.
+- A filename that could match multiple files in the project (e.g. "index" with no extension when several index.* files exist).
+- Messaging tasks with no recipient.
+- Scheduling tasks with no time or frequency.
+- Scheduling tasks with no notification/delivery method (macOS notification, ThinkDrop in-app alert, email, text message, write to file).
+- A service is named but multiple equally valid routes exist and the user gave no hint.
+- Any other detail whose absence would force the system to guess, retry, or fail.
 
 Rules:
-- ALWAYS include routeConfirmation if a ROUTE DECISION is provided and hasn't been confirmed yet.
-- On round 1, return {"complete": true} immediately if no critical input is missing. Only emit questions when a required slot is genuinely unanswered. Do NOT invent questions for fully-specified tasks.
+- When in doubt, ASK. A redundant question is far cheaper than a failed or wrong execution.
+- On round 1, return {"complete": true} ONLY if you are confident the task can execute without any guessing. If any failure-risk category applies, emit a question.
+- Include routeConfirmation if a ROUTE DECISION is provided and hasn't been confirmed yet — but do NOT let it crowd out other questions. Batch it with any other questions in the same round.
 - For each requiredInput, the system has already run memoryQuery and attached results in MEMORY RESULTS. If memory found enough data, set memoryResolved:true and ask a CONFIRMATION question (e.g. "I found N songs in your memory. Use these?"). If memory found nothing or too little, ask a from-scratch question.
 - CONFIRMATION questions (memoryResolved:true OR type "confirm") MUST have at least 2 options OR set freeText:true. Always give the user a way to accept the suggested value AND a way to reject or type a different value. For example: [{ "label": "Yes", "value": "<suggested value>", "primary": true }, { "label": "No, use different", "value": "use_different" }] with "freeText": true.
 - BATCH AGGRESSIVELY: Ask ALL questions you need answered in ONE batch — even if some answers might influence other questions' context. The user can answer them all at once. Do NOT split related questions across multiple rounds.
 - Questions about the same topic (e.g., playlist name, genre, artists, songs) MUST be in the same batch — never ask them one at a time.
 - Only defer a question to a later round if it TRULY cannot be asked without a prior answer (e.g., "Which specific album by [artist]?" when you don't know the artist yet). Even then, prefer asking "Which artist and album?" as one question.
-- CRITICAL SCHEDULING RULE: For any reminder, alarm, timer, cron, or recurring task where the user did NOT specify a notification/delivery method, ask ONE question: "How do you want to be notified?" with choice options: macOS notification, ThinkDrop in-app alert, email, text message, write to file. Do NOT proceed with scheduling tasks that lack a delivery method.
 - NEVER ask about things the system can look up (timezone, credentials, installed apps, auth status — these are in PROBE RESULTS).
 - NEVER ask about things already answered in PRIOR CLARIFICATIONS. Every entry in PRIOR CLARIFICATIONS is a SETTLED answer — do NOT re-ask it, even with different wording.
 - If a PRIOR CLARIFICATION answer starts with "yes —", it is a CONFIRMED answer — do NOT ask that question again.
 - If the ROUTE DECISION block is empty or all routes are marked [CONFIRMED], do NOT include a routeConfirmation. Confirmed routes are locked in.
-- If ALL required inputs have been answered in PRIOR CLARIFICATIONS and all routes are confirmed, return {"complete": true}.
+- If ALL failure-risk categories are clear and all routes are confirmed, return {"complete": true}.
 - Questions should be concise (15 words max). Options should be short labels.
 - memoryText/memoryTextTemplate: a clean factual statement for future memory storage. Example: "User's preferred <app-name> playlist name is '{answer}'". This will be stored as type 'gather_clarification' so future tasks can find it.
 - Max 5 questions per batch.

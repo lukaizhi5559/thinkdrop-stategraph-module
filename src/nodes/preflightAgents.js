@@ -294,6 +294,171 @@ function serviceToIconUrl(service, startUrl) {
   return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(AGENT_DOMAIN_OVERRIDES[base] || `${base}.com`)}&sz=128`;
 }
 
+// ── File reference resolution (hybrid regex + LLM extraction) ────────────────
+// Extracts a file/folder name from the user message, then probes the filesystem
+// via shell.run to find exact or fuzzy matches. Returns:
+//   { status: 'exact'|'fuzzy'|'ambiguous'|'none', path?, candidates?, matchedName? }
+
+const _FILE_STOPWORDS = /^(?:file|folder|the|a|an|this|that|it|app|application|ai|page|window|tab|screen|menu|button|panel|area|section|bar|tool|toolbar|sidebar|header|footer|content|text|image|video|audio|link|url|address|number|name|title|description|note|comment|message|email|chat|post|tweet|song|track|album|artist|playlist|channel|user|profile|account|setting|preference|option|feature|function|method|class|object|variable|constant|property|field|column|row|table|database|query|command|statement|expression|value|result|output|input|error|warning|info|debug|log|trace|event|handler|listener|callback|promise|async|await|return|param|parameter|arg|argument|var|let|const|if|else|for|while|switch|case|break|continue|try|catch|finally|throw|new|delete|typeof|instanceof|in|of|do|with|export|import|from|default|extends|implements|interface|enum|struct|union|typedef|namespace|module|package|library|framework|plugin|extension|addon|component|element|widget|gadget|control|view|model|controller|route|endpoint|api|service|server|client|request|response|header|body|status|method|get|post|put|patch|delete|head|options|connect|trace|content|type|length|encoding|charset|boundary|disposition|filename|name|value|data|json|xml|html|css|js|ts|py|rb|go|rs|c|cpp|java|kt|swift|php|pl|sh|bash|zsh|fish|ps1|bat|cmd|exe|app|dmg|pkg|deb|rpm|msi|zip|tar|gz|bz2|xz|7z|rar|pdf|doc|docx|xls|xlsx|ppt|pptx|txt|md|rst|log|csv|tsv|yaml|yml|toml|ini|cfg|conf|env|lock|tmp|temp|cache|bak|old|orig|swp|swo|swn|swn|pid|sock|fifo|pipe|tty|dev|null|zero|random|urandom)$/i;
+
+const _FILE_REGEX_PATTERNS = [
+  // "open|examine|read|edit|view|show|load|find|import [me] [the] <name> file? in <app>"
+  /\b(?:open|examine|read|edit|view|show|load|find|import)\s+(?:me\s+)?(?:the\s+)?([^/\s"']+?)(?:\s+file)?\s+(?:in|with|using|via)\b/i,
+  // "ask the AI about <name> in <app>"
+  /\bask\s+(?:the\s+)?ai\s+(?:to\s+)?(?:about\s+)?([^/\s"']+?)(?:\s+file)?\s+(?:in|with|using|via)\b/i,
+  // "tell me about <name> in <app>"
+  /\btell me about\s+([^/\s"']+?)(?:\s+file)?\s+(?:in|with|using|via)\b/i,
+  // quoted name: open "UnifiedOverlay" in Devin
+  /\b(?:open|examine|read|edit|view|show|load|find|import)\s+"([^"]+)"\s+(?:in|with|using|via)\b/i,
+  // path with slashes: open /path/to/file.ext in Devin
+  /\b(?:open|examine|read|edit|view|show|load|find|import)\s+(\/[^\s"']+\.\w+)\s+(?:in|with|using|via)\b/i,
+  // filename with extension anywhere in message: UnifiedOverlay.tsx
+  /\b([A-Za-z_][A-Za-z0-9_-]*\.[a-zA-Z0-9]+)\b/,
+];
+
+function _extractFileCandidate(userMessage) {
+  let candidate = null;
+  for (const p of _FILE_REGEX_PATTERNS) {
+    const m = userMessage.match(p);
+    if (m && m[1]) {
+      candidate = m[1].trim();
+      break;
+    }
+  }
+  if (candidate && _FILE_STOPWORDS.test(candidate)) {
+    candidate = null;
+  }
+  return candidate;
+}
+
+async function _llmExtractFileCandidate(llmBackend, userMessage, logger) {
+  if (!llmBackend) return null;
+  try {
+    const prompt = `Extract the file or folder name from this request. Return ONLY the file/folder name (with extension if present), nothing else. If no file/folder is referenced, return "NONE".\nRequest: "${userMessage}"`;
+    const raw = await llmBackend.generateAnswer(prompt, { query: prompt }, { maxTokens: 30, temperature: 0, taskType: 'classification' });
+    const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim().replace(/^["']|["']$/g, '');
+    if (!text || text.toLowerCase() === 'none' || text.toLowerCase() === 'null' || text.length < 2) return null;
+    if (_FILE_STOPWORDS.test(text)) return null;
+    return text;
+  } catch (e) {
+    logger.warn(`[Node:PreflightAgents] LLM file extraction failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function _probeFilesystem(mcpAdapter, candidate, logger) {
+  if (!candidate || !mcpAdapter) return { status: 'none' };
+
+  const path = require('path');
+  const os = require('os');
+
+  // If it's an absolute path, check directly
+  if (candidate.startsWith('/')) {
+    try {
+      require('fs').accessSync(candidate);
+      return { status: 'exact', path: candidate };
+    } catch (_) {
+      // Fall through to search
+    }
+  }
+
+  // Strip extension for wildcard search
+  const base = candidate.replace(/\.[a-zA-Z0-9]+$/, '');
+
+  // Search roots in priority order with maxdepth to avoid timeouts
+  const searchRoots = [
+    { root: process.cwd(), maxdepth: 5 },
+    { root: path.join(os.homedir(), 'Desktop', 'projects'), maxdepth: 5 },
+    { root: path.join(os.homedir(), 'Desktop'), maxdepth: 3 },
+  ];
+
+  let candidates = [];
+  for (const { root, maxdepth } of searchRoots) {
+    try {
+      require('fs').accessSync(root);
+    } catch (_) { continue; }
+
+    const findCmd = `find "${root}" -maxdepth ${maxdepth} -type f \\( -name "${candidate}" -o -name "${base}.*" -o -iname "*${base}*" \\) -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/.next/*" 2>/dev/null | head -30`;
+
+    try {
+      const res = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'shell.run',
+        args: { cmd: 'bash', argv: ['-c', findCmd] },
+      }, { timeoutMs: 15000 }).catch(() => null);
+
+      const data = res?.data || res;
+      const stdout = data?.stdout || data?.output || '';
+      const text = (typeof stdout === 'string' ? stdout : String(stdout || '')).trim();
+      if (text) {
+        candidates = candidates.concat(text.split('\n').filter(Boolean));
+      }
+    } catch (e) {
+      logger.warn(`[Node:PreflightAgents] File probe failed for ${root}: ${e.message}`);
+    }
+
+    if (candidates.length > 0) break; // Stop after first root with matches
+  }
+
+  // Deduplicate
+  candidates = [...new Set(candidates)];
+
+  if (candidates.length === 0) {
+    return { status: 'none' };
+  }
+
+  if (candidates.length === 1) {
+    // Check if it's an exact name match or fuzzy
+    const filename = candidates[0].split('/').pop();
+    if (filename === candidate || filename === `${base}.${candidate.split('.').pop()}`) {
+      return { status: 'exact', path: candidates[0] };
+    }
+    return { status: 'fuzzy', path: candidates[0], matchedName: filename };
+  }
+
+  // Multiple candidates — score them
+  const fs = require('fs');
+  const scored = candidates.map(p => {
+    const filename = p.split('/').pop();
+    let score = 0;
+    // Exact name match → highest
+    if (filename === candidate) score = 100;
+    // Exact base with any extension → high
+    else if (filename.replace(/\.[a-zA-Z0-9]+$/, '') === base) score = 90;
+    // Contains the candidate as substring → medium
+    else if (filename.toLowerCase().includes(base.toLowerCase())) score = 70;
+    // Fuzzy substring → lower
+    else score = 50;
+
+    // Prefer shorter paths, then more recently modified
+    let mtime = 0;
+    try { mtime = fs.statSync(p).mtimeMs; } catch (_) {}
+    return { path: p, score, mtime, depth: p.split('/').length, filename };
+  });
+
+  scored.sort((a, b) => (b.score - a.score) || (a.depth - b.depth) || (b.mtime - a.mtime));
+
+  // If the top candidate has a much higher score than the rest, treat as exact
+  if (scored.length > 1 && scored[0].score >= 90 && scored[1].score < 70) {
+    return { status: 'exact', path: scored[0].path };
+  }
+
+  // If all candidates are the same base name with different extensions, pick the best
+  const topBasename = scored[0].filename.replace(/\.[a-zA-Z0-9]+$/, '');
+  const allSameBase = scored.every(s => s.filename.replace(/\.[a-zA-Z0-9]+$/, '') === topBasename);
+  if (allSameBase && scored.length <= 3) {
+    // Prefer common source extensions
+    const extPriority = { '.tsx': 1, '.ts': 2, '.jsx': 3, '.js': 4, '.py': 5, '.md': 6 };
+    scored.sort((a, b) => {
+      const aExt = '.' + a.filename.split('.').pop();
+      const bExt = '.' + b.filename.split('.').pop();
+      return (extPriority[aExt] || 99) - (extPriority[bExt] || 99);
+    });
+    return { status: 'fuzzy', path: scored[0].path, matchedName: scored[0].filename };
+  }
+
+  return { status: 'ambiguous', candidates: scored.slice(0, 5).map(s => s.path) };
+}
+
 // ── Main node ─────────────────────────────────────────────────────────────────
 
 module.exports = async function preflightAgents(state) {
@@ -325,6 +490,65 @@ module.exports = async function preflightAgents(state) {
   if (!mcpAdapter) {
     logger.warn('[Node:PreflightAgents] No mcpAdapter — skipping preflight');
     return { ...state, preflightResult: null, preflightDone: true };
+  }
+
+  // ── File reference resolution (app_automation / local_file tasks) ──────────
+  // Extract a file/folder name from the user message and probe the filesystem
+  // BEFORE planning. This prevents app.runner from failing on an unresolved
+  // bare basename and prevents the griller from wasting time asking about it.
+  let _fileResolution = null;
+  if (_tc.taskType === 'app_automation' || _tc.taskType === 'local_file') {
+    let candidate = _extractFileCandidate(userMessage);
+    if (!candidate && /\b(?:open|examine|read|edit|view|show|load|find|import|ask|tell)\b/i.test(userMessage)) {
+      logger.info('[Node:PreflightAgents] No regex match for file name — trying LLM extraction');
+      candidate = await _llmExtractFileCandidate(state.llmBackend, userMessage, logger);
+    }
+
+    if (candidate) {
+      logger.info(`[Node:PreflightAgents] File candidate extracted: "${candidate}" — probing filesystem`);
+      _fileResolution = await _probeFilesystem(mcpAdapter, candidate, logger);
+      logger.info(`[Node:PreflightAgents] File resolution: status=${_fileResolution.status}${_fileResolution.path ? `, path=${_fileResolution.path}` : ''}${_fileResolution.candidates ? `, candidates=${_fileResolution.candidates.length}` : ''}`);
+
+      // If ambiguous or not found, ask the user for disambiguation
+      if (_fileResolution.status === 'ambiguous' && _fileResolution.candidates?.length > 0 && gatherAnswerCallback) {
+        const question = `I found ${_fileResolution.candidates.length} files matching "${candidate}". Which one should I use?`;
+        _emitProgress({
+          type: 'ask_user',
+          question,
+          options: _fileResolution.candidates.map(p => ({
+            label: p.split('/').slice(-3).join('/'),
+            value: p,
+          })),
+          source: 'preflightAgents',
+        });
+        try {
+          const answer = await gatherAnswerCallback(question);
+          if (answer && answer.trim()) {
+            _fileResolution = { status: 'exact', path: answer.trim() };
+            logger.info(`[Node:PreflightAgents] User selected file: ${answer.trim()}`);
+          }
+        } catch (e) {
+          logger.warn(`[Node:PreflightAgents] File disambiguation question failed: ${e.message}`);
+        }
+      } else if (_fileResolution.status === 'none' && gatherAnswerCallback) {
+        const question = `I couldn't find a file matching "${candidate}". Please provide the exact file path.`;
+        _emitProgress({ type: 'ask_user', question, source: 'preflightAgents' });
+        try {
+          const answer = await gatherAnswerCallback(question);
+          if (answer && answer.trim()) {
+            _fileResolution = { status: 'exact', path: answer.trim() };
+            logger.info(`[Node:PreflightAgents] User provided file path: ${answer.trim()}`);
+          }
+        } catch (e) {
+          logger.warn(`[Node:PreflightAgents] File path question failed: ${e.message}`);
+        }
+      }
+
+      // Enrich resolvedMessage with the resolved path so downstream nodes can use it
+      if (_fileResolution.path && _fileResolution.status === 'exact') {
+        userMessage = `${userMessage}\n[Resolved file path: ${_fileResolution.path}]`;
+      }
+    }
   }
 
   // Emit start
@@ -419,6 +643,10 @@ module.exports = async function preflightAgents(state) {
   if (_shouldRunCliPreflight && _tc.taskType === 'local_system') {
     _shouldRunCliPreflight = false;
     logger.info('[Node:PreflightAgents] CLI preflight skipped — taskType is local_system (no service CLI needed)');
+  }
+  if (_shouldRunCliPreflight && _tc.taskType === 'app_automation') {
+    _shouldRunCliPreflight = false;
+    logger.info('[Node:PreflightAgents] CLI preflight skipped — taskType is app_automation (desktop/browser automation, no service CLI needed)');
   }
   let _selectedCliAgents = []; // descriptors of selected CLI agents to pass explicitly
   let _isGenericPreflight = false; // true when running discovery scan without typed CLI agents
@@ -1599,18 +1827,50 @@ module.exports = async function preflightAgents(state) {
           message: `"${_displayName}" is not installed on this machine.${_downloadUrl ? ` Download: ${_downloadUrl}` : ''}`,
         });
 
-        if (gatherAnswerCallback && _downloadUrl) {
+        // Fail-fast: the target desktop app is not installed and there is no
+        // CLI/browser fallback. Surface a batched Grill-Me QuestionCard with a
+        // download link (if known), then return a planError so the run ends
+        // cleanly instead of stalling on the legacy single-string gather prompt.
+        const _questionId = `app_not_installed:${_targetSvc}`;
+        const _planErrorMsg = _downloadUrl
+          ? `"${_displayName}" is not installed on this machine. Install it from ${_downloadUrl} and try again.`
+          : `"${_displayName}" is not installed on this machine. Please install it and try again.`;
+
+        _emitProgress({
+          type: 'preflight:app_not_installed',
+          serviceName: _targetSvc,
+          appName: _displayName,
+          downloadUrl: _downloadUrl,
+          message: _planErrorMsg,
+        });
+
+        if (gatherAnswerCallback) {
+          const _options = [];
+          if (_downloadUrl) {
+            _options.push({ label: 'Open download page', value: 'open_download', primary: true });
+          }
+          _options.push({ label: 'Cancel', value: 'cancel' });
+
+          const _question = {
+            id: _questionId,
+            text: _planErrorMsg,
+            type: 'confirm',
+            options: _options,
+            freeText: false,
+            link: _downloadUrl ? { label: `↗ Download ${_displayName}`, url: _downloadUrl } : undefined,
+          };
+
           try {
-            _emitProgress({
-              type: 'preflight:app_not_installed',
-              serviceName: _targetSvc,
-              appName: _displayName,
-              downloadUrl: _downloadUrl,
-              message: `"${_displayName}" is not installed. Would you like me to open the download page?`,
+            const _batchId = `app_not_installed_${_targetSvc}_${Date.now()}`;
+            const _batchAnswers = await gatherAnswerCallback({
+              batch: true,
+              batchId: _batchId,
+              questions: [_question],
+              routeConfirmation: null,
             });
-            const _answer = await gatherAnswerCallback(`app_not_installed:${_targetSvc}`);
-            const _choice = String(_answer || '').trim().toLowerCase();
-            if (_choice === 'yes' || _choice === 'y' || _choice === 'ok' || _choice === 'sure') {
+            const _choice = String((_batchAnswers && _batchAnswers[_questionId]) || '').trim().toLowerCase();
+
+            if (_choice === 'open_download' && _downloadUrl) {
               try {
                 const { execSync } = require('child_process');
                 if (process.platform === 'darwin') {
@@ -1623,14 +1883,26 @@ module.exports = async function preflightAgents(state) {
                 logger.warn(`[Node:PreflightAgents] Could not open download page: ${openErr.message}`);
               }
             } else {
-              logger.info(`[Node:PreflightAgents] User declined to download "${_displayName}" — proceeding with fallback`);
+              logger.info(`[Node:PreflightAgents] User cancelled missing-app prompt for "${_displayName}"`);
             }
           } catch (grillErr) {
-            logger.warn(`[Node:PreflightAgents] App-not-installed grill failed: ${grillErr.message}`);
+            logger.warn(`[Node:PreflightAgents] App-not-installed batch prompt failed: ${grillErr.message}`);
           }
         } else {
-          logger.info(`[Node:PreflightAgents] App "${_displayName}" not installed — no gatherAnswerCallback or download URL, proceeding with fallback`);
+          logger.info(`[Node:PreflightAgents] App "${_displayName}" not installed — no gatherAnswerCallback, failing fast`);
         }
+
+        logger.error(`[Node:PreflightAgents] ${_planErrorMsg}`);
+        return {
+          ...state,
+          preflightDone: true,
+          planError: _planErrorMsg,
+          preflightResult: {
+            warnings,
+            agents: agentReadiness,
+            agentContextNote,
+          },
+        };
       }
     }
   }
@@ -2157,48 +2429,6 @@ module.exports = async function preflightAgents(state) {
     }
   }
 
-  // ── App agent build (Phase 2) ──────────────────────────────────────────
-  // For registered app-type agents, call app.agent build_agent to ensure
-  // descriptors are up-to-date with shortcuts and playbooks.
-  // Runs after Promise.all so _registeredAgentServiceMap is populated.
-  try {
-    const appAgents = agentReadiness.filter(a => a.type === 'app');
-    // Also check registered agents that might be app type
-    const registeredAppEntries = Object.entries(_registeredAgentServiceMap)
-      .filter(([svc, id]) => id.includes('.app.agent'));
-    if (registeredAppEntries.length > 0 || appAgents.length > 0) {
-      _emitProgress({
-        type: 'preflight:building_agent',
-        agentType: 'app',
-        agentId: 'app.preflight',
-        message: 'Checking app agents and shortcuts...',
-        iconUrl: null,
-      });
-    }
-    for (const [svc, id] of registeredAppEntries) {
-      if (appAgents.some(a => a.agentId === id)) continue; // already handled
-      const appName = svc;
-      const iconUrl = agentIdToIconUrl(id);
-      try {
-        _emitProgress({ type: 'preflight:checking', agentId: id, iconUrl, message: `Building ${appName} app agent…` });
-        const buildRes = await mcpAdapter.callService('command-service', 'app.agent', {
-          action: 'build_agent',
-          appName,
-        }, { timeoutMs: 30000 }).catch(() => null);
-        if (buildRes?.ok) {
-          logger.info(`[Node:PreflightAgents] App agent built: ${appName}`);
-          agentReadiness.push({ type: 'app', agentId: id, ready: true, authed: true, iconUrl, service: appName });
-          _emitProgress({ type: 'preflight:agent_ready', agentId: id, iconUrl, message: `${appName} ready` });
-        } else {
-          agentReadiness.push({ type: 'app', agentId: id, ready: false, authed: true, iconUrl, service: appName, reason: buildRes?.error || 'build failed' });
-        }
-      } catch (buildErr) {
-        logger.warn(`[Node:PreflightAgents] App agent build failed for ${appName}: ${buildErr.message}`);
-        agentReadiness.push({ type: 'app', agentId: id, ready: false, authed: true, iconUrl, service: appName, reason: buildErr.message });
-      }
-    }
-  } catch (_) {}
-
   // ── Disk-scan fallback: load recipes directly from filesystem ────────────────
   try {
     const skillsRoot = path.join(os.homedir(), '.thinkdrop', 'skills');
@@ -2254,6 +2484,14 @@ module.exports = async function preflightAgents(state) {
 
   const selectedReadinessFailures = [];
   for (const agentId of selectedAgentIds) {
+    // App-type agents (local desktop apps) have no credentials to validate.
+    // Installation is already verified by the desktop probe above, which grills
+    // the user with a download prompt if the app is missing. Skip the readiness
+    // gate for these agents — it doesn't apply.
+    if (_resolverTypeMap[agentId] === 'app' || agentId.endsWith('.app.agent')) {
+      logger.info(`[Node:PreflightAgents] Skipping readiness check for app agent: ${agentId}`);
+      continue;
+    }
     const agent = agentReadiness.find(a => String(a.agentId || '').toLowerCase() === agentId);
     if (!agent) {
       selectedReadinessFailures.push({ agentId, reason: 'selected agent did not complete preflight' });
@@ -2330,6 +2568,11 @@ module.exports = async function preflightAgents(state) {
     _trainedRecipeMap: mapSize > 0 ? _trainedRecipeMap : state._trainedRecipeMap,
     // ── Grill-Me Phase A: expose route decision on state for gatherPlanContext ──
     routeDecision: _routeDecision,
+    // ── File reference resolution (for app_automation / local_file tasks) ──────
+    _fileResolution: _fileResolution,
+    resolvedMessage: userMessage !== (state.resolvedMessage || state.message || '')
+      ? userMessage
+      : state.resolvedMessage,
   };
 };
 

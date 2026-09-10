@@ -74,8 +74,12 @@ Field rules:
   - WHO to send to (messaging tasks with no recipient anywhere)
   - WHICH service (when multiple equally valid options exist and user gave no hint)
   - For scheduling tasks (reminders, alarms, cron, recurring): set needsClarification:true when the user did NOT specify how they want to be notified/delivered. Notification methods include: macOS notification, ThinkDrop in-app alert, email, text message, write to file. If the user said "email me", "text me", "notify me", "show an alert", "send a notification", "osascript notification", etc. → needsClarification:false (method is specified). If they only said "remind me to X" or "set a reminder for X" with no delivery method → needsClarification:true.
+  - Missing or ambiguous file/folder path for app_automation or local_file tasks that the system cannot resolve automatically:
+    * A bare basename with NO extension and NO path separator (e.g. "UnifiedOverlay", "the readme", "the config file") → needsClarification:true
+    * A filename WITH an extension (e.g. "instruction.runner.cjs", "main.py", "README.md") → needsClarification:false (system can search the project tree)
+    * An absolute or relative path that exists → needsClarification:false
   - NEVER ask about file format, content, or preferences — the system can infer those
-  - NEVER ask when taskType is local_file, local_system, app_automation, or browser — these are always clear enough
+  - NEVER ask when taskType is local_system or browser — these are always clear enough
   - NEVER ask when isFollowUp is true and followUpTarget is resolved — EXCEPT for scheduling tasks where the notification/delivery method is missing (followUpTarget is the task content, not the delivery method)
 
 - targetService: the specific external service named (e.g. "gmail", "github", "youtube"). null for local tasks.
@@ -160,6 +164,14 @@ EXAMPLES (NOT image analysis — isImageAnalysis MUST be false):
   User: "convert the png to jpg" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":false}
   User: "what's on my screen" → {"taskType":"local_system","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":false}
   User: "resize the screenshot to 800px" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":false}
+
+EXAMPLES (ambiguous file path — needsClarification MUST be true):
+  User: "Open the <basename> file in <app-name> and ask the AI what it does." → {"taskType":"app_automation","targetService":"<app-name>","needsClarification":true,"reason":"file path is ambiguous: '<basename>' has no extension or folder"}
+  User: "Open the readme in <app-name> and summarize it." → {"taskType":"app_automation","targetService":"<app-name>","needsClarification":true,"reason":"file path is ambiguous: 'readme' has no extension or folder"}
+
+EXAMPLES (resolvable file path — needsClarification MUST be false):
+  User: "Open <filename.ext> in <app-name> and ask the AI what it's about." → {"taskType":"app_automation","targetService":"<app-name>","needsClarification":false}
+  User: "Open /Users/me/project/src/index.ts in <app-name> and refactor it." → {"taskType":"app_automation","targetService":"<app-name>","needsClarification":false}
 
 No explanation. No markdown. Only the JSON object.`;
 

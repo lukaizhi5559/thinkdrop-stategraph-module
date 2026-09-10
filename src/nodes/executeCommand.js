@@ -4330,7 +4330,7 @@ Please try again or search with different terms.`;
   if (skill === 'app.agent') {
     const agentTimeout = resolvedArgs.maxDurationMs
       ? resolvedArgs.maxDurationMs + 10000   // internal timeout + 10s headroom
-      : 120000;                              // default 2 min if no maxDurationMs
+      : 310000;                              // default 5 min + 10s if no maxDurationMs
     stepTimeoutMs = Math.max(stepTimeoutMs, agentTimeout);
   }
   // project_build can take several minutes (npm install + vite build + Playwright tests × 5 retries)
