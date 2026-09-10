@@ -467,8 +467,26 @@ function _buildSystemPrompt(userMessage, state) {
 
   // CRITICAL: app-automation tasks must never be answered by synthesizing or shell-editing;
   // the named app owns the content and the save action.
+  // However, examine/retrieve tasks (read, summarize, explain, tell me about) DO need a
+  // synthesize step after run_app_flow to present the answer to the user.
   if (_tc?.taskType === 'app_automation') {
-    result += `\n\n## CRITICAL: APP-AI AUTOMATION\n\nThis task asks to use a named app's built-in AI assistant. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
+    const _msgLower = (userMessage || '').toLowerCase();
+    const _EDIT_VERBS = /\b(add|edit|modify|refactor|write|create|update|delete|remove|insert|replace|rename|move|fix|implement|generate|build|scaffold|extract|convert|translate|format|lint|debug|patch|apply)\b/;
+    const _READ_VERBS = /\b(examine|read|summarize|explain|tell me about|what does|what is|describe|show me|review|analyze|inspect|investigate|find|locate|search|list|get|fetch|query|check|verify|confirm|report|present)\b/;
+    const _isEditTask = _EDIT_VERBS.test(_msgLower);
+    const _isReadTask = _READ_VERBS.test(_msgLower);
+    // Default to edit path when ambiguous (both verbs present) or neither present —
+    // preserves the original "app owns the save" behavior for the common case.
+    if (_isEditTask && !_isReadTask) {
+      // Edit/mutation task — single run_agent step, NO synthesize
+      result += `\n\n## CRITICAL: APP-AI AUTOMATION (EDIT TASK)\n\nThis task asks to use a named desktop app's built-in AI assistant to MODIFY a file. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, \`cli.agent\`, \`external.skill\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
+    } else if (_isReadTask && !_isEditTask) {
+      // Examine/retrieve task — run_app_flow THEN synthesize to present the answer
+      result += `\n\n## CRITICAL: APP-AI AUTOMATION (EXAMINE TASK)\n\nThis task asks to use a named desktop app's built-in AI assistant to READ and EXPLAIN content. You MUST produce TWO steps:\n1. \`app.agent\` with \`action: "run_app_flow"\`, \`appName: "<AppName from message>"\`, and \`goal: "<the user's full request>"\` — opens the file and uses the app's AI to analyze it.\n2. \`synthesize\` with \`prompt: "<rephrase the user's question>"\` — presents the app's answer to the user.\nDo NOT use \`shell.run\`, \`cli.agent\`, \`external.skill\`, or any other skill to read the file. The target app owns the file view.\n`;
+    } else {
+      // Ambiguous — default to edit path (preserves current behavior)
+      result += `\n\n## CRITICAL: APP-AI AUTOMATION\n\nThis task asks to use a named desktop app's built-in AI assistant. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, \`cli.agent\`, \`external.skill\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
+    }
   }
 
   // ── stepType: classify each browser.agent step's interaction mode ──────────

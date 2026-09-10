@@ -43,6 +43,7 @@ Domain-specific guidance for `app.agent`. General skill list, routing hierarchy,
 | `verify_app_focused` | Wait for app to open/load/be ready (OCR polls, no LLM calls) |
 | `execute_shortcut` | Keyboard shortcuts (after focus verified) |
 | `run_agent` | Per-app skill runner: opens a file in an app and invokes the app's AI assistant to edit it. Use for "open X and use the app's AI" tasks. |
+| `run_app_flow` | App-Flow iterative runner for complex multi-step tasks. Uses five tiers (App Shortcuts, Just-type, Global Shortcuts, Search Text, Monitoring) with force classification and OCR verification. |
 | `teleport_to_element` | Cmd+F navigation to jump to and focus an anchor text element. Only scrolls/focuses — does NOT click. |
 | `search_and_click` | Browser only. Uses OCR to find the text element, progressively shortens the phrase until a match is found, clicks it, and falls back to Cmd+F only if the mouse click fails. Call when user says "click X", "open X", or "select X" in a browser. |
 | `scroll` | Auto-routes to correct scroll mode based on app category |
@@ -116,10 +117,51 @@ For browser category, when the user wants to click, open, or select a text-based
 ```
 - Extract the exact file path from the user's message and pass it as `filePath`.
 - Extract the instruction for the app's AI assistant and pass it as `prompt`. Do NOT include boilerplate like "open the file" or "in the app" in the prompt.
-- ThinkDrop is only the proxy/orchestrator. The target app (e.g., Devin/Cursor/OpenCode) owns the file and its AI assistant.
+- ThinkDrop is only the proxy/orchestrator. The target app owns the file and its AI assistant.
 - The app's AI assistant performs the actual edit. The final save is triggered by the app's own save shortcut via `run_agent`.
 - Do NOT use `shell.run` to write to the file from outside the app.
 - Do NOT emit separate `execute_shortcut` + `typeText` steps for this pattern unless `run_agent` is unavailable. The per-app skill descriptor provides the correct shortcuts.
+- **NEVER use `cli.agent`, `external.skill`, or any other CLI/package tool for this desktop app task — the native app itself is the correct execution route.**
+
+## App-Flow (New — replaces run_agent for complex app tasks)
+
+When the user asks to perform a multi-step task in a desktop app that requires more than a single shortcut or file-open (e.g., "Examine the <file> using <AppName> LLM", "In <AppName>, set a reminder for standup at 9am", "In <AppName>, open a file and add a comment"):
+
+**Example plan:**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "run_app_flow", "appName": "<AppName>", "goal": "<goal>" }, "description": "Run App-Flow to accomplish <goal> in <AppName>" }
+]
+```
+
+- App-Flow uses five tiers: App Shortcuts (primary, 80-90%), Just-type (type into focused field), Global Shortcuts (fallback), Search Text w/LiteParser (fallback), Monitoring (wait for long-running ops)
+- Just-type has 5 sub-modes: type-plain (search/chat), type-commands (/slash), type-edit (code/long-form), type-search (@mentions), type-list-item (todos)
+- Monitoring reuses existing `actionMonitorWithBackoff` polling but with force classification (single number 0-3: not sure / still processing / done / error)
+- OCR verification runs between each step (before/after diff)
+- Force classification LLM picks the next tier (single number 0-5)
+- No URL-first — uses active app history from monitorService
+
+**When to use `run_app_flow` vs `run_agent`:**
+- Use `run_agent` for simple "open file + ask AI to edit" tasks (single file, single prompt, edit/mutation intent)
+- Use `run_app_flow` for complex multi-step tasks that need iterative navigation, slash commands, monitoring, or fallback strategies
+- For examine/retrieve tasks (read, summarize, explain, tell me about), follow `run_app_flow` with a `synthesize` step to present the answer to the user
+- For edit/mutation tasks (add, modify, refactor, write), use a single `run_agent` step with NO `synthesize` — the app owns the save
+- **NEVER use `shell.run`, `cli.agent`, `external.skill`, or any other CLI/package tool for a named desktop app task. The native desktop app itself is the correct execution route — do not install or call a similarly-named package from PyPI, npm, etc.**
+
+**Example: "Examine the <file> using <AppName> LLM and tell me what it's about"**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "run_app_flow", "appName": "<AppName>", "goal": "Examine the <file> using <AppName> LLM and tell me what it's about" }, "description": "Run App-Flow to examine <file> in <AppName>" },
+  { "skill": "synthesize", "args": { "prompt": "Summarize what the <file> contains based on the app's response" }, "description": "Present the explanation to the user" }
+]
+```
+
+**Example: "In <AppName>, set a reminder for standup at 9am"**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "run_app_flow", "appName": "<AppName>", "goal": "Set a reminder for standup at 9am" }, "description": "Run App-Flow to set reminder in <AppName>" }
+]
+```
 
 ## Browser Content Extraction (Copy Page Text via Clipboard)
 

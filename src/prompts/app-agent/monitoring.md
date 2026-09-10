@@ -13,19 +13,19 @@ Monitor screen state and decide when to act. Goal-oriented evaluation with hybri
 ## Modes
 
 ### Passive Mode
-Wait for completion without interaction (e.g., VSCode AI generating code, file upload).
+Wait for completion without interaction (e.g., editor AI generating code, file upload).
 - Polling: Start 5s → exponential backoff to 60s max
 - Trigger: OCR text change detected
 - Decision: COMPLETE | WAIT | ERROR | STALLED
 
 ### Active Mode
-Conversational back-and-forth (e.g., chat support, Slack DM).
+Conversational back-and-forth (e.g., chat support, messaging app DM).
 - Polling: Fixed 5s (conversational pace)
 - Trigger: Any OCR change
 - Decision: RESPOND | WAIT | COMPLETE | ESCALATE
 
 ### AI Response Mode
-Desktop AI app interaction (Devin, Cursor, Windsurf).
+Desktop AI app interaction (editor AI assistant, chat-based AI app).
 - Polling: 5s with semantic check
 - States: GENERATING | QUESTION | APPROVE | MORE_CONTENT | COMPLETE | STUCK
 - Scroll integration: MORE_CONTENT → scroll down → continue monitoring

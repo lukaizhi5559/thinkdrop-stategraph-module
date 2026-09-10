@@ -88,8 +88,29 @@ function resolveRoute({
   }
 
   // ── Priority 2: Desktop ──────────────────────────────────────────────────
-  // Desktop app must be installed, AppleScript-capable, logged in, and TCC granted.
-  if (desktopProbe && desktopProbe.installed && desktopProbe.applescriptSupported && desktopProbe.capability !== 'none') {
+  // Desktop app must be installed. Two paths:
+  //   (a) AppleScript-capable apps (from capability map): require applescriptSupported
+  //       AND capability !== 'none' AND TCC permission AND login state.
+  //   (b) Non-AppleScript apps (filesystem fallback): only require installed=true.
+  //       App-Flow uses NutJS keyboard + OCR, not AppleScript, so TCC and login
+  //       checks are not needed. This catches Devin, Cursor, VS Code, Windsurf, etc.
+  if (desktopProbe && desktopProbe.installed) {
+    const isAppleScriptCapable = desktopProbe.applescriptSupported && desktopProbe.capability !== 'none';
+
+    // Path (b): non-AppleScript app — App-Flow via NutJS+OCR
+    if (!isAppleScriptCapable) {
+      const result = {
+        route: 'desktop',
+        agentId: null, // desktop route uses app.agent (NutJS+OCR), no service agent
+        reason: `Desktop app installed (NutJS+OCR automation, no AppleScript needed)`,
+        probes,
+        createAgent: false,
+      };
+      logger.info?.(`[resolveRoute] ${svc}: route=desktop — ${result.reason}`);
+      return result;
+    }
+
+    // Path (a): AppleScript-capable app — full TCC + login checks
     // Check TCC permission
     if (tccProbe && !tccProbe.granted) {
       const result = {

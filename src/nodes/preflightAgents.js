@@ -1332,11 +1332,29 @@ module.exports = async function preflightAgents(state) {
     // Assesses whether browser.agent can handle the task well; if not,
     // searches for external AI tools and injects a note for the planner.
     // Skip when resolveAgent already selected (or created) agents — avoid inventing fake tools.
+    // ── Desktop app guard: skip tool discovery for any desktop app task ──
+    // If the classifier set taskType to 'app_automation' the user has explicitly
+    // named a desktop app to use. Tool discovery must NOT run because it may
+    // invent a CLI package (e.g. a PyPI project with the same name as the app).
+    // Also skip when the Grill-Me probe has already resolved a desktop route.
     (async () => {
       if (recoveryContext) return;
       if (!userMessage || userMessage.length < 10) return;
       if (selectedAgentIds.size > 0) {
         logger.info('[Node:PreflightAgents] resolveAgent selected agents — skipping tool discovery');
+        return;
+      }
+      // Strong desktop app guard: taskType 'app_automation' means the user named
+      // a native desktop app. Do not search for CLI packages that happen to share
+      // the same name (e.g. "llm-devin" when the user means the desktop app).
+      const _targetSvcForGuard = (_tc.targetService || '').toLowerCase();
+      if (_tc?.taskType === 'app_automation' && _targetSvcForGuard) {
+        logger.info(`[Node:PreflightAgents] Tool discovery skipped — taskType is app_automation for "${_targetSvcForGuard}"`);
+        return;
+      }
+      // Fallback guard: if the Grill-Me probe already resolved the route, skip.
+      if (_targetSvcForGuard && _routeDecision[_targetSvcForGuard]?.route === 'desktop') {
+        logger.info(`[Node:PreflightAgents] Tool discovery skipped — desktop app detected for "${_targetSvcForGuard}"`);
         return;
       }
       try {
@@ -1533,6 +1551,89 @@ module.exports = async function preflightAgents(state) {
       }
     })(),
   ]);
+
+  // ── Desktop app routing note + grill on not-installed ──────────────────────
+  // When the Grill-Me probe detected a desktop app for the target service:
+  //   (a) If installed → inject a strong routing note for the planner
+  //   (b) If not installed AND taskType is app_automation → grill the user
+  //       (offer to open the download page)
+  {
+    const _targetSvc = (_tc.targetService || '').toLowerCase();
+    if (_targetSvc && _routeDecision[_targetSvc]) {
+      const _route = _routeDecision[_targetSvc].route;
+      const _appName = _routeDecision[_targetSvc].probes?.desktop?.appName || _targetSvc;
+
+      if (_route === 'desktop') {
+        // (a) Inject routing note — tell the planner to use app.agent run_app_flow
+        const _routingNote = `DESKTOP APP DETECTED: "${_appName}" is installed on this machine. Route to app.agent { action: 'run_app_flow', appName: '${_appName}', goal: '<user goal>' }. Do NOT use cli.agent, shell.run, external.skill, or any CLI package to emulate this app. A native desktop app named "${_appName}" is installed; it is the ONLY correct execution route, even if a PyPI / npm / similar package with a related name exists.`;
+        agentContextNote = agentContextNote
+          ? `${agentContextNote}\n\n${_routingNote}`
+          : _routingNote;
+        logger.info(`[Node:PreflightAgents] Injected desktop routing note for "${_targetSvc}" (app: "${_appName}")`);
+      } else if (_route === 'unknown' && _tc.taskType === 'app_automation') {
+        // (b) App not installed — grill the user
+        const _candidates = (() => {
+          try {
+            const { _deriveAppNames } = require('../utils/probeDesktopApp');
+            return _deriveAppNames(_targetSvc);
+          } catch (_) { return []; }
+        })();
+        const _displayName = _candidates[0] || _targetSvc;
+        const _downloadUrls = {
+          devin: 'https://devin.ai/download',
+          cursor: 'https://cursor.com/download',
+          vscode: 'https://code.visualstudio.com/download',
+          vs_code: 'https://code.visualstudio.com/download',
+          visual_studio_code: 'https://code.visualstudio.com/download',
+          windsurf: 'https://windsurf.com/download',
+          zed: 'https://zed.dev/download',
+          slack: 'https://slack.com/downloads/mac',
+          discord: 'https://discord.com/download',
+          notion: 'https://www.notion.so/desktop',
+          figma: 'https://www.figma.com/downloads/',
+        };
+        const _downloadUrl = _downloadUrls[_targetSvc] || null;
+
+        warnings.push({
+          type: 'desktop_app_not_installed',
+          message: `"${_displayName}" is not installed on this machine.${_downloadUrl ? ` Download: ${_downloadUrl}` : ''}`,
+        });
+
+        if (gatherAnswerCallback && _downloadUrl) {
+          try {
+            _emitProgress({
+              type: 'preflight:app_not_installed',
+              serviceName: _targetSvc,
+              appName: _displayName,
+              downloadUrl: _downloadUrl,
+              message: `"${_displayName}" is not installed. Would you like me to open the download page?`,
+            });
+            const _answer = await gatherAnswerCallback(`app_not_installed:${_targetSvc}`);
+            const _choice = String(_answer || '').trim().toLowerCase();
+            if (_choice === 'yes' || _choice === 'y' || _choice === 'ok' || _choice === 'sure') {
+              try {
+                const { execSync } = require('child_process');
+                if (process.platform === 'darwin') {
+                  execSync(`open "${_downloadUrl}"`, { timeout: 3000 });
+                } else {
+                  execSync(`start "" "${_downloadUrl}"`, { timeout: 3000 });
+                }
+                logger.info(`[Node:PreflightAgents] Opened download page for "${_displayName}": ${_downloadUrl}`);
+              } catch (openErr) {
+                logger.warn(`[Node:PreflightAgents] Could not open download page: ${openErr.message}`);
+              }
+            } else {
+              logger.info(`[Node:PreflightAgents] User declined to download "${_displayName}" — proceeding with fallback`);
+            }
+          } catch (grillErr) {
+            logger.warn(`[Node:PreflightAgents] App-not-installed grill failed: ${grillErr.message}`);
+          }
+        } else {
+          logger.info(`[Node:PreflightAgents] App "${_displayName}" not installed — no gatherAnswerCallback or download URL, proceeding with fallback`);
+        }
+      }
+    }
+  }
 
   // ── Route choice gate (CLI-first) ──────────────────────────────────────────
   // When multiple execution routes (CLI/API, browser, app) are available for

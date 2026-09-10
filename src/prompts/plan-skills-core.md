@@ -19,6 +19,8 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 
 **Exceptions:** pure navigation → browser.agent directly. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
 
+**Desktop app automation (app_automation taskType):** When preflight detects a desktop app is installed (DESKTOP APP DETECTED note in agent context), ALWAYS route to `app.agent { action: 'run_app_flow', appName, goal }`. NEVER use `cli.agent`, `shell.run`, `external.skill`, or any CLI package for a named desktop app — it is a native desktop app, not a CLI tool, even if a package with a similar name exists on a package registry.
+
 ## Single-route mandate (MANDATORY)
 
 If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `browser.act` or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.

@@ -1515,6 +1515,7 @@ module.exports = async function executeCommand(state) {
       stepNum: skillCursor + 1,  // 1-based step number for UI
       totalSteps: skillPlan.length,
       skill,
+      args,                       // include args so consumers (e.g. driveProgressDrop) can pre-focus apps
       description,
       title: description || skill,  // title falls back to skill name
       intent: state.intent?.type || 'unknown'  // intent from state
@@ -4321,6 +4322,17 @@ Please try again or search with different terms.`;
   if (skill === 'web.crawl') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 45000);
   }
+  // app.agent run_app_flow: screen captures, OCR, web discovery, and monitoring
+  // AI responses can take minutes. The HTTP timeout must be LONGER than the
+  // internal maxDurationMs so the client doesn't discard the result.
+  // Progress callbacks (app_flow:action_start, app_flow:action_done) keep
+  // the UI informed during the wait, so this is not a blind spinner.
+  if (skill === 'app.agent') {
+    const agentTimeout = resolvedArgs.maxDurationMs
+      ? resolvedArgs.maxDurationMs + 10000   // internal timeout + 10s headroom
+      : 120000;                              // default 2 min if no maxDurationMs
+    stepTimeoutMs = Math.max(stepTimeoutMs, agentTimeout);
+  }
   // project_build can take several minutes (npm install + vite build + Playwright tests × 5 retries)
   if (skill === 'project_build') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 600000); // 10 min max
@@ -4712,6 +4724,7 @@ Please try again or search with different terms.`;
           stepNum: idx + 1,
           totalSteps: skillPlan.length,
           skill: gs.skill,
+          args: gs.args || {},
           description: gs.description,
           title: gs.description || gs.skill,
           intent: state.intent?.type || 'unknown'
@@ -5123,9 +5136,9 @@ Please try again or search with different terms.`;
   // ─────────────────────────────────────────────────────────────────────────────
 
   try {
-    // For cli.agent / browser.agent: inject _progressCallbackUrl so the agent can POST
+    // For cli.agent / browser.agent / app.agent: inject _progressCallbackUrl so the agent can POST
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
-    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent';
+    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent' || skill === 'app.agent';
     // Guard: planSkills LLM sometimes emits browser.agent/cli.agent steps without an
     // explicit `action` field.  The agent's switch statement hits the default case and
     // returns { ok: false, error: "Unknown action: \"undefined\"" }, triggering an
