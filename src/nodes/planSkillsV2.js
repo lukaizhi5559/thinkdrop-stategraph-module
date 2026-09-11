@@ -1196,10 +1196,15 @@ async function planSkillsV2(state) {
             const _fmMatch = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
             const _isNodeSkill = _fmMatch && /exec_type:\s*node\b/i.test(_fmMatch[1]);
             const _isPythonSkill = _fmMatch && /exec_type:\s*python\b/i.test(_fmMatch[1]);
-            const _isShellContract = !_isNodeSkill && !_isPythonSkill;
+            const _isInstructionSkill = _fmMatch && /exec_type:\s*instruction\b/i.test(_fmMatch[1]);
+            const _isShellContract = !_isNodeSkill && !_isPythonSkill && !_isInstructionSkill;
             if (_isNodeSkill || _isPythonSkill) {
               const _runtimeType = _isPythonSkill ? 'Python' : 'Node.js';
               skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is a ${_runtimeType} runtime skill (exec_type: ${_isPythonSkill ? 'python' : 'node'}). Generate a SINGLE step: { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n2. FORBIDDEN: Do NOT generate shell.run or curl steps.\n3. FORBIDDEN: Do NOT expand the implementation — just call external.skill.\n\n${contractMd.slice(0, 2000)}`;
+            } else if (_isInstructionSkill) {
+              // Instruction skills: knowledge/prompt-only. external.skill returns the
+              // markdown body; a synthesize step uses it to answer the user's question.
+              skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is an instruction/knowledge skill (exec_type: instruction). It returns knowledge content, not a direct answer.\n2. Generate TWO steps:\n   a. { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n   b. { "skill": "synthesize", "args": { "prompt": "Using the instruction content from the previous step, answer the user's question: ${userMessage.replace(/"/g, '\\"').slice(0, 300)}" } }\n3. The external.skill step returns the instruction markdown as output.\n4. The synthesize step uses that output to answer the user's question.\n5. FORBIDDEN: Do NOT generate shell.run, curl, or browser.agent steps for this skill.\n\n${contractMd.slice(0, 2000)}`;
             } else if (_isShellContract) {
               skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step.\n3. FORBIDDEN: Do NOT use external.skill for this.\n\n${contractMd.slice(0, 3000)}`;
               _shellContractMd = contractMd;

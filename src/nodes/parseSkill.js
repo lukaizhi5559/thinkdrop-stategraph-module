@@ -108,9 +108,14 @@ module.exports = async function parseSkill(state) {
     const _osModule = require('os');
     const SKILLS_BASE = _pathModule.join(_osModule.homedir(), '.thinkdrop', 'skills');
     try {
-      const _fsDirs = _fsModule.readdirSync(SKILLS_BASE).filter(d =>
-        _fsModule.existsSync(_pathModule.join(SKILLS_BASE, d, 'index.cjs'))
-      );
+      // Detect skill dirs that have either index.cjs (executable) OR skill.md
+      // (instruction/contract skills). Instruction skills imported from external
+      // URLs only have skill.md — without this check they'd be invisible to parseSkill.
+      const _fsDirs = _fsModule.readdirSync(SKILLS_BASE).filter(d => {
+        const hasIndex = _fsModule.existsSync(_pathModule.join(SKILLS_BASE, d, 'index.cjs'));
+        const hasSkillMd = _fsModule.existsSync(_pathModule.join(SKILLS_BASE, d, 'skill.md'));
+        return hasIndex || hasSkillMd;
+      });
       const _dbNames = new Set(installedSkills.map(s => s.name));
       let _fsAdded = 0;
       for (const dirName of _fsDirs) {
@@ -125,6 +130,18 @@ module.exports = async function parseSkill(state) {
               _fsMeta.sourceAction = _sj.source_action || null;
               if (_sj.description) _fsMeta.description = _sj.description;
               _fsMeta.goalTied = _sj.goal_tied || false;
+            } catch (_) {}
+          }
+          // Also read skill.md frontmatter for description (instruction skills)
+          const _skillMdPath = _pathModule.join(SKILLS_BASE, dirName, 'skill.md');
+          if (_fsModule.existsSync(_skillMdPath)) {
+            try {
+              const _md = _fsModule.readFileSync(_skillMdPath, 'utf8');
+              const _fmMatch = _md.match(/^---\s*\n([\s\S]*?)\n---/);
+              if (_fmMatch) {
+                const _descM = _fmMatch[1].match(/^description:\s*(.+)$/m);
+                if (_descM && _descM[1].trim()) _fsMeta.description = _descM[1].trim();
+              }
             } catch (_) {}
           }
           installedSkills.push(_fsMeta);

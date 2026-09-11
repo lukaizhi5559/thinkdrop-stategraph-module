@@ -2305,7 +2305,7 @@ module.exports = async function executeCommand(state) {
       // Mirrors skillRegistry.validateContract so errors are caught locally, with
       // clear fixes applied inline, rather than returned as an opaque HTTP 400.
       const REQUIRED_FM_FIELDS = ['name', 'description', 'exec_path', 'exec_type'];
-      const VALID_EXEC_TYPES = new Set(['node', 'shell', 'python']);
+      const VALID_EXEC_TYPES = new Set(['node', 'shell', 'python', 'instruction']);
       const SKILL_NAME_RE = /^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)+$/;
       {
         const fmPreflight = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
@@ -2335,11 +2335,25 @@ module.exports = async function executeCommand(state) {
             logger.info(`[Node:ExecuteCommand] skill.install pre-flight: fixed invalid exec_type "${execTypeM[1].trim()}" → shell`);
           } else {
             // Cross-field consistency: exec_type: node requires a .cjs/.js exec_path, not .md
+            // NOTE: exec_type: instruction is valid with .md exec_path — do NOT force to shell.
             const execPathInFm = fm.match(/^exec_path\s*:\s*(\S+)/m);
-            if (execPathInFm && execTypeM[1].trim() === 'node' && /\.md$/i.test(execPathInFm[1].trim())) {
+            const _execTypeVal = execTypeM[1].trim();
+            if (execPathInFm && _execTypeVal === 'node' && /\.md$/i.test(execPathInFm[1].trim())) {
               fm = fm.replace(/^exec_type\s*:.+$/m, `exec_type: shell`);
               patched = true;
               logger.info(`[Node:ExecuteCommand] skill.install pre-flight: fixed exec_type node→shell for .md exec_path`);
+            }
+            // instruction type requires .md exec_path
+            if (execPathInFm && _execTypeVal === 'instruction' && !/\.md$/i.test(execPathInFm[1].trim())) {
+              const preflightErr = `exec_type 'instruction' requires a .md exec_path, but got "${execPathInFm[1].trim()}".`;
+              logger.warn(`[Node:ExecuteCommand] skill.install pre-flight: ${preflightErr}`);
+              if (progressCallback) progressCallback({ type: 'step_failed', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'skill.install', description: 'Pre-flight failed', error: preflightErr });
+              return {
+                ...state,
+                skillResults: [...skillResults, { step: skillCursor + 1, skill: 'skill.install', args, description, ok: false, error: preflightErr }],
+                skillCursor: skillCursor + 1,
+                failedStep: { skill: 'skill.install', step: skillCursor + 1, error: preflightErr, args, stderr: preflightErr },
+              };
             }
           }
 
