@@ -283,7 +283,7 @@ module.exports = async function answer(state) {
       }
       return lines;
     }).join('\n\n');
-    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: For image results, use the IMAGE URL provided above. Do NOT invent or hallucinate image URLs. Synthesize the results into a SINGLE coherent answer — do NOT repeat the same fact or paragraph multiple times. Each piece of information should appear exactly once.`;
+    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: For image results, use the IMAGE URL provided above. Do NOT invent or hallucinate image URLs. Synthesize the results into a SINGLE coherent answer — do NOT repeat the same fact or paragraph multiple times. Each piece of information should appear exactly once.\n\nFORMATTING: Use markdown for readability — **bold** for key items, bullet lists for enumerations, and clear paragraph breaks. Do NOT use markdown headers (#) or code blocks unless the content is genuinely code. Keep the answer concise and well-structured.`;
   }
 
   // ── Inject conversation history for ambiguous follow-up interpretation ─────────
