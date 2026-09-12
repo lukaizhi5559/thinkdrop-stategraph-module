@@ -3387,8 +3387,11 @@ CRITICAL RULES:
         // inspect the answer before streaming. Streaming the apology text to the UI
         // and then correcting it on retry causes the Summary panel to show "I apologize"
         // even when the retry succeeds. We stream the final confirmed answer below.
-        synthesisAnswer = await llmBackend.generateAnswer(synthesisQuery, synthPayload, synthPayload.options, null);
-        logger.debug(`[Node:ExecuteCommand] synthesize: LLM answer generated (${synthesisAnswer.length} chars)`);
+        let _synthThinking = '';
+        const _synthOnReasoning = (r) => { if (r) _synthThinking += r; };
+        synthesisAnswer = await llmBackend.generateAnswer(synthesisQuery, synthPayload, synthPayload.options, null, _synthOnReasoning);
+        if (_synthThinking) state._synthThinking = _synthThinking;
+        logger.debug(`[Node:ExecuteCommand] synthesize: LLM answer generated (${synthesisAnswer.length} chars${_synthThinking ? `, thinking: ${_synthThinking.length} chars` : ''})`);
 
         // Clear all progress timers since we're done
         _progressTimers.forEach(t => clearTimeout(t));
@@ -7089,7 +7092,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       lastOpenedFilePath,
       webAgentBestUrl: newWebAgentBestUrl,
       commandExecuted: isLastStep,
-      answer: lastStepAnswer  // set so voice service _stategraphLaneResponse gets it for TTS
+      answer: lastStepAnswer,  // set so voice service _stategraphLaneResponse gets it for TTS
+      thinking: state._synthThinking || state.thinking || null
     };
 
   } catch (error) {

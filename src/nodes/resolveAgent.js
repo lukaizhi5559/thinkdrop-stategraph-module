@@ -29,6 +29,19 @@ const { fuzzyMatch } = require('../utils/fuzzyMatch');
 
 const MAX_ROUNDS = 3;
 
+// Agent canonicalization map — maps service-specific agents to their canonical
+// parent agent when they share the same authentication. This prevents the LLM
+// from selecting google_docs.agent when the user already has an authenticated
+// google.agent that handles all Google services.
+// NOTE: gmail.agent is NOT mapped to google.agent — it has separate auth.
+const AGENT_CANONICAL_MAP = {
+  'google_docs.agent': 'google.agent',
+  'google_sheets.agent': 'google.agent',
+  'google_calendar.agent': 'google.agent',
+  'google_drive.agent': 'google.agent',
+  'google_slides.agent': 'google.agent',
+};
+
 // Known service hostname aliases for verification. Smaller and more stable than a
 // full URL map; the primary source of truth is discovered via web.agent.
 const SERVICE_HOST_ALIASES = {
@@ -545,6 +558,13 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
     let agentId = (a.agentId || '').toLowerCase();
     if (!agentId) continue;
     if (!agentId.endsWith('.agent')) agentId += '.agent';
+    // Canonicalize service-specific agents to their parent agent when they share auth.
+    // E.g. google_docs.agent → google.agent (same Google account auth).
+    if (AGENT_CANONICAL_MAP[agentId]) {
+      const canonicalId = AGENT_CANONICAL_MAP[agentId];
+      logger.info(`[Node:ResolveAgent] Canonicalizing "${agentId}" → "${canonicalId}"`);
+      agentId = canonicalId;
+    }
     const exists = registeredIds.has(agentId);
     const service = a.service || agentId.replace(/\.agent$/, '');
     let create = !!a.create;

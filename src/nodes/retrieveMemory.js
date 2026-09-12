@@ -368,7 +368,10 @@ module.exports = async function retrieveMemory(state) {
       }
     }
 
-    const isActivityQuery = _isActivityQuery(resolvedMessage || message);
+    // Prefer LLM-based activity classification from classifyTask (state._taskClassification)
+    // over the regex fallback — the LLM understands "what have I been working on" etc.
+    // without needing every verb hardcoded in a regex.
+    const isActivityQuery = state._taskClassification?.isActivityQuery ?? _isActivityQuery(resolvedMessage || message);
     const searchQuery = buildSearchQuery(message, resolvedMessage);
 
     // If the query stripped down to the generic fallback, try to enrich it with the

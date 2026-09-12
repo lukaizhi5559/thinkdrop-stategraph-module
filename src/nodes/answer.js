@@ -256,7 +256,20 @@ module.exports = async function answer(state) {
 
   // ── Inject formatted web search results so LLM clearly sees all URLs ───────────
   if (contextDocs.length > 0) {
-    const formattedResults = contextDocs.map((doc, i) => {
+    // Deduplicate by URL (and by snippet similarity) to prevent the LLM from
+    // repeating the same information from overlapping search results.
+    const _seenUrls = new Set();
+    const _seenSnippets = new Set();
+    const _dedupedDocs = contextDocs.filter(doc => {
+      const url = doc.url || doc.originalUrl || '';
+      const snippet = (doc.snippet || '').substring(0, 120).toLowerCase().trim();
+      if (url && _seenUrls.has(url)) return false;
+      if (snippet && _seenSnippets.has(snippet)) return false;
+      if (url) _seenUrls.add(url);
+      if (snippet) _seenSnippets.add(snippet);
+      return true;
+    });
+    const formattedResults = _dedupedDocs.map((doc, i) => {
       const isImage = doc.isImage || doc.imageUrl;
       let lines = `[${i + 1}] ${doc.title || 'Untitled'}`;
       if (isImage && doc.imageUrl) {
@@ -270,7 +283,7 @@ module.exports = async function answer(state) {
       }
       return lines;
     }).join('\n\n');
-    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: For image results, use the IMAGE URL provided above. Do NOT invent or hallucinate image URLs.`;
+    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: For image results, use the IMAGE URL provided above. Do NOT invent or hallucinate image URLs. Synthesize the results into a SINGLE coherent answer — do NOT repeat the same fact or paragraph multiple times. Each piece of information should appear exactly once.`;
   }
 
   // ── Inject conversation history for ambiguous follow-up interpretation ─────────
@@ -331,6 +344,13 @@ module.exports = async function answer(state) {
     } else {
       systemInstructions += '\n- Use the provided context\n- Be helpful and concise';
     }
+  }
+
+  // Activity-query guard: if the user asked about their recent activity/work,
+  // instruct the LLM to focus on activity/screen/app memories and NOT surface
+  // unrelated personal profile data (email, phone, address) unless explicitly asked.
+  if ((intentType === 'memory_retrieve') && state._taskClassification?.isActivityQuery) {
+    systemInstructions += '\n- ACTIVITY QUERY GUARD: The user is asking about their recent activity or work. Focus ONLY on activity, screen capture, and app usage memories. Do NOT surface personal profile data (email, phone, address, birthday) unless the user explicitly asked for it. If the activity memories are empty or sparse, say so honestly rather than filling the gap with unrelated personal data.';
   }
 
   // Inject formatted memories directly into system instructions for memory intents.
@@ -528,11 +548,16 @@ module.exports = async function answer(state) {
   logger.debug(`[Node:Answer] conversationHistory: ${conversationHistory.length} msgs, memories: ${filteredMemories.length}`);
 
   try {
+    // Collect reasoning/thinking separately so it doesn't leak into the answer
+    let _thinking = '';
+    const onReasoning = (r) => { if (r) _thinking += r; };
+
     const finalAnswer = await backend.generateAnswer(
       finalQuery,
       payload,
       payload.options,
-      isStreaming ? streamCallback : null
+      isStreaming ? streamCallback : null,
+      onReasoning
     );
 
     logger.debug(`[Node:Answer] Answer generated (${finalAnswer.length} chars) via ${backend.getInfo().name}`);
@@ -700,6 +725,7 @@ Respond with ONLY valid JSON: {"correctIntent":"<intent>"}`;
     return {
       ...state,
       answer: displayAnswer,
+      thinking: _thinking || state.thinking || null,
       _answerStreamed: isStreaming,
       ...(pendingQuestion ? { pendingQuestion } : {}),
       metadata: {

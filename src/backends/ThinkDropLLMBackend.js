@@ -141,7 +141,7 @@ class ThinkDropLLMBackend extends LLMBackend {
    * Always streams - accumulates and returns full answer.
    * If onToken provided, forwards each chunk in real time.
    */
-  async generateAnswer(prompt, payload, options = {}, onToken = null) {
+  async generateAnswer(prompt, payload, options = {}, onToken = null, onReasoning = null) {
     // Acquire a connection from the pool (reuses persistent connections)
     const { ws, pooled } = await this._acquireWs();
     let _errored = false;
@@ -195,6 +195,7 @@ class ThinkDropLLMBackend extends LLMBackend {
 
     // Collect streaming response
     let accumulated = '';
+    let accumulatedReasoning = '';
     let streamStarted = false;
 
     // Dynamic timeout based on taskType — complex/super-heavy need much more time
@@ -235,9 +236,14 @@ class ThinkDropLLMBackend extends LLMBackend {
 
             } else if (msg.type === 'llm_stream_chunk') {
               const chunk = msg.payload?.chunk || msg.payload?.text || '';
+              const reasoning = msg.payload?.reasoning || '';
               if (chunk) {
                 accumulated += chunk;
                 if (onToken) onToken(chunk);
+              }
+              if (reasoning) {
+                accumulatedReasoning += reasoning;
+                if (onReasoning) onReasoning(reasoning);
               }
 
             } else if (msg.type === 'llm_stream_end') {
@@ -292,7 +298,16 @@ class ThinkDropLLMBackend extends LLMBackend {
       if (onToken) onToken(fallback);
       return fallback;
     }
-    return accumulated;
+    // Attach reasoning to the returned string via a non-enumerable property so
+    // callers that just want the text string are unaffected, while callers that
+    // check for reasoning can access it.
+    const result = accumulated;
+    if (accumulatedReasoning) {
+      try {
+        Object.defineProperty(result, 'reasoning', { value: accumulatedReasoning, enumerable: false, writable: false, configurable: true });
+      } catch (_) {}
+    }
+    return result;
   }
 
   /**

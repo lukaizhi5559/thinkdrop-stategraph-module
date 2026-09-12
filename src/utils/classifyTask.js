@@ -21,6 +21,7 @@
  *   isBrowseOnly: boolean,         // pure navigation — no messaging/send intent
  *   requiresDOM: boolean,           // browser task needing DOM access (form fill, login, scrape)
  *   isImageAnalysis: boolean,       // task asks to analyze/describe/scan visual content of local image files
+ *   isActivityQuery: boolean,       // user asks about recent activity/work/screen time (memory retrieval)
  * }
  *
  * Fails open: any error returns a safe default that never blocks execution.
@@ -45,7 +46,8 @@ Output ONLY valid JSON with exactly these fields:
   "isAppUiInspection": true | false,
   "isSpatialAnalysis": true | false,
   "isImageAnalysis": true | false,
-  "isConversationRecall": true | false
+  "isConversationRecall": true | false,
+  "isActivityQuery": true | false
 }
 
 Field rules:
@@ -95,6 +97,8 @@ Field rules:
 - isImageAnalysis: true when the task asks to analyze, describe, scan, examine, or understand the VISUAL CONTENT of local image files (png, jpg, jpeg, webp, gif, bmp, tiff, heic, screenshots, photos, pictures). This includes phrases like "what's in these images", "scan the screenshots", "describe the photos", "analyze the images in this folder", "tell me what these files are about" (when the folder contains images). ALSO true when the user references a folder whose name clearly indicates images (e.g. "screenshots", "photos", "images") AND asks to analyze/describe/scan/examine its contents — even if they say "files" instead of "images". false for: listing files, copying/moving/deleting images, converting image formats, resizing/cropping, or any task that doesn't require understanding what the images SHOW. false for live screen capture ("what's on my screen") — that's screen.capture, not image.analyze.
 
 - isConversationRecall: true when the user is asking ABOUT THE CONVERSATION ITSELF — i.e., meta-questions that request the assistant to inspect, recall, summarize, or repeat prior turns of the chat transcript. Signals: "what did I (just) ask", "what did I say", "what did we talk about", "what was my last question", "what did you just say", "what did I ask you (two messages ago / earlier / before / three prompts ago)", "summarize our conversation", "what have we been discussing", "repeat what I said", "remind me what we were talking about", "go back to what I said earlier". These are requests to READ the transcript, NOT topic continuations. When true, isFollowUp MUST be false and followUpTarget MUST be null. IMPORTANT: isConversationRecall is FALSE for queries about the user's PAST ACTIVITY or EPISODIC MEMORY — those are about screen captures and stored facts, NOT chat prompts. Examples where isConversationRecall is FALSE: "do you have any memories from yesterday", "what did I do yesterday", "what was I doing", "what did I watch", "what did I listen to", "what did I buy", "what did I have open", "what was on my screen", "what was I working on". These should be treated as normal memory_retrieve queries.
+
+- isActivityQuery: true when the user asks about their RECENT ACTIVITY, WORK, SCREEN TIME, or CONTENT CONSUMPTION — i.e., queries that should be answered from episodic memory / screen captures / app usage, NOT from the chat transcript and NOT from personal profile data. Signals: "what have I been working on", "what was I working on today", "what did I do yesterday", "what did I watch", "what did I listen to", "what apps did I use", "what was on my screen", "what was I doing", "what have I been up to". When true, the memory retrieval node should use a broad activity query (NOT the raw prompt) and a low similarity threshold, and the answer node should focus on activity/screen/app memories — NOT surface personal profile data (email, phone, address) unless explicitly asked. false for: personal profile queries ("what is my email", "what is my name"), conversation-recall meta-questions (those are isConversationRecall), and non-memory tasks (web search, automation).
 
 - requiresDOM: true when taskType is "browser" AND the task requires precise DOM-level interaction that keyboard shortcuts cannot do reliably. The following categories ALWAYS require DOM:
   1. Content creation and editing: make/create/build/edit/update/modify a playlist, document, board, post, event, collection, album, note, page, wiki article — clicking create/edit buttons, typing names, modifying content, adding items.
@@ -203,6 +207,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     isSpatialAnalysis: false,
     isImageAnalysis: false,
     isConversationRecall: false,
+    isActivityQuery: false,
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -263,6 +268,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isSpatialAnalysis:   !!parsed.isSpatialAnalysis,
       isImageAnalysis:     !!parsed.isImageAnalysis,
       isConversationRecall: !!parsed.isConversationRecall,
+      isActivityQuery:     !!parsed.isActivityQuery,
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);
