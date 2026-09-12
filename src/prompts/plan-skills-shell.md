@@ -107,7 +107,7 @@ git remote get-url origin | sed 's/.*github.com[:/]//' | sed 's/\.git$//'
 - **`find` on user directories — ALWAYS `-maxdepth 1` by default.** No recursion unless user says "recursively / subfolders / children / nested". Use `-exec {} +` (batch) NOT `-exec {} \;` (per-item subprocess, hangs on large trees). Example: `find ~/Desktop -maxdepth 1 -exec CMD {} +`.
 - **macOS Finder color tags** — color labels are stored in THREE keys: `com.apple.FinderInfo` (primary), `com.apple.metadata:_kMDItemUserTags`, and `com.apple.metadata:kMDLabel_*`. Must clear ALL of them. NEVER use `find ... -exec xattr -d {} \;` — recurses + hangs.
 - **`synthesize` with `saveToFile`** — ONLY when user explicitly asks to save/write/create a file.
-- **NEVER use `shell.run curl` to call external API services** — use `browser.agent` or `cli.agent` for ALL external services.
+- **NEVER use `shell.run curl` to call AUTHENTICATED external API services** (OAuth, api_key, bearer tokens) — use `browser.agent` or `cli.agent` for those. curl IS allowed and preferred for public file downloads (`curl -sL -o <dest> <url>`) and public page fetches — always verify downloads with `file <dest>`.
 - **Safe file move/copy — NEVER use wildcards that include the destination:** When moving files from a directory to a subfolder, the `*` wildcard includes the destination folder itself. Use specific file patterns OR exclude the destination:
   - CORRECT: `bash -c "mv ~/Desktop/*.txt ~/Desktop/dest/"`
   - CORRECT: `bash -c "find ~/Desktop -maxdepth 1 -type f ! -path '*thinkdrop-files*' -exec mv {} ~/Desktop/thinkdrop-files/ +"`

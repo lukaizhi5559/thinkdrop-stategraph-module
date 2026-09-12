@@ -321,6 +321,7 @@ Rules:
 - The question must be 15 words or fewer.
 - Do not include agents that are not needed for the task.
 - LOCAL MACHINE QUERIES: NEVER create or select an agent for local OS / shell queries — current time or date, system uptime, disk space, memory/CPU/battery usage, hardware info, running processes, hostname, OS version, environment variables, screen capture, or any task that runs against the local machine itself. These need NO service agent — return an empty "agents" array and "question": null. They are handled by generic shell/system skills, not by service agents.
+- PUBLIC WEB TASKS: NEVER create or select an agent for tasks that only need to READ public information or DOWNLOAD a public file — "look up X", "find info about Y", "search for Z on <site>", "download an mp3/pdf/image", "read this article", "any new X recently". These need NO service agent — return an empty "agents" array and "question": null. They are handled by generic web-search/curl/crawl skills, not by service agents. Naming a public website does NOT make it a service agent task — only select/create an agent when the task requires an account, login, or interaction (send, post, create, add-to-cart, fill a form, manage account data).
 - LOCAL IMAGE ANALYSIS: NEVER create or select an agent for tasks involving local image files (png, jpg, screenshots, photos). These are handled by the generic image.analyze skill, not by a browser or REST agent. Return an empty "agents" array and "question": null.
 - LOCAL FILE / IMAGE TASKS: If the task references a local file ([File: ...], [Folder: ...]) or local image AND the user does NOT explicitly name an external service/provider to send, upload, post, or share to, do NOT select or create a browser/REST agent. These are handled by generic skills (fs.read, image.analyze, synthesize). Only select an agent if the user explicitly asks to send/upload/post/share the file to a specific named service (e.g. "upload this image to ChatGPT", "email this file via gmail"). For follow-up prompts, only select an agent if the conversation history establishes that an external service was being used.
 - FOLLOW-UP CONTEXT: When a FOLLOW-UP CONTEXT block is provided, the user is revising or continuing a prior task. Reuse the same service/agent from the prior turn — do NOT ask for clarification on already-established context (e.g., do not ask "Which platform?" if the prior turn already established the platform).
@@ -713,6 +714,31 @@ module.exports = async function resolveAgent(state) {
   }
   if (_tcLocal?.taskType === 'local_system' && _tcLocal?.targetService) {
     logger.info(`[Node:ResolveAgent] local_system task but targetService="${_tcLocal.targetService}" set — proceeding to agent selection (possible misclassification): "${userMessage.slice(0, 80)}"`);
+  }
+
+  // ── Skip: public web tasks need no service agent ──────────────────────────
+  // classifyTask sets webAccessMode 'download' (fetch a public file) or
+  // 'public_read' (look up public info / read a public page). These are handled
+  // by generic skills — web.agent (MCP web search), web.crawl, shell.run curl —
+  // never by registered service agents. Letting the LLM selection run here
+  // caused it to fabricate agents for nonexistent services (goodpizzas.agent)
+  // or pick an unrelated authed agent (google.agent for "a sound of connecting
+  // to the internet"), which then hit the auth preflight wall.
+  // Exception: a follow-up that continues an established agent-based task keeps
+  // the selection path (the prior turn's agent may be needed).
+  const _webMode = _tcLocal?.webAccessMode;
+  if ((_webMode === 'download' || _webMode === 'public_read') && !_tcLocal?.isFollowUp) {
+    logger.info(`[Node:ResolveAgent] webAccessMode=${_webMode} — skipping agent selection (public web task, generic skills only): "${userMessage.slice(0, 80)}"`);
+    return {
+      ...state,
+      resolveAgentResult: {
+        agents: [],
+        reasoning: `Public web task (${_webMode}) — no service agent needed`,
+        question: null,
+        _message: userMessage,
+      },
+      resolveAgentAnswers: Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [],
+    };
   }
 
   const priorAnswers = Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [];

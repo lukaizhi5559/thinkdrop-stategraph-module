@@ -342,7 +342,15 @@ module.exports = async function retrieveMemory(state) {
     const PROFILE_QUERY_PATTERN = /^(what'?s|what is|who is|who'?s|where is)\s+(my|i am|am i)\b|^what (type|kind|sort) of (person|man|woman|human|individual)/i;
     const ALL_TIME_QUERY_PATTERN = /\b(first|earliest|ever|all time|oldest|very first|all history)\b/i;
     const msgWords = (resolvedMessage || message).trim().split(/\s+/).filter(Boolean).length;
+    // Skip dateRange inheritance for entity follow-ups (e.g. "how many believe in him"
+    // after "Jesus") — they have no temporal intent and inheriting a bogus range from
+    // a prior message (e.g. "around 2" parsed as 2 o'clock) pollutes the retrieval window.
+    // Also skip for conversation-recall meta-questions — they should use their own parsed
+    // range or search broadly, not a random inherited window.
+    const _isFollowUp = !!state._taskClassification?.isFollowUp;
+    const _isConvRecall = !!state._taskClassification?.isConversationRecall;
     if (!dateRange && msgWords <= 12 && context?.sessionId &&
+        !_isFollowUp && !_isConvRecall &&
         !PROFILE_QUERY_PATTERN.test(resolvedMessage || message) &&
         !ALL_TIME_QUERY_PATTERN.test(resolvedMessage || message)) {
       try {

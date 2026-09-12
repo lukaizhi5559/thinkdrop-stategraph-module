@@ -9,6 +9,16 @@ function writeIntentLog(entry) {
   catch (_) {}
 }
 
+// ── Emit intent:decided progress event so the renderer can play intent sounds ──
+// Flows through handoffRunner._makeProgressCallback → automation:progress IPC
+function _emitIntentDecided(state, intent, confidence) {
+  if (typeof state.progressCallback === 'function') {
+    try {
+      state.progressCallback({ type: 'intent:decided', intent, confidence });
+    } catch (_) {}
+  }
+}
+
 /**
  * parseIntentV2
  *
@@ -258,6 +268,7 @@ module.exports = async function parseIntentV2(state) {
     logger.debug(`[Node:ParseIntentV2] intentPlan passthrough → ${finalIntent} (${finalConf}): "${classifyMessage.slice(0, 80)}"`);
     writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'llm-decompose', intent: finalIntent, confidence: finalConf, subPromptCount: 1, durationMs: 0, subPrompts: [{ order: 0, text: sp.text, estimatedIntent: finalIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }] });
 
+    _emitIntentDecided(state, finalIntent, finalConf);
     return {
       ...state,
       intent: { type: finalIntent, confidence: finalConf, entities: [], requiresMemoryAccess: finalIntent === 'memory_retrieve' },
@@ -269,6 +280,7 @@ module.exports = async function parseIntentV2(state) {
   if (state._decomposedIntent === 'command_automate') {
     logger.debug(`[Node:ParseIntentV2] _decomposedIntent passthrough → command_automate`);
     writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'decomposed-intent-passthrough', intent: 'command_automate', confidence: 0.88 });
+    _emitIntentDecided(state, 'command_automate', 0.88);
     return { ...state, intent: { type: 'command_automate', confidence: 0.88, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'decomposed-intent-passthrough', processingTimeMs: 0 } };
   }
 
@@ -291,6 +303,7 @@ module.exports = async function parseIntentV2(state) {
         const xConf   = classifyRes.topConfidence || 0.70;
         logger.debug(`[Node:ParseIntentV2] phi4 classify → ${xIntent} (${xConf.toFixed(2)}): "${classifyMessage.slice(0, 60)}"`);
         writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'phi4-classify', intent: xIntent, confidence: xConf });
+        _emitIntentDecided(state, xIntent, xConf);
         return {
           ...state,
           intent: { type: xIntent, confidence: xConf, entities: [], requiresMemoryAccess: xIntent === 'memory_retrieve' },

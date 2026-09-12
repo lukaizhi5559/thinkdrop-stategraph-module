@@ -10,6 +10,17 @@ function writeDecomposeLog(entry) {
   catch (_) {}
 }
 
+// ── Emit intent:decided progress event so the renderer can play intent sounds ──
+// Fires earlier than parseIntentV2 (decompose runs first), giving faster audio feedback.
+// The renderer deduplicates: only the first intent:decided per task plays a sound.
+function _emitIntentDecided(state, intent, confidence) {
+  if (state && typeof state.progressCallback === 'function') {
+    try {
+      state.progressCallback({ type: 'intent:decided', intent, confidence });
+    } catch (_) {}
+  }
+}
+
 /**
  * decomposePromptV2
  *
@@ -208,6 +219,9 @@ DECISION RULES (check in order):
 - "what did I do yesterday/recent activity" → 4 (retrieving past activity)
 - "what is blockchain/what is 5*7" → 5 (general knowledge)
 - "what app am I in/what's on my screen" → 1 (screen observation)
+- "look online for X / find info about X / any new X out recently / what's the latest X" → 2 (web research with NO named site to interact with — NOT command_automate)
+- "search the web / google X / look up X online" → 2 (web search — no site interaction)
+- Naming a site to INTERACT with (post/send/create/add to cart/log in/fill a form) → 0; naming a site only to look something up on it → 2
 - When in doubt → 0 (command_automate is the safest single-step default)
 - Only return 7 when the user has MULTIPLE INDEPENDENT goals (e.g., "send an email AND schedule a meeting")
 - Do NOT return 7 for multi-agent tasks that serve ONE goal (e.g., "post on Twitter, Facebook, and LinkedIn" → 0, the planner handles multiple agents)
@@ -358,6 +372,77 @@ module.exports = async function decomposePromptV2(state) {
   const _MULTI_GOAL_CONJUNCTIONS = /\b(and\s+then|also|after\s+that|additionally|plus|furthermore|then\s+also)\b|;\s*[a-z]/i;
   const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower);
   const _SINGLE_STEP_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser']);
+  // ── Image-search guard — checked BEFORE the command_automate short-circuit ──
+  // classifyTask may mark "show me a picture of X" as taskType=browser, which would
+  // short-circuit to command_automate and build a web agent. The web_search intent
+  // handles image retrieval natively (with carousel), so route image queries there.
+  const _IMAGE_SEARCH_PATTERNS = [
+    /\bshow\s+me\s+(a\s+|an\s+|the\s+|some\s+)?(picture|image|photo|pic|logo|icon)s?\s+(of|for)\b/i,
+    /\b(show|find|search\s+for|look\s+up|get\s+me)\s+(a\s+|an\s+|the\s+|some\s+)?(picture|image|photo|pic|logo|icon)s?\s+(of|for)\b/i,
+    /\bwhat\s+does\s+.+\s+look\s+like\b/i,
+    /\b(can\s+i\s+see|let\s+me\s+see)\s+(a\s+|an\s+|the\s+)?(picture|image|photo|pic|logo|icon)\b/i,
+  ];
+  const _isImageSearch = _IMAGE_SEARCH_PATTERNS.some(re => re.test(_msgLower));
+  if (_isImageSearch && !_hasMultiGoalConjunction) {
+    logger.info(`[Node:DecomposePromptV2] Image-search guard: routing to web_search (taskType=${_tc.taskType}) — skipping command_automate short-circuit`);
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'web_search',
+      confidence: 0.9,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'image-search-guard', intent: 'web_search',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'web_search', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'web_search', 0.9);
+    return {
+      ...state,
+      _decomposedIntent: 'web_search',
+      _decomposedBy: 'image-search-guard',
+      intentPlan: subPrompts,
+    };
+  }
+  // ── Public-research guard — checked BEFORE the command_automate short-circuit ──
+  // classifyTask marks "look online for X" / "any new X recently" as
+  // taskType=browser + webAccessMode=public_read, which would otherwise
+  // short-circuit to command_automate → resolveAgent → a fabricated browser agent
+  // + auth preflight for a task that only needs a web search. When NO specific
+  // site/service is named, route to the web_search intent (existing cheap path:
+  // webSearch node → answer). Named-site research stays command_automate so the
+  // planner can use web.agent preferDomain — but it still won't get an agent.
+  if (_tc.webAccessMode === 'public_read' && !_tc.targetService && !_hasMultiGoalConjunction) {
+    logger.info(`[Node:DecomposePromptV2] Public-research guard: routing to web_search (taskType=${_tc.taskType}) — skipping command_automate short-circuit`);
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'web_search',
+      confidence: 0.9,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'public-research-guard', intent: 'web_search',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'web_search', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'web_search', 0.9);
+    return {
+      ...state,
+      _decomposedIntent: 'web_search',
+      _decomposedBy: 'public-research-guard',
+      intentPlan: subPrompts,
+    };
+  }
   if (_SINGLE_STEP_TASK_TYPES.has(_tc.taskType) && !_hasMultiGoalConjunction) {
     logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step command_automate (taskType=${_tc.taskType}, no multi-goal conjunction) — skipping LLM decision`);
     const subPrompts = [{
@@ -376,6 +461,7 @@ module.exports = async function decomposePromptV2(state) {
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
+    _emitIntentDecided(state, 'command_automate', 0.85);
     return {
       ...state,
       _decomposedIntent: 'command_automate',
@@ -403,6 +489,7 @@ module.exports = async function decomposePromptV2(state) {
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'memory_retrieve', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
+    _emitIntentDecided(state, 'memory_retrieve', 0.85);
     return {
       ...state,
       _decomposedIntent: 'memory_retrieve',
@@ -432,6 +519,7 @@ module.exports = async function decomposePromptV2(state) {
       isLongRunning: false,
       dataTemplate: null,
     }];
+    _emitIntentDecided(state, _SINGLE_STEP_INTENTS[_fastDecision], 0.85);
     // No _llmDateRange on fast path — retrieveMemory falls back to regex + LLM
   } else {
     logger.info('[Node:DecomposePromptV2] Fast decision: MULTI_STEP — running full decomposition');
@@ -527,6 +615,7 @@ module.exports = async function decomposePromptV2(state) {
       subPrompts: [{ order: 0, text: sp.text, estimatedIntent: sp.estimatedIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }],
     });
 
+    _emitIntentDecided(state, sp.estimatedIntent, sp.confidence || 0.85);
     return {
       ...state,
       _decomposedIntent: sp.estimatedIntent,
@@ -549,6 +638,7 @@ module.exports = async function decomposePromptV2(state) {
   logger.info(`[Node:DecomposePromptV2] LLM decomposed into ${collapsed.length} sub-prompts in ${durationMs}ms`);
   collapsed.forEach((sp, i) => logger.info(`  [${i}] "${sp.text}" → ${sp.estimatedIntent}`));
 
+  _emitIntentDecided(state, collapsed[0]?.estimatedIntent, collapsed[0]?.confidence || 0.85);
   return {
     ...state,
     _decomposedIntent: collapsed[0]?.estimatedIntent,

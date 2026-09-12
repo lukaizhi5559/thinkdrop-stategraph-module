@@ -4,9 +4,11 @@ Domain-specific guidance for `browser.agent` and `web.agent`. General skill list
 
 ### When to use `web.agent` before `browser.agent`
 
+- **Public research / search / look-up (no login needed):** `web.agent` (`research_domain` or `search_and_navigate`) → `synthesize`. NEVER use `browser.agent` — no session needed. Use `web.crawl {{bestUrl}}` first if the full page text is required.
+- **Public file download:** `web.agent { action: 'find_download', query, fileExt }` → `shell.run curl -sL -o <dest> {{bestUrl}}` → `shell.run file <dest>` verify. If `find_download` returns `isPage:true`, `web.crawl {{bestUrl}}` to find the real media link first.
 - **Known bot blockers / CAPTCHA:** sites that block automated browsing or present CAPTCHA challenges
 - **Unknown or uncertain domain:** the LLM may guess the wrong URL
-- **Pattern:** `web.agent search_and_navigate` → `browser.agent { action: 'run', url: '{{bestUrl}}' }` → `synthesize`
+- **Pattern (interactive only):** `web.agent search_and_navigate` → `browser.agent { action: 'run', url: '{{bestUrl}}' }` → `synthesize`
 
 ### Agent ID naming
 
@@ -15,7 +17,15 @@ Lowercase service name + `.agent` suffix:
 
 ### Examples
 
-**Search a named site:**
+**Search a named site — public look-up (NO login/interaction):**
+```json
+[
+  { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "<query> site:<service>", "preferDomain": "<service>" }, "description": "Look up <query> on <service>" },
+  { "skill": "synthesize", "args": { "prompt": "Present the results clearly to the user" }, "description": "Summarize the <service> results" }
+]
+```
+
+**Search a named site — interactive (filter UI, add to cart, logged-in results):**
 ```json
 [
   { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "look up <query>" }, "description": "Look up <query> on <service>" },
@@ -31,13 +41,14 @@ Lowercase service name + `.agent` suffix:
 ]
 ```
 
-**Read a raw URL:**
+**Read a raw PUBLIC URL:**
 ```json
 [
-  { "skill": "browser.agent", "args": { "action": "run", "task": "read and extract the main content from the page", "url": "https://<site>/page" }, "description": "Navigate and read the URL" },
+  { "skill": "web.crawl", "args": { "url": "https://<site>/page", "maxChars": 12000 }, "description": "Fetch readable text from the page" },
   { "skill": "synthesize", "args": { "prompt": "Summarize the page content for the user" }, "description": "Summarize page content" }
 ]
 ```
+Use `browser.agent` for a URL only when reading it requires login or page interaction.
 
 **Bypass a bot blocker:**
 ```json

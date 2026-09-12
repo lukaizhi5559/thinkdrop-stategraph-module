@@ -363,6 +363,10 @@ function _buildSystemPrompt(userMessage, state) {
   // cross-domain tasks (e.g. browser extraction + file save) see the full toolset.
   const _needsBrowser = (_tc?.requiresDOM === true) || (_hasExplicitUrl && !_browserIsOpen);
 
+  // Public web tasks (download a file / read public info) get the light-weight
+  // webfetch appendix — web.agent + web.crawl + curl patterns, no browser.agent.
+  const _needsWebFetch = ['download', 'public_read'].includes(_tc?.webAccessMode);
+
   const _isNativeDesktopTask = _tc?.taskType !== 'browser'
     && !(_tc?.taskType === 'query' && !_tc?.targetService && !_tc?.isAppUiInspection); // exclude pure abstract knowledge Q (but not named-app UI inspection)
 
@@ -464,6 +468,7 @@ function _buildSystemPrompt(userMessage, state) {
     if (_needsImage) appendices.push('plan-skills-image.md');
     if (_isMacOS) appendices.push('plan-skills-macos.md');
     if (_needsApp) appendices.push('plan-skills-app.md');
+    if (_needsWebFetch) appendices.push('plan-skills-webfetch.md');
     if (_needsBrowser) appendices.push('plan-skills-browser.md');
   }
 

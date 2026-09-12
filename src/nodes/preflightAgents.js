@@ -595,15 +595,18 @@ module.exports = async function preflightAgents(state) {
     }
   }
 
-  // ── Fast path: no agents selected + local task → skip heavy preflight ──────
+  // ── Fast path: no agents selected + local/public-web task → skip heavy preflight ──
   // When resolveAgent selected 0 agents, no agents need creating, and the task
-  // is local_file or local_system, the task runs via generic shell.run/app.agent
-  // skills — no service agents, no CLI preflight, no tool discovery, no MCP pings
-  // needed. Build a minimal empty preflight result and return early. This removes
-  // ~5s of MCP calls for local shell/file tasks.
+  // is local_file, local_system, or a public web task (download/public_read —
+  // fetch a file or read public info via web.agent/web.crawl/curl), no service
+  // agents, no CLI preflight, no tool discovery, no MCP pings, and crucially NO
+  // browser-auth probes are needed. Build a minimal empty preflight result and
+  // return early. This removes ~5s of MCP calls and prevents spurious
+  // "Sign in to X" banners on tasks that never needed an agent.
+  const _isPublicWebTask = _tc.webAccessMode === 'download' || _tc.webAccessMode === 'public_read';
   if (selectedAgentIds.size === 0 && createAgentSpecs.length === 0 && !recoveryContext &&
-      (_tc.taskType === 'local_file' || _tc.taskType === 'local_system')) {
-    logger.info(`[Node:PreflightAgents] Fast path — no agents selected, taskType=${_tc.taskType} → skipping heavy preflight`);
+      (_tc.taskType === 'local_file' || _tc.taskType === 'local_system' || _isPublicWebTask)) {
+    logger.info(`[Node:PreflightAgents] Fast path — no agents selected, taskType=${_tc.taskType} webAccessMode=${_tc.webAccessMode || 'n/a'} → skipping heavy preflight`);
     // Single cheap call: installed skills list (planSkillsV2 reads this)
     let _installedSkillsList = [];
     try {

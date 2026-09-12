@@ -31,6 +31,19 @@ Prefer AUTO_PATCH or REPLAN for categories A–D. Reserve ASK_USER for Category 
 
 ORDERING RULE: Identify the category from the injected diagnostic context, then apply the default strategy above. Only fall through to ASK_USER when the failure is genuinely Category E or no mechanical fix is available after one AUTO_PATCH/REPLAN attempt.
 
+## Public Web Escalation Ladder (cheapest → heaviest)
+
+Public web tasks (research, reading public pages, downloading public files) escalate in this order — never jump straight to a browser session and never retry the same failing approach:
+
+1. `web.agent` (search_and_navigate / research_domain / find_download) — find the URL or answer
+2. `web.crawl { url }` — fetch a public page's text when snippets aren't enough or a media link must be extracted
+3. `shell.run curl` — download a verified public asset URL
+4. `browser.agent` — LAST RESORT, only when the task genuinely requires interaction, login, CAPTCHA solving, or a UI flow
+
+- A public research task that failed via `browser.agent` should be REPLAN'd to `web.agent` + `synthesize`, NOT retried.
+- A curl download that saved an HTML page (`file` reports "HTML document"/"ASCII text") should be REPLAN_STEP'd to `web.crawl` the page URL and extract the real media link, NOT re-curled.
+- Only escalate UP the ladder when a lower rung demonstrably fails (bot block, HTML-instead-of-asset, CAPTCHA) or the task requires interaction.
+
 ## Common Failure Patterns
 
 mkdir permission denied → ASK_USER: offer Desktop or ~/Documents as alternative
@@ -58,7 +71,8 @@ shell.run exit code 0 but stdout contains a 403 AUTH error such as `"Method does
 shell.run exit code 1 and stdout or stderr signals missing OAuth credentials (contains `credentials are not configured`, `OAuth credentials`, `CLIENT_ID`, `CLIENT_SECRET`, `refresh_token`, `Authorization: Bearer` with empty token, `401`, or `403`) → OAuth token is missing. Action: ASK_USER with message: "**[skill name]** isn't connected yet. Go to the **Skills** tab, find **[skill name]**, click **⚠ Repair** to auto-detect the required permissions, then click **Reconnect** to grant access. Once connected, try your request again."
 shell.run error includes `Output not created:` with `missingPath` context and toolName=`pandoc`, plus stderr mentions `pdflatex`/`latex`/`pdf engine` → REPLAN: retry conversion with a different PDF engine and explicit verification. Suggestion: install/check wkhtmltopdf first, run pandoc with `--pdf-engine=wkhtmltopdf`, then verify file exists with `test -f <path>`.
 shell.run error includes `Output not created:` with toolName=`pandoc` and stderr still indicates engine unavailable after retry → ASK_USER with options to install wkhtmltopdf, switch output format (e.g. HTML), or cancel.
-shell.run error includes `Output not created:` with toolName=`curl` or `wget` → ASK_USER: download failed (URL/auth/network), offer retry, replace URL, or cancel.
+shell.run error includes `Output not created:` with toolName=`curl` or `wget` → REPLAN_STEP first: try the next candidate URL from the prior web.agent find_download `allResults` contract field, or run `web.agent find_download` again with a different query. Only ASK_USER after 2 failed candidates or a genuine Category E signal (403/auth).
+shell.run exit code 0 after curl/wget but the `file <dest>` verify step reports `HTML document` or `ASCII text` (downloaded a page, not the asset) → REPLAN_STEP: the URL was a page, not a direct asset. Use `web.crawl { url: '<page-url>' }` to extract the real media link (ends in the expected extension), then curl that link. If the page is bot-blocked or requires interaction, REPLAN with `browser.agent` to perform the download via the site's UI.
 shell.run error includes `Output not created:` with toolName=`mkdir` and permission-denied stderr → ASK_USER with writable location alternatives (Desktop/Documents/tmp).
 
 ## Python fallback patterns (bash → Python pivot)

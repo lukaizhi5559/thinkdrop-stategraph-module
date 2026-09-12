@@ -22,6 +22,9 @@
  *   requiresDOM: boolean,           // browser task needing DOM access (form fill, login, scrape)
  *   isImageAnalysis: boolean,       // task asks to analyze/describe/scan visual content of local image files
  *   isActivityQuery: boolean,       // user asks about recent activity/work/screen time (memory retrieval)
+ *   webAccessMode: 'none' | 'download' | 'public_read' | 'interactive',
+ *                                   // how the task touches the web: download a file, read public
+ *                                   // info, or interact with a session/auth'd service
  * }
  *
  * Fails open: any error returns a safe default that never blocks execution.
@@ -47,7 +50,8 @@ Output ONLY valid JSON with exactly these fields:
   "isSpatialAnalysis": true | false,
   "isImageAnalysis": true | false,
   "isConversationRecall": true | false,
-  "isActivityQuery": true | false
+  "isActivityQuery": true | false,
+  "webAccessMode": "none" | "download" | "public_read" | "interactive"
 }
 
 Field rules:
@@ -98,6 +102,13 @@ Field rules:
 
 - isConversationRecall: true when the user is asking ABOUT THE CONVERSATION ITSELF — i.e., meta-questions that request the assistant to inspect, recall, summarize, or repeat prior turns of the chat transcript. Signals: "what did I (just) ask", "what did I say", "what did we talk about", "what was my last question", "what did you just say", "what did I ask you (two messages ago / earlier / before / three prompts ago)", "summarize our conversation", "what have we been discussing", "repeat what I said", "remind me what we were talking about", "go back to what I said earlier". These are requests to READ the transcript, NOT topic continuations. When true, isFollowUp MUST be false and followUpTarget MUST be null. IMPORTANT: isConversationRecall is FALSE for queries about the user's PAST ACTIVITY or EPISODIC MEMORY — those are about screen captures and stored facts, NOT chat prompts. Examples where isConversationRecall is FALSE: "do you have any memories from yesterday", "what did I do yesterday", "what was I doing", "what did I watch", "what did I listen to", "what did I buy", "what did I have open", "what was on my screen", "what was I working on". These should be treated as normal memory_retrieve queries.
 
+- webAccessMode: how the task needs to touch the web — pick the CHEAPEST mode that can complete it:
+  - "download": the user wants a remote file/asset saved locally (mp3, wav, pdf, image, zip, csv, video, font, etc.) — either from a public URL they gave or found via search. No login, no account, no page interaction. These are handled by web search + curl, NOT by a browser session.
+  - "public_read": the user wants to look up, find, search, read, compare, or check PUBLIC information on the web — including "go to <site> and look up X", "find X on <site>", "search <site> for Y", "any new X out recently", "look online for X". The answer comes from search results or public page text; no login, no clicking through site UI, no form submission.
+  - "interactive": the task requires a real browser session — login/OAuth/account state, sending/posting/messaging, form fill, add-to-cart/checkout, account settings, filter/picker UIs, media playback controls, multi-step page flows, or the user explicitly wants to browse the site themselves ("open X for me", "show me the site"). Also use "interactive" whenever requiresDOM is true, and as the DEFAULT when taskType is "browser" but the needed access is unclear.
+  - "none": the task does not touch the web (local file/system/app tasks, memory, scheduling, pure knowledge queries).
+  Key distinction — NAMING a site is NOT enough for "interactive": "download a bird sound from freemusicarchive.org" is "download" (public file), "look up cheap X on amazon" is "public_read" (research), but "add X to my amazon cart" is "interactive" (account action). Download/public_read tasks NEVER need a service agent or auth — they use generic web-search/curl/crawl skills.
+
 - isActivityQuery: true when the user asks about their RECENT ACTIVITY, WORK, SCREEN TIME, or CONTENT CONSUMPTION — i.e., queries that should be answered from episodic memory / screen captures / app usage, NOT from the chat transcript and NOT from personal profile data. Signals: "what have I been working on", "what was I working on today", "what did I do yesterday", "what did I watch", "what did I listen to", "what apps did I use", "what was on my screen", "what was I doing", "what have I been up to". When true, the memory retrieval node should use a broad activity query (NOT the raw prompt) and a low similarity threshold, and the answer node should focus on activity/screen/app memories — NOT surface personal profile data (email, phone, address) unless explicitly asked. false for: personal profile queries ("what is my email", "what is my name"), conversation-recall meta-questions (those are isConversationRecall), and non-memory tasks (web search, automation).
 
 - requiresDOM: true when taskType is "browser" AND the task requires precise DOM-level interaction that keyboard shortcuts cannot do reliably. The following categories ALWAYS require DOM:
@@ -138,6 +149,22 @@ EXAMPLES (meta-questions — isFollowUp MUST be false, followUpTarget MUST be nu
   User: "summarize our conversation" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
   User: "what did I just ask you three prompts ago" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
   User: "remind me what we were just talking about" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
+
+EXAMPLES (webAccessMode):
+  User: "download a sound of connecting to the internet mp3" → {"taskType":"browser","webAccessMode":"download"}
+  User: "find a short bird chirp mp3 and save it to my desktop" → {"taskType":"browser","webAccessMode":"download"}
+  User: "download a bird sound from freemusicarchive.org" → {"taskType":"browser","targetService":"freemusicarchive","webAccessMode":"download"}
+  User: "goto amazon and look up cheap exercise equipment" → {"taskType":"browser","targetService":"amazon","webAccessMode":"public_read"}
+  User: "look online for other pizzas that are good" → {"taskType":"browser","webAccessMode":"public_read"}
+  User: "any new game systems out recently" → {"taskType":"query","webAccessMode":"public_read"}
+  User: "what's the latest on the spacex launch" → {"taskType":"query","webAccessMode":"public_read"}
+  User: "read this article https://example.com/post" → {"taskType":"browser","webAccessMode":"public_read"}
+  User: "send an email via gmail" → {"taskType":"messaging","targetService":"gmail","webAccessMode":"interactive"}
+  User: "add this item to my amazon cart" → {"taskType":"browser","targetService":"amazon","requiresDOM":true,"webAccessMode":"interactive"}
+  User: "create a notion todo for tomorrow" → {"taskType":"browser","targetService":"notion","requiresDOM":true,"webAccessMode":"interactive"}
+  User: "go to chatgpt and ask it about vegan food" → {"taskType":"browser","targetService":"chatgpt","webAccessMode":"interactive"}
+  User: "post on twitter" → {"taskType":"browser","targetService":"twitter","requiresDOM":true,"webAccessMode":"interactive"}
+  User: "what time is it" → {"taskType":"local_system","webAccessMode":"none"}
 
 EXAMPLES (episodic memory queries — isConversationRecall MUST be false, these are NOT about the chat transcript):
   User: "do you have any memories from yesterday" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":false}
@@ -208,6 +235,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     isImageAnalysis: false,
     isConversationRecall: false,
     isActivityQuery: false,
+    webAccessMode: 'none',
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -218,7 +246,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
   // Force-override these patterns so the user gets a reliable recall response.
   // Keep the pattern narrow — only meta-questions about the chat transcript itself,
   // NOT queries about past activity/episodic memory (those are memory_retrieve).
-  const CONVERSATION_RECALL_RE = /\b(?:what did i (?:just )?ask(?:ed)?|what did i (?:just )?say|what did we talk about|what was my (?:last|previous|recent) (?:question|prompt|message)|what did you (?:just )?say|what did i ask you .* ago|summarize our conversation|what have we been (?:discussing|talking about)|repeat what i said|remind me what we were talking about|go back to what i said (?:earlier|before))\b/i;
+  const CONVERSATION_RECALL_RE = /\b(?:what did i (?:just )?ask(?:ed)?|what did i (?:just )?say|what did we talk about|what were we (?:just )?talking about|what did we discuss|did we (?:talk|speak|chat|discuss)|have we (?:talked|discussed|spoken|mentioned)|what was my (?:last|previous|recent) (?:question|prompt|message)|what did you (?:just )?say|what did i ask you .* ago|summarize our conversation|what have we been (?:discussing|talking about)|repeat what i said|remind me what we were talking about|go back to what i said (?:earlier|before)|look (?:that |it )?up in (?:your |the )?(?:memory|conversation|chat|history)|check (?:your |the )?(?:memory|conversation|chat|history)|in our (?:conversation|chat|history))\b/i;
   if (CONVERSATION_RECALL_RE.test(userMessage)) {
     logger.info(`[classifyTask] Deterministic conversation-recall match: "${userMessage.slice(0, 80)}"`);
     return {
@@ -253,6 +281,14 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       return _default;
     }
 
+    // Sanitize webAccessMode — only the four known values; requiresDOM forces
+    // 'interactive' since DOM-level work always needs a real browser session.
+    const _VALID_WEB_MODES = new Set(['none', 'download', 'public_read', 'interactive']);
+    let webAccessMode = _VALID_WEB_MODES.has(parsed.webAccessMode) ? parsed.webAccessMode : 'none';
+    const requiresDOM = !!parsed.requiresDOM;
+    if (requiresDOM) webAccessMode = 'interactive';
+    else if (parsed.taskType === 'browser' && webAccessMode === 'none') webAccessMode = 'interactive'; // fail-safe
+
     return {
       taskType:            parsed.taskType           || _default.taskType,
       isFollowUp:          !!parsed.isFollowUp,
@@ -261,7 +297,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       targetService:       parsed.targetService       || null,
       isRecurring:         !!parsed.isRecurring,
       isBrowseOnly:        !!parsed.isBrowseOnly,
-      requiresDOM:         !!parsed.requiresDOM,
+      requiresDOM,
       isScreenFollowUp:    !!parsed.isScreenFollowUp,
       needsFreshScreen:    !!parsed.needsFreshScreen,
       isAppUiInspection:   !!parsed.isAppUiInspection,
@@ -269,6 +305,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isImageAnalysis:     !!parsed.isImageAnalysis,
       isConversationRecall: !!parsed.isConversationRecall,
       isActivityQuery:     !!parsed.isActivityQuery,
+      webAccessMode,
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

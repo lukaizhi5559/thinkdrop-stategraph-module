@@ -1,10 +1,11 @@
 synthesize|args:{prompt:string,saveToFile?:string,outputSchema?:{type:string|string[]}}|runs_an_LLM_to_answer_summarize_or_generate_text.__ALWAYS_the_final_step_for_user_facing_answers.__Use_{{synthesisAnswer}}_to_pipe_a_prior_synthesize_into_a_later_one.
 fs.read|args:{action:string,path?:string,paths?:string[],maxFileSize?:number,encoding?:string}|reads_one_or_more_local_files_and_returns_their_contents_(100KB_limit).__Use_for_reading_small_text_files_(md,_txt,_json,_js,_ts,_csv,_yaml,_html),_directory_trees_(action:tree),_code_search_(action:search),_or_codebase_exploration_(action:explore).__For_large_files_(>100KB)_use_shell.run_with_explicit_cmd/argv_(head,_tail,_sed,_wc,_grep)_instead.
 shell.run|args:{goal?:string,cmd?:string,argv?:string[]}|executes_a_local_shell_command.__Use_goal_for_natural_language_file_ops_OR_cmd/argv_for_explicit_commands.__NEVER_both_goal_AND_cmd_in_the_same_step.
-browser.agent|args:{action:string,agentId?:string,task?:string,service?:string,url?:string}|[sub-agent]_ALL_web_tasks:_public_sites,_OAuth_services,_REST_API_services,_AI_chatbots.__actions:_run_(delegate),_build_agent_(create_descriptor),_explore,_list_agents.__NEVER_emit_browser.act_or_playwright.agent_directly.
+browser.agent|args:{action:string,agentId?:string,task?:string,service?:string,url?:string}|[sub-agent]_INTERACTIVE_web_tasks_only:_OAuth/login_services,_REST_API_services,_AI_chatbots,_forms,_DOM_interaction,_account_actions.__actions:_run_(delegate),_build_agent_(create_descriptor),_explore,_list_agents.__NEVER_emit_browser.act_or_playwright.agent_directly.__NOT_for_public_research_or_downloads_(use_web.agent/web.crawl/shell.run).
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI-backed_services_(gh,_aws,_heroku)_AND_known_CLI_tools_(ffmpeg,_pandoc,_imagemagick,_yt-dlp).__actions:_run,_build_agent,_list_agents.
 app.agent|args:{action:string,appName?:string,goal?:string,searchText?:string,filePath?:string,prompt?:string}|[desktop_app_agent]_native_macOS_app_automation_via_shortcuts_+_OCR.__action:run_agent_uses_an_app's_built-in_AI_assistant.
-web.agent|args:{action:string,query?:string,domain?:string}|[web_search_agent]_searches_web_via_MCP.__Use_when_site_blocks_bots_or_URL_is_unknown.__action:search_and_navigate_returns_{bestUrl,title,snippet}.
+web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,fileExt?:string}|[web_search_agent]_searches_web_via_MCP.__Use_for_ALL_public_web_research_and_locating_public_file/page_URLs—no_browser_session_or_auth.__actions:_search_and_navigate_(→{bestUrl,title,snippet}),_research_domain,_get_tutorial_steps,_find_download_(→{bestUrl,contentType,isPage}).
+web.crawl|args:{url:string,maxChars?:number,timeoutMs?:number}|[page_fetcher]_fetches_readable_text_from_a_public_URL_via_headless_playwright-cli.__Use_to_read_a_specific_public_page_or_extract_links.__No_auth,_no_interaction.
 video.agent|args:{action:string,videoUrl?:string,platform?:string,query?:string,goal:string}|[video_agent]_watch/transcribe_video.__ALWAYS_wins_over_ytdlp.agent_for_"watch"/"transcribe"_verbs.
 provider.discovery|args:{action:string,provider?:string,modelId?:string,taskType?:string,query?:string,name?:string,baseURL?:string,envKey?:string}|[provider_management_agent]_Manages_LLM_providers_and_models.__actions:_list_models,_model_info,_switch_model,_use_model_(discover+promote),_find_providers_(web_search),_add_provider,_remove_provider,_health_check.__Use_when_user_asks_about_models/providers/model_speed/switching_models/finding_new_providers.
 schedule|args:{time?:string,delayMs?:number,label?:string}|waits_until_clock_time_or_delay_then_continues_plan.
@@ -15,7 +16,8 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 1. **CLI agent** — CLI-backed services (gh, aws, heroku) AND known CLI tools (ffmpeg, pandoc, imagemagick, yt-dlp, etc.). Check AVAILABLE AGENTS; if found, `cli.agent { action: 'run', agentId, task }`. If not found, `cli.agent { action: 'build_agent', service }` then run.
 2. **fs.read** — reading the contents of local files (< 100KB), mapping directory trees, searching code, or exploring a codebase. ALWAYS use `fs.read { action: 'read', path: '/path/to/file' }` instead of `shell.run` when the goal is to read/summarize/explain file contents (e.g. "what is this about", "summarize this file"). For files > 100KB, use `shell.run` with `head`/`tail`/`sed`/`grep` (see "Handling large files" below).
 3. **shell.run** — generic local file ops, Python scripts, git, and simple system commands that do not require installing a specific third-party CLI tool. Use for listing/moving/deleting/creating files or running commands that modify the filesystem; NEVER for simply reading a small file's content (use `fs.read` instead).
-4. **browser.agent** — web navigation, OAuth services, REST API services, AI chatbots. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
+4. **Public web** — public research, reading public pages, downloading public files → `web.agent` (search / research / find_download), `web.crawl` (read a public URL), `shell.run curl` (download). NO browser session or auth needed. Use this BEFORE browser.agent for any task that does not require login or page interaction.
+5. **browser.agent** — interactive web tasks only: OAuth/login services, forms, DOM interaction, account actions, AI chatbots. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
 
 **Exceptions:** pure navigation → browser.agent directly. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
 
@@ -54,12 +56,14 @@ If no authenticated route exists for a service, preflight will surface auth requ
 - Service marked `[NEEDS AUTH]` → do NOT use directly; preflight will surface auth requirements before planning. Use `browser.agent { action: 'build_agent', service }` to create a new agent if needed.
 - AI chatbot (`<chatbot-service>`) → `browser.agent { action: 'run', agentId, task }`
 - Bot-blocking site or uncertain URL → `web.agent search_and_navigate` → `browser.agent run with url:'{{bestUrl}}'`
+- Public file download (mp3, pdf, image, zip) → `web.agent { action: 'find_download', query, fileExt }` → `shell.run curl -sL -o <dest> {{bestUrl}}` → `shell.run file <dest>` verify → `synthesize`
+- Public web research / read a public page → `web.agent` (`research_domain` | `search_and_navigate`) or `web.crawl { url }` → `synthesize` (NEVER browser.agent)
 - Local file ops / scripts / git → `shell.run`
 - Desktop app interaction (shortcuts, scroll, OCR) → `app.agent`
 - App's built-in AI assistant → `app.agent { action: 'run_agent', appName, filePath, prompt }`
 - Watch/transcribe a specific video → `video.agent` (always wins over ytdlp.agent)
 
-**FORBIDDEN:** Never use `shell.run curl` for external API services. Use `browser.agent` or `cli.agent`.
+**FORBIDDEN:** Never use `shell.run curl` for *authenticated* external API services (OAuth, api_key, bearer) — use `browser.agent` or `cli.agent`. curl IS allowed and preferred for public file downloads and public page fetches.
 
 **`synthesize` ordering (core):**
 - Scrape → display: all extractions → `synthesize` → done
