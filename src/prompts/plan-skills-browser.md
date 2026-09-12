@@ -54,10 +54,11 @@ Use `browser.agent` for a URL only when reading it requires login or page intera
 ```json
 [
   { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "<search query> site:<site>", "preferDomain": "<site>" }, "description": "Find a direct article URL on <site>" },
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "extract the main article text", "url": "{{bestUrl}}" }, "description": "Read the article directly" },
+  { "skill": "web.crawl", "args": { "url": "{{bestUrl}}", "maxChars": 12000 }, "description": "Read the article (public — no login needed)" },
   { "skill": "synthesize", "args": { "prompt": "Summarize the article" }, "description": "Summarize the article" }
 ]
 ```
+If `web.crawl` returns bot-blocked or empty content, escalate to `browser.agent { action: 'run', url: '{{bestUrl}}' }`.
 
 ### Content creation tasks (playlists, documents, posts, boards)
 
@@ -128,3 +129,31 @@ The decompose rule above applies to tasks with **multiple independent actions** 
 ```
 
 **Key rule:** Only decompose if the task has multiple INDEPENDENT actions, requires the agent to SEARCH for content to add, OR involves a block-based document editor where the agent must create a document and then add structured blocks. Simple "send/post/reply/comment X to Y" with a single form and submit does NOT need decomposition — the agent can fill all fields and submit in one continuous flow.
+
+### Multi-agent browser.agent (independent — NO synthesize between steps)
+
+When steps use different agents and are independent, no synthesize needed between them. Add a final `synthesize` to combine all results.
+
+```json
+[
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
+  {"skill":"synthesize","args":{"prompt":"Compare the answers from <app-name>, <app-name>, and <app-name> about the best vegan foods."},"description":"Compare all answers"}
+]
+```
+
+**MULTI-AGENT URL RULE:** When a plan has multiple `browser.agent` steps with different `agentId` values, each step MUST have its own URL appropriate for that agent's service. Do NOT copy the URL from one step to another step with a different agentId. If you don't know the correct URL for a service, omit the `url` field — the system will inject the correct deep-link URL per agent from preflight.
+
+### browser.agent → shell.run (data passing — synthesize between steps)
+
+When step 2 (different skill) needs the text output of step 1, insert `synthesize` and use `{{synthesisAnswer}}`.
+
+```json
+[
+  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling <items> and their prices"},"description":"Scrape <ecommerce-service> for <items>"},
+  {"skill":"synthesize","args":{"prompt":"Format the <items> data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
+  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/<items>.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
+  {"skill":"synthesize","args":{"prompt":"Confirm the <items> data was saved to ~/Desktop/<items>.csv."},"description":"Confirm"}
+]
+```

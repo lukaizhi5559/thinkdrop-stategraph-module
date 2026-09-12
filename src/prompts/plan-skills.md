@@ -24,7 +24,7 @@ provider.discovery|args:{action:string,provider?:string,modelId?:string,taskType
 4. **Public web** — public research, reading public pages, downloading public files → `web.agent` (search / research / find_download), `web.crawl` (read a public URL), `shell.run curl` (download). NO browser session or auth needed. Use this BEFORE browser.agent for any task that does not require login or page interaction.
 5. **browser.agent** — interactive web tasks only: OAuth/login services, forms, DOM interaction, account actions, AI chatbots. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
 
-**Exceptions:** pure navigation → browser.agent directly. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
+**Exceptions:** pure navigation to a PUBLIC page → `web.crawl` (no login needed). Pure navigation requiring login/interaction → `browser.agent`. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
 
 ## Single-route mandate (MANDATORY)
 
@@ -92,21 +92,21 @@ If no authenticated route exists for a service, preflight will surface auth requ
 | REST API service (api_key/bearer) | `browser.agent { action: 'build_agent', service }` then `run` |
 | OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) | `browser.agent { action: 'run', agentId, task }` — handles OAuth internally |
 | CLI-backed service (gh, aws, heroku) | `cli.agent { action: 'run', agentId, task }` |
-| Service in AVAILABLE AGENTS [browser] | `browser.agent { action: 'run', agentId, task }` — NEVER raw `browser.act` |
-| Service in AVAILABLE AGENTS [browser] marked `[NEEDS AUTH]` | Do NOT use directly. Use a REST API alternative (`browser.agent { action: 'build_agent', service: '<app-service>' }` or `<app-service>`, etc.). NEVER silently trigger a browser login flow. Preflight will surface auth requirements before planning. |
+| Service in AVAILABLE AGENTS [browser] | `browser.agent { action: 'run', agentId, task }` — NEVER raw `browser.act`. If marked `[NEEDS AUTH]`, do NOT use directly — use a REST API alternative or preflight will surface auth requirements. |
 | Service in AVAILABLE AGENTS [api_key] | `browser.agent` or `cli.agent` run — api_key agents are API-only, cannot navigate |
 | AI chatbot (`<chatbot-service>`) | `browser.agent { action: 'run', agentId, task }` — chat interface, NOT developer API |
 | Discovery on a known agent (unknown nav path) | `browser.agent { action: 'explore', agentId, goal }` |
 | Public file download (mp3, pdf, image, zip) | `web.agent { action: 'find_download', query, fileExt }` → `shell.run curl -sL -o <dest> {{bestUrl}}` → `shell.run file <dest>` verify → `synthesize` |
 | Public web research / read a public page | `web.agent` (`research_domain` \| `search_and_navigate`) or `web.crawl { url }` → `synthesize` (NEVER browser.agent) |
-| Bot-blocking site or uncertain URL | `web.agent search_and_navigate` → `browser.agent run with url:'{{bestUrl}}'` |
-| Raw URL | `browser.agent { action: 'run', task, url }` |
+| Bot-blocking site or uncertain URL | `web.agent search_and_navigate` → `web.crawl { url: '{{bestUrl}}' }` → `synthesize` (escalate to `browser.agent` only if web.crawl fails) |
+| Raw public URL (read/extract) | `web.crawl { url, maxChars: 12000 }` → `synthesize` (use `browser.agent` only if login/interaction needed) |
+| Raw URL (interactive — login, form, click) | `browser.agent { action: 'run', task, url }` |
 | Local file ops, scripts, git (no specific third-party CLI tool needed) | `shell.run` |
 | Tool-based file conversion (PDF, images, video, audio) | `cli.agent` — `build_agent` if agent missing, then `run` |
 | Desktop app interaction (shortcuts, scroll, OCR) | `app.agent` |
 | Desktop app automation (app_automation taskType, app installed) | `app.agent { action: 'run_app_flow', appName, goal }` — NEVER `cli.agent`, `shell.run`, or any CLI package for a named desktop app even if a package with a similar name exists |
 | App's built-in AI assistant | `app.agent { action: 'run_agent', appName, filePath, prompt }` |
-| Search videos on a platform | `browser.agent { action: 'run', agentId: '<video-platform>.agent', task }` → `synthesize` |
+| Search videos on a platform | `video.agent { action: 'find_and_watch_tutorial', platform, query, goal }` → `synthesize` |
 | Watch/transcribe a specific video | `video.agent { action: 'watch_video', videoUrl, goal }` — ALWAYS wins over ytdlp.agent |
 | Find and watch tutorial video | `video.agent { action: 'find_and_watch_tutorial', platform, query, goal }` |
 
@@ -114,8 +114,9 @@ If no authenticated route exists for a service, preflight will surface auth requ
 
 - "watch", "transcribe", "get transcript", "extract from video" → `video.agent` (always wins over ytdlp.agent)
 - "download video", "convert to mp3" → `cli.agent { action: 'run', agentId: 'ytdlp.agent' }`
-- "search <video-platform> for X" → `browser.agent { action: 'run', agentId: '<video-platform>.agent' }` → `synthesize`
-- "goto", "visit", "open site" (navigation/interaction) → `browser.agent`
+- "search <video-platform> for X" → `video.agent { action: 'find_and_watch_tutorial' }` → `synthesize`
+- "goto", "visit", "open site" (public — no login) → `web.crawl` or `web.agent` → `synthesize`
+- "goto", "visit", "open site" (login/interaction needed) → `browser.agent`
 - "look up", "search", "find X on <site>" (public research) → `web.agent` → `synthesize`
 - "download <file>", "get an mp3/pdf/image" (public asset) → `web.agent find_download` → `shell.run curl` → `file` verify
 - "convert", "process file" → CLI first (but NOT "transcribe video" → `video.agent`)
@@ -137,9 +138,9 @@ If no authenticated route exists for a service, preflight will surface auth requ
 | Scrape → display | All extractions → `synthesize` → done | — |
 | Scrape → deliver via browser | All extractions → `synthesize` → consumer step | Consumer uses `{{synthesisAnswer}}` |
 | Multi-stage pipeline | extract → `synthesize` → use result → `synthesize` → deliver | Each `synthesize` sees only its preceding stage |
-| browser.agent → shell.run | No `synthesize` — use `{{PREV_OUTPUT}}` in goal | shell.run NEVER uses `{{synthesisAnswer}}` |
-| browser.agent → cli.agent | No `synthesize` — use `{{PREV_OUTPUT}}` in goal | — |
-| browser.agent → browser.agent (DEPENDENT) | `synthesize` → `{{synthesisAnswer}}` in task | Step 2 needs step 1's text output |
+| sub-agent → shell.run | No `synthesize` — use `{{PREV_OUTPUT}}` in goal | shell.run NEVER uses `{{synthesisAnswer}}` |
+| sub-agent → cli.agent | No `synthesize` — use `{{PREV_OUTPUT}}` in goal | — |
+| sub-agent → sub-agent (DEPENDENT) | `synthesize` → `{{synthesisAnswer}}` in task | Step 2 needs step 1's text output |
 | browser.agent → browser.agent (SAME-AGENT or INDEPENDENT) | NO `synthesize` between steps | Browser state carries over automatically |
 | Any retrieval step → display | Append `synthesize` after retrieval | Retrieval: "what is", "list", "show me", "find" |
 
@@ -196,21 +197,9 @@ When a sub-agent task involves multiple distinct actions, break it into multiple
 
 #### Case 1: Same-agent, state carries over (NO synthesize between steps)
 
-**BAD (one monolithic browser.agent step — agent gets stuck):**
-```json
-[{"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service>, create a <collection> named <name>, and add top <items> from <source-A>, <source-B>, and <source-C>"}}]
-```
+Consecutive same-agent steps reuse the same session/state automatically. No synthesize needed between steps — the state (browser tab, CLI context, app window) carries over.
 
-**GOOD (decomposed — browser state carries over between steps):**
-```json
-[
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <collection> named <name>"},"description":"Create <collection>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-A> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-A> <items>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-B> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-B> <items>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-C> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-C> <items>"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the <name> <collection> was created with <items> from <source-A>, <source-B>, and <source-C>."},"description":"Confirm <collection>"}
-]
-```
+**For browser.agent decomposition examples (content creation, block-based editors, multi-agent), see the browser.agent appendix.**
 
 #### Case 1b: Create container + fill content (same agent, state carries over)
 
@@ -227,20 +216,6 @@ columns, rows, cells, headers, labels, items, entries, records, fields, values, 
 title, name, date, time, description, subject, color, size, type, category, tag, to, cc, bcc, phone, email, address
 
 **Core rule:** If the "with/and" clause describes CONTENT (columns, rows, items, sections) entered into the container AFTER creation → DECOMPOSE into two steps. If it describes PROPERTIES (title, name, date) filled in the creation form DURING creation → keep as ONE step.
-
-**BAD (one monolithic step — agent confuses creation form with content grid):**
-```json
-[{"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <container> named <name> with <content-nouns> for <values>"}}]
-```
-
-**GOOD (decomposed — creation form is separate from content entry):**
-```json
-[
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <container> named <name>"},"description":"Create <container>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"In the <container>, enter <values> in <content-nouns>"},"description":"Fill <content-nouns>"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the <container> '<name>' was created with <content-nouns>: <values>."},"description":"Confirm"}
-]
-```
 
 **Concrete examples — DECOMPOSE (content entered after creation):**
 - `"create a spreadsheet named 'Trip Budget' with columns for Date, Category, Description, and Amount"` → Step 1: create spreadsheet. Step 2: enter column headers 'Date', 'Category', 'Description', 'Amount' in row 1.
@@ -280,31 +255,9 @@ This applies to ALL quoted/listed names: column headers, field names, section ti
 ]
 ```
 
-#### Case 3: Different agents, independent (NO synthesize between steps)
+#### Case 3 & 4: Multi-agent and cross-skill data passing
 
-**Multi-agent browser.agent example:**
-```json
-[
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
-  {"skill":"synthesize","args":{"prompt":"Compare the answers from <app-name>, <app-name>, and <app-name> about the best vegan foods."},"description":"Compare all answers"}
-]
-```
-
-**MULTI-AGENT URL RULE:** When a plan has multiple `browser.agent` steps with different `agentId` values, each step MUST have its own URL appropriate for that agent's service. Do NOT copy the URL from one step to another step with a different agentId. If you don't know the correct URL for a service, omit the `url` field — the system will inject the correct deep-link URL per agent from preflight.
-
-#### Case 4: Different agents, data passing needed (synthesize between steps)
-
-**browser.agent → shell.run example:**
-```json
-[
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling <items> and their prices"},"description":"Scrape <ecommerce-service> for <items>"},
-  {"skill":"synthesize","args":{"prompt":"Format the <items> data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
-  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/<items>.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the <items> data was saved to ~/Desktop/<items>.csv."},"description":"Confirm"}
-]
-```
+For multi-agent `browser.agent` examples and `browser.agent → shell.run` data passing, see the browser.agent appendix. The same synthesize rules apply: use `{{synthesisAnswer}}` when step 2 needs step 1's text output, otherwise no synthesize between independent steps.
 
 ### Decomposition Rules
 - Each step should have ONE clear action — if the task has "then", "and", or multiple verbs, decompose it
@@ -316,7 +269,7 @@ This applies to ALL quoted/listed names: column headers, field names, section ti
 
 | Sub-agent | When to use |
 |---|---|
-| `browser.agent` | ALL web tasks — public, auth, OAuth, REST API, AI chatbots |
+| `browser.agent` | INTERACTIVE web tasks only — auth, OAuth, REST API, AI chatbots, forms, DOM |
 | `cli.agent` | CLI-backed services (gh, aws, firebase, etc.) |
 | `video.agent` | Watch/transcribe video — always wins over ytdlp.agent |
 
@@ -324,17 +277,17 @@ This applies to ALL quoted/listed names: column headers, field names, section ti
 
 **No agent exists?** `build_agent` first, then `run`. **Rebuild?** `build_agent` with `force: true`.
 
-## browser.agent — unified browser entry point
+## browser.agent — interactive browser automation (LAST RESORT)
 
-`browser.agent` is the ONLY browser skill to emit. It handles auth, CAPTCHA, session persistence, and playbook caching internally.
+`browser.agent` is the ONLY browser skill for INTERACTIVE tasks (login, forms, DOM, account actions, AI chatbots). Use it ONLY when web.agent/web.crawl/shell.run cannot do the job. For PUBLIC URLs, use `web.crawl` → `synthesize`.
 
-- Named sites: `browser.agent { action: 'run', agentId, task }`
-- Raw URLs: `browser.agent { action: 'run', task, url }`
+- Named sites (interactive): `browser.agent { action: 'run', agentId, task }`
+- Raw URLs (interactive — login/form/click): `browser.agent { action: 'run', task, url }`
 - New services: `browser.agent { action: 'build_agent', service }` then `run`
 
 **AI chatbot URLs:** Each chatbot service has its own URL — use `web.agent search_and_navigate` if the URL is unknown, or check AVAILABLE AGENTS for the registered agentId.
 
-**screen vs browser:** "what's on my screen" → `screen.capture`. "extract from web page" → `browser.agent`.
+**screen vs browser:** "what's on my screen" → `screen.capture`. "extract from PUBLIC web page" → `web.crawl`. "extract from PRIVATE web page (login required)" → `browser.agent`.
 
 ## file.bridge
 

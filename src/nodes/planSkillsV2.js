@@ -533,7 +533,13 @@ function _buildSystemPrompt(userMessage, state) {
   // agent re-infers intent from task text via regex — which misclassifies
   // contextual phrases like "search results page" as a search command.
   // Every browser.agent step MUST include a stepType field.
+  // SKIP for public web modes (download/public_read) — those tasks must NOT
+  // emit browser.agent steps at all, and the amazon.agent example below causes
+  // the LLM to copy the browser.agent pattern instead of using web.agent.
+  const _isPublicWebMode = ['download', 'public_read'].includes(_tc?.webAccessMode);
+  if (!_isPublicWebMode) {
   result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser.agent steps)\n\nFor every \`browser.agent\` step, you MUST include a \`stepType\` field with one of these values:\n\n- \`"navigate"\` — step that opens a URL, searches, or goes to a page (e.g., "Search Amazon for X", "Go to YouTube", "Open Gmail")\n- \`"on-page-action"\` — step that clicks/types/selects on the CURRENT page (e.g., "Click the first result, then click Add to Cart", "Fill in the form and submit")\n- \`"verify"\` — step that confirms a result without further interaction (e.g., "Confirm item added to cart", "Check if the email was sent")\n- \`"extract"\` — step that reads/extracts content (e.g., "Read the search results", "Get the email count")\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT classify it as \`"navigate"\` just because it contains the word "search".\n\nExample: [\n  { "skill": "browser.agent", "stepType": "navigate", "args": { "action": "run", "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "browser.agent", "stepType": "on-page-action", "args": { "action": "run", "agentId": "amazon.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "synthesize", "stepType": "verify", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
+  }
 
   const _skipReason = _skipAppendices ? ' (appendices skipped: tier1_simple)' : _hasLocalSignals ? ' (appendices skipped: local_signals)' : state.recoveryContext ? ' (appendices skipped: recovery)' : '';
   console.info(`[Node:PlanSkillsV2] system prompt: ${baseFile} tier:${_promptTier}${_skipReason} appendices:[${appendices.join(',')}] taskType:${_tc?.taskType || 'unknown'}`);
@@ -1769,6 +1775,17 @@ The user's request does NOT match any installed skill.
     logger.info(`[Node:PlanSkillsV2] System info query detected — injecting fresh-data note to force shell.run step`);
   }
 
+  // ── Public web hard constraint — injected LAST before the user request so ──
+  // recency bias works in our favor. The webfetch appendix is loaded but gets
+  // drowned out by 46 browser.agent mentions elsewhere in the prompt. This
+  // short, explicit, final constraint overrides all prior browser.agent examples.
+  let _publicWebConstraint = '';
+  const _webMode = state._taskClassification?.webAccessMode;
+  if (_webMode === 'public_read' || _webMode === 'download') {
+    _publicWebConstraint = `\n\n⚠️ HARD CONSTRAINT — PUBLIC WEB TASK (webAccessMode=${_webMode}):\nThis task has been classified as a PUBLIC web task. You MUST NOT use \`browser.agent\`.\n- For public_read: Use \`web.agent { action: "search_and_navigate", query: "<query> site:<domain>", preferDomain: "<domain>" }\` → \`synthesize\`. If full page text is needed, add \`web.crawl { url: "{{bestUrl}}" }\` before synthesize.\n- For download: Use \`web.agent { action: "find_download", query: "<query>", fileExt: "<ext>" }\` → \`shell.run curl -sL -o <dest> {{bestUrl}}\` → \`shell.run file <dest>\` → \`synthesize\`.\nNaming a website (e.g. amazon, youtube, wikipedia) does NOT require browser.agent — only login/forms/cart/account actions do.\n`;
+    logger.info(`[Node:PlanSkillsV2] Injecting public-web hard constraint (webAccessMode=${_webMode})`);
+  }
+
   const planningQuery = [
     _agentIdentity,
     SKILL_SYSTEM_PROMPT,
@@ -1792,6 +1809,7 @@ The user's request does NOT match any installed skill.
     messagingBodyNote,
     parallelNote,
     _systemInfoFreshDataNote,
+    _publicWebConstraint,
     `\n\nUser request: "${(runtimeParamMessage || userMessage).replace(/"/g, '\\"').slice(0, 2000)}"`,
   ].filter(Boolean).join('\n');
 
@@ -2009,6 +2027,41 @@ The user's request does NOT match any installed skill.
       }
     }
     if (!Array.isArray(skillPlan)) return { ...state, planError: `Cannot parse skill plan — no step array found` };
+  }
+
+  // ── Post-parse backstop: rewrite browser.agent → web.agent for public modes ──
+  // Even with the hard constraint, the LLM may still emit browser.agent due to
+  // the overwhelming number of browser.agent examples in the base prompt. This
+  // backstop catches those cases and rewrites them to the appropriate web.agent
+  // action so the plan executes via the light path instead of Playwright.
+  const _postWebMode = state._taskClassification?.webAccessMode;
+  if (Array.isArray(skillPlan) && (_postWebMode === 'public_read' || _postWebMode === 'download')) {
+    let _rewritten = 0;
+    skillPlan = skillPlan.map((step) => {
+      if (step.skill !== 'browser.agent') return step;
+      _rewritten++;
+      const _taskText = step.args?.task || userMessage || '';
+      const _svc = step.args?.agentId?.replace(/\.agent$/, '') || '';
+      logger.warn(`[Node:PlanSkillsV2] Post-parse backstop: rewriting browser.agent → web.agent for ${_postWebMode} task (agentId=${step.args?.agentId || 'none'})`);
+      if (_postWebMode === 'download') {
+        return {
+          skill: 'web.agent',
+          args: { action: 'find_download', query: _taskText },
+          description: step.description || `Find download for: ${_taskText.slice(0, 80)}`,
+        };
+      }
+      // public_read
+      return {
+        skill: 'web.agent',
+        args: _svc
+          ? { action: 'search_and_navigate', query: `${_taskText} site:${_svc}`, preferDomain: _svc }
+          : { action: 'research_domain', query: _taskText },
+        description: step.description || `Search the web for: ${_taskText.slice(0, 80)}`,
+      };
+    });
+    if (_rewritten > 0) {
+      logger.info(`[Node:PlanSkillsV2] Post-parse backstop: rewrote ${_rewritten} browser.agent step(s) → web.agent (webAccessMode=${_postWebMode})`);
+    }
   }
 
   // ── api_suggest guard (deprecated skill — route selection belongs to preflight) ──

@@ -19,7 +19,7 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 4. **Public web** — public research, reading public pages, downloading public files → `web.agent` (search / research / find_download), `web.crawl` (read a public URL), `shell.run curl` (download). NO browser session or auth needed. Use this BEFORE browser.agent for any task that does not require login or page interaction.
 5. **browser.agent** — interactive web tasks only: OAuth/login services, forms, DOM interaction, account actions, AI chatbots. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
 
-**Exceptions:** pure navigation → browser.agent directly. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
+**Exceptions:** pure navigation to a PUBLIC page → `web.crawl` (no login needed). Pure navigation requiring login/interaction → `browser.agent`. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
 
 **Desktop app automation (app_automation taskType):** When preflight detects a desktop app is installed (DESKTOP APP DETECTED note in agent context), ALWAYS route to `app.agent { action: 'run_app_flow', appName, goal }`. NEVER use `cli.agent`, `shell.run`, `external.skill`, or any CLI package for a named desktop app — it is a native desktop app, not a CLI tool, even if a package with a similar name exists on a package registry.
 
@@ -55,7 +55,7 @@ If no authenticated route exists for a service, preflight will surface auth requ
 - Service in AVAILABLE AGENTS [browser] → `browser.agent { action: 'run', agentId, task }` (NEVER raw `browser.act`)
 - Service marked `[NEEDS AUTH]` → do NOT use directly; preflight will surface auth requirements before planning. Use `browser.agent { action: 'build_agent', service }` to create a new agent if needed.
 - AI chatbot (`<chatbot-service>`) → `browser.agent { action: 'run', agentId, task }`
-- Bot-blocking site or uncertain URL → `web.agent search_and_navigate` → `browser.agent run with url:'{{bestUrl}}'`
+- Bot-blocking site or uncertain URL → `web.agent search_and_navigate` → `web.crawl { url: '{{bestUrl}}' }` → `synthesize` (escalate to `browser.agent` only if web.crawl fails)
 - Public file download (mp3, pdf, image, zip) → `web.agent { action: 'find_download', query, fileExt }` → `shell.run curl -sL -o <dest> {{bestUrl}}` → `shell.run file <dest>` verify → `synthesize`
 - Public web research / read a public page → `web.agent` (`research_domain` | `search_and_navigate`) or `web.crawl { url }` → `synthesize` (NEVER browser.agent)
 - Local file ops / scripts / git → `shell.run`
@@ -117,21 +117,7 @@ When a sub-agent task involves multiple distinct actions, break it into multiple
 
 Consecutive same-agent steps reuse the same session/state automatically. No synthesize needed between steps — the state (browser tab, CLI context, app window) carries over.
 
-**BAD (one monolithic browser.agent step — agent gets stuck). This applies even when a single-route mandate restricts you to one agent — the mandate specifies WHICH agent, not HOW MANY steps:**
-```json
-[{"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service>, create a <collection> named <name>, and add top <items> from <source-A>, <source-B>, and <source-C>"}}]
-```
-
-**GOOD (decomposed — browser state carries over between steps):**
-```json
-[
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <collection> named <name>"},"description":"Create <collection>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-A> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-A> <items>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-B> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-B> <items>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Search for <source-C> and add 3 top <items> to the <name> <collection>"},"description":"Add <source-C> <items>"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the <name> <collection> was created with <items> from <source-A>, <source-B>, and <source-C>."},"description":"Confirm <collection>"}
-]
-```
+**For browser.agent decomposition examples (content creation, block-based editors, multi-agent), see the browser.agent appendix.**
 
 **app.agent example (app state carries over):**
 ```json
@@ -209,20 +195,6 @@ title, name, date, time, description, subject, color, size, type, category, tag,
 
 **Core rule:** If the "with/and" clause describes CONTENT (columns, rows, items, sections) entered into the container AFTER creation → DECOMPOSE into two steps. If it describes PROPERTIES (title, name, date) filled in the creation form DURING creation → keep as ONE step.
 
-**BAD (one monolithic step — agent confuses creation form with content grid):**
-```json
-[{"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <container> named <name> with <content-nouns> for <values>"}}]
-```
-
-**GOOD (decomposed — creation form is separate from content entry):**
-```json
-[
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"Open <service> and create a new <container> named <name>"},"description":"Create <container>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"<service>.agent","task":"In the <container>, enter <values> in <content-nouns>"},"description":"Fill <content-nouns>"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the <container> '<name>' was created with <content-nouns>: <values>."},"description":"Confirm"}
-]
-```
-
 **Concrete examples — DECOMPOSE (content entered after creation):**
 - `"create a spreadsheet named 'Trip Budget' with columns for Date, Category, Description, and Amount"` → Step 1: create spreadsheet. Step 2: enter column headers 'Date', 'Category', 'Description', 'Amount' in row 1.
 - `"create a document titled 'Report' including sections for Introduction, Methods, and Conclusion"` → Step 1: create document. Step 2: add section headings.
@@ -254,33 +226,9 @@ When step 2 needs the TEXT OUTPUT of step 1, insert a `synthesize` step and use 
 ]
 ```
 
-### Case 3: Different agents, independent (NO synthesize between steps)
+### Case 3 & 4: Multi-agent and cross-skill data passing
 
-When steps use different agents and are independent, no synthesize needed between them. Add a final `synthesize` to combine all results.
-
-**Multi-agent browser.agent example:**
-```json
-[
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
-  {"skill":"synthesize","args":{"prompt":"Compare the answers from <app-name>, <app-name>, and <app-name> about the best vegan foods."},"description":"Compare all answers"}
-]
-```
-
-### Case 4: Different agents, data passing needed (synthesize between steps)
-
-When step 2 (different agent) needs the text output of step 1, insert `synthesize` and use `{{synthesisAnswer}}`.
-
-**browser.agent → shell.run example:**
-```json
-[
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling <items> and their prices"},"description":"Scrape <ecommerce-service> for <items>"},
-  {"skill":"synthesize","args":{"prompt":"Format the <items> data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
-  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/<items>.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the <items> data was saved to ~/Desktop/<items>.csv."},"description":"Confirm"}
-]
-```
+For multi-agent `browser.agent` examples and `browser.agent → shell.run` data passing, see the browser.agent appendix. The same synthesize rules apply: use `{{synthesisAnswer}}` when step 2 needs step 1's text output, otherwise no synthesize between independent steps.
 
 ### Decomposition Rules
 - Each step should have ONE clear action — if the task has "then", "and", or multiple verbs, decompose it
