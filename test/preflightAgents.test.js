@@ -35,7 +35,7 @@ function section(label) {
   console.log(`\n${'─'.repeat(72)}\n  ${label}\n${'─'.repeat(72)}`);
 }
 
-function makeState({ authSequence, agents, gatherCredentialResult, gatherAnswerResult, userMessage } = {}) {
+function makeState({ authSequence, agents, gatherCredentialResult, gatherAnswerResult, userMessage, llmBackend } = {}) {
   const progressEvents = [];
   const calls = [];
   let authIndex = 0;
@@ -50,7 +50,8 @@ function makeState({ authSequence, agents, gatherCredentialResult, gatherAnswerR
       if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
         return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [] } };
       }
-      if (service === 'command' && action === 'browser.agent' && payload?.action === 'authenticate') {
+      if ((service === 'command' && action === 'browser.agent' && payload?.action === 'authenticate') ||
+          (service === 'command' && action === 'command.automate' && payload?.skill === 'browser.agent' && payload?.args?.action === 'authenticate')) {
         const res = authSequence[authIndex % authSequence.length];
         authIndex++;
         return res;
@@ -77,6 +78,7 @@ function makeState({ authSequence, agents, gatherCredentialResult, gatherAnswerR
     confirmInstallCallback: async () => false,
     gatherOAuthCallback: async () => ({ connected: false }),
     resolveAgentResult: { agents: [] },
+    llmBackend,
     _progressEvents: progressEvents,
   };
 }
@@ -723,6 +725,68 @@ async function runTests() {
       if (origProbeDesktop) require.cache[probeDesktopPath] = origProbeDesktop; else delete require.cache[probeDesktopPath];
       if (origProbeTCC) require.cache[probeTCCPath] = origProbeTCC; else delete require.cache[probeTCCPath];
     }
+  });
+
+  section('LLM login-need gate');
+
+  await it('skips browser auth when LLM says login is not required', async () => {
+    const state = makeState({
+      agents: [
+        { id: 'etsy.agent', type: 'browser', service: 'etsy', capabilities: ['navigate', 'interact'], status: 'healthy' },
+      ],
+      authSequence: [
+        { ok: true, agentId: 'etsy.agent', authed: true, authVerified: true },
+      ],
+      userMessage: "Open Etsy and search for 'wooden cross wall art' then click the first result",
+      llmBackend: {
+        generateAnswer: async () => '0',
+      },
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'etsy.agent', create: false }] };
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
+    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === 'etsy.agent');
+    if (!agent) throw new Error('etsy.agent not in preflightResult.agents');
+    if (!agent.authed) throw new Error('Expected etsy.agent to be authed when LLM says no login needed');
+    if (!agent.ready) throw new Error('Expected etsy.agent to be ready when LLM says no login needed');
+    const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
+    if (authCalls.length !== 0) throw new Error(`Expected zero browser.agent authenticate calls when LLM skips auth, got ${authCalls.length}`);
+    const authRequiredEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'etsy.agent');
+    if (authRequiredEvents.length !== 0) throw new Error(`Expected zero preflight:auth_required events for etsy.agent, got ${authRequiredEvents.length}`);
+  });
+
+  await it('runs browser auth when LLM says login is required', async () => {
+    const state = makeState({
+      agents: [
+        { id: 'etsy.agent', type: 'browser', service: 'etsy', capabilities: ['navigate', 'interact'], status: 'healthy' },
+      ],
+      userMessage: 'Post a new listing on Etsy',
+      llmBackend: {
+        generateAnswer: async () => '1',
+      },
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'etsy.agent', create: false }] };
+    const result = await preflightAgents(state);
+    if (!result.planError) throw new Error('Expected planError because auth is required');
+    const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
+    if (authCalls.length !== 1) throw new Error(`Expected one browser.agent authenticate call, got ${authCalls.length}`);
+  });
+
+  await it('defaults to running browser auth when LLM backend returns unexpected value', async () => {
+    const state = makeState({
+      agents: [
+        { id: 'etsy.agent', type: 'browser', service: 'etsy', capabilities: ['navigate', 'interact'], status: 'healthy' },
+      ],
+      userMessage: 'Open Etsy and buy a gift',
+      llmBackend: {
+        generateAnswer: async () => 'maybe',
+      },
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'etsy.agent', create: false }] };
+    const result = await preflightAgents(state);
+    if (!result.planError) throw new Error('Expected planError because auth is required');
+    const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
+    if (authCalls.length !== 1) throw new Error(`Expected one browser.agent authenticate call, got ${authCalls.length}`);
   });
 
   console.log(`\n${'─'.repeat(72)}`);

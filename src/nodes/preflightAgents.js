@@ -351,6 +351,25 @@ async function _llmExtractFileCandidate(llmBackend, userMessage, logger) {
   }
 }
 
+// Quick LLM classification: does this prompt require the user to be logged in
+// or signed in to accomplish the goal? Returns 0 (no login needed) or 1 (login
+// required). Defaults to 1 on any error so we never silently skip auth.
+async function _llmNeedsLoginCheck(llmBackend, userMessage, logger) {
+  if (!llmBackend) return 1;
+  try {
+    const prompt = `You are a task classifier. Determine whether the following user request requires the user to be logged in or signed into an account to accomplish the goal. Return ONLY a single digit: 0 if the task can be completed without logging in, 1 if a login/sign-in is required.\n\nUser request: "${userMessage}"`;
+    const raw = await llmBackend.generateAnswer(prompt, { query: prompt }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
+    const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
+    if (text.startsWith('0')) return 0;
+    if (text.startsWith('1')) return 1;
+    logger.warn(`[Node:PreflightAgents] LLM login-need check returned unexpected value: "${text}" — defaulting to 1`);
+    return 1;
+  } catch (e) {
+    logger.warn(`[Node:PreflightAgents] LLM login-need check failed: ${e.message}`);
+    return 1;
+  }
+}
+
 async function _probeFilesystem(mcpAdapter, candidate, logger) {
   if (!candidate || !mcpAdapter) return { status: 'none' };
 
@@ -509,6 +528,21 @@ module.exports = async function preflightAgents(state) {
   if (!mcpAdapter) {
     logger.warn('[Node:PreflightAgents] No mcpAdapter — skipping preflight');
     return { ...state, preflightResult: null, preflightDone: true };
+  }
+
+  // ── Upfront login-need classification ─────────────────────────────────────
+  // If the prompt clearly does not require sign-in, skip browser auth probes
+  // and the auth popup. This catches public-web tasks like "Open Etsy and
+  // search for X" that resolveAgent may have selected a browser agent for.
+  let _skipBrowserAuthForTask = false;
+  if (state.llmBackend) {
+    const _needsLogin = await _llmNeedsLoginCheck(state.llmBackend, userMessage, logger);
+    if (_needsLogin === 0) {
+      _skipBrowserAuthForTask = true;
+      logger.info('[Node:PreflightAgents] LLM login-need check: prompt does not require sign-in — skipping browser auth probes');
+    } else {
+      logger.info('[Node:PreflightAgents] LLM login-need check: prompt may require sign-in — running browser auth probes');
+    }
   }
 
   // ── File reference resolution (app_automation / local_file tasks) ──────────
@@ -832,11 +866,11 @@ module.exports = async function preflightAgents(state) {
       type: 'browser',
       agentId: _newAgentId,
       ready: true,
-      authed: false,
+      authed: _skipBrowserAuthForTask,
       authType: 'browser_oauth',
       iconUrl: agentIdToIconUrl(_newAgentId, spec.startUrl),
       startUrl: spec.startUrl || null,
-      needsLogin: true,
+      needsLogin: !_skipBrowserAuthForTask,
       sessionStale: false,
       _newlyCreated: true,
     });
@@ -1145,10 +1179,13 @@ module.exports = async function preflightAgents(state) {
               const _provisionalAuthedAt = a.authedAt || _cachedAuth?.ts || null;
               // User chose "proceed without" — treat as authed for this run only.
               const _authBypassed = _bypassAuth.has(a.id.toLowerCase());
-              const authed = _authBypassed;
+              const _loginNotRequired = !_authBypassed && _skipBrowserAuthForTask;
+              const authed = _authBypassed || _skipBrowserAuthForTask;
               const _authTag = _authBypassed
                 ? ' [AUTH BYPASSED — running unauthenticated per user choice]'
-                : ' [NEEDS AUTH — user must authenticate before this agent can run]';
+                : _loginNotRequired
+                  ? ' [LOGIN NOT REQUIRED — proceeding without sign-in]'
+                  : ' [NEEDS AUTH — user must authenticate before this agent can run]';
               agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_authTag}`);
               if (_authBypassed) {
                 warnings.push({
@@ -1162,6 +1199,14 @@ module.exports = async function preflightAgents(state) {
                   iconUrl,
                   message: `${a.id} proceeding without sign-in`,
                 });
+              } else if (_loginNotRequired) {
+                logger.info(`[Node:PreflightAgents] ${a.id} login not required by LLM gate — marking authed for this run only`);
+                _emitProgress({
+                  type: 'preflight:agent_ready',
+                  agentId: a.id,
+                  iconUrl,
+                  message: `${a.id} login not required`,
+                });
               }
 
               const _agentAuthType = _deriveAgentAuthType(a.descriptor);
@@ -1174,7 +1219,7 @@ module.exports = async function preflightAgents(state) {
                 authType: _agentAuthType,
                 iconUrl,
                 startUrl: a.start_url,
-                needsLogin: !hasSession,
+                needsLogin: !authed && !hasSession,
                 sessionStale,
                 authedAt: _provisionalAuthedAt,
               });
@@ -2157,6 +2202,20 @@ module.exports = async function preflightAgents(state) {
 
   const authFailures = [];
   for (const a of browserAgentsNeedingAuth) {
+    // ── LLM login-need gate: if the prompt clearly does not require sign-in,
+    // mark browser agents as authed without running the probe or showing the popup.
+    if (_skipBrowserAuthForTask && a.type === 'browser') {
+      a.authed = true;
+      a.ready = true;
+      _emitProgress({
+        type: 'preflight:agent_ready',
+        agentId: a.agentId,
+        iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
+        message: `${a.agentId} login not required`,
+      });
+      continue;
+    }
+
     // ── Unauthenticated agent invariant: skip probe, force auth ─────────────
     // A newly built agent has no persistent profile yet — the probe can only
     // produce false positives on public landing pages, so force auth directly.
@@ -2237,7 +2296,7 @@ module.exports = async function preflightAgents(state) {
     while (attempts < 2) {
       authRes = await _authenticateBrowserAgent(a);
       const authPayload = authRes?.data || authRes || {};
-      if (authPayload.ok && authPayload.authVerified === true) {
+      if (authPayload.ok && (authPayload.authVerified === true || authPayload.authed === true)) {
         markAgentAuthed(a.agentId);
         a.authed = true;
         a.ready = true;
@@ -2250,7 +2309,7 @@ module.exports = async function preflightAgents(state) {
         break;
       }
 
-      if (authPayload.ok && authPayload.authVerified !== true) {
+      if (authPayload.ok && authPayload.authVerified !== true && authPayload.authed !== true) {
         authRes = { ok: false, error: 'authentication result was not verified by the selected driver' };
         break;
       }
