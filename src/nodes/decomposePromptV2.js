@@ -383,8 +383,13 @@ module.exports = async function decomposePromptV2(state) {
     /\b(can\s+i\s+see|let\s+me\s+see)\s+(a\s+|an\s+|the\s+)?(picture|image|photo|pic|logo|icon)\b/i,
   ];
   const _isImageSearch = _IMAGE_SEARCH_PATTERNS.some(re => re.test(_msgLower));
-  if (_isImageSearch && !_hasMultiGoalConjunction) {
-    logger.info(`[Node:DecomposePromptV2] Image-search guard: routing to web_search (taskType=${_tc.taskType}) — skipping command_automate short-circuit`);
+  // Exception: when the user names a specific site/service to search ON (e.g.
+  // "show pics of baby clothes for sale on amazon"), keep command_automate so
+  // the task reaches the site_search → web.crawl → extractItems pipeline and
+  // produces structured product cards. Generic image queries (no target site)
+  // still route to web_search for the image carousel.
+  if (_isImageSearch && !_hasMultiGoalConjunction && !_tc.targetService) {
+    logger.info(`[Node:DecomposePromptV2] Image-search guard: routing to web_search (taskType=${_tc.taskType} targetService=${_tc.targetService || 'none'}) — skipping command_automate short-circuit`);
     const subPrompts = [{
       text: message,
       estimatedIntent: 'web_search',

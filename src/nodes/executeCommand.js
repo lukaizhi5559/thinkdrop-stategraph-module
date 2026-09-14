@@ -55,6 +55,25 @@ if (!_classifyDeepLinkType) {
   };
 }
 
+// Resolve shared site-search helpers (buildSiteSearchUrl, isListingTask,
+// isDeepItemUrl) from command-service. Used to auto-inject extractItems on
+// listing-task web.crawl steps and to rewrite deep-item URLs to site-search
+// URLs when the planner landed on a product page instead of the SERP.
+let _siteSearch = null;
+try {
+  let _dir = __dirname;
+  for (let i = 0; i < 8; i++) {
+    const _candidate = path.join(_dir, 'mcp-services', 'command-service', 'src', 'skill-helpers', 'site-search.cjs');
+    if (fs.existsSync(_candidate)) {
+      _siteSearch = require(_candidate);
+      break;
+    }
+    _dir = path.dirname(_dir);
+  }
+} catch (_) {}
+const _isListingTask = (t) => _siteSearch ? _siteSearch.isListingTask(t) : false;
+const _isDeepItemUrl  = (u) => _siteSearch ? _siteSearch.isDeepItemUrl(u) : false;
+
 // Skill thinking helper for generating human-readable thinking messages
 const { generateSkillThinking } = require('../utils/skillThinking');
 const { parseLlmJson } = require('../utils/parseLlmJson');
@@ -3875,6 +3894,55 @@ Please try again or search with different terms.`;
     resolvedArgs = { ...resolvedArgs, fallbackUrls: webAgentFallbackUrls };
   }
 
+  // ── Listing-task safety nets for web.crawl ──────────────────────────────
+  // (1) Auto-inject extractItems:true when the user message looks like a
+  //     listing/shopping/search task OR the resolved URL is a search-results
+  //     page. Planners don't reliably set extractItems, and without it the
+  //     crawl returns text-only — cards never reach the UI.
+  // (2) Deep-page → site-search rewrite: when the planner landed on a deep
+  //     item page (/dp/, /product/, /item/, ...) for a listing task on a site
+  //     with a known search template, rewrite the URL to the SERP. This
+  //     catches planners that still emit search_and_navigate for shopping.
+  if (skill === 'web.crawl') {
+    const _userMsg = state.resolvedMessage || state.message || '';
+    const _listingMsg = _isListingTask(_userMsg);
+    const _crawlUrl = typeof resolvedArgs.url === 'string' ? resolvedArgs.url : '';
+    const _isSearchUrl = _siteSearch ? _siteSearch.isSearchResultsUrl(_crawlUrl) : false;
+
+    // (1) Auto-inject extractItems
+    if (_listingMsg || _isSearchUrl) {
+      if (!resolvedArgs.extractItems && !resolvedArgs.extractMedia) {
+        logger.info(`[Node:ExecuteCommand] auto-injecting extractItems:true for web.crawl (listing=${_listingMsg} searchUrl=${_isSearchUrl})`);
+        resolvedArgs = { ...resolvedArgs, extractItems: true };
+      }
+    }
+
+    // (2) Deep-page rewrite — only for listing tasks with a usable query.
+    if (_listingMsg && _isDeepItemUrl(_crawlUrl)) {
+      try {
+        const _host = new URL(_crawlUrl).hostname.replace(/^www\./, '');
+        // Strip the site name + common verbs from the user message to get the
+        // search query. e.g. "goto amazon and look up ESV bibles" → "ESV bibles".
+        let _q = _userMsg
+          .replace(new RegExp('\\b(?:goto|go\\s+to|open|visit|on|and|the|a|an)\\b', 'gi'), ' ')
+          .replace(new RegExp('\\b(?:amazon|ebay|etsy|walmart|target|bestbuy|youtube|google|bing|duckduckgo|github|stackoverflow|reddit|yelp|imdb|wikipedia|homedepot)\\.com\\b', 'i'), ' ')
+          .replace(new RegExp('\\b(?:show|see|display|browse|list|look\\s*up|search(?:\\s+for|\\s+on)?|find|shop(?:ping)?|buy|for\\s+sale|prices?|deals?|items?|products?|pics?|pictures?|images?|photos?|videos?|clips?)\\b', 'gi'), ' ')
+          .replace(/\s+/g, ' ').trim();
+        // Skip if the query is too short or is just the site name.
+        if (_q && _q.length >= 3 && !/^(amazon|ebay|etsy|walmart|target|bestbuy|youtube|google|bing|duckduckgo|github|stackoverflow|reddit|yelp|imdb|wikipedia|homedepot)$/i.test(_q)) {
+          // Use the synchronous static-template lookup only (no DB hit) —
+          // learned patterns are less reliable for a safety-net rewrite.
+          const _tmpl = _siteSearch ? _siteSearch.lookupSiteSearchTemplate(_host) : null;
+          if (_tmpl) {
+            const searchUrl = _tmpl.replace('{query}', encodeURIComponent(_q));
+            logger.info(`[Node:ExecuteCommand] deep-page rewrite: ${_crawlUrl} → ${searchUrl} (listing task on ${_host})`);
+            resolvedArgs = { ...resolvedArgs, url: searchUrl };
+          }
+        }
+      } catch (_) { /* non-fatal */ }
+    }
+  }
+
   // ── {{BODY}}, {{EMAIL}}, {{PHONE}}, {{URL}}, {{AMOUNT}}, ... ──────────────
   // buildRuntimeParams knows how to resolve these from the user message +
   // priorSynthesizedContent. Wired into the agent path (browser.agent/cli.agent/
@@ -5742,6 +5810,8 @@ Please try again or search with different terms.`;
       _raw: (skill === 'file.bridge' || skill === 'fs.read') ? raw : undefined,
       url: raw.url ?? null,
       items: raw.items ?? null,
+      itemStats: raw.itemStats ?? null,
+      links: raw.links ?? null,
       pageContext: raw.pageContext ?? null,
       stateChanged: raw.stateChanged ?? null,
       error: raw.error || null,
@@ -6476,15 +6546,25 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         const crawlChars = raw.contentLength ? ` — ${raw.contentLength.toLocaleString()} chars` : '';
         const crawlTrunc = raw.truncated ? ' (truncated)' : '';
         stepResult.stdout = `Crawled ${crawlTitle}${crawlChars}${crawlTrunc}\n\n${raw.content || ''}`;
-        // Append a compact item digest so the synthesize LLM can reference items in prose
+        // Append a compact item digest so the synthesize LLM can reference items in prose.
+        // Include [img:...] / [video:...] markers so the LLM knows media exists
+        // even when it can't see the rendered cards.
         if (Array.isArray(raw.items) && raw.items.length > 0) {
           const digest = raw.items.slice(0, 24).map((it, i) => {
             const t = it.title ? it.title : '';
             const p = it.price ? ` — ${it.price}` : '';
             const u = it.url ? ` — ${it.url}` : '';
-            return `${i + 1}. ${t}${p}${u}`;
+            const img = it.imageUrl ? ` [img: ${it.imageUrl}]` : '';
+            const vid = (it.videoUrl || it.embedUrl) ? ` [video: ${it.videoUrl || it.embedUrl}]` : '';
+            const mt = it.mediaType ? ` (${it.mediaType})` : '';
+            return `${i + 1}. ${t}${p}${u}${mt}${img}${vid}`;
           }).join('\n');
           stepResult.stdout += `\n\nFound ${raw.items.length} items:\n${digest}`;
+        } else if (resolvedArgs.extractItems || resolvedArgs.extractMedia) {
+          // Extraction was requested but yielded 0 items — tell the synthesize
+          // LLM so it doesn't claim cards exist. The page may be bot-limited
+          // or non-listing.
+          stepResult.stdout += `\n\nItem extraction returned 0 items (page may be bot-limited or non-listing).`;
         }
         logger.info(`[Node:ExecuteCommand] web.crawl done: ${crawlTitle}${crawlChars}${crawlTrunc}${raw.items ? ` (${raw.items.length} items)` : ''}`);
       }
@@ -6496,7 +6576,10 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
           const t = it.title ? it.title : '';
           const p = it.price ? ` — ${it.price}` : '';
           const u = it.url ? ` — ${it.url}` : '';
-          return `${i + 1}. ${t}${p}${u}`;
+          const img = it.imageUrl ? ` [img: ${it.imageUrl}]` : '';
+          const vid = (it.videoUrl || it.embedUrl) ? ` [video: ${it.videoUrl || it.embedUrl}]` : '';
+          const mt = it.mediaType ? ` (${it.mediaType})` : '';
+          return `${i + 1}. ${t}${p}${u}${mt}${img}${vid}`;
         }).join('\n');
         stepResult.stdout = `Found ${raw.items.length} items:\n${digest}`;
         logger.info(`[Node:ExecuteCommand] browser.agent extract_items: ${raw.items.length} items`);

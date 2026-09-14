@@ -1874,7 +1874,7 @@ The user's request does NOT match any installed skill.
   let _publicWebConstraint = '';
   const _webMode = state._taskClassification?.webAccessMode;
   if (_webMode === 'public_read' || _webMode === 'download') {
-    _publicWebConstraint = `\n\n⚠️ HARD CONSTRAINT — PUBLIC WEB TASK (webAccessMode=${_webMode}):\nThis task has been classified as a PUBLIC web task. You MUST NOT use \`browser.agent\`.\n- For public_read: Use \`web.agent { action: "search_and_navigate", query: "<query> site:<domain>", preferDomain: "<domain>" }\` → \`synthesize\`. If full page text is needed, add \`web.crawl { url: "{{bestUrl}}" }\` before synthesize.\n- For download: Use \`web.agent { action: "find_download", query: "<query>", fileExt: "<ext>" }\` → \`shell.run curl -sL -o <dest> {{bestUrl}}\` → \`shell.run file <dest>\` → \`synthesize\`.\nNaming a website (e.g. amazon, youtube, wikipedia) does NOT require browser.agent — only login/forms/cart/account actions do.\n`;
+    _publicWebConstraint = `\n\n⚠️ HARD CONSTRAINT — PUBLIC WEB TASK (webAccessMode=${_webMode}):\nThis task has been classified as a PUBLIC web task. You MUST NOT use \`browser.agent\`.\n- For named-site listing/search ("search <site> for X", "show pics of X on <site>", "find X for sale on <site>"): Use \`web.agent { action: "site_search", domain: "<domain>", query: "<user's search terms>" }\` → \`web.crawl { url: "{{bestUrl}}", extractItems: true }\` → \`synthesize\`. site_search resolves directly to the site's search-results URL (e.g. amazon.com/s?k=…) so the crawl lands on the SERP, not a single product page.\n- For public_read: Use \`web.agent { action: "search_and_navigate", query: "<query> site:<domain>", preferDomain: "<domain>" }\` → \`synthesize\`. If full page text is needed, add \`web.crawl { url: "{{bestUrl}}" }\` before synthesize.\n- For download: Use \`web.agent { action: "find_download", query: "<query>", fileExt: "<ext>" }\` → \`shell.run curl -sL -o <dest> {{bestUrl}}\` → \`shell.run file <dest>\` → \`synthesize\`.\nNaming a website (e.g. amazon, youtube, wikipedia) does NOT require browser.agent — only login/forms/cart/account actions do.\n`;
     logger.info(`[Node:PlanSkillsV2] Injecting public-web hard constraint (webAccessMode=${_webMode})`);
   }
 
@@ -2146,7 +2146,7 @@ The user's request does NOT match any installed skill.
       return {
         skill: 'web.agent',
         args: _svc
-          ? { action: 'search_and_navigate', query: `${_taskText} site:${_svc}`, preferDomain: _svc }
+          ? { action: 'site_search', domain: _svc, query: _taskText }
           : { action: 'research_domain', query: _taskText },
         description: step.description || `Search the web for: ${_taskText.slice(0, 80)}`,
       };

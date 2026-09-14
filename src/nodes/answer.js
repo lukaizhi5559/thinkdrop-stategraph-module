@@ -635,11 +635,13 @@ Please try asking: "help me track down the video links for each one of these wor
         streamCallback('\x00SOURCES\x00' + JSON.stringify(sources));
       }
 
-      // ── Emit image results as card items so the renderer can show a grid ──
+      // ── Emit image/video results as card items so the renderer can show a grid ──
       // Image-search docs carry imageUrl (cached thinkdrop-image:// or http
-      // thumbnail) + url (source page). The renderer maps these to cards.
-      const imageItems = contextDocs
-        .filter(d => (d.isImage || d.imageUrl) && d.imageUrl)
+      // thumbnail) + url (source page). Video docs carry mediaType:'video' +
+      // duration + channel. The renderer maps these to cards (WebResultCard
+      // renders a play badge for video items).
+      const mediaItems = contextDocs
+        .filter(d => (d.isImage || d.imageUrl || d.mediaType === 'video') && (d.imageUrl || d.url))
         .slice(0, 24)
         .map(d => {
           const url = (d.url && d.url.startsWith('http')) ? d.url : (d.originalUrl || null);
@@ -651,10 +653,13 @@ Please try asking: "help me track down the video links for each one of these wor
             url: url || undefined,
             snippet: d.snippet || undefined,
             hostname: hostname || undefined,
+            mediaType: d.mediaType || undefined,
+            duration: d.duration || undefined,
+            channel: d.channel || undefined,
           };
         });
-      if (imageItems.length > 0) {
-        streamCallback('\x00ITEMS\x00' + JSON.stringify(imageItems));
+      if (mediaItems.length > 0) {
+        streamCallback('\x00ITEMS\x00' + JSON.stringify(mediaItems));
       }
     }
 

@@ -78,12 +78,22 @@ module.exports = async function webSearch(state) {
     
     logger.debug(`[Node:WebSearch] Found ${searchResults.length} results`);
 
-    // Map search results to contextDocs, with special handling for image results
+    // Map search results to contextDocs, with special handling for image and
+    // video results. Video results carry thumbnails + duration + channel that
+    // the answer node emits as media cards via the \x00ITEMS\x00 sentinel.
     const contextDocs = searchResults.map(r => {
       const isImageResult = r.type === 'image-result';
+      const isVideoResult = r.type === 'video-result';
       const imageUrl = isImageResult && r.metadata?.properties?.url ? r.metadata.properties.url : null;
       const originalUrl = isImageResult && r.metadata?.properties?.originalUrl ? r.metadata.properties.originalUrl : null;
-      
+      // Video results: thumbnail may be under metadata.thumbnail.src or r.thumbnail.src
+      const videoThumb = isVideoResult
+        ? (r.metadata?.thumbnail?.src || r.thumbnail?.src || r.metadata?.properties?.thumbnail || null)
+        : null;
+      // News/article results also carry thumbnails sometimes.
+      const articleThumb = (!isImageResult && !isVideoResult && r.metadata?.thumbnail?.src) ? r.metadata.thumbnail.src : null;
+      const thumb = videoThumb || articleThumb;
+
       return {
         id: r.url || r.link,
         text: `${r.title}\n${r.snippet || r.description || ''}`,
@@ -94,7 +104,16 @@ module.exports = async function webSearch(state) {
         // Include image URL for image search results so they can be displayed
         // imageUrl is the Brave thumbnail (reliable CDN), originalUrl is the source page
         ...(imageUrl && { imageUrl, isImage: true }),
-        ...(originalUrl && { originalUrl })
+        ...(originalUrl && { originalUrl }),
+        // Video metadata — surfaced as media cards by the answer node.
+        ...(isVideoResult && {
+          mediaType: 'video',
+          imageUrl: videoThumb || undefined,
+          duration: r.metadata?.duration || r.duration || undefined,
+          channel: r.metadata?.channel || r.channel || undefined,
+        }),
+        // Article thumbnails (non-image, non-video) — render as card images.
+        ...(!isImageResult && !isVideoResult && articleThumb && { imageUrl: articleThumb }),
       };
     });
 

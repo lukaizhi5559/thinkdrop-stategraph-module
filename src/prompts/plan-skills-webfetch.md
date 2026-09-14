@@ -53,7 +53,7 @@ Domain-specific patterns for PUBLIC web tasks — downloading files and reading 
 **Research on a named site (search/browse/read listings or articles):**
 ```json
 [
-  { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "<query> site:<domain>", "preferDomain": "<domain>" }, "description": "Find <query> on <domain>" },
+  { "skill": "web.agent", "args": { "action": "site_search", "domain": "<domain>", "query": "<user's search terms>" }, "description": "Resolve <domain> search URL for <query>" },
   { "skill": "web.crawl", "args": { "url": "{{bestUrl}}", "fallbackUrls": "{{fallbackUrls}}", "maxChars": 12000, "extractItems": true }, "description": "Fetch the page content and extract listing cards from <domain>" },
   { "skill": "synthesize", "args": { "prompt": "Give a brief summary of the results. The listing cards (image, title, price, link) are shown to the user automatically — do not re-list every item." }, "description": "Present findings" }
 ]
@@ -75,11 +75,21 @@ Domain-specific patterns for PUBLIC web tasks — downloading files and reading 
 ]
 ```
 
+**Extract videos/media from a page:**
+```json
+[
+  { "skill": "web.crawl", "args": { "url": "<url>", "maxChars": 12000, "extractMedia": true }, "description": "Fetch the page and extract video/media cards" },
+  { "skill": "synthesize", "args": { "prompt": "Give a brief summary. Video cards (thumbnail, title, duration, external-open link) are shown to the user automatically — do not re-list every video." }, "description": "Present findings" }
+]
+```
+
 **Research rules:**
 - NEVER use `browser.agent` for public research — it needs no session. `web.agent` + `web.crawl` + `synthesize` covers it.
-- When the user asks to search/browse a specific site for items/listings/content, ALWAYS add `web.crawl {{bestUrl}}` between `web.agent` and `synthesize`. `search_and_navigate` returns a URL pointer, not page content — `synthesize` cannot present results it doesn't have.
+- For "search <site> for X" / "show pics of X on <site>" / "find X for sale on <site>" tasks, use `web.agent { action: "site_search", domain: "<domain>", query: "<user's search terms>" }`. This resolves directly to the site's search-results URL (e.g. amazon.com/s?k=…) so the crawl lands on the SERP, not a single product page. Fall back to `search_and_navigate` only for sites without a known search template.
+- When the user asks to search/browse a specific site for items/listings/content, ALWAYS add `web.crawl {{bestUrl}}` between `web.agent` and `synthesize`. `site_search`/`search_and_navigate` returns a URL pointer, not page content — `synthesize` cannot present results it doesn't have.
 - When the user asks to find/list/browse/show items, products, listings, or search results on a site, set `"extractItems": true` on the `web.crawl` step. The renderer shows the extracted items as cards (image, title, price, link) automatically — the `synthesize` step should give a brief text summary, NOT re-list every item.
+- When the user asks to find/show/watch videos on a page, set `"extractMedia": true` on the `web.crawl` step. Video cards (thumbnail with play badge, duration, external-open link) are shown automatically.
 - Use the "Find a link only" pattern (no `web.crawl`) ONLY when the answer IS the URL itself ("where can I find X", "find me a link to Y").
 - If the user wants deeper detail than the crawled page provides, add another `web.crawl` step on a specific result URL.
-- `web.agent` `search_and_navigate` returns `{bestUrl, title, snippet, fallbackUrls, allResults}` — use `{{bestUrl}}` to feed the URL into a `web.crawl` step, `{{fallbackUrls}}` as the `fallbackUrls` arg so web.crawl auto-retries alternate result URLs when the top pick lands on an error page, and `{{allResults}}` for fallback snippets.
+- `web.agent` `site_search` returns `{bestUrl, fallbackUrls, isSiteSearch, trust}` — use `{{bestUrl}}` to feed the URL into a `web.crawl` step. `search_and_navigate` returns `{bestUrl, title, snippet, fallbackUrls, allResults}` — use `{{fallbackUrls}}` as the `fallbackUrls` arg so web.crawl auto-retries alternate result URLs when the top pick lands on an error page, and `{{allResults}}` for fallback snippets.
 - Naming a site does NOT mean the task needs an account — only route to `browser.agent` when the task requires login, posting, purchasing, or clicking through site UI.
