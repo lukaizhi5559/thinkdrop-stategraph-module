@@ -22,34 +22,95 @@ const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
-// ── Hard guard: app.agent run_app_flow must always be followed by synthesize ──
-// The LLM planner sometimes omits the synthesize step for "ask the AI" read tasks.
-// This post-processing guard appends synthesize whenever the final step is an
-// app.agent run_app_flow, ensuring the answer is always presented to the user.
+// ── Hard guard: action plans must always end with synthesize ─────────────────
+// The LLM planner sometimes omits the synthesize step (e.g. "ask the AI" read
+// tasks, single shell.run plans). This post-processing guard appends a
+// confirmation synthesize whenever the final step is a "doing" skill and no
+// synthesize exists — the user always gets a result summary.
+// Meta/pause steps (ask_user, needs_skill, schedule, api_suggest, profile.*)
+// are exempt — they wait for input or exit early, so a trailing synthesize
+// would be unreachable or wrong.
+const _SYNTHESIZE_EXEMPT_SKILLS = new Set([
+  'synthesize', 'ask_user', 'needs_skill', 'schedule', 'api_suggest',
+  'profile.store_secret', 'smartFill',
+]);
+
 function _ensureSynthesizeForAppFlow(skillPlan, userMessage) {
   if (!Array.isArray(skillPlan) || skillPlan.length === 0) return skillPlan;
+  if (skillPlan.some(s => s.skill === 'synthesize')) return skillPlan;
 
   const lastStep = skillPlan[skillPlan.length - 1];
-  if (
-    lastStep?.skill === 'app.agent' &&
-    (lastStep?.args?.action === 'run_app_flow' || lastStep?.args?.action === 'run_agent')
-  ) {
-    const alreadyHasSynthesize = skillPlan.some(s => s.skill === 'synthesize');
-    if (!alreadyHasSynthesize) {
-      const msgLower = (userMessage || '').toLowerCase();
-      const _EDIT_VERBS = /\b(add|edit|modify|write|create|update|delete|remove|insert|replace|rename|move|fix|implement|generate|build|scaffold|extract|convert|translate|format|lint|debug|patch|apply)\b/;
-      const _READ_VERBS = /\b(examine|read|summarize|explain|tell me about|what does|what is|describe|show me|review|analyze|inspect|investigate|find|locate|search|list|get|fetch|query|check|verify|confirm|report|present|ask)\b/;
-      const isEdit = _EDIT_VERBS.test(msgLower) && !_READ_VERBS.test(msgLower);
+  if (!lastStep?.skill || _SYNTHESIZE_EXEMPT_SKILLS.has(lastStep.skill)) return skillPlan;
 
-      const synthesizePrompt = isEdit
-        ? `Summarize what the app did in response to: ${userMessage}`
-        : `Answer the user's original question based on the app agent's result. Original question: ${userMessage}`;
+  const msgLower = (userMessage || '').toLowerCase();
+  const _EDIT_VERBS = /\b(add|edit|modify|write|create|update|delete|remove|insert|replace|rename|move|fix|implement|generate|build|scaffold|extract|convert|translate|format|lint|debug|patch|apply)\b/;
+  const _READ_VERBS = /\b(examine|read|summarize|explain|tell me about|what does|what is|describe|show me|review|analyze|inspect|investigate|find|locate|search|list|get|fetch|query|check|verify|confirm|report|present|ask)\b/;
+  const isAppAnswer = lastStep.skill === 'app.agent' &&
+    (lastStep.args?.action === 'run_app_flow' || lastStep.args?.action === 'run_agent');
+  const isEdit = _EDIT_VERBS.test(msgLower) && !_READ_VERBS.test(msgLower);
 
-      skillPlan.push({
-        skill: 'synthesize',
-        description: isEdit ? 'Summarize the app action result' : 'Present the answer to the user',
-        args: { prompt: synthesizePrompt },
-      });
+  const synthesizePrompt = isAppAnswer && !isEdit
+    ? `Answer the user's original question based on the app agent's result. Original question: ${userMessage}`
+    : isEdit
+      ? `Summarize what was done in response to: ${userMessage}`
+      : `Confirm what was done in response to: ${userMessage}`;
+
+  skillPlan.push({
+    skill: 'synthesize',
+    description: isAppAnswer && !isEdit ? 'Present the answer to the user' : 'Confirm the result to the user',
+    args: { prompt: synthesizePrompt },
+  });
+  return skillPlan;
+}
+
+// ── Malformed-step guard ─────────────────────────────────────────────────────
+// The LLM occasionally emits a shell.run step with no cmd and no goal (e.g.
+// "print this file" with no File: in context → args:{} → execution fails with
+// "cmd is required"). Convert those into an ask_user step at plan time so the
+// user gets an actionable question instead of a validation error.
+function _sanitizeSkillPlan(skillPlan, state) {
+  if (!Array.isArray(skillPlan)) return skillPlan;
+  const _fileHint = state?._priorScreenContext?.filePath || null;
+  const _appHint = state?._priorScreenContext?.appName || null;
+  for (const step of skillPlan) {
+    if (step?.skill === 'shell.run') {
+      // Coerce argv object entries to strings — the planner LLM sometimes wraps
+      // file paths in {"file": "..."} objects instead of plain strings.
+      // {"file": "/path"} → "/path", {"path": "/path"} → "/path", anything else → String(a)
+      if (Array.isArray(step.args?.argv)) {
+        step.args.argv = step.args.argv.map(a => {
+          if (typeof a === 'string') return a;
+          if (a && typeof a === 'object') {
+            if (typeof a.file === 'string') return a.file;
+            if (typeof a.path === 'string') return a.path;
+          }
+          if (a != null) return String(a);
+          return a;
+        });
+      }
+      // Missing cmd/goal → fill from context or convert to ask_user
+      if (!step.args?.cmd && !step.args?.goal) {
+        const _msg = state?.resolvedMessage || state?.message || '';
+        // If we have a file hint + user message, fill in goal so shell.run's
+        // internal LLM can resolve it (e.g. "print this file" + File: /path)
+        if (_fileHint && _msg) {
+          step.args = { goal: `${_msg} — file: ${_fileHint}` };
+          if (step._malformed) {
+            logger.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled goal from context for _malformed step: "${_msg.slice(0, 60)} — file: ${_fileHint}"`);
+          }
+        } else {
+          // No file context — convert to ask_user
+          const q = _fileHint
+            ? `Did you mean to run this on "${_fileHint}" (currently open in ${_appHint || 'the active app'})?`
+            : 'I could not determine which file or target to run this on. What did you mean?';
+          step.skill = 'ask_user';
+          step.args = {
+            question: q,
+            options: _fileHint ? [`Yes, use ${_fileHint}`, 'Cancel'] : [],
+          };
+          step.description = 'Clarify the shell.run target';
+        }
+      }
     }
   }
   return skillPlan;
@@ -631,10 +692,16 @@ function _buildSystemPrompt(userMessage, state) {
   // ALSO skip for non-follow-up command_automate intents: the OCR from a previous
   // (often failed) attempt can falsely imply the task is already complete.
   const _screenNote = state._screenContextNote;
+  // Stale only when the captured window IS ThinkDrop/Electron itself — a Devin/
+  // VS Code title like "thinkdrop — plan-xxx.md" (project-name prefix) is real
+  // user context and must NOT be suppressed. The startsWith fallback covers
+  // OCR-path captures where appName came back missing/'unknown'.
+  const _ctxApp = state._priorScreenContext?.appName;
+  const _ctxTitle = (state._priorScreenContext?.windowTitle || '').toLowerCase();
   const _screenIsStale = state._priorScreenContext && (
-    state._priorScreenContext.appName === 'Electron' ||
-    state._priorScreenContext.appName === 'ThinkDrop' ||
-    (state._priorScreenContext.windowTitle || '').toLowerCase().includes('thinkdrop —')
+    _ctxApp === 'Electron' ||
+    _ctxApp === 'ThinkDrop' ||
+    ((!_ctxApp || _ctxApp === 'unknown') && _ctxTitle.startsWith('thinkdrop'))
   );
   const _isNonFollowUpAutomate = state.intent?.type === 'command_automate' && !state._taskClassification?.isFollowUp;
   if (_screenNote && !_screenIsStale && !_isNonFollowUpAutomate && typeof _screenNote === 'string' && _screenNote.length > 0) {
@@ -1636,6 +1703,31 @@ async function planSkillsV2(state) {
   //   }
   // }
 
+  // ── Deterministic file-op fast-path (bypass LLM planner for known patterns) ──
+  // The planner LLM sometimes emits empty args despite explicit examples in the
+  // prompt. For high-frequency, deterministic patterns like "print this file",
+  // bypass the LLM entirely and emit the correct step directly. Same pattern as
+  // SYSTEM_QUERY_REGISTRY in shell.run.cjs (force-classification for known queries).
+  if (!recoveryContext && !state._planFile) {
+    const _fileHint = state?._priorScreenContext?.filePath || null;
+    if (_fileHint) {
+      try {
+        if (fs.existsSync(_fileHint)) {
+          // "print this/that/the file/document/doc" → lp <File>
+          if (/\bprint\s+(?:this|that|the)?\s*(?:current\s+)?(?:file|document|doc)\b/i.test(userMessage)) {
+            const _fastPlan = [
+              { skill: 'shell.run', args: { cmd: 'lp', argv: [_fileHint] }, description: `Print ${_fileHint}` },
+              { skill: 'synthesize', args: { prompt: 'Confirm the file was sent to the printer.' }, description: 'Confirm print' },
+            ];
+            logger.info(`[Node:PlanSkillsV2] File-op fast-path: "${userMessage.slice(0, 60)}" → lp ${_fileHint}`);
+            if (progressCallback) progressCallback({ type: 'plan_ready', steps: _fastPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+            return { ...state, skillPlan: _fastPlan, skillCursor: 0, planError: null, recoveryContext: null };
+          }
+        }
+      } catch (_) { /* non-fatal — fall through to LLM planner */ }
+    }
+  }
+
   // ── Build the LLM planning query ──────────────────────────────────────────
   const runtimeNote = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, priorSynthesizedContent)
     ? (() => {
@@ -2559,7 +2651,12 @@ The user's request does NOT match any installed skill.
     }
   }
 
-  // ── Synthesize guard: every app.agent run_app_flow must be followed by synthesize
+  // ── Malformed-step guard: shell.run without cmd/goal → ask_user ────────────
+  if (Array.isArray(skillPlan)) {
+    skillPlan = _sanitizeSkillPlan(skillPlan, state);
+  }
+
+  // ── Synthesize guard: every action plan ends with a confirmation ────────────
   if (Array.isArray(skillPlan)) {
     skillPlan = _ensureSynthesizeForAppFlow(skillPlan, userMessage);
   }

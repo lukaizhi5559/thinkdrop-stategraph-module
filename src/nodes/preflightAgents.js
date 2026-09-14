@@ -302,6 +302,8 @@ function serviceToIconUrl(service, startUrl) {
 const _FILE_STOPWORDS = /^(?:file|folder|the|a|an|this|that|it|app|application|ai|page|window|tab|screen|menu|button|panel|area|section|bar|tool|toolbar|sidebar|header|footer|content|text|image|video|audio|link|url|address|number|name|title|description|note|comment|message|email|chat|post|tweet|song|track|album|artist|playlist|channel|user|profile|account|setting|preference|option|feature|function|method|class|object|variable|constant|property|field|column|row|table|database|query|command|statement|expression|value|result|output|input|error|warning|info|debug|log|trace|event|handler|listener|callback|promise|async|await|return|param|parameter|arg|argument|var|let|const|if|else|for|while|switch|case|break|continue|try|catch|finally|throw|new|delete|typeof|instanceof|in|of|do|with|export|import|from|default|extends|implements|interface|enum|struct|union|typedef|namespace|module|package|library|framework|plugin|extension|addon|component|element|widget|gadget|control|view|model|controller|route|endpoint|api|service|server|client|request|response|header|body|status|method|get|post|put|patch|delete|head|options|connect|trace|content|type|length|encoding|charset|boundary|disposition|filename|name|value|data|json|xml|html|css|js|ts|py|rb|go|rs|c|cpp|java|kt|swift|php|pl|sh|bash|zsh|fish|ps1|bat|cmd|exe|app|dmg|pkg|deb|rpm|msi|zip|tar|gz|bz2|xz|7z|rar|pdf|doc|docx|xls|xlsx|ppt|pptx|txt|md|rst|log|csv|tsv|yaml|yml|toml|ini|cfg|conf|env|lock|tmp|temp|cache|bak|old|orig|swp|swo|swn|swn|pid|sock|fifo|pipe|tty|dev|null|zero|random|urandom)$/i;
 
 const _FILE_REGEX_PATTERNS = [
+  // Drag-drop attachment marker: [File: /absolute/path] — try FIRST (deterministic)
+  /\[File:\s*(\/[^\]]+)\]/i,
   // "open|examine|read|edit|view|show|load|find|import [me] [the] <name> file? in <app>"
   /\b(?:open|examine|read|edit|view|show|load|find|import)\s+(?:me\s+)?(?:the\s+)?([^/\s"']+?)(?:\s+file)?\s+(?:in|with|using|via)\b/i,
   // "ask the AI about <name> in <app>"
@@ -313,6 +315,9 @@ const _FILE_REGEX_PATTERNS = [
   // path with slashes: open /path/to/file.ext in Devin
   /\b(?:open|examine|read|edit|view|show|load|find|import)\s+(\/[^\s"']+\.\w+)\s+(?:in|with|using|via)\b/i,
   // filename with extension anywhere in message: UnifiedOverlay.tsx
+  // NOTE: this is a fallback — filenames with spaces (e.g. "Screenshot 2026-09-12 at 11.10.16 PM.png")
+  // will only match the last token ("PM.png"). The [File:] marker above handles
+  // drag-drop attachments with full paths including spaces.
   /\b([A-Za-z_][A-Za-z0-9_-]*\.[a-zA-Z0-9]+)\b/,
 ];
 
@@ -370,6 +375,10 @@ async function _probeFilesystem(mcpAdapter, candidate, logger) {
     { root: process.cwd(), maxdepth: 5 },
     { root: path.join(os.homedir(), 'Desktop', 'projects'), maxdepth: 5 },
     { root: path.join(os.homedir(), 'Desktop'), maxdepth: 3 },
+    { root: path.join(os.homedir(), 'Documents'), maxdepth: 4 },
+    { root: path.join(os.homedir(), 'Downloads'), maxdepth: 3 },
+    { root: path.join(os.homedir(), '.devin'), maxdepth: 5 },
+    { root: path.join(os.homedir(), '.thinkdrop'), maxdepth: 4 },
   ];
 
   let candidates = [];
@@ -477,6 +486,16 @@ module.exports = async function preflightAgents(state) {
   }
   const recoveryContext = state.recoveryContext || null;
   const confirmInstallCallback = state.confirmInstallCallback || null;
+
+  // ── Auth bypass (one-run, user-chosen "proceed without") ──────────────────
+  // Agent IDs the user explicitly chose to run unauthenticated. NOT persisted —
+  // nothing is written to the auth cache or authed_at, so the next task that
+  // truly needs auth still prompts.
+  const _bypassAuth = new Set(
+    (Array.isArray(state.preflightAuthBypass) ? state.preflightAuthBypass : [state.preflightAuthBypass])
+      .filter(Boolean)
+      .map(s => String(s).toLowerCase())
+  );
   const gatherAnswerCallback = state.gatherAnswerCallback || null;
   const gatherCredentialCallback = state.gatherCredentialCallback || null;
 
@@ -1124,9 +1143,26 @@ module.exports = async function preflightAgents(state) {
               // the manual-login UI if cookies are already valid.
               const _cachedAuth = _getCachedAuth(a.id);
               const _provisionalAuthedAt = a.authedAt || _cachedAuth?.ts || null;
-              const authed = false;
-              const _authTag = ' [NEEDS AUTH — user must authenticate before this agent can run]';
+              // User chose "proceed without" — treat as authed for this run only.
+              const _authBypassed = _bypassAuth.has(a.id.toLowerCase());
+              const authed = _authBypassed;
+              const _authTag = _authBypassed
+                ? ' [AUTH BYPASSED — running unauthenticated per user choice]'
+                : ' [NEEDS AUTH — user must authenticate before this agent can run]';
               agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_authTag}`);
+              if (_authBypassed) {
+                warnings.push({
+                  type: 'auth_bypassed',
+                  message: `${a.id} sign-in skipped by user — running unauthenticated`,
+                });
+                logger.info(`[Node:PreflightAgents] ${a.id} auth bypassed by user — marking authed for this run only`);
+                _emitProgress({
+                  type: 'preflight:agent_ready',
+                  agentId: a.id,
+                  iconUrl,
+                  message: `${a.id} proceeding without sign-in`,
+                });
+              }
 
               const _agentAuthType = _deriveAgentAuthType(a.descriptor);
               agentReadiness.push({
@@ -1134,6 +1170,7 @@ module.exports = async function preflightAgents(state) {
                 agentId: a.id,
                 ready: true,
                 authed,
+                authBypassed: _authBypassed,
                 authType: _agentAuthType,
                 iconUrl,
                 startUrl: a.start_url,

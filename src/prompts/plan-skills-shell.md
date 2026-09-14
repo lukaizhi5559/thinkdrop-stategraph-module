@@ -2,6 +2,54 @@
 
 Domain-specific patterns for `shell.run`. The base prompt already establishes the skill hierarchy (CLI/shell first, app second, browser last) and general `shell.run` usage. This appendix adds concrete file-operation, install, and clipboard patterns.
 
+## ACTIVE SCREEN CONTEXT — "the file that's open" / "print the file"
+
+The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or most recent non-overlay) app and its open document path (`File: <path>`). This is the **authoritative source of truth** — NEVER query the frontmost app via osascript yourself (ThinkDrop's overlay is frontmost when the user types, so you'd resolve ThinkDrop itself and get an empty file path).
+
+**"Print the file that's open" / "print this file" / "print the current document":**
+- If `File:` is present → `shell.run { cmd: "lp", argv: ["<File>"] }` directly. One step. Done.
+- If `File:` is absent → `app.agent { action: 'run_app_flow', appName: "<App>", goal: "print the current document" }` for a named desktop app, OR emit an `ask_user` step.
+- **NEVER** generate an AppleScript that queries `path of document 1` of the frontmost app — the path is already resolved in ACTIVE SCREEN CONTEXT.
+
+**Multiple file matches:** if `mdfind` returns multiple paths for a filename, do NOT guess — emit an `ask_user` step: "I found multiple files named '<filename>'. Which one?" with the paths as options.
+
+**Unsaved/Untitled docs:** if `File:` is absent and the app is a document editor, emit an `ask_user` step: "The file appears to be unsaved. You need to save it before I can print it. Please save the file and try again." (actionable, not just an error).
+
+## App-control verbs via shell.run (osascript)
+
+For deterministic window management, prefer `shell.run` osascript over `app.agent` — no focus/OCR/shortcut-detection needed. Use `App:` from ACTIVE SCREEN CONTEXT as the app name.
+
+| Verb | shell.run command |
+|---|---|
+| close / quit / exit | `osascript -e 'tell application "X" to quit'` |
+| force quit | `killall "X"` |
+| minimize | `osascript -e 'tell application "System Events" to set miniaturized of every window of process "X" to true'` |
+| hide | `osascript -e 'tell application "System Events" to set visible of process "X" to false'` |
+| open / launch | `open -a "X"` or `open -a "X" "<file>"` |
+| print | `lp "<file>"` (use `File:` from ACTIVE SCREEN CONTEXT) |
+| volume up/down/mute | `osascript -e 'set volume output volume X'` / `osascript -e 'set volume output muted true'` |
+| bring to front / activate | `osascript -e 'tell application "X" to activate'` |
+| new window | `open -n -a "X"` |
+| relaunch | `killall "X" && open -a "X"` |
+
+**Example — "close this app":**
+```json
+[
+  { "skill": "shell.run", "args": { "cmd": "osascript", "argv": ["-e", "tell application \"<App from ACTIVE SCREEN CONTEXT>\" to quit"] }, "description": "Quit the active app" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the app was closed." }, "description": "Confirm" }
+]
+```
+
+**Example — "print the file that's open":**
+```json
+[
+  { "skill": "shell.run", "args": { "cmd": "lp", "argv": ["<File from ACTIVE SCREEN CONTEXT>"] }, "description": "Print the open file" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the file was sent to the printer." }, "description": "Confirm print" }
+]
+```
+
+**Simple file edits via shell (NOT edit.agent):** For simple string/pattern edits (replace X with Y, delete lines, append), use `sed`/`python3 -c` — deterministic, no LLM cost. `edit.agent` is only for semantic/structural edits (refactor, add section, fix bug). See "Python-First for File Operations" below.
+
 ## Python-First for File Operations
 
 **Default to Python for file system work.** Bash is only for simple one-liners or when Python is unavailable.

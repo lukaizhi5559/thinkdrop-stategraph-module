@@ -126,23 +126,45 @@ function parsePlan(raw, logger) {
     const parsed = JSON.parse(jsonrepair(text));
     if (!Array.isArray(parsed) && parsed && typeof parsed === 'object' && Array.isArray(parsed.steps)) {
       if (logger) logger.debug('[planHelpers:parsePlan] unwrapping {"steps":[...]} wrapper');
-      return parsed.steps;
+      return _validateStepSchema(parsed.steps, logger);
     }
     if (!Array.isArray(parsed) && parsed && typeof parsed === 'object') {
       for (const val of Object.values(parsed)) {
         if (Array.isArray(val) && val.length > 0 && typeof val[0]?.skill === 'string') {
           if (logger) logger.debug('[planHelpers:parsePlan] deep-scan unwrapped arbitrary object key → step array');
-          return val;
+          return _validateStepSchema(val, logger);
         }
       }
       if (logger) logger.warn('[planHelpers:parsePlan] object has no step-array under any key — returning null');
       return null;
     }
-    return parsed;
+    return _validateStepSchema(parsed, logger);
   } catch (e) {
     if (logger) logger.warn('[planHelpers:parsePlan] JSON parse failed:', e.message);
     return null;
   }
+}
+
+/**
+ * Schema validation pass — marks steps where the skill's args don't match the
+ * documented schema. For shell.run, requires either `goal` or `cmd` (string).
+ * Marked steps get _malformed=true so _sanitizeSkillPlan can handle them
+ * (convert to ask_user or fill from context). Catches LLM compliance failures
+ * at parse time rather than letting them reach execution.
+ */
+function _validateStepSchema(steps, logger) {
+  if (!Array.isArray(steps)) return steps;
+  for (const step of steps) {
+    if (step?.skill === 'shell.run' && step.args) {
+      const hasGoal = typeof step.args.goal === 'string' && step.args.goal.length > 0;
+      const hasCmd = typeof step.args.cmd === 'string' && step.args.cmd.length > 0;
+      if (!hasGoal && !hasCmd) {
+        if (logger) logger.warn('[planHelpers:parsePlan] shell.run step missing required args (goal or cmd) — marking _malformed');
+        step._malformed = true;
+      }
+    }
+  }
+  return steps;
 }
 
 module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan };

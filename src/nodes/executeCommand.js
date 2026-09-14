@@ -3836,8 +3836,11 @@ Please try again or search with different terms.`;
   })();
   // Resolve bestUrl: URL returned by the last successful web.agent search_and_navigate step
   const webAgentBestUrl = state.webAgentBestUrl || '';
+  // Alternate candidate URLs from the same step — lets web.crawl retry when
+  // bestUrl turns out to be an error page or thin content.
+  const webAgentFallbackUrls = Array.isArray(state.webAgentFallbackUrls) ? state.webAgentFallbackUrls : [];
   let resolvedArgs = args;
-  if (synthesisAnswer || synthesisAnswerFile || prevStdout || prevWatchId || webAgentBestUrl) {
+  if (synthesisAnswer || synthesisAnswerFile || prevStdout || prevWatchId || webAgentBestUrl || JSON.stringify(args).includes('{{fallbackUrls}}')) {
     let argsJson = JSON.stringify(args);
     if (synthesisAnswer) {
       argsJson = argsJson.replace(/\{\{synthesisAnswer\}\}/g, synthesisAnswer.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
@@ -3854,7 +3857,22 @@ Please try again or search with different terms.`;
     if (webAgentBestUrl) {
       argsJson = argsJson.replace(/\{\{bestUrl\}\}/gi, webAgentBestUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
     }
+    // {{fallbackUrls}} is an array token — replace the quoted form first so
+    // "fallbackUrls": "{{fallbackUrls}}" becomes a real JSON array, then the
+    // bare form for planners that emit it unquoted. Always resolves (default
+    // []) so the unresolved-token guard below never trips on it.
+    const fallbackJson = JSON.stringify(webAgentFallbackUrls);
+    argsJson = argsJson.replace(/"\{\{fallbackUrls\}\}"/gi, fallbackJson);
+    argsJson = argsJson.replace(/\{\{fallbackUrls\}\}/gi, fallbackJson);
     resolvedArgs = JSON.parse(argsJson);
+  }
+
+  // Auto-inject fallbackUrls into web.crawl steps — planners don't reliably
+  // emit the arg, and the fallbacks are already captured from web.agent.
+  if (skill === 'web.crawl'
+      && !(Array.isArray(resolvedArgs.fallbackUrls) && resolvedArgs.fallbackUrls.length)
+      && webAgentFallbackUrls.length) {
+    resolvedArgs = { ...resolvedArgs, fallbackUrls: webAgentFallbackUrls };
   }
 
   // ── {{BODY}}, {{EMAIL}}, {{PHONE}}, {{URL}}, {{AMOUNT}}, ... ──────────────
@@ -5069,10 +5087,12 @@ Please try again or search with different terms.`;
 
     // Extract bestUrl from the last successful web.agent step in the group
     let newWebAgentBestUrl = state.webAgentBestUrl || null;
+    let newWebAgentFallbackUrls = state.webAgentFallbackUrls || [];
     for (const outcome of settled) {
       const r = outcome.status === 'fulfilled' ? outcome.value : null;
       if (r && r.step?.skill === 'web.agent' && r.ok && r.raw?.bestUrl) {
         newWebAgentBestUrl = r.raw.bestUrl;
+        if (Array.isArray(r.raw.fallbackUrls)) newWebAgentFallbackUrls = r.raw.fallbackUrls;
         // Also synthesize stdout on the matching groupResult entry
         const grIdx = groupResults.findIndex(g => g.step === (r.idx + 1));
         if (grIdx >= 0 && !groupResults[grIdx].stdout) {
@@ -5091,6 +5111,7 @@ Please try again or search with different terms.`;
         skillResults: newResults,
         stepContracts: newStepContracts,
         webAgentBestUrl: newWebAgentBestUrl,
+        webAgentFallbackUrls: newWebAgentFallbackUrls,
         skillCursor: nextCursor,
         commandExecuted: false,
         failedStep: null,
@@ -5123,6 +5144,7 @@ Please try again or search with different terms.`;
           skillResults: newResults,
           stepContracts: newStepContracts,
           webAgentBestUrl: newWebAgentBestUrl,
+        webAgentFallbackUrls: newWebAgentFallbackUrls,
           skillCursor: nextCursor,
           commandExecuted: false,
           failedStep: null, // Don't set — let synthesize run first
@@ -5134,6 +5156,7 @@ Please try again or search with different terms.`;
         skillResults: newResults,
         stepContracts: newStepContracts,
         webAgentBestUrl: newWebAgentBestUrl,
+        webAgentFallbackUrls: newWebAgentFallbackUrls,
         skillCursor: nextCursor,
         commandExecuted: false,
         failedStep: firstFailure,
@@ -5145,6 +5168,7 @@ Please try again or search with different terms.`;
       skillResults: newResults,
       stepContracts: newStepContracts,
       webAgentBestUrl: newWebAgentBestUrl,
+      webAgentFallbackUrls: newWebAgentFallbackUrls,
       skillCursor: nextCursor,
       commandExecuted: nextCursor >= skillPlan.length,
       failedStep: null,
@@ -5533,16 +5557,23 @@ Please try again or search with different terms.`;
     // When shell.run returns askUser: true for unknown commands, surface the
     // allowlist question directly without routing through recoverSkill.
     if (skill === 'shell.run' && raw.askUser === true && raw._isShellAllowlist) {
+      const _cmdName = raw.commandName || path.basename(resolvedArgs.cmd || '');
+      // Canonical options matching the resume parser in main.js (line ~5098):
+      // /^allow\s+"?([a-z0-9._-]+)"?\s+and\s+retry$/i
+      const _allowOpt = `Allow "${_cmdName}" and retry`;
+      const _cancelOpt = 'Cancel';
       logger.info(`[Node:ExecuteCommand] shell.run ask_user (allowlist): "${String(raw.question).slice(0, 80)}"`);
       const askUserStep = {
         step: skillCursor + 1, skill, args: resolvedArgs, description,
         ok: false, askUser: true, error: raw.question,
+        commandName: _cmdName,
+        userAllowlistHint: true,
       };
       if (progressCallback) {
         progressCallback({
           type: 'ask_user',
           question: raw.question,
-          options: raw.options || [],
+          options: [_allowOpt, _cancelOpt],
           stepIndex: skillCursor,
           skill,
           description: description || skill,
@@ -5557,10 +5588,12 @@ Please try again or search with different terms.`;
         recoveryAction: 'ask_user',
         pendingQuestion: {
           question: raw.question,
-          options: raw.options || [],
+          options: [_allowOpt, _cancelOpt],
           context: `${description || skill} (step ${skillCursor + 1})`,
           _isShellAllowlist: true,
-          commandName: raw.commandName || null,
+          // Top-level fields (main.js + handoffRunner.js read these, not context.*)
+          commandName: _cmdName,
+          userAllowlistHint: true,
           userAllowlistPath: raw.userAllowlistPath || null,
         },
         commandExecuted: false,
@@ -5708,6 +5741,7 @@ Please try again or search with different terms.`;
       watchId: skill === 'file.watch' ? (raw.watchId || null) : null,
       _raw: (skill === 'file.bridge' || skill === 'fs.read') ? raw : undefined,
       url: raw.url ?? null,
+      items: raw.items ?? null,
       pageContext: raw.pageContext ?? null,
       stateChanged: raw.stateChanged ?? null,
       error: raw.error || null,
@@ -6442,7 +6476,30 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         const crawlChars = raw.contentLength ? ` — ${raw.contentLength.toLocaleString()} chars` : '';
         const crawlTrunc = raw.truncated ? ' (truncated)' : '';
         stepResult.stdout = `Crawled ${crawlTitle}${crawlChars}${crawlTrunc}\n\n${raw.content || ''}`;
-        logger.info(`[Node:ExecuteCommand] web.crawl done: ${crawlTitle}${crawlChars}${crawlTrunc}`);
+        // Append a compact item digest so the synthesize LLM can reference items in prose
+        if (Array.isArray(raw.items) && raw.items.length > 0) {
+          const digest = raw.items.slice(0, 24).map((it, i) => {
+            const t = it.title ? it.title : '';
+            const p = it.price ? ` — ${it.price}` : '';
+            const u = it.url ? ` — ${it.url}` : '';
+            return `${i + 1}. ${t}${p}${u}`;
+          }).join('\n');
+          stepResult.stdout += `\n\nFound ${raw.items.length} items:\n${digest}`;
+        }
+        logger.info(`[Node:ExecuteCommand] web.crawl done: ${crawlTitle}${crawlChars}${crawlTrunc}${raw.items ? ` (${raw.items.length} items)` : ''}`);
+      }
+      // browser.agent extract_items: append a compact item digest to stdout
+      // so the synthesize LLM can reference items in prose. The items array is
+      // already surfaced on stepResult.items via the generic construction above.
+      if (skill === 'browser.agent' && raw.ok && resolvedArgs.action === 'extract_items' && Array.isArray(raw.items) && raw.items.length > 0) {
+        const digest = raw.items.slice(0, 24).map((it, i) => {
+          const t = it.title ? it.title : '';
+          const p = it.price ? ` — ${it.price}` : '';
+          const u = it.url ? ` — ${it.url}` : '';
+          return `${i + 1}. ${t}${p}${u}`;
+        }).join('\n');
+        stepResult.stdout = `Found ${raw.items.length} items:\n${digest}`;
+        logger.info(`[Node:ExecuteCommand] browser.agent extract_items: ${raw.items.length} items`);
       }
       // web.agent: synthesize a human-readable stdout so synthesize/reviewExecution can read the result
       if (skill === 'web.agent' && raw.ok && raw.bestUrl) {
@@ -6994,6 +7051,11 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
     const newWebAgentBestUrl = (skill === 'web.agent' && stepResult.ok && raw.bestUrl)
       ? raw.bestUrl
       : (state.webAgentBestUrl || null);
+    // Capture fallbackUrls alongside bestUrl so {{fallbackUrls}} resolves for
+    // web.crawl retry on error pages / thin content.
+    const newWebAgentFallbackUrls = (skill === 'web.agent' && stepResult.ok && Array.isArray(raw.fallbackUrls))
+      ? raw.fallbackUrls
+      : (state.webAgentFallbackUrls || []);
 
     // ── Save-as-named-skill offer (Phase 3) ──────────────────────────────────
     // browser.agent returns saveSkillOffer after a verified mutation success.
@@ -7031,6 +7093,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         activeBrowserUrl,
         lastOpenedFilePath,
         webAgentBestUrl: newWebAgentBestUrl,
+        webAgentFallbackUrls: newWebAgentFallbackUrls,
         deferredSaveSkillOffer: _incomingOffer || _stashedOffer || null,
         commandExecuted: isLastStep,
         answer: lastStepAnswer,
@@ -7064,6 +7127,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         activeBrowserUrl,
         lastOpenedFilePath,
         webAgentBestUrl: newWebAgentBestUrl,
+        webAgentFallbackUrls: newWebAgentFallbackUrls,
         deferredSaveSkillOffer: null,  // consumed — clear the stash
         recoveryAction: 'ask_user',
         pendingQuestion: {
@@ -7091,6 +7155,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       activeBrowserUrl,
       lastOpenedFilePath,
       webAgentBestUrl: newWebAgentBestUrl,
+      webAgentFallbackUrls: newWebAgentFallbackUrls,
       commandExecuted: isLastStep,
       answer: lastStepAnswer,  // set so voice service _stategraphLaneResponse gets it for TTS
       thinking: state._synthThinking || state.thinking || null

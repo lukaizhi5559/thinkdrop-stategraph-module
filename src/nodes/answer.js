@@ -633,6 +633,28 @@ Please try asking: "help me track down the video links for each one of these wor
       if (sources.length > 0) {
         streamCallback('\x00SOURCES\x00' + JSON.stringify(sources));
       }
+
+      // ── Emit image results as card items so the renderer can show a grid ──
+      // Image-search docs carry imageUrl (cached thinkdrop-image:// or http
+      // thumbnail) + url (source page). The renderer maps these to cards.
+      const imageItems = contextDocs
+        .filter(d => (d.isImage || d.imageUrl) && d.imageUrl)
+        .slice(0, 24)
+        .map(d => {
+          const url = (d.url && d.url.startsWith('http')) ? d.url : (d.originalUrl || null);
+          let hostname = '';
+          try { hostname = new URL(url || d.imageUrl).hostname.replace(/^www\./, ''); } catch (_) {}
+          return {
+            title: d.title || undefined,
+            imageUrl: d.imageUrl,
+            url: url || undefined,
+            snippet: d.snippet || undefined,
+            hostname: hostname || undefined,
+          };
+        });
+      if (imageItems.length > 0) {
+        streamCallback('\x00ITEMS\x00' + JSON.stringify(imageItems));
+      }
     }
 
     // ── Guide offer extraction ────────────────────────────────────────────────

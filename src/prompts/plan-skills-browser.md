@@ -33,6 +33,24 @@ Lowercase service name + `.agent` suffix:
 ]
 ```
 
+**Show me / list / find items in my account (DISPLAY task — extract cards):**
+
+When the user asks to show, list, or find items in their authenticated account (emails, messages, posts, documents, issues, etc.), use `browser.agent run` to navigate to the target page, then `browser.agent extract_items` to extract structured cards. The renderer shows the items as cards (image, title, price, link) automatically — the `synthesize` step should give a brief text summary, NOT re-list every item.
+
+```json
+[
+  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "go to my <inbox/dashboard/list view>" }, "description": "Navigate to <service> <page>" },
+  { "skill": "browser.agent", "args": { "action": "extract_items", "agentId": "<service>.agent" }, "description": "Extract <items> as cards" },
+  { "skill": "synthesize", "args": { "prompt": "Give a brief summary of the results. The cards (image, title, link) are shown to the user automatically — do not re-list every item." }, "description": "Summarize <service> results" }
+]
+```
+
+**Key rules for extract_items:**
+- `extract_items` requires the browser to already be on the target page — always precede it with a `browser.agent run` step that navigates there.
+- Consecutive same-agent steps reuse the same browser session automatically — the `extract_items` step runs on the same session as the preceding `run` step.
+- `extract_items` is for DISPLAY tasks only (show me, list, find). For ACTION tasks (add to cart, send email, post), use `browser.agent run` for the full task and show the outcome text — do NOT use `extract_items`.
+- The `agentId` on the `extract_items` step must match the preceding `run` step so the same session is reused.
+
 **Ask an AI chatbot:**
 ```json
 [

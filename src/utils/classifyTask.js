@@ -51,7 +51,8 @@ Output ONLY valid JSON with exactly these fields:
   "isImageAnalysis": true | false,
   "isConversationRecall": true | false,
   "isActivityQuery": true | false,
-  "webAccessMode": "none" | "download" | "public_read" | "interactive"
+  "webAccessMode": "none" | "download" | "public_read" | "interactive",
+  "interactiveActions": ["login", "add_to_cart", ...] | []
 }
 
 Field rules:
@@ -75,6 +76,7 @@ Field rules:
 - followUpTarget: if isFollowUp is true AND recent conversation clearly shows what it refers to, provide the resolved concrete subject. This includes: a file path from a prior command, a topic/subject discussed (e.g. "Vietnam weather", "the Python script", "SpaceX stock"), a named entity, or any other concrete referent established in the conversation. Set to null only when the referent genuinely cannot be determined from history.
   - CRITICAL: Set followUpTarget to null when isFollowUp is false (including the META-QUESTION EXCEPTION above). A non-null followUpTarget with isFollowUp=false is invalid.
   - Never set followUpTarget to the user's own prior message text when the user is asking ABOUT that message (e.g., "what did I just ask" → followUpTarget must be null, NOT "what did I just ask").
+  - ACTIVE APP CONTEXT PRIORITY: When the user message uses deictic references ("this file", "that file", "the file", "it", "this", "that") and the prompt includes an "ACTIVE APP CONTEXT (live):" block with a "File: <path>" field, resolve followUpTarget to that file path. The live open file is the authoritative referent for deictic file references — NOT a file from conversation history. Also set isScreenFollowUp to false when the file is resolved this way (the file is known, no screen OCR needed).
 
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
   - WHO to send to (messaging tasks with no recipient anywhere)
@@ -108,6 +110,9 @@ Field rules:
   - "interactive": the task requires a real browser session — login/OAuth/account state, sending/posting/messaging, form fill, add-to-cart/checkout, account settings, filter/picker UIs, media playback controls, multi-step page flows, or the user explicitly wants to browse the site themselves ("open X for me", "show me the site"). Also use "interactive" whenever requiresDOM is true, and as the DEFAULT when taskType is "browser" but the needed access is unclear.
   - "none": the task does not touch the web (local file/system/app tasks, memory, scheduling, pure knowledge queries).
   Key distinction — NAMING a site is NOT enough for "interactive": "download a bird sound from freemusicarchive.org" is "download" (public file), "look up cheap X on amazon" is "public_read" (research), but "add X to my amazon cart" is "interactive" (account action). Download/public_read tasks NEVER need a service agent or auth — they use generic web-search/curl/crawl skills.
+  Examples: "Go to eBay and search for 'vintage children's Bible'" → public_read (simple search), "Search Amazon for cheap exercise equipment" → public_read (research), "Add the Bible to my eBay cart" → interactive (account action), "Send an email via Gmail" → interactive (send).
+
+- interactiveActions: list the specific interactive actions this prompt requires, or [] if none. Valid actions: login, oauth, add_to_cart, checkout, place_order, send_message, send_email, post, comment, like, share, follow, subscribe, retweet, react, vote, play_media, pause_media, skip_media, shuffle, repeat, fill_form, submit_form, upload, publish, delete, edit, create, update, deploy, merge_pr, approve_pr, assign_task, settings_change, filter_ui, sort_ui, date_picker, book_reservation. Set to [] when the task is simple search, browse, read, download, or lookup — those are NOT interactive actions. When webAccessMode is "interactive", this array MUST be non-empty (list the actions that make it interactive). When webAccessMode is "public_read", "download", or "none", this MUST be [].
 
 - isActivityQuery: true when the user asks about their RECENT ACTIVITY, WORK, SCREEN TIME, or CONTENT CONSUMPTION — i.e., queries that should be answered from episodic memory / screen captures / app usage, NOT from the chat transcript and NOT from personal profile data. Signals: "what have I been working on", "what was I working on today", "what did I do yesterday", "what did I watch", "what did I listen to", "what apps did I use", "what was on my screen", "what was I doing", "what have I been up to". When true, the memory retrieval node should use a broad activity query (NOT the raw prompt) and a low similarity threshold, and the answer node should focus on activity/screen/app memories — NOT surface personal profile data (email, phone, address) unless explicitly asked. false for: personal profile queries ("what is my email", "what is my name"), conversation-recall meta-questions (those are isConversationRecall), and non-memory tasks (web search, automation).
 
@@ -118,7 +123,7 @@ Field rules:
   4. E-commerce and booking: add to cart, select size/color/variant, checkout, apply coupon, place order, book flights/hotels/tables/appointments/tickets — navigating product/booking pages, selecting dates/times, filling forms, payment.
   5. Account settings: change password, update profile, toggle settings, enable/disable features, manage integrations/connections — navigating settings pages and filling forms.
   6. Web messaging and email management: send a message on Slack/Discord/Gmail web, archive/label/organize emails, mark as read, create filters, move to folders — clicking channels/threads, typing in message input, interacting with email list controls.
-  7. Search with filters/refinement: advanced search using filter UIs, dropdowns, date pickers, price ranges, checkboxes (e.g. "filter flights with 1 stop under $500", "filter products by price and color") — NOT simple search.
+  7. Search with filters/refinement: advanced search using filter UIs, dropdowns, date pickers, price ranges, checkboxes (e.g. "filter flights with 1 stop under $500", "filter products by price and color") — NOT simple search. Simple search ("search X for Y", "look up X on Y", "find X on Y", "go to X and search for Y") is NOT DOM-requiring — typing a query and reading results is achievable via web.crawl or web.agent.
   8. File management on web drives: upload/download/organize/rename/move/delete/share files on Google Drive, Dropbox, iCloud, OneDrive web — interacting with file list UIs, context menus, share dialogs.
   9. Project management and code review: move cards/tasks between columns, assign tasks, set due dates, add comments to cards on Trello/Asana/Jira/Monday, review/approve/merge PRs, close/reopen issues, assign labels on GitHub/GitLab — interacting with board UIs, PR review interfaces.
   10. Publishing and scheduling: publish/unpublish/schedule blog posts, tweets, social media content, landing pages — clicking publish/schedule buttons, setting publication dates/times.
@@ -218,7 +223,7 @@ const { parseLlmJson } = require('./parseLlmJson');
  * @param {object} logger
  * @returns {Promise<object>} classification object (always resolves, never throws)
  */
-async function classifyTask(userMessage, conversationHistory, llmBackend, logger, priorScreenSummary) {
+async function classifyTask(userMessage, conversationHistory, llmBackend, logger, priorScreenSummary, activeAppContext) {
   const _default = {
     taskType: 'ambiguous',
     isFollowUp: false,
@@ -236,6 +241,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     isConversationRecall: false,
     isActivityQuery: false,
     webAccessMode: 'none',
+    interactiveActions: [],
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -264,7 +270,20 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       .join('\n');
 
     const screenBlock = priorScreenSummary ? `\n\n${priorScreenSummary}` : '';
-    const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}${screenBlock}\n\nCURRENT USER MESSAGE: "${userMessage}"`;
+    // Active app context — the live open app + file path. The classifier uses
+    // this to resolve deictic references ("this file", "it") to the actual open
+    // file instead of a stale followUpTarget from conversation history.
+    let activeAppBlock = '';
+    if (activeAppContext && typeof activeAppContext === 'object') {
+      const parts = [];
+      if (activeAppContext.appName)     parts.push(`App: ${activeAppContext.appName}`);
+      if (activeAppContext.windowTitle)  parts.push(`Window: "${activeAppContext.windowTitle}"`);
+      if (activeAppContext.filePath)     parts.push(`File: ${activeAppContext.filePath}`);
+      if (parts.length > 0) {
+        activeAppBlock = `\n\nACTIVE APP CONTEXT (live): ${parts.join(', ')}`;
+      }
+    }
+    const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}${screenBlock}${activeAppBlock}\n\nCURRENT USER MESSAGE: "${userMessage}"`;
 
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
@@ -306,6 +325,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isConversationRecall: !!parsed.isConversationRecall,
       isActivityQuery:     !!parsed.isActivityQuery,
       webAccessMode,
+      interactiveActions:  Array.isArray(parsed.interactiveActions) ? parsed.interactiveActions : [],
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

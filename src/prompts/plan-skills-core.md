@@ -63,6 +63,90 @@ If no authenticated route exists for a service, preflight will surface auth requ
 - App's built-in AI assistant → `app.agent { action: 'run_agent', appName, filePath, prompt }`
 - Watch/transcribe a specific video → `video.agent` (always wins over ytdlp.agent)
 
+## ACTIVE SCREEN CONTEXT — authoritative app + file awareness
+
+The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or most recent non-overlay) app and its open document. This is the **authoritative source of truth** for high-level app-control and file-reference prompts — NEVER query the frontmost app via osascript yourself (ThinkDrop's overlay is frontmost when the user types, so you'd resolve ThinkDrop itself).
+
+**Fields:**
+- `App: <appName>` — the active or most recent non-overlay app (e.g. `Preview`, `TextEdit`, `Visual Studio Code`)
+- `Category: <category>` — `browser`/`editor`/`chat`/`design`/`terminal`/`email`/`document`/`other`
+- `Window: "<title>"` — the window title
+- `URL: <url>` — for browser tabs
+- `File: <path>` — the open document's absolute path (when available; absent for unsaved/browsers/non-document apps)
+- Source marker: `live` = current active app; `history` = previous non-overlay app (ThinkDrop/voice-companion was frontmost); `db-seed` = cold-start fallback
+
+**When `File:` is present**, it is the authoritative open document path — use it directly. Do NOT re-query the app or guess.
+
+### App-control verb routing (exhaustive — four tiers)
+
+Route app-control verbs by what they need. **Prefer `shell.run` (osascript/open/lp) for deterministic operations** — it avoids app.agent's shortcut-key detection, OCR verification, and focus-race issues.
+
+**Tier 1 — `shell.run` (osascript/open/lp/killall/sed/python): deterministic, no focus/OCR/LLM needed**
+
+| Verb | shell.run command |
+|---|---|
+| close / quit / exit this app | `osascript -e 'tell application "X" to quit'` |
+| force quit | `killall "X"` |
+| minimize this app | `osascript -e 'tell application "System Events" to set miniaturized of every window of process "X" to true'` |
+| hide this app | `osascript -e 'tell application "System Events" to set visible of process "X" to false'` |
+| open / launch an app | `open -a "X"` or `open -a "X" "<file>"` |
+| print the file that's open | `lp "<File>"` (use `File:` from ACTIVE SCREEN CONTEXT) |
+| volume up/down/mute/unmute | `osascript -e 'set volume output volume X'` / `osascript -e 'set volume output muted true'` |
+| bring to front / activate / focus | `osascript -e 'tell application "X" to activate'` |
+| new window | `open -n -a "X"` |
+| fullscreen (toggle) | `osascript` app-specific OR `app.agent` shortcut (shell preferred when script known) |
+| relaunch | `killall "X" && open -a "X"` |
+| **Simple string/pattern edit** (replace X with Y, delete lines, append) | `sed -i` or `python3 -c "..."` — deterministic, no LLM needed |
+| **JSON mutation** | `python3 -c 'import json; ...'` |
+| **CSV/Excel processing** | Python temp script |
+
+**Tier 2 — `edit.agent` (file I/O + LLM edit): semantic/structural edits, no shortcuts/OCR/focus**
+
+| Verb | Why edit.agent |
+|---|---|
+| **Semantic edit** (refactor, add section, fix bug, rephrase) | needs LLM understanding of intent — sed can't do this |
+| **Structural edit** (reorganize sections, change format) | needs understanding of document structure |
+
+**Tier 3 — `app.agent` (shortcuts + OCR): in-app interactions, needs focus**
+
+| Verb | Why app.agent |
+|---|---|
+| undo / redo / cut / copy / paste / select all / delete | needs focus + selection context |
+| find / find and replace | needs focus + text field |
+| toggle sidebar / dark mode / toolbar | app-specific shortcuts, needs focus |
+| tab nav (new/close/next/previous) | Cmd+T/Cmd+W need focus |
+| zoom in / zoom out | app-specific shortcuts |
+| media (play/pause/next/previous/ff/rewind) | needs focus or media keys |
+| app AI (ask AI / regenerate / new chat) | app-specific shortcuts (Cmd+L, Cmd+R) |
+| scroll / read content | OCR-based visual context |
+| search and click | OCR + click |
+
+**Tier 4 — `app.agent` run_agent: in-app AI editing (the app owns the file + its AI)**
+
+| Verb | Why run_agent |
+|---|---|
+| **In-app edit** (use VS Code's/TextEdit's own AI to edit) | the app owns the file and its save action |
+
+**Routing rule:** `shell.run` first for deterministic operations (window management, system-level, file ops, simple string edits); `edit.agent` for semantic/structural file edits (needs LLM); `app.agent` for in-app interactions (needs focus + shortcuts); `app.agent` run_agent for in-app AI editing.
+
+### App-usage and history prompts
+
+| Prompt | Endpoint | Notes |
+|---|---|---|
+| "How long I've been in X" / "time spent in X" | `getAppUsageSummary` | per-app durations from switch timestamps (approximate) |
+| "List apps I used today" / "app timeline" / "switch history" | `getAppHistory` | sequential timeline |
+| "What app am I using now" / "what's open" | `getActiveAppContext` (already in ACTIVE SCREEN CONTEXT) | use the `App:` field directly |
+| "What app was I using before" / "previous app" | `getActiveAppContext` (history source) | the `history` source marker indicates fallback |
+
+### "The file that's open" / "print the file" / "the current document"
+
+Use `File:` from ACTIVE SCREEN CONTEXT directly. NEVER query the frontmost app via osascript — the active app + open file are already resolved.
+
+- If `File:` is present → `shell.run { cmd: "lp", argv: ["<File>"] }` for print, or `shell.run` / `edit.agent` / `app.agent` depending on the verb.
+- If `File:` is absent → `app.agent { action: 'run_app_flow', appName, goal }` for a named desktop app, or ask the user.
+- **Multiple file matches:** if `mdfind` returns multiple paths for a filename, do NOT guess — emit an `ask_user` step: "I found multiple files named '<filename>'. Which one?" with the paths as options.
+- **Unsaved/Untitled docs:** if `File:` is absent and the app is a document editor, emit an `ask_user` step: "The file appears to be unsaved. You need to save it before I can print it. Please save the file and try again." (actionable, not just an error).
+
 **FORBIDDEN:** Never use `shell.run curl` for *authenticated* external API services (OAuth, api_key, bearer) — use `browser.agent` or `cli.agent`. curl IS allowed and preferred for public file downloads and public page fetches.
 
 **`synthesize` ordering (core):**
