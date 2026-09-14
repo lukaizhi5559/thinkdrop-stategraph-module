@@ -205,6 +205,12 @@ class ThinkDropLLMBackend extends LLMBackend {
       : _taskType === 'heavy' ? 90_000
       : this.responseTimeoutMs; // light/planning — keep default 60s
 
+    // Capture per-request handlers as named functions so they can be removed
+    // in the finally block below. Without this, every generateAnswer() call
+    // leaks an `error` and `close` listener on the pooled WebSocket → after ~10
+    // requests Node emits MaxListenersExceededWarning and event dispatch slows.
+    let onMessage, onErr, onClose;
+
     try {
       await new Promise((resolve, reject) => {
         let activeTimeout = setTimeout(() => {
@@ -222,7 +228,7 @@ class ThinkDropLLMBackend extends LLMBackend {
           }, _dynamicTimeoutMs);
         };
 
-        ws.on('message', (data) => {
+        onMessage = (data) => {
           try {
             const msg = JSON.parse(data.toString());
 
@@ -269,15 +275,15 @@ class ThinkDropLLMBackend extends LLMBackend {
           } catch (e) {
             // ignore parse errors on individual messages
           }
-        });
+        };
 
-        ws.on('error', (err) => {
+        onErr = (err) => {
           clearTimeout(activeTimeout);
           _errored = true;
           reject(err);
-        });
+        };
 
-        ws.on('close', () => {
+        onClose = () => {
           clearTimeout(activeTimeout);
           if (!streamStarted) {
             _errored = true;
@@ -285,10 +291,21 @@ class ThinkDropLLMBackend extends LLMBackend {
           } else {
             resolve();
           }
-        });
+        };
+
+        ws.on('message', onMessage);
+        ws.on('error', onErr);
+        ws.on('close', onClose);
       });
     } finally {
-      // Release the connection back to the pool (or close if temporary/errored)
+      // Remove THIS request's listeners before releasing the connection back
+      // to the pool. The pool-level error/close handlers (added in _acquireWs)
+      // remain intact; only the per-request ones are cleaned up here.
+      try {
+        if (onMessage) ws.removeListener('message', onMessage);
+        if (onErr) ws.removeListener('error', onErr);
+        if (onClose) ws.removeListener('close', onClose);
+      } catch (_) {}
       this._releaseWs(ws, _errored);
     }
 

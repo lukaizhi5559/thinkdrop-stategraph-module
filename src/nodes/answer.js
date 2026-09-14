@@ -539,7 +539,8 @@ module.exports = async function answer(state) {
     options: {
       maxTokens: 500,
       temperature: 0.1,
-      fastMode: filteredMemories.length === 0 && contextDocs.length === 0 && conversationHistory.length <= 2
+      fastMode: filteredMemories.length === 0 && contextDocs.length === 0 && conversationHistory.length <= 2,
+      taskType: 'conversational'  // Route to conversational chain — non-reasoning models (avoids reasoning leakage)
     }
   };
 
