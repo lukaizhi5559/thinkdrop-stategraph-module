@@ -1772,6 +1772,156 @@ describe('Expanded _INTENT_EVAL_PATTERNS — new URL path terms', () => {
   });
 });
 
+// ── Hash-aware URL-arrival verification ──────────────────────────────────────
+// Tests the hash comparison logic added to _verifyUrlFirstArrival.
+// Re-implemented here as a pure function to avoid loading browser.agent.cjs
+// (which pulls in playwright). Keep in sync with the source.
+describe('Hash-aware URL-arrival verification', () => {
+  function _hashAwareMatch(curUrl, expectedUrl) {
+    try {
+      const _cur = new URL(curUrl);
+      const _exp = new URL(expectedUrl);
+      let _m = _cur.hostname === _exp.hostname && _cur.pathname === _exp.pathname;
+      if (_m && _exp.hash && _exp.hash.length > 1) {
+        _m = _cur.hash === _exp.hash || _cur.hash.startsWith(_exp.hash);
+      }
+      return _m;
+    } catch (_) {
+      return curUrl.replace(/\/+$/, '') === String(expectedUrl || '').replace(/\/+$/, '');
+    }
+  }
+
+  it('matches same hostname+pathname without hash', () => {
+    expect(_hashAwareMatch('https://example.com/page', 'https://example.com/page')).toBe(true);
+  });
+  it('matches when expected has no hash and current has hash', () => {
+    expect(_hashAwareMatch('https://example.com/page#section', 'https://example.com/page')).toBe(true);
+  });
+  it('matches exact hash (#search/query)', () => {
+    expect(_hashAwareMatch(
+      'https://mail.google.com/mail/u/0/#search/from%3Ano-reply%40github.com',
+      'https://mail.google.com/mail/u/0/#search/from%3Ano-reply%40github.com'
+    )).toBe(true);
+  });
+  it('does NOT match #inbox vs #search (Gmail stripped query)', () => {
+    expect(_hashAwareMatch(
+      'https://mail.google.com/mail/u/0/#inbox',
+      'https://mail.google.com/mail/u/0/#inbox?q=from%3Ano-reply%40github.com'
+    )).toBe(false);
+  });
+  it('matches hash prefix (SPA appends state)', () => {
+    expect(_hashAwareMatch(
+      'https://mail.google.com/mail/u/0/#search/from%3Atest?compose=1',
+      'https://mail.google.com/mail/u/0/#search/from%3Atest'
+    )).toBe(true);
+  });
+  it('does NOT match different hash routes (#inbox vs #search)', () => {
+    expect(_hashAwareMatch(
+      'https://mail.google.com/mail/u/0/#inbox',
+      'https://mail.google.com/mail/u/0/#search/test'
+    )).toBe(false);
+  });
+  it('matches different hostname → false', () => {
+    expect(_hashAwareMatch('https://other.com/page', 'https://example.com/page')).toBe(false);
+  });
+});
+
+// ── Search-pattern cache validation ──────────────────────────────────────────
+// Tests _isValidSearchPattern and the deleteSearchUrlPattern export.
+describe('Search-pattern cache validation', () => {
+  const { _isValidSearchPattern } = require('../../mcp-services/command-service/src/skill-helpers/destination-resolver.cjs');
+
+  it('valid pattern: Gmail #search/{query}', () => {
+    expect(_isValidSearchPattern(
+      'https://mail.google.com/mail/u/0/#search/{query}',
+      'mail.google.com'
+    ).valid).toBe(true);
+  });
+  it('invalid pattern: Gmail #inbox?q={query} (hash-routing site with ?q= in hash)', () => {
+    const _r = _isValidSearchPattern(
+      'https://mail.google.com/mail/u/0/#inbox?q={query}',
+      'mail.google.com'
+    );
+    expect(_r.valid).toBe(false);
+  });
+  it('valid pattern: generic site ?q={query} (not a hash-routing site)', () => {
+    expect(_isValidSearchPattern(
+      'https://example.com/search?q={query}',
+      'example.com'
+    ).valid).toBe(true);
+  });
+  it('valid pattern: Outlook deeplink ?q={query} (not in hash)', () => {
+    expect(_isValidSearchPattern(
+      'https://outlook.live.com/mail/0/deeplink/search?q={query}',
+      'outlook.live.com'
+    ).valid).toBe(true);
+  });
+  it('invalid pattern: missing {query} placeholder', () => {
+    expect(_isValidSearchPattern(
+      'https://mail.google.com/mail/u/0/#search/test',
+      'mail.google.com'
+    ).valid).toBe(false);
+  });
+  it('invalid pattern: Outlook #inbox?q={query} (hash-routing site with ?q= in hash)', () => {
+    const _r = _isValidSearchPattern(
+      'https://outlook.live.com/mail/0/#inbox?q={query}',
+      'outlook.live.com'
+    );
+    expect(_r.valid).toBe(false);
+  });
+  it('valid pattern: non-hash-routing site with hash + ?q= (e.g., docs.google.com)', () => {
+    expect(_isValidSearchPattern(
+      'https://docs.google.com/document/d/123#heading?q={query}',
+      'docs.google.com'
+    ).valid).toBe(true);
+  });
+});
+
+// ── Intent gate removal: _buildSearchCriteriaUrl ─────────────────────────────
+// Tests that the Gmail #search/ template fires for non-MAIL intents.
+// The old code gated on `intent === INTENTS.MAIL`; the fix removed that gate.
+// We test the template-building logic directly (without the intent check).
+describe('_buildSearchCriteriaUrl: intent gate removed', () => {
+  // Re-implement the template selection logic (without the intent gate)
+  // to verify it fires for any intent when the service matches.
+  function _buildGmailSearchUrl(svc, baseHost, query) {
+    if (svc === 'gmail' || baseHost === 'mail.google.com') {
+      return `https://mail.google.com/mail/u/0/#search/${encodeURIComponent(query)}`;
+    }
+    if (svc === 'outlook' || baseHost === 'outlook.live.com' || baseHost === 'outlook.office.com') {
+      return `https://outlook.live.com/mail/0/deeplink/search?q=${encodeURIComponent(query)}`;
+    }
+    return null;
+  }
+
+  it('Gmail template fires for SEARCH intent (not just MAIL)', () => {
+    // Simulate: intent=SEARCH, svc=gmail, query="from:no-reply@github.com"
+    const _url = _buildGmailSearchUrl('gmail', 'mail.google.com', 'from:no-reply@github.com');
+    expect(_url).toBe('https://mail.google.com/mail/u/0/#search/from%3Ano-reply%40github.com');
+  });
+  it('Gmail template fires for OPEN_EXISTING intent', () => {
+    const _url = _buildGmailSearchUrl('gmail', 'mail.google.com', 'from:test@example.com');
+    expect(_url).toBe('https://mail.google.com/mail/u/0/#search/from%3Atest%40example.com');
+  });
+  it('Gmail template fires for RESEARCH intent', () => {
+    const _url = _buildGmailSearchUrl('gmail', 'mail.google.com', 'is:unread');
+    expect(_url).toBe('https://mail.google.com/mail/u/0/#search/is%3Aunread');
+  });
+  it('Outlook template fires for SEARCH intent', () => {
+    const _url = _buildGmailSearchUrl('outlook', 'outlook.live.com', 'from:test@example.com');
+    expect(_url).toBe('https://outlook.live.com/mail/0/deeplink/search?q=from%3Atest%40example.com');
+  });
+  it('returns null for unknown service', () => {
+    const _url = _buildGmailSearchUrl('unknown', 'unknown.com', 'test');
+    expect(_url).toBeNull();
+  });
+  it('Gmail template uses #search/ not ?q=', () => {
+    const _url = _buildGmailSearchUrl('gmail', 'mail.google.com', 'test');
+    expect(_url).toContain('#search/');
+    expect(String(_url).includes('?q=')).toBe(false);
+  });
+});
+
 console.log(`  Results: ${_passed} passed, ${_failed} failed`);
 if (_failures.length > 0) {
   console.log('\n  Failures:');

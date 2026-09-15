@@ -144,22 +144,63 @@ module.exports = async function resolveReferencesV2(state) {
     }
 
     if (sessionId) {
-      const histResult = await mcpAdapter.callService('conversation', 'message.list', {
-        sessionId,
-        limit: 20,
-        direction: 'DESC',
-      });
+      // Fetch in parallel: recent window (handles coreferences like "that"/"it")
+      // + cross-session semantic matches (finds older relevant messages buried
+      // under recent unrelated ones, including from rotated sessions).
+      const [histResult, searchResult] = await Promise.all([
+        mcpAdapter.callService('conversation', 'message.list', {
+          sessionId,
+          limit: 20,
+          direction: 'DESC',
+        }),
+        mcpAdapter.callService('conversation', 'message.search', {
+          sessionId,
+          query: message,
+          limit: 15,
+          includeRecent: 0, // recent messages are already covered by message.list
+          minSimilarity: 0.3,
+          searchAllSessions: true,
+        }).catch(() => null), // best-effort — semantic search is non-blocking
+      ]);
+
+      // Recent window (handles coreferences: "that", "it", "yes do it")
       const histData = histResult.data || histResult;
-      conversationHistory = (histData.messages || [])
+      const recentMessages = (histData.messages || [])
         .filter(msg => msg.sender !== 'system')
         .map(msg => ({
-          role:      msg.sender === 'user' ? 'user' : 'assistant',
-          content:   stripHtml(msg.text || msg.content || ''),
+          id: msg.id,
+          role: msg.sender === 'user' ? 'user' : 'assistant',
+          content: stripHtml(msg.text || msg.content || ''),
           timestamp: msg.timestamp,
+          source: 'recent',
         }))
         .reverse();
 
-      logger.debug(`[Node:ResolveReferencesV2] Fetched ${conversationHistory.length} messages for context window`);
+      // Semantic matches (older relevant messages from any session)
+      let semanticMessages = [];
+      if (searchResult) {
+        const searchData = searchResult.data || searchResult;
+        semanticMessages = (searchData.messages || [])
+          .filter(msg => msg.sender !== 'system')
+          .map(msg => ({
+            id: msg.id,
+            role: msg.sender === 'user' ? 'user' : 'assistant',
+            content: stripHtml(msg.text || msg.content || ''),
+            timestamp: msg.timestamp,
+            source: 'semantic',
+            sessionTitle: msg.sessionTitle,
+          }));
+      }
+
+      // Merge: deduplicate by message ID, recent first then semantic
+      const seenIds = new Set();
+      conversationHistory = [...recentMessages, ...semanticMessages].filter(msg => {
+        if (msg.id && seenIds.has(msg.id)) return false;
+        if (msg.id) seenIds.add(msg.id);
+        return true;
+      });
+
+      logger.debug(`[Node:ResolveReferencesV2] Context: ${recentMessages.length} recent + ${semanticMessages.length} semantic = ${conversationHistory.length} total`);
     }
   } catch (err) {
     logger.debug('[Node:ResolveReferencesV2] Could not fetch history, proceeding without:', err.message);
@@ -233,6 +274,15 @@ module.exports = async function resolveReferencesV2(state) {
   // LLM classification call is unnecessary. planExecutor/planSkills don't need it.
   // Pass _activeAppContext so the classifier can resolve "this file" → the live
   // open file path instead of a stale followUpTarget from conversation history.
+  //
+  // GATE: Only inject active app context when the message explicitly references a
+  // file/code artifact. The classifier's "ACTIVE APP CONTEXT PRIORITY" rule resolves
+  // ANY deictic reference ("it", "this", "that") to the IDE's open file — even when
+  // "it" refers to a conversational subject (a folder, a result, a topic). This caused
+  // task_1d44cd52 to resolve followUpTarget to skillThinking.js (the IDE's open file)
+  // instead of the basement project context. Generic deictics alone are insufficient.
+  const _FILE_REF_RE = /\b(?:this|that|the|open|current|active)\s+(?:file|script|code|function|class|method|component|module)\b|\b(?:this|that|the)\s+\w+\.(?:ts|js|tsx|jsx|py|cjs|mjs|md|json|sh|bash)\b|\b(?:open|current|active)\s+(?:file|tab|editor|buffer)\b/i;
+  const _hasFileRef = _FILE_REF_RE.test(message || '');
   let _taskClassification;
   if (state._planFile) {
     // Plan execution: skip the expensive LLM classification, but preserve the
@@ -254,7 +304,7 @@ module.exports = async function resolveReferencesV2(state) {
       state.llmBackend || null,
       logger,
       priorScreenSummary,
-      _activeAppContext,
+      _hasFileRef ? _activeAppContext : null,
     );
   }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);

@@ -298,7 +298,7 @@ async function _thinPostFailureHandler(state) {
   return {
     ...state,
     recoveryAction: 'ask_user',
-    pendingQuestion: { question: `Step "${failedStep.skill}" failed: ${failedStep.error}. Would you like to retry or skip?`, options: ['Retry', 'Skip this step'] },
+    pendingQuestion: { question: `Step "${failedStep.skill}" failed: ${failedStep.error}. Would you like to retry, skip, or cancel?`, options: ['Retry', 'Skip this step', 'Cancel'] },
     commandExecuted: false,
   };
 }
@@ -3030,10 +3030,14 @@ module.exports = async function executeCommand(state) {
     // Cross-turn is ONLY valid when zero action steps ran this turn (genuine follow-up prompt).
     // Meta-skills (synthesize, ask_user, schedule, needs_skill, api_suggest) are excluded from this
     // check — they don't represent real work on a new task.
+    // NOTE: A skipped or failed action step (ok=false, skipped=true) STILL counts as "work attempted
+    // this turn" — without this, a skipped shell.run step causes the cross-turn fallback to fire and
+    // pull unrelated prior-task content (observed in task_94e38046: Gmail/Copilot content leaked into
+    // the basement task's synthesis after the shell.run step was skipped, producing a false success).
     const conversationHistory = state.conversationHistory || [];
     const META_SKILLS = new Set(['synthesize', 'ask_user', 'schedule', 'needs_skill', 'api_suggest']);
     const hasActionStepsThisTurn = skillResults.some(r =>
-      r.ok && !r.skipped && r.step > lastSynthesizeStep && !META_SKILLS.has(r.skill)
+      r.step > lastSynthesizeStep && !META_SKILLS.has(r.skill)
     );
     let crossTurnContext = '';
     if (allContextParts.length === 0 && !hasActionStepsThisTurn && conversationHistory.length > 0) {
