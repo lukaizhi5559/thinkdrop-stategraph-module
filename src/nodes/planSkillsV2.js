@@ -533,6 +533,13 @@ function _buildSystemPrompt(userMessage, state) {
     if (_needsBrowser) appendices.push('plan-skills-browser.md');
   }
 
+  // Public web fetch appendix is mandatory for public_read/download tasks even
+  // when local signals skip the other appendices. Without it the planner may
+  // fall back to browser.agent examples in the base prompt.
+  if (_needsWebFetch && !appendices.includes('plan-skills-webfetch.md')) {
+    appendices.push('plan-skills-webfetch.md');
+  }
+
   // Always include the scheduling appendix for scheduling tasks. The user may
   // have confirmed a notification method via grilledConstraints, which makes
   // _hasLocalSignals true and skips the domain appendix block above. But the
@@ -600,6 +607,56 @@ function _buildSystemPrompt(userMessage, state) {
   const _isPublicWebMode = ['download', 'public_read'].includes(_tc?.webAccessMode);
   if (!_isPublicWebMode) {
   result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser.agent steps)\n\nFor every \`browser.agent\` step, you MUST include a \`stepType\` field with one of these values:\n\n- \`"navigate"\` — step that opens a URL, searches, or goes to a page (e.g., "Search Amazon for X", "Go to YouTube", "Open Gmail")\n- \`"on-page-action"\` — step that clicks/types/selects on the CURRENT page (e.g., "Click the first result, then click Add to Cart", "Fill in the form and submit")\n- \`"verify"\` — step that confirms a result without further interaction (e.g., "Confirm item added to cart", "Check if the email was sent")\n- \`"extract"\` — step that reads/extracts content (e.g., "Read the search results", "Get the email count")\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT classify it as \`"navigate"\` just because it contains the word "search".\n\nExample: [\n  { "skill": "browser.agent", "stepType": "navigate", "args": { "action": "run", "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "browser.agent", "stepType": "on-page-action", "args": { "action": "run", "agentId": "amazon.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "synthesize", "stepType": "verify", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
+
+    // ── Commerce routing note ──────────────────────────────────────────────
+    // For Amazon/eBay/Etsy add-to-cart, checkout, filter, or sort tasks,
+    // browser.agent internally routes to playwright.agent (Turn-Loop) instead
+    // of Tab-Map. Tab-Map is unreliable on dense product grids — Turn-Loop can
+    // target elements by CSS selector and clickByText instead of scanning focus
+    // order. The planner should still emit browser.agent steps (the planner
+    // doesn't need to know about the internal routing), but should keep
+    // on-page-action steps atomic (one mutation per step) so Turn-Loop can
+    // verify each action before proceeding.
+    const _isCommerceMutation = _tc?.webAccessMode === 'interactive'
+      && Array.isArray(_tc?.interactiveActions)
+      && _tc.interactiveActions.some(a => ['add_to_cart', 'checkout', 'place_order', 'filter_ui', 'sort_ui'].includes(a));
+    if (_isCommerceMutation) {
+      result += `\n\n## COMMERCE MUTATION ROUTING\n\nThis task involves a commerce mutation (add-to-cart, checkout, filter, sort) on a dense product site. The browser.agent will automatically route to playwright.agent (Turn-Loop) instead of Tab-Map for these steps — you do NOT need to change the skill name. Keep each on-page-action step atomic (one mutation per step, e.g., "click Add to Cart" as one step, then "verify item added" as the next) so Turn-Loop can verify each action before proceeding.`;
+      console.info(`[Node:PlanSkillsV2] Injecting commerce mutation routing note (interactiveActions=${_tc.interactiveActions.join(',')})`);
+    }
+
+    // ── Generalized postcondition contracts for all state-changing interactions ──
+    // For any interactive mutation (add_to_cart, submit, post, save, create,
+    // move, delete, send, reply, comment), inject a postcondition note so the
+    // planner generates goals that:
+    //   1. State the intended mutation explicitly.
+    //   2. Specify cardinality (exactly one, unless "all"/"every").
+    //   3. Tell the agent NOT to repeat the action once the postcondition is met.
+    // The authoritative verification is done by _verifyPostcondition in
+    // playwright.agent.cjs (state-delta check), not by this text — but the text
+    // guides the LLM planner and the Turn-Loop LLM to phrase goals correctly.
+    const _mutationPostconditions = {
+      add_to_cart: 'the item appears in the cart and the cart count/subtotal increased by exactly 1',
+      checkout: 'the page navigates to the checkout flow or a checkout confirmation appears',
+      place_order: 'an order confirmation appears or the page navigates to an order-confirmation page',
+      submit: 'the submitted form/application is confirmed (form cleared, confirmation message, or navigation to a confirmation page)',
+      post: 'the post/message/status appears in the feed or the composer closed',
+      save: 'a save confirmation appeared or the saved item is in the destination (saved items, bookmarks, favorites)',
+      create: 'the new item exists in the destination container (playlist, document list, folder, etc.) or the page navigated to the new item',
+      move: 'the item is in the destination and gone from the source',
+      delete: 'the item is no longer present in the source (list count decreased or item disappeared)',
+      send: 'the message appears in the sent/destination thread or the composer cleared',
+      reply: 'the reply appears in the conversation thread',
+      comment: 'the comment appears in the comments section',
+    };
+    if (_tc?.webAccessMode === 'interactive' && Array.isArray(_tc?.interactiveActions)) {
+      const _mutationActions = _tc.interactiveActions.filter(a => _mutationPostconditions[a]);
+      if (_mutationActions.length > 0) {
+        const _postLines = _mutationActions.map(a => `- ${a}: verify ${_mutationPostconditions[a]}`).join('\n');
+        result += `\n\n## POSTCONDITION CONTRACTS (mandatory verification)\n\nEach step that performs a state-changing interaction MUST include a postcondition. The Turn-Loop will verify the postcondition via pre/post state-delta before accepting completion. Do NOT repeat the action if the postcondition is already met.\n\nPostconditions for this task:\n${_postLines}\n\nCRITICAL: For singular actions (add one item, send one message, post one update), use "exactly one" in the goal phrasing. The Turn-Loop will stop after the first successful mutation — do NOT click additional matching elements once the postcondition is met.`;
+        console.info(`[Node:PlanSkillsV2] Injecting postcondition contracts (actions=${_mutationActions.join(',')})`);
+      }
+    }
   }
 
   const _skipReason = _skipAppendices ? ' (appendices skipped: tier1_simple)' : _hasLocalSignals ? ' (appendices skipped: local_signals)' : state.recoveryContext ? ' (appendices skipped: recovery)' : '';
@@ -732,6 +789,31 @@ When a task requires installing a tool or generating a document on macOS, score 
 - sudo installer and sudo softwareupdate are allowed when necessary
 
 **When multiple tiers can accomplish the task:** always go T1 → T2, document WHY in a synthesize step if you use T3+.`;
+  }
+
+  // ── Public web mode hard guard ──────────────────────────────────────────
+  // Some base prompts and agent-selection paths leak browser.agent examples.
+  // For public_read/download tasks, forbid any browser/agent step and force the
+  // web.agent + web.crawl path. This is a final guard, not a suggestion.
+  const _publicWebGuard = ['download', 'public_read'].includes(_tc?.webAccessMode);
+  if (_publicWebGuard) {
+    result += `\n\n## CRITICAL: PUBLIC WEB MODE — BROWSER SKILLS FORBIDDEN
+
+This task is classified as **${_tc.webAccessMode}**. It requires NO login, NO session, and NO DOM interaction. You MUST use ONLY <code>web.agent</code>, <code>web.crawl</code>, <code>shell.run</code> (for curl), and <code>synthesize</code>. 
+
+**FORBIDDEN:** 
+- <code>browser.agent</code> 
+- <code>browser.act</code> 
+- <code>playwright.agent</code> 
+- <code>app.agent</code> 
+- Any service-specific agent like <code>etsy.agent</code> or <code>amazon.agent</code> 
+
+**Correct sequence for site search + extract:** 
+1. <code>web.agent</code> with <code>action: "site_search"</code> and <code>domain</code> + <code>query</code> 
+2. <code>web.crawl</code> with <code>url: "{{bestUrl}}"</code>, <code>extractItems: true</code>, and optional <code>fallbackUrls: "{{fallbackUrls}}"</code> 
+3. <code>synthesize</code> to summarize the extracted items 
+
+If the user asks to "click the first result", treat that as selecting the first extracted URL for a follow-up <code>web.crawl</code>, NOT a browser click.`;
   }
 
   // ── Multi-step data pipeline rules ──────────────────────────────────────
@@ -2121,38 +2203,67 @@ The user's request does NOT match any installed skill.
     if (!Array.isArray(skillPlan)) return { ...state, planError: `Cannot parse skill plan — no step array found` };
   }
 
-  // ── Post-parse backstop: rewrite browser.agent → web.agent for public modes ──
+  // ── Post-parse backstop: rewrite browser/playwright/app.agent → web for public modes ──
   // Even with the hard constraint, the LLM may still emit browser.agent due to
   // the overwhelming number of browser.agent examples in the base prompt. This
   // backstop catches those cases and rewrites them to the appropriate web.agent
   // action so the plan executes via the light path instead of Playwright.
   const _postWebMode = state._taskClassification?.webAccessMode;
   if (Array.isArray(skillPlan) && (_postWebMode === 'public_read' || _postWebMode === 'download')) {
+    const _forbiddenPublicSkills = new Set(['browser.agent', 'browser.act', 'playwright.agent', 'app.agent']);
+    const _publicWebListingSignals = /\b(?:search|find|look up|show|pics|pictures|images|listings|products|items|for sale|on sale|cheap|deals)\b/i;
     let _rewritten = 0;
-    skillPlan = skillPlan.map((step) => {
-      if (step.skill !== 'browser.agent') return step;
+    skillPlan = skillPlan.flatMap((step) => {
+      if (!_forbiddenPublicSkills.has(step.skill)) return [step];
       _rewritten++;
       const _taskText = step.args?.task || userMessage || '';
-      const _svc = step.args?.agentId?.replace(/\.agent$/, '') || '';
-      logger.warn(`[Node:PlanSkillsV2] Post-parse backstop: rewriting browser.agent → web.agent for ${_postWebMode} task (agentId=${step.args?.agentId || 'none'})`);
+      const _svc = step.args?.agentId?.replace(/\.agent$/, '') || step.args?.appName || '';
+      logger.warn(`[Node:PlanSkillsV2] Post-parse backstop: rewriting ${step.skill} → web.agent for ${_postWebMode} task (agentId=${step.args?.agentId || step.args?.appName || 'none'})`);
       if (_postWebMode === 'download') {
-        return {
+        return [{
           skill: 'web.agent',
           args: { action: 'find_download', query: _taskText },
           description: step.description || `Find download for: ${_taskText.slice(0, 80)}`,
-        };
+        }];
       }
       // public_read
-      return {
+      const _hasListingSignal = _publicWebListingSignals.test(_taskText) || _publicWebListingSignals.test(userMessage);
+      const _webAgentStep = {
         skill: 'web.agent',
         args: _svc
           ? { action: 'site_search', domain: _svc, query: _taskText }
           : { action: 'research_domain', query: _taskText },
         description: step.description || `Search the web for: ${_taskText.slice(0, 80)}`,
       };
+      const _crawlStep = {
+        skill: 'web.crawl',
+        args: {
+          url: '{{bestUrl}}',
+          fallbackUrls: '{{fallbackUrls}}',
+          maxChars: 12000,
+          extractItems: _hasListingSignal,
+          hidden: true,
+        },
+        description: `Fetch and extract ${_hasListingSignal ? 'listing cards' : 'content'} from the resolved URL`,
+      };
+      return [_webAgentStep, _crawlStep];
     });
     if (_rewritten > 0) {
-      logger.info(`[Node:PlanSkillsV2] Post-parse backstop: rewrote ${_rewritten} browser.agent step(s) → web.agent (webAccessMode=${_postWebMode})`);
+      logger.info(`[Node:PlanSkillsV2] Post-parse backstop: rewrote ${_rewritten} forbidden step(s) → web.agent + web.crawl (webAccessMode=${_postWebMode})`);
+    }
+
+    // Also inject hidden:true into any pre-existing web.crawl steps so the
+    // warm retry inside web.crawl is skipped and executeCommand's hidden
+    // fallback handles bot walls instead.
+    let _hiddenInjected = 0;
+    skillPlan = skillPlan.map((step) => {
+      if (step.skill !== 'web.crawl') return step;
+      if (step.args?.hidden === true) return step;
+      _hiddenInjected++;
+      return { ...step, args: { ...(step.args || {}), hidden: true } };
+    });
+    if (_hiddenInjected > 0) {
+      logger.info(`[Node:PlanSkillsV2] Injected hidden:true into ${_hiddenInjected} web.crawl step(s) for ${_postWebMode}`);
     }
   }
 

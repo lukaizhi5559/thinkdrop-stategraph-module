@@ -4840,7 +4840,7 @@ Please try again or search with different terms.`;
       const gsArgs = gs.args || {};
       const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
       const _callArgs = _isAgent
-        ? { ...gsArgs, _stepType: gs.stepType || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+        ? { ...gsArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
         : gsArgs;
       // Extended timeout for parallel browser steps to handle YouTube searches + Tab-Flow
       const stepTimeoutMs = gs.skill === 'browser.agent' ? 420000 : 300000; // 7 min for browser, 5 min for CLI
@@ -5055,7 +5055,7 @@ Please try again or search with different terms.`;
         const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
         const extraArgs = decision === 'try_without' ? { skipAuth: true } : {};
         const _callArgs = _isAgent
-          ? { ...gsArgs, ...extraArgs, _stepType: gs.stepType || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: r.idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+          ? { ...gsArgs, ...extraArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: r.idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
           : { ...gsArgs, ...extraArgs };
 
         logger.info(`[Node:ExecuteCommand] parallel login: re-dispatching ${svc?.agentId} (decision=${decision})`);
@@ -5304,7 +5304,7 @@ Please try again or search with different terms.`;
       : null;
 
     const _callArgs = _isAgentSkill
-      ? { ...resolvedArgs, _stepType: step.stepType || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, _emitThinking, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+      ? { ...resolvedArgs, _stepType: step.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, _emitThinking, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
       : _isShellRunStep
         ? { ...resolvedArgs, _progressCallback: (evt) => {
             if (!progressCallback) return;
@@ -5393,7 +5393,73 @@ Please try again or search with different terms.`;
       15000
     );
 
-    const raw = result.data || result;
+    let raw = result.data || result;
+
+    // ── Bot-blocked / empty-items fallback: when web.crawl is blocked OR
+    // extracts zero items from a search/listing URL and a registered
+    // authenticated browser.agent exists for the domain, retry extraction
+    // using that agent's persistent authenticated session. The agent's
+    // profile persists real cookies so the site serves real content instead
+    // of a bot wall. Generic — works for any bot-protected site with a
+    // registered browser agent (Amazon, eBay, etc.), not site-specific.
+    const _extractAttempted = Array.isArray(raw.items) && (raw.itemStats || resolvedArgs?.extractItems || resolvedArgs?.extractMedia);
+    const _zeroItems = _extractAttempted && raw.items.length === 0;
+    const _searchOrListingUrl = _siteSearch ? _siteSearch.isSearchResultsUrl(resolvedArgs?.url) : false;
+    const _shouldAuthFallback = skill === 'web.crawl' && resolvedArgs?.url && (raw?.botBlocked || (_zeroItems && _searchOrListingUrl));
+    if (_shouldAuthFallback) {
+      try {
+        const _crawlUrl = new URL(resolvedArgs.url);
+        const _host = _crawlUrl.hostname.replace(/^www\./, '');
+        const _svcKey = _host.split('.')[0].toLowerCase().replace(/[^a-z0-9_]/g, '');
+        const _candidateAgentId = `${_svcKey}.agent`;
+        // Check if this agent is registered as a browser agent
+        const _agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+        const _agents = _agRes?.data || _agRes || [];
+        const _matching = Array.isArray(_agents) ? _agents.find(a => a?.id === _candidateAgentId && a?.type === 'browser') : null;
+        if (_matching) {
+          const _reason = raw?.botBlocked ? 'bot-blocked' : '0 items on search/listing URL';
+          // For public_read/download tasks, run the fallback in a hidden 1x1
+          // offscreen window so bot-wall bypass still works but no Chrome
+          // window is visible to the user.
+          // Prefer the step's `hidden` arg (injected by planSkillsV2); fall back to
+          // taskClassification for legacy paths where the step may not carry it.
+          const _webMode = state._taskClassification?.webAccessMode;
+          const _hiddenFallback = !!resolvedArgs.hidden ||
+            _webMode === 'public_read' ||
+            _webMode === 'download';
+          logger.info(`[Node:ExecuteCommand] web.crawl ${_reason} — falling back to authenticated browser.agent extract_url for ${_candidateAgentId}${_hiddenFallback ? ' (hidden)' : ''}`);
+          const _fbRes = await mcpAdapter.callService('command', 'command.automate', {
+            skill: 'browser.agent',
+            args: { action: 'extract_url', agentId: _candidateAgentId, url: resolvedArgs.url, hidden: _hiddenFallback }
+          }, { timeoutMs: 120000, signal: state.abortSignal });
+          const _fbRaw = _fbRes?.data || _fbRes;
+          if (_fbRaw?.ok && Array.isArray(_fbRaw.items) && _fbRaw.items.length > 0) {
+            logger.info(`[Node:ExecuteCommand] authenticated fallback extracted ${_fbRaw.items.length} items`);
+            // Replace raw with the fallback result so the existing web.crawl
+            // result-processing block (line 6544+) builds stdout + items from it.
+            raw = {
+              ok: true,
+              url: resolvedArgs.url,
+              title: _fbRaw.title || '',
+              content: _fbRaw.content || '',
+              contentLength: (_fbRaw.content || '').length,
+              truncated: false,
+              items: _fbRaw.items,
+              itemStats: _fbRaw.stats || {},
+              botBlocked: false,
+              authenticatedFallback: true,
+            };
+          } else {
+            logger.warn(`[Node:ExecuteCommand] authenticated fallback failed: ${_fbRaw?.error || '0 items'}`);
+          }
+        } else {
+          const _reason = raw?.botBlocked ? 'bot-blocked' : '0 items on search/listing URL';
+          logger.info(`[Node:ExecuteCommand] web.crawl ${_reason} but no registered browser agent for ${_host} — no authenticated fallback available`);
+        }
+      } catch (_fbErr) {
+        logger.warn(`[Node:ExecuteCommand] authenticated fallback error: ${_fbErr.message}`);
+      }
+    }
 
     // ── Sub-agent turn visibility ─────────────────────────────────────────────
     // cli.agent { action: run, agentId } and browser.agent { action: run } both return
@@ -5820,6 +5886,9 @@ Please try again or search with different terms.`;
       instruction: raw.instruction || null,
       reason: raw.reason || null,
       verified: raw.verified !== undefined ? raw.verified : null,
+      goalVerified: raw.goalVerified === true ? true : (raw.goalVerified === false ? false : null),
+      postconditionVerified: raw.postconditionVerified === true ? true : null,
+      routingDecision: raw.routingDecision || null,
       reasoning: raw.reasoning || null,
       suggestion: raw.suggestion || null,
       output: raw.output || null,

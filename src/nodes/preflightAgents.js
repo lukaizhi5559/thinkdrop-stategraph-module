@@ -2496,6 +2496,9 @@ module.exports = async function preflightAgents(state) {
     }
 
     // Delegate to browser.agent resolve_deep_link
+    // Pass headed:false + hidden:true so ALL browser operations during deep-link
+    // resolution (navigate, evaluate, web.crawl fallback) are headless/hidden.
+    // This prevents the blank visible Chrome window that appeared during preflight.
     try {
       const res = await mcpAdapter.callService('command', 'command.automate', {
         skill: 'browser.agent',
@@ -2506,6 +2509,8 @@ module.exports = async function preflightAgents(state) {
           startUrl: a.startUrl,
           task,
           sessionId: (a.agentId || '').replace(/\.agent$/, '_agent'),
+          headed: false,
+          hidden: true,
         },
       }, { timeoutMs: 30000 }).catch(() => null);
       const result = res?.data || res;

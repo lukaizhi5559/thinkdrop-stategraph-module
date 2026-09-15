@@ -116,6 +116,7 @@ Field rules:
 
 - interactiveActions: list the specific interactive actions this prompt requires, or [] if none. Valid actions: login, oauth, add_to_cart, checkout, place_order, send_message, send_email, post, comment, like, share, follow, subscribe, retweet, react, vote, play_media, pause_media, skip_media, shuffle, repeat, fill_form, submit_form, upload, publish, delete, edit, create, update, deploy, merge_pr, approve_pr, assign_task, settings_change, filter_ui, sort_ui, date_picker, book_reservation. Set to [] when the task is simple search, browse, read, download, or lookup — those are NOT interactive actions. When webAccessMode is "interactive", this array MUST be non-empty (list the actions that make it interactive). When webAccessMode is "public_read", "download", or "none", this MUST be [].
   IMPORTANT: "for sale" / "on sale" / "cheap" / "deals" / "discount" are product DESCRIPTORS, not filter actions. Do NOT set filter_ui for these. filter_ui requires an EXPLICIT filter/refine request like "filter by price under $50", "sort by rating", "only show prime eligible", "narrow down to size medium". A prompt like "show pics of baby clothes for sale on amazon" has NO interactive actions — set interactiveActions to [].
+  IMPORTANT: "click the first result", "open the first product", "follow the first link", "select the first item", or similar phrasing is URL SELECTION for reading/extraction — NOT an interactive DOM action. When the overall goal is to search a site and then read/extract the first result, keep webAccessMode="public_read", requiresDOM=false, and interactiveActions=[]. Only mark it interactive if the user also wants to add-to-cart, checkout, filter, fill a form, or otherwise mutate state on that page.
 
 - isActivityQuery: true when the user asks about their RECENT ACTIVITY, WORK, SCREEN TIME, or CONTENT CONSUMPTION — i.e., queries that should be answered from episodic memory / screen captures / app usage, NOT from the chat transcript and NOT from personal profile data. Signals: "what have I been working on", "what was I working on today", "what did I do yesterday", "what did I watch", "what did I listen to", "what apps did I use", "what was on my screen", "what was I doing", "what have I been up to". When true, the memory retrieval node should use a broad activity query (NOT the raw prompt) and a low similarity threshold, and the answer node should focus on activity/screen/app memories — NOT surface personal profile data (email, phone, address) unless explicitly asked. false for: personal profile queries ("what is my email", "what is my name"), conversation-recall meta-questions (those are isConversationRecall), and non-memory tasks (web search, automation).
 
@@ -163,6 +164,15 @@ EXAMPLES (webAccessMode):
   User: "find a short bird chirp mp3 and save it to my desktop" → {"taskType":"browser","webAccessMode":"download"}
   User: "download a bird sound from freemusicarchive.org" → {"taskType":"browser","targetService":"freemusicarchive","webAccessMode":"download"}
   User: "goto amazon and look up cheap exercise equipment" → {"taskType":"browser","targetService":"amazon","webAccessMode":"public_read"}
+  User: "show pics of baby clothes for sale on amazon" → {"taskType":"browser","targetService":"amazon","isBrowseOnly":true,"requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
+  User: "show me pictures of vintage toys for sale on eBay" → {"taskType":"browser","targetService":"ebay","isBrowseOnly":true,"requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
+  User: "find images of cheap running shoes on amazon" → {"taskType":"browser","targetService":"amazon","isBrowseOnly":true,"requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
+  User: "show me baby clothes listings on walmart" → {"taskType":"browser","targetService":"walmart","isBrowseOnly":true,"requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
+  User: "add baby clothes to my amazon cart" → {"taskType":"browser","targetService":"amazon","requiresDOM":true,"webAccessMode":"interactive","interactiveActions":["add_to_cart"]}
+  User: "filter amazon results by price under $50" → {"taskType":"browser","targetService":"amazon","requiresDOM":true,"webAccessMode":"interactive","interactiveActions":["filter_ui"]}
+  User: "sort ebay results by lowest price" → {"taskType":"browser","targetService":"ebay","requiresDOM":true,"webAccessMode":"interactive","interactiveActions":["sort_ui"]}
+  User: "Open Etsy and search for 'wooden cross wall art' then click the first result" → {"taskType":"browser","targetService":"etsy","requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
+  User: "Search Amazon for baby clothes and open the first product" → {"taskType":"browser","targetService":"amazon","requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
   User: "look online for other pizzas that are good" → {"taskType":"browser","webAccessMode":"public_read"}
   User: "any new game systems out recently" → {"taskType":"query","webAccessMode":"public_read"}
   User: "what's the latest on the spacex launch" → {"taskType":"query","webAccessMode":"public_read"}
@@ -307,7 +317,23 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // 'interactive' since DOM-level work always needs a real browser session.
     const _VALID_WEB_MODES = new Set(['none', 'download', 'public_read', 'interactive']);
     let webAccessMode = _VALID_WEB_MODES.has(parsed.webAccessMode) ? parsed.webAccessMode : 'none';
-    const requiresDOM = !!parsed.requiresDOM;
+    let requiresDOM = !!parsed.requiresDOM;
+    const _interactiveActions = Array.isArray(parsed.interactiveActions) ? parsed.interactiveActions : [];
+
+    // ── Search-to-extract guard: "click/open the first result" is URL selection
+    // for public read, not a DOM interaction, unless the user also wants to
+    // mutate state (cart, checkout, filter, form fill, etc.).
+    const _firstResultPattern = /\b(?:click|open|follow|select|tap)\s+(?:the\s+)?(?:first|top|1st)\s+(?:result|product|item|link|listing|page)\b/i;
+    const _mutationActions = new Set(['add_to_cart', 'checkout', 'place_order', 'filter_ui', 'sort_ui', 'fill_form', 'submit_form', 'book_reservation', 'upload', 'publish', 'delete', 'edit', 'create', 'update', 'send_message', 'send_email', 'post', 'comment', 'like', 'share', 'follow', 'subscribe', 'retweet', 'react', 'vote', 'play_media', 'pause_media', 'skip_media', 'shuffle', 'repeat']);
+    const _hasMutationAction = _interactiveActions.some(a => _mutationActions.has(a));
+    const _isFirstResultExtract = _firstResultPattern.test(userMessage) && !_hasMutationAction;
+    if (_isFirstResultExtract && (webAccessMode === 'interactive' || requiresDOM)) {
+      logger.info(`[classifyTask] Search-to-extract first-result pattern detected — forcing public_read: "${userMessage.slice(0, 80)}"`);
+      webAccessMode = 'public_read';
+      requiresDOM = false;
+      parsed.interactiveActions = [];
+    }
+
     if (requiresDOM) webAccessMode = 'interactive';
     else if (parsed.taskType === 'browser' && webAccessMode === 'none') webAccessMode = 'interactive'; // fail-safe
 

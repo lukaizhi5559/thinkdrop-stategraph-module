@@ -419,6 +419,25 @@ module.exports = async function reviewExecution(state) {
   // If browser.agent reports success with action-completion signals in the result,
   // trust it without requiring page snapshot verification. This prevents false-hollow
   // detection when the agent completed its task but the page snapshot is unavailable.
+  // ── browser.agent / playwright.agent verified-mutation short-circuit ──────
+  // The agent layer's own verification gates (postcondition state-delta,
+  // signals, structural sub-task checks, DOM/OCR verification) produce
+  // verified/goalVerified flags on the step result. Page text alone cannot
+  // prove a mutation happened (especially after navigation, e.g. to a cart
+  // page), so re-deriving fulfillment from page text produces false-negative
+  // "hollow result" replans of tasks that actually succeeded. When the agent
+  // already verified completion, trust it — same precedent as the app.agent
+  // stateChanged short-circuit below.
+  const _hasVerifiedBrowserMutation = skillResults.some(r =>
+    (r.skill === 'browser.agent' || r.skill === 'playwright.agent') &&
+    r.ok !== false &&
+    (r.verified === true || r.goalVerified === true || r.postconditionVerified === true)
+  );
+  if (_hasVerifiedBrowserMutation) {
+    logger.info('[Node:ReviewExecution] browser agent reported verified completion — skipping hollow check (agent-side verification)');
+    return { ...state, reviewVerdict: 'VERIFIED' };
+  }
+
   const _hasBrowserAgentSuccess = skillResults.some(r =>
     r.skill === 'browser.agent' && r.ok !== false &&
     /\b(sent|submitted|saved|completed|done|confirmed|created|updated|deleted|navigated|opened|filled|clicked|sent successfully|message sent|email sent|task completed)\b/i.test(String(r.result || ''))

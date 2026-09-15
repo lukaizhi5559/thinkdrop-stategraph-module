@@ -235,6 +235,9 @@ module.exports = async function resolveReferencesV2(state) {
   // open file path instead of a stale followUpTarget from conversation history.
   let _taskClassification;
   if (state._planFile) {
+    // Plan execution: skip the expensive LLM classification, but preserve the
+    // original webAccessMode (public_read/download) so downstream nodes like
+    // executeCommand can still make mode-aware decisions.
     _taskClassification = {
       taskType: 'ambiguous', isFollowUp: false, followUpTarget: null,
       needsClarification: false, targetService: null, isRecurring: false,
@@ -242,6 +245,7 @@ module.exports = async function resolveReferencesV2(state) {
       needsFreshScreen: false, isAppUiInspection: false, isSpatialAnalysis: false,
       isImageAnalysis: false, isConversationRecall: false,
       interactiveActions: [],
+      webAccessMode: state._taskClassification?.webAccessMode || null,
     };
   } else {
     _taskClassification = await classifyTask(
