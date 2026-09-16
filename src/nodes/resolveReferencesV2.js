@@ -51,6 +51,63 @@ function stripHtml(text) {
   return text ? text.replace(/<[^>]*>/g, '') : text;
 }
 
+// Deictic/referential words — when a message contains one, the user is almost
+// always pointing at a prior task's RESULT ("email me these addresses").
+const REFERENTIAL_RE = /\b(this|that|these|those|it|them|they|above|previous|last|again)\b/i;
+
+// Fetch the last assistant "result" message from each contributing session.
+// Semantic message search ranks individual messages, and the task RESULT (the
+// assistant synthesis carrying the actual data, e.g. store addresses) often
+// never ranks — only user prompts do. Referents almost always mean the result,
+// so we pull each matched session's last synthesis explicitly.
+async function _collectSessionResults(mcpAdapter, sessionIds, currentSessionId, logger) {
+  const uniq = [...new Set(sessionIds)]
+    .filter(id => id && id !== currentSessionId)
+    .slice(0, 3);
+  const results = [];
+  await Promise.all(uniq.map(async (sid) => {
+    try {
+      const res = await mcpAdapter.callService('conversation', 'message.list', {
+        sessionId: sid, limit: 10, direction: 'DESC',
+      });
+      const msgs = ((res?.data || res)?.messages || [])
+        .filter(m => m.sender === 'assistant');
+      if (msgs.length === 0) return;
+      const synth = msgs.find(m => /Step outputs:|\[synthesize\]:/i.test(m.text || m.content || '')) || msgs[0];
+      results.push({
+        id: synth.id,
+        role: 'assistant',
+        content: stripHtml(synth.text || synth.content || ''),
+        timestamp: synth.timestamp,
+        source: 'semantic-result',
+        sessionId: sid,
+        sessionTitle: synth.sessionTitle,
+      });
+    } catch (_) { /* best-effort enrichment */ }
+  }));
+  return results;
+}
+
+// Merge recent + semantic conversation messages into one chronological list.
+// Sorting is REQUIRED: downstream consumers take slice(-N) for "recent"
+// context — appending semantic matches at the tail poisons those slices with
+// stale cross-session messages (observed: an "email me these addresses"
+// follow-up saw 5 old-session turns and lost the actual addresses from the
+// prior turn). Semantic messages keep source:'semantic' so consumers can
+// also surface them under a separate labeled section.
+function _mergeConversationHistory(recentMessages = [], semanticMessages = []) {
+  const seenIds = new Set();
+  const merged = [...recentMessages, ...semanticMessages].filter(msg => {
+    if (msg.id && seenIds.has(msg.id)) return false;
+    if (msg.id) seenIds.add(msg.id);
+    return true;
+  });
+  merged.sort((a, b) =>
+    (+new Date(a.timestamp || 0) || 0) - (+new Date(b.timestamp || 0) || 0)
+  );
+  return merged;
+}
+
 // ── Fetch recent screen context from the background monitor heartbeat ───────────────────
 // The user-memory monitor runs every 5s, capturing screen OCR on window change or pixel diff.
 // memory.getRecentOcr returns the freshest capture within maxAgeSeconds — always current.
@@ -107,7 +164,7 @@ module.exports = async function resolveReferencesV2(state) {
   }
 
   if (!mcpAdapter) {
-    return { ...state, resolvedMessage: message, originalMessage: message, conversationHistory: [] };
+    return { ...state, resolvedMessage: message, originalMessage: message, conversationHistory: [], semanticHistory: [] };
   }
 
   // ── Surface progress: this is the first node in the graph, so the user sees
@@ -122,6 +179,7 @@ module.exports = async function resolveReferencesV2(state) {
 
   // ── Fetch conversation history (sliding window) ────────────────────────────
   let conversationHistory = [];
+  let semanticHistory = [];
   try {
     let sessionId = context?.sessionId;
 
@@ -188,17 +246,40 @@ module.exports = async function resolveReferencesV2(state) {
             content: stripHtml(msg.text || msg.content || ''),
             timestamp: msg.timestamp,
             source: 'semantic',
+            sessionId: msg.sessionId,
             sessionTitle: msg.sessionTitle,
           }));
       }
 
-      // Merge: deduplicate by message ID, recent first then semantic
-      const seenIds = new Set();
-      conversationHistory = [...recentMessages, ...semanticMessages].filter(msg => {
-        if (msg.id && seenIds.has(msg.id)) return false;
-        if (msg.id) seenIds.add(msg.id);
-        return true;
-      });
+      // Session-result enrichment: pull each contributing session's last
+      // assistant synthesis so the actual task RESULT is in context, not just
+      // the matching user prompts. For referential messages with no semantic
+      // matches, fall back to the immediately-previous session (covers
+      // similarity-threshold misses like "email me these addresses").
+      let sessionResults = await _collectSessionResults(
+        mcpAdapter, semanticMessages.map(m => m.sessionId), sessionId, logger);
+      if (sessionResults.length === 0 && REFERENTIAL_RE.test(message || '')) {
+        try {
+          const sessRes = await mcpAdapter.callService('conversation', 'session.list', { limit: 5 });
+          const sessions = (sessRes?.data || sessRes)?.sessions || [];
+          const prevSid = sessions
+            .map(s => s.id || s.sessionId)
+            .find(id => id && id !== sessionId);
+          if (prevSid) {
+            sessionResults = await _collectSessionResults(mcpAdapter, [prevSid], sessionId, logger);
+          }
+        } catch (_) { /* best-effort enrichment */ }
+      }
+      if (sessionResults.length > 0) {
+        semanticMessages = [...semanticMessages, ...sessionResults];
+        logger.debug(`[Node:ResolveReferencesV2] Session-result enrichment: +${sessionResults.length} assistant result(s)`);
+      }
+
+      // Merge: deduplicate by message ID, then sort chronologically.
+      conversationHistory = _mergeConversationHistory(recentMessages, semanticMessages);
+      // Expose the semantic matches separately so consumers can show them as
+      // labeled "earlier context" instead of them polluting recency slices.
+      semanticHistory = conversationHistory.filter(m => m.source === 'semantic' || m.source === 'semantic-result');
 
       logger.debug(`[Node:ResolveReferencesV2] Context: ${recentMessages.length} recent + ${semanticMessages.length} semantic = ${conversationHistory.length} total`);
     }
@@ -359,6 +440,7 @@ module.exports = async function resolveReferencesV2(state) {
     resolvedMessage:        message,
     originalMessage:        message,
     conversationHistory,
+    semanticHistory,
     _taskClassification,
     _priorScreenContext:    _priorScreenContext || null,
     _screenContextNote:     _screenContextNote || null,
@@ -366,3 +448,8 @@ module.exports = async function resolveReferencesV2(state) {
     coreferenceReplacements: [],
   };
 };
+
+// Exported for tests — chronological merge used inside the node above.
+module.exports._mergeConversationHistory = _mergeConversationHistory;
+module.exports._collectSessionResults = _collectSessionResults;
+module.exports.REFERENTIAL_RE = REFERENTIAL_RE;

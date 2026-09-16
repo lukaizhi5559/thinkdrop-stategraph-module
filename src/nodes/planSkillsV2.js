@@ -22,6 +22,34 @@ const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
+// Select the prior synthesized result a referent like "email me these
+// addresses" points at. Scans ALL of conversationHistory (not just the last
+// 5 turns — the referent can live in a rotated session, surfaced via
+// source:'semantic-result' enrichment) and skips send-confirmation syntheses
+// ("Confirmed sent…") which carry a delivery verdict, not referent data.
+// Falls back to the most recent candidate when every synthesis is a
+// confirmation — its "Body Content:" field may still carry the data.
+function _selectPriorSynthesis(conversationHistory = []) {
+  const MESSAGING_REQ_RE = /\b(email|e-mail|send|mail|message|text|sms|slack|post|share|forward|reply)\b/i;
+  const CONFIRM_RE = /confirmed sent|email (was )?sent|message (was )?sent|delivery (failed|status|notification)|mail delivery subsystem/i;
+  const candidates = [];
+  for (let i = 0; i < conversationHistory.length; i++) {
+    const m = conversationHistory[i];
+    if (m.role !== 'assistant' || !m.content || !m.content.includes('Step outputs:')) continue;
+    const prevUser = conversationHistory.slice(0, i).reverse().find(p => p.role === 'user');
+    candidates.push({
+      content: m.content,
+      isConfirmation: (prevUser && MESSAGING_REQ_RE.test(prevUser.content || '')) || CONFIRM_RE.test(m.content),
+    });
+  }
+  const pick = [...candidates].reverse().find(c => !c.isConfirmation) || candidates[candidates.length - 1];
+  if (!pick) return null;
+  const soIdx = pick.content.indexOf('Step outputs:');
+  const after = pick.content.slice(soIdx + 'Step outputs:'.length).trim();
+  const synthMatch = after.match(/\[synthesize\]:\n([\s\S]+?)(?=\n\[|$)/);
+  return (synthMatch ? synthMatch[1] : after).trim().slice(0, 2000);
+}
+
 // ── Hard guard: action plans must always end with synthesize ─────────────────
 // The LLM planner sometimes omits the synthesize step (e.g. "ask the AI" read
 // tasks, single shell.run plans). This post-processing guard appends a
@@ -1207,16 +1235,18 @@ async function planSkillsV2(state) {
       conversationNote = `${systemNote}\n\nRECENT CONVERSATION:\n${turnLines.join('\n')}`;
     }
 
-    const lastSynthMsg = recentTurns.slice().reverse().find(m => m.role === 'assistant' && m.content?.includes('[synthesize]:'));
-    const lastSynthSource = lastSynthMsg || recentTurns.slice().reverse().find(m => m.role === 'assistant');
-    if (lastSynthSource?.content) {
-      const soIdx = lastSynthSource.content.indexOf('Step outputs:');
-      if (soIdx !== -1) {
-        const after = lastSynthSource.content.slice(soIdx + 'Step outputs:'.length).trim();
-        const synthMatch = after.match(/\[synthesize\]:\n([\s\S]+?)(?=\n\[|$)/);
-        priorSynthesizedContent = (synthMatch ? synthMatch[1] : after).trim().slice(0, 2000);
-      }
+    // Cross-session semantic matches (labeled so they aren't mistaken for
+    // recent turns — they resolve old-session referents like "email me these
+    // addresses" when the referent isn't in the recent window).
+    const _semanticTurns = (state.semanticHistory || conversationHistory.filter(m => m.source === 'semantic' || m.source === 'semantic-result') || [])
+      .filter(m => (m.role !== 'system' && m.sender !== 'system') && m.content?.trim())
+      .slice(-4)
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').trim().slice(0, 400)}`);
+    if (_semanticTurns.length > 0) {
+      conversationNote += `\n\nRELEVANT EARLIER CONTEXT (older sessions — use only to resolve references in the current request):\n${_semanticTurns.join('\n')}`;
     }
+
+    priorSynthesizedContent = _selectPriorSynthesis(conversationHistory) || '';
   }
 
   // For non-follow-up command_automate tasks, previous conversation results
@@ -2878,3 +2908,4 @@ The user's request does NOT match any installed skill.
 
 module.exports = planSkillsV2;
 module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;
+module.exports._selectPriorSynthesis = _selectPriorSynthesis;

@@ -33,6 +33,16 @@ const WORD_NUMBERS = {
   'twenty-nine':29, thirty:30,
 };
 
+// Month matching must use word boundaries — substring matching misparses
+// ordinary words containing month prefixes ("walmart" → "mar" → March,
+// "many" → "may", "janitor" → "jan"), which made recall queries like
+// "did I send messages regarding target or walmart" search March.
+function _findMonthIndex(q) {
+  return MONTHS.findIndex(mn =>
+    new RegExp(`\\b${mn}\\b`).test(q) || new RegExp(`\\b${mn.slice(0, 3)}\\b`).test(q)
+  );
+}
+
 function normaliseWordNumbers(str) {
   return str.replace(
     /\b(twenty-(?:one|two|three|four|five|six|seven|eight|nine)|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty)\b/gi,
@@ -320,7 +330,7 @@ function parseDateRange(message) {
 
   // last year
   if (/\blast year\b/.test(q)) {
-    const monthIdx = MONTHS.findIndex(mn => q.includes(mn) || q.includes(mn.slice(0, 3)));
+    const monthIdx = _findMonthIndex(q);
     if (monthIdx >= 0) {
       const targetYear = y - 1;
       const rangeMatch = q.match(/\b(\d{1,2})(?:st|nd|rd|th)?\s*(?:to|through|and|-)\s*(\d{1,2})(?:st|nd|rd|th)?\b/);
@@ -343,7 +353,7 @@ function parseDateRange(message) {
   }
 
   // Named month with optional year and optional day range
-  const monthIdx = MONTHS.findIndex(mn => q.includes(mn) || q.includes(mn.slice(0, 3)));
+  const monthIdx = _findMonthIndex(q);
   if (monthIdx >= 0) {
     const yearMatch  = q.match(/\b(20\d{2})\b/);
     const targetYear = yearMatch ? parseInt(yearMatch[1]) : (monthIdx > m ? y - 1 : y);

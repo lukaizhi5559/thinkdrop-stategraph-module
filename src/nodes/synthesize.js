@@ -46,6 +46,16 @@ module.exports = async function synthesizeNode(state) {
   const _hasSystemInfo = /(?:filesystem|disk size|container total space|container free space|hw\.memsize|hw\.physicalcpu|hw\.logicalcpu|machdep\.cpu|internalbattery|productname:\t\tmacos|buildversion:|model name:|total number of cores|spdisplaysdatatype|sphardwaredatatype|spusbdatatype)/i.test(synthesisContext || '');
   const _isJsonShell = /=== Shell output[^\n]*\n\s*[\[{]/i.test(synthesisContext || '');
 
+  // ── Delivery-bounce detection ────────────────────────────────────────────
+  // When confirming a sent email, the sent thread can contain a Mail Delivery
+  // Subsystem bounce ("Address not found"). The message WAS sent — the bounce
+  // concerns delivery to the recipient address, not the send action. Without
+  // this instruction the LLM reports "the email failed to send".
+  const _hasBounce = /mail delivery subsystem|address not found|delivery status notification|undeliver|couldn'?t be found|delivery has failed/i.test(synthesisContext || '');
+  const _bounceNote = _hasBounce
+    ? `\n\nIMPORTANT: The context contains a mail-delivery bounce notification (e.g. "Mail Delivery Subsystem — Address not found"). This means the email WAS sent — the bounce only concerns whether the recipient address could receive it. Report the send as successful, and mention the bounce as a separate delivery caveat (e.g. "sent, but it may not have been delivered — the recipient address bounced").`
+    : '';
+
   const synthesisInstructions = _hasSystemInfo
     ? `You are a concise system-information assistant.
 The user asked: "${queryMessage || synthesisPrompt}"
@@ -74,7 +84,7 @@ EXAMPLES of bad answers (DO NOT DO THIS):
 If the raw output is missing the specific field the user asked about, say so directly.`
     : _isJsonShell
     ? `You are a technical analyst. You have been given data returned by a shell command or API call.\n\nThe user asked: "${queryMessage || synthesisPrompt}"\n\nAnswer their specific question directly and concisely using ONLY the relevant data. Format output in markdown — use bold for names/titles, bullet points for lists, and human-readable dates. Skip internal IDs, raw URLs, and low-level metadata unless the user explicitly asked for them. Do NOT output raw JSON or JSON field names verbatim.`
-    : `You are a helpful assistant. Today's date is ${_todayISO}. The user asked you to summarize or analyze data from API responses or web sources. You have been given the content. Provide a clear, concise answer that directly addresses the user's request. When the user's question references a time period (e.g. "last week", "yesterday", "two weeks ago"), reason relative to today (${_todayISO}). Do not assume a date from your training data. Never ask the user for clarification or additional information — you MUST produce the requested content using only the provided context. If details are ambiguous, produce the best-effort response. Do not output a question as your answer. CRITICAL: NEVER say a source "did not provide a response" or "no content was found" when page text is present in the context below. Always extract and summarize what IS there, even if it appears sparse or incomplete.`;
+    : `You are a helpful assistant. Today's date is ${_todayISO}. The user asked you to summarize or analyze data from API responses or web sources. You have been given the content. Provide a clear, concise answer that directly addresses the user's request. When the user's question references a time period (e.g. "last week", "yesterday", "two weeks ago"), reason relative to today (${_todayISO}). Do not assume a date from your training data. Never ask the user for clarification or additional information — you MUST produce the requested content using only the provided context. If details are ambiguous, produce the best-effort response. Do not output a question as your answer. CRITICAL: NEVER say a source "did not provide a response" or "no content was found" when page text is present in the context below. Always extract and summarize what IS there, even if it appears sparse or incomplete.${_bounceNote}`;
 
   const synthPayload = {
     query: synthesisQuery,

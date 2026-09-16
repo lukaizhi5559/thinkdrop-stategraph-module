@@ -10,6 +10,12 @@
 const { parseDateRange } = require('../utils/parseDateRange');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
+// Conversation-recall queries ask about past prompts/messages themselves
+// ("did I send messages about X", "list my last 8 prompts", "what did we
+// discuss"). They need cross-session message fetches even without a parsed
+// date range. Exported for unit tests.
+const CONV_RECALL_QUERY_RE = /\b(did i|have i|i'?ve|list my|my (last|recent|past|previous)|what did (i|we)|what were (my|the)|show (me )?my)\b.{0,60}\b(prompt\w*|messages?|emails?|texts?|ask\w*|sen[dt]\w*|search\w*|sa(y|id)|talk\w*|discuss\w*|chat\w*|conversation\w*|wrote|regarding|about)\b/i;
+
 /**
  * Format an ISO timestamp into human-readable absolute + relative date
  * - Absolute: "March 8, 2026 at 7:04 PM"
@@ -292,7 +298,10 @@ function _profileKeysForAttribute(attribute) {
   }
 }
 
-module.exports = async function retrieveMemory(state) {
+module.exports = retrieveMemory;
+module.exports.CONV_RECALL_QUERY_RE = CONV_RECALL_QUERY_RE;
+
+async function retrieveMemory(state) {
   const { mcpAdapter, message, resolvedMessage, context, intent } = state;
   const logger = state.logger || console;
 
@@ -349,6 +358,7 @@ module.exports = async function retrieveMemory(state) {
     // range or search broadly, not a random inherited window.
     const _isFollowUp = !!state._taskClassification?.isFollowUp;
     const _isConvRecall = !!state._taskClassification?.isConversationRecall;
+    const isRecallQuery = _isConvRecall || CONV_RECALL_QUERY_RE.test(resolvedMessage || message || '');
     if (!dateRange && msgWords <= 12 && context?.sessionId &&
         !_isFollowUp && !_isConvRecall &&
         !PROFILE_QUERY_PATTERN.test(resolvedMessage || message) &&
@@ -480,18 +490,30 @@ module.exports = async function retrieveMemory(state) {
           })
         : Promise.resolve({ messages: [] }),
 
-      // Cross-session messages by date range (for "yesterday", "last week", etc.)
+      // Cross-session messages: within an explicit date range, or — for
+      // conversation-recall queries with no date range — the newest messages
+      // across ALL sessions (indexed created_at DESC scan; cheap at any table
+      // size). Recall queries get DESC so a >30-message window keeps the newest.
       dateRange
         ? mcpAdapter.callService('conversation', 'message.listByDate', {
             startDate: dateRange.startDate,
             endDate: dateRange.endDate,
             limit: 30,
+            sortOrder: isRecallQuery ? 'DESC' : 'ASC',
             userId: context?.userId
           }).catch(err => {
             logger.warn('[Node:RetrieveMemory] Cross-session fetch failed:', err.message);
             return { messages: [] };
           })
-        : Promise.resolve({ messages: [] }),
+        : (isRecallQuery
+            ? mcpAdapter.callService('conversation', 'message.listByDate', {
+                limit: 50,
+                userId: context?.userId
+              }).catch(err => {
+                logger.warn('[Node:RetrieveMemory] Cross-session recall fetch failed:', err.message);
+                return { messages: [] };
+              })
+            : Promise.resolve({ messages: [] })),
 
       // Semantic memory search (skip for meta-questions; screen captures live in episodic_memory)
       // For personal-attribute queries, exclude screen_capture noise so the
@@ -628,6 +650,7 @@ module.exports = async function retrieveMemory(state) {
       .map(msg => {
         const formattedDate = formatTimestamp(msg.timestamp);
         return {
+          id: msg.id,
           role: msg.sender === 'user' ? 'user' : (msg.sender === 'system' ? 'system' : 'assistant'),
           content: msg.text,
           timestamp: msg.timestamp,
@@ -653,40 +676,55 @@ module.exports = async function retrieveMemory(state) {
 
     logger.debug(`[Node:RetrieveMemory] Loaded ${conversationHistory.length} messages, ${memories.length} memories`);
 
-    // ── Cross-session semantic search fallback ──────────────────────────────────
-    // When no memories found and query looks like "what was that conversation about X",
-    // try message.search across all sessions.
+    // ── Cross-session semantic message search ──────────────────────────────────
+    // Conversation-recall queries always search all sessions for relevant
+    // messages (complements the newest-N fetch — catches topical matches beyond
+    // the recent window). The old narrow fallback ("conversation about X" with
+    // no memories) is preserved for non-recall phrasings.
     let crossSessionSearchResults = [];
-    if (memories.length === 0 && !dateRange && !profileFallback) {
-      const CONV_RECALL_RE = /\b(conversation|chat|talk|discussed|talking)\s+(about|regarding|on|where)\b/i;
-      if (CONV_RECALL_RE.test(resolvedMessage || message || '')) {
-        try {
-          const searchRes = await mcpAdapter.callService('conversation', 'message.search', {
-            query: searchQuery,
-            limit: 15,
-            userId: context?.userId,
-          });
-          const searchData = searchRes?.data || searchRes;
-          crossSessionSearchResults = (searchData?.messages || searchData?.results || []).map(msg => ({
-            role: msg.sender === 'user' ? 'user' : 'assistant',
-            content: msg.text || msg.content,
-            timestamp: msg.timestamp,
-            formattedDate: formatTimestamp(msg.timestamp),
-            sessionId: msg.sessionId,
-          }));
-          if (crossSessionSearchResults.length > 0) {
-            logger.debug(`[Node:RetrieveMemory] Cross-session search found ${crossSessionSearchResults.length} messages`);
-          }
-        } catch (e) {
-          logger.debug(`[Node:RetrieveMemory] message.search fallback failed: ${e.message}`);
+    const LEGACY_RECALL_RE = /\b(conversation|chat|talk|discussed|talking)\s+(about|regarding|on|where)\b/i;
+    const shouldSearchAllSessions = isRecallQuery ||
+      (memories.length === 0 && !dateRange && !profileFallback &&
+       LEGACY_RECALL_RE.test(resolvedMessage || message || ''));
+    if (shouldSearchAllSessions) {
+      try {
+        const searchRes = await mcpAdapter.callService('conversation', 'message.search', {
+          query: searchQuery,
+          limit: 15,
+          userId: context?.userId,
+        });
+        const searchData = searchRes?.data || searchRes;
+        crossSessionSearchResults = (searchData?.messages || searchData?.results || []).map(msg => ({
+          id: msg.id,
+          role: msg.sender === 'user' ? 'user' : 'assistant',
+          content: msg.text || msg.content,
+          timestamp: msg.timestamp,
+          formattedDate: formatTimestamp(msg.timestamp),
+          sessionId: msg.sessionId,
+        }));
+        if (crossSessionSearchResults.length > 0) {
+          logger.debug(`[Node:RetrieveMemory] Cross-session search found ${crossSessionSearchResults.length} messages`);
         }
+      } catch (e) {
+        logger.debug(`[Node:RetrieveMemory] message.search fallback failed: ${e.message}`);
       }
     }
 
-    // Merge cross-session search results into conversation history if primary is empty
-    const finalHistory = conversationHistory.length > 0
-      ? conversationHistory
-      : (crossSessionSearchResults.length > 0 ? crossSessionSearchResults : conversationHistory);
+    // Merge semantic search hits into the history (dedupe by message id,
+    // chronological sort, keep the newest 30).
+    let finalHistory = conversationHistory;
+    if (crossSessionSearchResults.length > 0) {
+      const seenIds = new Set(conversationHistory.map(m => m.id).filter(Boolean));
+      const merged = [...conversationHistory];
+      for (const m of crossSessionSearchResults) {
+        if (m.id && seenIds.has(m.id)) continue;
+        if (m.id) seenIds.add(m.id);
+        merged.push(m);
+      }
+      finalHistory = merged
+        .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+        .slice(-30);
+    }
 
     return {
       ...state,

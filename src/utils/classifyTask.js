@@ -282,6 +282,16 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 300)}`)
       .join('\n');
 
+    // Cross-session semantic matches are merged into conversationHistory and
+    // timestamp-sorted — they rarely land in the recent slice when the current
+    // session is busy. Surface them under an explicit label so followUpTarget
+    // resolution for older-session referents still works.
+    const semanticCtx = (conversationHistory || [])
+      .filter(m => (m.source === 'semantic' || m.source === 'semantic-result') && m.content && m.content.trim())
+      .slice(-4)
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 300)}`)
+      .join('\n');
+
     const screenBlock = priorScreenSummary ? `\n\n${priorScreenSummary}` : '';
     // Active app context — the live open app + file path. The classifier uses
     // this to resolve deictic references ("this file", "it") to the actual open
@@ -296,7 +306,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
         activeAppBlock = `\n\nACTIVE APP CONTEXT (live): ${parts.join(', ')}`;
       }
     }
-    const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}${screenBlock}${activeAppBlock}\n\nCURRENT USER MESSAGE: "${userMessage}"`;
+    const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}${semanticCtx ? `\n\nRELEVANT EARLIER MESSAGES (older sessions — use only if they resolve the current message's referent):\n${semanticCtx}` : ''}${screenBlock}${activeAppBlock}\n\nCURRENT USER MESSAGE: "${userMessage}"`;
 
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,

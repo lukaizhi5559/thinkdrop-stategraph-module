@@ -390,7 +390,8 @@ module.exports = async function gatherPlanContext(state) {
   // ── Inject follow-up target into resolvedMessage for downstream nodes ────────
   const tc = state._taskClassification || {};
   let baseMsg = resolvedMessage || message || '';
-  if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp) {
+  if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp &&
+      !baseMsg.includes('(Context from prior turn:')) {
     baseMsg = `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
     logger.info(`[Node:GatherPlanContext] Follow-up target injected: "${tc.followUpTarget}"`);
   }
@@ -813,7 +814,8 @@ async function _runGrillLoop(state, logger) {
 
   const tc = state._taskClassification || {};
   let baseMsg = resolvedMessage || message || '';
-  if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp) {
+  if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp &&
+      !baseMsg.includes('(Context from prior turn:')) {
     baseMsg = `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
   }
   const originalMsg = state.originalMessage || state.message || baseMsg;

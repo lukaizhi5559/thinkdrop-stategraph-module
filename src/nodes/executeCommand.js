@@ -132,6 +132,59 @@ Rules:
   }
 }
 
+// ── Auto-skip: failed read-only step with independent remaining steps ────────
+// A failed read-only retrieval step (web.crawl, web.agent, web.search, fs.read,
+// image.analyze) shouldn't halt the whole plan when later steps can still
+// produce a partial answer. Skip it automatically instead of pausing on
+// ask_user — the step renders 'skipped' in the UI and synthesis reports the
+// gap honestly (blocked/skipped notes + [STEP STATUS: FAILED] annotations).
+//
+// Returns updated state, or null when auto-skip is unsafe:
+//   - failed step is the last step (nothing to continue to)
+//   - a remaining step references the failed step's output via
+//     {{CONTRACT[N]}} (exact index) or the immediate next step uses
+//     {{PREV_CONTRACT}}/{{prev_stdout}}/{{PREV_OUTPUT}} (resolves to the
+//     failed step's result/contract)
+// {{bestUrl}}/{{LAST_SUCCESSFUL}}/{{LAST_WITH_OUTPUT}}/{{synthesisAnswer}} do
+// NOT block — they resolve to earlier successful steps, and a missing bestUrl
+// hits the existing unresolved-token skip guard downstream.
+const _READ_ONLY_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search', 'fs.read', 'image.analyze']);
+
+function _tryAutoSkipIndependentStep(state) {
+  const { failedStep, skillPlan = [], skillCursor, skillResults = [] } = state;
+  const logger = state.logger || console;
+  if (!failedStep || !_READ_ONLY_SKILLS.has(failedStep.skill)) return null;
+  const remaining = skillPlan.slice(skillCursor + 1);
+  if (remaining.length === 0) return null;
+
+  const remainingJson = JSON.stringify(remaining.map(s => s.args || {}));
+  const nextJson = JSON.stringify(remaining[0]?.args || {});
+  if (remainingJson.includes(`{{CONTRACT[${skillCursor}]`)
+      || /\{\{(PREV_CONTRACT|prev_stdout|PREV_OUTPUT)/i.test(nextJson)) {
+    return null;
+  }
+
+  const reason = failedStep.error || 'step failed';
+  logger.info(`[ExecuteCommand:ThinRecovery] auto-skip: ${failedStep.skill} step ${skillCursor + 1} failed (${reason.slice(0, 100)}) — ${remaining.length} remaining step(s) independent — continuing plan`);
+  const cb = state.progressCallback;
+  if (cb) {
+    cb({ type: 'step_skipped', stepIndex: skillCursor, skill: failedStep.skill, description: failedStep.description, reason });
+    if (state._skillPlanFile) {
+      cb({ type: 'plan:step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: failedStep.skill, description: failedStep.description });
+    }
+  }
+  return {
+    ...state,
+    skillResults: skillResults.map(r =>
+      r.step === skillCursor + 1 ? { ...r, skipped: true, skipReason: reason } : r
+    ),
+    skillCursor: skillCursor + 1,
+    failedStep: null,
+    recoveryAction: null,
+    commandExecuted: false,
+  };
+}
+
 async function _thinPostFailureHandler(state) {
   const { failedStep, skillPlan, skillCursor, skillResults = [], llmBackend, message, resolvedMessage, stepRetryCount = 0, replanCount = 0, patchHistory = [] } = state;
   const logger = state.logger || console;
@@ -158,6 +211,17 @@ async function _thinPostFailureHandler(state) {
       pendingQuestion: { question: failedStep.question || failedStep.error, options: failedStep.options || [] },
       commandExecuted: false,
     };
+  }
+
+  // ── Bot-wall fast-path ───────────────────────────────────────────────────
+  // A bot-blocked read-only crawl can't be fixed by replan (public-web
+  // constraint rewrites browser.agent back to web.crawl → same wall) or
+  // auto-patch (no arg fixes a bot wall), and the visible warm retry already
+  // ran. If remaining steps don't depend on its output, skip it now instead
+  // of spending an LLM call that will land on ASK_USER anyway.
+  if (failedStep.botBlocked) {
+    const _botSkipped = _tryAutoSkipIndependentStep(state);
+    if (_botSkipped) return _botSkipped;
   }
 
   // No LLM backend — surface to user
@@ -295,6 +359,14 @@ async function _thinPostFailureHandler(state) {
     };
   }
 
+  // ── Auto-skip gate ─────────────────────────────────────────────────────────
+  // The LLM chose ASK_USER (or AUTO_PATCH fell through) — but for a read-only
+  // step whose output nothing downstream depends on, skipping and continuing
+  // the plan is better than pausing. Mutating skills and hard dependencies
+  // still pause below.
+  const _autoSkipped = _tryAutoSkipIndependentStep(state);
+  if (_autoSkipped) return _autoSkipped;
+
   return {
     ...state,
     recoveryAction: 'ask_user',
@@ -416,6 +488,9 @@ function generateStepContract(stepResult, stepIndex) {
       contract.outputs = {
         searchResults: { type: 'array', value: stepResult.result?.results || [] },
         bestUrl: { type: 'text', value: stepResult.result?.bestUrl || '' },
+        isPage: { type: 'boolean', value: stepResult.result?.isPage === true },
+        verified: { type: 'boolean', value: stepResult.result?.verified === true },
+        contentType: { type: 'text', value: stepResult.result?.contentType || '' },
         summary: { type: 'text', value: stepResult.stdout || '' }
       };
       break;
@@ -449,6 +524,30 @@ function generateStepContract(stepResult, stepIndex) {
         stdout: { type: 'text', value: stepResult.stdout || '' },
         output: { type: 'text', value: stepResult.output || '' }
       };
+  }
+
+  // ── File-type validation for `file <path>` steps ──────────────────────────
+  // macOS `file` exits 0 even for missing files ("No such file or directory")
+  // and for HTML saved as .jpg ("HTML document text"). Without this check,
+  // a bad download produces a "successful" contract and LAST_SUCCESSFUL points
+  // at an invalid file. Parse the stdout and mark the contract failed when:
+  //   (a) the file doesn't exist ("No such file or directory")
+  //   (b) the file is HTML/text but the target extension is a binary asset
+  //       (jpg, png, pdf, mp3, mp4, zip, ...) — a bot wall or redirect page
+  //       was saved with the requested extension.
+  if (stepResult.skill === 'shell.run' && stepResult.ok
+      && (stepResult.args?.cmd === 'file' || (Array.isArray(stepResult.args?.argv) && stepResult.args.argv[0] === 'file'))) {
+    const _fileOut = (stepResult.stdout || '').toLowerCase();
+    const _targetPath = (stepResult.args?.argv || []).find(a => typeof a === 'string' && a.includes('/') && /\.\w+$/.test(a)) || '';
+    const _ext = (_targetPath.match(/\.(\w+)$/) || [])[1] || '';
+    const _binaryExts = ['jpg','jpeg','png','gif','webp','bmp','tiff','heic','pdf','mp3','mp4','m4a','avi','mov','zip','csv','json','xlsx','docx','pptx','odt','rtf','epub','ttf','otf','woff','woff2','eot'];
+    if (_fileOut.includes('no such file or directory')) {
+      contract.success = false;
+      contract.error = { message: `File does not exist: ${_targetPath}`, fileTypeMismatch: true };
+    } else if (_binaryExts.includes(_ext) && (_fileOut.includes('html') || _fileOut.includes('ascii text') || _fileOut.includes('utf-8 text') || _fileOut.includes('empty'))) {
+      contract.success = false;
+      contract.error = { message: `Downloaded file is HTML/text, not ${_ext}: ${_fileOut.split('\n')[0]}`, fileTypeMismatch: true };
+    }
   }
 
   // Add error info for failed steps
@@ -616,20 +715,62 @@ function resolveContractPath(stepContracts, path) {
     return null;
   }
   
-  // Navigate the remaining path (e.g., ".outputs.stdout")
+  // Navigate the remaining path (e.g., ".outputs.stdout", ".outputs.filePaths[0]")
+  // Supports both dotted properties and bracket array indices:
+  //   "outputs.filePaths[0]"      → ["outputs", "filePaths", 0]
+  //   "outputs.filePaths[0].name" → ["outputs", "filePaths", 0, "name"]
+  //   "outputs.items[3].url"       → ["outputs", "items", 3, "url"]
+  // Pure dot paths (no brackets) still work — backwards compatible.
+  //
+  // Contract outputs are wrapped in { type, value } envelopes (see
+  // generateStepContract). Unwrap the envelope so that:
+  //   outputs.stdout    → "hello"           (not {type:'text', value:'hello'})
+  //   outputs.filePaths → ['/path/file']   (not {type:'array', value:[...]})
+  //   outputs.filePaths[0] → '/path/file'   (indexes the unwrapped array)
   if (remainingPath) {
-    const pathParts = remainingPath.substring(1).split('.');
+    const tokens = [];
+    for (const part of remainingPath.split('.')) {
+      if (!part) continue;
+      // Split "filePaths[0]" → "filePaths" + index 0
+      const bracketMatch = part.match(/^([^\[]+)\[(\d+)\]$/);
+      if (bracketMatch) {
+        tokens.push(bracketMatch[1]);
+        tokens.push(parseInt(bracketMatch[2], 10));
+      } else if (/^\d+$/.test(part)) {
+        tokens.push(parseInt(part, 10));
+      } else {
+        tokens.push(part);
+      }
+    }
     let current = contract;
-    for (const part of pathParts) {
-      if (current && typeof current === 'object' && part in current) {
-        current = current[part];
+    for (const tok of tokens) {
+      if (current == null) return null;
+      // Unwrap { type, value } envelope before indexing
+      if (current && typeof current === 'object' && !Array.isArray(current)
+          && typeof current.type === 'string' && 'value' in current && Object.keys(current).length <= 2) {
+        current = current.value;
+      }
+      if (current == null) return null;
+      if (typeof tok === 'number') {
+        if (Array.isArray(current) && tok >= 0 && tok < current.length) {
+          current = current[tok];
+        } else {
+          return null;
+        }
+      } else if (current && typeof current === 'object' && tok in current) {
+        current = current[tok];
       } else {
         return null;
       }
     }
+    // Unwrap final envelope if the resolved value is still wrapped
+    if (current && typeof current === 'object' && !Array.isArray(current)
+        && typeof current.type === 'string' && 'value' in current && Object.keys(current).length <= 2) {
+      current = current.value;
+    }
     return current;
   }
-  
+
   return contract;
 }
 
@@ -1440,6 +1581,33 @@ module.exports = async function executeCommand(state) {
       newArgs[k] = injectContract(v);
     }
     args = newArgs;
+  }
+
+  // ── isPage guard: refuse to curl a page URL as a binary asset ──────────────
+  // When a prior web.agent find_download returned isPage:true or verified:false,
+  // the bestUrl is a web page, not a direct asset. Curling it would download
+  // HTML and save it with the requested extension (e.g. .jpg), producing an
+  // invalid file. Block the curl step deterministically so recovery replans
+  // to web.crawl (Pattern C in plan-skills-webfetch.md) to find the real media
+  // link first.
+  if (skill === 'shell.run' && state.webAgentBestUrl
+      && (state.webAgentBestIsPage || state.webAgentBestVerified === false)) {
+    const _cmdStr = ((resolvedArgs.cmd || args.cmd || '') + ' ' + JSON.stringify(resolvedArgs.argv || args.argv || [])).toLowerCase();
+    const _isCurlDownload = /\bcurl\b/.test(_cmdStr) && /(\-o|--output)\b/.test(_cmdStr);
+    if (_isCurlDownload) {
+      const _pageErr = `find_download returned isPage:${state.webAgentBestIsPage}, verified:${state.webAgentBestVerified} for ${state.webAgentBestUrl} — this is a web page, not a direct asset. Use web.crawl ${state.webAgentBestUrl} to find the real media link first (Pattern C).`;
+      logger.warn(`[Node:ExecuteCommand] blocking curl of page URL (isPage=${state.webAgentBestIsPage}, verified=${state.webAgentBestVerified}): ${state.webAgentBestUrl}`);
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: description || skill, stdout: _pageErr, error: _pageErr });
+      if (_rawProgressCallback && state._skillPlanFile) {
+        _rawProgressCallback({ type: 'plan:step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description });
+      }
+      return {
+        ...state,
+        planError: _pageErr,
+        failedStep: { step: skillCursor + 1, skill, description, error: _pageErr, args: args || {} },
+        commandExecuted: false,
+      };
+    }
   }
 
   // ── {{user.agent.resolved.*}} — substitute resolved user context fields ──────
@@ -2654,10 +2822,26 @@ module.exports = async function executeCommand(state) {
       .filter(r => r.skipped && r.skipReason && r.step > lastSynthesizeStep)
       .map(r => `- Step ${r.step} (${r.description || r.skill}): ${r.skipReason}`);
 
+    // ── Blocked-step notes (bot walls, thin pages with no items) ─────────────
+    // Surface botBlocked/blocked steps explicitly so the synthesis LLM knows
+    // content was NOT retrieved — prevents false success claims.
+    const blockedStepNotes = skillResults
+      .filter(r => (r.botBlocked || r.blocked) && r.step > lastSynthesizeStep)
+      .map(r => `- Step ${r.step} (${r.description || r.skill}): BLOCKED — bot wall detected, content not retrieved`);
+
     // Include shell.run stdout (e.g. cat file output) as well as browser getPageText results
+    // Annotate each result with its contract success state so the LLM sees
+    // "Step 3 (curl download): FAILED — fileTypeMismatch" rather than just raw stdout.
+    const _stepContracts = state.stepContracts || [];
     const shellStdoutResults = skillResults
       .filter(r => r.skill === 'shell.run' && r.ok && r.stdout && r.stdout.trim().length > 0)
-      .map(r => `=== Shell output (${r.description || r.args?.cmd || 'shell.run'}) ===\n${r.stdout}`);
+      .map(r => {
+        const _contract = _stepContracts.find(c => c.stepIndex === r.step - 1);
+        const _failNote = _contract && _contract.success === false && _contract.error
+          ? `\n[STEP STATUS: FAILED — ${_contract.error.fileTypeMismatch ? 'fileTypeMismatch: ' : ''}${_contract.error.message || 'failed'}]`
+          : '';
+        return `=== Shell output (${r.description || r.args?.cmd || 'shell.run'}) ===\n${r.stdout}${_failNote}`;
+      });
 
     // ── Full-fidelity API response handling ──────────────────────────────────
     // Never truncate — write every large JSON response to ~/.thinkdrop/tmp/ in
@@ -3007,6 +3191,26 @@ module.exports = async function executeCommand(state) {
       ...externalSkillResults,
     ];
 
+    // ── Blocked/skipped step notes — surface failures so synthesis can't ────
+    // claim success when content was not retrieved. These are appended after
+    // the real context so the LLM sees both the data AND the failure state.
+    if (blockedStepNotes.length > 0) {
+      allContextParts.push(`=== BLOCKED STEPS ===\n${blockedStepNotes.join('\n')}`);
+    }
+    if (skippedStepNotes.length > 0) {
+      allContextParts.push(`=== SKIPPED STEPS ===\n${skippedStepNotes.join('\n')}`);
+    }
+
+    // ── System instruction: don't claim success when steps failed/blocked ───
+    // Deterministic guard — the LLM may still hallucinate success from raw
+    // stdout, so inject an explicit instruction when any prior step failed.
+    const _anyFailed = (_stepContracts || []).some(c => c.success === false && c.stepIndex < skillCursor + 1);
+    const _anyBlocked = skillResults.some(r => (r.botBlocked || r.blocked) && r.step <= skillCursor + 1);
+    let _truthfulnessNote = '';
+    if (_anyFailed || _anyBlocked) {
+      _truthfulnessNote = '\n\n[SYSTEM NOTE: One or more prior steps FAILED or were BLOCKED. Do NOT claim the task succeeded. Report what was attempted and what failed. If a download was requested, confirm the file exists at the path AND its type matches the request before claiming success — "HTML document" or "No such file or directory" means the download FAILED.]';
+    }
+
     // ── Prior synthesize results as fallback context ─────────────────────────
     // When a downstream synthesize step (e.g. "write email comparing prices") finds
     // no raw page-text results in its scope (because scraping happened before the
@@ -3089,8 +3293,8 @@ module.exports = async function executeCommand(state) {
     }
 
     const _rawSynthesisContext = allContextParts.length > 0
-      ? allContextParts.join('\n\n')
-      : crossTurnContext || skillResults.filter(r => r.ok && (r.result || r.stdout)).map(r => String(r.result || r.stdout)).join('\n\n');
+      ? allContextParts.join('\n\n') + _truthfulnessNote
+      : (crossTurnContext || skillResults.filter(r => r.ok && (r.result || r.stdout)).map(r => String(r.result || r.stdout)).join('\n\n')) + _truthfulnessNote;
     // Cap context to ~60k chars (~15k tokens) to prevent LLM context overflow on large fs.read/explore results.
     // Trim from the middle so we keep the directory tree (start) and most recent file content (end).
     const _SYNTH_CTX_LIMIT = 60000;
@@ -4844,7 +5048,7 @@ Please try again or search with different terms.`;
       const gsArgs = gs.args || {};
       const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
       const _callArgs = _isAgent
-        ? { ...gsArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+        ? { ...gsArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn${state._handoffTaskId ? `?taskId=${encodeURIComponent(state._handoffTaskId)}` : ''}`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
         : gsArgs;
       // Extended timeout for parallel browser steps to handle YouTube searches + Tab-Flow
       const stepTimeoutMs = gs.skill === 'browser.agent' ? 420000 : 300000; // 7 min for browser, 5 min for CLI
@@ -5059,7 +5263,7 @@ Please try again or search with different terms.`;
         const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
         const extraArgs = decision === 'try_without' ? { skipAuth: true } : {};
         const _callArgs = _isAgent
-          ? { ...gsArgs, ...extraArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: r.idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+          ? { ...gsArgs, ...extraArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn${state._handoffTaskId ? `?taskId=${encodeURIComponent(state._handoffTaskId)}` : ''}`, _stepIndex: r.idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
           : { ...gsArgs, ...extraArgs };
 
         logger.info(`[Node:ExecuteCommand] parallel login: re-dispatching ${svc?.agentId} (decision=${decision})`);
@@ -5160,10 +5364,14 @@ Please try again or search with different terms.`;
     // Extract bestUrl from the last successful web.agent step in the group
     let newWebAgentBestUrl = state.webAgentBestUrl || null;
     let newWebAgentFallbackUrls = state.webAgentFallbackUrls || [];
+    let newWebAgentBestIsPage = state.webAgentBestIsPage ?? false;
+    let newWebAgentBestVerified = state.webAgentBestVerified ?? false;
     for (const outcome of settled) {
       const r = outcome.status === 'fulfilled' ? outcome.value : null;
       if (r && r.step?.skill === 'web.agent' && r.ok && r.raw?.bestUrl) {
         newWebAgentBestUrl = r.raw.bestUrl;
+        newWebAgentBestIsPage = r.raw.isPage === true;
+        newWebAgentBestVerified = r.raw.verified === true;
         if (Array.isArray(r.raw.fallbackUrls)) newWebAgentFallbackUrls = r.raw.fallbackUrls;
         // Also synthesize stdout on the matching groupResult entry
         const grIdx = groupResults.findIndex(g => g.step === (r.idx + 1));
@@ -5171,7 +5379,7 @@ Please try again or search with different terms.`;
           const webAgentTitle = r.raw.title ? ` — "${r.raw.title}"` : '';
           groupResults[grIdx].stdout = `Best URL: ${r.raw.bestUrl}${webAgentTitle}`;
           if (r.raw.snippet) groupResults[grIdx].stdout += `\n${r.raw.snippet}`;
-          logger.info(`[Node:ExecuteCommand] runGroup web.agent: captured bestUrl=${r.raw.bestUrl}`);
+          logger.info(`[Node:ExecuteCommand] runGroup web.agent: captured bestUrl=${r.raw.bestUrl} (isPage=${newWebAgentBestIsPage}, verified=${newWebAgentBestVerified})`);
         }
       }
     }
@@ -5184,6 +5392,8 @@ Please try again or search with different terms.`;
         stepContracts: newStepContracts,
         webAgentBestUrl: newWebAgentBestUrl,
         webAgentFallbackUrls: newWebAgentFallbackUrls,
+        webAgentBestIsPage: newWebAgentBestIsPage,
+        webAgentBestVerified: newWebAgentBestVerified,
         skillCursor: nextCursor,
         commandExecuted: false,
         failedStep: null,
@@ -5217,6 +5427,8 @@ Please try again or search with different terms.`;
           stepContracts: newStepContracts,
           webAgentBestUrl: newWebAgentBestUrl,
         webAgentFallbackUrls: newWebAgentFallbackUrls,
+        webAgentBestIsPage: newWebAgentBestIsPage,
+        webAgentBestVerified: newWebAgentBestVerified,
           skillCursor: nextCursor,
           commandExecuted: false,
           failedStep: null, // Don't set — let synthesize run first
@@ -5229,6 +5441,8 @@ Please try again or search with different terms.`;
         stepContracts: newStepContracts,
         webAgentBestUrl: newWebAgentBestUrl,
         webAgentFallbackUrls: newWebAgentFallbackUrls,
+        webAgentBestIsPage: newWebAgentBestIsPage,
+        webAgentBestVerified: newWebAgentBestVerified,
         skillCursor: nextCursor,
         commandExecuted: false,
         failedStep: firstFailure,
@@ -5241,6 +5455,8 @@ Please try again or search with different terms.`;
       stepContracts: newStepContracts,
       webAgentBestUrl: newWebAgentBestUrl,
       webAgentFallbackUrls: newWebAgentFallbackUrls,
+      webAgentBestIsPage: newWebAgentBestIsPage,
+      webAgentBestVerified: newWebAgentBestVerified,
       skillCursor: nextCursor,
       commandExecuted: nextCursor >= skillPlan.length,
       failedStep: null,
@@ -5308,7 +5524,7 @@ Please try again or search with different terms.`;
       : null;
 
     const _callArgs = _isAgentSkill
-      ? { ...resolvedArgs, _stepType: step.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn`, _stepIndex: skillCursor, _emitThinking, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
+      ? { ...resolvedArgs, _stepType: step.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn${state._handoffTaskId ? `?taskId=${encodeURIComponent(state._handoffTaskId)}` : ''}`, _stepIndex: skillCursor, _emitThinking, context: { ...(resolvedArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
       : _isShellRunStep
         ? { ...resolvedArgs, _progressCallback: (evt) => {
             if (!progressCallback) return;
@@ -5458,7 +5674,46 @@ Please try again or search with different terms.`;
           }
         } else {
           const _reason = raw?.botBlocked ? 'bot-blocked' : '0 items on search/listing URL';
-          logger.info(`[Node:ExecuteCommand] web.crawl ${_reason} but no registered browser agent for ${_host} — no authenticated fallback available`);
+          // ── Visible warm-retry fallback for public tasks ───────────────────
+          // When no registered browser agent exists for the domain AND the task
+          // is public_read/download, retry web.crawl once with hidden:false
+          // (visible headed Chrome, warm profile). This opens a brief visible
+          // Chrome window — acceptable for a public content request that would
+          // otherwise silently fail. Only fires for public tasks.
+          //
+          // `resolvedArgs.hidden === true` is a reliable public-task proxy:
+          // planSkillsV2 only injects hidden:true for public_read/download
+          // (planSkillsV2.js ~2260), and webAccessMode is null on plan-resume
+          // runs (taskClassification is regenerated as taskType:ambiguous).
+          const _webMode = state._taskClassification?.webAccessMode;
+          const _publicTask = _webMode === 'public_read' || _webMode === 'download' || resolvedArgs.hidden === true;
+          if (_publicTask && resolvedArgs.hidden) {
+            logger.info(`[Node:ExecuteCommand] web.crawl ${_reason} — no registered agent for ${_host}, retrying as visible warm crawl (public task)`);
+            try {
+              const _visRes = await mcpAdapter.callService('command', 'command.automate', {
+                skill: 'web.crawl',
+                args: { ...resolvedArgs, hidden: false }
+              }, { timeoutMs: 120000, signal: state.abortSignal });
+              const _visRaw = _visRes?.data || _visRes;
+              if (_visRaw?.ok && !_visRaw.botBlocked
+                  && ((_visRaw.items?.length || 0) > 0 || (_visRaw.content || '').length > 1000)) {
+                logger.info(`[Node:ExecuteCommand] visible warm retry succeeded — ${_visRaw.items?.length || 0} items, ${(_visRaw.content || '').length} chars`);
+                raw = {
+                  ..._visRaw,
+                  authenticatedFallback: false,
+                  visibleWarmRetry: true,
+                };
+              } else {
+                logger.warn(`[Node:ExecuteCommand] visible warm retry also blocked — honest failure (${_visRaw?.items?.length || 0} items, ${(_visRaw?.content || '').length} chars)`);
+              }
+            } catch (_visErr) {
+              logger.warn(`[Node:ExecuteCommand] visible warm retry error: ${_visErr.message}`);
+            }
+          } else if (_publicTask && !resolvedArgs.hidden) {
+            logger.info(`[Node:ExecuteCommand] web.crawl ${_reason} — no agent, already tried visible warm retry — honest failure`);
+          } else {
+            logger.info(`[Node:ExecuteCommand] web.crawl ${_reason} but no registered browser agent for ${_host} — no authenticated fallback available`);
+          }
         }
       } catch (_fbErr) {
         logger.warn(`[Node:ExecuteCommand] authenticated fallback error: ${_fbErr.message}`);
@@ -5923,6 +6178,8 @@ Please try again or search with different terms.`;
       scrolls:         skill === 'app.agent' ? (raw.scrolls         ?? null) : undefined,
       accumulatedText: skill === 'app.agent' ? (raw.accumulatedText || null) : undefined,
       aborted:         skill === 'app.agent' ? (raw.aborted         ?? false) : undefined,
+      botBlocked:      raw.botBlocked === true,
+      blocked:         (raw.blocked === true || raw.botBlocked === true) || undefined,
       steps:        skill === 'video.agent' ? (raw.steps       || null) : undefined,
       pageTitle:    skill === 'video.agent' ? (raw.pageTitle   || null) : undefined,
       pageContent:  skill === 'video.agent' ? (raw.pageContent || null) : undefined,
@@ -7212,6 +7469,13 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
     const newWebAgentFallbackUrls = (skill === 'web.agent' && stepResult.ok && Array.isArray(raw.fallbackUrls))
       ? raw.fallbackUrls
       : (state.webAgentFallbackUrls || []);
+    // Capture isPage/verified so the isPage guard (Step 3) can block curl of page URLs
+    const newWebAgentBestIsPage = (skill === 'web.agent' && stepResult.ok && typeof raw.isPage === 'boolean')
+      ? raw.isPage
+      : (state.webAgentBestIsPage ?? false);
+    const newWebAgentBestVerified = (skill === 'web.agent' && stepResult.ok && typeof raw.verified === 'boolean')
+      ? raw.verified
+      : (state.webAgentBestVerified ?? false);
 
     // ── Save-as-named-skill offer (Phase 3) ──────────────────────────────────
     // browser.agent returns saveSkillOffer after a verified mutation success.
@@ -7250,6 +7514,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         lastOpenedFilePath,
         webAgentBestUrl: newWebAgentBestUrl,
         webAgentFallbackUrls: newWebAgentFallbackUrls,
+        webAgentBestIsPage: newWebAgentBestIsPage,
+        webAgentBestVerified: newWebAgentBestVerified,
         deferredSaveSkillOffer: _incomingOffer || _stashedOffer || null,
         commandExecuted: isLastStep,
         answer: lastStepAnswer,
@@ -7284,6 +7550,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         lastOpenedFilePath,
         webAgentBestUrl: newWebAgentBestUrl,
         webAgentFallbackUrls: newWebAgentFallbackUrls,
+        webAgentBestIsPage: newWebAgentBestIsPage,
+        webAgentBestVerified: newWebAgentBestVerified,
         deferredSaveSkillOffer: null,  // consumed — clear the stash
         recoveryAction: 'ask_user',
         pendingQuestion: {
@@ -7312,6 +7580,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       lastOpenedFilePath,
       webAgentBestUrl: newWebAgentBestUrl,
       webAgentFallbackUrls: newWebAgentFallbackUrls,
+      webAgentBestIsPage: newWebAgentBestIsPage,
+      webAgentBestVerified: newWebAgentBestVerified,
       commandExecuted: isLastStep,
       answer: lastStepAnswer,  // set so voice service _stategraphLaneResponse gets it for TTS
       thinking: state._synthThinking || state.thinking || null
