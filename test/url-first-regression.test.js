@@ -1922,6 +1922,88 @@ describe('_buildSearchCriteriaUrl: intent gate removed', () => {
   });
 });
 
+// ── _isSearchCriteriaTask: semantic veto + regex fallback ────────────────────
+// Regression for: "regarding the walmart and target addresses for locators
+// email me these addresses" being misrouted to Gmail #search/subject:… instead
+// of #inbox?compose=new. Two layers: (a) semantic veto — when the once-per-turn
+// classifier says the task is a mutation (send_email), soft criteria signals
+// (regarding/about/subject:/unread) are the email's fields, not filters;
+// (b) fallback regex — the /i flag previously made [A-Z] match any letter.
+describe('_isSearchCriteriaTask: semantic veto + fallback', () => {
+  let _isSearchCriteriaTask;
+  try {
+    _isSearchCriteriaTask = require('../../mcp-services/command-service/src/skills/browser.agent.cjs')._isSearchCriteriaTask;
+  } catch (e) {
+    console.log(`  [skip] browser.agent.cjs not loadable: ${e.message}`);
+  }
+
+  if (_isSearchCriteriaTask) {
+    const SEND_EMAIL = { interactiveActions: ['send_email'] };
+    const LOGIN_ONLY = { interactiveActions: ['login'] };
+    const NO_ACTIONS = { interactiveActions: [] };
+
+    // ── Semantic veto layer ──
+    it('send_email + "regarding … email me" → NOT criteria (the reported bug)', () => {
+      expect(_isSearchCriteriaTask(
+        'regarding the walmart and target addresses for locators email me these addresses',
+        SEND_EMAIL
+      )).toBe(false);
+    });
+    it('send_email + "compose an email to: bob with subject: hi" → NOT criteria (field names vetoed)', () => {
+      expect(_isSearchCriteriaTask(
+        "compose an email to: bob@example.com with subject: hi",
+        SEND_EMAIL
+      )).toBe(false);
+    });
+    it('send_email + hard operator "from:Bob" → STILL criteria (find-then-act)', () => {
+      expect(_isSearchCriteriaTask(
+        'find the email from:Bob and forward it to me',
+        SEND_EMAIL
+      )).toBe(true);
+    });
+    it('send_email + "is:unread" → STILL criteria (hard operator survives veto)', () => {
+      expect(_isSearchCriteriaTask(
+        'find is:unread emails and email me a summary',
+        SEND_EMAIL
+      )).toBe(true);
+    });
+    it('no actions + "find unread emails" → criteria', () => {
+      expect(_isSearchCriteriaTask('find unread emails', NO_ACTIONS)).toBe(true);
+    });
+    it('login-only actions + "find unread emails" → criteria (login is non-mutation)', () => {
+      expect(_isSearchCriteriaTask('find unread emails', LOGIN_ONLY)).toBe(true);
+    });
+    it('unknown action → veto skipped, regex decides', () => {
+      expect(_isSearchCriteriaTask('find unread emails', { interactiveActions: ['frobnicate'] })).toBe(true);
+    });
+
+    // ── Fallback regex layer (classification absent — identical to before) ──
+    it('null classification: exact prompt → NOT criteria ("regarding the" is not a proper-noun phrase)', () => {
+      expect(_isSearchCriteriaTask(
+        'regarding the walmart and target addresses for locators email me these addresses'
+      )).toBe(false);
+    });
+    it('null classification: "find unread emails from my pastor wendall" → criteria', () => {
+      expect(_isSearchCriteriaTask('find unread emails from my pastor wendall')).toBe(true);
+    });
+    it('null classification: "emails regarding Walmart" → criteria (capital + mail noun)', () => {
+      expect(_isSearchCriteriaTask('find emails regarding Walmart')).toBe(true);
+    });
+    it('null classification: bare "regarding walmart" → NOT criteria (lowercase, no mail context)', () => {
+      expect(_isSearchCriteriaTask('regarding walmart')).toBe(false);
+    });
+    it('null classification: "emails with subject: invoice" → criteria', () => {
+      expect(_isSearchCriteriaTask('emails with subject: invoice')).toBe(true);
+    });
+    it('null classification: "is:unread from:boss" → criteria (hard operators)', () => {
+      expect(_isSearchCriteriaTask('is:unread from:boss')).toBe(true);
+    });
+    it('null classification: "check my email" → NOT criteria (no signals)', () => {
+      expect(_isSearchCriteriaTask('check my email')).toBe(false);
+    });
+  }
+});
+
 console.log(`  Results: ${_passed} passed, ${_failed} failed`);
 if (_failures.length > 0) {
   console.log('\n  Failures:');

@@ -52,6 +52,39 @@ function loadAnswerPrompts() {
   }
 }
 
+// Build the RECENT CONVERSATION HISTORY block injected into answer prompts.
+// Recall queries ("list my last 8 prompts", "what did I ask 3 ago") get the
+// full loaded window plus a dedicated user-prompts list — interleaved
+// user/assistant turns mean a small slice hides most prompts (observed: -12
+// yielded ~6 user turns, so "last 8 prompts" answered "only six exist").
+// Exported for unit tests.
+function _buildRecallHistoryBlock(conversationHistory = [], isConversationRecall = false) {
+  const recentHistory = conversationHistory.slice(isConversationRecall ? -30 : -5);
+  const historyBlock = recentHistory.map((msg, i) => {
+    const role = msg.role === 'assistant' ? 'Previous AI Response (may contain errors)' : 'User';
+    return `[${i + 1}] ${role}: ${msg.content?.substring(0, 300) || 'No content'}`;
+  }).join('\n');
+  let text = `\n\n=== RECENT CONVERSATION HISTORY ===\n${historyBlock}\n=== END HISTORY ===\n\nCRITICAL: The conversation history above contains previous AI responses that may contain hallucinations or errors. For temporal queries (dates, times, "yesterday", "today", etc.), prioritize the actual memory data provided below over any dates mentioned in conversation history. Conversation history is only for context, not factual accuracy.`;
+  if (isConversationRecall) {
+    // Dedicated user-only list — assistant replies can't dilute the count, so
+    // "list my last N prompts" / "N prompts ago" has a precisely countable list
+    // spanning all loaded sessions.
+    const promptLines = conversationHistory
+      .filter(m => m.role === 'user')
+      .slice(-40)
+      .map((m, i) => {
+        const when = m.formattedDate?.absolute || m.timestamp || '';
+        return `[${i + 1}] ${m.content?.substring(0, 300) || 'No content'}${when ? ` — ${when}` : ''}`;
+      }).join('\n');
+    if (promptLines) {
+      text += `\n\n=== RECENT USER PROMPTS (oldest → newest, may span multiple sessions) ===\n${promptLines}\n=== END USER PROMPTS ===`;
+    }
+    text += `\n\nThe conversation history is listed from OLDEST to NEWEST. The LAST entry with role "User" is the most recent prompt the user sent (immediately before this question). For "what did I just ask you" / "my last prompt" / "previous prompt", answer with that exact message. For "N prompts ago", count backward from the last User entry.`;
+    text += `\n\nCRITICAL: The conversation history above IS your memory of past prompts. You DO have access to it. For questions about what the user asked, use the entries with role "User" in the RECENT CONVERSATION HISTORY — and for count/list questions ("list my last N prompts"), use the RECENT USER PROMPTS list, which contains ONLY your prompts (no AI replies) and can span multiple sessions. Quote or summarize the actual user messages. Do NOT say you cannot access previous prompts, and do NOT claim the list is exhaustive unless it clearly covers the requested count.`;
+  }
+  return text;
+}
+
 module.exports = async function answer(state) {
   const ANSWER_PROMPTS = loadAnswerPrompts();
   const {
@@ -307,18 +340,7 @@ module.exports = async function answer(state) {
   // 2. ALL memory_retrieve queries (to prevent date hallucinations)
   // 3. Conversation-recall meta-questions ("what did I ask you three prompts ago")
   if ((state._needsContextInterpretation || _isConversationFollowUp || _isMemoryRetrieve || _isConversationRecall) && conversationHistory.length > 0) {
-    // Recall queries need a wider window so "three prompts ago" is actually visible.
-    const recentHistory = conversationHistory.slice(_isConversationRecall ? -12 : -5);
-    const historyBlock = recentHistory.map((msg, i) => {
-      const role = msg.role === 'assistant' ? 'Previous AI Response (may contain errors)' : 'User';
-      return `[${i + 1}] ${role}: ${msg.content?.substring(0, 300) || 'No content'}`;
-    }).join('\n');
-    systemInstructions += `\n\n=== RECENT CONVERSATION HISTORY ===\n${historyBlock}\n=== END HISTORY ===\n\nCRITICAL: The conversation history above contains previous AI responses that may contain hallucinations or errors. For temporal queries (dates, times, "yesterday", "today", etc.), prioritize the actual memory data provided below over any dates mentioned in conversation history. Conversation history is only for context, not factual accuracy.`;
-    // For recall queries, the LLM must USE the history — not deny access to it.
-    if (_isConversationRecall) {
-      systemInstructions += `\n\nThe conversation history is listed from OLDEST to NEWEST. The LAST entry with role "User" is the most recent prompt the user sent (immediately before this question). For "what did I just ask you" / "my last prompt" / "previous prompt", answer with that exact message. For "N prompts ago", count backward from the last User entry.`;
-      systemInstructions += `\n\nCRITICAL: The conversation history above IS your memory of past prompts. You DO have access to it. For questions about what the user asked, use the entries with role "User" in the RECENT CONVERSATION HISTORY. Quote or summarize the actual user messages. Do NOT say you cannot access previous prompts.`;
-    }
+    systemInstructions += _buildRecallHistoryBlock(conversationHistory, _isConversationRecall);
   }
 
   systemInstructions += '\n\nRules:';
@@ -774,3 +796,5 @@ Respond with ONLY valid JSON: {"correctIntent":"<intent>"}`;
     };
   }
 };
+
+module.exports._buildRecallHistoryBlock = _buildRecallHistoryBlock;

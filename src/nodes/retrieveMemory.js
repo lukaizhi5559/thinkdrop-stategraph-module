@@ -14,7 +14,7 @@ const { parseLlmJson } = require('../utils/parseLlmJson');
 // ("did I send messages about X", "list my last 8 prompts", "what did we
 // discuss"). They need cross-session message fetches even without a parsed
 // date range. Exported for unit tests.
-const CONV_RECALL_QUERY_RE = /\b(did i|have i|i'?ve|list my|my (last|recent|past|previous)|what did (i|we)|what were (my|the)|show (me )?my)\b.{0,60}\b(prompt\w*|messages?|emails?|texts?|ask\w*|sen[dt]\w*|search\w*|sa(y|id)|talk\w*|discuss\w*|chat\w*|conversation\w*|wrote|regarding|about)\b/i;
+const CONV_RECALL_QUERY_RE = /\b(did i|have i|i'?ve|list my|repeat my|my (last|recent|past|previous)|what did (i|we)|what was (the|my) (last|first|previous)|what were (my|the)|show (me )?my)\b.{0,60}\b(prompt\w*|messages?|emails?|texts?|ask\w*|sen[dt]\w*|search\w*|sa(y|id)|talk\w*|discuss\w*|chat\w*|conversation\w*|request\w*|question\w*|wrote|regarding|about)\b/i;
 
 /**
  * Format an ISO timestamp into human-readable absolute + relative date
@@ -507,7 +507,7 @@ async function retrieveMemory(state) {
           })
         : (isRecallQuery
             ? mcpAdapter.callService('conversation', 'message.listByDate', {
-                limit: 50,
+                limit: 100,
                 userId: context?.userId
               }).catch(err => {
                 logger.warn('[Node:RetrieveMemory] Cross-session recall fetch failed:', err.message);
@@ -658,7 +658,10 @@ async function retrieveMemory(state) {
         };
       })
       .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-      .slice(-30); // keep last 30 for date-range queries (more history needed)
+      // Recall queries fetched the newest 100 across all sessions — keep them
+      // all so answer.js's RECENT USER PROMPTS section can reach ~50 prompts.
+      // Everything else stays at 30 for date-range queries.
+      .slice(isRecallQuery ? -100 : -30);
 
     // Process memories with formatted timestamps
     const memories = (memoriesData.results || []).map(mem => {
@@ -711,7 +714,7 @@ async function retrieveMemory(state) {
     }
 
     // Merge semantic search hits into the history (dedupe by message id,
-    // chronological sort, keep the newest 30).
+    // chronological sort). Recall keeps up to 100; everything else newest 30.
     let finalHistory = conversationHistory;
     if (crossSessionSearchResults.length > 0) {
       const seenIds = new Set(conversationHistory.map(m => m.id).filter(Boolean));
@@ -723,7 +726,7 @@ async function retrieveMemory(state) {
       }
       finalHistory = merged
         .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-        .slice(-30);
+        .slice(isRecallQuery ? -100 : -30);
     }
 
     return {

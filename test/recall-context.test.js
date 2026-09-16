@@ -55,10 +55,14 @@ const { parseDateRange } = require('../src/utils/parseDateRange');
 const retrieveMemory = require('../src/nodes/retrieveMemory.js');
 const planSkillsV2 = require('../src/nodes/planSkillsV2.js');
 const resolveReferencesV2 = require('../src/nodes/resolveReferencesV2.js');
+const answer = require('../src/nodes/answer.js');
+const synthesize = require('../src/nodes/synthesize.js');
 
 const { _selectPriorSynthesis } = planSkillsV2;
 const { _collectSessionResults } = resolveReferencesV2;
 const { CONV_RECALL_QUERY_RE } = retrieveMemory;
+const { _buildRecallHistoryBlock } = answer;
+const { _hasBounceMarker } = synthesize;
 
 // ─── parseDateRange — word-boundary month matching ───────────────────────────
 
@@ -115,6 +119,22 @@ describe('CONV_RECALL_QUERY_RE — recall detection', () => {
 
   it('"what were my recent searches" → true', () => {
     assert(CONV_RECALL_QUERY_RE.test('what were my recent searches'));
+  });
+
+  it('"repeat my last request" → true', () => {
+    assert(CONV_RECALL_QUERY_RE.test('repeat my last request'));
+  });
+
+  it('"what was the last thing i asked" → true', () => {
+    assert(CONV_RECALL_QUERY_RE.test('what was the last thing i asked'));
+  });
+
+  it('"show me my earlier questions" → true', () => {
+    assert(CONV_RECALL_QUERY_RE.test('show me my earlier questions'));
+  });
+
+  it('"what was the last movie i watched" → false (activity, not recall)', () => {
+    assert(!CONV_RECALL_QUERY_RE.test('what was the last movie i watched'));
   });
 
   it('"what\'s my name" → false (profile query, not recall)', () => {
@@ -216,6 +236,68 @@ describe('_collectSessionResults — session result enrichment', () => {
     assertEq(callCount, 0);
     await _collectSessionResults(mcpAdapter, ['a', 'b', 'c', 'd', 'e'], 'cur', _noopLogger);
     assertEq(callCount, 3, 'should cap at 3 session fetches');
+  });
+});
+
+// ─── _buildRecallHistoryBlock — recall answer window ─────────────────────────
+
+describe('_buildRecallHistoryBlock — recall window + prompts section', () => {
+  const _mkHistory = (n) => Array.from({ length: n }, (_, i) => ({
+    role: i % 2 === 0 ? 'user' : 'assistant',
+    content: `msg ${i}`,
+    timestamp: `2026-09-15 ${String(10 + Math.floor(i / 2)).padStart(2, '0')}:00:00`,
+    formattedDate: { absolute: `Sep 15 ${i}` },
+  }));
+
+  it('recall: interleaved block shows up to 30 messages (not 12)', () => {
+    const text = _buildRecallHistoryBlock(_mkHistory(40), true);
+    const entries = (text.match(/Previous AI Response|User:/g) || []).length;
+    assert(entries >= 29, `expected ~30 entries in interleaved block, got ${entries}`);
+  });
+
+  it('recall: RECENT USER PROMPTS section lists up to 40 user prompts with dates', () => {
+    const text = _buildRecallHistoryBlock(_mkHistory(80), true);
+    assert(text.includes('=== RECENT USER PROMPTS'), 'missing prompts section');
+    const section = text.split('=== RECENT USER PROMPTS')[1].split('=== END USER PROMPTS')[0];
+    const lines = section.trim().split('\n').filter(l => /^\[\d+\]/.test(l));
+    assertEq(lines.length, 40, 'prompts section should hold the last 40 user prompts');
+    assert(lines[0].includes('msg 0'), 'oldest first');
+    assert(lines[lines.length - 1].includes('msg 78'), 'newest last');
+    assert(lines[0].includes('Sep 15'), 'entries carry dates');
+  });
+
+  it('non-recall: keeps the -5 slice and no prompts section', () => {
+    const text = _buildRecallHistoryBlock(_mkHistory(40), false);
+    const entries = (text.match(/\[\d+\]/g) || []).length;
+    assertEq(entries, 5, 'non-recall should show last 5 only');
+    assert(!text.includes('RECENT USER PROMPTS'), 'no prompts section for non-recall');
+  });
+});
+
+// ─── _hasBounceMarker — strong/weak bounce gating ────────────────────────────
+
+describe('_hasBounceMarker — bounce detection', () => {
+  it('strong marker alone → true', () => {
+    assert(_hasBounceMarker('From: Mail Delivery Subsystem — Address not found', 'confirm email sent'));
+  });
+
+  it('"address not found" in a store-locator context → false (generic phrase)', () => {
+    const ctx = 'Target store locator: no results — address not found for ZIP 99999';
+    assert(!_hasBounceMarker(ctx, 'summarize the store locations'));
+  });
+
+  it('weak marker + mail context + send prompt → true', () => {
+    const ctx = 'Sent Mail — Location Addresses — delivery report: address not found';
+    assert(_hasBounceMarker(ctx, 'confirm the email was sent'));
+  });
+
+  it('weak marker + mail context + non-send prompt → false', () => {
+    const ctx = 'Inbox: delivery report — address not found (gmail)';
+    assert(!_hasBounceMarker(ctx, 'summarize my inbox'));
+  });
+
+  it('no bounce markers → false', () => {
+    assert(!_hasBounceMarker('Email sent successfully to bob@example.com', 'confirm email sent'));
   });
 });
 

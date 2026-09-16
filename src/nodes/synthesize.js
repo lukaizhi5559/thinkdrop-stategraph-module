@@ -10,6 +10,25 @@
 
 const fs = require('fs');
 
+// Delivery-bounce detection. When confirming a sent email, the sent thread can
+// contain a Mail Delivery Subsystem bounce ("Address not found") — the message
+// WAS sent; the bounce only concerns recipient delivery.
+//
+// Strong markers are mail-specific and sufficient alone. Weak markers
+// ("address not found", "couldn't be found") are generic — a store-locator or
+// geocoding synthesis can legitimately contain them — so they only count when
+// the context is clearly email-related AND the prompt is a send-verification.
+const _BOUNCE_STRONG = /mail delivery subsystem|delivery status notification|undeliverable|delivery has failed|message (wasn'?t|was not) delivered|returned to sender/i;
+const _BOUNCE_WEAK = /address not found|couldn'?t be found/i;
+const _MAIL_CONTEXT = /mail|e-?mail|gmail|recipient|inbox|sent (mail|items|folder)|compose|subject:/i;
+const _SEND_VERIFY = /sent|send|deliver|confirm|went through|did it (go|send)/i;
+
+function _hasBounceMarker(synthesisContext, prompt) {
+  const ctx = synthesisContext || '';
+  if (_BOUNCE_STRONG.test(ctx)) return true;
+  return _BOUNCE_WEAK.test(ctx) && _MAIL_CONTEXT.test(ctx) && _SEND_VERIFY.test(prompt || '');
+}
+
 module.exports = async function synthesizeNode(state) {
   const {
     logger,
@@ -51,7 +70,7 @@ module.exports = async function synthesizeNode(state) {
   // Subsystem bounce ("Address not found"). The message WAS sent — the bounce
   // concerns delivery to the recipient address, not the send action. Without
   // this instruction the LLM reports "the email failed to send".
-  const _hasBounce = /mail delivery subsystem|address not found|delivery status notification|undeliver|couldn'?t be found|delivery has failed/i.test(synthesisContext || '');
+  const _hasBounce = _hasBounceMarker(synthesisContext, synthesisPrompt || queryMessage);
   const _bounceNote = _hasBounce
     ? `\n\nIMPORTANT: The context contains a mail-delivery bounce notification (e.g. "Mail Delivery Subsystem — Address not found"). This means the email WAS sent — the bounce only concerns whether the recipient address could receive it. Report the send as successful, and mention the bounce as a separate delivery caveat (e.g. "sent, but it may not have been delivered — the recipient address bounced").`
     : '';
@@ -156,3 +175,5 @@ If the raw output is missing the specific field the user asked about, say so dir
     return { ...state, answer: `[Synthesis failed: ${error.message}]`, needsSynthesis: false };
   }
 };
+
+module.exports._hasBounceMarker = _hasBounceMarker;

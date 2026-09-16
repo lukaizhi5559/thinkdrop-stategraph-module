@@ -2511,6 +2511,10 @@ module.exports = async function preflightAgents(state) {
           sessionId: (a.agentId || '').replace(/\.agent$/, '_agent'),
           headed: false,
           hidden: true,
+          // Forward the once-per-turn semantic classification so the deep-link
+          // resolver can veto fuzzy search-criteria matches on mutation tasks
+          // (e.g. "email me X" must not become a Gmail #search/ URL).
+          taskClassification: _tc,
         },
       }, { timeoutMs: 30000 }).catch(() => null);
       const result = res?.data || res;
