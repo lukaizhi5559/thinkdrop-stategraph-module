@@ -63,6 +63,7 @@ const { _collectSessionResults } = resolveReferencesV2;
 const { CONV_RECALL_QUERY_RE } = retrieveMemory;
 const { _buildRecallHistoryBlock } = answer;
 const { _hasBounceMarker } = synthesize;
+const { classifyTask } = require('../src/utils/classifyTask.js');
 
 // ─── parseDateRange — word-boundary month matching ───────────────────────────
 
@@ -236,6 +237,60 @@ describe('_collectSessionResults — session result enrichment', () => {
     assertEq(callCount, 0);
     await _collectSessionResults(mcpAdapter, ['a', 'b', 'c', 'd', 'e'], 'cur', _noopLogger);
     assertEq(callCount, 3, 'should cap at 3 session fetches');
+  });
+});
+
+// ─── classifyTask — screen clarification follow-up regression ────────────────
+
+describe('classifyTask — screen clarification follow-up', () => {
+  const history = [
+    { role: 'user', content: 'what this here' },
+    { role: 'assistant', content: 'This is a Copilot Screen Assistant snippet comparing AI models for planning.' },
+    { role: 'user', content: 'do you agree with the response or not?' },
+    { role: 'assistant', content: 'There are caveats to that recommendation.' },
+    { role: 'user', content: 'why not' },
+    { role: 'assistant', content: 'Because the task complexity matters.' },
+    { role: 'user', content: 'what would you suggest' },
+    { role: 'assistant', content: 'Use the engineering-focused model for architecture.' },
+  ];
+
+  it('exposes the full context window + clarification signal to the LLM', async () => {
+    let prompt = '', sysPrompt = '';
+    await classifyTask(
+      'are you referring to the models still',
+      history,
+      { generateAnswer: async (p, opts) => { prompt = p; sysPrompt = opts?.context?.systemInstructions || ''; return JSON.stringify({ taskType: 'query', isFollowUp: true, followUpTarget: 'the AI model comparison', isScreenFollowUp: false, webAccessMode: 'none' }); } },
+      _noopLogger,
+      'PRIOR SCREEN CONTEXT (captured 1 min ago): App: Google Chrome, Window: Google AI Mode',
+    );
+    assert(prompt.includes('what this here'), 'classifier prompt should retain the original screen question');
+    assert(prompt.includes('what would you suggest'), 'classifier prompt should retain intervening turns');
+    assert(prompt.includes('PRIOR SCREEN CONTEXT'), 'classifier prompt should carry the prior screen block');
+    assert(/are you referring to/i.test(sysPrompt), 'system prompt should list clarification phrasing as a follow-up signal');
+  });
+
+  it('passes the LLM-resolved follow-up through without forcing', async () => {
+    const result = await classifyTask(
+      'are you referring to the models still',
+      history,
+      { generateAnswer: async () => JSON.stringify({ taskType: 'query', isFollowUp: true, followUpTarget: 'the AI model comparison', isScreenFollowUp: false, webAccessMode: 'none' }) },
+      _noopLogger,
+      'PRIOR SCREEN CONTEXT (captured 1 min ago): App: Google Chrome, Window: Google AI Mode',
+    );
+    assert(result.isFollowUp, 'LLM-resolved follow-up should pass through');
+    assertEq(result.followUpTarget, 'the AI model comparison', 'resolved referent should pass through');
+    assert(!result.isScreenFollowUp, 'conversation referent should not force screen context');
+  });
+
+  it('does not turn a standalone still-model definition into a follow-up', async () => {
+    const result = await classifyTask(
+      'what is a still model',
+      [],
+      { generateAnswer: async () => JSON.stringify({ taskType: 'query', isFollowUp: false, followUpTarget: null, isScreenFollowUp: false, webAccessMode: 'none' }) },
+      _noopLogger,
+    );
+    assert(!result.isFollowUp, 'standalone definition should not be a follow-up');
+    assert(!result.isScreenFollowUp, 'standalone definition should not use screen context');
   });
 });
 

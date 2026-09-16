@@ -325,7 +325,8 @@ module.exports = async function answer(state) {
   // include the actual conversation history so LLM can resolve ambiguous references.
   // This is critical for queries like "check for me now" where the raw message has no topic
   // signal and the LLM must rely on prior turns to understand what is being asked.
-  const _isConversationFollowUp = !!(state._taskClassification?.isFollowUp && state._taskClassification?.followUpTarget);
+  // Inject on isFollowUp alone: an unresolved referent needs history MORE, not less.
+  const _isConversationFollowUp = !!state._taskClassification?.isFollowUp;
   const _isMemoryRetrieve = intentType === 'memory_retrieve';
 
   // ── Conversation-recall meta-questions ──────────────────────────────────────

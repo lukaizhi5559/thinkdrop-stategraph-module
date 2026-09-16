@@ -448,6 +448,47 @@ module.exports = async function decomposePromptV2(state) {
       intentPlan: subPrompts,
     };
   }
+
+  // Conversation follow-ups with a resolved topic are knowledge lookups, not
+  // service automation. webSearch uses followUpTarget as the concrete query.
+  if (
+    _tc.taskType === 'query' &&
+    _tc.isFollowUp &&
+    _tc.followUpTarget &&
+    !_tc.isScreenFollowUp &&
+    !_tc.isConversationRecall &&
+    !_tc.isActivityQuery &&
+    !_tc.isAppUiInspection &&
+    !_tc.isSpatialAnalysis &&
+    !_tc.targetService &&
+    !_tc.requiresDOM &&
+    !_hasMultiGoalConjunction
+  ) {
+    logger.info(`[Node:DecomposePromptV2] Query-follow-up guard: routing to web_search for resolved topic "${_tc.followUpTarget}"`);
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'web_search',
+      confidence: 0.9,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'query-followup-guard', intent: 'web_search',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'web_search', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'web_search', 0.9);
+    return {
+      ...state,
+      _decomposedIntent: 'web_search',
+      _decomposedBy: 'query-followup-guard',
+      intentPlan: subPrompts,
+    };
+  }
   if (_SINGLE_STEP_TASK_TYPES.has(_tc.taskType) && !_hasMultiGoalConjunction) {
     logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step command_automate (taskType=${_tc.taskType}, no multi-goal conjunction) — skipping LLM decision`);
     const subPrompts = [{

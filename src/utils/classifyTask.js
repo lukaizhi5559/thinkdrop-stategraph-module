@@ -70,8 +70,10 @@ Field rules:
   1. Pronouns & demonstratives: it, this, that, these, those, they, them, one, same, such, the former, the latter, there, here
   2. Definite-article references to prior context: "the file", "the folder", "the result", "the script", "the code", "the project", "the email", "the document", "the previous [X]", "the above", "that [X]" (e.g. "that folder", "that python", "that directory")
   3. Temporal/additive continuation signals: "now [action]" (e.g. "now email that"), "also", "as well", "too", "what about [X]", "how about [X]"
+  4. Clarification/confirmation questions about the assistant's prior claims or an established topic: "are you referring to X", "do you mean X", "did you mean X", "when you say X", "are you talking about X", "is that what you mean", "are you asking about X", "you mean X?" — these continue the prior topic even though they name a concrete noun (e.g. "models") instead of using a pronoun.
   If the message uses ANY word/phrase that refers back to something established in RECENT CONVERSATION, set isFollowUp:true — even if the specific word is not listed above.
   - META-QUESTION EXCEPTION: Set isFollowUp to FALSE when the user is asking ABOUT THE CONVERSATION ITSELF — i.e., meta-questions that request the assistant to inspect, recall, or summarize prior turns of the chat transcript. Signals: "what did I (just) ask", "what did I say", "what did we talk about", "what was my last question", "what did you just say", "what did I ask you (two messages ago / earlier / before)", "summarize our conversation", "what have we been discussing", "repeat what I said". These are NOT topic continuations — they are requests to read the transcript. Do NOT resolve a followUpTarget for these.
+  - EPISODIC-QUERY EXCEPTION: "what about [time period]" continuing an activity or work question ("what about this week", "what about today", "and yesterday?") is a NEW episodic query — isFollowUp:false, isActivityQuery:true — not a topic continuation.
 
 - followUpTarget: if isFollowUp is true AND recent conversation clearly shows what it refers to, provide the resolved concrete subject. This includes: a file path from a prior command, a topic/subject discussed (e.g. "Vietnam weather", "the Python script", "SpaceX stock"), a named entity, or any other concrete referent established in the conversation. Set to null only when the referent genuinely cannot be determined from history.
   - CRITICAL: Set followUpTarget to null when isFollowUp is false (including the META-QUESTION EXCEPTION above). A non-null followUpTarget with isFollowUp=false is invalid.
@@ -142,6 +144,7 @@ Field rules:
   2. The user message refers to something on screen using a deictic ("this", "it", "that") OR asks for info/explanation without naming a new specific topic
   3. The message does NOT start a clearly unrelated new topic (e.g. "search for X", "open Y", "remind me to Z")
   4. The RECENT CONVERSATION does NOT contain a clear named topic that the message is more likely referring to (e.g. a country, city, person, product, service, website). If conversation history has an established subject and the message is a short follow-up ("check for me now", "what about that?", "do it"), set isScreenFollowUp:false — the follow-up is to the conversation, not the screen.
+     CRITICAL BOUNDARY: questions about the ASSISTANT'S PRIOR STATEMENT are always conversation follow-ups, even when that statement described screen content — "are you referring to X", "do you mean X", "when you say X", "still talking about X?" → isScreenFollowUp:false. Content the assistant already summarized lives in the conversation; the user is querying the claim, not the pixels. isScreenFollowUp:true is for screen content the assistant has NOT yet addressed — a visible error, an unremarked dialog, "what does this error mean".
   Set false when no PRIOR SCREEN CONTEXT is present.
 
 - needsFreshScreen: true when ALL of the following hold:
@@ -159,26 +162,18 @@ EXAMPLES (meta-questions — isFollowUp MUST be false, followUpTarget MUST be nu
   User: "what did I just ask you three prompts ago" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
   User: "remind me what we were just talking about" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":true}
 
-EXAMPLES (webAccessMode):
-  User: "download a sound of connecting to the internet mp3" → {"taskType":"browser","webAccessMode":"download"}
+EXAMPLES (webAccessMode — one per decision boundary):
   User: "find a short bird chirp mp3 and save it to my desktop" → {"taskType":"browser","webAccessMode":"download"}
   User: "download a bird sound from freemusicarchive.org" → {"taskType":"browser","targetService":"freemusicarchive","webAccessMode":"download"}
   User: "goto amazon and look up cheap exercise equipment" → {"taskType":"browser","targetService":"amazon","webAccessMode":"public_read"}
   User: "show pics of baby clothes for sale on amazon" → {"taskType":"browser","targetService":"amazon","isBrowseOnly":true,"requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
-  User: "show me pictures of vintage toys for sale on eBay" → {"taskType":"browser","targetService":"ebay","isBrowseOnly":true,"requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
-  User: "find images of cheap running shoes on amazon" → {"taskType":"browser","targetService":"amazon","isBrowseOnly":true,"requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
-  User: "show me baby clothes listings on walmart" → {"taskType":"browser","targetService":"walmart","isBrowseOnly":true,"requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
   User: "add baby clothes to my amazon cart" → {"taskType":"browser","targetService":"amazon","requiresDOM":true,"webAccessMode":"interactive","interactiveActions":["add_to_cart"]}
   User: "filter amazon results by price under $50" → {"taskType":"browser","targetService":"amazon","requiresDOM":true,"webAccessMode":"interactive","interactiveActions":["filter_ui"]}
-  User: "sort ebay results by lowest price" → {"taskType":"browser","targetService":"ebay","requiresDOM":true,"webAccessMode":"interactive","interactiveActions":["sort_ui"]}
   User: "Open Etsy and search for 'wooden cross wall art' then click the first result" → {"taskType":"browser","targetService":"etsy","requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
-  User: "Search Amazon for baby clothes and open the first product" → {"taskType":"browser","targetService":"amazon","requiresDOM":false,"webAccessMode":"public_read","interactiveActions":[]}
   User: "look online for other pizzas that are good" → {"taskType":"browser","webAccessMode":"public_read"}
-  User: "any new game systems out recently" → {"taskType":"query","webAccessMode":"public_read"}
   User: "what's the latest on the spacex launch" → {"taskType":"query","webAccessMode":"public_read"}
   User: "read this article https://example.com/post" → {"taskType":"browser","webAccessMode":"public_read"}
   User: "send an email via gmail" → {"taskType":"messaging","targetService":"gmail","webAccessMode":"interactive"}
-  User: "add this item to my amazon cart" → {"taskType":"browser","targetService":"amazon","requiresDOM":true,"webAccessMode":"interactive"}
   User: "create a notion todo for tomorrow" → {"taskType":"browser","targetService":"notion","requiresDOM":true,"webAccessMode":"interactive"}
   User: "go to chatgpt and ask it about vegan food" → {"taskType":"browser","targetService":"chatgpt","webAccessMode":"interactive"}
   User: "post on twitter" → {"taskType":"browser","targetService":"twitter","requiresDOM":true,"webAccessMode":"interactive"}
@@ -198,6 +193,8 @@ EXAMPLES (genuine follow-ups — isFollowUp true, followUpTarget resolved):
   User: "what are they about" (after retrieving memories) → {"taskType":"query","isFollowUp":true,"followUpTarget":"retrieved memories"}
   User: "now email that to me" (after retrieving info) → {"taskType":"messaging","isFollowUp":true,"followUpTarget":"retrieved info"}
   User: "I need the links for these as well" (after listing videos) → {"taskType":"query","isFollowUp":true,"followUpTarget":"video links"}
+  User: "are you referring to the models still" (after a screen answer comparing AI models and a short exchange about them) → {"taskType":"query","isFollowUp":true,"followUpTarget":"the AI model comparison","isScreenFollowUp":false}
+  User: "what does this error mean" (screen shows an npm error not yet discussed) → {"taskType":"query","isScreenFollowUp":true}
 
 EXAMPLES (image analysis — isImageAnalysis MUST be true):
   User: "scan the images and tell me what they are" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":true}
@@ -236,7 +233,7 @@ const { parseLlmJson } = require('./parseLlmJson');
  * @param {object} logger
  * @returns {Promise<object>} classification object (always resolves, never throws)
  */
-async function classifyTask(userMessage, conversationHistory, llmBackend, logger, priorScreenSummary, activeAppContext) {
+async function classifyTask(userMessage, conversationHistory, llmBackend, logger, priorScreenSummary, activeAppContext, options = {}) {
   const _default = {
     taskType: 'ambiguous',
     isFollowUp: false,
@@ -265,7 +262,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
   // Force-override these patterns so the user gets a reliable recall response.
   // Keep the pattern narrow — only meta-questions about the chat transcript itself,
   // NOT queries about past activity/episodic memory (those are memory_retrieve).
-  const CONVERSATION_RECALL_RE = /\b(?:what did i (?:just )?ask(?:ed)?|what did i (?:just )?say|what did we talk about|what were we (?:just )?talking about|what did we discuss|did we (?:talk|speak|chat|discuss)|have we (?:talked|discussed|spoken|mentioned)|what was my (?:last|previous|recent) (?:question|prompt|message)|what did you (?:just )?say|what did i ask you .* ago|summarize our conversation|what have we been (?:discussing|talking about)|repeat what i said|remind me what we were talking about|go back to what i said (?:earlier|before)|look (?:that |it )?up in (?:your |the )?(?:memory|conversation|chat|history)|check (?:your |the )?(?:memory|conversation|chat|history)|in our (?:conversation|chat|history))\b/i;
+  const CONVERSATION_RECALL_RE = /\b(?:what did i (?:just )?ask(?:ed)?|what did i (?:just )?say|what did we talk about|what were we (?:just )?talking about|what did we discuss|did we (?:talk|speak|chat|discuss)|have we (?:talked|discussed|spoken|mentioned)|what was my (?:last|previous|recent) (?:question|prompt|message)|what did you (?:just )?say|what did i ask you .* ago|summarize our conversation|what have we been (?:discussing|talking about)|repeat what i said|remind me what we were talking about|go back to what i said (?:earlier|before)|look (?:that |it )? up in (?:your |the )?(?:memory|conversation|chat|history)|check (?:your |the )?(?:memory|conversation|chat|history)|in our (?:conversation|chat|history))\b/i;
   if (CONVERSATION_RECALL_RE.test(userMessage)) {
     logger.info(`[classifyTask] Deterministic conversation-recall match: "${userMessage.slice(0, 80)}"`);
     return {
@@ -278,8 +275,12 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
   }
 
   try {
-    const recentCtx = (conversationHistory || []).slice(-6)
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 300)}`)
+    // Keep enough context to survive a few short conversational turns between
+    // a screen answer and a clarification. The classifier previously saw only
+    // six messages, so a 3-turn exchange could hide the original screen answer
+    // before the next clarification was classified.
+    const recentCtx = (conversationHistory || []).slice(-16)
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 500)}`)
       .join('\n');
 
     // Cross-session semantic matches are merged into conversationHistory and
@@ -310,7 +311,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
 
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
-      context: { systemInstructions: CLASSIFY_SYSTEM_PROMPT },
+      context: { systemInstructions: options.systemPrompt || CLASSIFY_SYSTEM_PROMPT },
     }, { maxTokens: 120, temperature: 0, fastMode: true, taskType: 'classification' });
 
     const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
@@ -347,16 +348,20 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     if (requiresDOM) webAccessMode = 'interactive';
     else if (parsed.taskType === 'browser' && webAccessMode === 'none') webAccessMode = 'interactive'; // fail-safe
 
+    const parsedIsScreenFollowUp = !!parsed.isScreenFollowUp;
+    const parsedIsFollowUp = !!parsed.isFollowUp;
+    const parsedFollowUpTarget = parsed.followUpTarget || null;
+
     return {
       taskType:            parsed.taskType           || _default.taskType,
-      isFollowUp:          !!parsed.isFollowUp,
-      followUpTarget:      parsed.followUpTarget      || null,
+      isFollowUp:          parsedIsFollowUp,
+      followUpTarget:      parsedFollowUpTarget,
       needsClarification:  !!parsed.needsClarification,
       targetService:       parsed.targetService       || null,
       isRecurring:         !!parsed.isRecurring,
       isBrowseOnly:        !!parsed.isBrowseOnly,
       requiresDOM,
-      isScreenFollowUp:    !!parsed.isScreenFollowUp,
+      isScreenFollowUp:    parsedIsScreenFollowUp,
       needsFreshScreen:    !!parsed.needsFreshScreen,
       isAppUiInspection:   !!parsed.isAppUiInspection,
       isSpatialAnalysis:   !!parsed.isSpatialAnalysis,
@@ -372,4 +377,4 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
   }
 }
 
-module.exports = { classifyTask };
+module.exports = { classifyTask, CLASSIFY_SYSTEM_PROMPT };

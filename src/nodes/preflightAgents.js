@@ -357,11 +357,24 @@ async function _llmExtractFileCandidate(llmBackend, userMessage, logger) {
 async function _llmNeedsLoginCheck(llmBackend, userMessage, logger) {
   if (!llmBackend) return 1;
   try {
-    const prompt = `You are a task classifier. Determine whether the following user request requires the user to be logged in or signed into an account to accomplish the goal. Return ONLY a single digit: 0 if the task can be completed without logging in, 1 if a login/sign-in is required.\n\nUser request: "${userMessage}"`;
+    const prompt = `You are a task classifier. Determine whether the following user request requires the user to be logged in or signed into an account to accomplish the goal. Return ONLY a single digit: 0 if the task can be completed without logging in, 1 if a login/sign-in is required.
+
+Return 0 (no login needed) for tasks that work anonymously on public sites:
+- Browsing, searching, viewing products/listings, reading prices or reviews
+- Adding items to a shopping cart on retail/marketplace sites (Walmart, Amazon, Target, eBay, Etsy, etc.) — guest carts work without an account
+- Reading public pages, documentation, videos, maps, directions, store locators
+
+Return 1 (login required) only for tasks that fundamentally need an account:
+- Sending/reading email, DMs, or posting content
+- Accessing account pages, order history, saved playlists/libraries, subscriptions
+- Checkout, payment, or purchase completion (NOT just adding to cart)
+- Anything explicitly asking for "my" account data (orders, messages, playlists)
+
+User request: "${userMessage}"`;
     const raw = await llmBackend.generateAnswer(prompt, { query: prompt }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
     const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
-    if (text.startsWith('0')) return 0;
-    if (text.startsWith('1')) return 1;
+    if (text.startsWith('0')) { logger.info(`[Node:PreflightAgents] LLM login-need check answered "0" (no login) for: "${userMessage.slice(0, 80)}"`); return 0; }
+    if (text.startsWith('1')) { logger.info(`[Node:PreflightAgents] LLM login-need check answered "1" (login required) for: "${userMessage.slice(0, 80)}"`); return 1; }
     logger.warn(`[Node:PreflightAgents] LLM login-need check returned unexpected value: "${text}" — defaulting to 1`);
     return 1;
   } catch (e) {
@@ -862,15 +875,17 @@ module.exports = async function preflightAgents(state) {
     if (spec.type !== 'browser') continue;
     if (spec._alreadyExisted) continue; // agent.list will handle it — no _newlyCreated flag
     const _newAgentId = spec.agentId.endsWith('.agent') ? spec.agentId : `${spec.agentId}.agent`;
+    const _newBypassed = _bypassAuth.has(_newAgentId.toLowerCase());
     agentReadiness.push({
       type: 'browser',
       agentId: _newAgentId,
       ready: true,
-      authed: _skipBrowserAuthForTask,
+      authed: _skipBrowserAuthForTask || _newBypassed,
+      authBypassed: _newBypassed,
       authType: 'browser_oauth',
       iconUrl: agentIdToIconUrl(_newAgentId, spec.startUrl),
       startUrl: spec.startUrl || null,
-      needsLogin: !_skipBrowserAuthForTask,
+      needsLogin: !(_skipBrowserAuthForTask || _newBypassed),
       sessionStale: false,
       _newlyCreated: true,
     });
@@ -2226,7 +2241,7 @@ module.exports = async function preflightAgents(state) {
     // or a previous auth attempt failed before recording authed_at). For these,
     // let the silent preflight probe run with requireCookieConfirmation=true
     // so the cookie sniff can detect existing auth and skip the auth banner.
-    const _forceAuth = a._newlyCreated;
+    const _forceAuth = a._newlyCreated && !_bypassAuth.has((a.agentId || '').toLowerCase());
     // Never-authenticated (but not newly created) agents require cookie
     // confirmation before the probe may declare them authenticated.
     a._requireCookieConfirmation = !a.authedAt && !a._newlyCreated;

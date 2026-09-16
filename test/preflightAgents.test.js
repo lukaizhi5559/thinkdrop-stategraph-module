@@ -47,6 +47,10 @@ function makeState({ authSequence, agents, gatherCredentialResult, gatherAnswerR
       if (service === 'command' && action === 'agent.list') {
         return { data: agents || [] };
       }
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'browser.agent' && payload?.args?.action === 'build_agent') {
+        const svc = payload.args.service;
+        return { data: { ok: true, agentId: `${svc}.agent`, alreadyExists: false, service: svc, startUrl: `https://${svc}.com`, capabilities: ['navigate', 'interact'] } };
+      }
       if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
         return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [] } };
       }
@@ -787,6 +791,29 @@ async function runTests() {
     if (!result.planError) throw new Error('Expected planError because auth is required');
     const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
     if (authCalls.length !== 1) throw new Error(`Expected one browser.agent authenticate call, got ${authCalls.length}`);
+  });
+
+  await it('honors preflightAuthBypass for a newly-created agent even when LLM says login required', async () => {
+    const state = makeState({
+      agents: [],
+      userMessage: "Go to Walmart and search for 'school supplies bulk' then add the first result to my cart",
+      authSequence: [
+        { ok: false, error: 'authenticate should not be called for a bypassed agent' },
+      ],
+      llmBackend: {
+        generateAnswer: async () => '1',
+      },
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'walmart.agent', service: 'walmart', type: 'browser', create: true }] };
+    state.preflightAuthBypass = ['walmart.agent'];
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
+    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === 'walmart.agent');
+    if (!agent) throw new Error('walmart.agent not in preflightResult.agents');
+    if (!agent.authed) throw new Error('Expected walmart.agent to be authed via user bypass');
+    if (agent.authBypassed !== true) throw new Error('Expected authBypassed flag on walmart.agent');
+    const authRequiredEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'walmart.agent');
+    if (authRequiredEvents.length !== 0) throw new Error(`Expected zero preflight:auth_required events for walmart.agent, got ${authRequiredEvents.length}`);
   });
 
   console.log(`\n${'─'.repeat(72)}`);

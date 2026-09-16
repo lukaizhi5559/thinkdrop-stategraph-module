@@ -238,12 +238,19 @@ async function _discoverVerifiedStartUrl(serviceKey, mcpAdapter, logger) {
   // 2. Discover via web.agent.
   let bestUrl = null;
   try {
-    const webRes = await mcpAdapter.callService('command', 'web.agent', {
-      action: 'search_and_navigate',
-      query: `${serviceKey} official website`,
-      preferDomain: serviceKey,
+    const webRes = await mcpAdapter.callService('command', 'command.automate', {
+      skill: 'web.agent',
+      args: {
+        action: 'search_and_navigate',
+        query: `${serviceKey} official website`,
+        preferDomain: serviceKey,
+      },
     }, { timeoutMs: 12000 }).catch(() => null);
-    bestUrl = webRes?.data?.bestUrl || webRes?.bestUrl || null;
+    bestUrl = webRes?.data?.result?.bestUrl
+      || webRes?.data?.bestUrl
+      || webRes?.result?.bestUrl
+      || webRes?.bestUrl
+      || null;
   } catch (err) {
     logger.warn(`[Node:ResolveAgent] web.agent discovery failed for ${serviceKey}: ${err.message}`);
   }
@@ -615,7 +622,9 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
   // the targetService tokens. Mismatches are rejected and the correct agent is
   // created instead. This makes it impossible for a wrong-service agent to be
   // selected when the target service is known.
-  const targetService = (taskClassification?.targetService || taskClassification?.followUpTarget || '').toLowerCase();
+  // followUpTarget is a conversation topic, not a service/domain. Only the
+  // classifier's explicit targetService may trigger domain mismatch correction.
+  const targetService = (taskClassification?.targetService || '').toLowerCase();
   if (targetService) {
     const targetSvcKey = targetService.replace(/[^a-z0-9_]/g, '');
     const targetAgentId = `${targetSvcKey}.agent`;
