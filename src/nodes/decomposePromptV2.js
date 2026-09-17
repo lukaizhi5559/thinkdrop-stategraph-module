@@ -460,6 +460,7 @@ module.exports = async function decomposePromptV2(state) {
     !_tc.isActivityQuery &&
     !_tc.isAppUiInspection &&
     !_tc.isSpatialAnalysis &&
+    !_tc.needsFreshScreen &&
     !_tc.targetService &&
     !_tc.requiresDOM &&
     !_hasMultiGoalConjunction
@@ -489,7 +490,11 @@ module.exports = async function decomposePromptV2(state) {
       intentPlan: subPrompts,
     };
   }
-  if (_SINGLE_STEP_TASK_TYPES.has(_tc.taskType) && !_hasMultiGoalConjunction) {
+  // needsFreshScreen = classifier saw a deictic screen reference with no cached
+  // context — observational by definition. Skip the automation short-circuit so
+  // the LLM decision can apply its screen_intelligence priority rule instead of
+  // forcing command_automate → app.agent clipboard scraping.
+  if (_SINGLE_STEP_TASK_TYPES.has(_tc.taskType) && !_tc.needsFreshScreen && !_hasMultiGoalConjunction) {
     logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step command_automate (taskType=${_tc.taskType}, no multi-goal conjunction) — skipping LLM decision`);
     const subPrompts = [{
       text: message,

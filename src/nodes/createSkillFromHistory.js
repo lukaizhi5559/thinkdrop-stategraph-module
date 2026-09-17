@@ -266,7 +266,7 @@ ${code}
 }
 
 /**
- * Register skill in DuckDB agents.db
+ * Register skill in DuckDB agents.duckdb
  */
 async function registerSkillInDb(db, skillName, skillPath, iface, logger) {
   if (!db) {

@@ -47,6 +47,25 @@ System info (disk usage, battery, memory) changes constantly — never rely on p
 context for system data. Always re-run the command to get fresh values.
 Required plan: [shell.run (get system info) → synthesize (summarize for user)]
 
+## macOS Screenshots (screencapture)
+
+"Take a screenshot" / "screenshot of this" / "capture my screen" → `shell.run` with `screencapture`. NEVER use `screen.capture` for save-to-file requests — it returns OCR text and saves NO PNG file.
+
+**Rules:**
+- ALWAYS run via `bash -c` — raw `cmd:"screencapture"` argv cannot contain `$(...)` (spawn does not expand shell syntax; the arg is blocked by validation).
+- ALWAYS save to `~/Desktop` — NEVER `/tmp`. Use macOS-style filenames: `Screenshot YYYY-MM-DD at HH.MM.SS.png`.
+- Default is full-screen non-interactive: `screencapture -x <file>`. Use `-i` (interactive region select) ONLY when the user explicitly asks to select a region/window — otherwise the step hangs and times out.
+- ALWAYS end the script with `echo "\"$f\""` (quoted) so the saved path lands in stdout — downstream `synthesize` steps read it via `{{LAST_SUCCESSFUL.outputs.filePaths[0]}}`. Unquoted paths with spaces are NOT extracted.
+- Do NOT add curl calls to hide ThinkDrop's overlay — `shell.run` automatically flash-hides its own UI around `screencapture`.
+
+**Canonical pattern (emit verbatim):**
+```json
+[
+  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "f=\"$HOME/Desktop/Screenshot $(date '+%Y-%m-%d at %H.%M.%S').png\"; screencapture -x \"$f\" && echo \"\\\"$f\\\"\""] }, "description": "Capture full screen to ~/Desktop" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the screenshot was saved to {{LAST_SUCCESSFUL.outputs.filePaths[0]}}." }, "description": "Confirm screenshot saved" }
+]
+```
+
 ## macOS Finder Desktop Icon Arrangement
 
 NEVER use `defaults write com.apple.finder DesktopViewSettings -dict IconViewSettings '{...}'` (macOS rejects nested composite types, exits with code 1). NEVER use `osascript` to set desktop arrangement/view options — ALL AppleScript `set icon view options` / `set arrangement` / `set desktop view options` commands return error -10006 or -1728 on modern macOS (Ventura+). NEVER use `guide.step` or System Preferences/Settings UI for desktop arrangement — it is ALWAYS solvable with PlistBuddy.

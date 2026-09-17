@@ -64,6 +64,7 @@ const { CONV_RECALL_QUERY_RE } = retrieveMemory;
 const { _buildRecallHistoryBlock } = answer;
 const { _hasBounceMarker } = synthesize;
 const { classifyTask } = require('../src/utils/classifyTask.js');
+const decomposePromptV2 = require('../src/nodes/decomposePromptV2.js');
 
 // ─── parseDateRange — word-boundary month matching ───────────────────────────
 
@@ -291,6 +292,51 @@ describe('classifyTask — screen clarification follow-up', () => {
     );
     assert(!result.isFollowUp, 'standalone definition should not be a follow-up');
     assert(!result.isScreenFollowUp, 'standalone definition should not use screen context');
+  });
+});
+
+// ─── decomposePromptV2 — screen-observation short-circuit guard ──────────────
+// Regression: passive screen reads classified local_system were force-routed to
+// command_automate by the single-step short-circuit, skipping the LLM decision
+// whose screen_intelligence rule would have caught them. needsFreshScreen must
+// bypass the short-circuit; plain local_system must not.
+
+describe('decomposePromptV2 — screen-observation guard', () => {
+  it('needsFreshScreen + local_system skips the command_automate short-circuit', async () => {
+    const result = await decomposePromptV2({
+      message: 'sum this up for me on the screen',
+      conversationHistory: [],
+      logger: _noopLogger,
+      llmBackend: { generateAnswer: async () => '1' }, // fast decision → screen_intelligence
+      _taskClassification: { taskType: 'local_system', needsFreshScreen: true },
+    });
+    assert(result._decomposedBy !== 'local-short-circuit', 'must not short-circuit to command_automate');
+    assertEq(result._decomposedIntent, 'screen_intelligence', 'LLM decision should route to screen_intelligence');
+  });
+
+  it('local_system without screen flags still short-circuits to command_automate', async () => {
+    let llmCalled = false;
+    const result = await decomposePromptV2({
+      message: 'take a screenshot',
+      conversationHistory: [],
+      logger: _noopLogger,
+      llmBackend: { generateAnswer: async () => { llmCalled = true; return '0'; } },
+      _taskClassification: { taskType: 'local_system' },
+    });
+    assertEq(result._decomposedIntent, 'command_automate');
+    assertEq(result._decomposedBy, 'local-short-circuit');
+    assert(!llmCalled, 'LLM decision should not be called on the short-circuit');
+  });
+
+  it('needsFreshScreen + query does not get captured by the query-follow-up guard', async () => {
+    const result = await decomposePromptV2({
+      message: 'what does this mean',
+      conversationHistory: [{ role: 'user', content: 'look at the error dialog' }, { role: 'assistant', content: 'I see a dialog.' }],
+      logger: _noopLogger,
+      llmBackend: { generateAnswer: async () => '1' },
+      _taskClassification: { taskType: 'query', isFollowUp: true, followUpTarget: 'the error dialog', needsFreshScreen: true },
+    });
+    assert(result._decomposedIntent !== 'web_search', 'screen deictic must not route to web_search');
   });
 });
 

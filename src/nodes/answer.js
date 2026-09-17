@@ -710,68 +710,9 @@ Please try asking: "help me track down the video links for each one of these wor
       }
     }
 
-    // ── Intent correction detection ───────────────────────────────────────────
-    // If the user's current message is correcting a previous misclassification,
-    // use the LLM to infer the correct intent and store an intent_override so
-    // the same phrasing never misclassifies again.
-    // Fire-and-forget — never blocks the answer from returning.
-    const _CORRECTION_SIGNAL = /\b(no[,\s]+(i meant|i wanted|that should|that was supposed)|not (a |an )?(web.?search|memory|search|lookup)|i (meant|wanted you to|need you to)\s+\w|that (should|was supposed to) (be|have been))\b/i;
-
-    if (_CORRECTION_SIGNAL.test(queryMessage) && mcpAdapter && backend && conversationHistory.length >= 2) {
-      try {
-        const prevUserMsgs = conversationHistory.filter(m => m.role === 'user');
-        const prevPrompt = prevUserMsgs.length > 0 ? prevUserMsgs[prevUserMsgs.length - 1]?.content : null;
-
-        if (prevPrompt && prevPrompt !== queryMessage) {
-          const wrongIntent = intent?.type || null;
-          // Fire-and-forget LLM call — does not block answer
-          (async () => {
-            try {
-              const correctionPrompt = `The user is correcting a previous AI misclassification.
-
-Previous user message: "${prevPrompt}"
-Current correction: "${queryMessage}"
-Previous intent classification: "${wrongIntent}"
-
-What is the CORRECT intent for the previous message? Choose one:
-- command_automate (browse, navigate, open app, run command, file operation)
-- memory_retrieve (recall stored info, what did I, look up my records)
-- memory_store (remember this, save this fact)
-- web_search (search online, look up on web)
-- general_knowledge (question, explain, what is)
-
-Respond with ONLY valid JSON: {"correctIntent":"<intent>"}`;
-
-              const raw = await backend.generateAnswer(correctionPrompt, {
-                context: { systemInstructions: 'You are an intent classifier. Respond with ONLY valid JSON.', intent: intentType },
-              }, { maxTokens: 30, temperature: 0, fastMode: true, taskType: 'classification' });
-
-              const parsed = parseLlmJson(raw, logger, 'Node:Answer:intentCorrection');
-              if (!parsed) return;
-              const correctIntent = parsed.correctIntent;
-
-              if (correctIntent && correctIntent !== wrongIntent) {
-                logger.info(`[Node:Answer] LLM correction: "${prevPrompt.slice(0, 60)}" was ${wrongIntent} → ${correctIntent}`);
-                mcpAdapter.callService('user-memory', 'intent_override.upsert', {
-                  examplePrompt: prevPrompt,
-                  correctIntent,
-                  wrongIntent,
-                  source: 'user_correction',
-                }).then(() => {
-                  logger.info(`[Node:Answer] Intent override stored: "${prevPrompt.slice(0, 60)}" → ${correctIntent}`);
-                }).catch(e => {
-                  logger.debug(`[Node:Answer] intent_override.upsert failed (non-fatal): ${e.message}`);
-                });
-              }
-            } catch (e) {
-              logger.debug(`[Node:Answer] LLM correction detection failed (non-fatal): ${e.message}`);
-            }
-          })();
-        }
-      } catch (e) {
-        logger.debug(`[Node:Answer] Correction detection setup failed (non-fatal): ${e.message}`);
-      }
-    }
+    // Intent-correction detection was removed — the intent_overrides store was
+    // retired (write path existed but the read path was deleted with
+    // parseIntent.js, so corrections were collected but never applied).
 
     return {
       ...state,

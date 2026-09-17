@@ -54,6 +54,7 @@ const SERVICE_HOST_ALIASES = {
   anthropic: ['anthropic.com', 'claude.ai'],
   twitter:   ['twitter.com', 'x.com'],
   x:         ['x.com', 'twitter.com'],
+  grok:      ['grok.com', 'x.ai'],
   deepseek:  ['deepseek.com', 'chat.deepseek.com'],
   perplexity:['perplexity.ai'],
   reddit:    ['reddit.com'],
@@ -140,6 +141,30 @@ function _messageMentionsServiceOrAgent(userMessage, registeredAgents) {
     if (token.length < 3) continue; // skip very short tokens (a, an, the)
     for (const name of names) {
       if (fuzzyMatch(token, name)) return true;
+    }
+  }
+  return false;
+}
+
+// Check if the user message explicitly names ONE specific agent/service — e.g.
+// "grok" in "ask grok and chatgpt this question". Used by the domain-mismatch
+// guard to exempt agents the user asked for by name: the guard exists to fix
+// wrong-service selections on prompts that never named a service, not to strip
+// agents the user explicitly requested alongside the targetService.
+function _messageMentionsAgent(userMessage, agentId, service) {
+  if (!userMessage) return false;
+  const tokens = (userMessage.toLowerCase().match(/[a-z0-9]+/g) || []).filter(t => t.length >= 3);
+  if (tokens.length === 0) return false;
+  const names = new Set();
+  if (agentId) names.add(agentId.toLowerCase().replace(/\.agent$/, ''));
+  if (service) names.add(service.toLowerCase());
+  const svcKey = (service || (agentId || '').replace(/\.agent$/, '')).toLowerCase().replace(/[^a-z0-9_]/g, '');
+  for (const alias of (SERVICE_HOST_ALIASES[svcKey] || [])) {
+    names.add(alias.toLowerCase().replace(/^www\./, '').replace(/\.[a-z]+$/, ''));
+  }
+  for (const token of tokens) {
+    for (const name of names) {
+      if (name.length >= 3 && fuzzyMatch(token, name)) return true;
     }
   }
   return false;
@@ -634,7 +659,11 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
       if (a.create) continue; // only validate registered (non-create) agents
       const regAgent = (registeredAgents || []).find(r => r.id?.toLowerCase() === a.agentId);
       const agentStartUrl = regAgent?.start_url || regAgent?.startUrl || null;
-      if (agentStartUrl && !_domainsMatchService(agentStartUrl, targetService)) {
+      // Exempt agents the user explicitly named in the message — the guard fixes
+      // wrong-service selections, not prompts that intentionally name multiple
+      // services (e.g. "ask grok and chatgpt" with targetService="chatgpt").
+      if (agentStartUrl && !_domainsMatchService(agentStartUrl, targetService)
+          && !_messageMentionsAgent(userMessage, a.agentId, a.service)) {
         rejected.push(a);
       }
     }
@@ -847,4 +876,5 @@ module.exports._resolveStartUrlForService = _resolveStartUrlForService;
 module.exports._discoverVerifiedStartUrl = _discoverVerifiedStartUrl;
 module.exports._httpGetBody = _httpGetBody;
 module.exports._messageMentionsServiceOrAgent = _messageMentionsServiceOrAgent;
+module.exports._messageMentionsAgent = _messageMentionsAgent;
 module.exports._domainsMatchService = _domainsMatchService;

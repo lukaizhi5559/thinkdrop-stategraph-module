@@ -57,12 +57,15 @@ function startTestServer(handler) {
   });
 }
 
-function makeMcpAdapter({ cachedUrl, discoveredUrl, writable = true }) {
+function makeMcpAdapter({ cachedUrl, discoveredUrl, writable = true, registeredAgents = null }) {
   const calls = [];
   return {
     calls,
     async callService(service, action, payload, opts) {
       calls.push({ service, action, payload, opts });
+      if (service === 'command' && action === 'agent.list') {
+        return { data: registeredAgents || [] };
+      }
       if (service === 'user-memory' && action === 'profile.get') {
         return cachedUrl ? { data: { valueRef: cachedUrl } } : { data: null };
       }
@@ -70,7 +73,8 @@ function makeMcpAdapter({ cachedUrl, discoveredUrl, writable = true }) {
         if (!writable) throw new Error('profile.set disabled');
         return { ok: true };
       }
-      if (service === 'command' && action === 'web.agent') {
+      if (service === 'command' && (action === 'web.agent'
+          || (action === 'command.automate' && payload?.skill === 'web.agent'))) {
         return discoveredUrl ? { data: { bestUrl: discoveredUrl } } : { ok: false, error: 'no results' };
       }
       return null;
@@ -353,6 +357,86 @@ async function runTests() {
     if (result.resolveAgentResult?.question !== null) throw new Error('Expected question: null for local_system');
     const listCalls = adapter.calls.filter(c => c.service === 'command' && c.action === 'agent.list');
     if (listCalls.length !== 0) throw new Error(`Expected no agent.list call for local_system, got ${listCalls.length}`);
+  });
+
+  section('Multi-service mention exemption');
+  // Regression: "ask grok and chatgpt this question and compare the two" was
+  // collapsed to chatgpt.agent alone — the domain-mismatch guard rejected
+  // grok.agent because singular targetService was 'chatgpt' (from follow-up
+  // context), even though the user explicitly named both services.
+  const _regAgents = [
+    { id: 'grok.agent', type: 'browser', start_url: 'https://grok.com/' },
+    { id: 'chatgpt.agent', type: 'browser', start_url: 'https://chatgpt.com/' },
+    { id: 'notion.agent', type: 'browser', start_url: 'https://notion.so/' },
+    { id: 'linear.agent', type: 'browser', start_url: 'https://linear.app/' },
+  ];
+
+  await it('keeps multiple explicitly-named agents when targetService matches only one', async () => {
+    const userMessage = 'ask grok and chatgpt this question and compare the two';
+    const adapter = makeMcpAdapter({ registeredAgents: _regAgents });
+    const llmBackend = {
+      async generateAnswer() {
+        return JSON.stringify({
+          agents: [
+            { agentId: 'grok.agent', role: 'ask Grok the question', exists: true, create: false },
+            { agentId: 'chatgpt.agent', role: 'ask ChatGPT the question', exists: true, create: false },
+          ],
+          reasoning: 'User named both services.',
+          question: null,
+        });
+      },
+    };
+    const state = {
+      intent: { type: 'command_automate' },
+      message: userMessage,
+      resolvedMessage: userMessage,
+      llmBackend,
+      mcpAdapter: adapter,
+      logger: { info() {}, warn() {}, debug() {}, error() {} },
+      _taskClassification: { taskType: 'browser', targetService: 'chatgpt', isFollowUp: true, followUpTarget: 'how many kids does Elon Musk have' },
+    };
+    const result = await resolveAgent(state);
+    const ids = (result.resolveAgentResult?.agents || []).map(a => a.agentId).sort();
+    if (ids.join(',') !== 'chatgpt.agent,grok.agent') {
+      throw new Error(`Expected both agents kept, got ${JSON.stringify(ids)}`);
+    }
+  });
+
+  await it('still rejects a wrong-service agent the user did not name', async () => {
+    const userMessage = 'check my open linear tickets';
+    const adapter = makeMcpAdapter({ registeredAgents: _regAgents });
+    const llmBackend = {
+      async generateAnswer() {
+        return JSON.stringify({
+          agents: [
+            { agentId: 'linear.agent', role: 'list open tickets', exists: true, create: false },
+            { agentId: 'notion.agent', role: 'check notion board', exists: true, create: false },
+          ],
+          reasoning: 'Hallucinated notion alongside linear.',
+          question: null,
+        });
+      },
+    };
+    const state = {
+      intent: { type: 'command_automate' },
+      message: userMessage,
+      resolvedMessage: userMessage,
+      llmBackend,
+      mcpAdapter: adapter,
+      logger: { info() {}, warn() {}, debug() {}, error() {} },
+      _taskClassification: { taskType: 'browser', targetService: 'linear' },
+    };
+    const result = await resolveAgent(state);
+    const ids = (result.resolveAgentResult?.agents || []).map(a => a.agentId);
+    if (!ids.includes('linear.agent')) throw new Error(`Expected linear.agent kept, got ${JSON.stringify(ids)}`);
+    if (ids.includes('notion.agent')) throw new Error('notion.agent should be rejected — not named in the message');
+  });
+
+  const { _messageMentionsAgent } = resolveAgent;
+  await it('_messageMentionsAgent detects explicit service names', () => {
+    if (!_messageMentionsAgent('ask grok and chatgpt this question', 'grok.agent', 'grok')) throw new Error('should detect grok');
+    if (!_messageMentionsAgent('ask grok and chatgpt this question', 'chatgpt.agent', 'chatgpt')) throw new Error('should detect chatgpt');
+    if (_messageMentionsAgent('check my open linear tickets', 'notion.agent', 'notion')) throw new Error('should not detect notion');
   });
 
   console.log(`\n${'─'.repeat(72)}`);

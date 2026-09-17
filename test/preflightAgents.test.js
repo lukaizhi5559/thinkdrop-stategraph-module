@@ -816,6 +816,88 @@ async function runTests() {
     if (authRequiredEvents.length !== 0) throw new Error(`Expected zero preflight:auth_required events for walmart.agent, got ${authRequiredEvents.length}`);
   });
 
+  section('Mid-run preflight decisions (live bypass / continue / unverifiable)');
+
+  await it('clears an auth failure when "Proceed without" lands mid-run', async () => {
+    const state = makeState({
+      agents: [
+        { id: 'bypassme.agent', type: 'browser', service: 'bypassme', capabilities: ['navigate'], status: 'healthy' },
+      ],
+      authSequence: [
+        { ok: false, error: 'network unreachable' },
+      ],
+      userMessage: 'do something with bypassme',
+    });
+    state.preflightAuthBypass = [];
+    // Simulate the UI "Proceed without" click landing while the probe runs —
+    // main.js pushes into this same array (shared by reference into live state).
+    const origCall = state.mcpAdapter.callService.bind(state.mcpAdapter);
+    state.mcpAdapter.callService = async (svc, action, payload, opts) => {
+      const r = await origCall(svc, action, payload, opts);
+      if (payload?.args?.action === 'authenticate') state.preflightAuthBypass.push('bypassme.agent');
+      return r;
+    };
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
+    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === 'bypassme.agent');
+    if (!agent) throw new Error('bypassme.agent not in preflightResult.agents');
+    if (!agent.authed) throw new Error('Expected bypassme.agent authed after mid-run bypass');
+    if (agent.authBypassed !== true) throw new Error('Expected authBypassed flag on bypassme.agent');
+    const ready = state._progressEvents.filter(e => e.type === 'preflight:agent_ready' && e.agentId === 'bypassme.agent');
+    if (ready.length < 1) throw new Error('Expected preflight:agent_ready for bypassed agent');
+  });
+
+  await it('parks persistent unverifiable browser probes as auth-required (not hard fail)', async () => {
+    const state = makeState({
+      agents: [
+        { id: 'botwall.agent', type: 'browser', service: 'botwall', capabilities: ['navigate'], status: 'healthy' },
+      ],
+      authSequence: [
+        { ok: false, unverifiable: true, error: 'page blank after hidden retry' },
+      ],
+      userMessage: 'do something with botwall',
+    });
+    const result = await preflightAgents(state);
+    if (!result.planError) throw new Error('Expected planError for unverifiable auth');
+    if (result.preflightAuthRequired !== true) throw new Error('Expected preflightAuthRequired=true for unverifiable probe');
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'botwall.agent');
+    if (authEvents.length < 1) throw new Error('Expected preflight:auth_required for unverifiable agent');
+    const failedEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_failed' && e.agentId === 'botwall.agent');
+    if (failedEvents.length !== 0) throw new Error(`Expected no auth_failed event for unverifiable agent, got ${failedEvents.length}`);
+  });
+
+  await it('re-verifies agents queued via mid-run auth_continue', async () => {
+    const state = makeState({
+      agents: [
+        { id: 'retryagent.agent', type: 'browser', service: 'retryagent', capabilities: ['navigate'], status: 'healthy' },
+      ],
+      authSequence: [
+        { ok: false, error: 'network unreachable' },
+        { ok: true, agentId: 'retryagent.agent', authed: true },
+      ],
+      userMessage: 'do something with retryagent',
+    });
+    state._authContinueQueued = [];
+    // Simulate "I've already signed in" landing mid-probe — the first
+    // authenticate call fails, the queued re-verify consumes the second.
+    const origCall = state.mcpAdapter.callService.bind(state.mcpAdapter);
+    let pushed = false;
+    state.mcpAdapter.callService = async (svc, action, payload, opts) => {
+      const r = await origCall(svc, action, payload, opts);
+      if (!pushed && payload?.args?.action === 'authenticate') {
+        pushed = true;
+        state._authContinueQueued.push('retryagent.agent');
+      }
+      return r;
+    };
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
+    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === 'retryagent.agent');
+    if (!agent?.authed) throw new Error('Expected retryagent.agent authed after queued re-verify');
+    const ready = state._progressEvents.filter(e => e.type === 'preflight:agent_ready' && e.agentId === 'retryagent.agent');
+    if (ready.length < 1) throw new Error('Expected preflight:agent_ready after re-verify');
+  });
+
   console.log(`\n${'─'.repeat(72)}`);
   if (_failed === 0) {
     console.log(`✅ All ${_passed} tests passed.`);

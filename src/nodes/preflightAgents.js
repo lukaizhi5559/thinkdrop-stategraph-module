@@ -528,6 +528,16 @@ module.exports = async function preflightAgents(state) {
       .filter(Boolean)
       .map(s => String(s).toLowerCase())
   );
+  // Live re-check: main.js pushes into state.preflightAuthBypass while this
+  // node is still running (mid-run "Proceed without" click). The array is
+  // shared by reference into the live state, so re-reading it catches
+  // bypasses that arrived after this node started.
+  const _isBypassedNow = (agentId) => {
+    const id = String(agentId || '').toLowerCase();
+    if (_bypassAuth.has(id)) return true;
+    const live = state.preflightAuthBypass;
+    return Array.isArray(live) && live.some(x => String(x).toLowerCase() === id);
+  };
   const gatherAnswerCallback = state.gatherAnswerCallback || null;
   const gatherCredentialCallback = state.gatherCredentialCallback || null;
 
@@ -2199,7 +2209,12 @@ module.exports = async function preflightAgents(state) {
         error: `auth check transport error: ${err?.message || 'unknown error'}`,
       }));
       const authPayload = authRes?.data || authRes || {};
-      if (!authPayload.ok) {
+      // Only surface the sign-in banner for a REAL auth need — a login wall
+      // (authRequired) or a credential ask (api_key/bearer/basic). Emitting
+      // auth_required on any failure (probe crash, transport error) shows a
+      // misleading "Sign into X" card while the retry is still in flight —
+      // and the buttons can't resolve mid-run.
+      if (!authPayload.ok && (authPayload.authRequired === true || authPayload.askUser === true)) {
         _emitProgress({
           type: 'preflight:auth_required',
           agentId: a.agentId,
@@ -2217,6 +2232,23 @@ module.exports = async function preflightAgents(state) {
 
   const authFailures = [];
   for (const a of browserAgentsNeedingAuth) {
+    // ── Live mid-run bypass: user clicked "Proceed without" while preflight
+    // was running. Mark authed for this run only — no probe, no failure.
+    if (_isBypassedNow(a.agentId)) {
+      logger.info(`[Node:PreflightAgents] ${a.agentId} bypassed mid-run by user — marking authed for this run only`);
+      a.authed = true;
+      a.ready = true;
+      a.authBypassed = true;
+      warnings.push({ type: 'auth_bypassed', message: `${a.agentId} sign-in skipped by user — running unauthenticated` });
+      _emitProgress({
+        type: 'preflight:agent_ready',
+        agentId: a.agentId,
+        iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
+        message: `${a.agentId} proceeding without sign-in`,
+      });
+      continue;
+    }
+
     // ── LLM login-need gate: if the prompt clearly does not require sign-in,
     // mark browser agents as authed without running the probe or showing the popup.
     if (_skipBrowserAuthForTask && a.type === 'browser') {
@@ -2309,6 +2341,21 @@ module.exports = async function preflightAgents(state) {
     let attempts = 0;
     let authRes = null;
     while (attempts < 2) {
+      // Bypass may have arrived while the previous attempt was in flight.
+      if (_isBypassedNow(a.agentId)) {
+        logger.info(`[Node:PreflightAgents] ${a.agentId} bypassed mid-probe by user — stopping auth attempts`);
+        a.authed = true;
+        a.ready = true;
+        a.authBypassed = true;
+        authRes = { ok: true, bypassed: true };
+        _emitProgress({
+          type: 'preflight:agent_ready',
+          agentId: a.agentId,
+          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
+          message: `${a.agentId} proceeding without sign-in`,
+        });
+        break;
+      }
       authRes = await _authenticateBrowserAgent(a);
       const authPayload = authRes?.data || authRes || {};
       if (authPayload.ok && (authPayload.authVerified === true || authPayload.authed === true)) {
@@ -2327,6 +2374,15 @@ module.exports = async function preflightAgents(state) {
       if (authPayload.ok && authPayload.authVerified !== true && authPayload.authed !== true) {
         authRes = { ok: false, error: 'authentication result was not verified by the selected driver' };
         break;
+      }
+
+      // Browser crashed (chromeCrash) — retryable. browser.agent already
+      // escalates silent probes to hidden-headed mode internally, so a second
+      // attempt covers genuine transient crashes (profile lock races, etc).
+      if (authPayload.chromeCrash === true) {
+        logger.warn(`[Node:PreflightAgents] ${a.agentId} auth probe crashed — retrying once`);
+        attempts++;
+        continue;
       }
 
       // Headless preflight probe detected a login wall. The preflight:auth_required
@@ -2422,6 +2478,23 @@ module.exports = async function preflightAgents(state) {
       const failureReason = authPayload.error || 'auth did not complete';
       a.ready = false;
       a.reason = failureReason;
+      // Persistent unverifiable probe (bot wall / blank page even in hidden
+      // headed mode) — auth state unknown. Park the task as auth-required so
+      // the user gets a working sign-in/bypass card instead of a hard fail.
+      if (authPayload.unverifiable === true) {
+        const _svcKey2 = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
+        logger.info(`[Node:PreflightAgents] ${a.agentId} auth state unverifiable — surfacing preflight:auth_required`);
+        _emitProgress({
+          type: 'preflight:auth_required',
+          agentId: a.agentId,
+          serviceName: _svcKey2,
+          authType: a.authType || 'browser_oauth',
+          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
+          message: `Couldn't verify ${a.agentId} — sign-in may be required`,
+        });
+        authFailures.push({ agentId: a.agentId, reason: 'auth required' });
+        continue;
+      }
       // For browser login walls the preflight:auth_required banner is already shown;
       // don't also show a scary auth-failed warning. Still record the failure so planning
       // is blocked until the user authenticates.
@@ -2436,6 +2509,58 @@ module.exports = async function preflightAgents(state) {
         logger.info(`[Node:PreflightAgents] ${a.agentId} auth pending — waiting for user to sign in via banner`);
       }
       authFailures.push({ agentId: a.agentId, reason: failureReason });
+    }
+  }
+
+  // ── Mid-run "Proceed without" may have landed after an agent already
+  // failed — un-fail bypassed agents so the run can continue instead of
+  // parking for a decision the user already made.
+  for (let i = authFailures.length - 1; i >= 0; i--) {
+    if (_isBypassedNow(authFailures[i].agentId)) {
+      const _unfailed = authFailures[i].agentId;
+      authFailures.splice(i, 1);
+      const _ua = browserAgentsNeedingAuth.find(x => x.agentId === _unfailed);
+      if (_ua) { _ua.authed = true; _ua.ready = true; _ua.authBypassed = true; }
+      warnings.push({ type: 'auth_bypassed', message: `${_unfailed} sign-in skipped by user — running unauthenticated` });
+      _emitProgress({
+        type: 'preflight:agent_ready',
+        agentId: _unfailed,
+        iconUrl: _ua?.iconUrl || agentIdToIconUrl(_unfailed),
+        message: `${_unfailed} proceeding without sign-in`,
+      });
+      logger.info(`[Node:PreflightAgents] ${_unfailed} bypassed mid-run — cleared auth failure`);
+    }
+  }
+
+  // ── Mid-run "I've already signed in" — user asserts auth completed during
+  // the probe window. Re-verify queued agents once; a pass clears the failure.
+  const _continueQueued = Array.isArray(state._authContinueQueued) ? state._authContinueQueued : [];
+  for (const _qc of _continueQueued) {
+    const _qid = String(_qc).toLowerCase();
+    const _failIdx = authFailures.findIndex(f => (f.agentId || '').toLowerCase() === _qid);
+    if (_failIdx < 0) continue;
+    const _qa = browserAgentsNeedingAuth.find(x => (x.agentId || '').toLowerCase() === _qid);
+    if (!_qa) continue;
+    logger.info(`[Node:PreflightAgents] re-verifying ${_qid} after mid-run auth_continue`);
+    _emitProgress({
+      type: 'preflight:auth_starting',
+      agentId: _qa.agentId,
+      message: `Re-verifying ${_qa.agentId} sign-in...`,
+    });
+    const _reRes = await _authenticateBrowserAgent(_qa);
+    const _rePayload = _reRes?.data || _reRes || {};
+    if (_rePayload.ok && (_rePayload.authVerified === true || _rePayload.authed === true)) {
+      markAgentAuthed(_qa.agentId);
+      _qa.authed = true;
+      _qa.ready = true;
+      authFailures.splice(_failIdx, 1);
+      _emitProgress({
+        type: 'preflight:agent_ready',
+        agentId: _qa.agentId,
+        iconUrl: _qa.iconUrl || agentIdToIconUrl(_qa.agentId),
+        message: `${_qa.agentId} authenticated`,
+      });
+      logger.info(`[Node:PreflightAgents] ${_qid} verified after mid-run auth_continue`);
     }
   }
 
