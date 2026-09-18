@@ -123,17 +123,54 @@ function extractTopicFromHistory(conversationHistory) {
  * filtering is handled separately by startDate/endDate in the WHERE
  * clause — this only affects relevance *ranking* within that window.
  */
+// Common abbreviations the user types that won't stem-match their full forms
+// in the FTS index ('appts' → 'appt' ≠ 'appoint'). Expansions are appended so
+// BM25 OR-matching can hit either surface form.
+const EPISODIC_ABBREV_EXPANSIONS = {
+  appt: 'appointment', appts: 'appointment appointments',
+  mtg: 'meeting', mtgs: 'meeting meetings',
+  doc: 'document', docs: 'document documents',
+  msg: 'message', msgs: 'message messages',
+  pic: 'picture photo', pics: 'picture photo pictures photos',
+  cal: 'calendar', addr: 'address', acct: 'account',
+  pw: 'password', rx: 'prescription',
+  info: 'information', conf: 'conference', convo: 'conversation',
+};
+
 function buildEpisodicSearchQuery(query) {
   let q = (query || '').toLowerCase().trim();
   q = q
     .replace(/\b(over|during|in|for)\s+(the\s+)?(past|last|next)\s+(\d+\s+)?(days?|weeks?|months?|hours?)\b/gi, '')
     .replace(/\b(the\s+)?(past|last|next)\s+(week|month|few\s+days?|couple\s+(of\s+)?days?)\b/gi, '')
     .replace(/\b(today|yesterday|this\s+(morning|afternoon|evening|week|month)|last\s+night|recently|lately)\b/gi, '')
+    // Relative date expressions — the dateRange scopes these already
+    .replace(/\b(in\s+)?\d+\s+(days?|weeks?|months?|years?)\s+(from\s+now|ago|later)\b/gi, '')
+    .replace(/\b(a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s+(days?|weeks?|months?|years?)\s+(from\s+now|ago|later)\b/gi, '')
+    // Month/day names are scoped by startDate/endDate — strip them from the
+    // BM25 terms so they don't dilute ranking.
+    .replace(/\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|jun|jul|aug|sept?|oct|nov|dec)\b/gi, '')
+    .replace(/\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)\b/gi, '')
     .replace(/\b(did|do|have|has|was|were|am|is|are)\s+i\b/gi, '')
     .replace(/\b(i|me|my|any|some|the|a|an|on|at|to|of|it|that|this|what|about|nothing|anything|something)\b/gi, '')
     .replace(/[?.!,]+/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim();
+
+  // Drop dangling prepositions left object-less by the strips above
+  // ("appts for november" → "appts").
+  q = q.replace(/\b(for|in|at|on|with|from|by)\b(?=\s*$)/g, '').trim();
+  q = q.replace(/\b(for|in|at|on|with|from|by)\s+(?=\b(?:for|in|at|on|with|from|by)\b)/g, '').trim();
+
+  // Expand abbreviations — append the full form(s) alongside the original so
+  // BM25 matches either spelling in OCR text.
+  const tokens = q.split(/\s+/).filter(Boolean);
+  const expanded = [];
+  for (const t of tokens) {
+    expanded.push(t);
+    const exp = EPISODIC_ABBREV_EXPANSIONS[t];
+    if (exp) expanded.push(...exp.split(/\s+/));
+  }
+  q = [...new Set(expanded)].join(' ');
 
   if (!q || q.length < 3) return 'activity screen apps websites';
 

@@ -145,7 +145,7 @@ Contradiction? (0 or 1)`;
       context: {
         systemInstructions: decisionSystemPrompt,
         sessionId: context?.sessionId,
-        userId: context?.userId || 'default_user',
+        userId: context?.userId || 'local_user',
       },
     }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
@@ -180,7 +180,7 @@ Output ONLY valid JSON:
       context: {
         systemInstructions: 'You are a fact-checking judge. A contradiction was detected between the synthesized answer and the page text. Produce the correct answer from the page text only. Output ONLY valid JSON.',
         sessionId: context?.sessionId,
-        userId: context?.userId || 'default_user',
+        userId: context?.userId || 'local_user',
       },
     }, { maxTokens: 300, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
@@ -236,7 +236,7 @@ Fulfilled? (0 or 1)`;
       context: {
         systemInstructions: systemPrompt,
         sessionId: context?.sessionId,
-        userId: context?.userId || 'default_user',
+        userId: context?.userId || 'local_user',
       },
     }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
@@ -286,7 +286,7 @@ Verdict? (0 or 1)`;
       context: {
         systemInstructions: systemPrompt,
         sessionId: context?.sessionId,
-        userId: context?.userId || 'default_user',
+        userId: context?.userId || 'local_user',
         intent: state.intent?.type || 'command_automate',
       }
     }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
@@ -763,7 +763,7 @@ Output ONLY valid JSON.`;
       context: {
         systemInstructions: REVIEW_SYSTEM_PROMPT,
         sessionId: context?.sessionId,
-        userId: context?.userId || 'default_user',
+        userId: context?.userId || 'local_user',
         intent: state.intent?.type || 'command_automate',
       }
     }, { maxTokens: 300, temperature: 0.1, fastMode: false, taskType: 'complex' });

@@ -160,7 +160,7 @@ async function preResolveSyncSteps(intentPlan, state, logger) {
       if (step.estimatedIntent === 'memory_retrieve' && state.mcpAdapter) {
         const resp = await state.mcpAdapter.callService('user-memory', 'memory.search', {
           query: step.text,
-          userId: state.context?.userId || 'default_user',
+          userId: state.context?.userId || 'local_user',
           limit: 1,
         });
         const mems = resp?.data?.memories || resp?.memories || [];
@@ -270,7 +270,7 @@ module.exports = async function planGenerator(state) {
 
   const userMessage = resolvedMessage || message || '';
   const sessionId = context?.sessionId || null;
-  const userId = context?.userId || 'default_user';
+  const userId = context?.userId || 'local_user';
 
   logger.info(`[Node:PlanGenerator] Generating plan for: "${userMessage.slice(0, 80)}"`);
 

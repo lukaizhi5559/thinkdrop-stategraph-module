@@ -73,7 +73,7 @@ module.exports = async function logConversation(state) {
         logger.warn('[Node:LogConversation] Session routing failed, trying session.create:', routeErr.message);
         try {
           const createResult = await mcpAdapter.callService('conversation', 'session.create', {
-            userId: context?.userId || 'default_user',
+            userId: context?.userId || 'local_user',
             metadata: { source: 'thinkdrop_electron', intent: intent?.type }
           });
           const createData = createResult.data || createResult;

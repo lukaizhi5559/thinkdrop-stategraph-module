@@ -355,7 +355,7 @@ async function injectSecrets(content, { keytarGet, mcpAdapter, logger } = {}) {
       const query = varName.toLowerCase().replace(/_/g, ' ');
       const response = await mcpAdapter.callService('user-memory', 'memory.search', {
         query,
-        userId: 'default_user',
+        userId: 'local_user',
         limit: 1,
       });
       const memories = response?.data?.memories || response?.memories || [];
@@ -393,7 +393,7 @@ async function injectSecrets(content, { keytarGet, mcpAdapter, logger } = {}) {
  * @param {object}   options.logger
  * @returns {Promise<{ stored: string[], failed: string[] }>}
  */
-async function storeSecrets(secrets, { keytarSet, mcpAdapter, userId = 'default_user', logger } = {}) {
+async function storeSecrets(secrets, { keytarSet, mcpAdapter, userId = 'local_user', logger } = {}) {
   const log = logger || console;
   const stored = [];
   const failed = [];

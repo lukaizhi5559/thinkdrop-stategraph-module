@@ -451,10 +451,20 @@ module.exports = async function decomposePromptV2(state) {
 
   // Conversation follow-ups with a resolved topic are knowledge lookups, not
   // service automation. webSearch uses followUpTarget as the concrete query.
+  // Only hijack to web_search when the classifier actually wants web access —
+  // 'none' means the follow-up is about personal/local data and belongs in
+  // memory_retrieve. Also never send a resolved *file path* to Brave.
+  const _followUpTargetIsPath = typeof _tc.followUpTarget === 'string' && (
+    /^~?\//.test(_tc.followUpTarget) ||
+    /^[A-Za-z]:[\\/]/.test(_tc.followUpTarget) ||
+    /\.(rtf|pdf|docx?|xlsx?|csv|txt|md|png|jpe?g|gif|mp4|mov|zip)$/i.test(_tc.followUpTarget)
+  );
   if (
     _tc.taskType === 'query' &&
     _tc.isFollowUp &&
     _tc.followUpTarget &&
+    !_followUpTargetIsPath &&
+    _tc.webAccessMode !== 'none' &&
     !_tc.isScreenFollowUp &&
     !_tc.isConversationRecall &&
     !_tc.isActivityQuery &&

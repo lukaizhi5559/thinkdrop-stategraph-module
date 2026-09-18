@@ -389,7 +389,7 @@ Output ONLY valid JSON.`;
       systemInstructions: systemPrompt,
       conversationHistory: (state.conversationHistory || []).slice(-6),
       sessionId: context?.sessionId,
-      userId: context?.userId || 'default_user',
+      userId: context?.userId || 'local_user',
       intent: 'command_automate'
     }
   };
@@ -598,7 +598,7 @@ Verdict? (0, 1, or 2)`;
       systemInstructions: systemPrompt,
       conversationHistory: (conversationHistory || []).slice(-6),
       sessionId: context?.sessionId,
-      userId: context?.userId || 'default_user',
+      userId: context?.userId || 'local_user',
       intent: 'command_automate'
     }
   };

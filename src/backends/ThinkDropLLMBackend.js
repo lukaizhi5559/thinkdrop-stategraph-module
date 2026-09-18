@@ -20,7 +20,7 @@ class ThinkDropLLMBackend extends LLMBackend {
    * @param {Object} config
    * @param {string} [config.wsUrl='ws://localhost:4000/ws/stream'] - WebSocket endpoint
    * @param {string} [config.apiKey=''] - API key sent as query param
-   * @param {string} [config.userId='default_user'] - User ID sent as query param
+   * @param {string} [config.userId='local_user'] - User ID sent as query param
    * @param {number} [config.connectTimeoutMs=5000] - Connection timeout
    * @param {number} [config.responseTimeoutMs=60000] - Response timeout
    */
@@ -28,7 +28,7 @@ class ThinkDropLLMBackend extends LLMBackend {
     super();
     this.wsUrl = config.wsUrl || process.env.WEBSOCKET_URL || 'ws://localhost:4000/ws/stream';
     this.apiKey = config.apiKey || process.env.WEBSOCKET_API_KEY || '';
-    this.userId = config.userId || 'default_user';
+    this.userId = config.userId || 'local_user';
     this.connectTimeoutMs = config.connectTimeoutMs || 5000;
     this.responseTimeoutMs = config.responseTimeoutMs || 60000;
 
