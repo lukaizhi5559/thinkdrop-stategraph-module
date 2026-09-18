@@ -52,6 +52,39 @@ function loadAnswerPrompts() {
   }
 }
 
+// ── Canned-refusal detection ────────────────────────────────────────────────
+// Free-tier providers occasionally emit canned refusals ("I'm afraid I can't
+// assist with that.") which get logged as assistant turns and then mimicked
+// by the next prompt. Mirrors thinkdrop-backend's REFUSAL_OPENERS approach —
+// normalized startsWith matching + length cap, no regexes. Kept local because
+// stategraph-module cannot import comms-graph. Used to filter poisoned
+// assistant turns out of injected history (stored records are untouched).
+const _REFUSAL_OPENERS = [
+  "i'm afraid i can't", "i'm afraid i cannot", "i am afraid i can't", "i am afraid i cannot",
+  "i can't assist", "i cannot assist", "i can't help with", "i cannot help with",
+  "i can't help you with", "i cannot help you with",
+  "i'm sorry, but i can't", "i'm sorry but i can't", "i'm sorry, but i cannot", "i'm sorry but i cannot",
+  "i'm sorry, i can't assist", "sorry, but i can't",
+  "i'm not able to assist", "i'm unable to", "i am unable to",
+  "i must decline", "i have to decline", "i cannot fulfill", "i can't fulfill",
+  "i cannot comply", "i can't comply", "i can't provide that", "i cannot provide that",
+  "as an ai, i can't", "as an ai, i cannot", "as an ai language model",
+  "unfortunately, i can't assist", "unfortunately, i cannot assist", "unfortunately, i'm unable",
+  "i apologize, but i can't", "i apologize, but i cannot",
+];
+const _REFUSAL_MAX_LEN = 300;
+const _WS_CHARS = new Set([' ', '\t', '\n', '\r', '\f', '\v']);
+function _isCannedRefusal(text) {
+  const s = String(text || '').trimStart().toLowerCase().replaceAll('‘', "'").replaceAll('’', "'");
+  let n = '', inWs = false;
+  for (const ch of s) {
+    if (_WS_CHARS.has(ch)) { if (!inWs) n += ' '; inWs = true; }
+    else { n += ch; inWs = false; }
+  }
+  if (!n || n.length > _REFUSAL_MAX_LEN) return false;
+  return _REFUSAL_OPENERS.some(o => n.startsWith(o));
+}
+
 // Build the RECENT CONVERSATION HISTORY block injected into answer prompts.
 // Recall queries ("list my last 8 prompts", "what did I ask 3 ago") get the
 // full loaded window plus a dedicated user-prompts list — interleaved
@@ -59,6 +92,8 @@ function loadAnswerPrompts() {
 // yielded ~6 user turns, so "last 8 prompts" answered "only six exist").
 // Exported for unit tests.
 function _buildRecallHistoryBlock(conversationHistory = [], isConversationRecall = false) {
+  // Drop canned-refusal assistant turns so poisoned history can't be mimicked.
+  conversationHistory = conversationHistory.filter(m => m.role !== 'assistant' || !_isCannedRefusal(m.content));
   const recentHistory = conversationHistory.slice(isConversationRecall ? -30 : -5);
   const historyBlock = recentHistory.map((msg, i) => {
     const role = msg.role === 'assistant' ? 'Previous AI Response (may contain errors)' : 'User';
@@ -472,7 +507,10 @@ module.exports = async function answer(state) {
     const eventLines = systemEvents.slice(-5).map(m => `  • ${(m.content || '').trim()}`);
     systemInstructions += `\n\n⚠️ SYSTEM EVENTS (treat as current facts — highest priority):\n${eventLines.join('\n')}`;
   }
-  const filteredConversationHistory = conversationHistory.filter(m => m.role !== 'system');
+  // Exclude canned-refusal assistant turns too — this history is passed to the
+  // backend as recentContext, and poisoned turns get mimicked.
+  const filteredConversationHistory = conversationHistory.filter(m =>
+    m.role !== 'system' && !(m.role === 'assistant' && _isCannedRefusal(m.content)));
 
   // ─── Workspace manifest injection (lightweight self-awareness) ──────────────
   // Reads ~/.thinkdrop/manifest.json if present and injects a compact summary
