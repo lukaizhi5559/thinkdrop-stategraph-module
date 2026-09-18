@@ -88,6 +88,7 @@ Rules:
   * Scheduling tasks with NO time or frequency specified — ask for time
   * Scheduling tasks with NO notification/delivery method specified — ask how (macOS notification, ThinkDrop in-app alert, email, text message, write to file)
   * Open/examine/edit a file in an app AND the file name is a bare basename with NO extension and NO path separator (e.g. "UnifiedOverlay", "the readme", "the config file") — ask for the exact file path or extension. Do NOT ask if the file name already has an extension (e.g. "main.py", "instruction.runner.cjs") or an absolute/relative path.
+  * The request asks to start/create/plan/build something with NO clear goal, deliverable, or scope — executing now would force the system to GUESS what to produce (e.g. "start a fishing project", "make a presentation", "I need an app", "let's do an activity") — ask the single most important scoping question (what's the goal or deliverable). Do NOT use this for well-specified requests ("create a file called notes.txt on the desktop") — those are complete.
 - NEVER ask about: timezone, credentials, optional preferences, or things the system can look up.
 - NEVER ask "which service" if the user already named one (gmail, slack, twilio, mailgun, etc.).
 - Browse / search / find / extract / navigate / look up tasks → always {"complete": true}.
@@ -158,6 +159,7 @@ Rules:
   * scheduling (reminders, alarms, cron) with no time or frequency specified
   * scheduling (reminders, alarms, cron) with no notification/delivery method specified (macOS notification, ThinkDrop alert, email, text, write to file)
   * open/examine/edit a file in an app AND the file name is a bare basename with NO extension and NO path separator (e.g. "UnifiedOverlay", "the readme", "the config file") — return 1. Do NOT return 1 if the file name already has an extension (e.g. "main.py", "instruction.runner.cjs") or an absolute/relative path.
+  * the request asks to start/create/plan/build something with NO clear goal, deliverable, or scope — executing now would force the system to GUESS what to produce (e.g. "start a fishing project", "make a presentation", "I need an app", "let's do an activity") — return 1. Do NOT return 1 for well-specified requests ("create a file called notes.txt on the desktop") — those are complete.
 - Return 2 ONLY when a required service appears in UNAUTHENTICATED AGENTS
 - Examples where the notification method is MISSING — return 1:
   "remind me to take out the trash" → 1 (no notification method)
@@ -171,7 +173,7 @@ Rules:
   "notify me via osascript" → 0
 - NEVER ask about: timezone, credentials, optional preferences, or things the system can look up
 - If a required service is NOT listed under UNAUTHENTICATED AGENTS, return 0 — do NOT ask about auth
-- When in doubt → 0`;
+- When in doubt about a slot value → 0. But an under-specified start/create/plan/build request is NEVER a doubt case → 1`;
 
   const userPrompt = `REQUEST: "${originalMsg}"
 TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}${tcBlock}
@@ -363,20 +365,13 @@ module.exports = async function gatherPlanContext(state) {
     return { ...state, resolvedMessage: _enrichedMsg, planGatheringComplete: true, planGatheringSkipped: true };
   }
 
-  // ── Deterministic bypass gate ───────────────────────────────────────────────
-  // Skip clarification entirely when the task is fully specified. This avoids
-  // the LLM readiness call (and the Grill loop's forced round-1 question) for
-  // the common case where classifyTask + resolveAgent + preflight already
-  // determined nothing is missing.
-  if (_shouldBypassGather(state)) {
-    logger.info('[Node:GatherPlanContext] Bypass — task fully specified (needsClarification=false, no agent question, no unauthed agents)');
-    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
-  }
-
   // ── Grill-Me Phase B: batched questioning path ──────────────────────────────
-  // When THINKDROP_GRILL_MODE=1, use the new memory-first batched Q&A loop
-  // instead of the legacy single-question loop. Falls back to legacy if the
-  // grill loop fails for any reason.
+  // Runs BEFORE the deterministic bypass gate: under grill mode the gate's
+  // narrow slot-filling signals (needsClarification=false) wrongly skip
+  // open-ended prompts ("start a fishing project") that the grill loop's
+  // failure-risk lens would question. The grill loop has its own cheap
+  // fast-decision exit for fully-specified tasks.
+  // Falls back to legacy if the grill loop fails for any reason.
   if (GRILL_MODE) {
     try {
       logger.info('[Node:GatherPlanContext] Grill-Me mode enabled — running batched Q&A loop');
@@ -385,6 +380,15 @@ module.exports = async function gatherPlanContext(state) {
       logger.warn(`[Node:GatherPlanContext] Grill-Me loop failed (${grillErr.message}) — falling back to legacy loop`);
       // Fall through to legacy loop
     }
+  }
+
+  // ── Deterministic bypass gate (legacy path only) ────────────────────────────
+  // Skip clarification entirely when the task is fully specified. This avoids
+  // the LLM readiness call for the common case where classifyTask +
+  // resolveAgent + preflight already determined nothing is missing.
+  if (_shouldBypassGather(state)) {
+    logger.info('[Node:GatherPlanContext] Bypass — task fully specified (needsClarification=false, no agent question, no unauthed agents)');
+    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
   }
 
   // ── Inject follow-up target into resolvedMessage for downstream nodes ────────
