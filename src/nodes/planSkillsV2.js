@@ -22,6 +22,19 @@ const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
+// Strip internal source-dump blocks from synthesized content before it can be
+// reused as a message body. executeCommand formats page results as
+// "=== Source: <url> ===\n<raw text>" for internal synthesis — those headers
+// and their raw paragraphs must NEVER reach a user-facing email (observed: a
+// help-center source dump was typed verbatim into a Gmail body).
+function _sanitizeSynthesisBody(text) {
+  let t = String(text || '');
+  if (/={2,}\s*Source:/i.test(t)) {
+    t = t.replace(/={2,}\s*Source:[^\n]*\n?[\s\S]*?(?=\n\s*={2,}\s*Source:|$)/gi, '\n');
+  }
+  return t.replace(/\n{3,}/g, '\n\n').trim();
+}
+
 // Select the prior synthesized result a referent like "email me these
 // addresses" points at. Scans ALL of conversationHistory (not just the last
 // 5 turns — the referent can live in a rotated session, surfaced via
@@ -31,7 +44,7 @@ const { parseLlmJson } = require('../utils/parseLlmJson');
 // confirmation — its "Body Content:" field may still carry the data.
 function _selectPriorSynthesis(conversationHistory = []) {
   const MESSAGING_REQ_RE = /\b(email|e-mail|send|mail|message|text|sms|slack|post|share|forward|reply)\b/i;
-  const CONFIRM_RE = /confirmed sent|email (was )?sent|message (was )?sent|delivery (failed|status|notification)|mail delivery subsystem/i;
+  const CONFIRM_RE = /confirmed sent|email (was |has been )?sent|message (was |has been )?sent|i'?ve sent|sent (the|it|that|your)|delivery (failed|status|notification)|mail delivery subsystem|successfully (sent|delivered)|has been delivered/i;
   const candidates = [];
   for (let i = 0; i < conversationHistory.length; i++) {
     const m = conversationHistory[i];
@@ -42,12 +55,23 @@ function _selectPriorSynthesis(conversationHistory = []) {
       isConfirmation: (prevUser && MESSAGING_REQ_RE.test(prevUser.content || '')) || CONFIRM_RE.test(m.content),
     });
   }
-  const pick = [...candidates].reverse().find(c => !c.isConfirmation) || candidates[candidates.length - 1];
-  if (!pick) return null;
-  const soIdx = pick.content.indexOf('Step outputs:');
-  const after = pick.content.slice(soIdx + 'Step outputs:'.length).trim();
-  const synthMatch = after.match(/\[synthesize\]:\n([\s\S]+?)(?=\n\[|$)/);
-  return (synthMatch ? synthMatch[1] : after).trim().slice(0, 2000);
+  const extract = (c) => {
+    const soIdx = c.content.indexOf('Step outputs:');
+    const after = c.content.slice(soIdx + 'Step outputs:'.length).trim();
+    const synthMatch = after.match(/\[synthesize\]:\n([\s\S]+?)(?=\n\[|$)/);
+    return _sanitizeSynthesisBody(synthMatch ? synthMatch[1] : after).slice(0, 2000);
+  };
+  // Prefer the newest non-confirmation synthesis whose sanitized body isn't
+  // just an internal source dump.
+  for (const c of [...candidates].reverse()) {
+    if (c.isConfirmation) continue;
+    const body = extract(c);
+    if (body.length >= 30) return body;
+  }
+  const last = candidates[candidates.length - 1];
+  if (!last) return null;
+  const body = extract(last);
+  return body.length ? body : null;
 }
 
 // ── Hard guard: action plans must always end with synthesize ─────────────────
@@ -1861,7 +1885,9 @@ async function planSkillsV2(state) {
     || /"[^"]{2,}"/.test(userMessage)
     || /'[^']{2,}'/.test(userMessage);
   if (isMessagingTask && priorSynthesizedContent && !_hasExplicitBody) {
-    let _sanitizedBody = priorSynthesizedContent;
+    // Strip internal "=== Source:" dumps first — priorSynthesizedContent can
+    // arrive via _selectPriorSynthesis OR resume state, so sanitize again here.
+    let _sanitizedBody = _sanitizeSynthesisBody(priorSynthesizedContent);
     if (/^here is the raw data returned/i.test(_sanitizedBody.trim()) ||
         /^\[shell\.run\]:\s*[\[{]/m.test(_sanitizedBody)) {
       const _jsonMatch = _sanitizedBody.match(/```json\n([\s\S]*?)\n```/) ||
@@ -1876,8 +1902,12 @@ async function planSkillsV2(state) {
         }
       }
     }
-    messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${_sanitizedBody}\n---\nDo NOT add a user.agent step to re-fetch this content — it is already provided above. Only add steps to resolve the recipient address (if unknown) and to send the email.`;
-    logger.info(`[Node:PlanSkillsV2] Injected prior synthesized content as messaging body (${priorSynthesizedContent.length} chars)`);
+    if (_sanitizedBody) {
+      messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${_sanitizedBody}\n---\nDo NOT add a user.agent step to re-fetch this content — it is already provided above. Only add steps to resolve the recipient address (if unknown) and to send the email.`;
+      logger.info(`[Node:PlanSkillsV2] Injected prior synthesized content as messaging body (${_sanitizedBody.length} chars)`);
+    } else {
+      logger.info('[Node:PlanSkillsV2] Prior synthesis sanitized to empty — skipping messaging body injection');
+    }
   }
 
   // ── SMS gateway injection ─────────────────────────────────────────────────
@@ -2844,8 +2874,12 @@ The user's request does NOT match any installed skill.
     }
   } catch (_) {}
 
-  const _needsApproval = _planApprovalMode === 'always' ||
-    (_planApprovalMode === 'multi_step' && skillPlan.length >= 2);
+  // state.userApproved: the originating surface already collected the user's OK
+  // (e.g. a Brain thought approval dispatched via /comms.proactive). Re-gating
+  // here would surface the SAME item as a second approval card in the Queue.
+  const _needsApproval = !state.userApproved && (
+    _planApprovalMode === 'always' ||
+    (_planApprovalMode === 'multi_step' && skillPlan.length >= 2));
 
   if (_needsApproval) {
     logger.info(`[Node:PlanSkillsV2] Plan approval required (mode=${_planApprovalMode}, steps=${skillPlan.length})`);

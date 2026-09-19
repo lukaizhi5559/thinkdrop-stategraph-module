@@ -559,6 +559,40 @@ module.exports = async function decomposePromptV2(state) {
     };
   }
 
+  // ── Unresolved-follow-up guard ────────────────────────────────────────────
+  // When classifyTask flagged isFollowUp but could not resolve a concrete
+  // followUpTarget, the message is a referent-less continuation (e.g. a bare
+  // "yes you can" whose offer-resolution failed). Running web_search on the
+  // literal text produces nonsense ("yes you can" → Yes You Can! brand results).
+  // Route to memory_retrieve instead — the answer node gets the full recent
+  // history and can respond from context or ask a clarifying question.
+  if (_tc.isFollowUp && !_tc.followUpTarget && !_hasMultiGoalConjunction) {
+    logger.info('[Node:DecomposePromptV2] Unresolved-follow-up guard: isFollowUp with null followUpTarget — routing to memory_retrieve (answer from history), skipping web_search on literal text');
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'memory_retrieve',
+      confidence: 0.8,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'unresolved-followup-guard', intent: 'memory_retrieve',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'memory_retrieve', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'memory_retrieve', 0.8);
+    return {
+      ...state,
+      _decomposedIntent: 'memory_retrieve',
+      _decomposedBy: 'unresolved-followup-guard',
+      intentPlan: subPrompts,
+    };
+  }
+
   // ── Fast number-based decision (single-step intent / multi-step) ──────────
   // Call the light model with "return ONLY a single number" to get a fast verdict.
   // If 0–6 (single-step), return a single sub-prompt with that intent — skip the
@@ -616,9 +650,15 @@ module.exports = async function decomposePromptV2(state) {
   // GRACE PERIOD: Don't filter if the similar message is >5 minutes old (user likely re-asking intentionally)
   const FIVE_MINUTES_MS = 5 * 60 * 1000;
   const now = Date.now();
+  // Exclude the CURRENT message — comms-graph logs quick-intent turns (and
+  // session.route can persist the user text) before the stategraph runs, so the
+  // live prompt is already the newest user entry in history. A single-step
+  // sub-prompt that equals it is a legitimate pass-through, not a duplicate.
+  const _currentMsgText = String(message || '').toLowerCase().trim();
   const recentUserMessages = (conversationHistory || [])
     .filter(m => m.role === 'user')
     .slice(-3)
+    .filter(m => String(m.content || '').toLowerCase().trim() !== _currentMsgText)
     .map(m => ({
       text: String(m.content || '').toLowerCase().trim(),
       timestamp: m.timestamp || m.created_at || now // fallback to now if no timestamp

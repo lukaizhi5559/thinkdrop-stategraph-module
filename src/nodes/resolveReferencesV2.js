@@ -395,9 +395,14 @@ module.exports = async function resolveReferencesV2(state) {
   // timestamp that doesn't correspond to any real file). fs.existsSync-check any
   // followUpTarget that looks like a path before injecting it downstream.
   // Drop + log if it doesn't exist — never pass a hallucinated path to the planner.
+  // Destination-path exception: when the user asks to SAVE/CREATE/WRITE a file,
+  // the followUpTarget path legitimately does not exist yet — it is the output
+  // target, not a source. Dropping it loses the resolved filename downstream.
+  const _DESTINATION_VERB_RE = /\b(save|saving|write|writing|create|creating|export|download|put|store|generate|move|copy|rename)\b/i;
+  const _pathIsDestination = _DESTINATION_VERB_RE.test(message || '');
   if (_taskClassification.followUpTarget && typeof _taskClassification.followUpTarget === 'string') {
     const t = _taskClassification.followUpTarget.trim();
-    if (t.startsWith('/') && /\.\w{1,10}$/.test(t)) {
+    if (t.startsWith('/') && /\.\w{1,10}$/.test(t) && !_pathIsDestination) {
       try {
         if (!fs.existsSync(t)) {
           logger.warn(`[Node:ResolveReferencesV2] followUpTarget path does not exist — dropping: "${t}"`);

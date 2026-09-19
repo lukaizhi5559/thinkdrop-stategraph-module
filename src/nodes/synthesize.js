@@ -56,7 +56,13 @@ module.exports = async function synthesizeNode(state) {
 
   const isStreaming = typeof streamCallback === 'function';
 
-  const synthesisQuery = `${synthesisPrompt || queryMessage}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
+  // Strip unresolved plan-contract tokens from the prompt — a literal
+  // "{{LAST_SUCCESSFUL.outputs.filePaths[0]}}" reaching the LLM produces a
+  // meta-answer about templates instead of the actual result. (synthesisContext
+  // is left alone — fetched page content can legitimately contain {{ }} syntax.)
+  const _UNRESOLVED_TOKEN_RE = /\{\{(?:CONTRACT\[\d+\]|PREV_CONTRACT|PREV_OUTPUT|PREV_OUTPUT_FILE|prev_stdout|LAST_SUCCESSFUL|LAST_WITH_OUTPUT|synthesisAnswer|user\.agent\.[^}]*)\}\}/g;
+  const _cleanPrompt = (s) => typeof s === 'string' ? s.replace(_UNRESOLVED_TOKEN_RE, '') : s;
+  const synthesisQuery = `${_cleanPrompt(synthesisPrompt || queryMessage)}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
   const _todayISO = new Date().toISOString().slice(0, 10);
 
   // ── Detect system-info shell output for targeted synthesis instructions ──
@@ -114,10 +120,9 @@ If the raw output is missing the specific field the user asked about, say so dir
       userId: context?.userId,
       intent: 'command_automate'
     },
-    // Skill contract writes need more room — a full skill.md with ## Auth,
-    // ## Commands, curl examples etc. easily exceeds 1500 tokens and gets
-    // truncated mid-code-block, producing corrupted stored contracts.
-    options: { maxTokens: synthesisFilePath?.endsWith('.md') ? 4096 : 1500, temperature: 0.2, fastMode: false, taskType: 'complex' }
+    // File writes need more room — ANY saveToFile (code, docs, markdown alike)
+    // must emit the complete content; 1500 tokens truncates mid-file.
+    options: { maxTokens: synthesisFilePath ? 4096 : 1500, temperature: 0.2, fastMode: false, taskType: 'complex' }
   };
 
   try {

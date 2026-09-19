@@ -551,7 +551,16 @@ Select the right agent(s) for this task, or ask the user if ambiguous.`;
       question: parsed.question || null,
     };
   } catch (err) {
-    logger.warn(`[Node:ResolveAgent] LLM call failed (${err.message}) — attempting targetService fallback`);
+    const _errMsg = err?.message || String(err);
+    // Provider outage — every LLM backend failed. Don't fall into the
+    // targetService fallback, which would ask the user a bogus "Which service
+    // or agent should I use?" question during a backend outage. Flag the state
+    // so the graph exits with a clean outage reply instead.
+    if (/all llm providers failed|no llm providers|providers? (?:are )?(?:all )?(?:unavailable|down)|llm circuit breaker/i.test(_errMsg)) {
+      logger.warn(`[Node:ResolveAgent] LLM provider outage detected (${_errMsg}) — aborting selection`);
+      return { agents: [], reasoning: _errMsg, question: null, providerOutage: true };
+    }
+    logger.warn(`[Node:ResolveAgent] LLM call failed (${_errMsg}) — attempting targetService fallback`);
     return _targetServiceFallback(registeredAgents, taskClassification, 'LLM selection failed.');
   }
 }
@@ -823,6 +832,27 @@ module.exports = async function resolveAgent(state) {
     logger.info(`[Node:ResolveAgent] Round ${round + 1}/${MAX_ROUNDS} — selecting agents for: "${userMessage.slice(0, 80)}"`);
 
     const result = await _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorAnswers, logger, 1, state._taskClassification, state.conversationHistory);
+
+    // Provider outage — every LLM backend failed. Exit the graph with a clean
+    // user-facing explanation instead of an agent-selection question.
+    if (result.providerOutage) {
+      const outageMsg = "I'm unable to process your request right now — all AI providers are currently unavailable (rate limits or an outage). Please try again in a few minutes.";
+      logger.warn(`[Node:ResolveAgent] Provider outage — returning clean reply instead of agent question`);
+      if (progressCallback) {
+        try {
+          progressCallback({ type: 'planning_failed', message: outageMsg, error: result.reasoning, source: 'resolveAgent' });
+        } catch (_) {}
+      }
+      return {
+        ...state,
+        answer: outageMsg,
+        planError: result.reasoning || 'All LLM providers failed',
+        providerOutage: true,
+        resolveAgentResult: { agents: [], reasoning: result.reasoning || '', question: null, _message: userMessage },
+        resolveAgentAnswers: priorAnswers,
+      };
+    }
+
     const normalized = await _normalizeAgentResult(result, registeredAgents, userMessage, mcpAdapter, logger, state._taskClassification);
 
     logger.info(`[Node:ResolveAgent] Selection: ${normalized.agents.length} agent(s), question: ${normalized.question || 'none'}`);

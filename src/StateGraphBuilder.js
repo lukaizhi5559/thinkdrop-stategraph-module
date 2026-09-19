@@ -518,7 +518,12 @@ class StateGraphBuilder {
       resolveUserContext: 'resolveAgent',
 
       // resolveAgent: selects agents, then proceeds to preflightAgents
-      resolveAgent: () => {
+      resolveAgent: (state) => {
+        // Provider outage — resolveAgent produced a clean reply; skip planning
+        if (state.providerOutage) {
+          logger.info('[StateGraph:Router] resolveAgent: providerOutage — exiting to logConversation');
+          return 'logConversation';
+        }
         logger.debug('[StateGraph:Router] resolveAgent → preflightAgents');
         return 'preflightAgents';
       },

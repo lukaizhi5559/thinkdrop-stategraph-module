@@ -182,7 +182,7 @@ When user wants to "create a skill": `synthesize(saveToFile: '~/.thinkdrop/skill
 - **Stopping a ThinkDrop project** → `project.stopper` with projectName (partial match OK). NEVER `shell.run kill`.
 - **Reading/writing files** → `shell.run` with `args.goal`. NEVER emit both `goal` AND `cmd`/`argv` in the same step.
 - **Bare folder name** → `shell.run` goal: `"Find the folder named <name> (check ~/Desktop, ~/Documents, ~/Downloads, then ~/) and <task>"`.
-- **`synthesize` with `saveToFile`** → ONLY when user explicitly asks to save a file.
+- **`synthesize` with `saveToFile`** → ONLY when user explicitly asks to save a file. For content-authoring saves (the file's content is generated text/code/document — not a download or command output), prefer this over a `shell.run` goal: the synthesize prompt must demand the COMPLETE content verbatim (no truncation, no placeholders), and any confirmation step must use the literal path, not a `{{...}}` contract ref.
 - **`image.analyze`** → local image files only. **`screen.capture`** → live screenshot + OCR (text only — saves NO file). To SAVE a screenshot PNG ("take a screenshot") → `shell.run` `bash -c` with `screencapture -x "$HOME/Desktop/Screenshot $(date '+%Y-%m-%d at %H.%M.%S').png"`, then `echo` the quoted path. NEVER `/tmp`, NEVER `$(...)` in raw argv.
 
 ## Sub-agents — reasoning loops

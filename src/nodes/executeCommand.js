@@ -462,7 +462,7 @@ function generateStepContract(stepResult, stepIndex) {
         stdout: { type: 'text', value: stepResult.stdout || '' },
         stderr: { type: 'text', value: stepResult.stderr || '' },
         exitCode: { type: 'number', value: stepResult.exitCode ?? null },
-        filePaths: { type: 'array', value: _extractFilePathsFromText(stepResult.stdout) }
+        filePaths: { type: 'array', value: [...new Set([..._extractFilePathsFromText(stepResult.stdout), ..._extractFilePathsFromArgv(stepResult.args)])] }
       };
       break;
 
@@ -621,6 +621,46 @@ function _extractFilePathsFromText(text) {
     }
   }
 
+  return paths;
+}
+
+/**
+ * Extract file DESTINATION paths from a shell.run step's args (cmd/argv script).
+ * A `cat > /path/file <<'EOF'` heredoc produces no stdout, so stdout-based
+ * extraction misses the written file entirely — the contract's filePaths comes
+ * up empty and downstream {{LAST_SUCCESSFUL.outputs.filePaths[0]}} refs fail.
+ * Parses redirect targets (`>` / `>>`), `tee` targets, and `curl -o`/`wget -O`.
+ */
+function _extractFilePathsFromArgv(args) {
+  if (!args || typeof args !== 'object') return [];
+  const argv = Array.isArray(args.argv) ? args.argv : [];
+  const script = [args.cmd, ...argv].filter(s => typeof s === 'string').join(' ');
+  if (!script) return [];
+
+  const paths = [];
+  const push = (p) => {
+    if (!p) return;
+    p = p.trim().replace(/^['"]|['"]$/g, '');
+    if (!p || p === '-' || /^[\/~]?dev\//.test(p) || /^&?\d+$/.test(p)) return;
+    // Only accept path-like targets — bare words (e.g. `a > b` inside a heredoc
+    // body) must not be reported as written files.
+    if (!/^[~/]/.test(p) && !/\.\w{1,10}$/.test(p)) return;
+    const norm = p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p;
+    if (!paths.includes(norm)) paths.push(norm);
+  };
+
+  const patterns = [
+    // redirect targets: > /path, >> /path — excludes fd redirects (2>, >&)
+    /(?<![0-9&])>>?\s*['"]?([^\s'";|&]+)['"]?/g,
+    // tee /path, tee -a /path
+    /\btee\s+(?:-a\s+)?['"]?([^\s'";|&]+)['"]?/g,
+    // curl -o /path, curl --output /path
+    /\b(?:curl|wget)\b[^\n|;]*?\s(?:-o|--output|-O)\s+['"]?([^\s'";|&]+)['"]?/g,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(script)) !== null) push(m[1]);
+  }
   return paths;
 }
 
@@ -1565,8 +1605,16 @@ module.exports = async function executeCommand(state) {
       return val.replace(/\{\{(CONTRACT\[\d+\]|PREV_CONTRACT|LAST_SUCCESSFUL|LAST_WITH_OUTPUT)([^}]*)\}\}/g, (match, contractRef, fieldPath) => {
         const resolved = resolveContractPath(stepContracts, contractRef + fieldPath);
         if (resolved === null || resolved === undefined) {
-          logger.warn(`[Node:ExecuteCommand] Contract reference not found: ${match}`);
-          return match; // Keep original if not found
+          // Never leak the literal {{...}} template into downstream prompts or
+          // user-facing answers. For filePaths/files refs, salvage the first
+          // recorded path from any prior contract; otherwise substitute an
+          // empty string so the sentence stays grammatically intact.
+          const salvaged = /filePaths|files/i.test(fieldPath)
+            ? stepContracts.flatMap(c =>
+                (c.outputs?.filePaths?.value || []).filter(v => typeof v === 'string'))[0]
+            : undefined;
+          logger.warn(`[Node:ExecuteCommand] Contract reference not found: ${match}${salvaged ? ` — salvaged "${salvaged}"` : ' — substituting empty string'}`);
+          return salvaged ?? '';
         }
         // Convert to string, handle objects
         if (typeof resolved === 'object') {
@@ -7688,3 +7736,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
     return await _thinPostFailureHandler(failState);
   }
 };
+
+// Test-only exports
+module.exports.generateStepContract = generateStepContract;
+module.exports._extractFilePathsFromArgv = _extractFilePathsFromArgv;

@@ -289,12 +289,52 @@ function parseDateRange(message) {
   }
 
   // past few days / past couple of days / over the past few weeks (vague quantifiers)
-  const fewMatch = q.match(/\b(?:past|over\s+(?:the\s+)?past)\s+(few|couple(?:\s+of)?)\s+(days?|weeks?)\b/);
+  // Also "last few/couple/several days|weeks|months", "in/during the last couple days".
+  const fewMatch = q.match(/\b(?:past|last|over\s+(?:the\s+)?(?:past|last)|during\s+(?:the\s+)?last|in\s+(?:the\s+)?last)\s+(few|couple(?:\s+of)?|several)\s+(days?|weeks?|months?)\b/);
   if (fewMatch) {
-    const isFew = fewMatch[1] === 'few';
-    const isWeeks = /week/.test(fewMatch[2]);
-    const n = isWeeks ? (isFew ? 3 : 2) : (isFew ? 3 : 2);
-    const start = new Date(now); start.setDate(start.getDate() - n * (isWeeks ? 7 : 1));
+    const quant = fewMatch[1];
+    const unit = fewMatch[2];
+    const n = quant === 'several' ? 4 : (/^couple/.test(quant) ? 2 : 3);
+    const mult = /month/.test(unit) ? 30 : /week/.test(unit) ? 7 : 1;
+    const start = new Date(now); start.setDate(start.getDate() - n * mult);
+    return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
+  }
+
+  // "(a) couple/few/several (of) days|weeks|months|hours|minutes ago"
+  // ("a couple minutes ago" is already handled above — this catches day+ units
+  // and the bare "couple days ago" / "few weeks ago" forms)
+  const fewAgoMatch = q.match(/\b(?:a\s+|an\s+)?(few|couple|several)\s+(?:of\s+)?(minutes?|hours?|days?|weeks?|months?)\s+ago\b/);
+  if (fewAgoMatch) {
+    const quant = fewAgoMatch[1];
+    const unit = fewAgoMatch[2];
+    const n = quant === 'several' ? 4 : (quant === 'couple' ? 2 : 3);
+    const ms = /month/.test(unit) ? 30 * 86400000
+      : /week/.test(unit) ? 7 * 86400000
+      : /day/.test(unit) ? 86400000
+      : /hour/.test(unit) ? 3600000
+      : 60000;
+    const start = new Date(now.getTime() - n * ms);
+    return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
+  }
+
+  // "a day or two (ago)", "a week or so" — short vague windows
+  const orTwoMatch = q.match(/\b(?:a\s+|an\s+)?(day|week|month)s?\s+or\s+(?:two|2|three|3|so)\b/);
+  if (orTwoMatch) {
+    const days = orTwoMatch[1] === 'month' ? 45 : orTwoMatch[1] === 'week' ? 10 : 2;
+    const start = new Date(now); start.setDate(start.getDate() - days);
+    return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
+  }
+
+  // "the other day" — vague recent past (last ~3 days)
+  if (/\bthe\s+other\s+day\b/.test(q)) {
+    const start = new Date(now); start.setDate(start.getDate() - 3);
+    return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
+  }
+
+  // bare "couple days" / "a couple of days" (no last/past/ago qualifier)
+  if (/\b(?:a\s+)?(?:few|couple(?:\s+of)?)\s+days?\b/.test(q)) {
+    const n = /\bcouple/.test(q) ? 2 : 3;
+    const start = new Date(now); start.setDate(start.getDate() - n);
     return { startDate: iso(startOf(start)), endDate: iso(endOf(now)) };
   }
 

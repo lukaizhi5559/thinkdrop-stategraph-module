@@ -402,6 +402,155 @@ describe('_hasBounceMarker — bounce detection', () => {
   });
 });
 
+// ─── parseDateRange — vague relative quantifiers ────────────────────────────
+// Regression: "the last couple days" returned null → fell through to the LLM
+// fallback which hallucinated 2023 dates and searched an empty window.
+
+describe('parseDateRange — couple/few/several phrasings', () => {
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+
+  it('"the last couple days" → ~2-day window ending today', () => {
+    const r = parseDateRange('No what have we been chatting about for the last couple days');
+    assert(r && r.startDate && r.endDate, 'expected a range');
+    const spanDays = (new Date(r.endDate) - new Date(r.startDate)) / 86400000;
+    assert(spanDays >= 1.5 && spanDays <= 4, `expected ~2-3 day window, got ${spanDays} days`);
+    assert(new Date(r.endDate) >= todayStart, 'endDate must reach today');
+  });
+
+  it('"last few days" → ~3-day window', () => {
+    const r = parseDateRange('what did we talk about over the last few days');
+    assert(r && r.startDate, 'expected a range');
+    const spanDays = (new Date(r.endDate) - new Date(r.startDate)) / 86400000;
+    assert(spanDays >= 2.5 && spanDays <= 5, `expected ~3-4 day window, got ${spanDays} days`);
+  });
+
+  it('"a couple days ago" → non-null window ending today', () => {
+    const r = parseDateRange('what did I ask you a couple days ago');
+    assert(r && r.startDate && r.endDate, 'expected a range');
+    assert(new Date(r.endDate) >= todayStart, 'endDate must reach today');
+  });
+
+  it('"a few days ago" → non-null', () => {
+    const r = parseDateRange('the prompt I sent a few days ago');
+    assert(r && r.startDate, 'expected a range');
+  });
+
+  it('"several days ago" → ~4-day window', () => {
+    const r = parseDateRange('what did we discuss several days ago');
+    assert(r && r.startDate, 'expected a range');
+    const spanDays = (new Date(r.endDate) - new Date(r.startDate)) / 86400000;
+    assert(spanDays >= 3.5 && spanDays <= 6, `expected ~4-5 day window, got ${spanDays} days`);
+  });
+
+  it('"the other day" → recent window', () => {
+    const r = parseDateRange('that article I saw the other day');
+    assert(r && r.startDate, 'expected a range');
+    assert(new Date(r.endDate) >= todayStart, 'endDate must reach today');
+  });
+
+  it('"a day or two ago" → ~2-day window', () => {
+    const r = parseDateRange('the file from a day or two ago');
+    assert(r && r.startDate, 'expected a range');
+  });
+
+  it('"last couple of weeks" → ~14-day window', () => {
+    const r = parseDateRange('what was I working on the last couple of weeks');
+    assert(r && r.startDate, 'expected a range');
+    const spanDays = (new Date(r.endDate) - new Date(r.startDate)) / 86400000;
+    assert(spanDays >= 10 && spanDays <= 21, `expected ~14 day window, got ${spanDays} days`);
+  });
+
+  it('numeric "last 2 days" still parses (regression)', () => {
+    const r = parseDateRange('what did we talk about the last 2 days');
+    assert(r && r.startDate, 'expected a range');
+  });
+
+  it('"past couple of days" still parses (regression)', () => {
+    const r = parseDateRange('what happened over the past couple of days');
+    assert(r && r.startDate, 'expected a range');
+  });
+});
+
+// ─── _llmDateFallback — stale-range guard + today anchor ─────────────────────
+// Regression: the fallback prompt never stated today's date, so the LLM
+// returned Oct-2023 for "the last couple days" and recall searched an empty
+// window. Now: prompt carries CURRENT DATE AND TIME, and relative-phrased
+// queries discard ranges that end before today.
+
+const { _llmDateFallback } = retrieveMemory;
+
+describe('_llmDateFallback — stale-range guard', () => {
+  const staleLLM = { generateAnswer: async () => '{"startDate":"2023-10-22 00:00:00","endDate":"2023-10-24 23:59:59"}' };
+
+  it('discards a stale LLM range for relative phrasing ("last couple days")', async () => {
+    const r = await _llmDateFallback('what have we been chatting about for the last couple days', staleLLM, _noopLogger);
+    assertEq(r, null, 'stale 2023 range must be discarded for relative phrasing');
+  });
+
+  it('keeps a stale range for absolute phrasing ("in october 2023")', async () => {
+    const r = await _llmDateFallback('what did I do in october 2023', staleLLM, _noopLogger);
+    assert(r && r.startDate === '2023-10-22 00:00:00', 'absolute dates must pass through untouched');
+  });
+
+  it('keeps a fresh range for relative phrasing', async () => {
+    const now = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const fmt = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const s = new Date(now); s.setDate(s.getDate() - 2); s.setHours(0, 0, 0, 0);
+    const e = new Date(now); e.setHours(23, 59, 59, 0);
+    const freshLLM = { generateAnswer: async () => `{"startDate":"${fmt(s)}","endDate":"${fmt(e)}"}` };
+    const r = await _llmDateFallback('what did we talk about lately', freshLLM, _noopLogger);
+    assert(r && r.startDate === fmt(s), 'a range ending today must be kept');
+  });
+
+  it('prompt carries the current date so the LLM can anchor "ago/last"', async () => {
+    let seenPrompt = '';
+    const capLLM = { generateAnswer: async (p) => { seenPrompt = p; return null; } };
+    await _llmDateFallback('what did we discuss last week', capLLM, _noopLogger);
+    const yr = new Date().getFullYear();
+    assert(seenPrompt.includes('CURRENT DATE AND TIME'), 'prompt must anchor the current date');
+    assert(seenPrompt.includes(String(yr)), `prompt must include current year ${yr}`);
+  });
+});
+
+// ─── retrieveMemory — cross-session message.search wiring ────────────────────
+// Regression: the recall path called message.search without sessionId or
+// searchAllSessions → the endpoint 500s, silently killing topical recall across
+// older sessions.
+
+describe('retrieveMemory — message.search passes searchAllSessions', () => {
+  it('cross-session semantic search is enabled for recall queries', async () => {
+    const calls = [];
+    const mcpAdapter = {
+      callService: async (svc, action, payload) => {
+        calls.push({ svc, action, payload });
+        if (action === 'message.list' || action === 'message.listByDate') return { messages: [] };
+        if (action === 'message.search') {
+          if (!payload.searchAllSessions) throw new Error('sessionId is required (or set searchAllSessions=true)');
+          return { messages: [] };
+        }
+        return { results: [], apps: [], keywords: [] };
+      },
+    };
+    await retrieveMemory({
+      message: 'what did we talk about earlier this week',
+      resolvedMessage: 'what did we talk about earlier this week',
+      intent: { type: 'memory_retrieve' },
+      context: { sessionId: 'sess-current', userId: 'local_user' },
+      mcpAdapter,
+      logger: _noopLogger,
+      conversationHistory: [],
+      _taskClassification: { isConversationRecall: true },
+    });
+    const searchCalls = calls.filter(c => c.action === 'message.search');
+    assert(searchCalls.length > 0, 'message.search should be called for a recall query');
+    for (const c of searchCalls) {
+      assertEq(c.payload.searchAllSessions, true, 'searchAllSessions must be true');
+      assertEq(c.payload.sessionId, 'sess-current', 'sessionId should be forwarded');
+    }
+  });
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 (async () => {

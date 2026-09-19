@@ -235,9 +235,17 @@ function _isActivityQuery(message) {
  * Lightweight LLM fallback to extract a date range when regex and decompose LLM both return null.
  * Uses minimal tokens (maxTokens: 100, temperature: 0) to keep latency low.
  */
+// Relative-time phrasings mean the range MUST end at/around "now". The LLM
+// fallback has no true sense of "today" (even with the anchor), so when it
+// hallucinates a stale window (observed: "last couple days" → Oct 2023) the
+// entire recall silently searches an empty window. Guard: if the message is
+// relative-phrased and the returned endDate predates today, discard it.
+const RELATIVE_TIME_RE = /\b(ago|last|past|couple|few|several|lately|recent(?:ly)?|yesterday|today|this\s+(morning|afternoon|evening|week|month|year)|other\s+day)\b/i;
+
 async function _llmDateFallback(message, llmBackend, logger) {
   if (!llmBackend || !llmBackend.generateAnswer) return null;
-  const prompt = `Extract a date range from this message. Return ONLY JSON {"startDate":"YYYY-MM-DD HH:MM:SS","endDate":"YYYY-MM-DD HH:MM:SS"} or null if no date reference. For relative ranges like "past week" or "last 7 days", startDate = 7 days ago at 00:00:00, endDate = today at 23:59:59. For single days like "a specific date", both start and end are that day. Message: "${message}"`;
+  const nowStr = new Date().toLocaleString('en-CA', { hour12: false });
+  const prompt = `CURRENT DATE AND TIME: ${nowStr} (local time). Extract a date range from this message. Return ONLY JSON {"startDate":"YYYY-MM-DD HH:MM:SS","endDate":"YYYY-MM-DD HH:MM:SS"} or null if no date reference. For relative ranges like "past week" or "last 7 days", startDate = 7 days ago at 00:00:00, endDate = today at 23:59:59. For single days like "a specific date", both start and end are that day. All dates MUST use the current year unless the message explicitly names a different year. Message: "${message}"`;
   try {
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
@@ -246,6 +254,17 @@ async function _llmDateFallback(message, llmBackend, logger) {
     if (!raw) return null;
     const parsed = parseLlmJson(raw, logger, 'Node:RetrieveMemory:dateFallback');
     if (parsed && parsed.startDate && parsed.endDate) {
+      // Sanity guard: relative-time phrasing must resolve to a window ending
+      // at/after today's start. A stale endDate means the LLM hallucinated the
+      // year — discard so the caller falls back to a broad fetch instead of
+      // searching an empty window.
+      if (RELATIVE_TIME_RE.test(message || '')) {
+        const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+        if (new Date(parsed.endDate) < todayStart) {
+          logger.warn(`[Node:RetrieveMemory] Discarding stale LLM dateRange ${JSON.stringify(parsed)} for relative-phrased query`);
+          return null;
+        }
+      }
       logger.debug(`[Node:RetrieveMemory] LLM fallback dateRange: ${JSON.stringify(parsed)}`);
       return parsed;
     }
@@ -337,6 +356,7 @@ function _profileKeysForAttribute(attribute) {
 
 module.exports = retrieveMemory;
 module.exports.CONV_RECALL_QUERY_RE = CONV_RECALL_QUERY_RE;
+module.exports._llmDateFallback = _llmDateFallback;
 
 async function retrieveMemory(state) {
   const { mcpAdapter, message, resolvedMessage, context, intent } = state;
@@ -732,6 +752,13 @@ async function retrieveMemory(state) {
           query: searchQuery,
           limit: 15,
           userId: context?.userId,
+          // Cross-session recall requires searchAllSessions — the endpoint 500s
+          // without a sessionId otherwise. Passing both lets Tier-1 always
+          // include the current session regardless of topic score.
+          sessionId: context?.sessionId,
+          searchAllSessions: true,
+          includeRecent: 0,
+          minSimilarity: 0.3,
         });
         const searchData = searchRes?.data || searchRes;
         crossSessionSearchResults = (searchData?.messages || searchData?.results || []).map(msg => ({

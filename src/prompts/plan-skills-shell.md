@@ -124,6 +124,17 @@ For deterministic window management, prefer `shell.run` osascript over `app.agen
 
 Use `synthesize` with `saveToFile` for plain text formats. The `synthesize` prompt MUST NOT include file content — it is auto-injected from prior `shell.run` stdout. Always instruct it to output the COMPLETE replacement content, no preamble.
 
+**Content-authoring saves** (write/save THIS code/text/document to a file — where the content itself must be generated or comes from conversation, e.g. "save this code to ~/Desktop/three.md"): prefer `synthesize` with `saveToFile` over a `shell.run` goal. A `shell.run` goal must re-generate the entire file content inside a single shell command, which risks truncation on long content. Pattern:
+
+```json
+[
+  { "skill": "synthesize", "args": { "prompt": "Output the COMPLETE content to write to the file — the full code/text, verbatim, no truncation, no abbreviations, no '// rest of code' placeholders, no preamble, no markdown fences.", "saveToFile": "/exact/path/from/user.md" }, "description": "Write content to file" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the file was saved at <literal path>. One sentence." }, "description": "Confirm file saved" }
+]
+```
+
+When `shell.run` IS used to write a file, the goal MUST contain the complete content (not "the code from before") and end with `&& echo "SAVED: <path>"` so the path lands in stdout for the confirmation step.
+
 ## Clipboard → File Pattern
 
 When a prior step (e.g., `app.agent extract_content_via_clipboard`) has placed content on the clipboard and you need to save it to a file:
