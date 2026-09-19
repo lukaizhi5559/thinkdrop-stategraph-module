@@ -4309,6 +4309,8 @@ Please try again or search with different terms.`;
     // Match {{identifier}} but exclude {{_...}} (underscore prefix).
     // The colon form {{service:field}} is matched here but filtered out below
     // so the auth-wall handler at line ~4388 can still own that case.
+    // Intentionally LOCAL — this is a generic placeholder validator, unlike
+    // shared/text-patterns.cjs stripUnresolvedTokens (known-token stripping).
     const _UNRESOLVED_RE = /\{\{(?!_)[a-zA-Z][a-zA-Z0-9_]*(?::[a-zA-Z0-9_]+)?\}\}/g;
     const _SERVICE_CRED_TOKEN = /\{\{[a-z0-9_.-]+:[a-z0-9_]+\}\}/i;
     const _argsJson = JSON.stringify(resolvedArgs);

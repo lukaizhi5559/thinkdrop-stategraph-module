@@ -9,6 +9,8 @@
  */
 
 const fs = require('fs');
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+const { stripUnresolvedTokens } = require('../../../shared/text-patterns.cjs');
 
 // Delivery-bounce detection. When confirming a sent email, the sent thread can
 // contain a Mail Delivery Subsystem bounce ("Address not found") — the message
@@ -60,8 +62,7 @@ module.exports = async function synthesizeNode(state) {
   // "{{LAST_SUCCESSFUL.outputs.filePaths[0]}}" reaching the LLM produces a
   // meta-answer about templates instead of the actual result. (synthesisContext
   // is left alone — fetched page content can legitimately contain {{ }} syntax.)
-  const _UNRESOLVED_TOKEN_RE = /\{\{(?:CONTRACT\[\d+\]|PREV_CONTRACT|PREV_OUTPUT|PREV_OUTPUT_FILE|prev_stdout|LAST_SUCCESSFUL|LAST_WITH_OUTPUT|synthesisAnswer|user\.agent\.[^}]*)\}\}/g;
-  const _cleanPrompt = (s) => typeof s === 'string' ? s.replace(_UNRESOLVED_TOKEN_RE, '') : s;
+  const _cleanPrompt = stripUnresolvedTokens;
   const synthesisQuery = `${_cleanPrompt(synthesisPrompt || queryMessage)}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
   const _todayISO = new Date().toISOString().slice(0, 10);
 

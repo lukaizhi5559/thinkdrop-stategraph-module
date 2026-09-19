@@ -25,10 +25,14 @@
  *   webAccessMode: 'none' | 'download' | 'public_read' | 'interactive',
  *                                   // how the task touches the web: download a file, read public
  *                                   // info, or interact with a session/auth'd service
+ *   expectsFileOutput: boolean,     // task creates/writes a file — path is a destination, not a source
  * }
  *
  * Fails open: any error returns a safe default that never blocks execution.
  */
+
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+const { CONVERSATION_RECALL_META_RE } = require('../../../shared/text-patterns.cjs');
 
 const CLASSIFY_SYSTEM_PROMPT = `You are a task classifier for a desktop automation assistant.
 
@@ -52,7 +56,8 @@ Output ONLY valid JSON with exactly these fields:
   "isConversationRecall": true | false,
   "isActivityQuery": true | false,
   "webAccessMode": "none" | "download" | "public_read" | "interactive",
-  "interactiveActions": ["login", "add_to_cart", ...] | []
+  "interactiveActions": ["login", "add_to_cart", ...] | [],
+  "expectsFileOutput": true | false
 }
 
 Field rules:
@@ -78,6 +83,8 @@ Field rules:
 - followUpTarget: if isFollowUp is true AND recent conversation clearly shows what it refers to, provide the resolved concrete subject. This includes: a file path from a prior command, a topic/subject discussed (e.g. "Vietnam weather", "the Python script", "SpaceX stock"), a named entity, or any other concrete referent established in the conversation. Set to null only when the referent genuinely cannot be determined from history.
   - OFFER-CONSENT RULE: when the message is a bare affirmation/consent ("yes", "yeah", "yep", "sure", "ok", "okay", "yes you can", "go ahead", "do it", "please do", "sounds good", "absolutely", "of course") replying to the assistant's immediately-preceding offer or yes/no question ("Would you like me to X?", "Want me to X?", "Should I X?", "I can X if you'd like"), the user is ACCEPTING that offer — this is a follow-up, not a new topic. Set isFollowUp:true, needsClarification:false, taskType to whatever the offered action implies, and resolve followUpTarget to the COMPLETE implied task — combine the offered action with the subject it refers to (e.g. assistant offered "search for specific styles, brands, or retailers" about baby clothes → followUpTarget="baby clothes"). The target must stand alone so downstream search/action steps can use it without re-reading history.
   - OFFER-DECLINE RULE: a bare refusal ("no", "nah", "don't", "not now", "no thanks") replying to an assistant offer declines it — set isFollowUp:true, followUpTarget:null, needsClarification:false, taskType:"ambiguous". The answer should acknowledge the decline; do NOT execute the offered action.
+
+- expectsFileOutput: true when the task creates/writes/saves/exports a file — the referenced path is a DESTINATION (it may not exist yet), not a source to read. Signals: "save this to X.md", "write the code to ~/Desktop/three.md", "export the results as report.csv", "put that in a file". false for tasks that only read/open/list files, or when no file output is produced.
   - CRITICAL: Set followUpTarget to null when isFollowUp is false (including the META-QUESTION EXCEPTION above). A non-null followUpTarget with isFollowUp=false is invalid.
   - Never set followUpTarget to the user's own prior message text when the user is asking ABOUT that message (e.g., "what did I just ask" → followUpTarget must be null, NOT "what did I just ask").
   - ACTIVE APP CONTEXT PRIORITY: When the user message uses deictic references ("this file", "that file", "the file", "it", "this", "that") and the prompt includes an "ACTIVE APP CONTEXT (live):" block with a "File: <path>" field, resolve followUpTarget to that file path. The live open file is the authoritative referent for deictic file references — NOT a file from conversation history. Also set isScreenFollowUp to false when the file is resolved this way (the file is known, no screen OCR needed).
@@ -265,6 +272,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     isActivityQuery: false,
     webAccessMode: 'none',
     interactiveActions: [],
+    expectsFileOutput: false,
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -275,8 +283,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
   // Force-override these patterns so the user gets a reliable recall response.
   // Keep the pattern narrow — only meta-questions about the chat transcript itself,
   // NOT queries about past activity/episodic memory (those are memory_retrieve).
-  const CONVERSATION_RECALL_RE = /\b(?:what did i (?:just )?ask(?:ed)?|what did i (?:just )?say|what did we talk about|what were we (?:just )?talking about|what did we discuss|did we (?:talk|speak|chat|discuss)|have we (?:talked|discussed|spoken|mentioned)|what was my (?:last|previous|recent) (?:question|prompt|message)|what did you (?:just )?say|what did i ask you .* ago|summarize our conversation|what have we been (?:discussing|talking about)|repeat what i said|remind me what we were talking about|go back to what i said (?:earlier|before)|look (?:that |it )? up in (?:your |the )?(?:memory|conversation|chat|history)|check (?:your |the )?(?:memory|conversation|chat|history)|in our (?:conversation|chat|history))\b/i;
-  if (CONVERSATION_RECALL_RE.test(userMessage)) {
+  // Canonical pattern: CONVERSATION_RECALL_META_RE in shared/text-patterns.cjs.
+  if (CONVERSATION_RECALL_META_RE.test(userMessage)) {
     logger.info(`[classifyTask] Deterministic conversation-recall match: "${userMessage.slice(0, 80)}"`);
     return {
       ..._default,
@@ -383,6 +391,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isActivityQuery:     !!parsed.isActivityQuery,
       webAccessMode,
       interactiveActions:  Array.isArray(parsed.interactiveActions) ? parsed.interactiveActions : [],
+      expectsFileOutput:   !!parsed.expectsFileOutput,
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

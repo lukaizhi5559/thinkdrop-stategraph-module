@@ -430,4 +430,12 @@ function parseDateRange(message) {
   return null; // No date reference found
 }
 
-module.exports = { parseDateRange, normaliseWordNumbers, MONTHS };
+// Relative-time phrasing detector — lives next to the parser it guards.
+// retrieveMemory uses this to sanity-check the LLM date fallback: a query
+// phrased with relative terms must not resolve to a stale/absent-year window.
+const RELATIVE_TIME_RE = /\b(ago|last|past|couple|few|several|lately|recent(?:ly)?|yesterday|today|this\s+(morning|afternoon|evening|week|month|year)|other\s+day)\b/i;
+function hasRelativeTimePhrase(message) {
+  return RELATIVE_TIME_RE.test(String(message || ''));
+}
+
+module.exports = { parseDateRange, normaliseWordNumbers, MONTHS, hasRelativeTimePhrase };

@@ -15,6 +15,8 @@
  */
 
 const { classifyTask } = require('../utils/classifyTask');
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+const { REFERENTIAL_RE, FILE_REF_RE, FILE_WRITE_VERB_RE } = require('../../../shared/text-patterns.cjs');
 
 /**
  * Binary web-access confirmation — runs only when classifyTask returns
@@ -51,9 +53,8 @@ function stripHtml(text) {
   return text ? text.replace(/<[^>]*>/g, '') : text;
 }
 
-// Deictic/referential words — when a message contains one, the user is almost
-// always pointing at a prior task's RESULT ("email me these addresses").
-const REFERENTIAL_RE = /\b(this|that|these|those|it|them|they|above|previous|last|again)\b/i;
+// REFERENTIAL_RE — canonical in shared/text-patterns.cjs. Deictic/referential
+// words almost always point at a prior task's RESULT ("email me these addresses").
 
 // Fetch the last assistant "result" message from each contributing session.
 // Semantic message search ranks individual messages, and the task RESULT (the
@@ -362,8 +363,7 @@ module.exports = async function resolveReferencesV2(state) {
   // "it" refers to a conversational subject (a folder, a result, a topic). This caused
   // task_1d44cd52 to resolve followUpTarget to skillThinking.js (the IDE's open file)
   // instead of the basement project context. Generic deictics alone are insufficient.
-  const _FILE_REF_RE = /\b(?:this|that|the|open|current|active)\s+(?:file|script|code|function|class|method|component|module)\b|\b(?:this|that|the)\s+\w+\.(?:ts|js|tsx|jsx|py|cjs|mjs|md|json|sh|bash)\b|\b(?:open|current|active)\s+(?:file|tab|editor|buffer)\b/i;
-  const _hasFileRef = _FILE_REF_RE.test(message || '');
+  const _hasFileRef = FILE_REF_RE.test(message || '');
   let _taskClassification;
   if (state._planFile) {
     // Plan execution: skip the expensive LLM classification, but preserve the
@@ -395,11 +395,13 @@ module.exports = async function resolveReferencesV2(state) {
   // timestamp that doesn't correspond to any real file). fs.existsSync-check any
   // followUpTarget that looks like a path before injecting it downstream.
   // Drop + log if it doesn't exist — never pass a hallucinated path to the planner.
-  // Destination-path exception: when the user asks to SAVE/CREATE/WRITE a file,
-  // the followUpTarget path legitimately does not exist yet — it is the output
-  // target, not a source. Dropping it loses the resolved filename downstream.
-  const _DESTINATION_VERB_RE = /\b(save|saving|write|writing|create|creating|export|download|put|store|generate|move|copy|rename)\b/i;
-  const _pathIsDestination = _DESTINATION_VERB_RE.test(message || '');
+  // Destination-path exception: when the task creates/writes a file, the
+  // followUpTarget path legitimately does not exist yet — it is the output
+  // target, not a source. Primary signal is the classifier's expectsFileOutput
+  // field (semantic — catches "drop it in three.md"); FILE_WRITE_VERB_RE is the
+  // cheap fallback when the field wasn't set.
+  const _pathIsDestination = _taskClassification.expectsFileOutput === true
+    || FILE_WRITE_VERB_RE.test(message || '');
   if (_taskClassification.followUpTarget && typeof _taskClassification.followUpTarget === 'string') {
     const t = _taskClassification.followUpTarget.trim();
     if (t.startsWith('/') && /\.\w{1,10}$/.test(t) && !_pathIsDestination) {

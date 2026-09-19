@@ -3,6 +3,8 @@
 const fs   = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+const { IMAGE_REQUEST_RES } = require('../../../shared/text-patterns.cjs');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeDecomposeLog(entry) {
@@ -376,13 +378,7 @@ module.exports = async function decomposePromptV2(state) {
   // classifyTask may mark "show me a picture of X" as taskType=browser, which would
   // short-circuit to command_automate and build a web agent. The web_search intent
   // handles image retrieval natively (with carousel), so route image queries there.
-  const _IMAGE_SEARCH_PATTERNS = [
-    /\bshow\s+me\s+(a\s+|an\s+|the\s+|some\s+)?(picture|image|photo|pic|logo|icon)s?\s+(of|for)\b/i,
-    /\b(show|find|search\s+for|look\s+up|get\s+me)\s+(a\s+|an\s+|the\s+|some\s+)?(picture|image|photo|pic|logo|icon)s?\s+(of|for)\b/i,
-    /\bwhat\s+does\s+.+\s+look\s+like\b/i,
-    /\b(can\s+i\s+see|let\s+me\s+see)\s+(a\s+|an\s+|the\s+)?(picture|image|photo|pic|logo|icon)\b/i,
-  ];
-  const _isImageSearch = _IMAGE_SEARCH_PATTERNS.some(re => re.test(_msgLower));
+  const _isImageSearch = IMAGE_REQUEST_RES.some(re => re.test(_msgLower));
   // Exception: when the user names a specific site/service to search ON (e.g.
   // "show pics of baby clothes for sale on amazon"), keep command_automate so
   // the task reaches the site_search → web.crawl → extractItems pipeline and

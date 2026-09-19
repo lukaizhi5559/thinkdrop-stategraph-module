@@ -7,14 +7,20 @@
  * - Without MCP: Returns empty arrays
  */
 
-const { parseDateRange } = require('../utils/parseDateRange');
+const { parseDateRange, hasRelativeTimePhrase } = require('../utils/parseDateRange');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+const {
+  CONV_RECALL_QUERY_RE,
+  LEGACY_RECALL_RE,
+  PROFILE_QUERY_PATTERN,
+  ALL_TIME_QUERY_PATTERN,
+} = require('../../../shared/text-patterns.cjs');
 
 // Conversation-recall queries ask about past prompts/messages themselves
 // ("did I send messages about X", "list my last 8 prompts", "what did we
 // discuss"). They need cross-session message fetches even without a parsed
-// date range. Exported for unit tests.
-const CONV_RECALL_QUERY_RE = /\b(did i|have i|i'?ve|list my|repeat my|my (last|recent|past|previous)|what did (i|we)|what was (the|my) (last|first|previous)|what were (my|the)|show (me )?my)\b.{0,60}\b(prompt\w*|messages?|emails?|texts?|ask\w*|sen[dt]\w*|search\w*|sa(y|id)|talk\w*|discuss\w*|chat\w*|conversation\w*|request\w*|question\w*|wrote|regarding|about)\b/i;
+// date range. CONV_RECALL_QUERY_RE is re-exported below for unit tests.
 
 /**
  * Format an ISO timestamp into human-readable absolute + relative date
@@ -240,8 +246,6 @@ function _isActivityQuery(message) {
 // hallucinates a stale window (observed: "last couple days" → Oct 2023) the
 // entire recall silently searches an empty window. Guard: if the message is
 // relative-phrased and the returned endDate predates today, discard it.
-const RELATIVE_TIME_RE = /\b(ago|last|past|couple|few|several|lately|recent(?:ly)?|yesterday|today|this\s+(morning|afternoon|evening|week|month|year)|other\s+day)\b/i;
-
 async function _llmDateFallback(message, llmBackend, logger) {
   if (!llmBackend || !llmBackend.generateAnswer) return null;
   const nowStr = new Date().toLocaleString('en-CA', { hour12: false });
@@ -258,7 +262,7 @@ async function _llmDateFallback(message, llmBackend, logger) {
       // at/after today's start. A stale endDate means the LLM hallucinated the
       // year — discard so the caller falls back to a broad fetch instead of
       // searching an empty window.
-      if (RELATIVE_TIME_RE.test(message || '')) {
+      if (hasRelativeTimePhrase(message)) {
         const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
         if (new Date(parsed.endDate) < todayStart) {
           logger.warn(`[Node:RetrieveMemory] Discarding stale LLM dateRange ${JSON.stringify(parsed)} for relative-phrased query`);
@@ -405,8 +409,6 @@ async function retrieveMemory(state) {
     //      These should search all history, not be limited to a prior time window.
     //   2. All-time / earliest-memory queries: "what's the first memory you have of me"
     //   3. Messages longer than 12 words — they carry enough context for their own parse.
-    const PROFILE_QUERY_PATTERN = /^(what'?s|what is|who is|who'?s|where is)\s+(my|i am|am i)\b|^what (type|kind|sort) of (person|man|woman|human|individual)/i;
-    const ALL_TIME_QUERY_PATTERN = /\b(first|earliest|ever|all time|oldest|very first|all history)\b/i;
     const msgWords = (resolvedMessage || message).trim().split(/\s+/).filter(Boolean).length;
     // Skip dateRange inheritance for entity follow-ups (e.g. "how many believe in him"
     // after "Jesus") — they have no temporal intent and inheriting a bogus range from
@@ -742,7 +744,6 @@ async function retrieveMemory(state) {
     // the recent window). The old narrow fallback ("conversation about X" with
     // no memories) is preserved for non-recall phrasings.
     let crossSessionSearchResults = [];
-    const LEGACY_RECALL_RE = /\b(conversation|chat|talk|discussed|talking)\s+(about|regarding|on|where)\b/i;
     const shouldSearchAllSessions = isRecallQuery ||
       (memories.length === 0 && !dateRange && !profileFallback &&
        LEGACY_RECALL_RE.test(resolvedMessage || message || ''));
