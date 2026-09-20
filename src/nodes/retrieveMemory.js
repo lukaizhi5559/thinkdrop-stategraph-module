@@ -15,7 +15,7 @@ const {
   LEGACY_RECALL_RE,
   PROFILE_QUERY_PATTERN,
   ALL_TIME_QUERY_PATTERN,
-} = require('../../../shared/text-patterns.cjs');
+} = require('../utils/textPatterns.cjs');
 
 // Conversation-recall queries ask about past prompts/messages themselves
 // ("did I send messages about X", "list my last 8 prompts", "what did we

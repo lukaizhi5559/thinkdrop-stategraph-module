@@ -16,7 +16,7 @@
 
 const { classifyTask } = require('../utils/classifyTask');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { REFERENTIAL_RE, FILE_REF_RE, FILE_WRITE_VERB_RE } = require('../../../shared/text-patterns.cjs');
+const { REFERENTIAL_RE, FILE_REF_RE, FILE_WRITE_VERB_RE } = require('../utils/textPatterns.cjs');
 
 /**
  * Binary web-access confirmation — runs only when classifyTask returns

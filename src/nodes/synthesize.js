@@ -10,7 +10,7 @@
 
 const fs = require('fs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { stripUnresolvedTokens } = require('../../../shared/text-patterns.cjs');
+const { stripUnresolvedTokens } = require('../utils/textPatterns.cjs');
 
 // Delivery-bounce detection. When confirming a sent email, the sent thread can
 // contain a Mail Delivery Subsystem bounce ("Address not found") — the message

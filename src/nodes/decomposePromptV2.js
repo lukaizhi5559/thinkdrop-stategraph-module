@@ -4,7 +4,7 @@ const fs   = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { IMAGE_REQUEST_RES } = require('../../../shared/text-patterns.cjs');
+const { IMAGE_REQUEST_RES } = require('../utils/textPatterns.cjs');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeDecomposeLog(entry) {

@@ -32,7 +32,7 @@
  */
 
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { CONVERSATION_RECALL_META_RE } = require('../../../shared/text-patterns.cjs');
+const { CONVERSATION_RECALL_META_RE } = require('./textPatterns.cjs');
 
 const CLASSIFY_SYSTEM_PROMPT = `You are a task classifier for a desktop automation assistant.
 
