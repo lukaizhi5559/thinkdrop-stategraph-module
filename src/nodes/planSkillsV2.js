@@ -168,6 +168,113 @@ function _sanitizeSkillPlan(skillPlan, state) {
   return skillPlan;
 }
 
+// ── Step-arg placeholder validation ──────────────────────────────────────────
+// {{...}} tokens resolve at dispatch time (executeCommand.js) from prior-step
+// state. The planner sometimes emits them where they can never resolve — e.g.
+// {{PREV_OUTPUT_FILE}} in step 1 (it stood in for "my location", which had no
+// source) — and the step dies as "Unresolved placeholder(s)" AFTER the user
+// already approved the plan. Validate at plan time and repair instead:
+//   • unresolvable token in a step → insert ONE ask_user step immediately
+//     before it and rewrite the token to {{_ctx_<key>_<i>}} — the answer lands
+//     in state._gatheredVars[varName] (serial flow populates it via
+//     gatherCredentialCallback; handoffRunner.answerQuestion patches it on
+//     resume) and resolveStepCredentials substitutes it at dispatch time.
+//     {{PREV_OUTPUT}} would NOT work — ask_user's stdout is only
+//     "Collected: <hint>", never the answer itself.
+//   • {{PREV_OUTPUT_FILE}} on a non-browser.agent step → {{PREV_OUTPUT}}
+//     (inline injection works for every skill once a prior step exists)
+// Tokens resolved by other machinery are untouched: {{_var}}, {{service:field}}.
+function _repairStepPlaceholders(skillPlan, state) {
+  if (!Array.isArray(skillPlan) || skillPlan.length === 0) return skillPlan;
+  const _log = (state && state.logger) || console;
+  const TOKEN_RE = /\{\{\s*([^{}]+?)\s*\}\}/g;
+
+  // Returns 'ok' | 'rewrite' | 'insert' for a {{token}} at plan position i.
+  const classify = (name, i, priorSkills, step) => {
+    if (!name || /^_/.test(name)) return 'ok';                       // {{_var}}
+    if (/^[a-z0-9_.-]+:[a-z0-9_]+$/i.test(name)) return 'ok';        // {{service:field}} cred
+    if (/^PREV_OUTPUT_FILE$/i.test(name)) {
+      if (i === 0) return 'insert';
+      return step.skill === 'browser.agent' ? 'ok' : 'rewrite';
+    }
+    if (/^(PREV_OUTPUT|prev_stdout|prev_watchId)$/i.test(name)) return i === 0 ? 'insert' : 'ok';
+    if (/^(synthesisAnswer|synthesisAnswerFile)$/i.test(name))
+      return priorSkills.includes('synthesize') ? 'ok' : 'insert';
+    if (/^(bestUrl|fallbackUrls)$/i.test(name))
+      return priorSkills.includes('web.agent') ? 'ok' : 'insert';
+    const cm = name.match(/^CONTRACT\[(\d+)\]/i);
+    if (cm) return parseInt(cm[1], 10) < i ? 'ok' : 'insert';       // CONTRACT[N] is 0-based
+    if (/^(PREV_CONTRACT|LAST_SUCCESSFUL|LAST_WITH_OUTPUT)\b/i.test(name))
+      return i === 0 ? 'insert' : 'ok';
+    return 'insert';                                                // unknown token — never resolves
+  };
+
+  const out = [];
+  let repairCount = 0;
+  for (let i = 0; i < skillPlan.length; i++) {
+    const step = skillPlan[i];
+    if (!step || !step.args || typeof step.args !== 'object') { out.push(step); continue; }
+    let argsJson;
+    try { argsJson = JSON.stringify(step.args); } catch (_) { out.push(step); continue; }
+    if (!argsJson.includes('{{')) { out.push(step); continue; }
+
+    // Producer checks must use the ORIGINAL plan — inserted ask_user steps
+    // would shift indices and look like producers.
+    const priorSkills = skillPlan.slice(0, i).map(s => s && s.skill);
+    let needsAskUser = false;
+    let firstBadKey = null;
+    let mutated = false;
+
+    // Find the first arg key holding an unresolvable token — used to phrase
+    // the ask_user question. Fresh regex per scan: /g regexes carry lastIndex
+    // state across uses.
+    for (const [k, v] of Object.entries(step.args)) {
+      if (typeof v !== 'string' || !v.includes('{{')) continue;
+      const bad = [...v.matchAll(/\{\{\s*([^{}]+?)\s*\}\}/g)]
+        .some(m => classify(m[1], i, priorSkills, step) === 'insert');
+      if (bad) { firstBadKey = k; break; }
+    }
+    const varName = `_ctx_${String(firstBadKey || 'input').replace(/\W+/g, '_')}_${i}`;
+
+    TOKEN_RE.lastIndex = 0;
+    argsJson = argsJson.replace(TOKEN_RE, (match, rawName) => {
+      const verdict = classify(rawName, i, priorSkills, step);
+      if (verdict === 'ok') return match;
+      mutated = true;
+      if (verdict === 'insert') { needsAskUser = true; return `{{${varName}}}`; }
+      return '{{PREV_OUTPUT}}';
+    });
+
+    if (!mutated) { out.push(step); continue; }
+    try { step.args = JSON.parse(argsJson); } catch (_) { /* keep rewritten-as-possible */ }
+    // {{fallbackUrls}} is array-typed — keep it an array after the rewrite.
+    if (typeof step.args.fallbackUrls === 'string') {
+      step.args.fallbackUrls = [step.args.fallbackUrls];
+    }
+
+    if (needsAskUser) {
+      repairCount++;
+      const keyHint = firstBadKey ? ` for "${firstBadKey}"` : '';
+      _log.info(`[Node:PlanSkillsV2] _repairStepPlaceholders: step ${i + 1} (${step.skill}) referenced unresolvable token(s) — inserting ask_user (varName=${varName}) to collect the missing input`);
+      out.push({
+        skill: 'ask_user',
+        args: {
+          question: `I'm missing a detail${keyHint} for this step: ${step.description || step.skill}. What should I use?`,
+          inputHint: 'Your answer',
+          varName,
+          options: [],
+        },
+        description: 'Collect missing input for the next step',
+      });
+    }
+    out.push(step);
+  }
+  if (repairCount > 0) {
+    _log.info(`[Node:PlanSkillsV2] _repairStepPlaceholders: ${repairCount} ask_user step(s) inserted`);
+  }
+  return out;
+}
+
 /**
  * Analyzes a skill plan and adds runGroup properties for parallel execution.
  * Only called for plans with 3+ steps to avoid unnecessary LLM overhead.
@@ -889,7 +996,10 @@ When a step produces content (text, markdown, JSON, file list, etc.) that a LATE
 - NEVER use \`pbpaste\` — it reads the user's clipboard, which is unrelated to automation output
 - NEVER emit \`{{prev_stdout}}\` as a URL or file path — it must only appear inside goal/task strings
 - NEVER assume content from a browser step is "already on disk" unless a prior shell.run step explicitly wrote it
-- NEVER hardcode placeholder text like "This is a template for ChatGPT responses" — use the actual prior step output via \`{{PREV_OUTPUT}}\``;
+- NEVER hardcode placeholder text like "This is a template for ChatGPT responses" — use the actual prior step output via \`{{PREV_OUTPUT}}\`
+- NEVER use \`{{PREV_OUTPUT}}\`/\`{{PREV_OUTPUT_FILE}}\`/\`{{CONTRACT[N]}}\`/\`{{bestUrl}}\`/\`{{synthesisAnswer}}\` (or any \`{{token}}\`) in the FIRST step — placeholders only resolve to output of EARLIER steps, so step 1 has nothing to reference
+- \`{{PREV_OUTPUT_FILE}}\` is ONLY valid on \`browser.agent\` steps — for \`web.agent\`/\`cli.agent\`/\`shell.run\` use \`{{PREV_OUTPUT}}\`
+- NEVER invent placeholders for missing user context (location, address, names, dates) — if the request needs info you don't have, make the first step \`ask_user\` to collect it`;
 
   // ── File context injection ───────────────────────────────────────────────
   // Scan the user message for file paths and inject real filesystem metadata
@@ -2825,6 +2935,10 @@ The user's request does NOT match any installed skill.
   // ── Malformed-step guard: shell.run without cmd/goal → ask_user ────────────
   if (Array.isArray(skillPlan)) {
     skillPlan = _sanitizeSkillPlan(skillPlan, state);
+    // Repair {{token}}s that can never resolve at their position (e.g.
+    // {{PREV_OUTPUT_FILE}} in step 1) — otherwise the step dies at dispatch
+    // as "Unresolved placeholder(s)" after the user already approved the plan.
+    skillPlan = _repairStepPlaceholders(skillPlan, state);
   }
 
   // ── Synthesize guard: every action plan ends with a confirmation ────────────

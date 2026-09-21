@@ -94,7 +94,11 @@ module.exports = async function logConversation(state) {
     // Store user message and assistant response in parallel
     const logPromises = [];
 
-    if (message) {
+    // _skipUserLog: resumed runs (ask_user answers) re-execute with the same
+    // prompt — the user turn was already persisted by the paused run that
+    // routed through this node. Without the flag each pause/resume writes
+    // another identical user row and history shows the prompt once per pause.
+    if (message && !state._skipUserLog) {
       logPromises.push(
         mcpAdapter.callService('conversation', 'message.add', {
           sessionId,
