@@ -241,6 +241,17 @@ module.exports = async function parseIntentV2(state) {
       finalIntent = 'command_automate';
     }
 
+    // Active-document referents ("print this", "what's this page about",
+    // "explain this file") resolve to a concrete file/URL via the classifier's
+    // activeDocRef — they need deterministic retrieval (fs.read / web.crawl /
+    // shell.run), not viewport OCR. activeDocRef==='screen' stays on the OCR
+    // path — there is no file/URL target to fetch.
+    if (finalIntent === 'screen_intelligence'
+        && ['file', 'url'].includes(state._taskClassification?.activeDocRef)) {
+      logger.info(`[Node:ParseIntentV2] activeDocRef override: screen_intelligence → command_automate (${state._taskClassification.activeDocRef}) for "${classifyMessage.slice(0, 80)}"`);
+      finalIntent = 'command_automate';
+    }
+
     // app_automation tasks (e.g. "In Devin use the AI to add tests") must never be
     // downgraded to local_system/synthesize by the decomposer. Force command_automate.
     if (state._taskClassification?.taskType === 'app_automation') {

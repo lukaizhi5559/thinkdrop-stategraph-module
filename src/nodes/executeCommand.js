@@ -502,6 +502,16 @@ function generateStepContract(stepResult, stepIndex) {
       };
       break;
 
+    case 'edit.agent':
+      contract.outputs = {
+        filePath: { type: 'text', value: stepResult.filePath || stepResult.args?.filePath || '' },
+        filePaths: { type: 'array', value: [stepResult.filePath || stepResult.args?.filePath].filter(Boolean) },
+        appliedEdits: { type: 'number', value: stepResult.appliedEdits ?? 0 },
+        backupPath: { type: 'text', value: stepResult.backupPath || '' },
+        summary: { type: 'text', value: stepResult.stdout || '' }
+      };
+      break;
+
     case 'cli.agent':
       contract.outputs = {
         command: { type: 'text', value: stepResult.args?.command || '' },
@@ -585,6 +595,8 @@ function _generateContractSummary(stepResult) {
       return `Image analysis of ${args.filePath || 'image'} ${status}`;
     case 'cli.agent':
       return `CLI command '${args.command?.slice(0, 50)}...' ${status}`;
+    case 'edit.agent':
+      return `Edit agent on ${args.filePath || args.path || 'file'} ${status}`;
     case 'app.agent':
       return `App agent '${args.action || 'action'}' on ${args.appName || 'app'} ${status}`;
     case 'user.agent':
@@ -5628,6 +5640,16 @@ Please try again or search with different terms.`;
           }}
         : resolvedArgs;
 
+    // Tag edit.agent steps that target the currently-open document — the file
+    // may have unsaved changes in its host app, so Phase-2 draft mode keys off
+    // this flag to prefer draft+approval over in-place writes.
+    if (skill === 'edit.agent' && state._priorScreenContext?.filePath) {
+      const _editTarget = _callArgs.filePath || _callArgs.path || _callArgs.file || null;
+      if (_editTarget && _editTarget === state._priorScreenContext.filePath) {
+        _callArgs._isActiveDoc = true;
+      }
+    }
+
     // ── Phase 2: Smart Routing — Skip shell.run if app already focused ───────
     // Detects shell.run steps that open apps and skips them if the app is already
     // open and focused. Reduces unnecessary process spawning.
@@ -6239,6 +6261,9 @@ Please try again or search with different terms.`;
       suggestion: raw.suggestion || null,
       output: raw.output || null,
       missingPath: raw.missingPath || null,
+      filePath: raw.filePath ?? null,
+      backupPath: raw.backupPath ?? null,
+      appliedEdits: raw.appliedEdits ?? null,
       toolName: raw.toolName || null,
       stderrHint: raw.stderrHint || null,
       userAllowlistHint: !!raw.userAllowlistHint,

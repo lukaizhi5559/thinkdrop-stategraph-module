@@ -15,6 +15,37 @@ The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or mo
 
 **Unsaved/Untitled docs:** if `File:` is absent and the app is a document editor, emit an `ask_user` step: "The file appears to be unsaved. You need to save it before I can print it. Please save the file and try again." (actionable, not just an error).
 
+**"Print this page" / "save this page" — `URL:` present in ACTIVE SCREEN CONTEXT:**
+
+Canonical: Chrome headless → PDF (preserves layout + images). For print, pipe the PDF to `lp`; for save, keep the PDF file.
+
+```json
+[
+  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "f=\"/tmp/thinkdrop_page_$(date +%s).pdf\"; \"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" --headless --disable-gpu --print-to-pdf=\"$f\" --no-pdf-header-footer \"<URL>\" 2>/dev/null && lp \"$f\" && echo \"PRINTED: $f\""] }, "description": "Render the page to PDF and print it" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the page was printed." }, "description": "Confirm print" }
+]
+```
+
+- **Save instead of print:** same command minus `lp` — `--print-to-pdf="~/Desktop/page_$(date +%s).pdf"` then `echo "SAVED: $f"`. Always `expanduser`-safe: use `$HOME` or a literal path, never `~` inside the quoted argv string for the output path (Chrome accepts `~`? — use `$HOME` to be safe).
+- **Fallback (Chrome blocked/missing or page unreachable):** `bash -c "curl -sL '<URL>' | textutil -stdin -format html -convert txt -stdout | lp"` — text-only but works without a browser.
+- **Last resort (both fail — auth wall, JS-only app):** `bash -c "f=\"$HOME/Desktop/Screenshot $(date '+%Y-%m-%d at %H.%M.%S').png\"; screencapture -x \"$f\" && lp \"$f\" && echo \"PRINTED: $f\""` — screenshots what's visible and prints it.
+- **NEVER** emit `shell.run` with just a `goal` like "print the current page" — always use the `URL:`/`File:` from ACTIVE SCREEN CONTEXT with explicit `cmd`/`argv`.
+
+## Office-format files (docx / xlsx / doc / rtf / pages)
+
+`edit.agent` and `fs.read` handle plain text only — Office formats use deterministic Python recipes (python-docx, openpyxl, textutil are installed):
+
+| Task | Recipe |
+|---|---|
+| Read .doc/.rtf/.pages text | `textutil -convert txt -stdout '<file>'` |
+| Read .docx text | `python3 -c "import docx; d=docx.Document('<file>'); print('\\n'.join(p.text for p in d.paragraphs))"` or `textutil -convert txt -stdout` |
+| Read .xlsx cells | `python3 -c "import openpyxl; wb=openpyxl.load_workbook('<file>'); ws=wb.active; [print(r) for r in ws.iter_rows(values_only=True)]"` |
+| Edit .xlsx cell formats/values | `python3 -c "import openpyxl; wb=openpyxl.load_workbook('<file>'); ws=wb.active; ws['A1'].number_format='0.00'; ws['A4'].number_format='\"$\"#,##0.00'; wb.save('<file>')"` |
+| Edit .docx text (find/replace) | `python3 -c` with python-docx — iterate `doc.paragraphs`, edit `run.text`, `doc.save('<out>')` — **write to a copy** (`~/.thinkdrop/edits/drafts/`), never rewrite the original blindly |
+| Print .docx/.xlsx/.pages | Convert first: `textutil -convert txt -stdout '<file>' | lp` (layout not preserved — warn in synthesize) or open the app and `run_app_flow` Cmd+P |
+
+For semantic Office edits ("check spelling", "rewrite this section"), produce a corrected **copy** at `~/.thinkdrop/edits/drafts/<name>-<timestamp>.<ext>` and report the draft path — never edit binary originals in place.
+
 ## App-control verbs via shell.run (osascript)
 
 For deterministic window management, prefer `shell.run` osascript over `app.agent` — no focus/OCR/shortcut-detection needed. Use `App:` from ACTIVE SCREEN CONTEXT as the app name.

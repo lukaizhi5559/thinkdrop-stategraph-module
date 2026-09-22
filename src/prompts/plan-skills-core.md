@@ -1,6 +1,7 @@
 synthesize|args:{prompt:string,saveToFile?:string,outputSchema?:{type:string|string[]}}|runs_an_LLM_to_answer_summarize_or_generate_text.__ALWAYS_the_final_step_for_user_facing_answers.__Use_{{synthesisAnswer}}_to_pipe_a_prior_synthesize_into_a_later_one.
 fs.read|args:{action:string,path?:string,paths?:string[],maxFileSize?:number,encoding?:string}|reads_one_or_more_local_files_and_returns_their_contents_(100KB_limit).__Use_for_reading_small_text_files_(md,_txt,_json,_js,_ts,_csv,_yaml,_html),_directory_trees_(action:tree),_code_search_(action:search),_or_codebase_exploration_(action:explore).__For_large_files_(>100KB)_use_shell.run_with_explicit_cmd/argv_(head,_tail,_sed,_wc,_grep)_instead.
 shell.run|args:{goal?:string,cmd?:string,argv?:string[]}|executes_a_local_shell_command.__Use_goal_for_natural_language_file_ops_OR_cmd/argv_for_explicit_commands.__NEVER_both_goal_AND_cmd_in_the_same_step.
+edit.agent|args:{goal:string,filePath:string,agentContext?:string}|edits_a_local_text_file_via_LLM_full-content_rewrite.__Use_for_semantic/structural_edits_(refactor,_add_section,_fix_bug,_rephrase)_on_text_files_≤8K_chars.__NOT_for_binary/office_files_(docx/xlsx/pdf/pages_—_use_shell.run_python_recipes),_NOT_for_simple_string_replacement_(use_sed/python3_via_shell.run),_NOT_for_files_>8K_chars_(use_targeted_shell.run_edits).
 browser.agent|args:{action:string,agentId?:string,task?:string,service?:string,url?:string}|[sub-agent]_INTERACTIVE_web_tasks_only:_OAuth/login_services,_REST_API_services,_AI_chatbots,_forms,_DOM_interaction,_account_actions.__actions:_run_(delegate),_build_agent_(create_descriptor),_explore,_list_agents.__NEVER_emit_browser.act_or_playwright.agent_directly.__NOT_for_public_research_or_downloads_(use_web.agent/web.crawl/shell.run).
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI-backed_services_(gh,_aws,_heroku)_AND_known_CLI_tools_(ffmpeg,_pandoc,_imagemagick,_yt-dlp).__actions:_run,_build_agent,_list_agents.
 app.agent|args:{action:string,appName?:string,goal?:string,searchText?:string,filePath?:string,prompt?:string}|[desktop_app_agent]_native_macOS_app_automation_via_shortcuts_+_OCR.__action:run_agent_uses_an_app's_built-in_AI_assistant.
@@ -139,12 +140,19 @@ Route app-control verbs by what they need. **Prefer `shell.run` (osascript/open/
 | "What app am I using now" / "what's open" | `getActiveAppContext` (already in ACTIVE SCREEN CONTEXT) | use the `App:` field directly |
 | "What app was I using before" / "previous app" | `getActiveAppContext` (history source) | the `history` source marker indicates fallback |
 
-### "The file that's open" / "print the file" / "the current document"
+### Active Document Resolution — "this file" / "this page" / "print this" / "what's this about"
 
-Use `File:` from ACTIVE SCREEN CONTEXT directly. NEVER query the frontmost app via osascript — the active app + open file are already resolved.
+The deictic referent ("this", "this file", "this page", "it") is already resolved: check `File:` and `URL:` in ACTIVE SCREEN CONTEXT — one of them is the target. NEVER query the frontmost app via osascript (the overlay is frontmost) and NEVER emit a targetless `shell.run` goal like "print the current file" — if no File:/URL: exists, use the Neither column.
 
-- If `File:` is present → `shell.run { cmd: "lp", argv: ["<File>"] }` for print, or `shell.run` / `edit.agent` / `app.agent` depending on the verb.
-- If `File:` is absent → `app.agent { action: 'run_app_flow', appName, goal }` for a named desktop app, or ask the user.
+| Verb | `File:` present | `URL:` present | Neither |
+|---|---|---|---|
+| read / explain / summarize / "what's this about" | `fs.read { action:'read', path:'<File>' }` → synthesize. Binary (.docx/.xlsx/.pdf/.pages) → `shell.run` format reader (see shell appendix). >100KB → `shell.run` head/grep/sed. | `web.crawl { url:'<URL>' }` → synthesize. If crawl fails or returns botBlocked → `app.agent extract_content_via_clipboard` → `screen.capture`/OCR. | `app.agent extract_content_via_clipboard` (browser) or `screen.capture` → synthesize |
+| print | `shell.run { cmd:'lp', argv:['<File>'] }`. .doc/.rtf/.pages → `textutil -convert txt -stdout '<File>' \| lp`. .docx/.xlsx → textutil/python recipe first. | `shell.run` Chrome headless → PDF → `lp` (canonical — see shell appendix) → fallback `curl -sL '<URL>' \| textutil -stdin -format html -convert txt -stdout \| lp` → last resort `screencapture -x` → `lp` | `screencapture -x` → `lp`, or `app.agent run_app_flow` Cmd+P |
+| save / download / "save this page" | `shell.run { cmd:'cp', argv:['<File>','<dest>'] }` | `shell.run` Chrome headless `--print-to-pdf=<dest>` (keeps layout+images) → fallback `curl -sL -o <dest> '<URL>'` | `app.agent extract_content_via_clipboard` → `shell.run` write file, or `screen.capture` for an image copy |
+| edit | simple string change → `shell.run` sed/python3; semantic/structural → `edit.agent { goal, filePath:'<File>' }`; .docx/.xlsx → `shell.run` python-docx/openpyxl recipe | → `app.agent { action:'run_agent' }` (in-app edit via the browser's AI) | → `app.agent { action:'run_agent' }` or `ask_user` |
+
+**Fallback ordering is part of the contract:** if a deterministic fetch step fails, recovery follows the listed ladder — clipboard extraction or OCR, never a blind retry.
+
 - **Multiple file matches:** if `mdfind` returns multiple paths for a filename, do NOT guess — emit an `ask_user` step: "I found multiple files named '<filename>'. Which one?" with the paths as options.
 - **Unsaved/Untitled docs:** if `File:` is absent and the app is a document editor, emit an `ask_user` step: "The file appears to be unsaved. You need to save it before I can print it. Please save the file and try again." (actionable, not just an error).
 

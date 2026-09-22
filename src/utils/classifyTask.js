@@ -57,7 +57,8 @@ Output ONLY valid JSON with exactly these fields:
   "isActivityQuery": true | false,
   "webAccessMode": "none" | "download" | "public_read" | "interactive",
   "interactiveActions": ["login", "add_to_cart", ...] | [],
-  "expectsFileOutput": true | false
+  "expectsFileOutput": true | false,
+  "activeDocRef": "file" | "url" | "screen" | null
 }
 
 Field rules:
@@ -87,7 +88,15 @@ Field rules:
 - expectsFileOutput: true when the task creates/writes/saves/exports a file — the referenced path is a DESTINATION (it may not exist yet), not a source to read. Signals: "save this to X.md", "write the code to ~/Desktop/three.md", "export the results as report.csv", "put that in a file". false for tasks that only read/open/list files, or when no file output is produced.
   - CRITICAL: Set followUpTarget to null when isFollowUp is false (including the META-QUESTION EXCEPTION above). A non-null followUpTarget with isFollowUp=false is invalid.
   - Never set followUpTarget to the user's own prior message text when the user is asking ABOUT that message (e.g., "what did I just ask" → followUpTarget must be null, NOT "what did I just ask").
-  - ACTIVE APP CONTEXT PRIORITY: When the user message uses deictic references ("this file", "that file", "the file", "it", "this", "that") and the prompt includes an "ACTIVE APP CONTEXT (live):" block with a "File: <path>" field, resolve followUpTarget to that file path. The live open file is the authoritative referent for deictic file references — NOT a file from conversation history. Also set isScreenFollowUp to false when the file is resolved this way (the file is known, no screen OCR needed).
+  - ACTIVE DOC CONTEXT (activeDocRef): When an "ACTIVE APP CONTEXT (live):" or "PRIOR SCREEN CONTEXT" block is present AND the user message refers to the currently open document/page/site — e.g. "this file", "this page", "this document", "this site", "the current doc", or a bare "this"/"it" paired with a document action (read, explain, summarize, print, save, edit, download, translate, describe, "tell me about", "what's this about") where CONVERSATION HISTORY does not supply a competing referent — set:
+    * "file"   — when the block has a File: path and the referent is that document
+    * "url"    — when the block has a URL: (or app is a browser) and the referent is that page/site
+    * "screen" — when the referent is visible screen content with no resolvable file/url ("what's on my screen", "this error dialog", "this window")
+    * null     — otherwise
+  - CRITICAL: NEVER set activeDocRef when the deictic refers to something established in CONVERSATION HISTORY — conversational referents go in followUpTarget with isFollowUp:true. Example: "email me those addresses" after listing addresses → followUpTarget="the addresses", activeDocRef=null even if a file is open. The live doc is the referent ONLY when the message targets a document/page/file/site artifact itself — not a conversational subject (a topic, a result, a list, an answer).
+  - activeDocRef and followUpTarget are independent fields — do NOT put the live file path or url into followUpTarget; the resolved value is attached downstream from the context block (activeDocRef only names the KIND of referent).
+  - Do NOT resolve activeDocRef to a file mentioned in conversation history — it is ONLY for the live open document/page in the context blocks.
+  - When activeDocRef is "file" or "url", also set isScreenFollowUp:false and needsFreshScreen:false (the target is known — no screen OCR needed). When activeDocRef is "screen", set isScreenFollowUp:true.
 
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
   - WHO to send to (messaging tasks with no recipient anywhere)
@@ -273,6 +282,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     webAccessMode: 'none',
     interactiveActions: [],
     expectsFileOutput: false,
+    activeDocRef: null,
+    activeDocTarget: null,
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -324,6 +335,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       if (activeAppContext.appName)     parts.push(`App: ${activeAppContext.appName}`);
       if (activeAppContext.windowTitle)  parts.push(`Window: "${activeAppContext.windowTitle}"`);
       if (activeAppContext.filePath)     parts.push(`File: ${activeAppContext.filePath}`);
+      if (activeAppContext.url)          parts.push(`URL: ${activeAppContext.url}`);
       if (parts.length > 0) {
         activeAppBlock = `\n\nACTIVE APP CONTEXT (live): ${parts.join(', ')}`;
       }
@@ -373,6 +385,12 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const parsedIsFollowUp = !!parsed.isFollowUp;
     const parsedFollowUpTarget = parsed.followUpTarget || null;
 
+    // activeDocRef — kind of live-document referent, if any. The concrete
+    // target (path/url) is attached deterministically by the caller from the
+    // live context — never trust an LLM-emitted path string.
+    const _VALID_DOC_REFS = new Set(['file', 'url', 'screen']);
+    const activeDocRef = _VALID_DOC_REFS.has(parsed.activeDocRef) ? parsed.activeDocRef : null;
+
     return {
       taskType:            parsed.taskType           || _default.taskType,
       isFollowUp:          parsedIsFollowUp,
@@ -392,6 +410,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       webAccessMode,
       interactiveActions:  Array.isArray(parsed.interactiveActions) ? parsed.interactiveActions : [],
       expectsFileOutput:   !!parsed.expectsFileOutput,
+      activeDocRef,
+      activeDocTarget:     null, // resolved by caller from live context
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

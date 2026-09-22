@@ -122,6 +122,7 @@ function _ensureSynthesizeForAppFlow(skillPlan, userMessage) {
 // user gets an actionable question instead of a validation error.
 function _sanitizeSkillPlan(skillPlan, state) {
   if (!Array.isArray(skillPlan)) return skillPlan;
+  const _log = state?.logger || console;
   const _fileHint = state?._priorScreenContext?.filePath || null;
   const _appHint = state?._priorScreenContext?.appName || null;
   for (const step of skillPlan) {
@@ -148,7 +149,7 @@ function _sanitizeSkillPlan(skillPlan, state) {
         if (_fileHint && _msg) {
           step.args = { goal: `${_msg} — file: ${_fileHint}` };
           if (step._malformed) {
-            logger.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled goal from context for _malformed step: "${_msg.slice(0, 60)} — file: ${_fileHint}"`);
+            _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled goal from context for _malformed step: "${_msg.slice(0, 60)} — file: ${_fileHint}"`);
           }
         } else {
           // No file context — convert to ask_user
@@ -162,6 +163,32 @@ function _sanitizeSkillPlan(skillPlan, state) {
           };
           step.description = 'Clarify the shell.run target';
         }
+      }
+    }
+
+    // ── Active-document target fill ──────────────────────────────────────────
+    // When the user refers to the open document ("print this", "read this
+    // page", "fix this file") the planner may emit a doc skill with no
+    // concrete target. Fill it from the live screen context rather than
+    // failing at dispatch or degrading to ask_user.
+    if (step?.skill === 'edit.agent') {
+      const a = step.args || (step.args = {});
+      if (!a.filePath && !a.path && !a.file && _fileHint) {
+        a.filePath = _fileHint;
+        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled edit.agent.filePath from active doc: ${_fileHint}`);
+      }
+    } else if (step?.skill === 'fs.read') {
+      const a = step.args || (step.args = {});
+      if (!a.path && _fileHint) {
+        a.path = _fileHint;
+        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled fs.read.path from active doc: ${_fileHint}`);
+      }
+    } else if (step?.skill === 'web.crawl') {
+      const a = step.args || (step.args = {});
+      const _urlHint = state?._priorScreenContext?.url || null;
+      if (!a.url && _urlHint) {
+        a.url = _urlHint;
+        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled web.crawl.url from active doc: ${_urlHint}`);
       }
     }
   }
@@ -585,7 +612,10 @@ function _buildSystemPrompt(userMessage, state) {
 
   // Public web tasks (download a file / read public info) get the light-weight
   // webfetch appendix — web.agent + web.crawl + curl patterns, no browser.agent.
-  const _needsWebFetch = ['download', 'public_read'].includes(_tc?.webAccessMode);
+  // Also load it when the referent is the open web page — crawl/curl patterns
+  // are the deterministic path for reading/saving/printing it.
+  const _needsWebFetch = ['download', 'public_read'].includes(_tc?.webAccessMode)
+    || _tc?.activeDocRef === 'url';
 
   const _isNativeDesktopTask = _tc?.taskType !== 'browser'
     && !(_tc?.taskType === 'query' && !_tc?.targetService && !_tc?.isAppUiInspection); // exclude pure abstract knowledge Q (but not named-app UI inspection)
@@ -602,7 +632,8 @@ function _buildSystemPrompt(userMessage, state) {
   const _needsApp = _isNativeDesktopTask || _isBrowserNavTask || _isBrowserInPageClick || _tc?.taskType === 'app_automation';
 
   const _needsShell = _tc?.taskType === 'local_file'
-    || (_tc?.taskType !== 'app_automation' && ['file', 'copy', 'save', 'write', 'export', 'convert', 'move', 'delete', 'find'].some(k =>
+    || !!_tc?.activeDocRef // doc tasks need shell recipes (lp, textutil, Chrome→PDF, screencapture)
+    || (_tc?.taskType !== 'app_automation' && ['file', 'copy', 'save', 'write', 'export', 'convert', 'move', 'delete', 'find', 'print'].some(k =>
       _tc?.taskType?.includes(k) || _tc?.intent?.includes(k) || userMessage.toLowerCase().includes(k)
     ));
 
@@ -907,6 +938,11 @@ function _buildSystemPrompt(userMessage, state) {
   // plan file names that leak stale context into the planning prompt.
   // ALSO skip for non-follow-up command_automate intents: the OCR from a previous
   // (often failed) attempt can falsely imply the task is already complete.
+  // Exception: when the classifier resolved an active-document referent
+  // (activeDocRef — "print this", "read this page"), the app metadata IS the
+  // target and must be injected; _screenContextNote is metadata-only
+  // (app/category/window/URL/File — no OCR body) so the stale-OCR concern
+  // does not apply to it.
   const _screenNote = state._screenContextNote;
   // Stale only when the captured window IS ThinkDrop/Electron itself — a Devin/
   // VS Code title like "thinkdrop — plan-xxx.md" (project-name prefix) is real
@@ -919,7 +955,10 @@ function _buildSystemPrompt(userMessage, state) {
     _ctxApp === 'ThinkDrop' ||
     ((!_ctxApp || _ctxApp === 'unknown') && _ctxTitle.startsWith('thinkdrop'))
   );
-  const _isNonFollowUpAutomate = state.intent?.type === 'command_automate' && !state._taskClassification?.isFollowUp;
+  const _isNonFollowUpAutomate = state.intent?.type === 'command_automate'
+    && !state._taskClassification?.isFollowUp
+    && !state._taskClassification?.isScreenFollowUp
+    && !state._taskClassification?.activeDocRef;
   if (_screenNote && !_screenIsStale && !_isNonFollowUpAutomate && typeof _screenNote === 'string' && _screenNote.length > 0) {
     result += `\n\n## ACTIVE SCREEN CONTEXT (live — use this app as the target for screen-related tasks)\n\n${_screenNote}`;
   }
@@ -3057,3 +3096,4 @@ The user's request does NOT match any installed skill.
 module.exports = planSkillsV2;
 module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;
 module.exports._selectPriorSynthesis = _selectPriorSynthesis;
+module.exports._sanitizeSkillPlan = _sanitizeSkillPlan;

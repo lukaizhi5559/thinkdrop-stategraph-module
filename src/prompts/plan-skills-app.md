@@ -202,12 +202,12 @@ When the user asks to read, scroll, summarize, or tell them about the content cu
 
 | Active category | Correct action | Direction / notes |
 |---|---|---|
-| `browser` | `extract_content_via_clipboard` | Use the Cmd+L → Tab → Cmd+A → Cmd+C chain. NEVER use `scroll`, `passive_read_scroll`, or `search_scroll` for browser content. |
+| `browser` | `extract_content_via_clipboard` | Use the Cmd+L → Tab → Cmd+A → Cmd+C chain. NEVER use `scroll`, `passive_read_scroll`, or `search_scroll` for browser content. **Exception: when `URL:` is present in ACTIVE SCREEN CONTEXT, prefer `web.crawl { url }` first — it is deterministic (no focus/clipboard churn). Use `extract_content_via_clipboard` as the fallback for bot-blocked, auth'd, or JS-only pages where crawl fails.** |
 | `editor`, `chat`, `terminal` | `passive_read_scroll` | `direction: "up"` — jump to the bottom, then scroll up to accumulate history. |
 | `email`, `design`, `document` | `passive_read_scroll` | `direction: "down"` — start at the top, scroll down. |
 | `other` | `passive_read_scroll` | `direction: "down"` unless the goal clearly indicates searching for a recent item at the bottom. |
 
-CRITICAL: If the active screen is a browser, ignore phrases like "scroll this page", "read this page", "tell me about this" — always use `extract_content_via_clipboard` and then `synthesize`.
+CRITICAL: If the active screen is a browser, ignore phrases like "scroll this page", "read this page", "tell me about this" — always use `extract_content_via_clipboard` and then `synthesize` (or `web.crawl` when `URL:` is present, per the note above).
 
 ## Screen Highlighting — GhostLayer Overlay
 

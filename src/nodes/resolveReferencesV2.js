@@ -16,7 +16,7 @@
 
 const { classifyTask } = require('../utils/classifyTask');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { REFERENTIAL_RE, FILE_REF_RE, FILE_WRITE_VERB_RE } = require('../utils/textPatterns.cjs');
+const { REFERENTIAL_RE, FILE_WRITE_VERB_RE } = require('../utils/textPatterns.cjs');
 
 /**
  * Binary web-access confirmation — runs only when classifyTask returns
@@ -357,13 +357,13 @@ module.exports = async function resolveReferencesV2(state) {
   // Pass _activeAppContext so the classifier can resolve "this file" → the live
   // open file path instead of a stale followUpTarget from conversation history.
   //
-  // GATE: Only inject active app context when the message explicitly references a
-  // file/code artifact. The classifier's "ACTIVE APP CONTEXT PRIORITY" rule resolves
-  // ANY deictic reference ("it", "this", "that") to the IDE's open file — even when
-  // "it" refers to a conversational subject (a folder, a result, a topic). This caused
-  // task_1d44cd52 to resolve followUpTarget to skillThinking.js (the IDE's open file)
-  // instead of the basement project context. Generic deictics alone are insufficient.
-  const _hasFileRef = FILE_REF_RE.test(message || '');
+  // The context is now passed UNCONDITIONALLY: the classifier's ACTIVE DOC CONTEXT
+  // rule resolves doc-artifact referents ("this file", "this page", "print this")
+  // into the separate `activeDocRef` field — it no longer resolves arbitrary
+  // deictics into followUpTarget (the task_1d44cd52 bug: "it" → the IDE's open
+  // file instead of the conversational subject). Conversational referents stay in
+  // followUpTarget; the live-doc resolution is a parallel channel that cannot
+  // corrupt it, and an unused context block is harmless.
   let _taskClassification;
   if (state._planFile) {
     // Plan execution: skip the expensive LLM classification, but preserve the
@@ -385,10 +385,44 @@ module.exports = async function resolveReferencesV2(state) {
       state.llmBackend || null,
       logger,
       priorScreenSummary,
-      _hasFileRef ? _activeAppContext : null,
+      _activeAppContext,
     );
   }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
+
+  // ── Resolve activeDocTarget deterministically ───────────────────────────────
+  // The classifier only emits the KIND of referent (activeDocRef: file/url/
+  // screen). The concrete path/url is attached here from the merged live context
+  // (_priorScreenContext was enriched with _activeAppContext fields above) — the
+  // LLM never emits path strings, so there is no hallucination surface.
+  if (_taskClassification.activeDocRef === 'file') {
+    const fp = _priorScreenContext?.filePath || null;
+    if (fp) {
+      try {
+        // The monitor derives filePath from the window title — verify it exists
+        // before letting the planner treat it as a readable file.
+        if (fs.existsSync(fp)) {
+          _taskClassification.activeDocTarget = fp;
+        } else {
+          logger.info(`[Node:ResolveReferencesV2] activeDocRef=file but path missing — downgrading to screen: ${fp}`);
+          _taskClassification.activeDocRef = 'screen';
+        }
+      } catch (_) {
+        _taskClassification.activeDocTarget = fp;
+      }
+    } else {
+      // Classifier said "file" but no live filePath exists — fall back to the
+      // screen-content path rather than a targetless file plan.
+      _taskClassification.activeDocRef = 'screen';
+    }
+  } else if (_taskClassification.activeDocRef === 'url') {
+    const u = _priorScreenContext?.url || null;
+    if (u) {
+      _taskClassification.activeDocTarget = u;
+    } else {
+      _taskClassification.activeDocRef = 'screen';
+    }
+  }
 
   // ── Validate classifier-resolved file paths ──────────────────────────────────
   // The classifier can hallucinate paths from chat history (e.g. a screenshot

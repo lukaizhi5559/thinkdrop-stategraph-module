@@ -44,6 +44,34 @@ Public web tasks (research, reading public pages, downloading public files) esca
 - A curl download that saved an HTML page (`file` reports "HTML document"/"ASCII text") should be REPLAN_STEP'd to `web.crawl` the page URL and extract the real media link, NOT re-curled.
 - Only escalate UP the ladder when a lower rung demonstrably fails (bot block, HTML-instead-of-asset, CAPTCHA) or the task requires interaction.
 
+## Active-Document Fallback Ladders (File:/URL: targets)
+
+When a step targeted the user's open document or page (resolved from ACTIVE SCREEN CONTEXT), follow these ladders — never blind-retry the same approach:
+
+**Page read/understand fails:**
+1. `web.crawl` fails or returns `botBlocked:true` → REPLAN_STEP to `app.agent { action:'extract_content_via_clipboard', appName:'<browser>', category:'browser' }` (pulls real DOM text — works on auth'd/bot-walled pages since it reads the rendered tab, not a fresh fetch)
+2. Clipboard extraction fails or returns empty → `screen.capture` or `app.agent get_recent_ocr` → synthesize from OCR text
+3. All fail → ASK_USER
+
+**File read fails:**
+1. `fs.read` error / unreadable / binary content → REPLAN_STEP to `shell.run` format reader: `textutil -convert txt -stdout '<file>'` (doc/docx/rtf/pages), `pdftotext '<file>' -` (pdf), `python3 -c "import openpyxl..."` (xlsx), `python3 -c "import docx..."` (docx)
+2. Format reader unavailable/fails → `app.agent` OCR on the open app (`get_recent_ocr` / `screen.capture`)
+3. All fail → ASK_USER
+
+**Print fails:**
+1. `lp` exit non-zero (no printer, bad format) → for a File: target try converting first: `textutil -convert txt -stdout '<file>' | lp` or `cupsfilter '<file>' > /tmp/out.pdf && lp /tmp/out.pdf`
+2. For a URL: target where Chrome→PDF failed → `curl -sL '<url>' | textutil -stdin -format html -convert txt -stdout | lp`
+3. Both fail → `screencapture -x <shot.png> && lp <shot.png>` (prints what's visible), or `app.agent { action:'run_app_flow', appName, goal:'print the current document' }` (in-app Cmd+P)
+4. Still failing → ASK_USER (likely no printer configured)
+
+**edit.agent failures — map the `reason` field:**
+- `binary_file` → REPLAN_STEP to the format-appropriate path (openpyxl/python-docx/textutil recipe, or `app.agent run_agent` for in-app editing)
+- `file_too_large` → REPLAN_STEP to a targeted `shell.run` edit (sed/python3 on the specific region) — do NOT retry edit.agent on the same file
+- `file_missing` → REPLAN: re-resolve the path via `mdfind` or check ACTIVE SCREEN CONTEXT for a fresher `File:` — never guess
+- `mtime_conflict` → AUTO_PATCH/REPLAN_STEP: re-run the same edit.agent step (it re-reads the file fresh); if it recurs, the host app is auto-saving — switch to `app.agent run_agent` in-app edit
+- `suspicious_output` / `llm_failed` → REPLAN_STEP once with a narrower goal; second failure → `app.agent run_agent` or ASK_USER
+- `write_failed` → Category E handling (permissions) → ASK_USER
+
 ## Common Failure Patterns
 
 mkdir permission denied → ASK_USER: offer Desktop or ~/Documents as alternative
