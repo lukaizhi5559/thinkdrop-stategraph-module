@@ -379,6 +379,33 @@ module.exports = async function answer(state) {
     systemInstructions += _buildRecallHistoryBlock(conversationHistory, _isConversationRecall);
   }
 
+  // ── Semantically matched older-session messages + queued task journal ──────
+  // Semantic hits can be weeks/months old — merged into the chronological
+  // history they get sliced off by the recency windows above. They get their
+  // own section so long-ago recall ("remember when I asked about X") actually
+  // reaches the model.
+  const _semanticMatches = Array.isArray(state.semanticMatches) ? state.semanticMatches : [];
+  if (_semanticMatches.length > 0) {
+    const matchedLines = _semanticMatches.slice(0, 15).map((m, i) => {
+      const when = m.formattedDate?.absolute || m.timestamp || '';
+      const role = m.role === 'user' ? 'User' : 'Assistant';
+      const sess = m.sessionTitle ? ` — session "${m.sessionTitle}"` : '';
+      return `[${i + 1}] ${role}${when ? ` — ${when}` : ''}${sess}: ${(m.content || '').substring(0, 400)}`;
+    }).join('\n');
+    systemInstructions += `\n\n=== MATCHED MESSAGES FROM OLDER CONVERSATIONS ===\n${matchedLines}\n=== END MATCHED MESSAGES ===\nThese messages were found by semantic search across ALL past conversation sessions — they may be days, weeks, or months old. For "remember when…" / "what about that time we…" questions, THIS section usually holds the answer: quote or summarize these directly and cite their dates.`;
+  }
+
+  const _taskMatches = Array.isArray(state.taskMatches) ? state.taskMatches : [];
+  if (_taskMatches.length > 0) {
+    const taskLines = _taskMatches.slice(0, 8).map((t, i) => {
+      const when = t.formattedDate || '';
+      const tail = t.result ? ` → ${String(t.result).substring(0, 200)}`
+        : (t.error ? ` → failed: ${String(t.error).substring(0, 120)}` : '');
+      return `[${i + 1}] ${when ? `${when} — ` : ''}[${t.status}] "${(t.prompt || '').substring(0, 200)}"${tail}`;
+    }).join('\n');
+    systemInstructions += `\n\n=== PAST QUEUE TASKS ===\n${taskLines}\n=== END PAST QUEUE TASKS ===\nThese are tasks the user previously queued or ran (from the task journal) — use them when the user asks about work they had you do, projects you executed, or jobs that were queued.`;
+  }
+
   systemInstructions += '\n\nRules:';
 
   // Load intent-specific rules from answer.md, fall back to inline defaults

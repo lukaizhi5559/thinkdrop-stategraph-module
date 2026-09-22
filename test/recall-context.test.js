@@ -551,6 +551,126 @@ describe('retrieveMemory — message.search passes searchAllSessions', () => {
   });
 });
 
+// ─── retrieveMemory — unconditional cross-session search for memory_retrieve ──
+// Regression: recall phrasings ("remember when I asked you about X",
+// "that time we chatted about Y") matched NO recall regex and the LLM
+// isConversationRecall flag came back false, so message.search / listByDate /
+// episodic never ran and topical recall silently returned nothing. Retrieval
+// breadth is now driven by the intent classifier, not secondary NLU patterns.
+
+describe('retrieveMemory — memory_retrieve triggers all recall sources without flags', () => {
+  const recallPhrasings = [
+    'remember when I asked you about president trump',
+    'what about that time we chatted about the flower project',
+    'do you remember that appointment I had at the dentist',
+  ];
+
+  for (const phrase of recallPhrasings) {
+    it(`"${phrase}" → message.search fires (scanAllSessions) despite no recall flags`, async () => {
+      const calls = [];
+      const mcpAdapter = {
+        callService: async (svc, action, payload) => {
+          calls.push({ svc, action, payload });
+          if (action === 'message.list' || action === 'message.listByDate') return { messages: [] };
+          if (action === 'message.search') return { messages: [] };
+          return { results: [], apps: [], keywords: [] };
+        },
+      };
+      await retrieveMemory({
+        message: phrase,
+        resolvedMessage: phrase,
+        intent: { type: 'memory_retrieve' },
+        context: { sessionId: 'sess-current', userId: 'local_user' },
+        mcpAdapter,
+        logger: _noopLogger,
+        conversationHistory: [],
+        _taskClassification: { isConversationRecall: false, isFollowUp: false, isActivityQuery: false },
+      });
+      const searchCalls = calls.filter(c => c.action === 'message.search');
+      assert(searchCalls.length > 0, `message.search should fire for "${phrase}"`);
+      for (const c of searchCalls) {
+        assertEq(c.payload.searchAllSessions, true, 'searchAllSessions must be true');
+        assertEq(c.payload.scanAllSessions, true, 'scanAllSessions must be true (bypass tier-1 topic filter)');
+      }
+      const crossCalls = calls.filter(c => c.action === 'message.listByDate');
+      assert(crossCalls.length > 0, 'cross-session listByDate should fire for memory_retrieve');
+      const episodicCalls = calls.filter(c => c.action === 'episodic.search');
+      assert(episodicCalls.length > 0, 'wide-window episodic.search should fire for memory_retrieve with no dateRange');
+    });
+  }
+
+  it('semantic hits expose source/similarity/sessionTitle and exclude the self-match', async () => {
+    const phrase = 'remember when I asked you about president trump';
+    const mcpAdapter = {
+      callService: async (svc, action, payload) => {
+        if (action === 'message.list' || action === 'message.listByDate') return { messages: [] };
+        if (action === 'message.search') return {
+          messages: [
+            // The just-logged current user turn — must be filtered out.
+            { id: 'm1', sessionId: 'sess-current', text: phrase, sender: 'user', timestamp: new Date().toISOString(), similarity: 1.0, sessionTitle: 'current' },
+            { id: 'm2', sessionId: 'old-sess', text: 'show me picture of president trump', sender: 'user', timestamp: '2026-09-19T23:11:21.361Z', similarity: 0.47, sessionTitle: 'Old session' },
+          ],
+        };
+        return { results: [], apps: [], keywords: [] };
+      },
+    };
+    const out = await retrieveMemory({
+      message: phrase,
+      resolvedMessage: phrase,
+      intent: { type: 'memory_retrieve' },
+      context: { sessionId: 'sess-current', userId: 'local_user' },
+      mcpAdapter,
+      logger: _noopLogger,
+      conversationHistory: [],
+      _taskClassification: { isConversationRecall: false },
+    });
+    assert(Array.isArray(out.semanticMatches), 'semanticMatches should be an array');
+    assertEq(out.semanticMatches.length, 1, 'self-match must be excluded from semanticMatches');
+    assertEq(out.semanticMatches[0].id, 'm2');
+    assertEq(out.semanticMatches[0].source, 'semantic', 'source marker must be preserved');
+    assert(out.semanticMatches[0].similarity > 0, 'similarity must be preserved');
+    assertEq(out.semanticMatches[0].sessionTitle, 'Old session', 'sessionTitle must be preserved');
+    assert(Array.isArray(out.taskMatches), 'taskMatches should always be an array');
+  });
+});
+
+// ─── searchTaskJournal — queue journal keyword search ─────────────────────────
+
+describe('searchTaskJournal — keyword search over the queue journal', () => {
+  it('matches tasks by prompt keywords and returns metadata', () => {
+    const fs = require('fs');
+    const os = require('os');
+    const path = require('path');
+    const tmp = path.join(os.tmpdir(), `td-journal-test-${Date.now()}.json`);
+    fs.writeFileSync(tmp, JSON.stringify([
+      { id: 'task_a', prompt: 'review the flowers project folder and make a pdf', status: 'done', createdAt: Date.now() - 86400000, result: 'PDF created at ~/Desktop/flowers.pdf' },
+      { id: 'task_b', prompt: 'unrelated grocery list task', status: 'done', createdAt: Date.now() - 172800000, result: null },
+    ]));
+    process.env.TASK_JOURNAL_PATH = tmp;
+    try {
+      const { searchTaskJournal } = require('../src/utils/taskJournalSearch.cjs');
+      const hits = searchTaskJournal('what about that time we chatted about the flower project');
+      assert(hits.length > 0, 'expected at least one journal hit');
+      assertEq(hits[0].id, 'task_a', 'flower task should rank first (plural stem flower↔flowers)');
+      assert(hits[0].formattedDate, 'hit should carry a formatted date');
+      assertEq(hits[0].status, 'done');
+    } finally {
+      delete process.env.TASK_JOURNAL_PATH;
+      fs.unlinkSync(tmp);
+    }
+  });
+
+  it('missing journal file → []', () => {
+    process.env.TASK_JOURNAL_PATH = '/tmp/definitely-not-here-td.json';
+    try {
+      const { searchTaskJournal } = require('../src/utils/taskJournalSearch.cjs');
+      assertEq(searchTaskJournal('anything at all').length, 0, 'missing file must return []');
+    } finally {
+      delete process.env.TASK_JOURNAL_PATH;
+    }
+  });
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 (async () => {

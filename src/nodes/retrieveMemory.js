@@ -9,6 +9,7 @@
 
 const { parseDateRange, hasRelativeTimePhrase } = require('../utils/parseDateRange');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { searchTaskJournal } = require('../utils/taskJournalSearch.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const {
   CONV_RECALL_QUERY_RE,
@@ -418,6 +419,11 @@ async function retrieveMemory(state) {
     const _isFollowUp = !!state._taskClassification?.isFollowUp;
     const _isConvRecall = !!state._taskClassification?.isConversationRecall;
     const isRecallQuery = _isConvRecall || CONV_RECALL_QUERY_RE.test(resolvedMessage || message || '');
+    // The intent classifier already decided this is a recall turn — the
+    // regex/LLM flags above only tune window sizes and sort order. Retrieval
+    // breadth must NOT depend on them: natural phrasings ("remember when I
+    // asked you about X", "that time we chatted about Y") miss every pattern.
+    const _isMemoryRetrieveIntent = intent?.type === 'memory_retrieve';
     if (!dateRange && msgWords <= 12 && context?.sessionId &&
         !_isFollowUp && !_isConvRecall &&
         !PROFILE_QUERY_PATTERN.test(resolvedMessage || message) &&
@@ -513,6 +519,12 @@ async function retrieveMemory(state) {
     // Fetch top app/window pairs from the date range to enrich the BM25 query
     // with the actual vocabulary present in the data. This replaces hardcoded
     // platform names (YouTube, Netflix, etc.) with dynamic discovery.
+    // Wide-window episodic recall: a memory_retrieve query with no date range
+    // ("remember that appointment months ago", "that time we did X") still needs
+    // screen-capture coverage — scope it to the past year. Skipped when a
+    // personal-attribute profile lookup applies (episodic noise hurts those).
+    const _isWideEpisodicRecall = _isMemoryRetrieveIntent && !dateRange && !isActivityQuery && !personalAttribute;
+
     let dbKeywords = [];
     try {
       const episodicDateRangeForKeywords = dateRange || (isActivityQuery ? (() => {
@@ -521,7 +533,13 @@ async function retrieveMemory(state) {
         const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
         const e = new Date(now); e.setHours(23, 59, 59, 999);
         return { startDate: iso(s), endDate: iso(e) };
-      })() : null);
+      })() : (_isWideEpisodicRecall ? (() => {
+        const s = new Date(now); s.setDate(s.getDate() - 365);
+        const pad = n => String(n).padStart(2, '0');
+        const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        const e = new Date(now); e.setHours(23, 59, 59, 999);
+        return { startDate: iso(s), endDate: iso(e) };
+      })() : null));
       if (episodicDateRangeForKeywords) {
         const kwResult = await mcpAdapter.callService('user-memory', 'episodic.keywords', {
           startDate: episodicDateRangeForKeywords.startDate,
@@ -564,7 +582,7 @@ async function retrieveMemory(state) {
             logger.warn('[Node:RetrieveMemory] Cross-session fetch failed:', err.message);
             return { messages: [] };
           })
-        : (isRecallQuery
+        : ((isRecallQuery || _isMemoryRetrieveIntent)
             ? mcpAdapter.callService('conversation', 'message.listByDate', {
                 limit: 100,
                 userId: context?.userId
@@ -604,7 +622,13 @@ async function retrieveMemory(state) {
           const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
           const e = new Date(now); e.setHours(23, 59, 59, 999);
           return { startDate: iso(s), endDate: iso(e) };
-        })() : null);
+        })() : (_isWideEpisodicRecall ? (() => {
+          const s = new Date(now); s.setDate(s.getDate() - 365);
+          const pad = n => String(n).padStart(2, '0');
+          const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+          const e = new Date(now); e.setHours(23, 59, 59, 999);
+          return { startDate: iso(s), endDate: iso(e) };
+        })() : null));
         if (!episodicDateRange) return Promise.resolve({ results: [] });
         // For activity queries, use a broad query so BM25 doesn't filter out relevant captures.
         // The answer LLM will classify which captures match the user's intent (video, music, etc.)
@@ -616,7 +640,9 @@ async function retrieveMemory(state) {
         const rangeMs = new Date(episodicDateRange.endDate) - new Date(episodicDateRange.startDate);
         const isWideRange = rangeMs > 86400000; // > 1 day
         let episodicLimit = 10;
-        if (isActivityQuery) {
+        if (_isWideEpisodicRecall) {
+          episodicLimit = 50;
+        } else if (isActivityQuery) {
           const rangeDays = isWideRange ? Math.ceil(rangeMs / 86400000) : 0;
           if (rangeDays === 0) episodicLimit = 10;
           else if (rangeDays <= 7) episodicLimit = 100;  // Increased from 50 to ensure multi-day coverage
@@ -743,8 +769,15 @@ async function retrieveMemory(state) {
     // messages (complements the newest-N fetch — catches topical matches beyond
     // the recent window). The old narrow fallback ("conversation about X" with
     // no memories) is preserved for non-recall phrasings.
+    //
+    // Retrieval is unconditional for memory_retrieve: the intent classifier is
+    // the detector — re-gating on phrasing regexes or the LLM's
+    // isConversationRecall flag re-introduced silent misses ("remember when I
+    // asked you about X" matched none of them). scanAllSessions bypasses the
+    // tier-1 topic_embedding filter, which can zero out the scan when session
+    // topics drift (the embedding is seeded once from the first message).
     let crossSessionSearchResults = [];
-    const shouldSearchAllSessions = isRecallQuery ||
+    const shouldSearchAllSessions = _isMemoryRetrieveIntent || isRecallQuery ||
       (memories.length === 0 && !dateRange && !profileFallback &&
        LEGACY_RECALL_RE.test(resolvedMessage || message || ''));
     if (shouldSearchAllSessions) {
@@ -758,8 +791,9 @@ async function retrieveMemory(state) {
           // include the current session regardless of topic score.
           sessionId: context?.sessionId,
           searchAllSessions: true,
+          scanAllSessions: true,
           includeRecent: 0,
-          minSimilarity: 0.3,
+          minSimilarity: 0.25,
         });
         const searchData = searchRes?.data || searchRes;
         crossSessionSearchResults = (searchData?.messages || searchData?.results || []).map(msg => ({
@@ -769,12 +803,47 @@ async function retrieveMemory(state) {
           timestamp: msg.timestamp,
           formattedDate: formatTimestamp(msg.timestamp),
           sessionId: msg.sessionId,
+          // Keep the markers — classifyTask's semanticCtx filter and the
+          // answer.js matched-messages block depend on them (previously dropped
+          // in this map, so hits were indistinguishable from fetched history).
+          source: 'semantic',
+          similarity: typeof msg.similarity === 'number' ? msg.similarity : null,
+          sessionTitle: msg.sessionTitle || null,
         }));
         if (crossSessionSearchResults.length > 0) {
           logger.debug(`[Node:RetrieveMemory] Cross-session search found ${crossSessionSearchResults.length} messages`);
         }
       } catch (e) {
         logger.debug(`[Node:RetrieveMemory] message.search fallback failed: ${e.message}`);
+      }
+    }
+
+    // The user's current prompt may already be persisted (comms-graph logs the
+    // user turn before the handoff runs) — it self-matches at similarity ~1.0.
+    // Exclude it and anything <60s old so recall surfaces actual history.
+    const _nowMs = Date.now();
+    const _currentMsgText = (resolvedMessage || message || '').trim().toLowerCase();
+    const semanticMatches = crossSessionSearchResults.filter(m => {
+      const t = (m.content || '').trim().toLowerCase();
+      if (t && t === _currentMsgText) return false;
+      const ts = new Date(m.timestamp).getTime();
+      if (!isNaN(ts) && Math.abs(_nowMs - ts) < 60 * 1000) return false;
+      return true;
+    });
+
+    // ── Task journal (queue) search ────────────────────────────────────────────
+    // comms-graph journals every handoff task's prompt/result/status to
+    // ~/.thinkdrop/task-journal.json — recall queries should see queued and
+    // completed work, not just chat messages.
+    let taskMatches = [];
+    if (_isMemoryRetrieveIntent || isRecallQuery) {
+      try {
+        taskMatches = searchTaskJournal(resolvedMessage || message, { limit: 8 });
+        if (taskMatches.length > 0) {
+          logger.debug(`[Node:RetrieveMemory] Task journal matched ${taskMatches.length} tasks`);
+        }
+      } catch (e) {
+        logger.debug(`[Node:RetrieveMemory] Task journal search failed: ${e.message}`);
       }
     }
 
@@ -802,6 +871,8 @@ async function retrieveMemory(state) {
       memories,
       filteredMemories: memories,
       rawMemoriesCount: memories.length,
+      semanticMatches,
+      taskMatches,
       ...(profileFallback ? { _profileFallback: profileFallback } : {}),
     };
   } catch (error) {
