@@ -2782,6 +2782,16 @@ module.exports = async function executeCommand(state) {
       (found, r) => found || (r.skill === 'synthesize' ? r.step : 0), 0
     );
     logger.debug(`[Node:ExecuteCommand] synthesize: scoping to results after step ${lastSynthesizeStep} (last synthesize)`);
+    // Collapse consecutive repeats of the same short chunk — shopping carousels
+    // and aria dumps produce "LEGO Friends: LEGO Friends: …" ×200 which floods
+    // the synthesis context and gets echoed back verbatim into the answer.
+    function _collapseRepeatedRuns(text) {
+      if (!text || text.length < 200) return text;
+      return text.replace(/(\b.{3,60}?[:\-,;]\s*)(\1){2,}/g, (m, chunk) => {
+        const n = Math.round(m.length / chunk.length);
+        return `${chunk.trim()} (×${n}) `;
+      });
+    }
     const pageTextResults = skillResults
       .filter(r => (
         (r.skill === 'browser.act' && (r.args?.action === 'getPageText' || r.args?.action === 'waitForStableText')) ||
@@ -2832,7 +2842,7 @@ module.exports = async function executeCommand(state) {
           _rawText = (typeof r.result === 'string' && r.result) || r.text || (typeof r.stdout === 'string' && r.stdout) || '';
         }
         const analysis = analyzePageContent(_rawText, r.url || r.result?.videoUrl || r.args?.videoUrl, r.args?.agentId);
-        let processedText = _rawText;
+        let processedText = _collapseRepeatedRuns(_rawText);
         
         // If we have UI chrome but also real content, add clarifying note
         if (analysis.uiChromeDetected && analysis.hasContent) {
@@ -2876,6 +2886,15 @@ module.exports = async function executeCommand(state) {
     const blockedStepNotes = skillResults
       .filter(r => (r.botBlocked || r.blocked) && r.step > lastSynthesizeStep)
       .map(r => `- Step ${r.step} (${r.description || r.skill}): BLOCKED — bot wall detected, content not retrieved`);
+
+    // ── Action-outcome notes ────────────────────────────────────────────────
+    // browser.agent mutation steps report "Completed: …" and are deliberately
+    // excluded from pageTextResults (they carry no page text). But a verify/
+    // confirm synthesize MUST still see that the step ran and what it verified —
+    // otherwise the LLM only sees stale page dumps and hallucinates a report.
+    const actionOutcomeNotes = skillResults
+      .filter(r => r.ok && r.step > lastSynthesizeStep && typeof r.result === 'string' && r.result.startsWith('Completed:'))
+      .map(r => `- Step ${r.step} (${r.description || r.skill}): ${r.result.slice(0, 300)}`);
 
     // Include shell.run stdout (e.g. cat file output) as well as browser getPageText results
     // Annotate each result with its contract success state so the LLM sees
@@ -3245,6 +3264,9 @@ module.exports = async function executeCommand(state) {
     if (blockedStepNotes.length > 0) {
       allContextParts.push(`=== BLOCKED STEPS ===\n${blockedStepNotes.join('\n')}`);
     }
+    if (actionOutcomeNotes.length > 0) {
+      allContextParts.push(`=== STEP OUTCOMES (action steps — what was done and verified) ===\n${actionOutcomeNotes.join('\n')}`);
+    }
     if (skippedStepNotes.length > 0) {
       allContextParts.push(`=== SKIPPED STEPS ===\n${skippedStepNotes.join('\n')}`);
     }
@@ -3545,7 +3567,22 @@ module.exports = async function executeCommand(state) {
       const _synthLangSuffix = (_synthLang && _synthLang !== 'en')
         ? `\n\nIMPORTANT: The user wrote in ${_SYNTH_LANG_NAMES[_synthLang] || _synthLang}. You MUST respond entirely in ${_SYNTH_LANG_NAMES[_synthLang] || _synthLang}.`
         : '';
-      let synthesisInstructions = (isFileEdit
+      // Verify/confirm synthesize steps ("Confirm the item was added to the
+      // cart") need a verification persona — the default research template
+      // turns them into a comparison/count report of whatever page dump is in
+      // context (the "Item titles: LEGO Friends ×200" failure mode).
+      const _isVerifyStep = step.stepType === 'verify' ||
+        /^(confirm|verify|check (that|whether|if)|make sure|ensure)\b/i.test((synthesisPrompt || '').trim());
+      let synthesisInstructions = (_isVerifyStep
+        ? `You are verifying the outcome of a completed automation run. The thing to verify: "${synthesisPrompt}"
+
+Use the STEP OUTCOMES and any page content below as evidence.
+
+CRITICAL RULES:
+1. Answer in 1-3 plain sentences: state clearly whether it succeeded, cite the concrete evidence (e.g. cart count changed 0→1, confirmation banner, item name on the page), and name the item/product if identifiable.
+2. Do NOT enumerate page items, result counts, product titles, or catalog content — that is not what was asked.
+3. If the evidence is ambiguous, say what was observed rather than guessing success or failure.`
+        : isFileEdit
         ? `You are a file editing assistant. The user has asked you to modify a file. You have been given the current file content. Your job is to output the COMPLETE updated file content with ONLY the requested changes applied. Output the full file text only — no preamble, no explanation, no markdown code fences, no commentary. Preserve all existing structure, headings, and formatting. Only change what was explicitly requested.`
         : hasSystemInfoShellOutput
         ? `You are a concise system-information assistant.

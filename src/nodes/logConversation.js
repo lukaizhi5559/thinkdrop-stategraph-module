@@ -227,6 +227,10 @@ module.exports = async function logConversation(state) {
             intent: intent?.type,
             source: 'stategraph',
             _isRecovery: _isRecoveryTurn,
+            // Persisted so history-reloaded feed entries keep the Queue
+            // deep-link (mapHistoryMessage reads metadata.taskId). Only
+            // handoff tasks carry _handoffTaskId — quick replies have none.
+            taskId: state._handoffTaskId || null,
             timestamp: new Date().toISOString()
           }
         }).catch(err => {
