@@ -609,8 +609,11 @@ class StateGraphBuilder {
           };
           return 'evaluateSkills';
         }
-        // Scout card is waiting for user provider selection — stop looping, surface ASK_USER
-        if (state.scoutPending || state.pendingQuestion?._isScoutSelect || state.pendingQuestion?._isAgentAskUser) {
+        // Any pendingQuestion means "pause for user input" — scout-select,
+        // agent ask_user, or a bare question from an ask_user/guard step.
+        // Without this, the loop continues and later steps run with unresolved
+        // {{_ctx_*}} tokens (the literal token reached Chrome as a URL once).
+        if (state.scoutPending || state.pendingQuestion) {
           return 'logConversation';
         }
         // Plan ordering error — route to evaluateSkills for replan

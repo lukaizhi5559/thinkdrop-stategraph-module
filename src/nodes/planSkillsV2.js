@@ -125,7 +125,75 @@ function _sanitizeSkillPlan(skillPlan, state) {
   const _log = state?.logger || console;
   const _fileHint = state?._priorScreenContext?.filePath || null;
   const _appHint = state?._priorScreenContext?.appName || null;
+  const _urlHint = state?._priorScreenContext?.url || null;
+
+  // ── Anti-hallucination URL guard ──────────────────────────────────────────
+  // The planner has filled recipe <URL> placeholders with defaults (google.com
+  // printed instead of the user's page). A URL literal is only legitimate if it
+  // is the resolved live context URL or the user typed it — anything else is an
+  // invention. Fix by substitution when a context URL exists, else ask_user.
+  const _msgForUrls = state?.resolvedMessage || state?.message || '';
+  const _allowedUrls = new Set((_msgForUrls.match(/https?:\/\/[^\s"'<>)\]]+/gi) || []));
+  if (_urlHint) _allowedUrls.add(_urlHint);
+  const _guardStepUrls = (step) => {
+    const fields = step?.skill === 'shell.run'
+      ? [step.args?.cmd, step.args?.goal, ...(Array.isArray(step.args?.argv) ? step.args.argv : [])]
+      : step?.skill === 'web.crawl' ? [step.args?.url] : [];
+    const bad = [];
+    for (const f of fields) {
+      if (typeof f !== 'string') continue;
+      for (const m of f.matchAll(/https?:\/\/[^\s"'<>)\]]+/gi)) {
+        if (!_allowedUrls.has(m[0])) bad.push(m[0]);
+      }
+    }
+    if (!bad.length) return;
+    if (_urlHint) {
+      const sub = (s) => typeof s === 'string' ? bad.reduce((acc, u) => acc.split(u).join(_urlHint), s) : s;
+      if (step.skill === 'shell.run') {
+        step.args.cmd = sub(step.args?.cmd);
+        step.args.goal = sub(step.args?.goal);
+        if (Array.isArray(step.args?.argv)) step.args.argv = step.args.argv.map(sub);
+      } else {
+        step.args.url = _urlHint;
+      }
+      _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: substituted invented URL(s) [${bad.join(', ')}] with context URL ${_urlHint}`);
+      return null;
+    }
+    // No context URL — pause the plan instead of dead-ending it: insert an
+    // ask_user that collects the page URL and rewrite the invented literal(s)
+    // to {{_ctx_url_<n>}} so the original step runs with the user's answer at
+    // dispatch (same convention as _repairStepPlaceholders — the answer lands
+    // in state._gatheredVars[varName]).
+    const varName = `_ctx_url_${step._urlVarIdx}`;
+    const tok = `{{${varName}}}`;
+    const subTok = (s) => typeof s === 'string' ? bad.reduce((acc, u) => acc.split(u).join(tok), s) : s;
+    if (step.skill === 'shell.run') {
+      step.args.cmd = subTok(step.args?.cmd);
+      step.args.goal = subTok(step.args?.goal);
+      if (Array.isArray(step.args?.argv)) step.args.argv = step.args.argv.map(subTok);
+    } else {
+      step.args.url = tok;
+    }
+    _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: blocked invented URL(s) [${bad.join(', ')}] — no URL in context/message → pausing for user input (${varName})`);
+    return {
+      skill: 'ask_user',
+      args: {
+        question: `I couldn't determine which page you're referring to — no browser URL is visible right now. Paste the URL (or name the page) and I'll continue.`,
+        inputHint: 'Page URL or name',
+        varName,
+        options: [],
+      },
+      description: 'Clarify the target page',
+    };
+  };
+
+  let _urlVarIdx = 0;
+  const _guardedPlan = [];
   for (const step of skillPlan) {
+    if (step && typeof step === 'object') step._urlVarIdx = _urlVarIdx;
+    const _inserted = _guardStepUrls(step);
+    if (_inserted) { _guardedPlan.push(_inserted); _urlVarIdx++; }
+    delete step?._urlVarIdx;
     if (step?.skill === 'shell.run') {
       // Coerce argv object entries to strings — the planner LLM sometimes wraps
       // file paths in {"file": "..."} objects instead of plain strings.
@@ -185,14 +253,14 @@ function _sanitizeSkillPlan(skillPlan, state) {
       }
     } else if (step?.skill === 'web.crawl') {
       const a = step.args || (step.args = {});
-      const _urlHint = state?._priorScreenContext?.url || null;
       if (!a.url && _urlHint) {
         a.url = _urlHint;
         _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled web.crawl.url from active doc: ${_urlHint}`);
       }
     }
+    _guardedPlan.push(step);
   }
-  return skillPlan;
+  return _guardedPlan;
 }
 
 // ── Step-arg placeholder validation ──────────────────────────────────────────
@@ -300,6 +368,47 @@ function _repairStepPlaceholders(skillPlan, state) {
     _log.info(`[Node:PlanSkillsV2] _repairStepPlaceholders: ${repairCount} ask_user step(s) inserted`);
   }
   return out;
+}
+
+/**
+ * Resolve {{_ctx_url_N}} tokens left by the invented-URL guard against the
+ * FRESH live context URL — a plan can be approved/resumed minutes after it was
+ * built, and the browser URL may have been resolved in the meantime.
+ * Substitutes the token into step args, then drops the paired ask_user steps
+ * (matched via args.varName). VarNames already answered by the user
+ * (state._gatheredVars) are left alone — an explicit answer beats context.
+ * @param {Array} plan
+ * @param {string|null} ctxUrl — state._priorScreenContext.url
+ * @param {object} gatheredVars — state._gatheredVars
+ * @param {object} log
+ * @returns {Array} plan (possibly with ask_user steps removed)
+ */
+function _resolveCtxUrlTokens(plan, ctxUrl, gatheredVars, log) {
+  if (!ctxUrl || !Array.isArray(plan)) return plan;
+  const answered = gatheredVars || {};
+  const satisfied = new Set();
+  const safeUrl = JSON.stringify(ctxUrl).slice(1, -1); // JSON-escape for in-args splice
+  for (const step of plan) {
+    if (!step || typeof step !== 'object' || !step.args) continue;
+    const json = JSON.stringify(step.args);
+    if (!json.includes('_ctx_url_')) continue;
+    const names = [...new Set(
+      [...json.matchAll(/\{\{\s*(_ctx_url_\d+)\s*\}\}/g)].map(m => m[1])
+    )].filter(n => !(n in answered));
+    if (!names.length) continue;
+    let out = json;
+    for (const n of names) {
+      out = out.replace(new RegExp(`\\{\\{\\s*${n}\\s*\\}\\}`, 'g'), () => safeUrl);
+      satisfied.add(n);
+    }
+    try { step.args = JSON.parse(out); } catch (_) { /* keep original args */ }
+  }
+  if (!satisfied.size) return plan;
+  const kept = plan.filter(s => !(s?.skill === 'ask_user' && satisfied.has(s?.args?.varName)));
+  if (kept.length !== plan.length) {
+    log.info(`[Node:PlanSkillsV2] _resolveCtxUrlTokens: resolved ${satisfied.size} token(s) to live URL ${ctxUrl} — removed ${plan.length - kept.length} ask_user step(s)`);
+  }
+  return kept;
 }
 
 /**
@@ -1195,9 +1304,13 @@ async function planSkillsV2(state) {
   if (!_isRecoveryPath &&
       state._skillPlanFile && state._planFile && state._skillPlanFile === state._planFile &&
       Array.isArray(state.skillPlan) && state.skillPlan.length > 0) {
-    logger.info(`[Node:PlanSkillsV2] planExecutor passthrough — ${state.skillPlan.length} steps pre-built, skipping planning`);
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: state.skillPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-    return { ...state, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null };
+    // The plan was built with plan-time context — the live URL may have been
+    // resolved while it waited for approval. Satisfy pending {{_ctx_url_N}}
+    // tokens (and drop their ask_user gates) against the fresh context.
+    const _resolvedPlan = _resolveCtxUrlTokens(state.skillPlan, state._priorScreenContext?.url, state._gatheredVars, logger);
+    logger.info(`[Node:PlanSkillsV2] planExecutor passthrough — ${_resolvedPlan.length} steps pre-built, skipping planning`);
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: _resolvedPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+    return { ...state, skillPlan: _resolvedPlan, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null };
   }
 
   // ── planMode fast-path: planExecutor dispatched this step (legacy) ─────────
@@ -1241,8 +1354,12 @@ async function planSkillsV2(state) {
         ? state._skillPlan
         : JSON.parse(Buffer.from(state._skillPlan, 'base64').toString('utf8'));
       if (Array.isArray(decoded) && decoded.length > 0) {
+        // Same freshness reconciliation as the planExecutor passthrough —
+        // answer-resume plans can carry {{_ctx_url_N}} tokens whose URL has
+        // since resolved in live context.
+        const _resolvedPlan = _resolveCtxUrlTokens(decoded, state._priorScreenContext?.url, state._gatheredVars, logger);
         // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
-        const _guardedPlan = _ensureSynthesizeForAppFlow(decoded, userMessage);
+        const _guardedPlan = _ensureSynthesizeForAppFlow(_resolvedPlan, userMessage);
         const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
@@ -3097,3 +3214,4 @@ module.exports = planSkillsV2;
 module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;
 module.exports._selectPriorSynthesis = _selectPriorSynthesis;
 module.exports._sanitizeSkillPlan = _sanitizeSkillPlan;
+module.exports._resolveCtxUrlTokens = _resolveCtxUrlTokens;

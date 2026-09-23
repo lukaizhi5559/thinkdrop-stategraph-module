@@ -329,6 +329,7 @@ module.exports = async function resolveReferencesV2(state) {
         if (app.windowTitle) parts.push(`Window: "${app.windowTitle}"`);
         if (app.url)         parts.push(`URL: ${app.url}`);
         if (app.filePath)    parts.push(`File: ${app.filePath}`);
+        if (app.windowId)    parts.push(`WinId: ${app.windowId}`);
         const source = app.source || 'live';
         const ageMin = app.timestamp ? Math.round((Date.now() - new Date(app.timestamp).getTime()) / 60000) : 0;
         _screenContextNote = `ACTIVE SCREEN (${source}, ${ageMin} min ago): ${parts.join(', ')}`;
@@ -340,10 +341,11 @@ module.exports = async function resolveReferencesV2(state) {
           windowTitle: app.windowTitle,
           url: app.url,
           filePath: app.filePath,
+          windowId: app.windowId || null,
           timestamp: app.timestamp || (_priorScreenContext?.timestamp || new Date().toISOString()),
           source,
         };
-        logger.debug(`[Node:ResolveReferencesV2] Active app context (${source}): ${app.appName} ${app.filePath ? `file=${app.filePath}` : '(no file)'}`);
+        logger.debug(`[Node:ResolveReferencesV2] Active app context (${source}): ${app.appName} ${app.filePath ? `file=${app.filePath}` : '(no file)'}${app.url ? ` url=${app.url}` : ''}${app.windowId ? ` winId=${app.windowId}` : ''}`);
       }
     } catch (err) {
       logger.debug(`[Node:ResolveReferencesV2] memory.getActiveAppContext unavailable: ${err.message}`);

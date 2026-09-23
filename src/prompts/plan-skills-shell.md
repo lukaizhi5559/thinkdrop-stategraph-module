@@ -9,6 +9,7 @@ The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or mo
 **"Print the file that's open" / "print this file" / "print the current document":**
 - If `File:` is present → `shell.run { cmd: "lp", argv: ["<File>"] }` directly. One step. Done.
 - If `File:` is absent → `app.agent { action: 'run_app_flow', appName: "<App>", goal: "print the current document" }` for a named desktop app, OR emit an `ask_user` step.
+- If the app is a browser and `URL:` is present → the URL pipeline below (Chrome→PDF→lp) — this also covers screen-anchored prints ("print what's on my screen") when the screen shows a browser page.
 - **NEVER** generate an AppleScript that queries `path of document 1` of the frontmost app — the path is already resolved in ACTIVE SCREEN CONTEXT.
 
 **Multiple file matches:** if `mdfind` returns multiple paths for a filename, do NOT guess — emit an `ask_user` step: "I found multiple files named '<filename>'. Which one?" with the paths as options.
@@ -17,19 +18,28 @@ The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or mo
 
 **"Print this page" / "save this page" — `URL:` present in ACTIVE SCREEN CONTEXT:**
 
-Canonical: Chrome headless → PDF (preserves layout + images). For print, pipe the PDF to `lp`; for save, keep the PDF file.
+Canonical: `scripts/print-page.sh` — three-tier render with bot-wall guard built in: (1) headless `playwright pdf` → (2) headed 1×1 playwright-cli session (passes most bot walls; persistent `~/.thinkdrop/print-profile` accumulates clearance cookies) → (3) window-scoped `screencapture -l<WinId>` of the real visible page. Prints via `lp` or saves the artifact.
 
 ```json
 [
-  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "f=\"/tmp/thinkdrop_page_$(date +%s).pdf\"; \"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\" --headless --disable-gpu --print-to-pdf=\"$f\" --no-pdf-header-footer \"<URL>\" 2>/dev/null && lp \"$f\" && echo \"PRINTED: $f\""] }, "description": "Render the page to PDF and print it" },
-  { "skill": "synthesize", "args": { "prompt": "Confirm the page was printed." }, "description": "Confirm print" }
+  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "bash '/Users/lukaizhi/Desktop/projects/thinkdrop/scripts/print-page.sh' '<URL>' '<WinId>' print"], "timeoutMs": 60000 }, "description": "Render the page (bot-wall-safe) and print it" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the page was printed; if stdout says MODE=window-capture, mention it printed the visible window because the site blocks headless rendering." }, "description": "Confirm print" }
 ]
 ```
 
-- **Save instead of print:** same command minus `lp` — `--print-to-pdf="~/Desktop/page_$(date +%s).pdf"` then `echo "SAVED: $f"`. Always `expanduser`-safe: use `$HOME` or a literal path, never `~` inside the quoted argv string for the output path (Chrome accepts `~`? — use `$HOME` to be safe).
-- **Fallback (Chrome blocked/missing or page unreachable):** `bash -c "curl -sL '<URL>' | textutil -stdin -format html -convert txt -stdout | lp"` — text-only but works without a browser.
-- **Last resort (both fail — auth wall, JS-only app):** `bash -c "f=\"$HOME/Desktop/Screenshot $(date '+%Y-%m-%d at %H.%M.%S').png\"; screencapture -x \"$f\" && lp \"$f\" && echo \"PRINTED: $f\""` — screenshots what's visible and prints it.
-- **NEVER** emit `shell.run` with just a `goal` like "print the current page" — always use the `URL:`/`File:` from ACTIVE SCREEN CONTEXT with explicit `cmd`/`argv`.
+- **Save instead of print:** same call with `save` as the 4th arg → `SAVED: <path>`. For save, a PDF-tier output lands in `/tmp` — move it to a user-visible path (e.g. `mv "$f" "$HOME/Desktop/"`) if the user asked for a specific destination.
+- The script emits `MODE=pdf` or `MODE=window-capture` — a walled page that resists even the headed render prints the real visible window instead (always the true page; overlay excluded by `-l<WinId>`).
+- If `WinId:` is absent from ACTIVE SCREEN CONTEXT pass an empty string `''` — the script falls back to fullscreen `-x` (the shell.run flash-wrap hides the overlay).
+- **Fallback (playwright missing or page unreachable):** `bash -c "curl -sL '<URL>' | textutil -stdin -format html -convert txt -stdout | lp"` — text-only but works without a browser.
+- **Last resort (both fail — auth wall, JS-only app):** screenshot the app's window and print it — **window-scoped, never full-screen** (full-screen `screencapture -x` includes the ThinkDrop overlay):
+
+```json
+{ "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "f=\"$HOME/Desktop/Screenshot $(date '+%Y-%m-%d at %H.%M.%S').png\"; if [ -n \"<WinId>\" ]; then screencapture -l<WinId> -o -x \"$f\"; else screencapture -x \"$f\"; fi && lp \"$f\" && echo \"PRINTED: $f\""] }, "description": "Screenshot the app window and print it" }
+```
+
+  `-l<WinId>` captures only that window — the ThinkDrop overlay and desktop are excluded. `WinId:` comes from ACTIVE SCREEN CONTEXT (the CGWindowID of the active app); when absent, the recipe falls back to full-screen `-x`.
+- **NEVER** emit `shell.run` with just a `goal` like "print the current page" — always use the `URL:`/`File:`/`App:`/`WinId:` from ACTIVE SCREEN CONTEXT with explicit `cmd`/`argv`.
+- **NEVER invent a URL.** `<URL>` in these recipes means the literal `URL:` value from ACTIVE SCREEN CONTEXT or a URL the user typed — nothing else. If no `URL:` is present, do NOT substitute a default/search-engine/placeholder URL (a invented URL is worse than no URL — it prints the wrong page). Use the Neither column (window screenshot or `ask_user`) instead.
 
 ## Office-format files (docx / xlsx / doc / rtf / pages)
 

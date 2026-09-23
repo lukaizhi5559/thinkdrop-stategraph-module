@@ -96,6 +96,7 @@ Field rules:
   - CRITICAL: NEVER set activeDocRef when the deictic refers to something established in CONVERSATION HISTORY — conversational referents go in followUpTarget with isFollowUp:true. Example: "email me those addresses" after listing addresses → followUpTarget="the addresses", activeDocRef=null even if a file is open. The live doc is the referent ONLY when the message targets a document/page/file/site artifact itself — not a conversational subject (a topic, a result, a list, an answer).
   - activeDocRef and followUpTarget are independent fields — do NOT put the live file path or url into followUpTarget; the resolved value is attached downstream from the context block (activeDocRef only names the KIND of referent).
   - Do NOT resolve activeDocRef to a file mentioned in conversation history — it is ONLY for the live open document/page in the context blocks.
+  - LIVE-ARTIFACT NOUN OVERRIDE: explicit nouns that can only exist on screen — "this site", "this webpage", "this website", "this tab", "the browser page", "the browser tab", "the page in the browser", "the page I'm on", "the site I'm on" — resolve to activeDocRef even when CONVERSATION HISTORY supplies a competing referent (e.g. "print this site" after discussing a saved file → activeDocRef="url", followUpTarget may still carry the file). A site/webpage/tab/browser-page referent is never a conversation artifact. Bare "this"/"it" and conversation-artifact nouns ("this file", "the document") still defer to a competing conversation referent.
   - When activeDocRef is "file" or "url", also set isScreenFollowUp:false and needsFreshScreen:false (the target is known — no screen OCR needed). When activeDocRef is "screen", set isScreenFollowUp:true.
 
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
@@ -262,6 +263,22 @@ const { parseLlmJson } = require('./parseLlmJson');
  * @param {object} logger
  * @returns {Promise<object>} classification object (always resolves, never throws)
  */
+// Strip overlay-injected attachment tags ([Thought: …], [File: …],
+// [Folder: …], [Context: …], [Highlighted: …]) from the start of a message
+// before classification — the tag text (often a long proactive outreach) can
+// break the classifier's JSON response and skew taskType. The tags remain in
+// the raw message for downstream planning nodes.
+function _stripAttachmentTags(text) {
+  let t = String(text || '');
+  // Single-line tags: each occupies one line ending in ']'
+  const lineTag = /^[ \t]*\[(?:Thought|File|Folder|Context|Highlighted):[^\n]*\][ \t]*\n?/;
+  while (lineTag.test(t)) t = t.replace(lineTag, '');
+  // Leading multi-line tag block (e.g. a multi-line [Highlighted: …]) —
+  // lazy match to the first ']' is sufficient here.
+  t = t.replace(/^\s*\[(?:Thought|File|Folder|Context|Highlighted):[\s\S]*?\]\s*/, '');
+  return t.trim();
+}
+
 async function classifyTask(userMessage, conversationHistory, llmBackend, logger, priorScreenSummary, activeAppContext, options = {}) {
   const _default = {
     taskType: 'ambiguous',
@@ -288,6 +305,9 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
 
   if (!llmBackend || !userMessage) return _default;
 
+  // Classify the user's actual text, not overlay-injected attachment tags.
+  const classifiedMessage = _stripAttachmentTags(userMessage) || userMessage;
+
   // ── Deterministic conversation-recall pre-check ────────────────────────────
   // The LLM sometimes returns isConversationRecall:false for obvious meta-questions
   // like "what did I just ask", causing answer.js to skip injecting chat history.
@@ -295,8 +315,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
   // Keep the pattern narrow — only meta-questions about the chat transcript itself,
   // NOT queries about past activity/episodic memory (those are memory_retrieve).
   // Canonical pattern: CONVERSATION_RECALL_META_RE in shared/text-patterns.cjs.
-  if (CONVERSATION_RECALL_META_RE.test(userMessage)) {
-    logger.info(`[classifyTask] Deterministic conversation-recall match: "${userMessage.slice(0, 80)}"`);
+  if (CONVERSATION_RECALL_META_RE.test(classifiedMessage)) {
+    logger.info(`[classifyTask] Deterministic conversation-recall match: "${classifiedMessage.slice(0, 80)}"`);
     return {
       ..._default,
       taskType: 'query',
@@ -340,7 +360,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
         activeAppBlock = `\n\nACTIVE APP CONTEXT (live): ${parts.join(', ')}`;
       }
     }
-    const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}${semanticCtx ? `\n\nRELEVANT EARLIER MESSAGES (older sessions — use only if they resolve the current message's referent):\n${semanticCtx}` : ''}${screenBlock}${activeAppBlock}\n\nCURRENT USER MESSAGE: "${userMessage}"`;
+    const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}${semanticCtx ? `\n\nRELEVANT EARLIER MESSAGES (older sessions — use only if they resolve the current message's referent):\n${semanticCtx}` : ''}${screenBlock}${activeAppBlock}\n\nCURRENT USER MESSAGE: "${classifiedMessage}"`;
 
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
@@ -391,6 +411,11 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const _VALID_DOC_REFS = new Set(['file', 'url', 'screen']);
     const activeDocRef = _VALID_DOC_REFS.has(parsed.activeDocRef) ? parsed.activeDocRef : null;
 
+    // Deterministic consistency: a resolved file/url target never needs screen
+    // OCR. The LLM has emitted isScreenFollowUp:true alongside activeDocRef:"url"
+    // (observed on "print this page for me") — normalize rather than trust.
+    const concreteDocRef = activeDocRef === 'file' || activeDocRef === 'url';
+
     return {
       taskType:            parsed.taskType           || _default.taskType,
       isFollowUp:          parsedIsFollowUp,
@@ -400,8 +425,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isRecurring:         !!parsed.isRecurring,
       isBrowseOnly:        !!parsed.isBrowseOnly,
       requiresDOM,
-      isScreenFollowUp:    parsedIsScreenFollowUp,
-      needsFreshScreen:    !!parsed.needsFreshScreen,
+      isScreenFollowUp:    concreteDocRef ? false : parsedIsScreenFollowUp,
+      needsFreshScreen:    concreteDocRef ? false : !!parsed.needsFreshScreen,
       isAppUiInspection:   !!parsed.isAppUiInspection,
       isSpatialAnalysis:   !!parsed.isSpatialAnalysis,
       isImageAnalysis:     !!parsed.isImageAnalysis,
@@ -419,4 +444,4 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
   }
 }
 
-module.exports = { classifyTask, CLASSIFY_SYSTEM_PROMPT };
+module.exports = { classifyTask, CLASSIFY_SYSTEM_PROMPT, _stripAttachmentTags };
