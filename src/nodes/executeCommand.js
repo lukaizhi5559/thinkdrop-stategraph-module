@@ -1388,7 +1388,7 @@ module.exports = async function executeCommand(state) {
   // desync cursor and UI step indexes.
   if (skillCursor === 0) {
     const { lintFileEditPlan } = require('../utils/planHelpers');
-    const _linted = lintFileEditPlan(skillPlan, logger);
+    const _linted = lintFileEditPlan(skillPlan, logger, { prompt: state.resolvedMessage || state.message });
     if (_linted.rewrites.length > 0) skillPlan = _linted.plan;
   }
 
@@ -6407,6 +6407,8 @@ Please try again or search with different terms.`;
       backupPath: raw.backupPath ?? null,
       appliedEdits: raw.appliedEdits ?? null,
       draftPath: raw.draftPath ?? null,
+      mode: raw.mode ?? null,
+      changed: raw.changed ?? null,
       openIn: raw.openIn ?? null,
       closedIn: raw.closedIn ?? null,
       diff: raw.diff ?? null,

@@ -26,6 +26,9 @@
  *                                   // how the task touches the web: download a file, read public
  *                                   // info, or interact with a session/auth'd service
  *   expectsFileOutput: boolean,     // task creates/writes a file — path is a destination, not a source
+ *   mediaListing: 'none' | 'image' | 'video',
+ *                                   // user wants a set/list of media results (cards with links),
+ *                                   // not to play/open a specific item
  * }
  *
  * Fails open: any error returns a safe default that never blocks execution.
@@ -55,10 +58,12 @@ Output ONLY valid JSON with exactly these fields:
   "isImageAnalysis": true | false,
   "isConversationRecall": true | false,
   "isActivityQuery": true | false,
+  "isThoughtReply": true | false,
   "webAccessMode": "none" | "download" | "public_read" | "interactive",
   "interactiveActions": ["login", "add_to_cart", ...] | [],
   "expectsFileOutput": true | false,
-  "activeDocRef": "file" | "url" | "screen" | null
+  "activeDocRef": "file" | "url" | "screen" | null,
+  "mediaListing": "none" | "image" | "video"
 }
 
 Field rules:
@@ -84,6 +89,12 @@ Field rules:
 - followUpTarget: if isFollowUp is true AND recent conversation clearly shows what it refers to, provide the resolved concrete subject. This includes: a file path from a prior command, a topic/subject discussed (e.g. "Vietnam weather", "the Python script", "SpaceX stock"), a named entity, or any other concrete referent established in the conversation. Set to null only when the referent genuinely cannot be determined from history.
   - OFFER-CONSENT RULE: when the message is a bare affirmation/consent ("yes", "yeah", "yep", "sure", "ok", "okay", "yes you can", "go ahead", "do it", "please do", "sounds good", "absolutely", "of course") replying to the assistant's immediately-preceding offer or yes/no question ("Would you like me to X?", "Want me to X?", "Should I X?", "I can X if you'd like"), the user is ACCEPTING that offer — this is a follow-up, not a new topic. Set isFollowUp:true, needsClarification:false, taskType to whatever the offered action implies, and resolve followUpTarget to the COMPLETE implied task — combine the offered action with the subject it refers to (e.g. assistant offered "search for specific styles, brands, or retailers" about baby clothes → followUpTarget="baby clothes"). The target must stand alone so downstream search/action steps can use it without re-reading history.
   - OFFER-DECLINE RULE: a bare refusal ("no", "nah", "don't", "not now", "no thanks") replying to an assistant offer declines it — set isFollowUp:true, followUpTarget:null, needsClarification:false, taskType:"ambiguous". The answer should acknowledge the decline; do NOT execute the offered action.
+  - PROACTIVE-CARD RULE: a proactive card is a popup offer/question the user SAW on screen — "not a spoken reply" only describes HOW it was delivered, not whether it can be answered. A card IS an open offer awaiting a response and fully counts for OFFER-CONSENT/OFFER-DECLINE. Decide in this order:
+    1. ATTACHED CARD FIRST: a turn labeled "ATTACHED to the user's reply" is the card that was on screen when the user hit send — privileged evidence. Bare affirmatives/negatives with no topical signal ("yes", "sure", "no thanks", "ok") ARE replies to it → isThoughtReply:true. For an affirmative, also set isFollowUp:true + followUpTarget = the card's implied task (combine the offered action with its subject, same as OFFER-CONSENT). For a refusal, isFollowUp:false + followUpTarget:null (OFFER-DECLINE).
+    2. TOPICAL REPLY: if the reply's subject clearly matches an earlier real turn (e.g. "find Roses not all Flowers" after a flower search while the attached card was about a code scan), use THAT turn → isFollowUp:true → that turn's subject, isThoughtReply:false.
+    3. Older non-attached cards ("shown to user earlier") may still be the referent of a delayed reply ("that scan you mentioned", "about that meeting") → isThoughtReply:true when the reply explicitly targets a card's topic.
+    4. If the reply could plausibly target the attached card OR another turn and the card is not clearly topically excluded → needsClarification:true.
+  - ELLIPTICAL-IMPERATIVE RULE: a short imperative that names an ACTION but omits or generic-izes the SUBJECT ("search for me", "do it", "how many unread", "check again", "show me", "pull it up") continues the newest prior turn — isFollowUp:true, followUpTarget = that turn's concrete subject. Do NOT take the message literally (e.g. "search for me" after a mechanics question means search for mechanics, not a literal search for "me").
 
 - expectsFileOutput: true when the task creates/writes/saves/exports a file — the referenced path is a DESTINATION (it may not exist yet), not a source to read. Signals: "save this to X.md", "write the code to ~/Desktop/three.md", "export the results as report.csv", "put that in a file". false for tasks that only read/open/list files, or when no file output is produced.
   - CRITICAL: Set followUpTarget to null when isFollowUp is false (including the META-QUESTION EXCEPTION above). A non-null followUpTarget with isFollowUp=false is invalid.
@@ -139,6 +150,12 @@ Field rules:
 - interactiveActions: list the specific interactive actions this prompt requires, or [] if none. Valid actions: login, oauth, add_to_cart, checkout, place_order, send_message, send_email, post, comment, like, share, follow, subscribe, retweet, react, vote, play_media, pause_media, skip_media, shuffle, repeat, fill_form, submit_form, upload, publish, delete, edit, create, update, deploy, merge_pr, approve_pr, assign_task, settings_change, filter_ui, sort_ui, date_picker, book_reservation. Set to [] when the task is simple search, browse, read, download, or lookup — those are NOT interactive actions. When webAccessMode is "interactive", this array MUST be non-empty (list the actions that make it interactive). When webAccessMode is "public_read", "download", or "none", this MUST be [].
   IMPORTANT: "for sale" / "on sale" / "cheap" / "deals" / "discount" are product DESCRIPTORS, not filter actions. Do NOT set filter_ui for these. filter_ui requires an EXPLICIT filter/refine request like "filter by price under $50", "sort by rating", "only show prime eligible", "narrow down to size medium". A prompt like "show pics of baby clothes for sale on amazon" has NO interactive actions — set interactiveActions to [].
   IMPORTANT: "click the first result", "open the first product", "follow the first link", "select the first item", or similar phrasing is URL SELECTION for reading/extraction — NOT an interactive DOM action. When the overall goal is to search a site and then read/extract the first result, keep webAccessMode="public_read", requiresDOM=false, and interactiveActions=[]. Only mark it interactive if the user also wants to add-to-cart, checkout, filter, fill a form, or otherwise mutate state on that page.
+
+- mediaListing: the user wants a SET/LIST of media results returned (cards with links), not to play, watch, open, or interact with one specific item:
+  - "video": find/list/show/pull/recommend videos, tutorials, episodes, sermons, or clips — e.g. "find videos from mike winger on Christ in the old testament", "list of mike winger videos", "show me sourdough tutorial videos", "get me some videos about X". ALSO true for follow-ups whose resolved referent is a video list (e.g. "pull list with links", "I need the links for these" after a video-listing turn).
+  - "image": show/find/get pictures, photos, pics, images, or artwork of X — e.g. "show me a picture of X", "find pics of baby clothes", "what does X look like".
+  - "none": everything else — including playing/watching/opening a SPECIFIC video ("watch the mike winger video", "play this on youtube"), downloading a media file (that's webAccessMode="download"), and all non-media tasks.
+  mediaListing is independent of targetService: "show pics of baby clothes on amazon" is still "image" (the named site is handled downstream).
 
 - isActivityQuery: true when the user asks about their RECENT ACTIVITY, WORK, SCREEN TIME, or CONTENT CONSUMPTION — i.e., queries that should be answered from episodic memory / screen captures / app usage, NOT from the chat transcript and NOT from personal profile data. Signals: "what have I been working on", "what was I working on today", "what did I do yesterday", "what did I watch", "what did I listen to", "what apps did I use", "what was on my screen", "what was I doing", "what have I been up to". When true, the memory retrieval node should use a broad activity query (NOT the raw prompt) and a low similarity threshold, and the answer node should focus on activity/screen/app memories — NOT surface personal profile data (email, phone, address) unless explicitly asked. false for: personal profile queries ("what is my email", "what is my name"), conversation-recall meta-questions (those are isConversationRecall), and non-memory tasks (web search, automation).
 
@@ -198,6 +215,15 @@ EXAMPLES (webAccessMode — one per decision boundary):
   User: "go to chatgpt and ask it about vegan food" → {"taskType":"browser","targetService":"chatgpt","webAccessMode":"interactive"}
   User: "post on twitter" → {"taskType":"browser","targetService":"twitter","requiresDOM":true,"webAccessMode":"interactive"}
   User: "what time is it" → {"taskType":"local_system","webAccessMode":"none"}
+
+EXAMPLES (mediaListing — list of media results vs. playing one item):
+  User: "find videos from mike winger Christ in the old testament" → {"taskType":"browser","targetService":"youtube","webAccessMode":"public_read","mediaListing":"video"}
+  User: "list of mike winger videos" → {"taskType":"browser","targetService":"youtube","webAccessMode":"public_read","mediaListing":"video"}
+  User: "pull list with links" (after a video-listing turn) → {"taskType":"browser","isFollowUp":true,"followUpTarget":"Mike Winger videos","webAccessMode":"public_read","mediaListing":"video"}
+  User: "watch the latest mike winger video on youtube" → {"taskType":"browser","targetService":"youtube","webAccessMode":"interactive","interactiveActions":["play_media"],"mediaListing":"none"}
+  User: "show me a picture of a red panda" → {"taskType":"query","webAccessMode":"public_read","mediaListing":"image"}
+  User: "show pics of baby clothes for sale on amazon" → {"taskType":"browser","targetService":"amazon","webAccessMode":"public_read","mediaListing":"image"}
+  User: "find a bird chirp mp3 and save it" → {"taskType":"browser","webAccessMode":"download","mediaListing":"none"}
 
 EXAMPLES (episodic memory queries — isConversationRecall MUST be false, these are NOT about the chat transcript):
   User: "do you have any memories from yesterday" → {"taskType":"query","isFollowUp":false,"followUpTarget":null,"isConversationRecall":false}
@@ -297,11 +323,13 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     isImageAnalysis: false,
     isConversationRecall: false,
     isActivityQuery: false,
+    isThoughtReply: false,
     webAccessMode: 'none',
     interactiveActions: [],
     expectsFileOutput: false,
     activeDocRef: null,
     activeDocTarget: null,
+    mediaListing: 'none',
   };
 
   if (!llmBackend || !userMessage) return _default;
@@ -332,8 +360,16 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // a screen answer and a clarification. The classifier previously saw only
     // six messages, so a 3-turn exchange could hide the original screen answer
     // before the next clarification was classified.
+    const _roleLabel = (m) => {
+      if (m.isThoughtCard || m.source === 'thought-attachment') {
+        return m.attachedToMessage
+          ? 'Assistant (proactive card ATTACHED to the user\'s reply — it was on screen when they sent this message, and its offer/question is the live referent candidate)'
+          : 'Assistant (proactive card shown to user earlier, not a spoken reply)';
+      }
+      return m.role === 'user' ? 'User' : 'Assistant';
+    };
     const recentCtx = (conversationHistory || []).slice(-16)
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 500)}`)
+      .map(m => `${_roleLabel(m)}: ${String(m.content || '').slice(0, 500)}`)
       .join('\n');
 
     // Cross-session semantic matches are merged into conversationHistory and
@@ -412,6 +448,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const _VALID_DOC_REFS = new Set(['file', 'url', 'screen']);
     const activeDocRef = _VALID_DOC_REFS.has(parsed.activeDocRef) ? parsed.activeDocRef : null;
 
+    const _VALID_MEDIA_LISTINGS = new Set(['none', 'image', 'video']);
+
     // Deterministic consistency: a resolved file/url target never needs screen
     // OCR. The LLM has emitted isScreenFollowUp:true alongside activeDocRef:"url"
     // (observed on "print this page for me") — normalize rather than trust.
@@ -433,11 +471,13 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isImageAnalysis:     !!parsed.isImageAnalysis,
       isConversationRecall: !!parsed.isConversationRecall,
       isActivityQuery:     !!parsed.isActivityQuery,
+      isThoughtReply:      !!parsed.isThoughtReply,
       webAccessMode,
       interactiveActions:  Array.isArray(parsed.interactiveActions) ? parsed.interactiveActions : [],
       expectsFileOutput:   !!parsed.expectsFileOutput,
       activeDocRef,
       activeDocTarget:     null, // resolved by caller from live context
+      mediaListing:        _VALID_MEDIA_LISTINGS.has(parsed.mediaListing) ? parsed.mediaListing : 'none',
     };
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

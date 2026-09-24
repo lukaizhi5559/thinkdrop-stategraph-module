@@ -155,9 +155,42 @@ async function getRecentMonitorCapture(mcpAdapter, logger) {
   }
 }
 
+// Message rows may carry metadata as an object or a JSON string depending on
+// the transport path — normalize once.
+function _msgMeta(msg) {
+  const md = msg?.metadata;
+  if (!md) return null;
+  if (typeof md === 'string') { try { return JSON.parse(md); } catch (_) { return null; } }
+  return md;
+}
+
 module.exports = async function resolveReferencesV2(state) {
-  const { mcpAdapter, message, context } = state;
+  const { mcpAdapter, context } = state;
   const logger = state.logger || console;
+  let message = state.message;
+
+  // ── Proactive-card reply handling ──────────────────────────────────────────
+  // The renderer auto-attaches the tail Thought card as "[Thought: …]" text AND
+  // sends it as structured thoughtContext. Split them: every downstream node
+  // (session.route, message.search, classifyTask, webSearch, planning, logging)
+  // works on the reply-only text — the card blob must never leak into search
+  // queries or intent decomposition. The card itself joins conversationHistory
+  // below as a LABELED turn so the classifier can weigh it against real turns.
+  // [Context:] isolation wins — a message can never legitimately carry both.
+  let _thoughtCtx = state._thoughtAttachment || context?.thoughtContext || null;
+  const _hasContextTag = /\[Context:/.test(message || '');
+  if (!_thoughtCtx && /^\s*\[Thought:/.test(message || '')) {
+    // Metadata-less path (legacy input / log replay) — structural tag parse.
+    const m = String(message).match(/^\s*\[Thought:([\s\S]*?)\]\s*/);
+    if (m) _thoughtCtx = { id: null, text: m[1].trim(), tag: m[0] };
+  }
+  if (_thoughtCtx) {
+    const replyOnly = _thoughtCtx.tag
+      ? String(message).replace(_thoughtCtx.tag, '').trim()
+      : String(message).replace(/^\s*\[Thought:[\s\S]*?\]\s*/, '').trim();
+    message = replyOnly || message; // keep the tag if the reply itself is empty
+    if (_hasContextTag) _thoughtCtx = null; // isolation wins — tag stripped, card ignored
+  }
 
   // ── skill_build pass-through ───────────────────────────────────────────────
   if (state.skillBuildRequest && state.intent?.type === 'skill_build') {
@@ -234,13 +267,21 @@ module.exports = async function resolveReferencesV2(state) {
       const histData = histResult.data || histResult;
       const recentMessages = (histData.messages || [])
         .filter(msg => msg.sender !== 'system')
-        .map(msg => ({
-          id: msg.id,
-          role: msg.sender === 'user' ? 'user' : 'assistant',
-          content: stripHtml(msg.text || msg.content || ''),
-          timestamp: msg.timestamp,
-          source: 'recent',
-        }))
+        .map(msg => {
+          const md = _msgMeta(msg);
+          // Persisted Thought cards ride in history as assistant rows — flag
+          // them so the classifier renders them labeled as cards (same label
+          // as the live-injected 'thought-attachment' turn).
+          const isCard = msg.sender === 'assistant' && md?.source === 'thought_engine';
+          return {
+            id: msg.id,
+            role: msg.sender === 'user' ? 'user' : 'assistant',
+            content: stripHtml(msg.text || msg.content || ''),
+            timestamp: msg.timestamp,
+            source: 'recent',
+            ...(isCard ? { isThoughtCard: true, thoughtId: md.thoughtId || null } : {}),
+          };
+        })
         .reverse();
 
       // Empty-session fallback: the routed session has no messages (new or just
@@ -262,14 +303,19 @@ module.exports = async function resolveReferencesV2(state) {
             });
             priorSessionMessages = (((res?.data || res)?.messages) || [])
               .filter(m => m.sender !== 'system')
-              .map(m => ({
-                id: m.id,
-                role: m.sender === 'user' ? 'user' : 'assistant',
-                content: stripHtml(m.text || m.content || ''),
-                timestamp: m.timestamp,
-                source: 'prior-session',
-                sessionId: prevSid,
-              }))
+              .map(m => {
+                const md = _msgMeta(m);
+                const isCard = m.sender === 'assistant' && md?.source === 'thought_engine';
+                return {
+                  id: m.id,
+                  role: m.sender === 'user' ? 'user' : 'assistant',
+                  content: stripHtml(m.text || m.content || ''),
+                  timestamp: m.timestamp,
+                  source: 'prior-session',
+                  sessionId: prevSid,
+                  ...(isCard ? { isThoughtCard: true, thoughtId: md.thoughtId || null } : {}),
+                };
+              })
               .reverse();
             if (priorSessionMessages.length > 0) {
               logger.debug(`[Node:ResolveReferencesV2] Empty session — pulled ${priorSessionMessages.length} prior-session message(s) from ${prevSid}`);
@@ -284,15 +330,20 @@ module.exports = async function resolveReferencesV2(state) {
         const searchData = searchResult.data || searchResult;
         semanticMessages = (searchData.messages || [])
           .filter(msg => msg.sender !== 'system')
-          .map(msg => ({
-            id: msg.id,
-            role: msg.sender === 'user' ? 'user' : 'assistant',
-            content: stripHtml(msg.text || msg.content || ''),
-            timestamp: msg.timestamp,
-            source: 'semantic',
-            sessionId: msg.sessionId,
-            sessionTitle: msg.sessionTitle,
-          }));
+          .map(msg => {
+            const md = _msgMeta(msg);
+            const isCard = msg.sender === 'assistant' && md?.source === 'thought_engine';
+            return {
+              id: msg.id,
+              role: msg.sender === 'user' ? 'user' : 'assistant',
+              content: stripHtml(msg.text || msg.content || ''),
+              timestamp: msg.timestamp,
+              source: 'semantic',
+              sessionId: msg.sessionId,
+              sessionTitle: msg.sessionTitle,
+              ...(isCard ? { isThoughtCard: true, thoughtId: md.thoughtId || null } : {}),
+            };
+          });
       }
 
       // Session-result enrichment: pull each contributing session's last
@@ -324,6 +375,44 @@ module.exports = async function resolveReferencesV2(state) {
 
       // Merge: deduplicate by message ID, then sort chronologically.
       conversationHistory = _mergeConversationHistory(recentMessages, semanticMessages);
+
+      // Card reply: the attached Thought was already persisted as an assistant
+      // row at delivery (thought-engine writes it) — when that row is present
+      // it IS the card turn (adopt its thoughtId); only inject a synthetic
+      // labeled turn when the row isn't in the fetched window. Either way the
+      // attached card gets `attachedToMessage` — it was on screen when the user
+      // sent this message, making it the privileged referent candidate.
+      if (_thoughtCtx?.text) {
+        const _norm = s => String(s || '').replace(/\s+/g, ' ').trim();
+        const _row = conversationHistory.find(m => m.isThoughtCard && _norm(m.content) === _norm(_thoughtCtx.text));
+        if (_row) {
+          _row.attachedToMessage = true;
+          if (!_thoughtCtx.id && _row.thoughtId) _thoughtCtx.id = _row.thoughtId;
+        } else {
+          conversationHistory.push({
+            role: 'assistant',
+            content: _thoughtCtx.text,
+            timestamp: new Date().toISOString(),
+            source: 'thought-attachment',
+            isThoughtCard: true,
+            attachedToMessage: true,
+            thoughtId: _thoughtCtx.id || null,
+          });
+        }
+      }
+
+      // Thought-nudge cap: silence-nudge cards pile up as persisted rows and
+      // bury real turns in the context window. Keep only the newest 3 card
+      // rows (always retaining the attached card); transcript is untouched —
+      // this only trims the classifier/answer context.
+      {
+        const _cards = conversationHistory.filter(m => m.isThoughtCard && !m.attachedToMessage);
+        if (_cards.length > 3) {
+          const _drop = new Set(_cards.slice(0, _cards.length - 3).map(m => m.id || m));
+          conversationHistory = conversationHistory.filter(m =>
+            !m.isThoughtCard || m.attachedToMessage || !_drop.has(m.id || m));
+        }
+      }
       // Expose the semantic matches separately so consumers can show them as
       // labeled "earlier context" instead of them polluting recency slices.
       semanticHistory = conversationHistory.filter(m =>
@@ -424,6 +513,7 @@ module.exports = async function resolveReferencesV2(state) {
       isBrowseOnly: false, requiresDOM: false, isScreenFollowUp: false,
       needsFreshScreen: false, isAppUiInspection: false, isSpatialAnalysis: false,
       isImageAnalysis: false, isConversationRecall: false,
+      isThoughtReply: false,
       interactiveActions: [],
       webAccessMode: state._taskClassification?.webAccessMode || null,
     };
@@ -438,6 +528,48 @@ module.exports = async function resolveReferencesV2(state) {
     );
   }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
+
+  // ── Ack floor: card attached + content-free ack + LLM no-resolution ────────
+  // A bare "sure"/"yes"/"no thanks" carries zero topical signal — when the
+  // classifier produced NO resolution at all, the only live referent is the
+  // attached card (the user sent while looking at it). This floor never
+  // overrides an actual LLM judgment — it fires solely in the no-resolution
+  // branch whose observed outcome was a literal `WebSearch "sure"`.
+  const _ACK_YES = new Set(['yes','yeah','yep','yup','sure','ok','okay','k','sounds good','go ahead','do it','please do','absolutely','of course','definitely','yes please','please']);
+  const _ACK_NO  = new Set(['no','nope','nah','no thanks','not now','later','maybe later','no thank you']);
+  const _ackWord = String(message || '').toLowerCase().replace(/[.!?…]+/g, '').trim();
+  if (_thoughtCtx && !state._planFile &&
+      !_taskClassification.isFollowUp && !_taskClassification.isThoughtReply && !_taskClassification.needsClarification &&
+      (_ACK_YES.has(_ackWord) || _ACK_NO.has(_ackWord))) {
+    const _affirmative = _ACK_YES.has(_ackWord);
+    _taskClassification.isThoughtReply = true;
+    _taskClassification.isFollowUp = _affirmative;
+    _taskClassification.followUpTarget = _affirmative ? _thoughtCtx.text : null;
+    logger.info(`[Node:ResolveReferencesV2] ack floor: "${_ackWord}" + attached card → isThoughtReply=true (${_affirmative ? 'accepted' : 'declined'})`);
+  }
+
+  // ── Thought-card lifecycle: report the outcome to the engine ──────────────
+  // Attached-card prompts: isThoughtReply decides responded-vs-dismissed.
+  // Plain prompts that resolve to a persisted card turn = delayed re-engagement
+  // (recover thoughtId from the newest card row in history).
+  try {
+    const _isThoughtReply = _taskClassification?.isThoughtReply === true;
+    let _cardId = _thoughtCtx?.id || null;
+    let _outcome = null;
+    if (_thoughtCtx) {
+      _outcome = _isThoughtReply ? 'user responded' : 'dismissed — user engaged elsewhere';
+    } else if (_isThoughtReply) {
+      const _cardRow = [...conversationHistory].reverse().find(m => m.isThoughtCard && m.thoughtId);
+      if (_cardRow) { _cardId = _cardRow.thoughtId; _outcome = 'responded (delayed)'; }
+    }
+    if (_cardId && _outcome) {
+      mcpAdapter.callService('user-memory', 'thought.update', {
+        id: _cardId,
+        updates: { status: 'completed', outcomeText: _outcome },
+      }).catch(() => {});
+      logger.info(`[Node:ResolveReferencesV2] Thought ${_cardId} → ${_outcome}`);
+    }
+  } catch (_) { /* lifecycle reporting is best-effort */ }
 
   // ── Resolve activeDocTarget deterministically ───────────────────────────────
   // The classifier only emits the KIND of referent (activeDocRef: file/url/
@@ -470,6 +602,26 @@ module.exports = async function resolveReferencesV2(state) {
       _taskClassification.activeDocTarget = u;
     } else {
       _taskClassification.activeDocRef = 'screen';
+    }
+  }
+
+  // ── Deixis fallback: "the file" + live document ──────────────────────────────
+  // The classifier sometimes emits no referent at all on follow-ups like
+  // "update the file and make it longer" (isFollowUp:false, activeDocRef:null)
+  // even though a document app holds the file live. When the message uses
+  // file-shaped deixis AND the live context carries a verified file path,
+  // fill the null — the classifier's own resolution always wins, this only
+  // fires when it produced nothing.
+  if (!_taskClassification.activeDocRef) {
+    const _dfp = _priorScreenContext?.filePath || null;
+    if (_dfp && /\b(?:the|this|that|my)\s+(?:file|document|doc|text\s+file|note)\b/i.test(message || '')) {
+      try {
+        if (fs.existsSync(_dfp)) {
+          _taskClassification.activeDocRef = 'file';
+          _taskClassification.activeDocTarget = _dfp;
+          logger.info(`[Node:ResolveReferencesV2] deixis fallback: file-referring message + live doc → activeDocTarget=${_dfp}`);
+        }
+      } catch (_) { /* existsSync failed — leave null */ }
     }
   }
 
@@ -527,11 +679,15 @@ module.exports = async function resolveReferencesV2(state) {
 
   return {
     ...state,
+    // Card replies: `message` is the reply-only text everywhere downstream —
+    // the tag stays available via _thoughtAttachment.tag.
+    message:                message,
     resolvedMessage:        message,
     originalMessage:        message,
     conversationHistory,
     semanticHistory,
     _taskClassification,
+    _thoughtAttachment:     _thoughtCtx || null,
     _priorScreenContext:    _priorScreenContext || null,
     _screenContextNote:     _screenContextNote || null,
     coreferenceMethod:      'none',

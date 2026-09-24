@@ -480,6 +480,21 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };
   }
 
+  // ── edit.agent success short-circuit ─────────────────────────────────────
+  // edit.agent's own result is self-verifying: ok=true means the edit was
+  // applied with a backup, written as a reviewable draft (draftPath + diff),
+  // or confirmed as a no-change. A draft IS the deliverable — the draft card
+  // is the user-approval UX, not a partial result. Without this gate the step
+  // falls into the browser-only fulfillment check, which judges an empty
+  // synthesize output + null snapshot → false "hollow" verdict → replan that
+  // once produced app.agent keystroke macros (Cmd+C/Cmd+V) against the live
+  // document instead of reusing edit.agent.
+  const _hasEditAgentSuccess = skillResults.some(r => r.skill === 'edit.agent' && r.ok === true);
+  if (_hasEditAgentSuccess) {
+    logger.info('[Node:ReviewExecution] edit.agent succeeded — skipping hollow check (draft/applied result is the deliverable)');
+    return { ...state, reviewVerdict: 'VERIFIED' };
+  }
+
   // Second pass — a patch was applied last time but re-verification still failed.
   // Don't loop: surface what we know to the user.
   if (reviewRetryCount > 0) {

@@ -751,6 +751,383 @@ describe('resolveReferencesV2 — prior-session fallback for empty sessions', ()
   });
 });
 
+// ─── Thought-card reply handling ─────────────────────────────────────────────
+// Regression: a reply to a proactive card arrived as "[Thought: …] + reply" —
+// the tag poisoned webSearch queries, decompose picked memory_store off the
+// card blob, and the card never existed as a labeled conversation turn. Fix:
+// structured thoughtContext metadata + tag strip + labeled synthetic turn +
+// post-classify lifecycle reporting.
+
+describe('resolveReferencesV2 — proactive card replies', () => {
+  const CARD = 'The Bible study discussion on Samuel 25:3-30:5 is starting soon. Want a summary?';
+  const TAG = `[Thought: ${CARD}]`;
+
+  const makeAdapter = (over = {}) => {
+    const calls = [];
+    return {
+      calls,
+      callService: async (svc, action, payload) => {
+        calls.push({ svc, action, payload });
+        if (action === 'message.list') return { messages: over.recent || [] };
+        if (action === 'message.search') return { messages: [] };
+        if (action === 'session.list') return { sessions: [] };
+        return {};
+      },
+    };
+  };
+  const classifyWith = (fields) => JSON.stringify({
+    taskType: 'query', isFollowUp: false, followUpTarget: null,
+    needsClarification: false, targetService: null, isRecurring: false,
+    isBrowseOnly: false, requiresDOM: false, isScreenFollowUp: false,
+    needsFreshScreen: false, isAppUiInspection: false, isSpatialAnalysis: false,
+    isImageAnalysis: false, isConversationRecall: false, isActivityQuery: false,
+    webAccessMode: 'none', interactiveActions: [], expectsFileOutput: false,
+    activeDocRef: null, activeDocTarget: null, ...fields,
+  });
+  const llm = (fields = {}) => ({ generateAnswer: async () => classifyWith(fields) });
+
+  it('thoughtContext metadata: tag stripped, card injected labeled, thought.update=responded', async () => {
+    const adapter = makeAdapter();
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nthis bible study happen already`,
+      mcpAdapter: adapter,
+      llmBackend: llm({ isThoughtReply: true }),
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: 'th_1', text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    assertEq(out.message, 'this bible study happen already', 'message must be reply-only');
+    assertEq(out.resolvedMessage, 'this bible study happen already');
+    assert(!String(out.message).includes('[Thought:'), 'tag must be stripped');
+    assertEq(out._thoughtAttachment?.id, 'th_1');
+    const card = (out.conversationHistory || []).find(m => m.isThoughtCard);
+    assert(card, 'a labeled card turn should be in conversationHistory');
+    assertEq(card.source, 'thought-attachment');
+    const upd = adapter.calls.find(c => c.action === 'thought.update');
+    assert(upd, 'thought.update should fire');
+    assertEq(upd.payload.id, 'th_1');
+    assertEq(upd.payload.updates.outcomeText, 'user responded');
+  });
+
+  it('isThoughtReply:false on an attached card → outcome "dismissed — user engaged elsewhere"', async () => {
+    const adapter = makeAdapter();
+    await resolveReferencesV2({
+      message: `${TAG}\n\nfind Roses not just all Flowers`,
+      mcpAdapter: adapter,
+      llmBackend: llm({ isThoughtReply: false, isFollowUp: true, followUpTarget: 'roses for mom' }),
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: 'th_9', text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    const upd = adapter.calls.find(c => c.action === 'thought.update');
+    assert(upd, 'thought.update should fire for the attached card');
+    assertEq(upd.payload.updates.outcomeText, 'dismissed — user engaged elsewhere');
+  });
+
+  it('tag-only fallback (no metadata): parses the card, strips the tag', async () => {
+    const adapter = makeAdapter();
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nyes`,
+      mcpAdapter: adapter,
+      llmBackend: llm({ isThoughtReply: true }),
+      context: { sessionId: 'sess-1' },
+      logger: _noopLogger,
+    });
+    assertEq(out.message, 'yes');
+    assert(out._thoughtAttachment && out._thoughtAttachment.text === CARD, 'fallback should populate _thoughtAttachment');
+    assert((out.conversationHistory || []).some(m => m.isThoughtCard), 'card turn should be injected');
+  });
+
+  it('[Context:] wins over [Thought:] — card ignored but tag still stripped', async () => {
+    const adapter = makeAdapter();
+    const out = await resolveReferencesV2({
+      message: `[Context: some isolated body]\n${TAG}\n\nuse this`,
+      mcpAdapter: adapter,
+      llmBackend: llm({}),
+      context: { sessionId: 'iso_x' },
+      _thoughtAttachment: { id: 'th_iso', text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    assertEq(out._thoughtAttachment, null, 'isolation must drop thought handling');
+    assert(!String(out.message).includes('[Thought:'), 'tag should still be stripped');
+    assert(!(adapter.calls || []).some(c => c.action === 'thought.update'), 'no lifecycle update under isolation');
+  });
+
+  it('persisted card row dedupes the synthetic turn and adopts its thoughtId', async () => {
+    const persisted = {
+      id: 'db_card', sender: 'assistant', text: CARD, timestamp: '2026-09-24T10:00:00Z',
+      metadata: { source: 'thought_engine', thoughtId: 'th_persisted' },
+    };
+    const adapter = makeAdapter({ recent: [persisted] });
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nyes`,
+      mcpAdapter: adapter,
+      llmBackend: llm({ isThoughtReply: true }),
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: null, text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    const cards = (out.conversationHistory || []).filter(m => m.isThoughtCard);
+    assertEq(cards.length, 1, 'no duplicate card turn — persisted row should be reused');
+    const upd = adapter.calls.find(c => c.action === 'thought.update');
+    assert(upd, 'thought.update should fire');
+    assertEq(upd.payload.id, 'th_persisted', 'adopted the persisted row thoughtId');
+    assertEq(upd.payload.updates.outcomeText, 'user responded');
+  });
+
+  it('delayed re-engagement: no attachment + isThoughtReply → newest card row updated', async () => {
+    const persisted = {
+      id: 'db_card2', sender: 'assistant', text: 'I scanned your coding project. Fix issues?', timestamp: '2026-09-24T10:00:00Z',
+      metadata: { source: 'thought_engine', thoughtId: 'th_delayed' },
+    };
+    const adapter = makeAdapter({ recent: [persisted] });
+    await resolveReferencesV2({
+      message: 'speaking about that coding project, fix the issues',
+      mcpAdapter: adapter,
+      llmBackend: llm({ isThoughtReply: true, isFollowUp: true, followUpTarget: 'coding project issues' }),
+      context: { sessionId: 'sess-1' },
+      logger: _noopLogger,
+    });
+    const upd = adapter.calls.find(c => c.action === 'thought.update');
+    assert(upd, 'delayed re-engagement should update the persisted card');
+    assertEq(upd.payload.id, 'th_delayed');
+    assertEq(upd.payload.updates.outcomeText, 'responded (delayed)');
+  });
+
+  // ── attachedToMessage flag + ack floor + nudge cap ──────────────────────────
+
+  it('attached card gets attachedToMessage (dedupe path AND injected path)', async () => {
+    const persisted = {
+      id: 'db_card3', sender: 'assistant', text: CARD, timestamp: '2026-09-24T10:00:00Z',
+      metadata: { source: 'thought_engine', thoughtId: 'th_flag' },
+    };
+    const adapter = makeAdapter({ recent: [persisted] });
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nsure`,
+      mcpAdapter: adapter,
+      llmBackend: llm({ isThoughtReply: true }),
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: null, text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    const cards = (out.conversationHistory || []).filter(m => m.isThoughtCard);
+    assertEq(cards.length, 1);
+    assert(cards[0].attachedToMessage === true, 'deduped persisted row must be flagged attachedToMessage');
+  });
+
+  it('ack floor: "sure" + attached card + LLM no-resolution → isThoughtReply/isFollowUp', async () => {
+    const adapter = makeAdapter();
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nsure`,
+      mcpAdapter: adapter,
+      llmBackend: llm({}), // isFollowUp:false, isThoughtReply:false, needsClarification:false
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: 'th_ack', text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    assertEq(out._taskClassification.isThoughtReply, true, 'floor must set isThoughtReply');
+    assertEq(out._taskClassification.isFollowUp, true, 'affirmative floor must set isFollowUp');
+    assertEq(out._taskClassification.followUpTarget, CARD, 'affirmative floor resolves target to the card');
+    const upd = adapter.calls.find(c => c.action === 'thought.update');
+    assert(upd && upd.payload.updates.outcomeText === 'user responded', 'lifecycle must report responded');
+  });
+
+  it('ack floor: "no thanks" + attached card + LLM no-resolution → declined', async () => {
+    const adapter = makeAdapter();
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nno thanks`,
+      mcpAdapter: adapter,
+      llmBackend: llm({}),
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: 'th_no', text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    assertEq(out._taskClassification.isThoughtReply, true);
+    assertEq(out._taskClassification.isFollowUp, false, 'negative ack declines — no follow-up target');
+    assertEq(out._taskClassification.followUpTarget, null);
+  });
+
+  it('ack floor does NOT fire when the LLM produced a resolution', async () => {
+    const adapter = makeAdapter();
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nsure`,
+      mcpAdapter: adapter,
+      llmBackend: llm({ isFollowUp: true, followUpTarget: 'the file update', isThoughtReply: false }),
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: 'th_keep', text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    assertEq(out._taskClassification.isThoughtReply, false, 'floor must not override an LLM judgment');
+    assertEq(out._taskClassification.followUpTarget, 'the file update');
+  });
+
+  it('ack floor does NOT fire on topical replies (LLM output preserved)', async () => {
+    const adapter = makeAdapter();
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nfind Roses not just all Flowers`,
+      mcpAdapter: adapter,
+      llmBackend: llm({ isFollowUp: true, followUpTarget: 'roses for mom' }),
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: 'th_top', text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    assertEq(out._taskClassification.isThoughtReply, false);
+    assertEq(out._taskClassification.followUpTarget, 'roses for mom');
+  });
+
+  it('thought-nudge cap: >3 card rows trimmed to newest 3, attached row preserved', async () => {
+    const mk = (i, txt) => ({
+      id: `th_r${i}`, sender: 'assistant', text: txt || `nudge ${i}`, timestamp: `2026-09-24T09:0${i}:00Z`,
+      metadata: { source: 'thought_engine', thoughtId: `th_r${i}` },
+    });
+    const adapter = makeAdapter({
+      recent: [mk(0), mk(1), mk(2), mk(3), mk(4), mk(5, CARD)],
+    });
+    const out = await resolveReferencesV2({
+      message: `${TAG}\n\nsure`,
+      mcpAdapter: adapter,
+      llmBackend: llm({ isThoughtReply: true }),
+      context: { sessionId: 'sess-1' },
+      _thoughtAttachment: { id: 'th_r5', text: CARD, tag: TAG },
+      logger: _noopLogger,
+    });
+    const cards = (out.conversationHistory || []).filter(m => m.isThoughtCard);
+    assertEq(cards.length, 4, `expected newest 3 + attached = 4 cards, got ${cards.length}`);
+    assert(cards.some(m => m.attachedToMessage), 'attached card must survive the cap');
+    assert(!cards.some(m => m.content === 'nudge 0'), 'oldest nudges must be dropped');
+  });
+});
+
+// ─── classifyTask — card labeling + isThoughtReply passthrough ────────────────
+
+describe('classifyTask — proactive card context', () => {
+  it('renders isThoughtCard turns with the proactive-card label', async () => {
+    let captured = '';
+    const llmBackend = {
+      generateAnswer: async (p) => { captured = p; return JSON.stringify({ taskType: 'query', isFollowUp: false, followUpTarget: null, isThoughtReply: true }); },
+    };
+    await classifyTask('yes', [
+      { role: 'user', content: 'search for flowers for my mom', timestamp: '2026-09-24T10:00:00Z' },
+      { role: 'assistant', content: 'Here are flower results', timestamp: '2026-09-24T10:01:00Z' },
+      { role: 'assistant', content: 'I scanned your coding project. Fix issues?', timestamp: '2026-09-24T10:02:00Z', isThoughtCard: true },
+    ], llmBackend, _noopLogger);
+    assert(/Assistant \(proactive card shown to user earlier, not a spoken reply\): I scanned your coding project/.test(captured),
+      'non-attached card turn must render with the earlier-card label');
+    assert(/Assistant: Here are flower results/.test(captured), 'real assistant turns keep the plain label');
+  });
+
+  it('renders the attached card with the privileged ATTACHED label', async () => {
+    let captured = '';
+    const llmBackend = {
+      generateAnswer: async (p) => { captured = p; return JSON.stringify({ taskType: 'query', isFollowUp: true, followUpTarget: 'card offer', isThoughtReply: true }); },
+    };
+    await classifyTask('sure', [
+      { role: 'assistant', content: 'Earlier card', timestamp: '2026-09-24T10:01:00Z', isThoughtCard: true },
+      { role: 'assistant', content: 'Want me to share Dee-1 music?', timestamp: '2026-09-24T10:02:00Z', isThoughtCard: true, attachedToMessage: true },
+    ], llmBackend, _noopLogger);
+    assert(/ATTACHED to the user's reply/.test(captured), 'attached card must carry the privileged label');
+    assert(/ATTACHED to the user's reply[^:]*: Want me to share Dee-1 music\?/.test(captured),
+      'ATTACHED label must sit on the attached card, not the earlier one');
+    assert(/proactive card shown to user earlier/.test(captured), 'non-attached card keeps the earlier label');
+  });
+
+  it('parses isThoughtReply through to the output', async () => {
+    const out = await classifyTask('yes', [], {
+      generateAnswer: async () => JSON.stringify({ taskType: 'query', isFollowUp: true, followUpTarget: 'card offer', isThoughtReply: true }),
+    }, _noopLogger);
+    assertEq(out.isThoughtReply, true);
+  });
+
+  it('defaults isThoughtReply to false when the model omits it', async () => {
+    const out = await classifyTask('hello there', [], {
+      generateAnswer: async () => JSON.stringify({ taskType: 'ambiguous' }),
+    }, _noopLogger);
+    assertEq(out.isThoughtReply, false);
+  });
+});
+
+// ─── retrieveMemory — transcript-meta queries skip the episodic dump ──────────
+// Regression: "remember what" (isConversationRecall) pulled a 365-day screen-
+// capture window (50 results) + memory-table noise, and the answer summarized
+// unrelated activity instead of the last conversation turns.
+
+describe('retrieveMemory — isConversationRecall skips episodic.search', () => {
+  it('"remember what" → episodic.search NOT called; transcript sources still run', async () => {
+    const calls = [];
+    const mcpAdapter = {
+      callService: async (svc, action, payload) => {
+        calls.push({ svc, action, payload });
+        if (action === 'message.list' || action === 'message.listByDate') return { messages: [] };
+        if (action === 'message.search') return { messages: [] };
+        return { results: [], apps: [], keywords: [] };
+      },
+    };
+    await retrieveMemory({
+      message: 'remember what',
+      resolvedMessage: 'remember what',
+      intent: { type: 'memory_retrieve' },
+      context: { sessionId: 'sess-current', userId: 'local_user' },
+      mcpAdapter,
+      logger: _noopLogger,
+      conversationHistory: [],
+      _taskClassification: { isConversationRecall: true },
+    });
+    assert(!calls.some(c => c.action === 'episodic.search'),
+      'episodic.search must not fire for transcript-meta questions');
+    assert(calls.some(c => c.action === 'message.search'),
+      'message.search should still run for transcript recall');
+    assert(calls.some(c => c.action === 'message.listByDate'),
+      'cross-session listByDate should still run');
+  });
+
+  it('topical recall (isConversationRecall:false) still fires episodic.search', async () => {
+    const calls = [];
+    const mcpAdapter = {
+      callService: async (svc, action, payload) => {
+        calls.push({ svc, action, payload });
+        if (action === 'message.list' || action === 'message.listByDate') return { messages: [] };
+        if (action === 'message.search') return { messages: [] };
+        return { results: [], apps: [], keywords: [] };
+      },
+    };
+    await retrieveMemory({
+      message: 'remember when I asked you about president trump',
+      resolvedMessage: 'remember when I asked you about president trump',
+      intent: { type: 'memory_retrieve' },
+      context: { sessionId: 'sess-current', userId: 'local_user' },
+      mcpAdapter,
+      logger: _noopLogger,
+      conversationHistory: [],
+      _taskClassification: { isConversationRecall: false },
+    });
+    assert(calls.some(c => c.action === 'episodic.search'),
+      'wide episodic window must still fire for topical recall');
+  });
+});
+
+// ─── answer.js — transcript recall prompt rules ───────────────────────────────
+
+describe('answer._buildRecallHistoryBlock — card labels + recency rule', () => {
+  it('renders card turns labeled and includes the recency-first rule for recall', () => {
+    const text = _buildRecallHistoryBlock([
+      { role: 'user', content: 'this bible study happen already', timestamp: '2026-09-24T10:00:00Z' },
+      { role: 'assistant', content: 'Got it! I will remember that.', timestamp: '2026-09-24T10:00:30Z' },
+      { role: 'assistant', content: 'Bible study is starting soon', timestamp: '2026-09-24T09:59:00Z', isThoughtCard: true },
+    ], true);
+    assert(text.includes('RECENCY-FIRST RULE'), 'recency-first instruction must be present for isConversationRecall');
+    assert(text.includes('Proactive card shown to user'), 'card turns must render labeled');
+    assert(!text.includes('Previous AI Response (may contain errors): Bible study is starting soon'),
+      'card turn must NOT render as a generic AI response');
+  });
+
+  it('non-recall blocks do not get the recency-first rule', () => {
+    const text = _buildRecallHistoryBlock([
+      { role: 'user', content: 'hi', timestamp: '2026-09-24T10:00:00Z' },
+    ], false);
+    assert(!text.includes('RECENCY-FIRST RULE'), 'recency rule is recall-only');
+  });
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 (async () => {

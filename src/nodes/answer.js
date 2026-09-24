@@ -96,7 +96,9 @@ function _buildRecallHistoryBlock(conversationHistory = [], isConversationRecall
   conversationHistory = conversationHistory.filter(m => m.role !== 'assistant' || !_isCannedRefusal(m.content));
   const recentHistory = conversationHistory.slice(isConversationRecall ? -30 : -5);
   const historyBlock = recentHistory.map((msg, i) => {
-    const role = msg.role === 'assistant' ? 'Previous AI Response (may contain errors)' : 'User';
+    const role = (msg.isThoughtCard || msg.source === 'thought-attachment')
+      ? (msg.attachedToMessage ? 'Proactive card attached to the user\'s reply' : 'Proactive card shown to user')
+      : (msg.role === 'assistant' ? 'Previous AI Response (may contain errors)' : 'User');
     return `[${i + 1}] ${role}: ${msg.content?.substring(0, 300) || 'No content'}`;
   }).join('\n');
   let text = `\n\n=== RECENT CONVERSATION HISTORY ===\n${historyBlock}\n=== END HISTORY ===\n\nCRITICAL: The conversation history above contains previous AI responses that may contain hallucinations or errors. For temporal queries (dates, times, "yesterday", "today", etc.), prioritize the actual memory data provided below over any dates mentioned in conversation history. Conversation history is only for context, not factual accuracy.`;
@@ -115,6 +117,7 @@ function _buildRecallHistoryBlock(conversationHistory = [], isConversationRecall
       text += `\n\n=== RECENT USER PROMPTS (oldest → newest, may span multiple sessions) ===\n${promptLines}\n=== END USER PROMPTS ===`;
     }
     text += `\n\nThe conversation history is listed from OLDEST to NEWEST. The LAST entry with role "User" is the most recent prompt the user sent (immediately before this question). For "what did I just ask you" / "my last prompt" / "previous prompt", answer with that exact message. For "N prompts ago", count backward from the last User entry.`;
+    text += `\n\nRECENCY-FIRST RULE: vague transcript questions ("remember what", "what were we talking about", "what did you just say") resolve to the LAST few turns — the immediately preceding exchange is the referent. Screen activity and memory data below are supplementary context only — do NOT summarize them unless the user asks about their activity/screen.`;
     text += `\n\nCRITICAL: The conversation history above IS your memory of past prompts. You DO have access to it. For questions about what the user asked, use the entries with role "User" in the RECENT CONVERSATION HISTORY — and for count/list questions ("list my last N prompts"), use the RECENT USER PROMPTS list, which contains ONLY your prompts (no AI replies) and can span multiple sessions. Quote or summarize the actual user messages. Do NOT say you cannot access previous prompts, and do NOT claim the list is exhaustive unless it clearly covers the requested count.`;
   }
   return text;
@@ -351,7 +354,7 @@ module.exports = async function answer(state) {
       }
       return lines;
     }).join('\n\n');
-    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: For image results, use the IMAGE URL provided above. Do NOT invent or hallucinate image URLs. Synthesize the results into a SINGLE coherent answer — do NOT repeat the same fact or paragraph multiple times. Each piece of information should appear exactly once.\n\nFORMATTING: Use markdown for readability — **bold** for key items, bullet lists for enumerations, and clear paragraph breaks. Do NOT use markdown headers (#) or code blocks unless the content is genuinely code. Keep the answer concise and well-structured.`;
+    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: For image results, use the IMAGE URL provided above. Do NOT invent or hallucinate image URLs. Synthesize the results into a SINGLE coherent answer — do NOT repeat the same fact or paragraph multiple times. Each piece of information should appear exactly once.\n\nLINKS: When the answer lists or recommends items that come from these results (businesses, shops, videos, products, articles, sites, tools), each item's name MUST be a markdown link — [Name](URL) — using the URL shown for that result above, or place the URL directly after the item. Use ONLY the URLs provided above; never invent, guess, or reconstruct a URL. If an item has no corresponding result URL, present it without a link rather than making one up.\n\nFORMATTING: Use markdown for readability — **bold** for key items, bullet lists for enumerations, and clear paragraph breaks. Do NOT use markdown headers (#) or code blocks unless the content is genuinely code. Keep the answer concise and well-structured.`;
   }
 
   // ── Inject conversation history for ambiguous follow-up interpretation ─────────
@@ -388,7 +391,9 @@ module.exports = async function answer(state) {
   if (_semanticMatches.length > 0) {
     const matchedLines = _semanticMatches.slice(0, 15).map((m, i) => {
       const when = m.formattedDate?.absolute || m.timestamp || '';
-      const role = m.role === 'user' ? 'User' : 'Assistant';
+      const role = (m.isThoughtCard || m.source === 'thought-attachment')
+        ? 'Proactive card'
+        : (m.role === 'user' ? 'User' : 'Assistant');
       const sess = m.sessionTitle ? ` — session "${m.sessionTitle}"` : '';
       return `[${i + 1}] ${role}${when ? ` — ${when}` : ''}${sess}: ${(m.content || '').substring(0, 400)}`;
     }).join('\n');

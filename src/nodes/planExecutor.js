@@ -158,7 +158,7 @@ module.exports = async function planExecutor(state) {
   // Approved/resumed plans skip planSkillsV2's post-parse lint — apply the
   // same file-edit enforcement here so pre-fix saved plans can't still
   // overwrite user files via synthesize saveToFile.
-  skillPlan = lintFileEditPlan(skillPlan, logger).plan;
+  skillPlan = lintFileEditPlan(skillPlan, logger, { prompt: originalPrompt }).plan;
 
   logger.info(`[Node:PlanExecutor] Built skillPlan[${skillPlan.length}] — handing to planSkills → executeCommand`);
 

@@ -4,7 +4,8 @@ const fs   = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { IMAGE_REQUEST_RES } = require('../utils/textPatterns.cjs');
+// Media routing uses the classifier's mediaListing flag (see media-search guard
+// below), not the IMAGE_REQUEST_RES regexes in text-patterns.
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeDecomposeLog(entry) {
@@ -194,9 +195,18 @@ function collapseUserInfoQuery(plan, originalMessage, logger) {
 // Returns 0–6 (single-step with that intent) or 7 (multi-step → full generation).
 // Safe default on parse failure/timeout: 0 (command_automate — most common, safe single-step).
 const _SINGLE_STEP_INTENTS = ['command_automate', 'screen_intelligence', 'web_search', 'memory_store', 'memory_retrieve', 'general_knowledge', 'greeting'];
+function _decisionRoleLabel(m) {
+  if (!(m.isThoughtCard || m.source === 'thought-attachment')) {
+    return m.role === 'user' ? 'User' : 'Assistant';
+  }
+  return m.attachedToMessage
+    ? 'Assistant (proactive card ATTACHED to the user\'s reply — the offer they are answering)'
+    : 'Assistant (proactive card)';
+}
+
 async function _decomposeDecision(message, llmBackend, conversationHistory, logger) {
   const recentCtx = (conversationHistory || []).slice(-4)
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 150)}`)
+    .map(m => `${_decisionRoleLabel(m)}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
   const contextBlock = recentCtx ? `\nRecent conversation (for context only):\n${recentCtx}\n` : '';
 
@@ -225,6 +235,7 @@ DECISION RULES (check in order):
 - "search the web / google X / look up X online" → 2 (web search — no site interaction)
 - Naming a site to INTERACT with (post/send/create/add to cart/log in/fill a form) → 0; naming a site only to look something up on it → 2
 - When in doubt → 0 (command_automate is the safest single-step default)
+- PROACTIVE-CARD REPLY: a turn labeled "Assistant (proactive card)" is a popup offer the user saw; a turn labeled "ATTACHED to the user's reply" is the specific card they were looking at when they sent this message — treat the reply as answering THAT card. Classify by what the reply asks for given the card: conversational replies about it ("it already happened", "tell me more") → 5 general_knowledge, NOT 3 memory_store — unless the reply explicitly asks to remember/save something. Replies accepting an offered action ("sure", "yes", "do it") → the intent that action implies. Replies declining it ("no thanks") → 6 general_knowledge acknowledgment.
 - Only return 7 when the user has MULTIPLE INDEPENDENT goals (e.g., "send an email AND schedule a meeting")
 - Do NOT return 7 for multi-agent tasks that serve ONE goal (e.g., "post on Twitter, Facebook, and LinkedIn" → 0, the planner handles multiple agents)
 
@@ -265,7 +276,7 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
   const currentDate = now.toLocaleDateString('en-CA'); // YYYY-MM-DD in local time
   const currentTime = now.toTimeString().split(' ')[0].substring(0, 5); // HH:MM format
   const recentCtx = (conversationHistory || []).slice(-4)
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 150)}`)
+    .map(m => `${_decisionRoleLabel(m)}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
   const contextBlock = recentCtx ? `\nRecent conversation (for context/grounding only - DO NOT include in decomposition):\n${recentCtx}\n` : '';
   const userPrompt = `CURRENT DATE AND TIME: ${currentDate} ${currentTime}\n\nDecompose ONLY the NEW user message below into ordered single-intent sub-prompts.${contextBlock}\nNEW MESSAGE TO DECOMPOSE:\n"${message}"`;
@@ -374,18 +385,32 @@ module.exports = async function decomposePromptV2(state) {
   const _MULTI_GOAL_CONJUNCTIONS = /\b(and\s+then|also|after\s+that|additionally|plus|furthermore|then\s+also)\b|;\s*[a-z]/i;
   const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower);
   const _SINGLE_STEP_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser']);
-  // ── Image-search guard — checked BEFORE the command_automate short-circuit ──
-  // classifyTask may mark "show me a picture of X" as taskType=browser, which would
-  // short-circuit to command_automate and build a web agent. The web_search intent
-  // handles image retrieval natively (with carousel), so route image queries there.
-  const _isImageSearch = IMAGE_REQUEST_RES.some(re => re.test(_msgLower));
-  // Exception: when the user names a specific site/service to search ON (e.g.
-  // "show pics of baby clothes for sale on amazon"), keep command_automate so
-  // the task reaches the site_search → web.crawl → extractItems pipeline and
-  // produces structured product cards. Generic image queries (no target site)
-  // still route to web_search for the image carousel.
-  if (_isImageSearch && !_hasMultiGoalConjunction && !_tc.targetService) {
-    logger.info(`[Node:DecomposePromptV2] Image-search guard: routing to web_search (taskType=${_tc.taskType} targetService=${_tc.targetService || 'none'}) — skipping command_automate short-circuit`);
+  // ── Media-search guard — checked BEFORE the command_automate short-circuit ──
+  // classifyTask sets mediaListing when the user wants a SET of media results
+  // (image carousel / video cards with links). The web_search intent handles
+  // both natively — routing these to command_automate would build a web agent
+  // + auth preflight + SERP crawl for a task a single search call answers.
+  // This replaces the old IMAGE_REQUEST_RES regex guard: the classifier sees
+  // conversation history, so media-less follow-ups ("pull list with links")
+  // resolve correctly via followUpTarget.
+  const _mediaListing = _tc.mediaListing || 'none';
+  // Image requests on a NAMED site ("pics of baby clothes on amazon") stay
+  // command_automate → site_search → web.crawl → extractItems (structured
+  // product cards). Generic image queries route to web_search.
+  // Video requests route to web_search even when a video platform is named —
+  // Brave Video Search handles site-scoped queries and youtube SERP crawls
+  // are bot-walled. Non-video sites stay command_automate.
+  const _VIDEO_PLATFORMS = new Set(['youtube', 'yt', 'vimeo', 'tiktok', 'twitch', 'netflix', 'rumble', 'bitchute', 'dailymotion']);
+  const _targetSvcLower = String(_tc.targetService || '').toLowerCase();
+  const _routeMediaToWebSearch =
+    !_hasMultiGoalConjunction &&
+    _tc.webAccessMode !== 'interactive' &&
+    (
+      (_mediaListing === 'image' && !_tc.targetService) ||
+      (_mediaListing === 'video' && (!_tc.targetService || _VIDEO_PLATFORMS.has(_targetSvcLower)))
+    );
+  if (_routeMediaToWebSearch) {
+    logger.info(`[Node:DecomposePromptV2] Media-search guard: routing to web_search (mediaListing=${_mediaListing} taskType=${_tc.taskType} targetService=${_tc.targetService || 'none'}) — skipping command_automate short-circuit`);
     const subPrompts = [{
       text: message,
       estimatedIntent: 'web_search',
@@ -398,7 +423,7 @@ module.exports = async function decomposePromptV2(state) {
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
       ts: new Date().toISOString(), message, carriedHint: null,
-      parser: 'image-search-guard', intent: 'web_search',
+      parser: 'media-search-guard', intent: 'web_search',
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'web_search', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
@@ -406,7 +431,8 @@ module.exports = async function decomposePromptV2(state) {
     return {
       ...state,
       _decomposedIntent: 'web_search',
-      _decomposedBy: 'image-search-guard',
+      _decomposedBy: 'media-search-guard',
+      _mediaListing,
       intentPlan: subPrompts,
     };
   }

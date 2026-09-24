@@ -211,7 +211,7 @@ function _validateStepSchema(steps, logger) {
  *
  * Returns { plan, rewrites } — rewrites is a log-friendly list of what changed.
  */
-const _CONFIRM_ONLY_RE = /^\s*(?:please\s+)?(?:confirm|verify|check|double-check)\b[\s\S]{0,200}?\b(?:saved|written|created|applied|corrected|updated|exists)\b/i;
+const _CONFIRM_ONLY_RE = /^\s*(?:please\s+)?(?:confirm(?:ed|ing)?|verify|verifying|verified|check(?:ed)?|double-check)\b[\s\S]{0,200}?\b(?:saved|written|created|applied|corrected|updated|exists|duplicated|done|completed?)\b/i;
 
 function _expandHomeDir(p) {
   return p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p;
@@ -252,10 +252,58 @@ function getProtectedPaths(message) {
   return out;
 }
 
-function _lintFileEditPlan(plan, logger) {
+// app.agent actions/shortcuts that mutate document content. Keystroke-edit
+// plans (Cmd+F → Cmd+C → Cmd+V …) bypass every file-edit rail and can pollute
+// the user's live document — a real recovery replan once did exactly that.
+// Navigation/copy/close shortcuts (Cmd+F, Cmd+G, Cmd+C, Cmd+W) stay legal.
+const _APPAGENT_PASTE_RE = /\b(?:cmd|command|ctrl|control|⌘)\s*\+\s*[vx]\b|paste/i;
+
+function _isAppAgentContentMutation(step) {
+  if (step?.skill !== 'app.agent') return false;
+  const a = step.args || {};
+  if (a.action === 'type_text') return true;
+  if (a.action === 'execute_shortcut') {
+    const sc = String(a.shortcutOverride || a.shortcut || '');
+    if (_APPAGENT_PASTE_RE.test(sc)) return true;
+    if (a.textToType || a.insertText) return true;
+  }
+  return false;
+}
+
+function _lintFileEditPlan(plan, logger, ctx = {}) {
   if (!Array.isArray(plan)) return { plan, rewrites: [] };
   const rewrites = [];
   const thinkdropDir = path.join(os.homedir(), '.thinkdrop') + path.sep;
+  const prot = getProtectedPaths(ctx.prompt || '');
+
+  // ── Keystroke-edit guard ─────────────────────────────────────────────────
+  // Any app.agent step that inserts/pastes/types content while the user has a
+  // file attached is a file edit wearing the wrong skill. Collapse to a single
+  // edit.agent step when the whole plan is about the file; drop flagged steps
+  // in mixed/multi-file plans rather than guess which file they meant.
+  if (prot.length > 0) {
+    const flaggedIdx = [];
+    plan.forEach((s, i) => { if (_isAppAgentContentMutation(s)) flaggedIdx.push(i); });
+    if (flaggedIdx.length > 0) {
+      const flaggedSet = new Set(flaggedIdx);
+      const rest = plan.filter((_, i) => !flaggedSet.has(i));
+      const FILE_RELATED = new Set(['app.agent', 'synthesize', 'fs.read', 'file.read', 'edit.agent']);
+      const allFileRelated = rest.every(s => FILE_RELATED.has(s?.skill));
+      if (prot.length === 1 && allFileRelated) {
+        const goal = String(ctx.prompt || '')
+          .replace(_ATTACH_TAG_RE, '')
+          .replace(/\s+/g, ' ')
+          .trim() || `Edit ${path.basename(prot[0].resolved)}`;
+        rewrites.push({ index: flaggedIdx[0], kind: 'app.agent-keystroke-edit→edit.agent', filePath: prot[0].resolved });
+        return {
+          plan: [{ skill: 'edit.agent', args: { goal, filePath: prot[0].resolved, mode: 'draft' }, description: `Edit ${path.basename(prot[0].resolved)}` }],
+          rewrites,
+        };
+      }
+      rewrites.push({ index: flaggedIdx[0], kind: 'drop-app.agent-keystroke-edit', count: flaggedIdx.length });
+      plan = rest;
+    }
+  }
 
   let steps = plan.map((step, i) => {
     if (step?.skill !== 'synthesize') return step;
@@ -278,6 +326,19 @@ function _lintFileEditPlan(plan, logger) {
       args: { goal, filePath: abs },
       description: step.description || `Edit ${path.basename(abs)}`,
     };
+  });
+
+  // ── Draft-first default ──────────────────────────────────────────────────
+  // Interactive file edits should produce a reviewable draft (diff card →
+  // user clicks Apply), not an immediate in-place write. Runs after the
+  // synthesize→edit.agent conversion so converted steps get the default too.
+  // Explicit mode:'inplace'/'apply' is respected — only fills a missing mode.
+  steps = steps.map((step, i) => {
+    if (step?.skill !== 'edit.agent') return step;
+    const a = step.args || {};
+    if (a.mode || a.writeMode) return step;
+    rewrites.push({ index: i, kind: 'edit.agent→draft-mode' });
+    return { ...step, args: { ...a, mode: 'draft' } };
   });
 
   const last = steps[steps.length - 1];

@@ -574,8 +574,16 @@ module.exports = async function preflightAgents(state) {
   // BEFORE planning. This prevents app.runner from failing on an unresolved
   // bare basename and prevents the griller from wasting time asking about it.
   let _fileResolution = null;
-  if (_tc.taskType === 'app_automation' || _tc.taskType === 'local_file') {
+  // The gate also fires on activeDocRef:'file'/activeDocTarget — misclassified
+  // follow-ups like "update the file" (taskType:ambiguous) still refer to a
+  // live local document and must resolve it before any agent planning.
+  if (_tc.taskType === 'app_automation' || _tc.taskType === 'local_file' || _tc.activeDocRef === 'file' || _tc.activeDocTarget) {
     let candidate = _extractFileCandidate(userMessage);
+    // "the file" has no literal name to extract — fall back to the resolved
+    // live-document target.
+    if (!candidate && _tc.activeDocTarget && /^(\/|~\/)/.test(String(_tc.activeDocTarget))) {
+      candidate = String(_tc.activeDocTarget);
+    }
     if (!candidate && /\b(?:open|examine|read|edit|view|show|load|find|import|ask|tell)\b/i.test(userMessage)) {
       logger.info('[Node:PreflightAgents] No regex match for file name — trying LLM extraction');
       candidate = await _llmExtractFileCandidate(state.llmBackend, userMessage, logger);
@@ -672,6 +680,29 @@ module.exports = async function preflightAgents(state) {
     }
   }
 
+  // ── Demote misrouted service/app agents when a local file is the subject ────
+  // "Update the file" can get LLM-routed to microsoft_word_online.agent or a
+  // code editor before file resolution runs — then preflight surfaces auth
+  // cards for services the task never needed. When an exact local file
+  // resolved AND the message names no service/agent, the selected agents add
+  // nothing: planSkills handles local files via edit.agent/fs.read. Service
+  // mentions ("email me this file") preserve the pick.
+  if (_fileResolution?.status === 'exact' && _fileResolution.path
+      && selectedAgentIds.size > 0 && !_tc.targetService) {
+    let _regAgents = [];
+    try {
+      const _agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+      _regAgents = (_agRes?.data || _agRes || []).filter(a => a && a.id);
+    } catch (_) {}
+    const { _messageMentionsServiceOrAgent } = require('./resolveAgent');
+    if (!_messageMentionsServiceOrAgent(userMessage, _regAgents)) {
+      logger.info(`[Node:PreflightAgents] local file resolved (${_fileResolution.path}) + no service mentioned — dropping ${selectedAgentIds.size} misrouted agent(s): ${[...selectedAgentIds].join(', ')}`);
+      selectedAgentIds.clear();
+      createAgentSpecs.length = 0;
+      state.resolveAgentResult = { ...(resolveAgentResult || {}), agents: [] };
+    }
+  }
+
   // ── Fast path: no agents selected + local/public-web task → skip heavy preflight ──
   // When resolveAgent selected 0 agents, no agents need creating, and the task
   // is local_file, local_system, or a public web task (download/public_read —
@@ -682,7 +713,7 @@ module.exports = async function preflightAgents(state) {
   // "Sign in to X" banners on tasks that never needed an agent.
   const _isPublicWebTask = _tc.webAccessMode === 'download' || _tc.webAccessMode === 'public_read';
   if (selectedAgentIds.size === 0 && createAgentSpecs.length === 0 && !recoveryContext &&
-      (_tc.taskType === 'local_file' || _tc.taskType === 'local_system' || _isPublicWebTask)) {
+      (_tc.taskType === 'local_file' || _tc.taskType === 'local_system' || _isPublicWebTask || _tc.activeDocRef === 'file')) {
     logger.info(`[Node:PreflightAgents] Fast path — no agents selected, taskType=${_tc.taskType} webAccessMode=${_tc.webAccessMode || 'n/a'} → skipping heavy preflight`);
     // Single cheap call: installed skills list (planSkillsV2 reads this)
     let _installedSkillsList = [];
@@ -2587,8 +2618,15 @@ module.exports = async function preflightAgents(state) {
   // When a service has exactly one executable route and it is now ready+
   // authed, treat that route as authoritative. The planner is forbidden from
   // falling back to api_suggest or alternative routes for that service.
+  // Public web tasks (public_read/download — _isPublicWebTask set above) must
+  // NOT pin a service route — they run through web.agent/web.crawl/shell.run
+  // per the planner's public-web hard constraint. A browser mandate here would
+  // contradict that constraint (and produced youtube.agent for "find videos
+  // from X" listing prompts).
   const singleRouteMandate = {};
-  {
+  if (_isPublicWebTask) {
+    logger.info(`[Node:PreflightAgents] Skipping single-route mandate — webAccessMode=${_tc.webAccessMode} (public web task, no service agent)`);
+  } else {
     const _readyByService = new Map();
     for (const a of agentReadiness) {
       if (!a.ready || !a.authed) continue;
@@ -2669,7 +2707,10 @@ module.exports = async function preflightAgents(state) {
     return null;
   }
 
-  for (const a of agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
+  // Deep-links resolve to a SINGLE page (e.g. one watch?v= URL) — wrong for
+  // public_read listing/search tasks that need a SERP, and the resolution
+  // chain itself burns web-search + crawl calls the task doesn't need.
+  for (const a of _isPublicWebTask ? [] : agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
     const deepLink = await _resolveDeepLinkForAgent(a, userMessage);
     if (deepLink) {
       a.deepLinkUrl = deepLink.url || deepLink;

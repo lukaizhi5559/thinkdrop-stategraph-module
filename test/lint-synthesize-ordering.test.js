@@ -104,6 +104,88 @@ check('null message → empty', Array.isArray(prot) && prot.length === 0);
   const amb = await _thinPostFailureHandler(ambState);
   check('ambiguous denial falls through', !(amb.recoveryAction === 'auto_patch' && amb.skillPlan?.[0]?.skill === 'edit.agent'));
 
+  // ── Keystroke-edit guard — the Cmd+C/Cmd+V macro plan that polluted the
+  //    user's live TextEdit buffer must collapse to a single edit.agent. ────
+  const prompt = `[File: ${attachFile}]\n\nUpdate Section 1 and make it better`;
+  const macroPlan = [
+    { skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'TextEdit', shortcutOverride: 'Cmd+F', searchText: 'Section 1' }, description: 'Find section' },
+    { skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'TextEdit', shortcutOverride: 'Cmd+C' }, description: 'Copy text' },
+    { skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'TextEdit', shortcutOverride: 'Cmd+V' }, description: 'Paste to duplicate' },
+    { skill: 'synthesize', args: { prompt: 'Confirmed: Section 1 content has been duplicated in the file.' }, description: 'Confirm duplication' },
+  ];
+  const { plan: collapsed, rewrites: rw1 } = lintFileEditPlan(macroPlan, logger, { prompt });
+  check('keystroke-macro plan collapses to edit.agent',
+    collapsed.length === 1 && collapsed[0].skill === 'edit.agent'
+    && collapsed[0].args.filePath === fs.realpathSync(attachFile)
+    && collapsed[0].args.mode === 'draft'
+    && /update section 1/i.test(collapsed[0].args.goal),
+    JSON.stringify(collapsed));
+  check('collapse rewrite recorded', rw1.some(r => r.kind === 'app.agent-keystroke-edit→edit.agent'));
+
+  // Benign app.agent navigation (no mutation) → untouched.
+  const navPlan = [{ skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'TextEdit', shortcutOverride: 'Cmd+F', searchText: 'x' } }];
+  const { plan: nav } = lintFileEditPlan(navPlan, logger, { prompt });
+  check('non-mutating app.agent steps pass through', nav.length === 1 && nav[0].skill === 'app.agent');
+
+  // Mixed plan (non-file step present) → flagged steps dropped, others kept.
+  const mixedPlan = [
+    { skill: 'shell.run', args: { cmd: 'ls' }, description: 'list' },
+    { skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'TextEdit', shortcutOverride: 'Cmd+V' } },
+  ];
+  const { plan: mixed, rewrites: rw2 } = lintFileEditPlan(mixedPlan, logger, { prompt });
+  check('mixed plan drops flagged app.agent step', mixed.length === 1 && mixed[0].skill === 'shell.run'
+    && rw2.some(r => r.kind === 'drop-app.agent-keystroke-edit'), JSON.stringify(mixed));
+
+  // type_text is a mutation too.
+  const typePlan = [
+    { skill: 'app.agent', args: { action: 'type_text', appName: 'TextEdit', text: 'replacement content' } },
+    { skill: 'synthesize', args: { prompt: 'Confirm the file was updated' } },
+  ];
+  const { plan: typed } = lintFileEditPlan(typePlan, logger, { prompt });
+  check('type_text plan collapses to edit.agent', typed.length === 1 && typed[0].skill === 'edit.agent', JSON.stringify(typed));
+
+  // Past-tense self-confirmation synthesize is dropped by the confirm regex.
+  const confirmPlan = [
+    { skill: 'shell.run', args: { cmd: 'ls' } },
+    { skill: 'synthesize', args: { prompt: 'Confirmed: the file was duplicated correctly.' } },
+  ];
+  const { plan: conf } = lintFileEditPlan(confirmPlan, logger);
+  check('past-tense confirm synthesize dropped', conf.length === 1 && conf[0].skill === 'shell.run', JSON.stringify(conf));
+
+  // Draft-first default — edit.agent without mode gets mode:'draft'.
+  const editNoMode = [{ skill: 'edit.agent', args: { goal: 'fix typos', filePath: attachFile } }];
+  const { plan: drafted, rewrites: rw3 } = lintFileEditPlan(editNoMode, logger, { prompt });
+  check('edit.agent without mode → mode:draft injected', drafted[0].args.mode === 'draft'
+    && rw3.some(r => r.kind === 'edit.agent→draft-mode'));
+
+  // Explicit inplace is respected.
+  const editInplace = [{ skill: 'edit.agent', args: { goal: 'x', filePath: attachFile, mode: 'inplace' } }];
+  const { plan: inp } = lintFileEditPlan(editInplace, logger, { prompt });
+  check('explicit mode:inplace untouched', inp[0].args.mode === 'inplace');
+
+  // synthesize→edit.agent conversion also gets draft mode.
+  const synPlan = [{ skill: 'synthesize', args: { prompt: 'Fix typos', saveToFile: target } }];
+  const { plan: synConverted } = lintFileEditPlan(synPlan, logger);
+  check('converted synthesize→edit.agent gets draft mode', synConverted[0]?.args?.mode === 'draft', JSON.stringify(synConverted[0]?.args));
+
+  // plan-skills-file.md appendix is mandatory whenever a local file resolves —
+  // including recovery/tier-3 plans whose base prompt lacks edit.agent docs.
+  const { _buildSystemPrompt } = require('../src/nodes/planSkillsV2');
+  const recoveryState = {
+    recoveryContext: { reason: 'hollow' },
+    _fileResolution: { status: 'exact', path: attachFile },
+    _taskClassification: { taskType: 'local_file' },
+  };
+  const recoveryPrompt = _buildSystemPrompt(`[File: ${attachFile}] update section 1`, recoveryState);
+  check('recovery prompt includes file-edit appendix',
+    /LOCAL FILE EDITING|edit\.agent is the ONLY skill/i.test(recoveryPrompt || ''),
+    `prompt len=${(recoveryPrompt || '').length}`);
+  check('recovery prompt documents draft mode + keystroke ban',
+    /mode:"draft"|mode:'draft'/i.test(recoveryPrompt) && /app\.agent.*keystroke|keystrokes/i.test(recoveryPrompt));
+
+  const noFilePrompt = _buildSystemPrompt('what time is it in Tokyo', { _taskClassification: { taskType: 'query' } });
+  check('non-file prompt skips file appendix', !/LOCAL FILE EDITING — MANDATORY RULES/.test(noFilePrompt || ''));
+
   fs.rmSync(attachDir, { recursive: true, force: true });
   fs.rmSync(path.dirname(target), { recursive: true, force: true });
   console.log(`\n${passed} passed, ${failed} failed`);

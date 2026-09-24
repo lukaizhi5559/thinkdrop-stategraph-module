@@ -108,7 +108,10 @@ module.exports = async function logConversation(state) {
             intent: intent?.type,
             intentConfidence: intent?.confidence,
             source: 'thinkdrop_electron',
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            // Card replies carry the thought id so history can link the reply
+            // back to the proactive card it answered.
+            ...(state._thoughtAttachment?.id ? { thoughtId: state._thoughtAttachment.id, thoughtReply: true } : {}),
           }
         }).catch(err => {
           logger.warn('[Node:LogConversation] Failed to log user message:', err.message);

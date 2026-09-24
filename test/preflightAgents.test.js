@@ -899,6 +899,56 @@ async function runTests() {
   });
 
   console.log(`\n${'─'.repeat(72)}`);
+  // ── Local-file demotion: service agents picked for a file task get dropped ──
+  section('Local-file agent demotion');
+
+  const demoteTmp = path.join(os.tmpdir(), `pf-demote-${Date.now()}.txt`);
+  fs.writeFileSync(demoteTmp, 'hello world\n');
+
+  await it('drops a service agent when a local file resolves and no service is named', async () => {
+    const state = makeState({
+      userMessage: 'I need you to update the file and make it longer',
+      agents: [{ id: 'microsoft_word_online.agent', name: 'Word Online', service: 'microsoft_word_online' }, { id: 'gmail.agent', name: 'Gmail', service: 'gmail' }],
+      llmBackend: { async generateAnswer() { return '0'; } }, // login-need check → no login
+    });
+    state._taskClassification = { taskType: 'ambiguous', activeDocRef: 'file', activeDocTarget: demoteTmp };
+    state.resolveAgentResult = { agents: [{ agentId: 'microsoft_word_online.agent', role: 'update the file', exists: true }] };
+    const result = await preflightAgents(state);
+    const remaining = state.resolveAgentResult?.agents || [];
+    if (remaining.length !== 0) throw new Error(`expected agents demoted, got ${JSON.stringify(remaining)}`);
+    const authEvents = (state._progressEvents || []).filter(e => e.type === 'preflight:auth_required');
+    if (authEvents.length) throw new Error('auth card surfaced for a local-file task');
+    if (!result.preflightResult) throw new Error('no preflightResult');
+  });
+
+  await it('keeps agents when the message names a service', async () => {
+    const state = makeState({
+      userMessage: 'email me this file via gmail',
+      agents: [{ id: 'microsoft_word_online.agent', name: 'Word Online', service: 'microsoft_word_online' }, { id: 'gmail.agent', name: 'Gmail', service: 'gmail' }],
+      llmBackend: { async generateAnswer() { return '0'; } },
+    });
+    state._taskClassification = { taskType: 'ambiguous', activeDocRef: 'file', activeDocTarget: demoteTmp };
+    state.resolveAgentResult = { agents: [{ agentId: 'microsoft_word_online.agent', role: 'update the file', exists: true }] };
+    await preflightAgents(state);
+    const remaining = state.resolveAgentResult?.agents || [];
+    if (remaining.length === 0) throw new Error('service-named task had agents demoted');
+  });
+
+  await it('keeps agents when no file resolves', async () => {
+    const state = makeState({
+      userMessage: 'check my notifications',
+      agents: [{ id: 'gmail.agent', name: 'Gmail', service: 'gmail' }],
+      llmBackend: { async generateAnswer() { return '0'; } },
+    });
+    state._taskClassification = { taskType: 'browser' };
+    state.resolveAgentResult = { agents: [{ agentId: 'gmail.agent', role: 'check', exists: true }] };
+    await preflightAgents(state);
+    const remaining = state.resolveAgentResult?.agents || [];
+    if (remaining.length === 0) throw new Error('non-file task had agents demoted');
+  });
+
+  try { fs.unlinkSync(demoteTmp); } catch (_) {}
+
   if (_failed === 0) {
     console.log(`✅ All ${_passed} tests passed.`);
   } else {

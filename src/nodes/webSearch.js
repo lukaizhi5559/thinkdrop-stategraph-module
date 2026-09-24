@@ -64,12 +64,27 @@ module.exports = async function webSearch(state) {
       }
     }
 
+    // ── Media-listing hint (media-search guard in decomposePromptV2) ─────────
+    // Video-listing queries need the web-search service's VIDEO intent to fire
+    // (Brave Video Search → media cards). Ensure the query carries a video
+    // keyword — follow-up queries resolved via followUpTarget may lack one —
+    // and ask for more results since the user wants a list, not an answer.
+    const _mediaListing = state._mediaListing || (state._taskClassification || {}).mediaListing || 'none';
+    let limit = 3;
+    if (_mediaListing === 'video') {
+      if (!/\b(videos?|tutorial|episode|sermon|clip)s?\b/i.test(query)) {
+        query = `${query} videos`;
+        logger.info(`[Node:WebSearch] mediaListing=video — appended video keyword: "${query}"`);
+      }
+      limit = 8;
+    }
+
     logger.debug(`[Node:WebSearch] Query: "${query}"`);
 
     // Call web-search service
     const result = await mcpAdapter.callService('web-search', 'web.search', {
       query: query,
-      limit: 3
+      limit
     });
 
     // MCP protocol wraps response in 'data' field

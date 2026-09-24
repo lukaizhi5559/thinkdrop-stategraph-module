@@ -853,6 +853,18 @@ function _buildSystemPrompt(userMessage, state) {
     appendices.push('plan-skills-scheduling.md');
   }
 
+  // File-edit appendix is mandatory whenever a local file is resolved or
+  // attached — including recovery/tier-3 plans, whose base prompt
+  // (plan-skills.md) never documents edit.agent. Without it a recovery replan
+  // once produced app.agent keystroke macros (Cmd+C/Cmd+V) against the user's
+  // live document instead of an edit.agent step.
+  const _hasResolvedFile = state._fileResolution?.status === 'exact'
+    || /\[File:/i.test(userMessage)
+    || !!_tc?.activeDocTarget;
+  if (_hasResolvedFile && !appendices.includes('plan-skills-file.md')) {
+    appendices.push('plan-skills-file.md');
+  }
+
   for (const filename of appendices) {
     const appendix = _loadPromptFile(filename);
     if (appendix) {
@@ -2660,7 +2672,7 @@ The user's request does NOT match any installed skill.
   // file" rule the LLM keeps ignoring: rewrite those steps to edit.agent and
   // drop trailing confirm-only synthesize steps that confabulate write status.
   if (Array.isArray(skillPlan)) {
-    const _linted = lintFileEditPlan(skillPlan, logger);
+    const _linted = lintFileEditPlan(skillPlan, logger, { prompt: userMessage });
     if (_linted.rewrites.length > 0) {
       logger.warn(`[Node:PlanSkillsV2] File-edit lint applied ${_linted.rewrites.length} fix(es)`);
       skillPlan = _linted.plan;
@@ -3227,6 +3239,7 @@ The user's request does NOT match any installed skill.
 }
 
 module.exports = planSkillsV2;
+module.exports._buildSystemPrompt = _buildSystemPrompt;
 module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;
 module.exports._selectPriorSynthesis = _selectPriorSynthesis;
 module.exports._sanitizeSkillPlan = _sanitizeSkillPlan;

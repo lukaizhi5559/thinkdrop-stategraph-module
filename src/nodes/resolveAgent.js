@@ -800,30 +800,38 @@ module.exports = async function resolveAgent(state) {
     logger.warn(`[Node:ResolveAgent] Failed to fetch agent list: ${e.message}`);
   }
 
-  // ── Skip: local_file / image_analysis tasks with no service mentioned ──────
-  // These tasks are handled by generic skills (fs.read, image.analyze, synthesize).
-  // Only skip when the user did NOT name a service/agent (fuzzy-checked) AND this
-  // is not a follow-up (follow-ups let the LLM selection use conversation history).
-  // Exception: "upload this image to ChatGPT" → mention detected → don't skip.
+  // ── Skip: local_file / image_analysis / live-doc tasks, no service named ───
+  // These tasks are handled by generic skills (edit.agent, fs.read, synthesize).
+  // The subject test fires on ANY local-file signal — classifier taskType,
+  // activeDocRef:'file' (incl. the deixis fallback), or a [File:]/[Folder:]
+  // tag in the message — because misclassifications like taskType:ambiguous on
+  // "update the file" must not fall through to service-agent selection.
+  // Only skip when the user did NOT name a service/agent (fuzzy-checked) —
+  // "upload this image to ChatGPT" / "email me the file" still select agents.
   const _tc = state._taskClassification;
-  if (_tc && (_tc.taskType === 'local_file' || _tc.isImageAnalysis === true)) {
-    const _isFollowUp = !!_tc.isFollowUp;
+  const _localFileSubject = !!_tc && (
+    _tc.taskType === 'local_file'
+    || _tc.isImageAnalysis === true
+    || _tc.activeDocRef === 'file'
+    || /\[\s*(?:File|Folder)\s*:/i.test(userMessage || '')
+  );
+  if (_localFileSubject) {
     const _hasTargetService = !!_tc.targetService;
     const _mentionsService = _messageMentionsServiceOrAgent(userMessage, registeredAgents);
-    if (!_isFollowUp && !_hasTargetService && !_mentionsService) {
-      logger.info(`[Node:ResolveAgent] ${_tc.isImageAnalysis ? 'image_analysis' : 'local_file'} task — no service/agent mentioned, skipping agent selection: "${userMessage.slice(0, 80)}"`);
+    if (!_hasTargetService && !_mentionsService) {
+      logger.info(`[Node:ResolveAgent] local-file subject (${_tc.taskType === 'local_file' ? 'taskType' : _tc.isImageAnalysis ? 'image' : _tc.activeDocRef === 'file' ? 'activeDoc' : 'tag'}) — no service/agent mentioned, skipping agent selection: "${userMessage.slice(0, 80)}"`);
       return {
         ...state,
         resolveAgentResult: {
           agents: [],
-          reasoning: `${_tc.isImageAnalysis ? 'Image analysis' : 'Local file'} task — no service agent mentioned`,
+          reasoning: 'Local file task — no service agent mentioned',
           question: null,
           _message: userMessage,
         },
         resolveAgentAnswers: Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [],
       };
     }
-    logger.info(`[Node:ResolveAgent] ${_tc.isImageAnalysis ? 'image_analysis' : 'local_file'} task but service mentioned (targetService=${_tc.targetService || 'null'}, mentionsService=${_mentionsService}, isFollowUp=${_isFollowUp}) — proceeding to LLM selection`);
+    logger.info(`[Node:ResolveAgent] local-file subject but service mentioned (targetService=${_tc.targetService || 'null'}, mentionsService=${_mentionsService}, isFollowUp=${!!_tc.isFollowUp}) — proceeding to LLM selection`);
   }
 
   // ── Inline Q&A loop (max MAX_ROUNDS) ───────────────────────────────────────

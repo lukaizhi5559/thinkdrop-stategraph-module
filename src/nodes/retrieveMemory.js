@@ -616,6 +616,10 @@ async function retrieveMemory(state) {
       // even when temporal phrasing isn't parsed by any layer.
       (() => {
         if (intent?.type === 'context_query') return Promise.resolve({ results: [] });
+        // Transcript-meta questions ("remember what", "what did I just ask") are
+        // answered from conversation history — a screen-capture dump only
+        // injects irrelevant activity noise into the answer prompt.
+        if (_isConvRecall) return Promise.resolve({ results: [] });
         const episodicDateRange = dateRange || (isActivityQuery ? (() => {
           const s = new Date(now); s.setDate(s.getDate() - 30);
           const pad = n => String(n).padStart(2, '0');

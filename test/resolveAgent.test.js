@@ -439,6 +439,67 @@ async function runTests() {
     if (_messageMentionsAgent('check my open linear tickets', 'notion.agent', 'notion')) throw new Error('should not detect notion');
   });
 
+  // ── Local-file subject guard — misroutes that produced the Word Online auth
+  // card: follow-ups about "the file" must skip service-agent selection ───────
+  section('Local-file subject guard');
+  const _failLlm = { async generateAnswer() { throw new Error('LLM selection should not run for a local-file subject'); } };
+  const _fileAgents = [{ id: 'microsoft_word_online.agent', name: 'Word Online' }, { id: 'gmail.agent', name: 'Gmail' }];
+
+  await it('local_file follow-up with no service mention → skips LLM selection', async () => {
+    const msg = 'refering to the proofread text file';
+    const result = await resolveAgent({
+      message: msg, resolvedMessage: msg, llmBackend: _failLlm,
+      mcpAdapter: makeMcpAdapter({ registeredAgents: _fileAgents }),
+      logger: console, intent: { type: 'command_automate' },
+      _taskClassification: { taskType: 'local_file', isFollowUp: true },
+    });
+    const agents = result.resolveAgentResult?.agents;
+    if (!Array.isArray(agents) || agents.length !== 0) throw new Error(`expected no agents, got ${JSON.stringify(agents)}`);
+  });
+
+  await it('ambiguous taskType + activeDocRef:file → skips LLM selection', async () => {
+    const msg = 'I need you to update the file and make it longer better explanation';
+    const result = await resolveAgent({
+      message: msg, resolvedMessage: msg, llmBackend: _failLlm,
+      mcpAdapter: makeMcpAdapter({ registeredAgents: _fileAgents }),
+      logger: console, intent: { type: 'command_automate' },
+      _taskClassification: { taskType: 'ambiguous', activeDocRef: 'file', activeDocTarget: '/tmp/x.txt' },
+    });
+    const agents = result.resolveAgentResult?.agents;
+    if (!Array.isArray(agents) || agents.length !== 0) throw new Error(`expected no agents, got ${JSON.stringify(agents)}`);
+  });
+
+  await it('[File:] tag in message → skips LLM selection', async () => {
+    const msg = '[File: /Users/x/notes.txt] clean this up';
+    const result = await resolveAgent({
+      message: msg, resolvedMessage: msg, llmBackend: _failLlm,
+      mcpAdapter: makeMcpAdapter({ registeredAgents: _fileAgents }),
+      logger: console, intent: { type: 'command_automate' },
+      _taskClassification: { taskType: 'ambiguous' },
+    });
+    const agents = result.resolveAgentResult?.agents;
+    if (!Array.isArray(agents) || agents.length !== 0) throw new Error(`expected no agents, got ${JSON.stringify(agents)}`);
+  });
+
+  await it('local_file follow-up that names a service → LLM selection proceeds', async () => {
+    const msg = 'email me this file via gmail';
+    const result = await resolveAgent({
+      message: msg, resolvedMessage: msg,
+      llmBackend: {
+        async generateAnswer() {
+          return JSON.stringify({ agents: [{ agentId: 'gmail.agent', role: 'send the file', exists: true }], reasoning: 'gmail', question: null });
+        },
+      },
+      mcpAdapter: makeMcpAdapter({ registeredAgents: _fileAgents }),
+      logger: console, intent: { type: 'command_automate' },
+      _taskClassification: { taskType: 'local_file', isFollowUp: true },
+    });
+    const agents = result.resolveAgentResult?.agents || [];
+    if (!agents.length || !String(agents[0].agentId).includes('gmail')) {
+      throw new Error(`expected gmail agent, got ${JSON.stringify(agents)}`);
+    }
+  });
+
   console.log(`\n${'─'.repeat(72)}`);
   if (_failed === 0) {
     console.log(`✅ All ${_passed} tests passed.`);
