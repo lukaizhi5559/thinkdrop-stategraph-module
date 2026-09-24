@@ -243,6 +243,41 @@ module.exports = async function resolveReferencesV2(state) {
         }))
         .reverse();
 
+      // Empty-session fallback: the routed session has no messages (new or just
+      // rotated), so the immediately-preceding turn lives in another session.
+      // Pull the most recent other session's tail so elliptical follow-ups
+      // ("how many unread") still resolve against the real prior turn instead
+      // of only stale cross-session semantic matches.
+      let priorSessionMessages = [];
+      if (recentMessages.length === 0) {
+        try {
+          const sessRes = await mcpAdapter.callService('conversation', 'session.list', { limit: 5 });
+          const sessions = (sessRes?.data || sessRes)?.sessions || [];
+          const prevSid = sessions
+            .map(s => s.id || s.sessionId)
+            .find(id => id && id !== sessionId);
+          if (prevSid) {
+            const res = await mcpAdapter.callService('conversation', 'message.list', {
+              sessionId: prevSid, limit: 8, direction: 'DESC',
+            });
+            priorSessionMessages = (((res?.data || res)?.messages) || [])
+              .filter(m => m.sender !== 'system')
+              .map(m => ({
+                id: m.id,
+                role: m.sender === 'user' ? 'user' : 'assistant',
+                content: stripHtml(m.text || m.content || ''),
+                timestamp: m.timestamp,
+                source: 'prior-session',
+                sessionId: prevSid,
+              }))
+              .reverse();
+            if (priorSessionMessages.length > 0) {
+              logger.debug(`[Node:ResolveReferencesV2] Empty session — pulled ${priorSessionMessages.length} prior-session message(s) from ${prevSid}`);
+            }
+          }
+        } catch (_) { /* best-effort enrichment */ }
+      }
+
       // Semantic matches (older relevant messages from any session)
       let semanticMessages = [];
       if (searchResult) {
@@ -267,7 +302,7 @@ module.exports = async function resolveReferencesV2(state) {
       // similarity-threshold misses like "email me these addresses").
       let sessionResults = await _collectSessionResults(
         mcpAdapter, semanticMessages.map(m => m.sessionId), sessionId, logger);
-      if (sessionResults.length === 0 && REFERENTIAL_RE.test(message || '')) {
+      if (sessionResults.length === 0 && priorSessionMessages.length === 0 && REFERENTIAL_RE.test(message || '')) {
         try {
           const sessRes = await mcpAdapter.callService('conversation', 'session.list', { limit: 5 });
           const sessions = (sessRes?.data || sessRes)?.sessions || [];
@@ -283,12 +318,16 @@ module.exports = async function resolveReferencesV2(state) {
         semanticMessages = [...semanticMessages, ...sessionResults];
         logger.debug(`[Node:ResolveReferencesV2] Session-result enrichment: +${sessionResults.length} assistant result(s)`);
       }
+      if (priorSessionMessages.length > 0) {
+        semanticMessages = [...priorSessionMessages, ...semanticMessages];
+      }
 
       // Merge: deduplicate by message ID, then sort chronologically.
       conversationHistory = _mergeConversationHistory(recentMessages, semanticMessages);
       // Expose the semantic matches separately so consumers can show them as
       // labeled "earlier context" instead of them polluting recency slices.
-      semanticHistory = conversationHistory.filter(m => m.source === 'semantic' || m.source === 'semantic-result');
+      semanticHistory = conversationHistory.filter(m =>
+        m.source === 'semantic' || m.source === 'semantic-result' || m.source === 'prior-session');
 
       logger.debug(`[Node:ResolveReferencesV2] Context: ${recentMessages.length} recent + ${semanticMessages.length} semantic = ${conversationHistory.length} total`);
     }

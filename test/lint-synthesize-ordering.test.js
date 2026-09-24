@@ -1,0 +1,111 @@
+'use strict';
+
+// Regression: lintFileEditPlan drops a trailing confirm-synthesize, but
+// _ensureSynthesizeForAppFlow used to re-push one because edit.agent wasn't in
+// _SYNTHESIZE_EXEMPT_SKILLS — the saved plan kept the confabulating step and the
+// run ended with a chat summary instead of the draft/apply UX.
+
+const { lintFileEditPlan, getProtectedPaths } = require('../src/utils/planHelpers');
+const { _ensureSynthesizeForAppFlow } = require('../src/nodes/planSkillsV2');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
+let passed = 0, failed = 0;
+function check(name, cond, extra = '') {
+  if (cond) { passed++; console.log(`  ✓ ${name}`); }
+  else { failed++; console.log(`  ✗ ${name} ${extra}`); }
+}
+
+const logger = { info: () => {}, warn: () => {}, debug: () => {} };
+
+// Real existing file so the lint's saveToFile→edit.agent rewrite engages.
+const target = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'lint-order-')), 'notes.md');
+fs.writeFileSync(target, 'Meeting notes — dealine Wenesday\n');
+
+// Original LLM plan: read → synthesize.saveToFile (rewrites an existing file —
+// lint converts to edit.agent) → confirm synthesize (lint drops).
+const plan = [
+  { skill: 'fs.read', args: { action: 'read', path: target }, description: 'Read the file' },
+  { skill: 'synthesize', args: { prompt: 'Fix the typos', saveToFile: target }, description: 'Fix spelling mistakes and save' },
+  { skill: 'synthesize', args: { prompt: 'Confirm the file was saved correctly' }, description: 'Confirm the result to the user' },
+];
+
+const { plan: linted, rewrites } = lintFileEditPlan(plan, logger);
+check('lint rewrote saveToFile→edit.agent', linted[1]?.skill === 'edit.agent' && linted[1]?.args?.filePath === target);
+check('lint dropped confirm step', linted.length === 2 && rewrites.some(r => r.kind === 'drop-confirm-step'));
+
+// The post-lint pipeline step that used to resurrect the confirm step.
+const final = _ensureSynthesizeForAppFlow(linted, 'fix the spelling/grammar mistake in this file');
+check('ensure does NOT re-add synthesize after edit.agent', final.length === 2 && final.every(s => s.skill !== 'synthesize'),
+  JSON.stringify(final.map(s => s.skill)));
+
+// Sanity: a plan ending on a non-exempt skill still gets a synthesize.
+const other = _ensureSynthesizeForAppFlow([{ skill: 'shell.run', args: { cmd: 'ls' }, description: 'list' }], 'list the files');
+check('ensure still adds synthesize for non-exempt endings', other.length === 2 && other[1].skill === 'synthesize');
+
+// getProtectedPaths — attachment-tag extraction for the shell.run sandbox.
+const attachDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lint-prot-'));
+const attachFile = path.join(attachDir, 'proofreading_test.txt');
+fs.writeFileSync(attachFile, 'This sentense has misstakes.\n');
+
+let prot = getProtectedPaths(`[File: ${attachFile}]\n\nfix the spelling in this file`);
+check('extracts attached file', prot.length === 1 && prot[0].original === attachFile && prot[0].resolved === fs.realpathSync(attachFile));
+
+prot = getProtectedPaths(`[Folder: ${attachDir}]`);
+check('extracts attached folder', prot.length === 1 && prot[0].original === attachDir);
+
+prot = getProtectedPaths(`[File: ${attachFile}] [File: ${attachFile}]`);
+check('dedupes repeated tags', prot.length === 1);
+
+prot = getProtectedPaths(`[File: ${attachDir}/does_not_exist.txt]`);
+check('skips nonexistent paths', prot.length === 0);
+
+prot = getProtectedPaths('fix typos in the file — no tag');
+check('no tags → empty', prot.length === 0);
+
+prot = getProtectedPaths(null);
+check('null message → empty', Array.isArray(prot) && prot.length === 0);
+
+// SANDBOX_REROUTE — a sandboxed shell.run step denied a write to the attached
+// file → thin recovery substitutes edit.agent deterministically (auto_patch).
+(async () => {
+  const { _thinPostFailureHandler } = require('../src/nodes/executeCommand');
+  const deniedStep = {
+    step: 1, skill: 'shell.run',
+    description: 'Fix spelling and grammar mistakes in the test file',
+    args: { cmd: 'python3', argv: ['-c', 'open(path,"w")...'] },
+    ok: false, error: 'Process exited with code 1',
+    stderr: `PermissionError: [Errno 1] Operation not permitted: '${attachFile}'`,
+    _sandboxDenied: true, _sandboxDeniedPath: attachFile,
+  };
+  const failState = {
+    failedStep: deniedStep,
+    skillPlan: [{ skill: 'shell.run', args: deniedStep.args, description: deniedStep.description }],
+    skillCursor: 0, skillResults: [], patchHistory: [], stepRetryCount: 0,
+    logger, llmBackend: null,
+  };
+  const routed = await _thinPostFailureHandler(failState);
+  check('sandbox denial → edit.agent substituted',
+    routed.recoveryAction === 'auto_patch'
+    && routed.skillPlan[0].skill === 'edit.agent'
+    && routed.skillPlan[0].args.filePath === attachFile
+    && /fix spelling/i.test(routed.skillPlan[0].args.goal),
+    JSON.stringify({ action: routed.recoveryAction, plan: routed.skillPlan?.[0] }));
+  check('reroute recorded in patchHistory', routed.patchHistory?.some(p => p.action === 'SANDBOX_REROUTE'));
+
+  // Second denial at the same cursor → falls through (no loop).
+  const secondState = { ...failState, patchHistory: [{ action: 'SANDBOX_REROUTE', note: 'x', attempt: 1 }] };
+  const second = await _thinPostFailureHandler(secondState);
+  check('repeat denial does NOT re-substitute', !(second.skillPlan?.[0]?.skill === 'edit.agent' && second.recoveryAction === 'auto_patch'));
+
+  // Denial with no resolvable path → falls through to normal recovery.
+  const ambState = { ...failState, failedStep: { ...deniedStep, _sandboxDeniedPath: null } };
+  const amb = await _thinPostFailureHandler(ambState);
+  check('ambiguous denial falls through', !(amb.recoveryAction === 'auto_patch' && amb.skillPlan?.[0]?.skill === 'edit.agent'));
+
+  fs.rmSync(attachDir, { recursive: true, force: true });
+  fs.rmSync(path.dirname(target), { recursive: true, force: true });
+  console.log(`\n${passed} passed, ${failed} failed`);
+  process.exit(failed ? 1 : 0);
+})().catch(e => { console.error(e); process.exit(1); });

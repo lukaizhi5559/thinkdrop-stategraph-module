@@ -217,6 +217,41 @@ function _expandHomeDir(p) {
   return p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p;
 }
 
+// ThinkDrop attachment tags — same syntax parsed in planSkillsV2 for the
+// FILE CONTEXT table. Controlled markup, not free-form text scanning.
+const _ATTACH_TAG_RE = /\[(?:File|Folder):\s*([^\]]+)\]/gi;
+
+/**
+ * Attached files the user explicitly handed to this run — the paths that must
+ * never be modified by raw shell.run. shell.run.cjs wraps spawned commands in
+ * `sandbox-exec` with a `deny file-write*` rule per resolved path, so ANY
+ * write mechanism (open('w'), sed -i, >, tee, rm, mv — including indirect
+ * references via cwd/env vars) fails with EPERM instead of silently rewriting
+ * a user file outside edit.agent's draft/backup rails.
+ *
+ * Returns [{ original, resolved }] — original is the path as written (tools
+ * report it in error output, e.g. "touch: /tmp/x: Operation not permitted");
+ * resolved is the realpath (Seatbelt literals match canonical paths, so
+ * /tmp/… must be denied as /private/tmp/…).
+ */
+function getProtectedPaths(message) {
+  if (!message || typeof message !== 'string') return [];
+  const out = [];
+  const seen = new Set();
+  for (const m of message.matchAll(_ATTACH_TAG_RE)) {
+    const original = _expandHomeDir(m[1].trim().replace(/^['"]|['"]$/g, ''));
+    if (!original || seen.has(original)) continue;
+    seen.add(original);
+    let resolved = original;
+    try { resolved = fs.realpathSync(original); } catch (_) {
+      // Nonexistent attachments can't be written-to meaningfully — skip.
+      continue;
+    }
+    out.push({ original, resolved });
+  }
+  return out;
+}
+
 function _lintFileEditPlan(plan, logger) {
   if (!Array.isArray(plan)) return { plan, rewrites: [] };
   const rewrites = [];
@@ -259,4 +294,4 @@ function _lintFileEditPlan(plan, logger) {
   return { plan: steps, rewrites };
 }
 
-module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan };
+module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths };

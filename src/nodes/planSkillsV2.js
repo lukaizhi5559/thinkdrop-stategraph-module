@@ -85,6 +85,11 @@ function _selectPriorSynthesis(conversationHistory = []) {
 const _SYNTHESIZE_EXEMPT_SKILLS = new Set([
   'synthesize', 'ask_user', 'needs_skill', 'schedule', 'api_suggest',
   'profile.store_secret', 'smartFill',
+  // edit.agent ends a plan with its own completion UX — a draft card +
+  // Apply button or an applied-edit result. A trailing "confirm" synthesize
+  // can't inspect the file and confabulates write status (lint drops it —
+  // don't re-add it here).
+  'edit.agent',
 ]);
 
 function _ensureSynthesizeForAppFlow(skillPlan, userMessage) {
@@ -3225,4 +3230,5 @@ module.exports = planSkillsV2;
 module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;
 module.exports._selectPriorSynthesis = _selectPriorSynthesis;
 module.exports._sanitizeSkillPlan = _sanitizeSkillPlan;
+module.exports._ensureSynthesizeForAppFlow = _ensureSynthesizeForAppFlow;
 module.exports._resolveCtxUrlTokens = _resolveCtxUrlTokens;

@@ -224,6 +224,38 @@ async function _thinPostFailureHandler(state) {
     if (_botSkipped) return _botSkipped;
   }
 
+  // ── Sandboxed protected-path write → substitute edit.agent ────────────────
+  // shell.run ran under sandbox-exec and the kernel denied a write to a
+  // user-attached file (EPERM). Content edits to attachments must go through
+  // edit.agent's draft/backup/diff rails — substitute the step directly, no
+  // LLM decision needed. Once per cursor: a second denial falls through to
+  // normal recovery/ask_user (e.g. non-edit ops like mv that edit.agent
+  // can't perform).
+  if (failedStep._sandboxDeniedPath && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !patchHistory.some(p => p.action === 'SANDBOX_REROUTE')) {
+    const _denied = failedStep._sandboxDeniedPath;
+    const _editGoal = failedStep.description || failedStep.args?.goal
+      || `Edit ${path.basename(_denied)}`;
+    const patchedPlan = [...skillPlan];
+    patchedPlan[skillCursor] = {
+      ...patchedPlan[skillCursor],
+      skill: 'edit.agent',
+      args: { goal: _editGoal, filePath: _denied },
+      description: failedStep.description || `Edit ${path.basename(_denied)}`,
+    };
+    logger.info(`[ExecuteCommand:ThinRecovery] SANDBOX_REROUTE: shell.run write to attached file ${_denied} denied — substituting edit.agent (goal="${_editGoal.slice(0, 80)}")`);
+    return {
+      ...state,
+      recoveryAction: 'auto_patch',
+      skillPlan: patchedPlan,
+      recoveryNote: `Direct writes to your attached file ${path.basename(_denied)} are blocked — routing through the safe editor instead.`,
+      patchHistory: [...patchHistory, { action: 'SANDBOX_REROUTE', note: `edit.agent for ${_denied}`, attempt: stepRetryCount + 1 }],
+      stepRetryCount: stepRetryCount + 1,
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
   // No LLM backend — surface to user
   if (!llmBackend) {
     return {
@@ -3682,6 +3714,13 @@ CRITICAL RULES:
 4. If the page text contains an "AI Overview" or auto-generated summary section (e.g. Gmail's AI Overview, Google Search AI Overview), do NOT trust its claims about the presence or absence of results. The AI Overview may state "no results found" or "no unread emails" even when actual results/email rows are clearly listed below it. Always verify against the actual list items, email rows, or data entries in the page text — not the AI Overview's summary. When the AI Overview contradicts the actual list items, trust the list items.
 5. COUNT QUESTION RULE: If the user asked "how many", "count", or "tell me how many": (a) First, search the page text for pagination, summary, or total count labels (e.g., "X-Y of N", "X of N", "Showing X results", "N items", "N matches", "No results", "Zero items"). (b) If the label shows an actual number N (e.g., "1-50 of 127", "Showing 1-10 of 23"), extract the absolute total N and report N as the definitive count (even if N is 0). Do NOT manually count individual rows — the pagination label is the source of truth. (c) If the label says "X-Y of many" (e.g., "1-50 of many", "Showing most recent 1-50 of many"), the exact total is not resolved by the app — the count is at least Y. Report the final answer as "at least Y" (e.g., "at least 50") and do NOT manually count visible rows. (d) If no total label exists, manually count only the fully visible rows/items in the page text. Report the final answer strictly as "at least N" (where N is your manual count). (e) Briefly list the first 2-3 visible item titles/subjects as supplementary context to verify you are looking at the right data. (f) Output the final count clearly at the very beginning of your response (e.g., "Count: N" or "Count: at least N").`) + _synthLangSuffix;
 
+      // Absolute-path rule — when the answer cites a saved/modified file it must
+      // write the FULL path, not a basename. The renderer linkifies absolute
+      // paths into clickable file chips; a bare filename renders as dead text.
+      if (!isFileEdit) {
+        synthesisInstructions += `\n\nFILE PATH RULE: When your answer mentions a file that was created, saved, moved, or modified, always write the FULL absolute path (e.g. /Users/name/Desktop/report.pdf) — never just the filename. The UI turns absolute paths into clickable file chips.`;
+      }
+
       // ── Output schema enforcement ─────────────────────────────────────────────
       const _outputSchema = args.outputSchema;
       let _schemaConstraint = '';
@@ -4473,6 +4512,22 @@ Please try again or search with different terms.`;
     };
   }
 
+  // Protected-path sandbox — files the user attached via [File: …]/[Folder: …]
+  // tags must never be rewritten by raw shell commands; they belong to
+  // edit.agent's draft/backup/diff rails. shell.run.cjs wraps the spawn in
+  // sandbox-exec denying file-write* on these paths — kernel-level, so every
+  // write mechanism (open(w), sed -i, >, tee, rm, mv, indirect refs) fails
+  // EPERM instead of silently rewriting a user file. Detected denials get a
+  // deterministic edit.agent substitution in _thinPostFailureHandler.
+  if (skill === 'shell.run' && !resolvedArgs.protectedPaths) {
+    const { getProtectedPaths } = require('../utils/planHelpers');
+    const _protPaths = state._protectedPaths
+      || getProtectedPaths(state.resolvedMessage || state.message || '');
+    if (_protPaths.length > 0) {
+      resolvedArgs = { ...resolvedArgs, protectedPaths: _protPaths };
+    }
+  }
+
   // Fix apostrophes in single-quoted bash variable assignments.
   // LLMs consistently generate broken quoting like: MSG='what's up'
   // which ends the single-quoted string at the apostrophe (exit code 2).
@@ -5212,12 +5267,20 @@ Please try again or search with different terms.`;
     }
 
     // Helper: dispatch a single group step (with automatic retry for Chrome crashes)
+    // Attached files are protected for grouped shell.run steps too — same
+    // sandbox-exec deny as the sequential path.
+    const { getProtectedPaths: _getProtG } = require('../utils/planHelpers');
+    const _runProtectedPaths = state._protectedPaths
+      || _getProtG(state.resolvedMessage || state.message || '');
+
     const _dispatchGroupStep = async ({ idx, step: gs }) => {
       const gsArgs = gs.args || {};
       const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
       const _callArgs = _isAgent
         ? { ...gsArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn${state._handoffTaskId ? `?taskId=${encodeURIComponent(state._handoffTaskId)}` : ''}`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
-        : gsArgs;
+        : (gs.skill === 'shell.run' && _runProtectedPaths.length > 0 && !gsArgs.protectedPaths)
+          ? { ...gsArgs, protectedPaths: _runProtectedPaths }
+          : gsArgs;
       // Extended timeout for parallel browser steps to handle YouTube searches + Tab-Flow
       const stepTimeoutMs = gs.skill === 'browser.agent' ? 420000 : 300000; // 7 min for browser, 5 min for CLI
 
@@ -5440,7 +5503,9 @@ Please try again or search with different terms.`;
         const extraArgs = decision === 'try_without' ? { skipAuth: true } : {};
         const _callArgs = _isAgent
           ? { ...gsArgs, ...extraArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn${state._handoffTaskId ? `?taskId=${encodeURIComponent(state._handoffTaskId)}` : ''}`, _stepIndex: r.idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
-          : { ...gsArgs, ...extraArgs };
+          : (gs.skill === 'shell.run' && _runProtectedPaths.length > 0 && !gsArgs.protectedPaths)
+            ? { ...gsArgs, ...extraArgs, protectedPaths: _runProtectedPaths }
+            : { ...gsArgs, ...extraArgs };
 
         logger.info(`[Node:ExecuteCommand] parallel login: re-dispatching ${svc?.agentId} (decision=${decision})`);
         try {
@@ -6379,6 +6444,24 @@ Please try again or search with different terms.`;
       transcription: skill === 'video.agent' ? (raw.transcription || null) : undefined,
       confidence:   skill === 'video.agent' ? (raw.confidence  ?? null) : undefined,
     };
+
+    // Sandboxed protected-path denial — a sandboxed shell.run step tried to
+    // write a user-attached file and the kernel refused (EPERM). Mark it so
+    // _thinPostFailureHandler can substitute an edit.agent step
+    // deterministically instead of spending an LLM call on the reroute.
+    if (skill === 'shell.run' && raw.sandboxed === true && stepResult.ok === false) {
+      const _denyHay = `${stepResult.stderr || ''}\n${stepResult.stdout || ''}\n${stepResult.error || ''}`;
+      if (_denyHay.includes('Operation not permitted') || _denyHay.includes('Permission denied') || _denyHay.includes('deny file-write')) {
+        const { getProtectedPaths } = require('../utils/planHelpers');
+        const _protPaths = state._protectedPaths
+          || getProtectedPaths(state.resolvedMessage || state.message || '');
+        const _hit = _protPaths.find(p => _denyHay.includes(p.original) || _denyHay.includes(p.resolved));
+        stepResult._sandboxDenied = true;
+        stepResult._sandboxDeniedPath = _hit
+          ? _hit.original
+          : (_protPaths.length === 1 ? _protPaths[0].original : null);
+      }
+    }
 
     // Defensive fallback: app.agent extract_content_via_clipboard returns the
     // page text in .content, but some downstream paths only check .text or
@@ -7885,3 +7968,4 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
 // Test-only exports
 module.exports.generateStepContract = generateStepContract;
 module.exports._extractFilePathsFromArgv = _extractFilePathsFromArgv;
+module.exports._thinPostFailureHandler = _thinPostFailureHandler;

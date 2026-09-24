@@ -88,6 +88,7 @@ Field rules:
 - expectsFileOutput: true when the task creates/writes/saves/exports a file — the referenced path is a DESTINATION (it may not exist yet), not a source to read. Signals: "save this to X.md", "write the code to ~/Desktop/three.md", "export the results as report.csv", "put that in a file". false for tasks that only read/open/list files, or when no file output is produced.
   - CRITICAL: Set followUpTarget to null when isFollowUp is false (including the META-QUESTION EXCEPTION above). A non-null followUpTarget with isFollowUp=false is invalid.
   - Never set followUpTarget to the user's own prior message text when the user is asking ABOUT that message (e.g., "what did I just ask" → followUpTarget must be null, NOT "what did I just ask").
+  - RECENCY PREFERENCE: when resolving followUpTarget, prefer the referent established in the NEWEST conversation messages (the immediately preceding turn) over older RELEVANT EARLIER MESSAGES matches — the prior turn is almost always the intended antecedent for a short elliptical follow-up.
   - ACTIVE DOC CONTEXT (activeDocRef): When an "ACTIVE APP CONTEXT (live):" or "PRIOR SCREEN CONTEXT" block is present AND the user message refers to the currently open document/page/site — e.g. "this file", "this page", "this document", "this site", "the current doc", or a bare "this"/"it" paired with a document action (read, explain, summarize, print, save, edit, download, translate, describe, "tell me about", "what's this about") where CONVERSATION HISTORY does not supply a competing referent — set:
     * "file"   — when the block has a File: path and the referent is that document
     * "url"    — when the block has a URL: (or app is a browser) and the referent is that page/site
@@ -340,8 +341,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // session is busy. Surface them under an explicit label so followUpTarget
     // resolution for older-session referents still works.
     const semanticCtx = (conversationHistory || [])
-      .filter(m => (m.source === 'semantic' || m.source === 'semantic-result') && m.content && m.content.trim())
-      .slice(-4)
+      .filter(m => (m.source === 'semantic' || m.source === 'semantic-result' || m.source === 'prior-session') && m.content && m.content.trim())
+      .slice(-8)
       .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 300)}`)
       .join('\n');
 

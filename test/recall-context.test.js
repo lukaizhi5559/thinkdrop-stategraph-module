@@ -671,6 +671,86 @@ describe('searchTaskJournal — keyword search over the queue journal', () => {
   });
 });
 
+// ─── resolveReferencesV2 — prior-session fallback for empty sessions ─────────
+// Regression: "how many unread" 2 min after a Gmail task was routed into a
+// brand-new empty session (sessionRouter age-rotated the just-reactivated
+// session). With 0 recent messages, only stale cross-session semantic hits
+// remained and classifyTask resolved followUpTarget to an unrelated file path.
+// Fix: when the routed session is empty, pull the most recent other session's
+// tail as source:'prior-session' context.
+
+describe('resolveReferencesV2 — prior-session fallback for empty sessions', () => {
+  const BASE_CLASSIFY_JSON = JSON.stringify({
+    taskType: 'query', isFollowUp: true, followUpTarget: 'gmail emails',
+    needsClarification: false, targetService: 'gmail', isRecurring: false,
+    isBrowseOnly: false, requiresDOM: false, isScreenFollowUp: false,
+    needsFreshScreen: false, isAppUiInspection: false, isSpatialAnalysis: false,
+    isImageAnalysis: false, isConversationRecall: false, isActivityQuery: false,
+    webAccessMode: 'none', interactiveActions: [], expectsFileOutput: false,
+    activeDocRef: null, activeDocTarget: null,
+  });
+
+  it('empty routed session pulls the previous session tail as prior-session context', async () => {
+    const calls = [];
+    const mcpAdapter = {
+      callService: async (svc, action, payload) => {
+        calls.push({ svc, action, payload });
+        if (action === 'message.list') {
+          if (payload.sessionId === 'sess-new') return { messages: [] };
+          if (payload.sessionId === 'sess-gmail') return {
+            messages: [
+              { id: 'g2', sender: 'assistant', text: 'Found 3 emails from Pastor Wendal', timestamp: '2026-09-24T03:31:00Z' },
+              { id: 'g1', sender: 'user', text: 'check if any no emails from pastor wendal has been sent to my gmail account', timestamp: '2026-09-24T03:29:23Z' },
+            ],
+          };
+          return { messages: [] };
+        }
+        if (action === 'message.search') return { messages: [] };
+        if (action === 'session.list') return {
+          sessions: [{ id: 'sess-new' }, { id: 'sess-gmail' }],
+        };
+        return {};
+      },
+    };
+    const llmBackend = { generateAnswer: async () => BASE_CLASSIFY_JSON };
+    const out = await resolveReferencesV2({
+      message: 'how many unread',
+      mcpAdapter,
+      llmBackend,
+      context: { sessionId: 'sess-new' },
+      logger: _noopLogger,
+    });
+    const prior = (out.conversationHistory || []).filter(m => m.source === 'prior-session');
+    assert(prior.length === 2, `expected 2 prior-session messages, got ${prior.length}`);
+    assert(prior.some(m => /pastor wendal/i.test(m.content)), 'prior-session msgs must include the gmail turn');
+    assert((out.semanticHistory || []).some(m => m.source === 'prior-session'),
+      'semanticHistory should expose prior-session msgs');
+  });
+
+  it('non-empty session does NOT pull prior-session context', async () => {
+    const mcpAdapter = {
+      callService: async (svc, action, payload) => {
+        if (action === 'message.list') return {
+          messages: [{ id: 'r1', sender: 'user', text: 'earlier same-session turn', timestamp: '2026-09-24T03:30:00Z' }],
+        };
+        if (action === 'message.search') return { messages: [] };
+        if (action === 'session.list') throw new Error('session.list must not be called when recent exists');
+        return {};
+      },
+    };
+    const llmBackend = { generateAnswer: async () => BASE_CLASSIFY_JSON };
+    const out = await resolveReferencesV2({
+      message: 'how many unread',
+      mcpAdapter,
+      llmBackend,
+      context: { sessionId: 'sess-has-history' },
+      logger: _noopLogger,
+    });
+    assert(!(out.conversationHistory || []).some(m => m.source === 'prior-session'),
+      'prior-session fallback must not fire when recent history exists');
+  });
+});
+
 // ─── Summary ─────────────────────────────────────────────────────────────────
 
 (async () => {

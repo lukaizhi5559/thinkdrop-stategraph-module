@@ -65,7 +65,7 @@ When a step targeted the user's open document or page (resolved from ACTIVE SCRE
 4. Still failing → ASK_USER (likely no printer configured)
 
 **edit.agent failures — map the `reason` field:**
-- `binary_file` → REPLAN_STEP to the format-appropriate path (openpyxl/python-docx/textutil recipe, or `app.agent run_agent` for in-app editing)
+- `binary_file` → REPLAN_STEP: if the goal was to READ/summarize the file → `doc.read { path }` (pdf/docx/xlsx/pptx/doc/rtf/odt) or `media.transcribe { path }` (audio/video); if to EDIT → `app.agent run_agent` for in-app editing
 - `file_too_large` → REPLAN_STEP to a targeted `shell.run` edit (sed/python3 on the specific region) — do NOT retry edit.agent on the same file
 - `file_missing` → REPLAN: re-resolve the path via `mdfind` or check ACTIVE SCREEN CONTEXT for a fresher `File:` — never guess
 - `mtime_conflict` → AUTO_PATCH/REPLAN_STEP: re-run the same edit.agent step (it re-reads the file fresh); if it recurs, the host app is auto-saving — switch to `app.agent run_agent` in-app edit
@@ -77,6 +77,13 @@ When a step targeted the user's open document or page (resolved from ACTIVE SCRE
 - `no_draft` / `ext_mismatch` (apply mode) → REPLAN: re-resolve the draftPath from the prior draft step's output; converted .doc→.docx drafts cannot be applied — tell the user to save manually
 - `file_open` (apply mode) → ASK_USER: the file is still open in the named app (`openIn` field) — tell the user to close it there (Don't Save if they kept the old version) and ask to apply again. Do NOT retry apply while it is open
 - `write_failed` → Category E handling (permissions) → ASK_USER
+
+**doc.read / media.transcribe failures:**
+- `missing_dep` → the dep manifest tried auto-install already — ASK_USER only if it failed (offer the exact command from the error); do NOT retry the same skill blindly
+- `unsupported` → the format has no built-in reader. **Escalate, don't dead-end**: local CLI that might handle it → `cli.agent { action:'build_agent', service }` then `run` (e.g. pandoc for epub, imagemagick for psd); no local tool fits → `tool.discover { action:'discover', task }` for external AI tools
+- `extract_failed` / `transcribe_failed` → REPLAN_STEP once (corrupt file or decoder issue); second failure → `cli.agent` tool route or ASK_USER
+
+**No built-in covers a file format** (any skill returns binary_file/unsupported, or the task needs a format nobody reads) → prefer the dynamic layer over raw `shell.run` guesswork: `cli.agent { action:'build_agent', service:'<tool>' }` → `run` when a known CLI exists; `tool.discover { action:'discover', task }` when none does.
 
 ## Common Failure Patterns
 
