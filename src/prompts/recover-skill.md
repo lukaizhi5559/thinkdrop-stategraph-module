@@ -70,6 +70,12 @@ When a step targeted the user's open document or page (resolved from ACTIVE SCRE
 - `file_missing` → REPLAN: re-resolve the path via `mdfind` or check ACTIVE SCREEN CONTEXT for a fresher `File:` — never guess
 - `mtime_conflict` → AUTO_PATCH/REPLAN_STEP: re-run the same edit.agent step (it re-reads the file fresh); if it recurs, the host app is auto-saving — switch to `app.agent run_agent` in-app edit
 - `suspicious_output` / `llm_failed` → REPLAN_STEP once with a narrower goal; second failure → `app.agent run_agent` or ASK_USER
+- `region_not_found` → REPLAN_STEP with a goal that quotes the exact target text; second failure → ASK_USER which section to edit
+- `ambiguous_region` → REPLAN_STEP with a more specific anchor (quote more surrounding text); second failure → ASK_USER
+- `missing_dep` → ASK_USER: "python-docx/openpyxl is required and auto-install failed — install it manually?" (offer `pip3 install --user python-docx openpyxl`)
+- `office_ops_failed` → REPLAN_STEP once; second failure → `app.agent run_agent` in-app edit or ASK_USER
+- `no_draft` / `ext_mismatch` (apply mode) → REPLAN: re-resolve the draftPath from the prior draft step's output; converted .doc→.docx drafts cannot be applied — tell the user to save manually
+- `file_open` (apply mode) → ASK_USER: the file is still open in the named app (`openIn` field) — tell the user to close it there (Don't Save if they kept the old version) and ask to apply again. Do NOT retry apply while it is open
 - `write_failed` → Category E handling (permissions) → ASK_USER
 
 ## Common Failure Patterns

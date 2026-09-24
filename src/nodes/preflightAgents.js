@@ -512,7 +512,8 @@ module.exports = async function preflightAgents(state) {
   // context, not just a vague follow-up like "I need you to check again".
   // gatherPlanContext does the same injection later, but preflight runs BEFORE it.
   const _tc = state._taskClassification || {};
-  if (_tc.isFollowUp && _tc.followUpTarget && !_tc.isScreenFollowUp) {
+  const _isIsoSession = String(state.context?.sessionId || state.resolvedSessionId || '').startsWith('iso_');
+  if (!_isIsoSession && _tc.isFollowUp && _tc.followUpTarget && !_tc.isScreenFollowUp) {
     userMessage = `${userMessage}\n\n(Context from prior turn: ${_tc.followUpTarget})`;
     logger.info(`[Node:PreflightAgents] Follow-up target injected: "${_tc.followUpTarget}"`);
   }

@@ -136,7 +136,9 @@ async function _askLLMDecision(llmBackend, userMsg, originalMsg, priorQA, conver
     : '\n\nUNAUTHENTICATED AGENTS: none — all required services are authenticated or do not require auth.';
 
   const tc = resolvedSelfContext?._taskClassification || {};
-  const followUpTarget = tc.isFollowUp && !tc.isScreenFollowUp ? tc.followUpTarget : null;
+  // iso_* sessions are context-isolated — no prior-turn injection.
+  const _isIsoSession = resolvedSelfContext?._isIsoSession === true;
+  const followUpTarget = !_isIsoSession && tc.isFollowUp && !tc.isScreenFollowUp ? tc.followUpTarget : null;
   const followUpBlock = followUpTarget
     ? `\n\n(Context from prior turn: ${followUpTarget})`
     : '';
@@ -225,7 +227,8 @@ async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHi
   logger.info(`[Node:GatherPlanContext] preflightResult.agents=${JSON.stringify(preflightResult?.agents?.map(a => ({ agentId: a.agentId, type: a.type, authed: a.authed })) || [])} | unauthedAgents=${JSON.stringify(unauthedAgents)}`);
 
   const tc = resolvedSelfContext?._taskClassification || {};
-  const followUpTarget = tc.isFollowUp && !tc.isScreenFollowUp ? tc.followUpTarget : null;
+  const _isIsoSession = resolvedSelfContext?._isIsoSession === true;
+  const followUpTarget = !_isIsoSession && tc.isFollowUp && !tc.isScreenFollowUp ? tc.followUpTarget : null;
   const followUpBlock = followUpTarget
     ? `\n\n(Context from prior turn: ${followUpTarget})`
     : '';
@@ -288,6 +291,12 @@ module.exports = async function gatherPlanContext(state) {
   if (!llmBackend) {
     logger.warn('[Node:GatherPlanContext] No llmBackend — skipping');
     return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  }
+
+  // iso_* sessions are context-isolated ([Context:] chip) — flag it so the
+  // Q&A helpers suppress prior-turn/history injection.
+  if (String(state.context?.sessionId || '').startsWith('iso_') && state.resolvedSelfContext) {
+    state.resolvedSelfContext._isIsoSession = true;
   }
 
   // ── Delivery-channel question for scheduling tasks ──────────────────────────
@@ -393,8 +402,11 @@ module.exports = async function gatherPlanContext(state) {
 
   // ── Inject follow-up target into resolvedMessage for downstream nodes ────────
   const tc = state._taskClassification || {};
+  // iso_* sessions are context-isolated — no prior-turn injection.
+  const _isIsoSession = String(state.context?.sessionId || state.resolvedSessionId || '').startsWith('iso_')
+    || state.resolvedSelfContext?._isIsoSession === true;
   let baseMsg = resolvedMessage || message || '';
-  if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp &&
+  if (!_isIsoSession && tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp &&
       !baseMsg.includes('(Context from prior turn:')) {
     baseMsg = `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
     logger.info(`[Node:GatherPlanContext] Follow-up target injected: "${tc.followUpTarget}"`);
@@ -817,8 +829,11 @@ async function _runGrillLoop(state, logger) {
   const userId = state.context?.userId || 'local_user';
 
   const tc = state._taskClassification || {};
+  // iso_* sessions are context-isolated — no prior-turn injection.
+  const _isIsoSession = String(state.context?.sessionId || state.resolvedSessionId || '').startsWith('iso_')
+    || state.resolvedSelfContext?._isIsoSession === true;
   let baseMsg = resolvedMessage || message || '';
-  if (tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp &&
+  if (!_isIsoSession && tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp &&
       !baseMsg.includes('(Context from prior turn:')) {
     baseMsg = `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
   }

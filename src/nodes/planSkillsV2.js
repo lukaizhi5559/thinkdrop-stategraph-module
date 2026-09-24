@@ -18,7 +18,7 @@ const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
 
-const { parsePlan, buildStepDescription, serializeSkillPlanToMd } = require('../utils/planHelpers');
+const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan } = require('../utils/planHelpers');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
@@ -2648,6 +2648,17 @@ The user's request does NOT match any installed skill.
 
     if (_replacedCount > 0) {
       logger.warn(`[Node:PlanSkillsV2] api_suggest guard: replaced ${_replacedCount} deprecated api_suggest step(s) with mandated agent or build_agent`);
+    }
+  }
+
+  // ── File-edit lint — enforce the "no synthesize saveToFile over an existing
+  // file" rule the LLM keeps ignoring: rewrite those steps to edit.agent and
+  // drop trailing confirm-only synthesize steps that confabulate write status.
+  if (Array.isArray(skillPlan)) {
+    const _linted = lintFileEditPlan(skillPlan, logger);
+    if (_linted.rewrites.length > 0) {
+      logger.warn(`[Node:PlanSkillsV2] File-edit lint applied ${_linted.rewrites.length} fix(es)`);
+      skillPlan = _linted.plan;
     }
   }
 

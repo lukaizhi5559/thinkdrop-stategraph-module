@@ -1307,7 +1307,7 @@ function loadSmartFillPrompt() {
 const SMART_FILL_SYSTEM_PROMPT = loadSmartFillPrompt() || 'You are a DOM field mapper. Output only valid JSON mapping role names to CSS selectors. No explanation.';
 
 module.exports = async function executeCommand(state) {
-  const {
+  let {
     mcpAdapter,
     skillPlan,
     skillCursor = 0,
@@ -1348,6 +1348,16 @@ module.exports = async function executeCommand(state) {
       commandExecuted: false,
       answer: '[No skill plan found — ensure planSkills node runs before executeCommand]'
     };
+  }
+
+  // File-edit lint backstop — plans that bypassed planSkillsV2/planExecutor
+  // (recovery splices, cached plans) can still carry synthesize+saveToFile
+  // over an existing file. Fresh starts only — mid-plan rewrites would
+  // desync cursor and UI step indexes.
+  if (skillCursor === 0) {
+    const { lintFileEditPlan } = require('../utils/planHelpers');
+    const _linted = lintFileEditPlan(skillPlan, logger);
+    if (_linted.rewrites.length > 0) skillPlan = _linted.plan;
   }
 
   // Write live plan document on every pass so the UI / debugging tools can track progress
@@ -1435,7 +1445,13 @@ module.exports = async function executeCommand(state) {
       }
     }
 
-    if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults, savedFilePaths: [...new Set(savedFilePaths)], planFile: state._skillPlanFile || null });
+    // Collect draft results (edit.agent draft mode) so the feed can render an
+    // apply affordance — "Close <App> & Apply" when the target is held open.
+    const drafts = skillResults
+      .filter(r => r?.draftPath)
+      .map(r => ({ draftPath: r.draftPath, filePath: r.filePath || r.args?.filePath || null, openIn: r.openIn || [], diff: r.diff || null }));
+
+    if (progressCallback) progressCallback({ type: 'all_done', completedCount, totalCount: skillPlan.length, skillResults, savedFilePaths: [...new Set(savedFilePaths)], drafts, planFile: state._skillPlanFile || null });
 
     // ── Composite agent synthesis (Part 3) — DISABLED ────────────────────────
     // Composite skill generation has been disabled. Skills are now created via
@@ -1581,7 +1597,9 @@ module.exports = async function executeCommand(state) {
     const _prevResultStr = typeof _prev?.result === 'object' && _prev?.result !== null
       ? JSON.stringify(_prev.result)
       : (_prev?.result || '');
-    const prevStdout = (_prev?.stdout || _prevResultStr || '').slice(0, 12000);
+    // fs.read returns content in .content (also .tree/.text on some skills) —
+    // without these fallbacks {{PREV_OUTPUT}} stays literal and reaches the LLM.
+    const prevStdout = (_prev?.stdout || _prevResultStr || _prev?.content || _prev?.text || _prev?.tree || '').slice(0, 12000);
     if (prevStdout) {
       // Case-insensitive: match {{PREV_OUTPUT}} and {{prev_stdout}} (planner sometimes emits lowercase)
       const injectPrev = (val) => typeof val === 'string'
@@ -1605,6 +1623,25 @@ module.exports = async function executeCommand(state) {
         args = { ...fileArgs, _prevOutputFile: _tmpFile };
       } catch (_) {}
     }
+
+  }
+
+  // ── Unresolved-marker guard ─────────────────────────────────────────────
+  // A literal {{PREV_OUTPUT}}/{{prev_stdout}} must never reach the LLM (it
+  // answers "no text was provided" and that text can land in saveToFile over a
+  // real file). Fail the step so recoverSkill replans instead.
+  const _leftoverMarker = Object.values(args).find(v => typeof v === 'string' && /\{\{(PREV_OUTPUT|prev_stdout)\}\}/i.test(v));
+  if (_leftoverMarker) {
+    const _prevSkill = skillResults[skillResults.length - 1]?.skill || 'none';
+    const _mErr = `Step references {{PREV_OUTPUT}} but there is no injectable output from a previous step (prev=${_prevSkill}) — replan with a concrete source`;
+    logger.warn(`[Node:ExecuteCommand] ${_mErr}`);
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: description || skill, stdout: _mErr, error: _mErr });
+    return {
+      ...state,
+      planError: _mErr,
+      failedStep: { step: skillCursor + 1, skill, description, error: _mErr, args: args || {} },
+      commandExecuted: false,
+    };
   }
 
   // ── {{CONTRACT[]}} template injection ───────────────────────────────────────
@@ -3409,10 +3446,12 @@ module.exports = async function executeCommand(state) {
       : '';
     let synthesisFilePath = args.saveToFile || null;
 
-    // If saveToFile contains {{prev_stdout}}, resolve it now using the previous step's stdout
+    // If saveToFile contains {{prev_stdout}}, resolve it now using the previous step's output
     if (synthesisFilePath && synthesisFilePath.includes('{{prev_stdout}}')) {
       const prevStep = skillResults[skillResults.length - 1];
-      const prevStdout = prevStep?.stdout?.trim() || '';
+      const _prevResStr = typeof prevStep?.result === 'object' && prevStep?.result !== null
+        ? JSON.stringify(prevStep.result) : (prevStep?.result || '');
+      const prevStdout = (prevStep?.stdout || _prevResStr || prevStep?.content || prevStep?.text || '').trim();
       synthesisFilePath = synthesisFilePath.replace(/\{\{prev_stdout\}\}/g, prevStdout);
       logger.debug(`[Node:ExecuteCommand] synthesize: resolved saveToFile via {{prev_stdout}}: ${synthesisFilePath}`);
     }
@@ -3871,6 +3910,7 @@ Please try again or search with different terms.`;
     const fs = require('fs');
     const path = require('path');
 
+    let _openInApp = [];
     // Write to explicit saveToFile if requested
     if (synthesisFilePath && synthesisAnswer && !synthesisAnswer.startsWith('[')) {
       try {
@@ -3879,6 +3919,20 @@ Please try again or search with different terms.`;
         if (!fs.existsSync(parentDir)) {
           fs.mkdirSync(parentDir, { recursive: true });
           logger.debug(`[Node:ExecuteCommand] synthesize: created directory ${parentDir}`);
+        }
+        // Backup-before-overwrite — saveToFile must never silently destroy an
+        // existing file (a broken synthesis once overwrote the user's source
+        // document with an error message). Same convention as edit.agent.
+        if (fs.existsSync(synthesisFilePath)) {
+          try {
+            const _bakDir = path.join(os.homedir(), '.thinkdrop', 'edits', 'backups');
+            fs.mkdirSync(_bakDir, { recursive: true });
+            const _bakPath = path.join(_bakDir, `${path.basename(synthesisFilePath)}-${Date.now()}.bak`);
+            fs.copyFileSync(synthesisFilePath, _bakPath);
+            logger.info(`[Node:ExecuteCommand] synthesize: backed up existing file → ${_bakPath}`);
+          } catch (_bakErr) {
+            logger.warn(`[Node:ExecuteCommand] synthesize: pre-write backup failed (continuing): ${_bakErr.message}`);
+          }
         }
         // Strip internal === Shell output (...) === markers that executeCommand injects for LLM context
         // but must never appear in saved files (e.g. skill.md contracts, text files, etc.)
@@ -4095,6 +4149,18 @@ Please try again or search with different terms.`;
           fs.writeFileSync(synthesisFilePath, cleanedAnswer, 'utf8');
         }
         logger.debug(`[Node:ExecuteCommand] synthesize: saved to ${synthesisFilePath}`);
+        // If another app holds the file open, its next save stomps this write —
+        // record the holder so the step result (and any downstream step) can
+        // report the real state instead of confabulating.
+        try {
+          const { spawnSync: _lsofSpawn } = require('child_process');
+          const _h = _lsofSpawn('lsof', ['-F', 'c', '--', synthesisFilePath], { timeout: 5000, encoding: 'utf8' });
+          if (_h.status === 0 && _h.stdout) {
+            _openInApp = [...new Set(String(_h.stdout).split('\n')
+              .filter(l => l.length > 1 && l[0] === 'c')
+              .map(l => l.slice(1).trim()).filter(Boolean))];
+          }
+        } catch (_) {}
       } catch (writeErr) {
         logger.warn(`[Node:ExecuteCommand] synthesize: could not write file: ${writeErr.message}`);
       }
@@ -4111,7 +4177,10 @@ Please try again or search with different terms.`;
     }
 
     // Emit step_done with the actual answer as stdout (and savedFilePath if written)
-    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'synthesize', description: description || 'Comparing results...', stdout: synthesisAnswer, savedFilePath: synthesisFilePath || null });
+    const _openNote = _openInApp.length
+      ? `\n\nNote: ${require('path').basename(synthesisFilePath)} is open in ${_openInApp.join(', ')} — that app may show the old version. Reopen the file there; saving from it would overwrite this change.`
+      : '';
+    if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'synthesize', description: description || 'Comparing results...', stdout: synthesisAnswer + _openNote, savedFilePath: synthesisFilePath || null, openIn: _openInApp.length ? _openInApp : null });
 
     // Accumulate explicit saveToFile paths across multiple synthesize steps
     const prevSavedFiles = state.savedFilePaths || [];
@@ -4123,13 +4192,13 @@ Please try again or search with different terms.`;
 
     // Emit all_done if synthesize is the last step — otherwise the UI spinner never dismisses
     if (isSynthesizeLastStep && progressCallback) {
-      const _synthUpdatedResults = [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: synthesisAnswer, stdout: synthesisAnswer }];
+      const _synthUpdatedResults = [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: synthesisAnswer, stdout: synthesisAnswer, openIn: _openInApp.length ? _openInApp : null }];
       progressCallback({ type: 'all_done', completedCount: skillCursor + 1, totalCount: skillPlan.length, skillResults: _synthUpdatedResults, savedFilePaths: newSavedFiles, planFile: state._skillPlanFile || null });
     }
 
     return {
       ...state,
-      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: synthesisAnswer, stdout: synthesisAnswer }],
+      skillResults: [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: synthesisAnswer, stdout: synthesisAnswer, openIn: _openInApp.length ? _openInApp : null }],
       skillCursor: skillCursor + 1,
       failedStep: null,
       synthesisAnswer,          // available as {{synthesisAnswer}} in subsequent step args
@@ -5213,6 +5282,10 @@ Please try again or search with different terms.`;
               description: gs.description,
               stdout: raw?.stdout ?? null,
               runGroup: groupId,
+              draftPath: raw?.draftPath ?? null,
+              filePath: raw?.filePath ?? null,
+              openIn: raw?.openIn ?? null,
+              diff: raw?.diff ?? null,
             });
           }
           return {
@@ -5221,6 +5294,10 @@ Please try again or search with different terms.`;
             ok: raw?.ok === true,
             result: raw?.result ?? raw?.stdout ?? null,
             stdout: raw?.stdout ?? null,
+            draftPath: raw?.draftPath ?? null,
+            filePath: raw?.filePath ?? null,
+            openIn: raw?.openIn ?? null,
+            diff: raw?.diff ?? null,
             error: raw?.error ?? null,
             stderr: raw?.stderr ?? null,
             exitCode: raw?.exitCode ?? null,
@@ -6264,6 +6341,10 @@ Please try again or search with different terms.`;
       filePath: raw.filePath ?? null,
       backupPath: raw.backupPath ?? null,
       appliedEdits: raw.appliedEdits ?? null,
+      draftPath: raw.draftPath ?? null,
+      openIn: raw.openIn ?? null,
+      closedIn: raw.closedIn ?? null,
+      diff: raw.diff ?? null,
       toolName: raw.toolName || null,
       stderrHint: raw.stderrHint || null,
       userAllowlistHint: !!raw.userAllowlistHint,
@@ -7043,7 +7124,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         ? (stepResult.skillName || resolvedArgs.name || 'external.skill')
         : null;
       const stepDoneDescription = description || (resolvedSkillName ? `external.skill — ${resolvedSkillName}` : skill);
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepDoneDescription, stdout: stepResult.stdout || stepResult.output, exitCode: stepResult.exitCode });
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepDoneDescription, stdout: stepResult.stdout || stepResult.output, exitCode: stepResult.exitCode, draftPath: stepResult.draftPath || null, filePath: stepResult.filePath || null, openIn: stepResult.openIn || null, diff: stepResult.diff || null });
 
       // ── Auth wall detected by waitForStableText or navigate ─────────────────
       // When waitForStableText (or navigate cold-start) returns authRequired:true

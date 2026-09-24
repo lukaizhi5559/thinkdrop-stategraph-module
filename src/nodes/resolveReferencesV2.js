@@ -183,6 +183,10 @@ module.exports = async function resolveReferencesV2(state) {
   let semanticHistory = [];
   try {
     let sessionId = context?.sessionId;
+    // Isolated-context sessions (iso_* from a [Context:] chip) must not pull
+    // any conversation history — isolation is the whole point. The semantic
+    // search below queries ALL sessions, so it would leak prior context in.
+    const _isIsolatedSession = String(sessionId || '').startsWith('iso_');
 
     if (!sessionId) {
       try {
@@ -202,7 +206,11 @@ module.exports = async function resolveReferencesV2(state) {
       logger.info(`[Node:ResolveReferencesV2] Using pre-resolved sessionId from context: ${sessionId}`);
     }
 
-    if (sessionId) {
+    if (sessionId && _isIsolatedSession) {
+      logger.info(`[Node:ResolveReferencesV2] Isolated session ${sessionId} — skipping conversation history + semantic search`);
+    }
+
+    if (sessionId && !_isIsolatedSession) {
       // Fetch in parallel: recent window (handles coreferences like "that"/"it")
       // + cross-session semantic matches (finds older relevant messages buried
       // under recent unrelated ones, including from rotated sessions).

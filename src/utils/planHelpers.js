@@ -10,6 +10,9 @@
  */
 
 const { jsonrepair } = require('jsonrepair');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 /**
  * Serialize a JSON skill plan to a human-readable .md file.
@@ -154,6 +157,30 @@ function parsePlan(raw, logger) {
  */
 function _validateStepSchema(steps, logger) {
   if (!Array.isArray(steps)) return steps;
+
+  // ── Structural normalization ─────────────────────────────────────────────
+  // The planner sometimes wraps steps oddly: `[{},[{s},{s}]]` (empty object +
+  // nested array), or sprinkles non-object entries. Flatten one level of
+  // nested arrays and drop anything that isn't a step-shaped object — a step
+  // without a string `skill` would dispatch as "undefined" downstream.
+  const flat = steps.flat(Infinity);
+  const kept = [];
+  for (const s of flat) {
+    if (s && typeof s === 'object' && !Array.isArray(s) && typeof s.skill === 'string' && s.skill.length > 0) {
+      kept.push(s);
+    } else {
+      logger?.warn?.('[planHelpers:parsePlan] dropping non-step entry:', JSON.stringify(s)?.slice(0, 120));
+    }
+  }
+  if (kept.length === 0 && steps.length > 0) {
+    if (logger) logger.warn('[planHelpers:parsePlan] all entries were non-steps — rejecting plan');
+    return null;
+  }
+  if (kept.length !== steps.length) {
+    if (logger) logger.info(`[planHelpers:parsePlan] normalized plan: ${steps.length} → ${kept.length} step(s)`);
+  }
+  steps = kept;
+
   for (const step of steps) {
     if (step?.skill === 'shell.run' && step.args) {
       const hasGoal = typeof step.args.goal === 'string' && step.args.goal.length > 0;
@@ -167,4 +194,69 @@ function _validateStepSchema(steps, logger) {
   return steps;
 }
 
-module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan };
+/**
+ * Deterministic plan lint for file edits.
+ *
+ * The prompt tells the planner "NEVER modify an existing file via synthesize
+ * saveToFile — use edit.agent" — but it still emits read → synthesize →
+ * saveToFile-over-existing recipes. Same lesson as the web-mode backstop in
+ * planSkillsV2: soft guidance needs a deterministic rewrite.
+ *
+ *   - synthesize + saveToFile pointing at an EXISTING file → edit.agent step
+ *     (goal = prompt minus {{…}} markers; filePath = resolved target)
+ *   - skipped: paths under ~/.thinkdrop/ (skill.md contracts + drafts are
+ *     system artifacts that legitimately overwrite), unresolved {{…}} targets
+ *   - a TRAILING pure-confirm synthesize ("Confirm the file was saved…") is
+ *     dropped — it can't inspect the file and confabulates failure reports
+ *
+ * Returns { plan, rewrites } — rewrites is a log-friendly list of what changed.
+ */
+const _CONFIRM_ONLY_RE = /^\s*(?:please\s+)?(?:confirm|verify|check|double-check)\b[\s\S]{0,200}?\b(?:saved|written|created|applied|corrected|updated|exists)\b/i;
+
+function _expandHomeDir(p) {
+  return p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p;
+}
+
+function _lintFileEditPlan(plan, logger) {
+  if (!Array.isArray(plan)) return { plan, rewrites: [] };
+  const rewrites = [];
+  const thinkdropDir = path.join(os.homedir(), '.thinkdrop') + path.sep;
+
+  let steps = plan.map((step, i) => {
+    if (step?.skill !== 'synthesize') return step;
+    const target = step.args?.saveToFile;
+    if (typeof target !== 'string' || !target.trim()) return step;
+    if (/\{\{[^}]*\}\}/.test(target)) return step;
+    const abs = _expandHomeDir(target.trim());
+    if (abs.startsWith(thinkdropDir)) return step;
+    let exists = false;
+    try { exists = fs.existsSync(abs); } catch (_) {}
+    if (!exists) return step;
+    const goal = String(step.args.prompt || '')
+      .replace(/\{\{[^}]*\}\}/g, '')
+      .replace(/\s+/g, ' ')
+      .trim() || step.description || `Edit ${path.basename(abs)}`;
+    rewrites.push({ index: i, kind: 'synthesize→edit.agent', filePath: abs });
+    return {
+      ...step,
+      skill: 'edit.agent',
+      args: { goal, filePath: abs },
+      description: step.description || `Edit ${path.basename(abs)}`,
+    };
+  });
+
+  const last = steps[steps.length - 1];
+  if (steps.length > 1 && last?.skill === 'synthesize' && !last.args?.saveToFile
+      && String(last.args?.prompt || '').length < 400
+      && _CONFIRM_ONLY_RE.test(String(last.args.prompt))) {
+    rewrites.push({ index: steps.length - 1, kind: 'drop-confirm-step' });
+    steps = steps.slice(0, -1);
+  }
+
+  if (rewrites.length && logger) {
+    logger.info(`[planHelpers:lintFileEditPlan] ${rewrites.length} fix(es): ${rewrites.map(r => `${r.kind}@${r.index}`).join(', ')}`);
+  }
+  return { plan: steps, rewrites };
+}
+
+module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan };

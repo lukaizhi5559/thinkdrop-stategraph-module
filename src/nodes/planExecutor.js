@@ -13,6 +13,7 @@ const fs   = require('fs');
 const path = require('path');
 
 const planScanner = require('../utils/planScanner');
+const { lintFileEditPlan } = require('../utils/planHelpers');
 const {
   extractPlanContext,
   getCurrentBrowserContext,
@@ -83,7 +84,7 @@ module.exports = async function planExecutor(state) {
     keytarGet = (service, key) => keytar.getPassword(service, key);
   } catch (_) {}
 
-  const skillPlan = [];
+  let skillPlan = [];
   for (const step of pendingSteps) {
     const originalEntry = originalSkillPlan ? originalSkillPlan[step.num - 1] : null;
 
@@ -153,6 +154,11 @@ module.exports = async function planExecutor(state) {
       logger.warn('[Node:PlanExecutor] No gatherAnswerCallback available — cannot ask for filename');
     }
   }
+
+  // Approved/resumed plans skip planSkillsV2's post-parse lint — apply the
+  // same file-edit enforcement here so pre-fix saved plans can't still
+  // overwrite user files via synthesize saveToFile.
+  skillPlan = lintFileEditPlan(skillPlan, logger).plan;
 
   logger.info(`[Node:PlanExecutor] Built skillPlan[${skillPlan.length}] — handing to planSkills → executeCommand`);
 

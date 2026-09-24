@@ -50,8 +50,8 @@ Canonical: `scripts/print-page.sh` — three-tier render with bot-wall guard bui
 | Read .doc/.rtf/.pages text | `textutil -convert txt -stdout '<file>'` |
 | Read .docx text | `python3 -c "import docx; d=docx.Document('<file>'); print('\\n'.join(p.text for p in d.paragraphs))"` or `textutil -convert txt -stdout` |
 | Read .xlsx cells | `python3 -c "import openpyxl; wb=openpyxl.load_workbook('<file>'); ws=wb.active; [print(r) for r in ws.iter_rows(values_only=True)]"` |
-| Edit .xlsx cell formats/values | `python3 -c "import openpyxl; wb=openpyxl.load_workbook('<file>'); ws=wb.active; ws['A1'].number_format='0.00'; ws['A4'].number_format='\"$\"#,##0.00'; wb.save('<file>')"` |
-| Edit .docx text (find/replace) | `python3 -c` with python-docx — iterate `doc.paragraphs`, edit `run.text`, `doc.save('<out>')` — **write to a copy** (`~/.thinkdrop/edits/drafts/`), never rewrite the original blindly |
+| Edit .xlsx cell formats/values | `edit.agent { goal, filePath }` — structured openpyxl ops to a draft copy (supersedes inline python recipes) |
+| Edit .docx text (find/replace) | `edit.agent { goal, filePath }` — structured python-docx ops to a draft copy in `~/.thinkdrop/edits/drafts/`, never the original |
 | Print .docx/.xlsx/.pages | Convert first: `textutil -convert txt -stdout '<file>' | lp` (layout not preserved — warn in synthesize) or open the app and `run_app_flow` Cmd+P |
 
 For semantic Office edits ("check spelling", "rewrite this section"), produce a corrected **copy** at `~/.thinkdrop/edits/drafts/<name>-<timestamp>.<ext>` and report the draft path — never edit binary originals in place.
