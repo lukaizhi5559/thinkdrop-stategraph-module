@@ -172,7 +172,7 @@ describe('webSearch — video listing query hint + limit', () => {
     });
     const q = adapter.calls[0].args.query;
     assert(/\bvideos\b/i.test(q), `query should contain "videos" — got "${q}"`);
-    assertEq(adapter.calls[0].args.limit, 8);
+    assertEq(adapter.calls[0].args.maxResults, 8);
   });
 
   it('does not append "videos" when the query already has a video keyword', async () => {
@@ -186,10 +186,72 @@ describe('webSearch — video listing query hint + limit', () => {
     });
     const q = adapter.calls[0].args.query;
     assert(!/videos videos/i.test(q), `query should not double the keyword — got "${q}"`);
-    assertEq(adapter.calls[0].args.limit, 8);
+    assertEq(adapter.calls[0].args.maxResults, 8);
   });
 
-  it('non-media queries keep limit=3 and no keyword injection', async () => {
+  it('forces provider=brave-video for video listings', async () => {
+    const adapter = _mkAdapter();
+    adapter.callService = async (svc, action, args) => {
+      adapter.calls.push({ svc, action, args });
+      return { data: { results: [{ url: 'https://youtube.com/watch?v=abc', title: 'v', type: 'video-result', metadata: { thumbnail: { src: 'https://i.ytimg.com/t.jpg' }, duration: '12:00', channel: 'ch' } }] } };
+    };
+    const r = await webSearch({
+      message: 'find videos from mike winger',
+      mcpAdapter: adapter,
+      logger: _noopLogger,
+      _mediaListing: 'video',
+      _taskClassification: { mediaListing: 'video' },
+    });
+    assertEq(adapter.calls[0].args.provider, 'brave-video');
+    assertEq(adapter.calls.length, 1, 'no fallback needed when results exist');
+    const doc = r.contextDocs[0];
+    assertEq(doc.mediaType, 'video');
+    assert(doc.imageUrl, 'video doc should carry thumbnail imageUrl');
+    assertEq(doc.duration, '12:00');
+    assertEq(doc.channel, 'ch');
+  });
+
+  it('retries with auto provider when brave-video returns empty', async () => {
+    const adapter = _mkAdapter();
+    let n = 0;
+    adapter.callService = async (svc, action, args) => {
+      adapter.calls.push({ svc, action, args });
+      n++;
+      return { data: { results: n === 1 ? [] : [{ url: 'https://x.com/v', title: 't' }] } };
+    };
+    await webSearch({
+      message: 'find videos about X',
+      mcpAdapter: adapter,
+      logger: _noopLogger,
+      _mediaListing: 'video',
+      _taskClassification: { mediaListing: 'video' },
+    });
+    assertEq(adapter.calls.length, 2, 'should retry with auto provider');
+    assertEq(adapter.calls[0].args.provider, 'brave-video');
+    assert(!adapter.calls[1].args.provider, 'retry must not force a provider');
+  });
+
+  it('retries with auto provider when brave-video call throws', async () => {
+    const adapter = _mkAdapter();
+    let n = 0;
+    adapter.callService = async (svc, action, args) => {
+      adapter.calls.push({ svc, action, args });
+      n++;
+      if (n === 1) throw new Error('Brave 429');
+      return { data: { results: [{ url: 'https://x.com/v', title: 't' }] } };
+    };
+    await webSearch({
+      message: 'find videos about X',
+      mcpAdapter: adapter,
+      logger: _noopLogger,
+      _mediaListing: 'video',
+      _taskClassification: { mediaListing: 'video' },
+    });
+    assertEq(adapter.calls.length, 2, 'throw on forced provider should retry auto');
+    assert(!adapter.calls[1].args.provider, 'retry must not force a provider');
+  });
+
+  it('non-media queries keep limit=3, no provider, no keyword injection', async () => {
     const adapter = _mkAdapter();
     await webSearch({
       message: 'what is the capital of france',
@@ -198,6 +260,7 @@ describe('webSearch — video listing query hint + limit', () => {
       _taskClassification: {},
     });
     assertEq(adapter.calls[0].args.limit, 3);
+    assert(!adapter.calls[0].args.provider, 'no provider forced for non-media');
     assert(!/videos/i.test(adapter.calls[0].args.query), 'no video keyword injected');
   });
 });

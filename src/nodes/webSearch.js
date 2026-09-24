@@ -65,27 +65,44 @@ module.exports = async function webSearch(state) {
     }
 
     // ── Media-listing hint (media-search guard in decomposePromptV2) ─────────
-    // Video-listing queries need the web-search service's VIDEO intent to fire
-    // (Brave Video Search → media cards). Ensure the query carries a video
-    // keyword — follow-up queries resolved via followUpTarget may lack one —
-    // and ask for more results since the user wants a list, not an answer.
+    // Video-listing queries need Brave VIDEO Search (thumbnails → media cards),
+    // but the service's own intent classifier often scores generic queries as
+    // 'web' — so force the provider explicitly. Ensure the query carries a
+    // video keyword — follow-up queries resolved via followUpTarget may lack
+    // one — and ask for more results since the user wants a list, not an answer.
     const _mediaListing = state._mediaListing || (state._taskClassification || {}).mediaListing || 'none';
-    let limit = 3;
-    if (_mediaListing === 'video') {
-      if (!/\b(videos?|tutorial|episode|sermon|clip)s?\b/i.test(query)) {
-        query = `${query} videos`;
-        logger.info(`[Node:WebSearch] mediaListing=video — appended video keyword: "${query}"`);
-      }
-      limit = 8;
+    const _provider = _mediaListing === 'video' ? 'brave-video'
+      : _mediaListing === 'image' ? 'brave-image'
+      : null;
+    if (_mediaListing === 'video' && !/\b(videos?|tutorial|episode|sermon|clip)s?\b/i.test(query)) {
+      query = `${query} videos`;
+      logger.info(`[Node:WebSearch] mediaListing=video — appended video keyword: "${query}"`);
     }
 
-    logger.debug(`[Node:WebSearch] Query: "${query}"`);
+    logger.debug(`[Node:WebSearch] Query: "${query}"${_provider ? ` provider=${_provider}` : ''}`);
 
-    // Call web-search service
-    const result = await mcpAdapter.callService('web-search', 'web.search', {
-      query: query,
-      limit
+    // Call web-search service. NOTE: the route reads `maxResults` (not `limit`).
+    // Forced-provider calls skip the service's fallback chain — on empty/failed
+    // results, retry once with auto provider before returning empty.
+    const _searchArgs = (provider) => ({
+      query,
+      limit: _mediaListing === 'video' ? 8 : 3,
+      ...(provider ? { provider } : {}),
+      ...(_mediaListing === 'video' ? { maxResults: 8 } : {}),
     });
+    let result = null;
+    try {
+      result = await mcpAdapter.callService('web-search', 'web.search', _searchArgs(_provider));
+    } catch (e) {
+      if (!_provider) throw e;
+      logger.warn(`[Node:WebSearch] ${_provider} call failed (${e.message}) — will retry with auto provider`);
+      result = null;
+    }
+    const _resultCount = (r) => ((r?.data || r)?.results || []).length;
+    if (_provider && _resultCount(result) === 0) {
+      logger.warn(`[Node:WebSearch] ${_provider} returned 0 results — retrying with auto provider`);
+      result = await mcpAdapter.callService('web-search', 'web.search', _searchArgs(null));
+    }
 
     // MCP protocol wraps response in 'data' field
     const searchData = result.data || result;
