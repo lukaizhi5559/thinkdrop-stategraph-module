@@ -219,7 +219,7 @@ function _decisionRoleLabel(m) {
     : 'Assistant (proactive card)';
 }
 
-async function _decomposeDecision(message, llmBackend, conversationHistory, logger) {
+async function _decomposeDecision(message, llmBackend, conversationHistory, logger, carriedHint = null) {
   const recentCtx = (conversationHistory || []).slice(-4)
     .map(m => `${_decisionRoleLabel(m)}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
@@ -269,7 +269,15 @@ EXAMPLES:
   "hello" → 6
   "post on Twitter and send an email" → 7`;
 
-  const userPrompt = `Message: "${message}"${contextBlock}\nIntent? (0–7)`;
+  // comms-graph's deterministic intentGuesser result travels with the handoff
+  // (state._carriedHint). It is a prior, not an override: the LLM still decides,
+  // but on parse failure / provider flake the hint beats the command_automate
+  // default — a wrong automation plan is the most expensive misroute there is.
+  const hintIdx = _SINGLE_STEP_INTENTS.indexOf(carriedHint);
+  const hintLine = hintIdx >= 0
+    ? `\nUpstream routing hint (deterministic comms-layer classifier): ${carriedHint} — use it unless the message clearly implies otherwise.`
+    : '';
+  const userPrompt = `Message: "${message}"${contextBlock}${hintLine}\nIntent? (0–7)`;
 
   try {
     const raw = await llmBackend.generateAnswer(userPrompt, {
@@ -277,12 +285,13 @@ EXAMPLES:
       context: { systemInstructions: systemPrompt },
     }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
     const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    const result = (num >= 0 && num <= 7) ? num : 0;
-    logger.info(`[Node:DecomposePromptV2] _decomposeDecision: intent=${result} (${result < 7 ? _SINGLE_STEP_INTENTS[result] : 'MULTI_STEP'}) (raw="${(raw || '').trim()}")`);
+    const result = (num >= 0 && num <= 7) ? num : (hintIdx >= 0 ? hintIdx : 0);
+    logger.info(`[Node:DecomposePromptV2] _decomposeDecision: intent=${result} (${result < 7 ? _SINGLE_STEP_INTENTS[result] : 'MULTI_STEP'}) (raw="${(raw || '').trim()}" hint=${carriedHint || 'none'})`);
     return result;
   } catch (e) {
-    logger.warn(`[Node:DecomposePromptV2] _decomposeDecision failed: ${e.message} — defaulting to 0 (command_automate)`);
-    return 0;
+    const fallback = hintIdx >= 0 ? hintIdx : 0;
+    logger.warn(`[Node:DecomposePromptV2] _decomposeDecision failed: ${e.message} — defaulting to ${fallback} (${_SINGLE_STEP_INTENTS[fallback]})`);
+    return fallback;
   }
 }
 
@@ -399,6 +408,7 @@ module.exports = async function decomposePromptV2(state) {
   // for obvious single-step tasks. Falls through to the LLM fast decision when
   // the task type is ambiguous or the message shows multi-goal conjunctions.
   const _tc = state._taskClassification || {};
+  const _carriedHint = typeof state._carriedHint === 'string' ? state._carriedHint : null;
   const _msgLower = String(message || '').toLowerCase();
   const _MULTI_GOAL_CONJUNCTIONS = /\b(and\s+then|also|after\s+that|additionally|plus|furthermore|then\s+also)\b|;\s*[a-z]/i;
   const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower);
@@ -420,7 +430,7 @@ module.exports = async function decomposePromptV2(state) {
     }];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'declined-ack-guard', intent: 'general_knowledge',
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'general_knowledge', dependsOn: [], isLongRunning: false, dataTemplate: null }],
@@ -479,7 +489,7 @@ module.exports = async function decomposePromptV2(state) {
       : [displayStep];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'screen-output-guard', intent: 'screen_display',
       subPromptCount: subPrompts.length, durationMs,
       subPrompts: subPrompts.map(s => ({ order: s.order, text: s.text, estimatedIntent: s.estimatedIntent, dependsOn: s.dependsOn, isLongRunning: false, dataTemplate: null })),
@@ -529,7 +539,7 @@ module.exports = async function decomposePromptV2(state) {
     }];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'media-search-guard', intent: 'web_search',
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'web_search', dependsOn: [], isLongRunning: false, dataTemplate: null }],
@@ -564,7 +574,7 @@ module.exports = async function decomposePromptV2(state) {
     }];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'public-research-guard', intent: 'web_search',
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'web_search', dependsOn: [], isLongRunning: false, dataTemplate: null }],
@@ -616,7 +626,7 @@ module.exports = async function decomposePromptV2(state) {
     }];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'query-followup-guard', intent: 'web_search',
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'web_search', dependsOn: [], isLongRunning: false, dataTemplate: null }],
@@ -646,7 +656,7 @@ module.exports = async function decomposePromptV2(state) {
     }];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'local-short-circuit', intent: 'command_automate',
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
@@ -674,7 +684,7 @@ module.exports = async function decomposePromptV2(state) {
     }];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'local-short-circuit', intent: 'memory_retrieve',
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'memory_retrieve', dependsOn: [], isLongRunning: false, dataTemplate: null }],
@@ -711,7 +721,7 @@ module.exports = async function decomposePromptV2(state) {
     }];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'unresolved-followup-guard', intent: 'memory_retrieve',
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'memory_retrieve', dependsOn: [], isLongRunning: false, dataTemplate: null }],
@@ -744,7 +754,7 @@ module.exports = async function decomposePromptV2(state) {
     }];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'thought-reply-guard', intent: _thoughtIntent,
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: message, estimatedIntent: _thoughtIntent, dependsOn: [], isLongRunning: false, dataTemplate: null }],
@@ -766,7 +776,7 @@ module.exports = async function decomposePromptV2(state) {
   // Note: _llmDateRange is lost on the single-step path — retrieveMemory.js has a
   // 3-layer fallback (Layer 1: _llmDateRange, Layer 2: regex parseDateRange,
   // Layer 3: LLM fallback) so this is safe.
-  const _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger);
+  const _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint);
   let subPrompts;
   if (_fastDecision >= 0 && _fastDecision <= 6) {
     logger.info(`[Node:DecomposePromptV2] Fast decision: single-step ${_SINGLE_STEP_INTENTS[_fastDecision]} — skipping full decomposition`);
@@ -875,7 +885,7 @@ module.exports = async function decomposePromptV2(state) {
     const isSame     = singleText === origText || origText.includes(singleText) || singleText.includes(origText);
 
     writeDecomposeLog({
-      ts: new Date().toISOString(), message, carriedHint: null,
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'llm-decompose', intent: sp.estimatedIntent,
       subPromptCount: 1, durationMs,
       subPrompts: [{ order: 0, text: sp.text, estimatedIntent: sp.estimatedIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }],
@@ -895,7 +905,7 @@ module.exports = async function decomposePromptV2(state) {
   const collapsed = collapseLinearCAChain(subPrompts, message, logger);
 
   writeDecomposeLog({
-    ts: new Date().toISOString(), message, carriedHint: null,
+    ts: new Date().toISOString(), message, carriedHint: _carriedHint,
     parser: 'llm-decompose', intent: collapsed[0]?.estimatedIntent,
     subPromptCount: collapsed.length, durationMs,
     subPrompts: collapsed.map(sp => ({ order: sp.order, text: sp.text, estimatedIntent: sp.estimatedIntent, dependsOn: sp.dependsOn, isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate })),

@@ -42,6 +42,7 @@ const TESTS = [
   'stage-c-stability.test.js',
   'route-table.test.js',
   'classify-task-prompt.test.js',
+  'carried-hint.test.js',
   'llm-backend-watchdog.test.js',
   'synthesize-crossturn-guard.test.js',
   'engine-execute.test.js',
