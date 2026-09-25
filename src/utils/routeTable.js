@@ -106,6 +106,12 @@ function suggestIntent(tc, message) {
     }
   }
 
+  // 8. thought-reply — reply bound to an attached card is a topical query
+  //    about the card (grounded by search unless web access is off)
+  if (tc.isThoughtReply && tc.followUpTarget && !hasMultiGoal) {
+    return { intent: tc.webAccessMode === 'none' ? 'memory_retrieve' : 'web_search', rule: 'thought-reply' };
+  }
+
   return null;
 }
 

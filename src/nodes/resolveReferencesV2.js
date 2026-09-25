@@ -549,6 +549,32 @@ module.exports = async function resolveReferencesV2(state) {
     logger.info(`[Node:ResolveReferencesV2] ack floor: "${_ackWord}" + attached card → isThoughtReply=true (${_affirmative ? 'accepted' : 'declined'})`);
   }
 
+  // ── Card-binding floor ────────────────────────────────────────────────────
+  // An attached card is an explicit referent selection. When the classifier
+  // produced NO usable referent (no followUpTarget — e.g. it read a chatty
+  // card reply like "let's chat about this" as a fresh greeting), the card
+  // fills the void. When the classifier DID resolve a target — even inferred
+  // from history — its judgment stands: a card attachment must not hijack a
+  // topical pivot ("find Roses not just all Flowers" → roses, not the card).
+  if (_thoughtCtx && !state._planFile &&
+      !_taskClassification.isThoughtReply &&
+      !_taskClassification.followUpTarget &&
+      !_taskClassification.targetService && !_taskClassification.activeDocRef) {
+    const _CONCRETE_TASK_TYPES = new Set([
+      'local_file', 'local_system', 'app_automation', 'browser',
+      'scheduling', 'messaging', 'skill_creation', 'file_output',
+    ]);
+    const _isFreshTask = _CONCRETE_TASK_TYPES.has(_taskClassification.taskType) &&
+      !_taskClassification.isFollowUp && !_taskClassification.needsClarification;
+    if (!_isFreshTask) {
+      _taskClassification.isThoughtReply = true;
+      _taskClassification.isFollowUp = true;
+      _taskClassification.followUpTarget = _thoughtCtx.text;
+      _taskClassification.needsClarification = false;
+      logger.info(`[Node:ResolveReferencesV2] card-binding floor: no classifier referent — attached card bound ("${String(_thoughtCtx.text || '').slice(0, 60)}")`);
+    }
+  }
+
   // ── Thought-card lifecycle: report the outcome to the engine ──────────────
   // Attached-card prompts: isThoughtReply decides responded-vs-dismissed.
   // Plain prompts that resolve to a persisted card turn = delayed re-engagement

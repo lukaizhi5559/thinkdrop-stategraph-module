@@ -285,6 +285,52 @@ describe('golden journeys — routing contract', () => {
     assertEq(out.intent?.type, 'general_knowledge');
   });
 
+  it('chatty reply + attached card → card wins over inferred history referent', async () => {
+    // The Dee-1 regression: classifier anchored "this" to the file-edit turn
+    // (followUpTarget="the file or the edits" — words not in the reply), then
+    // the number-call returned greeting (decision '6'). The card-binding floor
+    // must override to the attached card and route it as a thought reply.
+    const CARD = 'Dee-1 is a New Orleans-born rapper, activist, and former congressional candidate.';
+    const out = await runPipeline({
+      message: 'let chat about this',
+      mcpAdapter: makeAdapter(),
+      llmBackend: makeLlm({
+        // Observed failure shape: classifier read the chatty card reply as a
+        // fresh social turn — no referent produced — and the number-call then
+        // said 'greeting' (decision 6). The card-binding floor fills the void.
+        classify: { taskType: 'social', isFollowUp: false, followUpTarget: null, webAccessMode: 'public_read' },
+        decision: '6',
+      }),
+      context: { sessionId: 'sess-golden' },
+      _thoughtAttachment: { id: 'th_3', text: CARD, tag: `[Thought: ${CARD}]` },
+      logger: _noopLogger,
+    });
+    assertEq(out._taskClassification.isThoughtReply, true);
+    assertEq(out._taskClassification.followUpTarget, CARD);
+    assertEq(out._taskClassification.resolution, 'resolved');
+    assert(/guard/.test(out._decomposedBy || ''), `expected a guard route, got ${out._decomposedBy}`);
+    assertEq(out.intent?.type, 'web_search');
+  });
+
+  it('reply naming a different topic + attached card → classifier target survives', async () => {
+    // Explicit pivot wins: "the proofreading file" is named in the reply, so
+    // the card must NOT bind even though it is attached.
+    const CARD = 'Dee-1 is a New Orleans-born rapper, activist, and former congressional candidate.';
+    const out = await runPipeline({
+      message: "let's chat about the proofreading file instead",
+      mcpAdapter: makeAdapter(),
+      llmBackend: makeLlm({
+        classify: { taskType: 'query', isFollowUp: true, followUpTarget: 'proofreading file' },
+        decision: '5',
+      }),
+      context: { sessionId: 'sess-golden' },
+      _thoughtAttachment: { id: 'th_4', text: CARD, tag: `[Thought: ${CARD}]` },
+      logger: _noopLogger,
+    });
+    assertEq(out._taskClassification.isThoughtReply, false);
+    assertEq(out._taskClassification.followUpTarget, 'proofreading file');
+  });
+
   it('bare "yes" opener with no card/history → needs_clarification (orphan ack)', async () => {
     let batch = null;
     const out = await runPipeline(baseState({

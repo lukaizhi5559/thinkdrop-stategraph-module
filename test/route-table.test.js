@@ -83,6 +83,18 @@ eq(suggestIntent({ resolution: 'needs_clarification', taskType: 'query' }, 'sure
 eq(suggestIntent({ isFollowUp: true, followUpTarget: 'Bryce', taskType: 'query' }, 'x')?.intent,
   'web_search', 'followUp WITH target hits query-followup, not unresolved');
 
+// ── thought-reply (card-bound) ───────────────────────────────────────────────
+eq(suggestIntent({ isThoughtReply: true, followUpTarget: 'Dee-1 is a New Orleans-born rapper', taskType: 'query' }, 'let chat about this')?.intent,
+  'web_search', 'bound card reply → web_search');
+eq(suggestIntent({ isThoughtReply: true, followUpTarget: 'card text', webAccessMode: 'none' }, 'tell me more')?.intent,
+  'memory_retrieve', 'webAccessMode=none → memory_retrieve');
+eq(suggestIntent({ isThoughtReply: true, followUpTarget: 'card', taskType: 'query' }, 'yes and then email John'),
+  null, 'multi-goal suppresses thought-reply');
+eq(suggestIntent({ isThoughtReply: true, followUpTarget: null }, 'no thanks'),
+  null, 'no target + no isFollowUp → no opinion (decline handled upstream)');
+eq(suggestIntent({ isThoughtReply: true, followUpTarget: 'card text', taskType: 'browser' }, 'x')?.intent,
+  'command_automate', 'browser taskType hits short-circuit before thought-reply');
+
 // ── null / uncovered cases ───────────────────────────────────────────────────
 eq(suggestIntent(null, 'x'), null, 'null tc → null');
 eq(suggestIntent({}, 'x'), null, 'empty tc → null');

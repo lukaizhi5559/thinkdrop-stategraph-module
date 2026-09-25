@@ -665,6 +665,39 @@ module.exports = async function decomposePromptV2(state) {
     };
   }
 
+  // ── Thought-reply guard — checked BEFORE the LLM number-call ──────────────
+  // A reply bound to an attached proactive card (isThoughtReply + resolved
+  // followUpTarget) is a topical query about the card — never greeting or
+  // chitchat. "let's chat about this" with a card attached must not reach the
+  // 4-turn number-call, which lacks the card context and drifts.
+  if (_tc.isThoughtReply && _tc.followUpTarget && !_hasMultiGoalConjunction) {
+    const _thoughtIntent = _tc.webAccessMode === 'none' ? 'memory_retrieve' : 'web_search';
+    logger.info(`[Node:DecomposePromptV2] Thought-reply guard: routing to ${_thoughtIntent} for attached card "${String(_tc.followUpTarget).slice(0, 60)}"`);
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: _thoughtIntent,
+      confidence: 0.85,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'thought-reply-guard', intent: _thoughtIntent,
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: _thoughtIntent, dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, _thoughtIntent, 0.85);
+    return {
+      ...state,
+      _decomposedIntent: _thoughtIntent,
+      _decomposedBy: 'thought-reply-guard',
+      intentPlan: subPrompts,
+    };
+  }
+
   // ── Fast number-based decision (single-step intent / multi-step) ──────────
   // Call the light model with "return ONLY a single number" to get a fast verdict.
   // If 0–6 (single-step), return a single sub-prompt with that intent — skip the
