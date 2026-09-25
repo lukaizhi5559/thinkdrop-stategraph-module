@@ -63,7 +63,12 @@ Output ONLY valid JSON with exactly these fields:
   "interactiveActions": ["login", "add_to_cart", ...] | [],
   "expectsFileOutput": true | false,
   "activeDocRef": "file" | "url" | "screen" | null,
-  "mediaListing": "none" | "image" | "video"
+  "mediaListing": "none" | "image" | "video",
+  "isScreenOutput": true | false,
+  "screenOutputAction": "show" | "clear" | null,
+  "screenOutputKind": "text" | "emoji" | "image" | "chart" | "effect" | "alert" | "deck" | "scene" | null,
+  "screenOutputContent": "<literal content to display>" | null,
+  "screenOutputMood": "neutral" | "warm" | "happy" | "sad" | "alert" | "playful" | "calm" | null
 }
 
 Field rules:
@@ -111,6 +116,14 @@ Field rules:
   - LIVE-ARTIFACT NOUN OVERRIDE: explicit nouns that can only exist on screen — "this site", "this webpage", "this website", "this tab", "the browser page", "the browser tab", "the page in the browser", "the page I'm on", "the site I'm on" — resolve to activeDocRef even when CONVERSATION HISTORY supplies a competing referent (e.g. "print this site" after discussing a saved file → activeDocRef="url", followUpTarget may still carry the file). A site/webpage/tab/browser-page referent is never a conversation artifact. Bare "this"/"it" and conversation-artifact nouns ("this file", "the document") still defer to a competing conversation referent.
   - When activeDocRef is "file" or "url", also set isScreenFollowUp:false and needsFreshScreen:false (the target is known — no screen OCR needed). When activeDocRef is "screen", set isScreenFollowUp:true.
 
+- isScreenOutput: true when the user wants content PAINTED ONTO THE SCREEN itself — the GhostLayer visual output surface (a transparent always-on-top layer over the whole desktop). This is WRITING to the screen, the opposite of reading it. Signals: "show it on the screen", "display that on my screen", "put this on screen", "show on screen", "make it rain (on my screen)", "fireworks on the screen", "show a big emoji", "put up a chart on screen", "clear the screen", "take that off the screen".
+  - action "show": render/display/paint/put something onto the screen — "show it on the screen", "display John 3:16 on screen", "make it rain", "put up fireworks"
+  - action "clear": remove screen displays — "clear the screen", "hide that overlay", "take it off my screen", "dismiss that"
+  - screenOutputKind: the requested visual form when identifiable — "make it rain"/"fireworks"/"snow" → "effect"; "big emoji"/"show a smiley" → "emoji"; "pie chart"/"bar chart"/"graph" → "chart"; "show this image/picture on screen" → "image"; "slides/presentation" → "deck"; a full-screen warning/block → "alert"; otherwise "text".
+  - screenOutputContent: the literal text/emoji/content to display when embedded in the message ("show 'hello world' on the screen" → "hello world", "display a 🔥 emoji" → "🔥"). null when the referent is a prior assistant answer ("show it on the screen" → null — the node resolves it from history).
+  - screenOutputMood: emotional tone when implied — playful/happy/calm/etc., else null.
+  - BOUNDARY — isScreenOutput is FALSE for: reading/observing the screen ("what's on my screen" → query/isScreenFollowUp), highlighting or annotating app UI elements ("highlight the submit button" → local_system), taking screenshots, and media searches without a screen qualifier ("show me a picture of X" → mediaListing). The screen qualifier must be explicit: "on the screen", "on my screen", "onto the screen", "on screen".
+
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
   - WHO to send to (messaging tasks with no recipient anywhere)
   - WHICH service (when multiple equally valid options exist and user gave no hint)
@@ -123,7 +136,7 @@ Field rules:
   - NEVER ask when taskType is local_system or browser — these are always clear enough
   - NEVER ask when isFollowUp is true and followUpTarget is resolved — EXCEPT for scheduling tasks where the notification/delivery method is missing (followUpTarget is the task content, not the delivery method)
 
-- targetService: the specific external service named (e.g. "gmail", "github", "youtube"). null for local tasks.
+- targetService: the specific external service named (e.g. "gmail", "github", "youtube"). null for local tasks. CRITICAL: set targetService ONLY when the user EXPLICITLY names the service in the message — never infer or invent one. "pull up John 3:16" names NO service → null (do not output "biblegateway"). "find videos about X" names no service → null. A service the user didn't type is always wrong.
 
 - isRecurring: true for "every day", "daily", "weekly", "remind me every", "alarm", "recurring", "each morning"
 
@@ -372,6 +385,11 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     activeDocRef: null,
     activeDocTarget: null,
     mediaListing: 'none',
+    isScreenOutput: false,
+    screenOutputAction: null,
+    screenOutputKind: null,
+    screenOutputContent: null,
+    screenOutputMood: null,
     resolution: 'resolved',
   };
 
@@ -490,6 +508,27 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const parsedIsFollowUp = !!parsed.isFollowUp;
     const parsedFollowUpTarget = parsed.followUpTarget || null;
 
+    // Phantom-service guard: the classifier sometimes INVENTS a targetService
+    // the user never named ("pull up John 3:16" → "biblegateway"), which blocks
+    // the public-research guard and forces a heavyweight command_automate plan
+    // for a simple lookup. For non-interactive tasks, drop any service not
+    // literally mentioned in the message. Interactive tasks keep the inferred
+    // target — the planner needs a service domain to drive.
+    const _serviceMentioned = (svc, msg) => {
+      if (!svc || !msg) return false;
+      const m = msg.toLowerCase();
+      const s = String(svc).toLowerCase();
+      if (m.includes(s)) return true;
+      // Multi-word services ("google docs") — any ≥3-char token counts
+      return s.split(/[^a-z0-9]+/).filter(t => t.length >= 3).some(t => m.includes(t));
+    };
+    let parsedTargetService = parsed.targetService || null;
+    if (parsedTargetService && webAccessMode !== 'interactive' && !requiresDOM &&
+        !_serviceMentioned(parsedTargetService, classifiedMessage)) {
+      logger.info(`[classifyTask] Phantom targetService "${parsedTargetService}" not mentioned in message — dropping (webAccessMode=${webAccessMode})`);
+      parsedTargetService = null;
+    }
+
     // activeDocRef — kind of live-document referent, if any. The concrete
     // target (path/url) is attached deterministically by the caller from the
     // live context — never trust an LLM-emitted path string.
@@ -508,7 +547,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       isFollowUp:          parsedIsFollowUp,
       followUpTarget:      parsedFollowUpTarget,
       needsClarification:  !!parsed.needsClarification,
-      targetService:       parsed.targetService       || null,
+      targetService:       parsedTargetService,
       isRecurring:         !!parsed.isRecurring,
       isBrowseOnly:        !!parsed.isBrowseOnly,
       requiresDOM,
@@ -526,6 +565,11 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       activeDocRef,
       activeDocTarget:     null, // resolved by caller from live context
       mediaListing:        _VALID_MEDIA_LISTINGS.has(parsed.mediaListing) ? parsed.mediaListing : 'none',
+      isScreenOutput:      !!parsed.isScreenOutput,
+      screenOutputAction:  ['show', 'clear'].includes(parsed.screenOutputAction) ? parsed.screenOutputAction : null,
+      screenOutputKind:    ['text', 'emoji', 'image', 'chart', 'effect', 'alert', 'deck', 'scene'].includes(parsed.screenOutputKind) ? parsed.screenOutputKind : null,
+      screenOutputContent: typeof parsed.screenOutputContent === 'string' && parsed.screenOutputContent ? parsed.screenOutputContent.slice(0, 20000) : null,
+      screenOutputMood:    ['neutral', 'warm', 'happy', 'sad', 'alert', 'playful', 'calm'].includes(parsed.screenOutputMood) ? parsed.screenOutputMood : null,
     });
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);

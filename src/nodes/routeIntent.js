@@ -176,6 +176,7 @@ module.exports = async function routeIntent(state) {
     question:           'webSearch',
     general_knowledge:  'webSearch',
     greeting:           'answer',
+    screen_display:     'screenOutput',
   };
   patch._advanceRoute = INTENT_ROUTES[intentType] || 'retrieveMemory';
   return patch;

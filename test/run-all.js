@@ -42,6 +42,7 @@ const TESTS = [
   'stage-c-stability.test.js',
   'route-table.test.js',
   'engine-execute.test.js',
+  'screen-output.test.js',
   'phase3-longrunning.test.js',
   'tab-flow-tab-map.test.js',
   'lint-synthesize-ordering.test.js',

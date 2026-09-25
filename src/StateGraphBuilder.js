@@ -50,6 +50,7 @@ const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
 const planExecutorNode = require('./nodes/planExecutor');
 const preflightAgentsNode = require('./nodes/preflightAgents');
 const resolveAgentNode = require('./nodes/resolveAgent');
+const screenOutputNode = require('./nodes/screenOutput');
 
 // assessRisk and detectOperationType removed — grill-mode pipeline deleted
 
@@ -230,6 +231,7 @@ class StateGraphBuilder {
       flagStepFailure: (state) => flagStepFailureNode({ ...state, logger }),
       surfacePlanFailure: (state) => surfacePlanFailureNode({ ...state, logger }),
       routeIntent: (state) => routeIntentNode({ ...state, logger }),
+      screenOutput: (state) => screenOutputNode({ ...state, logger }),
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
@@ -274,6 +276,11 @@ class StateGraphBuilder {
 
       // Settings path: executeSettings → answer → logConversation
       executeSettings: 'answer',
+
+      // Screen-output path: screenOutput → answer → logConversation
+      // (the GhostLayer display itself is fire-and-forget — the answer node
+      // shows the brief ack in the overlay)
+      screenOutput: 'answer',
 
       // Memory store path: store → logConversation → end
       storeMemory: 'logConversation',

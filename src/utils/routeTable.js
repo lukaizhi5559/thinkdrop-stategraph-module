@@ -43,6 +43,12 @@ function suggestIntent(tc, message) {
     return { intent: 'general_knowledge', rule: 'declined-ack' };
   }
 
+  // 1b. screen-output — user wants content painted onto the screen surface
+  //     (GhostLayer): "show it on the screen", "make it rain", "clear the screen"
+  if (tc.isScreenOutput && !hasMultiGoal) {
+    return { intent: 'screen_display', rule: 'screen-output' };
+  }
+
   // 2. media-search — image/video listing without a named site (or a video
   //    platform) routes to web_search instead of browser automation
   const mediaListing = tc.mediaListing || 'none';

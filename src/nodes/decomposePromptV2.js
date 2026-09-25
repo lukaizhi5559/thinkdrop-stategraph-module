@@ -54,7 +54,7 @@ function _emitIntentDecided(state, intent, confidence) {
 
 const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent classifier. Sub-prompts are executed by a downstream intent router:
 - Each sub-prompt "text" must contain exactly ONE distinct action or intent
-- Valid estimatedIntent values: command_automate, screen_intelligence, web_search, memory_store, memory_retrieve, general_knowledge, greeting
+- Valid estimatedIntent values: command_automate, screen_intelligence, web_search, memory_store, memory_retrieve, general_knowledge, greeting, screen_display
 - Mark isLongRunning:true ONLY for browser automation expected to take >30 seconds
 - Mark dependsOn:[N] when this step requires the OUTPUT of step N
 - CRITICAL: When dependsOn is non-empty, you MUST include dataTemplate with "{{result[N]}}" placeholders for each dependency index. Example: dataTemplate: "Using the result: {{result[0]}}"
@@ -70,6 +70,7 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - EXAMPLES of command_automate (user info + action): "send my family info via email" → command_automate | "email my wife's number to John" → command_automate | "post about my mom on Facebook" → command_automate | "share my contact list" → command_automate
 - PRIORITY RULE - KNOWLEDGE vs SEARCH vs ACTION (when no specific website/tool is mentioned): For general questions without browser/tool interaction: Use general_knowledge for math/calculations ("convert 88s to minutes", "what is 5*7"), timeless facts ("who wrote Pride and Prejudice"), and definitions ("what is blockchain"). Use web_search for time-sensitive info (prices, news, "latest", "current"). Use command_automate ONLY when specific website interaction, tool usage, or external action is required.
 - General rule: When a request combines data retrieval with an action (e.g., "send weather info via email"), split into TWO steps: (1) retrieve the data (memory_retrieve/web_search), (2) perform the action (command_automate with dependsOn:[0]).
+- SCREEN DISPLAY: when a step asks to show/display/put content ON THE SCREEN (the user's desktop — "on the screen", "on my screen", "show it on screen"), use estimatedIntent:'screen_display'. As a dependent step it paints the previous step's output (use dependsOn + dataTemplate). EXAMPLES: "find X and show it on the screen" → [web_search, screen_display dependsOn:[0]] | "look up the verse and put it on my screen" → [web_search, screen_display dependsOn:[0]]. "clear the screen"/"take that off the screen" → single screen_display step. NOT for reading the screen (screen_intelligence) or UI highlights (command_automate).
 - PRIORITY RULE - EPISODIC MEMORY RETRIEVAL (check before NAMED SERVICE rule): When the user asks about PAST activity, screen history, or what they were doing on/in <appName> at a PRIOR time → memory_retrieve, NOT command_automate. Key signals: time references ("yesterday", "this morning", "this week", "recent", "earlier", "around 2 PM"), past tense ("was", "did", "were", "listening", "working"), or "what was on my screen". The user wants to recall past screen captures from episodic memory, not interact with the service now. EXAMPLES: "What was I working on in <appName> yesterday?" → memory_retrieve | "Show me my recent <appName> activity." → memory_retrieve | "Summarize my <appName> conversations from this morning." → memory_retrieve | "What did my <appName> look like this week?" → memory_retrieve | "What music was I listening to?" → memory_retrieve | "Find anything about the <topic> I saw earlier." → memory_retrieve | "What was on my screen around 2 PM today?" → memory_retrieve
 - PRIORITY RULE - NAMED SERVICE/PLATFORM INTERACTION: When a user mentions a specific named service, website, platform, or application AND wants to find, search, locate, extract, or interact with content on that specific service → command_automate. Key distinction: "find workout videos" (general knowledge) vs "find workout videos on [named service]" (automation).
 - PRIORITY RULE - CONTENT/LINK EXTRACTION: Any request to extract, retrieve, get, or obtain specific links, URLs, or structured content from a targeted source → command_automate.
@@ -346,7 +347,7 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
   if (intentMatch) {
     const extractedRaw = intentMatch[1].trim();
     // Snap to nearest known intent to handle partial truncation (e.g. "command_automat" → "command_automate")
-    const KNOWN_INTENTS = ['command_automate', 'screen_intelligence', 'web_search', 'memory_store', 'memory_retrieve', 'general_knowledge', 'greeting'];
+    const KNOWN_INTENTS = ['command_automate', 'screen_intelligence', 'web_search', 'memory_store', 'memory_retrieve', 'general_knowledge', 'greeting', 'screen_display'];
     const extractedIntent = KNOWN_INTENTS.find(i => i.startsWith(extractedRaw) || extractedRaw.startsWith(i.slice(0, 10))) || extractedRaw;
     logger.info(`[Node:DecomposePromptV2] Extracted intent from malformed JSON: "${extractedRaw}" → "${extractedIntent}"`);
     return [{
@@ -429,6 +430,39 @@ module.exports = async function decomposePromptV2(state) {
       ...state,
       _decomposedIntent: 'general_knowledge',
       _decomposedBy: 'declined-ack-guard',
+      intentPlan: subPrompts,
+    };
+  }
+  // ── Screen-output guard — checked BEFORE every intent guard ──────────────
+  // classifyTask sets isScreenOutput when the user wants content PAINTED onto
+  // the screen surface (GhostLayer): "show it on the screen", "make it rain",
+  // "clear the screen". Deterministic route to the screen_display intent →
+  // screenOutput node → POST /screen/display|clear on the overlay server.
+  // Multi-goal messages ("search X and show it on the screen") fall through to
+  // the LLM decomposer, which can emit screen_display as a dependsOn step.
+  if (_tc.isScreenOutput && !_hasMultiGoalConjunction) {
+    logger.info(`[Node:DecomposePromptV2] Screen-output guard: routing to screen_display (action=${_tc.screenOutputAction || 'show'} kind=${_tc.screenOutputKind || 'text'}) — skipping command_automate short-circuit`);
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'screen_display',
+      confidence: 0.9,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'screen-output-guard', intent: 'screen_display',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'screen_display', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'screen_display', 0.9);
+    return {
+      ...state,
+      _decomposedIntent: 'screen_display',
+      _decomposedBy: 'screen-output-guard',
       intentPlan: subPrompts,
     };
   }

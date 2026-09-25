@@ -21,7 +21,7 @@
  */
 module.exports = {
   // ── Classification / resolution (resolveReferencesV2 + clarify) ──────────
-  _taskClassification: { writer: 'resolveReferencesV2/classifyTask', readers: 'everywhere', lifecycle: 'run', note: 'LLM classification artifact; referent fields cleared per queued step by advanceQueue' },
+  _taskClassification: { writer: 'resolveReferencesV2/classifyTask', readers: 'everywhere', lifecycle: 'run', note: 'LLM classification artifact; referent fields cleared per queued step by advanceQueue. Subfields include isScreenOutput + screenOutputAction/Kind/Content/Mood → screen_display intent → screenOutput node (GhostLayer paint channel)' },
   _thoughtAttachment:  { writer: 'main.js initialState', readers: 'resolveReferencesV2, clarify', lifecycle: 'step', note: 'proactive card the user replied to' },
   _clarified:          { writer: 'clarify', readers: 'clarify', lifecycle: 'run', note: 'one-shot cap — clarification runs at most once per run' },
   _advanceRoute:       { writer: 'advanceQueue / preparePostScreen', readers: 'advanceQueue, preparePostScreen edges', lifecycle: 'routing', note: 'keeps edges pure — node computes, edge reads' },
