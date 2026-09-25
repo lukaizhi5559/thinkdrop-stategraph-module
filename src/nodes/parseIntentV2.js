@@ -2,6 +2,8 @@
 
 const fs   = require('fs');
 const path = require('path');
+// Canonical patterns live in shared/text-patterns.cjs — update there, not here.
+const { SCREEN_OBSERVATION_RE } = require('../utils/textPatterns.cjs');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeIntentLog(entry) {
@@ -228,7 +230,11 @@ module.exports = async function parseIntentV2(state) {
     // (e.g. "show me where the input area is in Slack") which decomposePromptV2 can
     // misclassify as screen_intelligence. Override to command_automate so planSkills
     // generates the correct app.agent get_recent_ocr + synthesize plan.
-    if (finalIntent === 'screen_intelligence' && state._taskClassification?.isAppUiInspection === true) {
+    // Spec precondition: the flag is only defined for a NAMED app — targetService
+    // must be set. Without one the flag contradicts its own contract (observed:
+    // "is there an error dialog on my screen" → isAppUiInspection:true with no
+    // app named → a pure-observation question burned a plan + clarify gate).
+    if (finalIntent === 'screen_intelligence' && state._taskClassification?.isAppUiInspection === true && state._taskClassification?.targetService) {
       logger.info(`[Node:ParseIntentV2] isAppUiInspection override: screen_intelligence → command_automate for "${classifyMessage.slice(0, 80)}"`);
       finalIntent = 'command_automate';
     }
@@ -246,15 +252,35 @@ module.exports = async function parseIntentV2(state) {
     // activeDocRef — they need deterministic retrieval (fs.read / web.crawl /
     // shell.run), not viewport OCR. activeDocRef==='screen' stays on the OCR
     // path — there is no file/URL target to fetch.
+    // Precondition: the message must not name the screen itself. classifyTask
+    // conflates a screen referent with whatever URL happens to be open
+    // (observed: "read the text visible on my screen" → activeDocRef:'url'
+    // because Chrome had YouTube open; "what app am I looking at" →
+    // activeDocRef:'file' from the focused editor tab — the referent IS the
+    // screen in both). Any screen-observation phrasing (shared vocabulary)
+    // or explicit surface word means the classification contradicts the
+    // message and the override is skipped.
+    const _msgNamesScreen = SCREEN_OBSERVATION_RE.test(classifyMessage)
+      || /\b(screen|display|monitor|desktop)\b/i.test(classifyMessage);
     if (finalIntent === 'screen_intelligence'
-        && ['file', 'url'].includes(state._taskClassification?.activeDocRef)) {
+        && ['file', 'url'].includes(state._taskClassification?.activeDocRef)
+        && !_msgNamesScreen) {
       logger.info(`[Node:ParseIntentV2] activeDocRef override: screen_intelligence → command_automate (${state._taskClassification.activeDocRef}) for "${classifyMessage.slice(0, 80)}"`);
       finalIntent = 'command_automate';
     }
 
     // app_automation tasks (e.g. "In Devin use the AI to add tests") must never be
     // downgraded to local_system/synthesize by the decomposer. Force command_automate.
-    if (state._taskClassification?.taskType === 'app_automation') {
+    // Contradiction check: taskType is one flaky classifyTask label — it set
+    // app_automation + targetService:'Devin' on "summarize what I worked on
+    // recently" (a memory question; the active app leaked into the label).
+    // When the decomposer's decision and the deterministic comms hint concur
+    // on a non-automation intent, they outweigh the bare label.
+    const _hintNorm = state._carriedHint === 'screen_analysis' ? 'screen_intelligence' : state._carriedHint;
+    const _hintConfirmsNonAction = _hintNorm
+      && _hintNorm !== 'command_automate'
+      && _hintNorm === finalIntent;
+    if (state._taskClassification?.taskType === 'app_automation' && !_hintConfirmsNonAction) {
       logger.info(`[Node:ParseIntentV2] app_automation override: ${finalIntent} → command_automate for "${classifyMessage.slice(0, 80)}"`);
       finalIntent = 'command_automate';
     }

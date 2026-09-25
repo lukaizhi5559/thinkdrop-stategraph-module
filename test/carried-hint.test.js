@@ -58,12 +58,22 @@ describe('decomposePromptV2 — carriedHint channel', () => {
     assertEq(r._decomposedIntent, 'command_automate');
   });
 
-  it('clear signal overrides hint — LLM verdict wins over prior', async () => {
-    // hint says memory_retrieve but the model confidently returns 0
+  it('clear signal overrides hint — specific non-zero verdict wins over prior', async () => {
+    // hint says memory_retrieve but the model affirmatively returns web_search
+    const r = await _decompose("what's my name",
+      { generateAnswer: async () => '2' },
+      { _carriedHint: 'memory_retrieve' });
+    assertEq(r._decomposedIntent, 'web_search');
+  });
+
+  it('bare 0 is residual — non-command hint vetoes it', async () => {
+    // 0 = command_automate is also the "when in doubt" bucket per the decision
+    // prompt, so a bare 0 can't express a confident automation verdict. A
+    // deterministic non-command hint beats it (mirrors the comms keyword veto).
     const r = await _decompose("what's my name",
       { generateAnswer: async () => '0' },
       { _carriedHint: 'memory_retrieve' });
-    assertEq(r._decomposedIntent, 'command_automate');
+    assertEq(r._decomposedIntent, 'memory_retrieve');
   });
 
   it('hint appears in the decision prompt as a prior', async () => {

@@ -70,7 +70,7 @@ async function _collectSessionResults(mcpAdapter, sessionIds, currentSessionId, 
     try {
       const res = await mcpAdapter.callService('conversation', 'message.list', {
         sessionId: sid, limit: 10, direction: 'DESC',
-      });
+      }, _ENRICH_OPTS);
       const msgs = ((res?.data || res)?.messages || [])
         .filter(m => m.sender === 'assistant');
       if (msgs.length === 0) return;
@@ -117,13 +117,21 @@ const fs   = require('fs');
 const os   = require('os');
 const path = require('path');
 
+// Enrichment MCP calls must never hold the pipeline — the client default
+// (600s in main.js/stub) is sized for long-running automation calls, not
+// context reads. Observed: a wedged user-memory service held
+// getActiveAppContext for a full 10min client timeout inside
+// resolveReferences. Bound every enrichment call in this node to 10s,
+// single attempt — every call site already degrades gracefully on failure.
+const _ENRICH_OPTS = { timeoutMs: 10_000, maxRetries: 1 };
+
 async function getRecentMonitorCapture(mcpAdapter, logger) {
   // Primary: live monitor via user-memory MCP (max 5s stale)
   if (mcpAdapter) {
     try {
       const result = await mcpAdapter.callService('user-memory', 'memory.getRecentOcr', {
         maxAgeSeconds: 300, // 5 minutes — generous; monitor fires every 5s
-      });
+      }, _ENRICH_OPTS);
       const data = result?.data || result;
       if (data?.available && data?.capture) {
         const c = data.capture;
@@ -225,7 +233,7 @@ module.exports = async function resolveReferencesV2(state) {
       try {
         // No sessionId provided — create/route to a new session
         // (session selection via semantic matching is now done in main.js before graph execution)
-        const routeResult = await mcpAdapter.callService('conversation', 'session.route', { text: message });
+        const routeResult = await mcpAdapter.callService('conversation', 'session.route', { text: message }, _ENRICH_OPTS);
         sessionId = (routeResult.data || routeResult)?.sessionId || null;
         
         if (sessionId) {
@@ -252,7 +260,7 @@ module.exports = async function resolveReferencesV2(state) {
           sessionId,
           limit: 20,
           direction: 'DESC',
-        }),
+        }, _ENRICH_OPTS),
         mcpAdapter.callService('conversation', 'message.search', {
           sessionId,
           query: message,
@@ -260,7 +268,7 @@ module.exports = async function resolveReferencesV2(state) {
           includeRecent: 0, // recent messages are already covered by message.list
           minSimilarity: 0.3,
           searchAllSessions: true,
-        }).catch(() => null), // best-effort — semantic search is non-blocking
+        }, _ENRICH_OPTS).catch(() => null), // best-effort — semantic search is non-blocking
       ]);
 
       // Recent window (handles coreferences: "that", "it", "yes do it")
@@ -292,7 +300,7 @@ module.exports = async function resolveReferencesV2(state) {
       let priorSessionMessages = [];
       if (recentMessages.length === 0) {
         try {
-          const sessRes = await mcpAdapter.callService('conversation', 'session.list', { limit: 5 });
+          const sessRes = await mcpAdapter.callService('conversation', 'session.list', { limit: 5 }, _ENRICH_OPTS);
           const sessions = (sessRes?.data || sessRes)?.sessions || [];
           const prevSid = sessions
             .map(s => s.id || s.sessionId)
@@ -300,7 +308,7 @@ module.exports = async function resolveReferencesV2(state) {
           if (prevSid) {
             const res = await mcpAdapter.callService('conversation', 'message.list', {
               sessionId: prevSid, limit: 8, direction: 'DESC',
-            });
+            }, _ENRICH_OPTS);
             priorSessionMessages = (((res?.data || res)?.messages) || [])
               .filter(m => m.sender !== 'system')
               .map(m => {
@@ -355,7 +363,7 @@ module.exports = async function resolveReferencesV2(state) {
         mcpAdapter, semanticMessages.map(m => m.sessionId), sessionId, logger);
       if (sessionResults.length === 0 && priorSessionMessages.length === 0 && REFERENTIAL_RE.test(message || '')) {
         try {
-          const sessRes = await mcpAdapter.callService('conversation', 'session.list', { limit: 5 });
+          const sessRes = await mcpAdapter.callService('conversation', 'session.list', { limit: 5 }, _ENRICH_OPTS);
           const sessions = (sessRes?.data || sessRes)?.sessions || [];
           const prevSid = sessions
             .map(s => s.id || s.sessionId)
@@ -454,7 +462,7 @@ module.exports = async function resolveReferencesV2(state) {
   let _activeAppContext = null;
   if (mcpAdapter) {
     try {
-      const ctxResult = await mcpAdapter.callService('user-memory', 'memory.getActiveAppContext', {});
+      const ctxResult = await mcpAdapter.callService('user-memory', 'memory.getActiveAppContext', {}, _ENRICH_OPTS);
       const ctxData = ctxResult?.data || ctxResult;
       const app = ctxData?.app;
       if (app) {

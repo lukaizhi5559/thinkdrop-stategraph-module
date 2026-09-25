@@ -230,10 +230,25 @@ class ThinkDropLLMBackend extends LLMBackend {
       await new Promise((resolve, reject) => {
         const _timedOut = () => {
           _errored = true;
+          clearTimeout(deadlineTimeout);
           ws.terminate();
           reject(new Error(`[ThinkDropLLMBackend] Response timeout — no stream activity for ${_dynamicTimeoutMs}ms`));
         };
         let activeTimeout = setTimeout(_timedOut, _dynamicTimeoutMs);
+
+        // Total-duration bound: the idle watchdog re-arms on fallback
+        // heartbeats, so a backend provider-chain sweep can keep a doomed
+        // request alive for 10+ minutes (observed: a maxTokens:5 classify call
+        // held for 928s while providers cycled). Any request still running
+        // past 3× its idle bound (floor 45s, overridable via
+        // options.totalTimeoutMs) is pathological — terminate so the caller's
+        // own retry/fallback logic gets control back.
+        const _totalBoundMs = options.totalTimeoutMs || Math.max(_dynamicTimeoutMs * 3, 45_000);
+        const deadlineTimeout = setTimeout(() => {
+          _errored = true;
+          ws.terminate();
+          reject(new Error(`[ThinkDropLLMBackend] Total duration bound exceeded (${_totalBoundMs}ms) — stream heartbeats present but no answer materialized`));
+        }, _totalBoundMs);
 
         const resetTimeout = () => {
           clearTimeout(activeTimeout);
@@ -243,6 +258,7 @@ class ThinkDropLLMBackend extends LLMBackend {
         if (_abortSignal) {
           onAbort = () => {
             clearTimeout(activeTimeout);
+            clearTimeout(deadlineTimeout);
             _errored = true;
             ws.terminate();
             const err = new Error('[ThinkDropLLMBackend] Aborted by caller');
@@ -282,12 +298,14 @@ class ThinkDropLLMBackend extends LLMBackend {
 
             } else if (msg.type === 'llm_stream_end') {
               clearTimeout(activeTimeout);
+              clearTimeout(deadlineTimeout);
               // Don't close pooled connections — release them back to the pool
               resolve();
 
             } else if (msg.type === 'llm_error') {
               // Terminal error — all providers exhausted
               clearTimeout(activeTimeout);
+              clearTimeout(deadlineTimeout);
               _errored = true;
               const llmErrMsg = msg.payload?.message || 'WebSocket LLM error';
               if (/All LLM providers failed/i.test(llmErrMsg)) {
@@ -297,6 +315,7 @@ class ThinkDropLLMBackend extends LLMBackend {
             } else if (msg.type === 'error') {
               // Legacy/non-streaming error — treat as terminal
               clearTimeout(activeTimeout);
+              clearTimeout(deadlineTimeout);
               _errored = true;
               reject(new Error(msg.payload?.message || 'WebSocket LLM error'));
             }
@@ -307,12 +326,14 @@ class ThinkDropLLMBackend extends LLMBackend {
 
         onErr = (err) => {
           clearTimeout(activeTimeout);
+          clearTimeout(deadlineTimeout);
           _errored = true;
           reject(err);
         };
 
         onClose = () => {
           clearTimeout(activeTimeout);
+          clearTimeout(deadlineTimeout);
           if (!streamStarted) {
             _errored = true;
             reject(new Error('[ThinkDropLLMBackend] Connection closed before stream started'));

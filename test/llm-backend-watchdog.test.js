@@ -99,6 +99,53 @@ async function main() {
     wss.close();
   }
 
+  // ── 5. Fallback-heartbeat loop dies via TOTAL bound, not idle watchdog ─────
+  // The production hang: backend sweeps providers emitting llm_stream_fallback
+  // every <idle window — the idle watchdog re-arms forever while no answer
+  // materializes (observed: a maxTokens:5 classify call held 928s). The total
+  // deadline must terminate it.
+  {
+    const { wss, port } = await startServer((_req, ws) => {
+      send(ws, { type: 'llm_stream_start' });
+      const iv = setInterval(() => {
+        send(ws, { type: 'llm_stream_fallback', payload: { reason: 'provider flap', attempt: 1 } });
+      }, 50); // heartbeat faster than any idle window — idle watchdog never fires
+      ws.on('close', () => clearInterval(iv));
+    });
+    const backend = new ThinkDropLLMBackend({ wsUrl: `ws://127.0.0.1:${port}`, responseTimeoutMs: 300 });
+    const t0 = Date.now();
+    try {
+      await backend.generateAnswer('p', { query: 'p', context: {} }, { totalTimeoutMs: 900 });
+      ok(false, 'heartbeat loop should have thrown');
+    } catch (e) {
+      ok(/total duration bound/i.test(e.message), `heartbeat loop rejected with total-bound error (${e.message})`);
+      const elapsed = Date.now() - t0;
+      ok(elapsed >= 850 && elapsed < 5000, `total bound fired at ~900ms (${elapsed}ms)`);
+    }
+    wss.close();
+  }
+
+  // ── 6. Total bound is generous enough for a slow-but-finishing stream ──────
+  {
+    const { wss, port } = await startServer((_req, ws) => {
+      send(ws, { type: 'llm_stream_start' });
+      let n = 0;
+      const iv = setInterval(() => {
+        n++;
+        if (n <= 8) send(ws, { type: 'llm_stream_chunk', payload: { chunk: `x${n}` } });
+        else { clearInterval(iv); send(ws, { type: 'llm_stream_end' }); }
+      }, 100); // 900ms of active streaming
+    });
+    const backend = new ThinkDropLLMBackend({ wsUrl: `ws://127.0.0.1:${port}`, responseTimeoutMs: 300 });
+    try {
+      const out = await backend.generateAnswer('p', { query: 'p', context: {} }, { totalTimeoutMs: 2000 });
+      ok(typeof out === 'string' && out.includes('x8'), `stream under total bound completed (${JSON.stringify(out)})`);
+    } catch (e) {
+      ok(false, `stream under total bound should have completed — got ${e.message}`);
+    }
+    wss.close();
+  }
+
   // ── 4. Pre-aborted signal rejects before sending ───────────────────────────
   {
     const { wss, port } = await startServer(() => {});

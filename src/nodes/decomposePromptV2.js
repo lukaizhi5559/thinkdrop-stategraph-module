@@ -7,6 +7,7 @@ const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
+const { SCREEN_OBSERVATION_RE } = require('../utils/textPatterns.cjs');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeDecomposeLog(entry) {
@@ -279,20 +280,55 @@ EXAMPLES:
     : '';
   const userPrompt = `Message: "${message}"${contextBlock}${hintLine}\nIntent? (0–7)`;
 
-  try {
-    const raw = await llmBackend.generateAnswer(userPrompt, {
-      query: userPrompt,
-      context: { systemInstructions: systemPrompt },
-    }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
-    const result = (num >= 0 && num <= 7) ? num : (hintIdx >= 0 ? hintIdx : 0);
-    logger.info(`[Node:DecomposePromptV2] _decomposeDecision: intent=${result} (${result < 7 ? _SINGLE_STEP_INTENTS[result] : 'MULTI_STEP'}) (raw="${(raw || '').trim()}" hint=${carriedHint || 'none'})`);
-    return result;
-  } catch (e) {
-    const fallback = hintIdx >= 0 ? hintIdx : 0;
-    logger.warn(`[Node:DecomposePromptV2] _decomposeDecision failed: ${e.message} — defaulting to ${fallback} (${_SINGLE_STEP_INTENTS[fallback]})`);
-    return fallback;
+  // Parse contract: a bare digit is trusted; a single distinct digit embedded
+  // in short text is extracted. Multiple distinct digits (enumerated echoes —
+  // providers sometimes answer "0 = handoff, 1 = ...") or pure prose are
+  // UNTRUSTED — concatenating their digits (the old /\D/g strip) produced
+  // out-of-range garbage that fell through to command_automate.
+  const _parseDecision = (raw) => {
+    const trimmed = (raw || '').trim();
+    const clean = trimmed.match(/^\s*([0-7])\s*$/);
+    if (clean) return { num: parseInt(clean[1], 10), extracted: false };
+    const digits = [...new Set(trimmed.match(/\d/g) || [])];
+    if (digits.length === 1 && trimmed.length <= 60) {
+      const n = parseInt(digits[0], 10);
+      if (n <= 7) return { num: n, extracted: true };
+    }
+    return null;
+  };
+
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const raw = await llmBackend.generateAnswer(userPrompt, {
+        query: userPrompt,
+        context: { systemInstructions: systemPrompt },
+      }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
+      const parsed = _parseDecision(raw);
+      if (parsed) {
+        // Hint veto over bare 0: command_automate is the residual bucket —
+        // "0" means "no better match", and the five-token call flakes on
+        // ambiguous verbs while seeing the hint in its prompt. A confident
+        // deterministic hint for a NON-automation intent beats the residual
+        // (same rule as the comms keyword veto). Only 0 is vetoed — a
+        // specific non-zero choice is the model affirmatively disagreeing.
+        if (parsed.num === 0 && hintIdx > 0 && _SINGLE_STEP_INTENTS[hintIdx] !== 'command_automate') {
+          logger.info(`[Node:DecomposePromptV2] _decomposeDecision: LLM returned residual 0 but hint=${carriedHint} claims ${_SINGLE_STEP_INTENTS[hintIdx]} — hint veto (raw="${(raw || '').trim()}"${attempt > 1 ? ` attempt=${attempt}` : ''})`);
+          return hintIdx;
+        }
+        logger.info(`[Node:DecomposePromptV2] _decomposeDecision: intent=${parsed.num} (${_SINGLE_STEP_INTENTS[parsed.num] || 'MULTI_STEP'}) (raw="${(raw || '').trim()}" hint=${carriedHint || 'none'}${attempt > 1 ? ` attempt=${attempt}` : ''}${parsed.extracted ? ' extracted' : ''})`);
+        return parsed.num;
+      }
+      lastErr = new Error(`unparseable: "${(raw || '').trim().slice(0, 80)}"`);
+      logger.warn(`[Node:DecomposePromptV2] _decomposeDecision unparseable (attempt ${attempt}): "${(raw || '').trim().slice(0, 80)}"`);
+    } catch (e) {
+      lastErr = e;
+      logger.warn(`[Node:DecomposePromptV2] _decomposeDecision attempt ${attempt} failed: ${e.message}`);
+    }
   }
+  const fallback = hintIdx >= 0 ? hintIdx : 0;
+  logger.warn(`[Node:DecomposePromptV2] _decomposeDecision exhausted retries (${lastErr?.message}) — defaulting to ${fallback} (${_SINGLE_STEP_INTENTS[fallback]})`);
+  return fallback;
 }
 
 async function llmDecompose(message, llmBackend, conversationHistory, logger, onParsed = null) {
@@ -408,11 +444,17 @@ module.exports = async function decomposePromptV2(state) {
   // for obvious single-step tasks. Falls through to the LLM fast decision when
   // the task type is ambiguous or the message shows multi-goal conjunctions.
   const _tc = state._taskClassification || {};
-  const _carriedHint = typeof state._carriedHint === 'string' ? state._carriedHint : null;
+  // comms-graph's intentGuesser speaks comms vocabulary — normalize at the
+  // seam. 'screen_analysis' was silently dropped (indexOf → -1) leaving
+  // screen prompts hint-less at the number-call.
+  const _HINT_VOCAB = { screen_analysis: 'screen_intelligence' };
+  const _rawHint = typeof state._carriedHint === 'string' ? state._carriedHint : null;
+  const _carriedHint = _rawHint ? (_HINT_VOCAB[_rawHint] || _rawHint) : null;
   const _msgLower = String(message || '').toLowerCase();
   const _MULTI_GOAL_CONJUNCTIONS = /\b(and\s+then|also|after\s+that|additionally|plus|furthermore|then\s+also)\b|;\s*[a-z]/i;
   const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower);
   const _SINGLE_STEP_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser']);
+  const _ACTION_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser', 'messaging', 'scheduling']);
   // ── Declined-ack guard — checked BEFORE every intent guard ───────────────
   // resolution==='declined_ack' means the user refused an attached card/offer —
   // a complete answer, not a task. Emit a single general_knowledge step; the
@@ -643,7 +685,16 @@ module.exports = async function decomposePromptV2(state) {
   // context — observational by definition. Skip the automation short-circuit so
   // the LLM decision can apply its screen_intelligence priority rule instead of
   // forcing command_automate → app.agent clipboard scraping.
-  if (_SINGLE_STEP_TASK_TYPES.has(_tc.taskType) && !_tc.needsFreshScreen && !_hasMultiGoalConjunction) {
+  // Disagreement check: the short-circuit trusts one classifyTask label to
+  // skip ALL routing — and taskType flakes ("find me three ramen restaurants
+  // in SF" → local_system → forced command_automate over a web_search hint).
+  // When the deterministic comms-layer guesser claims a non-automation
+  // intent, the signals disagree — get the number call's opinion instead of
+  // trusting the label.
+  const _hintDisagreesWithAutomation = _carriedHint
+    && _carriedHint !== 'command_automate'
+    && _SINGLE_STEP_INTENTS.includes(_carriedHint);
+  if (_SINGLE_STEP_TASK_TYPES.has(_tc.taskType) && !_tc.needsFreshScreen && !_hasMultiGoalConjunction && !_hintDisagreesWithAutomation) {
     logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step command_automate (taskType=${_tc.taskType}, no multi-goal conjunction) — skipping LLM decision`);
     const subPrompts = [{
       text: message,
@@ -698,6 +749,57 @@ module.exports = async function decomposePromptV2(state) {
     };
   }
 
+  // ── Screen-observation guard — BEFORE the follow-up guard and number call ──
+  // classifyTask marks live-screen questions with typed flags (activeDocRef:
+  // 'screen', isScreenFollowUp, needsFreshScreen). The single-digit number call
+  // flakes on these — "what's on my screen" drew command_automate (100s) one
+  // run and screen_intelligence (18s) the next. The referent is structurally
+  // known (the live screen), so route deterministically when taskType is
+  // 'query' — imperative screen actions carry local_system/app_automation and
+  // still need planning, never this guard.
+  const _isLiveScreenQuery = (
+      (_tc.taskType === 'query'
+        && (_tc.activeDocRef === 'screen' || _tc.isScreenFollowUp === true || _tc.needsFreshScreen === true)
+        // Hint veto: a lone flaky flag must not beat a contradictory comms
+        // guess — "summarize what I worked on recently" drew
+        // needsFreshScreen:true (hallucination) while the hint said
+        // memory_retrieve (observed Stage-2 flake).
+        && !(_carriedHint && _carriedHint !== 'screen_intelligence'))
+      // Lexical arm: classifyTask's flags are LLM-derived and flaky — "what
+      // app am I looking at" drew isFollowUp:true/activeDocRef:'file' with no
+      // screen flags, falling through to the unresolved-follow-up guard →
+      // memory_retrieve (observed Stage-2 flake). The message's own screen-
+      // observation vocabulary is deterministic; trust it whenever the task
+      // isn't classified as an action (imperatives still need planning).
+      || (SCREEN_OBSERVATION_RE.test(message) && (!_tc.taskType || !_ACTION_TASK_TYPES.has(_tc.taskType)))
+    ) && !_tc.isScreenOutput;
+  if (_isLiveScreenQuery && !_hasMultiGoalConjunction) {
+    logger.info('[Node:DecomposePromptV2] Screen-observation guard: routing to screen_intelligence (typed flags) — skipping number call');
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'screen_intelligence',
+      confidence: 0.85,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'screen-observation-guard', intent: 'screen_intelligence',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'screen_intelligence', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'screen_intelligence', 0.85);
+    return {
+      ...state,
+      _decomposedIntent: 'screen_intelligence',
+      _decomposedBy: 'screen-observation-guard',
+      intentPlan: subPrompts,
+    };
+  }
+
   // ── Unresolved-follow-up guard ────────────────────────────────────────────
   // When classifyTask flagged isFollowUp but could not resolve a concrete
   // followUpTarget, the message is a referent-less continuation (e.g. a bare
@@ -708,7 +810,15 @@ module.exports = async function decomposePromptV2(state) {
   // resolution==='needs_clarification' is the centralized version of the same
   // verdict: the clarify gate already ran (or was unavailable), so the message
   // is still unresolved — answer from context, never literal tool execution.
-  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification') && !_hasMultiGoalConjunction) {
+  // A screen-referential message ("read the text visible on my screen") is not
+  // an unresolved follow-up even when classifyTask flags isFollowUp — the live
+  // screen IS the resolved referent. Forcing memory_retrieve answers a
+  // live-observation question from stale captures (or worse, nothing).
+  const _screenReferent = _tc.activeDocRef === 'screen'
+    || _tc.isScreenFollowUp === true
+    || _tc.needsFreshScreen === true
+    || SCREEN_OBSERVATION_RE.test(message);
+  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification') && !_hasMultiGoalConjunction && !_screenReferent) {
     logger.info(`[Node:DecomposePromptV2] Unresolved-follow-up guard: ${_tc.resolution === 'needs_clarification' ? 'resolution=needs_clarification' : 'isFollowUp with null followUpTarget'} — routing to memory_retrieve (answer from history), skipping web_search on literal text`);
     const subPrompts = [{
       text: message,
@@ -776,7 +886,25 @@ module.exports = async function decomposePromptV2(state) {
   // Note: _llmDateRange is lost on the single-step path — retrieveMemory.js has a
   // 3-layer fallback (Layer 1: _llmDateRange, Layer 2: regex parseDateRange,
   // Layer 3: LLM fallback) so this is safe.
-  const _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint);
+  let _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint);
+
+  // Contradiction check: command_automate is the heaviest route (plan +
+  // approval + tool exec). When classifyTask already typed the message as a
+  // non-action task — no named service, no interactive actions — a bare 0
+  // from the five-token number call contradicts the richer typed
+  // classification (observed flakes: "find me three ramen restaurants",
+  // "write a haiku", "summarize what I worked on recently" all cleanly
+  // returned 0 and burned plan/gate minutes). Escalate to the full
+  // llmDecompose prompt, which carries the detailed PRIORITY RULES, rather
+  // than trusting the digit. Note taskType itself flakes between
+  // 'query'/'ambiguous' — both are non-action, so the check is on
+  // membership in the ACTION set, not equality with 'query'.
+  if (_fastDecision === 0 && _tc.taskType && !_ACTION_TASK_TYPES.has(_tc.taskType)
+      && !_tc.targetService && !(_tc.interactiveActions && _tc.interactiveActions.length)) {
+    logger.info(`[Node:DecomposePromptV2] number-call chose command_automate but taskType='${_tc.taskType}' with no action signals — escalating to full llmDecompose`);
+    _fastDecision = 7;
+  }
+
   let subPrompts;
   if (_fastDecision >= 0 && _fastDecision <= 6) {
     logger.info(`[Node:DecomposePromptV2] Fast decision: single-step ${_SINGLE_STEP_INTENTS[_fastDecision]} — skipping full decomposition`);

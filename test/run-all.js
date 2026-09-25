@@ -44,6 +44,8 @@ const TESTS = [
   'classify-task-prompt.test.js',
   'carried-hint.test.js',
   'answer-degenerate.test.js',
+  'screen-referent-routing.test.js',
+  'decompose-decision.test.js',
   'llm-backend-watchdog.test.js',
   'synthesize-crossturn-guard.test.js',
   'engine-execute.test.js',
