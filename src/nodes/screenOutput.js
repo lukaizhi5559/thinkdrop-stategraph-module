@@ -90,6 +90,13 @@ module.exports = async function screenOutput(state) {
   const kind = tc.screenOutputKind || 'text';
   const payload = { kind };
 
+  // Structured data emitted by the classifier (chart data, deck slides, alert
+  // severity) merges in first; kind-specific logic below fills any gaps.
+  if (tc.screenOutputPayload && typeof tc.screenOutputPayload === 'object') {
+    Object.assign(payload, tc.screenOutputPayload);
+    payload.kind = kind; // kind is authoritative from the classification
+  }
+
   if (tc.screenOutputMood) payload.mood = tc.screenOutputMood;
 
   switch (kind) {
@@ -98,6 +105,56 @@ module.exports = async function screenOutput(state) {
       payload.effect = m ? m[1].toLowerCase().replace(/\s+/g, '-') : 'confetti';
       if (payload.effect === 'firework') payload.effect = 'fireworks';
       if (payload.effect === 'emoji rain') payload.effect = 'emoji-rain';
+      break;
+    }
+    case 'chart': {
+      // Data sources: classifier payload → prior step result object.
+      if (!payload.chart) {
+        const results = Array.isArray(state.intentResults) ? state.intentResults : [];
+        const last = results[results.length - 1];
+        const r = last && last.result && typeof last.result === 'object' ? last.result : null;
+        if (r && r.chart && typeof r.chart === 'object') payload.chart = r.chart;
+        else if (r && Array.isArray(r.data) && r.data.length) {
+          const m = message.match(/\b(pie|donut|bar|line|area|stat)\b/i);
+          payload.chart = { type: m ? m[1].toLowerCase() : 'pie', data: r.data };
+        }
+      }
+      if (!payload.chart) {
+        return {
+          ...state,
+          _forceAnswerContext: '## Screen\n\nNo chart data on hand — give me the numbers (e.g. "pie chart: apples 5, bananas 3") or run a query first.',
+        };
+      }
+      if (tc.screenOutputContent) payload.title = tc.screenOutputContent;
+      break;
+    }
+    case 'deck': {
+      if (!payload.deck) {
+        const results = Array.isArray(state.intentResults) ? state.intentResults : [];
+        const last = results[results.length - 1];
+        const r = last && last.result && typeof last.result === 'object' ? last.result : null;
+        if (r && r.deck && Array.isArray(r.deck.slides)) payload.deck = r.deck;
+      }
+      if (!payload.deck) {
+        return {
+          ...state,
+          _forceAnswerContext: '## Screen\n\nNo slides on hand — describe the deck (e.g. "slides: Intro / Goals / Next steps") or generate the content first.',
+        };
+      }
+      break;
+    }
+    case 'alert': {
+      if (/block|danger|stop|inappropriate|not for children/i.test(message)) payload.severity = payload.severity || 'block';
+      else if (/warn|caution|careful/i.test(message)) payload.severity = payload.severity || 'warn';
+      if (payload.blocking == null) payload.blocking = true; // alerts block by default
+      payload.dismiss = 'manual';
+      payload.text = payload.text || tc.screenOutputContent || _stepResultText(state) || _lastAssistantText(state.conversationHistory);
+      if (!payload.text && !payload.title) {
+        return {
+          ...state,
+          _forceAnswerContext: '## Screen\n\nWhat should the alert say?',
+        };
+      }
       break;
     }
     case 'emoji': {

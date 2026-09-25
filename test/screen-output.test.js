@@ -303,6 +303,60 @@ describe('screenOutput node', () => {
       assertEq(posted[0].body.emoji, '🔥');
     });
 
+    // chart kind → classifier payload passthrough
+    await _withMockFetch(null, async (posted) => {
+      await screenOutput({
+        logger: _noopLogger,
+        message: 'pie chart: apples 5, bananas 3 on the screen',
+        _taskClassification: {
+          isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart',
+          screenOutputPayload: { chart: { type: 'pie', data: [{ label: 'apples', value: 5 }], xKey: 'label', yKey: 'value' } },
+        },
+        conversationHistory: [],
+      });
+      assertEq(posted[0].body.kind, 'chart');
+      assertEq(posted[0].body.chart.type, 'pie');
+      assertEq(posted[0].body.chart.data.length, 1);
+    });
+
+    // chart kind → step-result object supplies the chart
+    await _withMockFetch(null, async (posted) => {
+      await screenOutput({
+        logger: _noopLogger,
+        message: 'show that as a chart on the screen',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart' },
+        intentResults: [{ step: 0, intent: 'memory_retrieve', result: { chart: { type: 'bar', data: [{ d: 'Mon', v: 2 }] } } }],
+        conversationHistory: [],
+      });
+      assertEq(posted[0].body.chart.type, 'bar');
+    });
+
+    // alert kind → blocking + manual dismiss defaults, severity from message
+    await _withMockFetch(null, async (posted) => {
+      await screenOutput({
+        logger: _noopLogger,
+        message: 'block this site on the screen, it is not for children',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'alert', screenOutputContent: 'Not for children' },
+        conversationHistory: [],
+      });
+      assertEq(posted[0].body.severity, 'block');
+      assertEq(posted[0].body.blocking, true);
+      assertEq(posted[0].body.dismiss, 'manual');
+      assertEq(posted[0].body.text, 'Not for children');
+    });
+
+    // deck kind → no slides → honest failure, no POST
+    await _withMockFetch(null, async (posted) => {
+      const r = await screenOutput({
+        logger: _noopLogger,
+        message: 'show a presentation on the screen',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'deck' },
+        conversationHistory: [],
+      });
+      assertEq(posted.length, 0);
+      assert(/no slides/i.test(r._forceAnswerContext));
+    });
+
     // nothing to display → honest failure, no POST
     await _withMockFetch(null, async (posted) => {
       const r = await screenOutput({

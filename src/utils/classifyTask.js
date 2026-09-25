@@ -68,7 +68,8 @@ Output ONLY valid JSON with exactly these fields:
   "screenOutputAction": "show" | "clear" | null,
   "screenOutputKind": "text" | "emoji" | "image" | "chart" | "effect" | "alert" | "deck" | "scene" | null,
   "screenOutputContent": "<literal content to display>" | null,
-  "screenOutputMood": "neutral" | "warm" | "happy" | "sad" | "alert" | "playful" | "calm" | null
+  "screenOutputMood": "neutral" | "warm" | "happy" | "sad" | "alert" | "playful" | "calm" | null,
+  "screenOutputPayload": { ... } | null
 }
 
 Field rules:
@@ -122,6 +123,7 @@ Field rules:
   - screenOutputKind: the requested visual form when identifiable — "make it rain"/"fireworks"/"snow" → "effect"; "big emoji"/"show a smiley" → "emoji"; "pie chart"/"bar chart"/"graph" → "chart"; "show this image/picture on screen" → "image"; "slides/presentation" → "deck"; a full-screen warning/block → "alert"; otherwise "text".
   - screenOutputContent: the literal text/emoji/content to display when embedded in the message ("show 'hello world' on the screen" → "hello world", "display a 🔥 emoji" → "🔥"). null when the referent is a prior assistant answer ("show it on the screen" → null — the node resolves it from history).
   - screenOutputMood: emotional tone when implied — playful/happy/calm/etc., else null.
+  - screenOutputPayload: optional structured data for non-text kinds. For "chart" emit {"chart":{"type":"pie|donut|bar|line|area|stat","data":[{"label":..,"value":..}],"xKey":"label","yKey":"value"}} when the message carries the data inline ("pie chart: apples 5, bananas 3"); for "deck" emit {"deck":{"slides":[{"title":..,"bullets":[..]}]}}; for "alert" emit {"severity":"info|warn|block","title":..}. null for text/emoji/effect/image or when data comes from a prior step.
   - BOUNDARY — isScreenOutput is FALSE for: reading/observing the screen ("what's on my screen" → query/isScreenFollowUp), highlighting or annotating app UI elements ("highlight the submit button" → local_system), taking screenshots, and media searches without a screen qualifier ("show me a picture of X" → mediaListing). The screen qualifier must be explicit: "on the screen", "on my screen", "onto the screen", "on screen".
 
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
@@ -390,6 +392,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     screenOutputKind: null,
     screenOutputContent: null,
     screenOutputMood: null,
+    screenOutputPayload: null,
     resolution: 'resolved',
   };
 
@@ -570,6 +573,15 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       screenOutputKind:    ['text', 'emoji', 'image', 'chart', 'effect', 'alert', 'deck', 'scene'].includes(parsed.screenOutputKind) ? parsed.screenOutputKind : null,
       screenOutputContent: typeof parsed.screenOutputContent === 'string' && parsed.screenOutputContent ? parsed.screenOutputContent.slice(0, 20000) : null,
       screenOutputMood:    ['neutral', 'warm', 'happy', 'sad', 'alert', 'playful', 'calm'].includes(parsed.screenOutputMood) ? parsed.screenOutputMood : null,
+      // Structured payload passthrough for chart/deck/alert data — bounded and
+      // re-validated downstream by shared/screen-output.cjs normalization.
+      screenOutputPayload: (() => {
+        if (!parsed.screenOutputPayload || typeof parsed.screenOutputPayload !== 'object' || Array.isArray(parsed.screenOutputPayload)) return null;
+        try {
+          const s = JSON.stringify(parsed.screenOutputPayload);
+          return s.length <= 51200 ? JSON.parse(s) : null;
+        } catch (_) { return null; }
+      })(),
     });
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);
