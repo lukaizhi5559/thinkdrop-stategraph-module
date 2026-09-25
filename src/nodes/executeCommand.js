@@ -3389,13 +3389,23 @@ module.exports = async function executeCommand(state) {
     // this turn" — without this, a skipped shell.run step causes the cross-turn fallback to fire and
     // pull unrelated prior-task content (observed in task_94e38046: Gmail/Copilot content leaked into
     // the basement task's synthesis after the shell.run step was skipped, producing a false success).
+    //
+    // REFERENTIAL GATE: cross-turn context is only legitimate when THIS task
+    // refers to prior output — a follow-up ("put this in a doc", "summarize
+    // that") or a conversation-recall request. A fresh self-contained task
+    // ("create a file with the text hello world" → synthesize args.prompt is
+    // the literal content) must not inherit prior sessions' step outputs —
+    // observed: the LLM summarized an unrelated proofreading run into the
+    // file instead of writing "hello world".
+    const _tc = state._taskClassification || {};
+    const _isReferentialTask = !!(_tc.isFollowUp || _tc.followUpTarget || _tc.isConversationRecall);
     const conversationHistory = state.conversationHistory || [];
     const META_SKILLS = new Set(['synthesize', 'ask_user', 'schedule', 'needs_skill', 'api_suggest']);
     const hasActionStepsThisTurn = skillResults.some(r =>
       r.step > lastSynthesizeStep && !META_SKILLS.has(r.skill)
     );
     let crossTurnContext = '';
-    if (allContextParts.length === 0 && !hasActionStepsThisTurn && conversationHistory.length > 0) {
+    if (allContextParts.length === 0 && !hasActionStepsThisTurn && _isReferentialTask && conversationHistory.length > 0) {
       // Find the most recent assistant message that contains step outputs
       const recentOutputMsg = [...conversationHistory].reverse()
         .find(m => m.role === 'assistant' && m.content && m.content.includes('Step outputs:'));

@@ -255,7 +255,11 @@ EXAMPLES (webAccessMode — one per decision boundary):
   User: "create a notion todo for tomorrow" → {"taskType":"browser","targetService":"notion","requiresDOM":true,"webAccessMode":"interactive"}
   User: "go to chatgpt and ask it about vegan food" → {"taskType":"browser","targetService":"chatgpt","webAccessMode":"interactive"}
   User: "post on twitter" → {"taskType":"browser","targetService":"twitter","requiresDOM":true,"webAccessMode":"interactive"}
-  User: "what time is it" → {"taskType":"local_system","webAccessMode":"none"}
+  User: "what time is it" → {"taskType":"query","webAccessMode":"none"}  // temporal questions are answered from injected CURRENT LOCAL TIME, not shell automation
+  User: "what day is today" → {"taskType":"query","webAccessMode":"none"}
+  User: "what's the date" → {"taskType":"query","webAccessMode":"none"}
+  User: "check my disk space" → {"taskType":"local_system","webAccessMode":"none"}
+  User: "how much memory is this process using" → {"taskType":"local_system","webAccessMode":"none"}
 
 EXAMPLES (mediaListing — list of media results vs. playing one item):
   User: "find videos from mike winger Christ in the old testament" → {"taskType":"browser","targetService":"youtube","webAccessMode":"public_read","mediaListing":"video"}

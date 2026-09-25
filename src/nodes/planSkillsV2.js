@@ -2445,6 +2445,9 @@ The user's request does NOT match any installed skill.
       maxTokens: _maxTokens,
       temperature: 0.1,
       taskType: 'complex',
+      // Cancellation — a cancelled task must tear down the in-flight plan
+      // stream, not finish it silently (seen: 14min stream surviving cancel).
+      abortSignal: state.abortSignal,
       // ── Structured output: constrain the LLM to emit valid JSON matching
       // the skill_plan schema. This eliminates parse retries (30-50% fewer
       // output tokens, no prose padding) and guarantees schema adherence.
@@ -2868,7 +2871,7 @@ The user's request does NOT match any installed skill.
       const priorSteps = skillPlan.slice(0, i).map((s, j) => `Step ${j + 1}: ${s.skill}${s.args?.url ? ` (${s.args.url})` : ''}${s.description ? ` — ${s.description}` : ''}`).join('\n');
       const expandQuery = `Write a detailed synthesize prompt for this task.\n\nContext — this is step ${i + 1} in a plan:\n${priorSteps}\n\nIntent: ${expandIntent}\nUser request: "${userMessage}"\n\nWrite ONLY the prompt text (no JSON, no fences).`;
       try {
-        const expanded = await backend.generateAnswer(expandQuery, { query: expandQuery, context: { systemInstructions: 'You write precise LLM prompts. Output only the prompt text, nothing else.', conversationHistory: [], intent: 'command_automate' }, options: { maxTokens: 800, temperature: 0.1, fastMode: true } }, { maxTokens: 800, temperature: 0.1, fastMode: true, taskType: 'classification' }, null);
+        const expanded = await backend.generateAnswer(expandQuery, { query: expandQuery, context: { systemInstructions: 'You write precise LLM prompts. Output only the prompt text, nothing else.', conversationHistory: [], intent: 'command_automate' }, options: { maxTokens: 800, temperature: 0.1, fastMode: true, abortSignal: state.abortSignal } }, { maxTokens: 800, temperature: 0.1, fastMode: true, taskType: 'classification', abortSignal: state.abortSignal }, null);
         if (expanded && expanded.trim().length > 20) {
           skillPlan[i].args.prompt = expanded.trim().replace(/^```[a-zA-Z]*\r?\n/, '').replace(/\n```\s*$/, '').trim();
           logger.info(`[Node:PlanSkillsV2] Phase 2 expanded step ${i + 1}: ${skillPlan[i].args.prompt.length} chars`);

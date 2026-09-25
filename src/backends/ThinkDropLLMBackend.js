@@ -198,35 +198,59 @@ class ThinkDropLLMBackend extends LLMBackend {
     let accumulatedReasoning = '';
     let streamStarted = false;
 
-    // Dynamic timeout based on taskType — complex/super-heavy need much more time
+    // Dynamic timeout based on taskType — complex/super-heavy need much more time.
+    // The watchdog is an IDLE-GAP bound, not a total-duration bound: it is
+    // re-armed on stream start and on every chunk/fallback, so a stalled
+    // stream dies after _dynamicTimeoutMs of silence while a slow-but-active
+    // stream may run arbitrarily long.
     const _taskType = options.taskType || (context.intent === 'command_automate' ? 'complex' : 'planning');
     const _dynamicTimeoutMs = _taskType === 'complex' ? 240_000
       : _taskType === 'super-heavy' ? 180_000
       : _taskType === 'heavy' ? 90_000
       : this.responseTimeoutMs; // light/planning — keep default 60s
 
+    // Cancellation: callers pass options.abortSignal (wired from
+    // state.abortSignal by long-running nodes). Aborting terminates the WS —
+    // an aborted connection is errored, not returned to the pool.
+    const _abortSignal = options.abortSignal || null;
+    if (_abortSignal?.aborted) {
+      this._releaseWs(ws, true);
+      const err = new Error('[ThinkDropLLMBackend] Aborted before request started');
+      err.name = 'AbortError';
+      throw err;
+    }
+
     // Capture per-request handlers as named functions so they can be removed
     // in the finally block below. Without this, every generateAnswer() call
     // leaks an `error` and `close` listener on the pooled WebSocket → after ~10
     // requests Node emits MaxListenersExceededWarning and event dispatch slows.
-    let onMessage, onErr, onClose;
+    let onMessage, onErr, onClose, onAbort;
 
     try {
       await new Promise((resolve, reject) => {
-        let activeTimeout = setTimeout(() => {
+        const _timedOut = () => {
           _errored = true;
           ws.terminate();
-          reject(new Error('[ThinkDropLLMBackend] Response timeout'));
-        }, _dynamicTimeoutMs);
+          reject(new Error(`[ThinkDropLLMBackend] Response timeout — no stream activity for ${_dynamicTimeoutMs}ms`));
+        };
+        let activeTimeout = setTimeout(_timedOut, _dynamicTimeoutMs);
 
         const resetTimeout = () => {
           clearTimeout(activeTimeout);
-          activeTimeout = setTimeout(() => {
+          activeTimeout = setTimeout(_timedOut, _dynamicTimeoutMs);
+        };
+
+        if (_abortSignal) {
+          onAbort = () => {
+            clearTimeout(activeTimeout);
             _errored = true;
             ws.terminate();
-            reject(new Error('[ThinkDropLLMBackend] Response timeout'));
-          }, _dynamicTimeoutMs);
-        };
+            const err = new Error('[ThinkDropLLMBackend] Aborted by caller');
+            err.name = 'AbortError';
+            reject(err);
+          };
+          _abortSignal.addEventListener('abort', onAbort, { once: true });
+        }
 
         onMessage = (data) => {
           try {
@@ -234,13 +258,17 @@ class ThinkDropLLMBackend extends LLMBackend {
 
             if (msg.type === 'llm_stream_start') {
               streamStarted = true;
-              clearTimeout(activeTimeout);
+              // Keep the watchdog armed — the first chunk must arrive within
+              // the idle window, not whenever the provider feels like it.
+              resetTimeout();
 
             } else if (msg.type === 'llm_stream_fallback') {
               // Preferred provider failed — fallback in progress, keep connection alive
               resetTimeout();
 
             } else if (msg.type === 'llm_stream_chunk') {
+              // Every chunk proves liveness — re-arm the idle watchdog.
+              resetTimeout();
               const chunk = msg.payload?.chunk || msg.payload?.text || '';
               const reasoning = msg.payload?.reasoning || '';
               if (chunk) {
@@ -305,6 +333,7 @@ class ThinkDropLLMBackend extends LLMBackend {
         if (onMessage) ws.removeListener('message', onMessage);
         if (onErr) ws.removeListener('error', onErr);
         if (onClose) ws.removeListener('close', onClose);
+        if (onAbort && _abortSignal) _abortSignal.removeEventListener('abort', onAbort);
       } catch (_) {}
       this._releaseWs(ws, _errored);
     }

@@ -668,7 +668,7 @@ module.exports = async function answer(state) {
     let _thinking = '';
     const onReasoning = (r) => { if (r) _thinking += r; };
 
-    const finalAnswer = await backend.generateAnswer(
+    let finalAnswer = await backend.generateAnswer(
       finalQuery,
       payload,
       payload.options,
