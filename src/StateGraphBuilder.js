@@ -35,6 +35,7 @@ const parseProjectNode = require('./nodes/parseProject');
 const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
 const resolveUserContextNode = require('./nodes/resolveUserContext');
 const gatherPlanContextNode = require('./nodes/gatherPlanContext');
+const clarifyNode = require('./nodes/clarify');
 const executeIntrospectNode = require('./nodes/executeIntrospect');
 const executeSettingsNode = require('./nodes/executeSettings');
 const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
@@ -276,6 +277,7 @@ class StateGraphBuilder {
     const nodes = {
       decomposePrompt: (state) => decomposePromptNode({ ...state, logger, llmBackend }),
       resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter, llmBackend }),
+      clarify: (state) => clarifyNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       checkPlanCache: (state) => checkPlanCacheNode({ ...state, logger }),
@@ -311,9 +313,21 @@ class StateGraphBuilder {
     // Intent-based routing (matches DistilBERT classifier intents)
     const edges = {
       start: 'resolveReferences',
-      resolveReferences: 'decomposePrompt',
+      // clarify is the pre-routing resolution gate: needs_clarification → ask
+      // the user (grill batch) + re-classify once; resolved/declined_ack pass.
+      resolveReferences: 'clarify',
+      clarify: 'decomposePrompt',
       decomposePrompt: 'parseIntent',
-      parseIntent: 'checkPlanCache',
+      parseIntent: (state) => {
+        // declined_ack — user refused a card/offer. The decompose guard emitted
+        // a general_knowledge step; route straight to answer. No plan cache,
+        // skill parse, search, or execution — the offered action never runs.
+        if (state._taskClassification?.resolution === 'declined_ack') {
+          logger.info('[StateGraph:Router] declined_ack — routing to answer (acknowledgement only)');
+          return 'answer';
+        }
+        return 'checkPlanCache';
+      },
       checkPlanCache: 'parseSkill',
       parseSkill: (state) => {
         // parseIntent has already run upstream — always proceed to enrichIntent.

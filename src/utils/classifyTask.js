@@ -35,7 +35,7 @@
  */
 
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { CONVERSATION_RECALL_META_RE } = require('./textPatterns.cjs');
+const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE } = require('./textPatterns.cjs');
 
 const CLASSIFY_SYSTEM_PROMPT = `You are a task classifier for a desktop automation assistant.
 
@@ -282,6 +282,48 @@ No explanation. No markdown. Only the JSON object.`;
 const { parseLlmJson } = require('./parseLlmJson');
 
 /**
+ * deriveResolution — collapse a (possibly partial or contradictory) LLM
+ * classification into the pipeline's single authoritative verdict:
+ *
+ *   'resolved'             — a concrete referent/target exists, or the missing
+ *                            detail is a slot that downstream fillers
+ *                            (gatherPlanContext/grill) already own
+ *   'needs_clarification'  — the message carries no usable referent: a bare
+ *                            ack with nothing to attach to, a card reply the
+ *                            classifier couldn't resolve, or a hedged vague/
+ *                            ambiguous turn. The clarify gate asks the user
+ *                            before routing — the literal text never reaches
+ *                            search, planning, or automation.
+ *   'declined_ack'         — a bare refusal to a proactive card or assistant
+ *                            offer. Terminal acknowledgement: never clarify,
+ *                            never execute the offered action.
+ *
+ * This is the ONLY place the verdict is computed — downstream nodes read
+ * `resolution` instead of re-interpreting the individual flags.
+ */
+function deriveResolution(tc, userMessage, hasAttachedCard) {
+  const word = String(userMessage || '').toLowerCase().replace(/[.!?…]+/g, '').trim();
+  const isDecline = BARE_DECLINE_RE.test(word);
+  const isAffirm  = BARE_AFFIRM_RE.test(word);
+
+  // A bare decline to a card/offer is a complete answer — not a task.
+  if (isDecline && (hasAttachedCard || tc.isThoughtReply)) return 'declined_ack';
+
+  // Any concrete referent → downstream nodes have something to work with.
+  if (tc.followUpTarget || tc.activeDocRef || tc.isScreenFollowUp || tc.needsFreshScreen) {
+    return 'resolved';
+  }
+
+  const unattachedCardAck = !!tc.isThoughtReply && (isAffirm || isDecline);
+  const hedgedVague = tc.needsClarification === true
+    && (tc.taskType === 'ambiguous' || tc.taskType === 'query');
+  const orphanAck = isAffirm && !tc.isFollowUp;
+
+  if (unattachedCardAck || hedgedVague || orphanAck) return 'needs_clarification';
+  return 'resolved';
+}
+
+/**
  * Classify the user's task using the LLM.
  *
  * @param {string} userMessage
@@ -330,12 +372,18 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     activeDocRef: null,
     activeDocTarget: null,
     mediaListing: 'none',
+    resolution: 'resolved',
   };
-
-  if (!llmBackend || !userMessage) return _default;
 
   // Classify the user's actual text, not overlay-injected attachment tags.
   const classifiedMessage = _stripAttachmentTags(userMessage) || userMessage;
+  const _hasAttachedCard = (conversationHistory || []).some(m => m.attachedToMessage);
+  const _withResolution = (tc) => {
+    tc.resolution = deriveResolution(tc, classifiedMessage, _hasAttachedCard);
+    return tc;
+  };
+
+  if (!llmBackend || !userMessage) return _withResolution(_default);
 
   // ── Deterministic conversation-recall pre-check ────────────────────────────
   // The LLM sometimes returns isConversationRecall:false for obvious meta-questions
@@ -411,7 +459,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const parsed = parseLlmJson(text, logger, 'classifyTask');
     if (!parsed) {
       logger.debug('[classifyTask] No JSON in response — using default');
-      return _default;
+      return _withResolution(_default);
     }
 
     // Sanitize webAccessMode — only the four known values; requiresDOM forces
@@ -455,7 +503,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // (observed on "print this page for me") — normalize rather than trust.
     const concreteDocRef = activeDocRef === 'file' || activeDocRef === 'url';
 
-    return {
+    return _withResolution({
       taskType:            parsed.taskType           || _default.taskType,
       isFollowUp:          parsedIsFollowUp,
       followUpTarget:      parsedFollowUpTarget,
@@ -478,11 +526,11 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       activeDocRef,
       activeDocTarget:     null, // resolved by caller from live context
       mediaListing:        _VALID_MEDIA_LISTINGS.has(parsed.mediaListing) ? parsed.mediaListing : 'none',
-    };
+    });
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);
-    return _default;
+    return _withResolution(_default);
   }
 }
 
-module.exports = { classifyTask, CLASSIFY_SYSTEM_PROMPT, _stripAttachmentTags };
+module.exports = { classifyTask, deriveResolution, CLASSIFY_SYSTEM_PROMPT, _stripAttachmentTags };

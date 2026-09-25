@@ -352,7 +352,10 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
 }
 
 module.exports = async function decomposePromptV2(state) {
-  const { message, llmBackend, conversationHistory } = state;
+  const { llmBackend, conversationHistory } = state;
+  // resolvedMessage carries the clarify gate's merged answers when they exist —
+  // it is the operative text for decomposition, guards, and sub-prompt content.
+  const message = state.resolvedMessage || state.message;
   const logger = state.logger || console;
 
   // ── Structural fast-paths (not NLU — these are pipeline control signals) ──
@@ -385,6 +388,36 @@ module.exports = async function decomposePromptV2(state) {
   const _MULTI_GOAL_CONJUNCTIONS = /\b(and\s+then|also|after\s+that|additionally|plus|furthermore|then\s+also)\b|;\s*[a-z]/i;
   const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower);
   const _SINGLE_STEP_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser']);
+  // ── Declined-ack guard — checked BEFORE every intent guard ───────────────
+  // resolution==='declined_ack' means the user refused an attached card/offer —
+  // a complete answer, not a task. Emit a single general_knowledge step; the
+  // router sends it straight to 'answer', bypassing search/planning/execution.
+  if (_tc.resolution === 'declined_ack') {
+    logger.info('[Node:DecomposePromptV2] declined_ack — routing to answer (no tool execution)');
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'general_knowledge',
+      confidence: 0.9,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: null,
+      parser: 'declined-ack-guard', intent: 'general_knowledge',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'general_knowledge', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'general_knowledge', 0.9);
+    return {
+      ...state,
+      _decomposedIntent: 'general_knowledge',
+      _decomposedBy: 'declined-ack-guard',
+      intentPlan: subPrompts,
+    };
+  }
   // ── Media-search guard — checked BEFORE the command_automate short-circuit ──
   // classifyTask sets mediaListing when the user wants a SET of media results
   // (image carousel / video cards with links). The web_search intent handles
@@ -588,8 +621,11 @@ module.exports = async function decomposePromptV2(state) {
   // literal text produces nonsense ("yes you can" → Yes You Can! brand results).
   // Route to memory_retrieve instead — the answer node gets the full recent
   // history and can respond from context or ask a clarifying question.
-  if (_tc.isFollowUp && !_tc.followUpTarget && !_hasMultiGoalConjunction) {
-    logger.info('[Node:DecomposePromptV2] Unresolved-follow-up guard: isFollowUp with null followUpTarget — routing to memory_retrieve (answer from history), skipping web_search on literal text');
+  // resolution==='needs_clarification' is the centralized version of the same
+  // verdict: the clarify gate already ran (or was unavailable), so the message
+  // is still unresolved — answer from context, never literal tool execution.
+  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification') && !_hasMultiGoalConjunction) {
+    logger.info(`[Node:DecomposePromptV2] Unresolved-follow-up guard: ${_tc.resolution === 'needs_clarification' ? 'resolution=needs_clarification' : 'isFollowUp with null followUpTarget'} — routing to memory_retrieve (answer from history), skipping web_search on literal text`);
     const subPrompts = [{
       text: message,
       estimatedIntent: 'memory_retrieve',

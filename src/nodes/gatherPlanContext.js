@@ -35,7 +35,9 @@ const MAX_AUTH_ROUNDS = 10; // auth sign-ins don't count against Q&A budget
 
 // ── Grill-Me Phase B: batched question constants ─────────────────────────────
 const GRILL_MAX_ROUNDS = 5;
-const GRILL_MODE = process.env.THINKDROP_GRILL_MODE === '1';
+// Grill mode is ON by default — batched clarifying questions are the standard
+// missing-info UX. Set THINKDROP_GRILL_MODE=0 to opt out (tests, fallback).
+const GRILL_MODE = process.env.THINKDROP_GRILL_MODE !== '0';
 
 // ── Deterministic bypass gate ────────────────────────────────────────────────
 // Returns true when the task is fully specified and clarification cannot add

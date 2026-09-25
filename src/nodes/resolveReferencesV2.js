@@ -14,7 +14,7 @@
  * _taskClassification.followUpTarget (LLM-resolved) so no node needs regex.
  */
 
-const { classifyTask } = require('../utils/classifyTask');
+const { classifyTask, deriveResolution } = require('../utils/classifyTask');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { REFERENTIAL_RE, FILE_WRITE_VERB_RE } = require('../utils/textPatterns.cjs');
 
@@ -516,6 +516,7 @@ module.exports = async function resolveReferencesV2(state) {
       isThoughtReply: false,
       interactiveActions: [],
       webAccessMode: state._taskClassification?.webAccessMode || null,
+      resolution: 'resolved',
     };
   } else {
     _taskClassification = await classifyTask(
@@ -557,7 +558,9 @@ module.exports = async function resolveReferencesV2(state) {
     let _cardId = _thoughtCtx?.id || null;
     let _outcome = null;
     if (_thoughtCtx) {
-      _outcome = _isThoughtReply ? 'user responded' : 'dismissed — user engaged elsewhere';
+      _outcome = _isThoughtReply
+        ? (_ACK_NO.has(_ackWord) ? 'user declined' : 'user responded')
+        : 'dismissed — user engaged elsewhere';
     } else if (_isThoughtReply) {
       const _cardRow = [...conversationHistory].reverse().find(m => m.isThoughtCard && m.thoughtId);
       if (_cardRow) { _cardId = _cardRow.thoughtId; _outcome = 'responded (delayed)'; }
@@ -675,6 +678,16 @@ module.exports = async function resolveReferencesV2(state) {
     } else {
       logger.info('[Node:ResolveReferencesV2] binary confirmation: 1 → keeping interactive');
     }
+  }
+
+  // ── Resolution contract — the pipeline's authoritative "do we know what this
+  // is" verdict. Derived LAST, after every normalization pass above (ack floor,
+  // activeDocRef, path validation, webAccess confirm) has settled the fields it
+  // reads. Downstream: 'needs_clarification' → clarify gate asks the user;
+  // 'declined_ack' → terminal acknowledgement; 'resolved' → normal routing.
+  _taskClassification.resolution = deriveResolution(_taskClassification, message, !!_thoughtCtx);
+  if (_taskClassification.resolution !== 'resolved') {
+    logger.info(`[Node:ResolveReferencesV2] resolution=${_taskClassification.resolution}: "${String(message).slice(0, 60)}"`);
   }
 
   return {

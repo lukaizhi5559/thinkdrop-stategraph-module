@@ -367,6 +367,10 @@ module.exports = async function answer(state) {
   const _isConversationFollowUp = !!state._taskClassification?.isFollowUp;
   const _isMemoryRetrieve = intentType === 'memory_retrieve';
 
+  // declined_ack — user refused a proactive card/offer. The answer must see the
+  // card turn so it can acknowledge the specific decline politely.
+  const _isDeclinedAck = state._taskClassification?.resolution === 'declined_ack';
+
   // ── Conversation-recall meta-questions ──────────────────────────────────────
   // "what did I ask you three prompts ago", "summarize our conversation", etc.
   // classifyTask sets isConversationRecall:true for these (and isFollowUp:false).
@@ -378,7 +382,7 @@ module.exports = async function answer(state) {
   // 1. Follow-up queries that need context interpretation
   // 2. ALL memory_retrieve queries (to prevent date hallucinations)
   // 3. Conversation-recall meta-questions ("what did I ask you three prompts ago")
-  if ((state._needsContextInterpretation || _isConversationFollowUp || _isMemoryRetrieve || _isConversationRecall) && conversationHistory.length > 0) {
+  if ((state._needsContextInterpretation || _isConversationFollowUp || _isMemoryRetrieve || _isConversationRecall || _isDeclinedAck) && conversationHistory.length > 0) {
     systemInstructions += _buildRecallHistoryBlock(conversationHistory, _isConversationRecall);
   }
 
@@ -434,6 +438,12 @@ module.exports = async function answer(state) {
     } else {
       systemInstructions += '\n- Use the provided context\n- Be helpful and concise';
     }
+  }
+
+  // declined_ack: the user refused an offer — acknowledge and stop. Never
+  // answer or act on the offer's content.
+  if (_isDeclinedAck) {
+    systemInstructions += '\n- The user just declined a proactive offer/card. Acknowledge the decline politely in one short sentence. Do NOT answer, summarize, or act on the offer\'s content — it was refused.';
   }
 
   // Activity-query guard: if the user asked about their recent activity/work,
