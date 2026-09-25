@@ -85,6 +85,18 @@ function _isCannedRefusal(text) {
   return _REFUSAL_OPENERS.some(o => n.startsWith(o));
 }
 
+// Degenerate-output detection: providers occasionally emit a valid intro
+// then loop blank lines until the token cap (observed: "Here are some
+// jokes…" + ~250 newlines). 5+ consecutive blank-line segments never appear
+// in legitimate markdown — unambiguous degeneration, safe to retry.
+const _BLANK_RUN_RE = /(\n\s*){5,}/;
+function _isDegenerateAnswer(text) {
+  return typeof text === 'string' && _BLANK_RUN_RE.test(text);
+}
+function _collapseBlankRuns(text) {
+  return typeof text === 'string' ? text.replace(/(\n\s*){3,}/g, '\n\n').trimEnd() : text;
+}
+
 // Build the RECENT CONVERSATION HISTORY block injected into answer prompts.
 // Recall queries ("list my last 8 prompts", "what did I ask 3 ago") get the
 // full loaded window plus a dedicated user-prompts list — interleaved
@@ -675,6 +687,33 @@ module.exports = async function answer(state) {
       isStreaming ? streamCallback : null,
       onReasoning
     );
+
+    // ── Degenerate-output guard ─────────────────────────────────────────
+    // A blank-line loop yields a non-answer wrapped in spam. Retry once
+    // unstreamed (the provider chain rotates between calls, so the retry
+    // lands on a different model); keep the retry only if it isn't
+    // degenerate too. If spam already streamed to the UI, REPLACE the
+    // shown content with the corrected text.
+    if (_isDegenerateAnswer(finalAnswer)) {
+      logger.warn(`[Node:Answer] Degenerate answer detected (${finalAnswer.length} chars) — retrying once`);
+      const streamed = finalAnswer;
+      try {
+        const retryAnswer = await backend.generateAnswer(
+          finalQuery, payload, payload.options, null, onReasoning
+        );
+        if (typeof retryAnswer === 'string' && retryAnswer.trim() && !_isDegenerateAnswer(retryAnswer)) {
+          finalAnswer = retryAnswer;
+        }
+      } catch (retryErr) {
+        logger.warn(`[Node:Answer] Degenerate-answer retry failed: ${retryErr.message}`);
+      }
+      finalAnswer = _collapseBlankRuns(finalAnswer);
+      if (isStreaming && typeof streamCallback === 'function' && finalAnswer !== streamed) {
+        streamCallback('\x00REPLACE\x00' + finalAnswer);
+      }
+    } else {
+      finalAnswer = _collapseBlankRuns(finalAnswer);
+    }
 
     logger.debug(`[Node:Answer] Answer generated (${finalAnswer.length} chars) via ${backend.getInfo().name}`);
 
