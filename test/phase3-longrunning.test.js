@@ -13,7 +13,7 @@
 process.env.LONG_TASK_TIMEOUT_MS = '100';
 
 const taskRunner   = require('../src/nodes/taskRunner');
-const parseIntent  = require('../src/nodes/parseIntent');
+const parseIntent  = require('../src/nodes/parseIntentV2');
 const { runTier1_5 } = require('../../mcp-services/personality-service/src/heartbeat.cjs');
 
 const logger = {
