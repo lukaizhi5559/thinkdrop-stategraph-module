@@ -3,6 +3,7 @@
 const fs   = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
@@ -22,6 +23,19 @@ function _emitIntentDecided(state, intent, confidence) {
       state.progressCallback({ type: 'intent:decided', intent, confidence });
     } catch (_) {}
   }
+  // Stage E shadow mode: compare the deterministic routeTable suggestion
+  // against the path that actually decided. Log-only — no behavior change.
+  // Divergences here are the cutover dataset for replacing the LLM
+  // number-call with the table.
+  try {
+    const shadow = suggestIntent(state._taskClassification, state.resolvedMessage || state.message);
+    const log = state.logger || console;
+    if (shadow && shadow.intent !== intent) {
+      log.info(`[IntentShadow] DIVERGENCE: decided=${intent} table=${shadow.intent} rule=${shadow.rule} msg="${String(state.message || '').slice(0, 80)}"`);
+    } else if (shadow) {
+      log.debug?.(`[IntentShadow] agree: ${intent} (rule=${shadow.rule})`);
+    }
+  } catch (_) { /* shadow logging must never affect routing */ }
 }
 
 /**

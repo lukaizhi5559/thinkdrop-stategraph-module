@@ -40,6 +40,7 @@ const TESTS = [
   'active-doc-routing.test.js',
   'phase2-multiintent.test.js',
   'stage-c-stability.test.js',
+  'route-table.test.js',
   'phase3-longrunning.test.js',
   'tab-flow-tab-map.test.js',
   'lint-synthesize-ordering.test.js',
