@@ -187,6 +187,33 @@ describe('parseIntentV2 — app_automation override convergence check', () => {
   });
 });
 
+describe('decomposePromptV2 — ambient-artifact misresolution guard', () => {
+  it('bare deictic + activeDocRef:file → memory_retrieve (conversational referent)', async () => {
+    // classifyTask resolved "that" in "tell me more about that" to the open
+    // Devin plan file (activeDocRef:'file', followUpTarget:'the plan file in
+    // Devin') instead of the prior recall turn — general_knowledge then
+    // answered about Devin planning (observed Stage-3 failure). A bare
+    // deictic can only refer to the conversation → memory_retrieve.
+    const r = await _decompose('tell me more about that',
+      { generateAnswer: async () => '5' },
+      { taskType: 'query', isFollowUp: true, followUpTarget: 'the plan file in Devin', activeDocRef: 'file' },
+      'memory_retrieve');
+    assertEq(r._decomposedIntent, 'memory_retrieve');
+    // The deictic-continuation guard (runs earlier) now claims bare deictics;
+    // unresolved-followup remains the fallback for the hint-vetoed case.
+    assertEq(r._decomposedBy, 'deictic-continuation-guard');
+  });
+
+  it('deictic naming an artifact noun is NOT misresolved', async () => {
+    // "tell me more about that file" names an artifact — the ambient-file
+    // referent is legitimate; the guard must not claim it.
+    const r = await _decompose('tell me more about that file',
+      { generateAnswer: async () => '5' },
+      { taskType: 'query', isFollowUp: true, followUpTarget: 'plan.md', activeDocRef: 'file' });
+    assertEq(r._decomposedBy !== 'unresolved-followup-guard', true, 'artifact noun → guard must not fire');
+  });
+});
+
 describe('parseIntentV2 — activeDocRef override precondition', () => {
   it('activeDocRef=url + message names the screen → no override (screen referent is explicit)', async () => {
     // classifyTask conflated "the text" with the open Chrome URL —
@@ -212,5 +239,113 @@ describe('parseIntentV2 — activeDocRef override precondition', () => {
     const r = await _parse('explain this file to me',
       { activeDocRef: 'file' });
     assertEq(r.intent.type, 'command_automate');
+  });
+
+  it('activeDocRef=file + window-chrome question → no override (ambient file misref)', async () => {
+    // "read the title of that window" — classifyTask resolved "that window"
+    // to the open plan file (activeDocRef:'file', isFollowUp:true,
+    // followUpTarget:"the title of the window"); the number call correctly
+    // picked screen_intelligence, then the file override clobbered it to
+    // command_automate (observed Stage-3 run-3 flake → plan approval).
+    const r = await _parse('read the title of that window',
+      { activeDocRef: 'file', isFollowUp: true, followUpTarget: 'the title of the window' });
+    assertEq(r.intent.type, 'screen_intelligence');
+  });
+});
+
+describe('decomposePromptV2 — deictic-continuation guard', () => {
+  it('window-chrome question routes via screen guard even without typed flags', async () => {
+    // "read the title of that window" named no surface word — the shared
+    // window-chrome vocabulary is the lexical signal (taskType query).
+    const r = await _decompose('read the title of that window', null,
+      { taskType: 'query', isFollowUp: true, followUpTarget: 'the title of the window', activeDocRef: 'file', webAccessMode: 'none' });
+    assertEq(r._decomposedIntent, 'screen_intelligence');
+    assertEq(r._decomposedBy, 'screen-observation-guard');
+  });
+
+  it('bare deictic + concurring memory hint → memory_retrieve, skipping number call', async () => {
+    // Stage-3 flake: hint said memory_retrieve but the number call picked
+    // general_knowledge (semanticCtx happened to carry the topic — luck, not
+    // design). A bare deictic's referent lives only in the transcript.
+    const backend = { generateAnswer: async () => { throw new Error('number call must not run'); } };
+    const r = await _decompose('tell me more about that', backend,
+      { taskType: 'query', isFollowUp: true, followUpTarget: 'the prior topic', webAccessMode: 'none' },
+      'memory_retrieve');
+    assertEq(r._decomposedIntent, 'memory_retrieve');
+    assertEq(r._decomposedBy, 'deictic-continuation-guard');
+  });
+
+  it('bare deictic + no hint → memory_retrieve (transcript is the referent)', async () => {
+    const backend = { generateAnswer: async () => { throw new Error('number call must not run'); } };
+    const r = await _decompose('when was that', backend,
+      { taskType: 'query' });
+    assertEq(r._decomposedIntent, 'memory_retrieve');
+    assertEq(r._decomposedBy, 'deictic-continuation-guard');
+  });
+
+  it('bare deictic + contradicting hint defers to normal flow', async () => {
+    // An action/search hint vetoes — "do that again" asks to re-run a task.
+    const r = await _decompose('when was that', null,
+      { taskType: 'query', isFollowUp: true, followUpTarget: 'the search' },
+      'web_search');
+    assert(r._decomposedBy !== 'deictic-continuation-guard', 'guard must defer when hint disagrees');
+  });
+
+  it('deictic naming a screen surface stays screen_intelligence (guard order)', async () => {
+    // "what's that on my screen" matches both vocabularies — the referent is
+    // the live screen, so the screen guard must win (runs earlier).
+    const r = await _decompose('what is that on my screen', null,
+      { taskType: 'query' });
+    assertEq(r._decomposedIntent, 'screen_intelligence');
+    assertEq(r._decomposedBy, 'screen-observation-guard');
+  });
+});
+
+describe('decomposePromptV2 — classifyTask suggestedIntent merge', () => {
+  // The merge replaces the redundant second classifier: classifyTask saw the
+  // full context the 5-token number call lacks, so a suggestedIntent that
+  // concurs with (or is unopposed by) the carried hint IS the decision.
+  const _noCall = { generateAnswer: async () => { throw new Error('number call must not run'); } };
+
+  it('suggestedIntent unopposed → decision without the number call', async () => {
+    const r = await _decompose('explain the difference between TCP and UDP', _noCall,
+      { taskType: 'query', suggestedIntent: 'general_knowledge' });
+    assertEq(r._decomposedIntent, 'general_knowledge');
+  });
+
+  it('suggestedIntent + concurring hint → decision without the number call', async () => {
+    const r = await _decompose('who is my wife', _noCall,
+      { taskType: 'query', suggestedIntent: 'memory_retrieve' },
+      'memory_retrieve');
+    assertEq(r._decomposedIntent, 'memory_retrieve');
+  });
+
+  it('contradicting hint → number call arbitrates', async () => {
+    // classifyTask said web_search but comms' deterministic hint says
+    // general_knowledge — disagreement escalates to the number call.
+    let calls = 0;
+    const r = await _decompose('explain how photosynthesis works',
+      { generateAnswer: async () => { calls++; return '5'; } },
+      { taskType: 'query', suggestedIntent: 'web_search' },
+      'general_knowledge');
+    assertEq(calls, 1, 'number call must run on hint conflict');
+    assertEq(r._decomposedIntent, 'general_knowledge');
+  });
+
+  it('suggestedIntent=multi_step → full decomposition, no number call', async () => {
+    const plan = [{ text: 'find X', estimatedIntent: 'web_search', order: 0, dependsOn: [], isLongRunning: false },
+                  { text: 'email it', estimatedIntent: 'command_automate', order: 1, dependsOn: [0], isLongRunning: false }];
+    const backend = { generateAnswer: async () => JSON.stringify({ subPrompts: plan }) };
+    const r = await _decompose('find X and email it to me', backend,
+      { taskType: 'query', suggestedIntent: 'multi_step' });
+    assertEq(r.intentPlan.length, 2);
+    assertEq(r._decomposedBy, 'llm');
+  });
+
+  it('no suggestedIntent → number call runs as before', async () => {
+    const r = await _decompose('what is the capital of France',
+      { generateAnswer: async () => '5' },
+      { taskType: 'query' });
+    assertEq(r._decomposedIntent, 'general_knowledge');
   });
 });

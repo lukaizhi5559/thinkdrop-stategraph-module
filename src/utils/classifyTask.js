@@ -95,7 +95,8 @@ Output ONLY valid JSON with exactly these fields:
   "screenOutputKind": "text" | "emoji" | "image" | "chart" | "effect" | "alert" | "deck" | "scene" | null,
   "screenOutputContent": "<literal content to display>" | null,
   "screenOutputMood": "neutral" | "warm" | "happy" | "sad" | "alert" | "playful" | "calm" | null,
-  "screenOutputPayload": { ... } | null
+  "screenOutputPayload": { ... } | null,
+  "suggestedIntent": "command_automate" | "screen_intelligence" | "web_search" | "memory_store" | "memory_retrieve" | "general_knowledge" | "greeting" | "screen_display" | "multi_step" | null
 }
 
 Field rules:
@@ -321,6 +322,18 @@ EXAMPLES (imperative screen actions — taskType stays "local_system"):
   User: "highlight the submit button on this page" → {"taskType":"local_system","isFollowUp":false,"followUpTarget":null}
   User: "scroll down on the current page" → {"taskType":"local_system","isFollowUp":false,"followUpTarget":null}
 
+- suggestedIntent: the single-step intent this message routes to, derived FROM the fields you just set — not an independent guess:
+  - taskType in {local_file, local_system, app_automation, browser, messaging, scheduling} or any interactive action → "command_automate"
+  - passive screen observation (see the "query" rule) → "screen_intelligence"
+  - isScreenOutput → "screen_display"
+  - isConversationRecall, isActivityQuery, or an unresolved follow-up whose referent is the conversation itself → "memory_retrieve"
+  - memory store ("remember/note that my X is Y") → "memory_store"
+  - live/time-sensitive info needs (news, prices, "latest", weather) → "web_search"
+  - timeless knowledge, math, definitions → "general_knowledge"
+  - pure greeting/chitchat → "greeting"
+  - 2+ truly independent goals needing separate steps → "multi_step"
+  - genuinely can't tell → null
+
 No explanation. No markdown. Only the JSON object.`;
 
 // Extract and parse JSON from LLM output using the shared parseLlmJson utility.
@@ -417,6 +430,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     activeDocRef: null,
     activeDocTarget: null,
     mediaListing: 'none',
+    suggestedIntent: null,
     isScreenOutput: false,
     screenOutputAction: null,
     screenOutputKind: null,
@@ -570,6 +584,14 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
 
     const _VALID_MEDIA_LISTINGS = new Set(['none', 'image', 'video']);
 
+    // suggestedIntent — the single-step intent the classifier itself implies.
+    // Whitelisted; invalid/missing → null (decompose falls back to the number
+    // call). 'multi_step' means the message needs the full llmDecompose path.
+    const _VALID_SUGGESTED_INTENTS = new Set([
+      'command_automate', 'screen_intelligence', 'web_search', 'memory_store',
+      'memory_retrieve', 'general_knowledge', 'greeting', 'screen_display', 'multi_step',
+    ]);
+
     // Deterministic consistency: a resolved file/url target never needs screen
     // OCR. The LLM has emitted isScreenFollowUp:true alongside activeDocRef:"url"
     // (observed on "print this page for me") — normalize rather than trust.
@@ -598,6 +620,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       activeDocRef,
       activeDocTarget:     null, // resolved by caller from live context
       mediaListing:        _VALID_MEDIA_LISTINGS.has(parsed.mediaListing) ? parsed.mediaListing : 'none',
+      suggestedIntent:     _VALID_SUGGESTED_INTENTS.has(parsed.suggestedIntent) ? parsed.suggestedIntent : null,
       isScreenOutput:      !!parsed.isScreenOutput,
       screenOutputAction:  ['show', 'clear'].includes(parsed.screenOutputAction) ? parsed.screenOutputAction : null,
       screenOutputKind:    ['text', 'emoji', 'image', 'chart', 'effect', 'alert', 'deck', 'scene'].includes(parsed.screenOutputKind) ? parsed.screenOutputKind : null,

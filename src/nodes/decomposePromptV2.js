@@ -7,7 +7,7 @@ const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
-const { SCREEN_OBSERVATION_RE } = require('../utils/textPatterns.cjs');
+const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE } = require('../utils/textPatterns.cjs');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeDecomposeLog(entry) {
@@ -455,6 +455,19 @@ module.exports = async function decomposePromptV2(state) {
   const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower);
   const _SINGLE_STEP_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser']);
   const _ACTION_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser', 'messaging', 'scheduling']);
+  // Ambient-artifact misresolution: a bare-deictic continuation ("tell me
+  // more about that", "when was that") can only refer to the conversation,
+  // yet classifyTask sometimes resolves the deictic to the open file/url
+  // (observed: activeDocRef:'file' + followUpTarget:'the plan file in Devin'
+  // → general_knowledge answered about Devin planning instead of the prior
+  // recall). Prompt rule 140 already bans the conflation — enforce it here:
+  // the veto suppresses the query-follow-up web_search AND routes to
+  // memory_retrieve via the unresolved-follow-up guard below.
+  const _ambientMisref = DEICTIC_CONTINUATION_RE.test(message)
+    && ['file', 'url'].includes(_tc.activeDocRef)
+    // A deictic followed by an artifact/content noun ("that file", "this
+    // error") legitimately resolves to the ambient referent — exempt it.
+    && !/\b(?:that|this|it|those|them)\s+(?:file|page|site|website|tab|document|doc|folder|screen|window|app|dialog|error|link|article|video|song|post|image|photo|picture|recipe|message|email)\b/i.test(message);
   // ── Declined-ack guard — checked BEFORE every intent guard ───────────────
   // resolution==='declined_ack' means the user refused an attached card/offer —
   // a complete answer, not a task. Emit a single general_knowledge step; the
@@ -654,6 +667,7 @@ module.exports = async function decomposePromptV2(state) {
     !_tc.needsFreshScreen &&
     !_tc.targetService &&
     !_tc.requiresDOM &&
+    !_ambientMisref &&
     !_hasMultiGoalConjunction
   ) {
     logger.info(`[Node:DecomposePromptV2] Query-follow-up guard: routing to web_search for resolved topic "${_tc.followUpTarget}"`);
@@ -800,6 +814,44 @@ module.exports = async function decomposePromptV2(state) {
     };
   }
 
+  // ── Deictic-continuation guard — AFTER the screen guard, BEFORE the
+  // follow-up guard and number call ─────────────────────────────────────────
+  // A bare deictic ("tell me more about that", "when was that") carries its
+  // referent entirely in the conversation transcript — memory_retrieve is the
+  // only intent with transcript access. Left to the number call it flaked to
+  // general_knowledge (observed Stage-3 runs 1-2: semanticCtx happened to
+  // carry the topic so the answer looked right, but the route lacked the
+  // transcript). A contradicting hint vetoes — an action/search deictic
+  // ("do that again") asks to re-run a task, not recall it.
+  if (DEICTIC_CONTINUATION_RE.test(message)
+      && !_hasMultiGoalConjunction
+      && (!_carriedHint || _carriedHint === 'memory_retrieve')) {
+    logger.info('[Node:DecomposePromptV2] Deictic-continuation guard: bare deictic resolves via transcript — routing to memory_retrieve, skipping number call');
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'memory_retrieve',
+      confidence: 0.85,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'deictic-continuation-guard', intent: 'memory_retrieve',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'memory_retrieve', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'memory_retrieve', 0.85);
+    return {
+      ...state,
+      _decomposedIntent: 'memory_retrieve',
+      _decomposedBy: 'deictic-continuation-guard',
+      intentPlan: subPrompts,
+    };
+  }
+
   // ── Unresolved-follow-up guard ────────────────────────────────────────────
   // When classifyTask flagged isFollowUp but could not resolve a concrete
   // followUpTarget, the message is a referent-less continuation (e.g. a bare
@@ -818,8 +870,8 @@ module.exports = async function decomposePromptV2(state) {
     || _tc.isScreenFollowUp === true
     || _tc.needsFreshScreen === true
     || SCREEN_OBSERVATION_RE.test(message);
-  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification') && !_hasMultiGoalConjunction && !_screenReferent) {
-    logger.info(`[Node:DecomposePromptV2] Unresolved-follow-up guard: ${_tc.resolution === 'needs_clarification' ? 'resolution=needs_clarification' : 'isFollowUp with null followUpTarget'} — routing to memory_retrieve (answer from history), skipping web_search on literal text`);
+  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification' || _ambientMisref) && !_hasMultiGoalConjunction && !_screenReferent) {
+    logger.info(`[Node:DecomposePromptV2] Unresolved-follow-up guard: ${_ambientMisref ? 'bare deictic misresolved to ambient ' + _tc.activeDocRef : (_tc.resolution === 'needs_clarification' ? 'resolution=needs_clarification' : 'isFollowUp with null followUpTarget')} — routing to memory_retrieve (answer from history), skipping web_search on literal text`);
     const subPrompts = [{
       text: message,
       estimatedIntent: 'memory_retrieve',
@@ -886,7 +938,27 @@ module.exports = async function decomposePromptV2(state) {
   // Note: _llmDateRange is lost on the single-step path — retrieveMemory.js has a
   // 3-layer fallback (Layer 1: _llmDateRange, Layer 2: regex parseDateRange,
   // Layer 3: LLM fallback) so this is safe.
-  let _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint);
+  // ── classifyTask/number-call merge ─────────────────────────────────────────
+  // classifyTask's suggestedIntent was emitted by the same call that produced
+  // the typed fields — it saw the 16-turn history, semantic context, and
+  // ambient refs the 5-token number call lacks. When it concurs with the
+  // carried hint (or the hint abstains), it IS the decision — the second
+  // classification adds flake surface, not information (observed: identical
+  // prompts alternating intents across runs). A contradicting hint sends the
+  // question to the number call as tiebreaker — its internal hint-veto still
+  // applies there. 'multi_step' skips straight to full decomposition.
+  let _fastDecision;
+  const _suggestedIntent = typeof _tc.suggestedIntent === 'string' ? _tc.suggestedIntent : null;
+  const _suggestedIdx = _suggestedIntent ? _SINGLE_STEP_INTENTS.indexOf(_suggestedIntent) : -1;
+  if (_suggestedIntent === 'multi_step') {
+    logger.info('[Node:DecomposePromptV2] classifyTask suggestedIntent=multi_step — skipping number call, running full decomposition');
+    _fastDecision = 7;
+  } else if (_suggestedIdx >= 0 && (!_carriedHint || _carriedHint === _suggestedIntent)) {
+    logger.info(`[Node:DecomposePromptV2] classifyTask suggestedIntent=${_suggestedIntent} (hint=${_carriedHint || 'none'} — concur/abstain) — skipping number call`);
+    _fastDecision = _suggestedIdx;
+  } else {
+    _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint);
+  }
 
   // Contradiction check: command_automate is the heaviest route (plan +
   // approval + tool exec). When classifyTask already typed the message as a

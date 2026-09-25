@@ -16,7 +16,7 @@
 
 const { classifyTask, deriveResolution } = require('../utils/classifyTask');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { REFERENTIAL_RE, FILE_WRITE_VERB_RE } = require('../utils/textPatterns.cjs');
+const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE } = require('../utils/textPatterns.cjs');
 
 /**
  * Binary web-access confirmation — runs only when classifyTask returns
@@ -255,20 +255,32 @@ module.exports = async function resolveReferencesV2(state) {
       // Fetch in parallel: recent window (handles coreferences like "that"/"it")
       // + cross-session semantic matches (finds older relevant messages buried
       // under recent unrelated ones, including from rotated sessions).
+      // Semantic search is referential-only: it exists to resolve prior-turn
+      // referents, so messages that can't refer to history (no demonstrative,
+      // deictic, recall, or episodic signal) skip the embedding round-trip —
+      // it ran on every prompt but only ever produced usable context for
+      // referential ones.
+      const _needsSemanticSearch =
+        REFERENTIAL_RE.test(message || '')
+        || DEICTIC_CONTINUATION_RE.test(message || '')
+        || CONVERSATION_RECALL_RE.test(message || '')
+        || EPISODIC_RE.test(message || '');
       const [histResult, searchResult] = await Promise.all([
         mcpAdapter.callService('conversation', 'message.list', {
           sessionId,
           limit: 20,
           direction: 'DESC',
         }, _ENRICH_OPTS),
-        mcpAdapter.callService('conversation', 'message.search', {
-          sessionId,
-          query: message,
-          limit: 15,
-          includeRecent: 0, // recent messages are already covered by message.list
-          minSimilarity: 0.3,
-          searchAllSessions: true,
-        }, _ENRICH_OPTS).catch(() => null), // best-effort — semantic search is non-blocking
+        _needsSemanticSearch
+          ? mcpAdapter.callService('conversation', 'message.search', {
+            sessionId,
+            query: message,
+            limit: 15,
+            includeRecent: 0, // recent messages are already covered by message.list
+            minSimilarity: 0.3,
+            searchAllSessions: true,
+          }, _ENRICH_OPTS).catch(() => null) // best-effort — semantic search is non-blocking
+          : Promise.resolve(null),
       ]);
 
       // Recent window (handles coreferences: "that", "it", "yes do it")
@@ -459,8 +471,19 @@ module.exports = async function resolveReferencesV2(state) {
   // is frontmost. We fetch it BEFORE classifyTask so the classifier LLM can
   // resolve deictic references ("this file", "it") against the live active file
   // instead of stale conversation history.
+  // Fetch lazily: the live app/file context only matters when the message
+  // could actually refer to it — an artifact noun ("the file", "that window"),
+  // a screen-observation utterance, or an action verb bound to a demonstrative
+  // ("print this", "open it"). Withholding it from context-free prompts is
+  // both a saved MCP call and a correctness fix: it removes the ambient
+  // misresolution vector (classifyTask resolving a bare "that" to whatever
+  // file happens to be open — the Stage-3 "tell me more about that" flake).
+  const _needsAmbientCtx =
+    AMBIENT_ARTIFACT_RE.test(message || '')
+    || SCREEN_OBSERVATION_RE.test(message || '')
+    || (ACTION_VERB_RE.test(message || '') && REFERENTIAL_RE.test(message || ''));
   let _activeAppContext = null;
-  if (mcpAdapter) {
+  if (mcpAdapter && _needsAmbientCtx) {
     try {
       const ctxResult = await mcpAdapter.callService('user-memory', 'memory.getActiveAppContext', {}, _ENRICH_OPTS);
       const ctxData = ctxResult?.data || ctxResult;
