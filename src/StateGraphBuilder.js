@@ -1036,6 +1036,27 @@ class StateGraphBuilder {
             carriedIntent:     null,
             enrichmentNeeded:  [],
             matchedSkillName:  null,
+            // Referent + pause/verdict state from the previous step must not
+            // bleed into the next one — a queued step is a fresh sub-intent,
+            // not a reply to the same card/question.
+            pendingQuestion:   null,
+            reviewVerdict:     null,
+            evaluationVerdict: null,
+            evaluationFix:     null,
+            recoveryContext:   null,
+            singleStepReplan:  null,
+            scoutPending:      false,
+            _thoughtAttachment: null,
+            _needsFreshScreen: false,
+            _postScreenIntent: null,
+            _taskClassification: state._taskClassification ? {
+              ...state._taskClassification,
+              isFollowUp:        false,
+              isThoughtReply:    false,
+              followUpTarget:    null,
+              needsClarification: false,
+              resolution:        'resolved',
+            } : null,
           });
 
           return 'enrichIntent';

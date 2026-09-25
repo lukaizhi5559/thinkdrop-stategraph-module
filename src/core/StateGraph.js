@@ -64,8 +64,12 @@ class StateGraph {
     };
 
     let currentNode = this.startNode;
-    const visited = new Set();
-    const maxIterations = 50; // Prevent infinite loops
+    // Per-node visit counts for real loop detection. Recovery cycles
+    // (execute → evaluate → recover → execute) legitimately revisit a node
+    // a few times; more than MAX_NODE_VISITS means the graph is stuck.
+    const visitCount = new Map();
+    const MAX_NODE_VISITS = 5;
+    const maxIterations = 50; // Hard bound — safety net behind loop detection
     let iterations = 0;
 
     while (currentNode && currentNode !== 'end' && iterations < maxIterations) {
@@ -79,14 +83,18 @@ class StateGraph {
         break;
       }
 
-      // Check for infinite loops
-      const visitKey = `${currentNode}_${iterations}`;
-      if (visited.has(visitKey) && iterations > 10) {
-        this.logger.warn(`[StateGraph] Possible infinite loop detected at node: ${currentNode}`);
-        state.error = `Infinite loop detected at node: ${currentNode}`;
+      // Loop detection: a node re-entered more than MAX_NODE_VISITS times
+      // means an edge cycle is stuck (e.g. recovery ping-pong). The old check
+      // keyed on `${node}_${iterations}` — unique every pass — so it could
+      // never fire; only maxIterations bounded the run.
+      const visits = (visitCount.get(currentNode) || 0) + 1;
+      visitCount.set(currentNode, visits);
+      if (visits > MAX_NODE_VISITS) {
+        this.logger.warn(`[StateGraph] Loop detected: node "${currentNode}" entered ${visits} times — aborting run`);
+        state.error = `Loop detected: node "${currentNode}" entered ${visits} times`;
+        state.failedNode = currentNode;
         break;
       }
-      visited.add(visitKey);
 
       // Execute node
       const nodeStartTime = Date.now();
