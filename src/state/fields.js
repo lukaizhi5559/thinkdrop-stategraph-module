@@ -14,6 +14,10 @@
  *   'session' — survives across runs (persisted / carried via resume)
  *
  * Not executable — documentation-as-code. Add new _fields here first.
+ *
+ * Node contract: a node may return a partial patch — the engine merges it via
+ * Object.assign and records trace from `updatedState.trace || state.trace`.
+ * Nodes do NOT need to spread `...state` just to preserve trace.
  */
 module.exports = {
   // ── Classification / resolution (resolveReferencesV2 + clarify) ──────────

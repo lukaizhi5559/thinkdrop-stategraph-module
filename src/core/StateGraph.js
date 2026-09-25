@@ -126,9 +126,12 @@ class StateGraph {
         // Capture output state for trace
         const outputSnapshot = this._captureStateSnapshot(updatedState);
 
-        // Record trace
+        // Record trace. Nodes may return a partial patch (no `trace` field) —
+        // fall back to the live state.trace array instead of assuming the
+        // node spread `...state` through.
         const duration = Date.now() - nodeStartTime;
-        updatedState.trace.push({
+        const traceArr = Array.isArray(updatedState.trace) ? updatedState.trace : state.trace;
+        traceArr.push({
           node: currentNode,
           duration,
           timestamp: new Date().toISOString(),
