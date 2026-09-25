@@ -19,7 +19,7 @@
  *      ("show it on the screen" → the previous answer)
  *   4. state.synthesisAnswer / state.answer
  *
- * Returns { ...state, _forceAnswerContext } and routes to `answer` — the
+ * Returns { ...state, _directAnswer } and routes to `answer` — the
  * overlay shows a brief ack while the GhostLayer paints the display.
  */
 
@@ -80,7 +80,7 @@ module.exports = async function screenOutput(state) {
     const res = await _post('/screen/clear', {}, logger);
     return {
       ...state,
-      _forceAnswerContext: res.ok
+      _directAnswer: res.ok
         ? '## Screen\n\nCleared the screen.'
         : `## Screen\n\nCouldn't reach the screen output (${res.error || `HTTP ${res.status}`}). Is the app fully started?`,
     };
@@ -122,10 +122,14 @@ module.exports = async function screenOutput(state) {
       if (!payload.chart) {
         return {
           ...state,
-          _forceAnswerContext: '## Screen\n\nNo chart data on hand — give me the numbers (e.g. "pie chart: apples 5, bananas 3") or run a query first.',
+          _directAnswer: '## Screen\n\nNo chart data on hand — give me the numbers (e.g. "pie chart: apples 5, bananas 3") or run a query first.',
         };
       }
       if (tc.screenOutputContent) payload.title = tc.screenOutputContent;
+      // Interactive by default: ant-design-charts tooltips/legends need real
+      // mouse events, which requires lifting click-through (blocking:true).
+      // The window captures input until Esc/click-outside/clear.
+      if (payload.blocking == null) payload.blocking = true;
       break;
     }
     case 'deck': {
@@ -138,9 +142,11 @@ module.exports = async function screenOutput(state) {
       if (!payload.deck) {
         return {
           ...state,
-          _forceAnswerContext: '## Screen\n\nNo slides on hand — describe the deck (e.g. "slides: Intro / Goals / Next steps") or generate the content first.',
+          _directAnswer: '## Screen\n\nNo slides on hand — describe the deck (e.g. "slides: Intro / Goals / Next steps") or generate the content first.',
         };
       }
+      // Deck controls are click zones — dead without lifted click-through.
+      if (payload.deck && payload.deck.controls && payload.blocking == null) payload.blocking = true;
       break;
     }
     case 'alert': {
@@ -152,7 +158,7 @@ module.exports = async function screenOutput(state) {
       if (!payload.text && !payload.title) {
         return {
           ...state,
-          _forceAnswerContext: '## Screen\n\nWhat should the alert say?',
+          _directAnswer: '## Screen\n\nWhat should the alert say?',
         };
       }
       break;
@@ -171,7 +177,7 @@ module.exports = async function screenOutput(state) {
       else {
         return {
           ...state,
-          _forceAnswerContext: '## Screen\n\nNo image URL or file path found in that request. Try "show this image on the screen: <url-or-path>".',
+          _directAnswer: '## Screen\n\nNo image URL or file path found in that request. Try "show this image on the screen: <url-or-path>".',
         };
       }
       if (tc.screenOutputContent) payload.caption = tc.screenOutputContent;
@@ -188,7 +194,7 @@ module.exports = async function screenOutput(state) {
       if (!content) {
         return {
           ...state,
-          _forceAnswerContext: '## Screen\n\nNothing on hand to show — what should I put up?',
+          _directAnswer: '## Screen\n\nNothing on hand to show — what should I put up?',
         };
       }
       payload.text = content;
@@ -209,14 +215,14 @@ module.exports = async function screenOutput(state) {
   if (!res.ok) {
     return {
       ...state,
-      _forceAnswerContext: `## Screen\n\nCouldn't put that on screen (${res.error || `HTTP ${res.status}`}). Is the app fully started?`,
+      _directAnswer: `## Screen\n\nCouldn't put that on screen (${res.error || `HTTP ${res.status}`}). Is the app fully started?`,
     };
   }
 
   logger.info(`[Node:ScreenOutput] displayed id=${res.json?.id} kind=${payload.kind}`);
   return {
     ...state,
-    _forceAnswerContext: kind === 'effect'
+    _directAnswer: kind === 'effect'
       ? `## Screen\n\nOn screen — ${payload.effect}.`
       : '## Screen\n\nOn screen.',
   };

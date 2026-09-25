@@ -148,6 +148,49 @@ describe('classifyTask — phantom targetService guard', () => {
   });
 });
 
+describe('classifyTask — deterministic screen-output detector', () => {
+  const _falseLLM = { generateAnswer: async () => JSON.stringify({ taskType: 'local_system', isScreenOutput: false }) };
+
+  it('"show on my screen" forces isScreenOutput even when LLM says false', async () => {
+    const r = await classifyTask('show on my screen', [], _falseLLM, _noopLogger);
+    assertEq(r.isScreenOutput, true);
+    assertEq(r.screenOutputAction, 'show');
+    assertEq(r.screenOutputKind, 'text');
+  });
+
+  it('"clear the screen" forces action=clear', async () => {
+    const r = await classifyTask('clear the screen', [], _falseLLM, _noopLogger);
+    assertEq(r.isScreenOutput, true);
+    assertEq(r.screenOutputAction, 'clear');
+  });
+
+  it('"what\'s on my screen" does NOT trigger (reading, not displaying)', async () => {
+    const r = await classifyTask("what's on my screen", [], _falseLLM, _noopLogger);
+    assertEq(r.isScreenOutput, false);
+  });
+
+  it('detector survives a total LLM failure', async () => {
+    const r = await classifyTask('show it on the screen', [], { generateAnswer: async () => { throw new Error('down'); } }, _noopLogger);
+    assertEq(r.isScreenOutput, true);
+    assertEq(r.screenOutputAction, 'show');
+  });
+});
+
+describe('answer — _directAnswer short-circuit', () => {
+  it('returns the direct answer without calling the LLM backend', async () => {
+    const answer = require('../src/nodes/answer.js');
+    const r = await answer({
+      logger: _noopLogger,
+      message: 'show it on the screen',
+      _directAnswer: '## Screen\n\nOn screen.',
+      llmBackend: { generateAnswer: async () => { throw new Error('LLM must not be called'); } },
+      conversationHistory: [],
+    });
+    assertEq(r.answer, '## Screen\n\nOn screen.');
+    assertEq(r.metadata.answerSource, 'direct');
+  });
+});
+
 describe('decomposePromptV2 — screen-output guard', () => {
   it('isScreenOutput → screen_display single-step', async () => {
     const r = await _decompose('show it on the screen', {
@@ -177,6 +220,40 @@ describe('decomposePromptV2 — screen-output guard', () => {
   it('isScreenOutput false → guard does not fire', async () => {
     const r = await _decompose('what time is it', { taskType: 'local_system' });
     assert(r._decomposedBy !== 'screen-output-guard', `guard fired unexpectedly (got ${r._decomposedBy})`);
+  });
+
+  it('non-referential fetch content → web_search → screen_display two-step', async () => {
+    const r = await _decompose('show me john 3:16 on my screen', {
+      taskType: 'browser', webAccessMode: 'public_read', isScreenOutput: true, screenOutputAction: 'show',
+    });
+    assertEq(r._decomposedBy, 'screen-output-guard');
+    assertEq(r.intentPlan.length, 2);
+    assertEq(r.intentPlan[0].estimatedIntent, 'web_search');
+    assertEq(r.intentPlan[1].estimatedIntent, 'screen_display');
+    assertEq(r.intentPlan[1].dependsOn[0], 0);
+  });
+
+  it('referential phrasing stays single-step', async () => {
+    const r = await _decompose('show the whole chapter on my screen', {
+      taskType: 'local_system', isScreenOutput: true, screenOutputAction: 'show',
+    });
+    assertEq(r._decomposedBy, 'screen-output-guard');
+    assertEq(r.intentPlan.length, 1);
+    assertEq(r.intentPlan[0].estimatedIntent, 'screen_display');
+  });
+
+  it('inline literal content stays single-step', async () => {
+    const r = await _decompose('show hello world on the screen', {
+      taskType: 'local_system', isScreenOutput: true, screenOutputAction: 'show', screenOutputContent: 'hello world',
+    });
+    assertEq(r.intentPlan.length, 1);
+  });
+
+  it('effect kind never gets a fetch step', async () => {
+    const r = await _decompose('make fireworks on my screen', {
+      taskType: 'local_system', isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'effect',
+    });
+    assertEq(r.intentPlan.length, 1);
   });
 });
 
@@ -221,7 +298,7 @@ describe('screenOutput node', () => {
       });
       assertEq(posted.length, 1);
       assert(posted[0].url.endsWith('/screen/clear'), `expected /screen/clear, got ${posted[0].url}`);
-      assert(/cleared/i.test(r._forceAnswerContext), 'ack missing');
+      assert(/cleared/i.test(r._directAnswer), 'ack missing');
     });
 
     // show + explicit content → POST /screen/display with literal text
@@ -236,7 +313,7 @@ describe('screenOutput node', () => {
       assert(posted[0].url.endsWith('/screen/display'));
       assertEq(posted[0].body.kind, 'text');
       assertEq(posted[0].body.text, 'hello world');
-      assert(/on screen/i.test(r._forceAnswerContext));
+      assert(/on screen/i.test(r._directAnswer));
     });
 
     // show with no explicit content → last assistant message
@@ -317,6 +394,22 @@ describe('screenOutput node', () => {
       assertEq(posted[0].body.kind, 'chart');
       assertEq(posted[0].body.chart.type, 'pie');
       assertEq(posted[0].body.chart.data.length, 1);
+      // Interactive by default — the ant charts need real mouse events.
+      assertEq(posted[0].body.blocking, true);
+    });
+
+    // explicit blocking:false in the classifier payload is respected
+    await _withMockFetch(null, async (posted) => {
+      await screenOutput({
+        logger: _noopLogger,
+        message: 'ambient pie chart on the screen',
+        _taskClassification: {
+          isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart',
+          screenOutputPayload: { chart: { type: 'pie', data: [{ label: 'a', value: 1 }] }, blocking: false },
+        },
+        conversationHistory: [],
+      });
+      assertEq(posted[0].body.blocking, false);
     });
 
     // chart kind → step-result object supplies the chart
@@ -354,7 +447,7 @@ describe('screenOutput node', () => {
         conversationHistory: [],
       });
       assertEq(posted.length, 0);
-      assert(/no slides/i.test(r._forceAnswerContext));
+      assert(/no slides/i.test(r._directAnswer));
     });
 
     // nothing to display → honest failure, no POST
@@ -366,7 +459,7 @@ describe('screenOutput node', () => {
         conversationHistory: [{ role: 'user', content: 'hi' }],
       });
       assertEq(posted.length, 0);
-      assert(/nothing on hand/i.test(r._forceAnswerContext));
+      assert(/nothing on hand/i.test(r._directAnswer));
     });
 
     // server unreachable → honest failure
@@ -380,7 +473,7 @@ describe('screenOutput node', () => {
           _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputContent: 'hi' },
           conversationHistory: [],
         });
-        assert(/couldn't/i.test(r._forceAnswerContext), `expected failure ack, got: ${r._forceAnswerContext}`);
+        assert(/couldn't/i.test(r._directAnswer), `expected failure ack, got: ${r._directAnswer}`);
       } finally { global.fetch = _realFetch; }
     }
   });

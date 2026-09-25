@@ -37,6 +37,32 @@
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE } = require('./textPatterns.cjs');
 
+// ── Deterministic screen-output detection ──────────────────────────────────
+// The LLM's isScreenOutput flag is advisory — phrasing is unambiguous enough
+// that a regex is more reliable (observed: identical "show on my screen"
+// messages classified both true and false on different turns). The detector
+// only ever FORCES the flag on; it never clears an LLM true.
+const _SCREEN_SHOW_RE = /\b(show|display|put|project|paint|present|pop|throw|bring|make|give)\b[^.!?]*\bon\s+(?:the\s+|my\s+)?screen\b/i;
+const _SCREEN_CLEAR_RE = /\b(clear|dismiss|hide|close|wipe|remove|erase)\b[\w\s'!]*\bscreen\b/i;
+const _SCREEN_OFF_RE = /\btake\s+(?:that|it|this|them)\s+off\b[^.!?]*\bscreen\b/i;
+
+function detectScreenOutput(userMessage) {
+  const m = String(userMessage || '');
+  if (_SCREEN_CLEAR_RE.test(m) || _SCREEN_OFF_RE.test(m)) return 'clear';
+  if (_SCREEN_SHOW_RE.test(m)) return 'show';
+  return null;
+}
+
+/** Force screen-output fields when the detector fires but the LLM demurred. */
+function _applyScreenDetect(result, userMessage) {
+  const action = detectScreenOutput(userMessage);
+  if (!action) return result;
+  result.isScreenOutput = true;
+  if (action === 'clear' || !result.screenOutputAction) result.screenOutputAction = action;
+  if (action === 'show' && !result.screenOutputKind) result.screenOutputKind = 'text';
+  return result;
+}
+
 const CLASSIFY_SYSTEM_PROMPT = `You are a task classifier for a desktop automation assistant.
 
 Given the user's message and recent conversation history, classify the task.
@@ -545,7 +571,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // (observed on "print this page for me") — normalize rather than trust.
     const concreteDocRef = activeDocRef === 'file' || activeDocRef === 'url';
 
-    return _withResolution({
+    return _applyScreenDetect(_withResolution({
       taskType:            parsed.taskType           || _default.taskType,
       isFollowUp:          parsedIsFollowUp,
       followUpTarget:      parsedFollowUpTarget,
@@ -582,11 +608,11 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
           return s.length <= 51200 ? JSON.parse(s) : null;
         } catch (_) { return null; }
       })(),
-    });
+    }), userMessage);
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);
-    return _withResolution(_default);
+    return _applyScreenDetect(_withResolution(_default), userMessage);
   }
 }
 
-module.exports = { classifyTask, deriveResolution, CLASSIFY_SYSTEM_PROMPT, _stripAttachmentTags };
+module.exports = { classifyTask, deriveResolution, detectScreenOutput, CLASSIFY_SYSTEM_PROMPT, _stripAttachmentTags };

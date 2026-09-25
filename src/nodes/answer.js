@@ -165,6 +165,18 @@ module.exports = async function answer(state) {
       : String(queryMessage);
   }
 
+  // Direct-answer short-circuit: nodes that already know the exact user-facing
+  // text (screen_display acks, deterministic failures) set _directAnswer and
+  // skip the LLM entirely — _forceAnswerContext is only a prompt hint the
+  // model can override, which produced off-script answers for screen output.
+  if (typeof state._directAnswer === 'string' && state._directAnswer.trim()) {
+    return {
+      ...state,
+      answer: state._directAnswer,
+      metadata: { ...state.metadata, answerSource: 'direct' },
+    };
+  }
+
   // Only stream on first attempt - retries would cause double responses
   const isStreaming = typeof streamCallback === 'function' && retryCount === 0;
 

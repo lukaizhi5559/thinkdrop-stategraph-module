@@ -70,7 +70,7 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - EXAMPLES of command_automate (user info + action): "send my family info via email" → command_automate | "email my wife's number to John" → command_automate | "post about my mom on Facebook" → command_automate | "share my contact list" → command_automate
 - PRIORITY RULE - KNOWLEDGE vs SEARCH vs ACTION (when no specific website/tool is mentioned): For general questions without browser/tool interaction: Use general_knowledge for math/calculations ("convert 88s to minutes", "what is 5*7"), timeless facts ("who wrote Pride and Prejudice"), and definitions ("what is blockchain"). Use web_search for time-sensitive info (prices, news, "latest", "current"). Use command_automate ONLY when specific website interaction, tool usage, or external action is required.
 - General rule: When a request combines data retrieval with an action (e.g., "send weather info via email"), split into TWO steps: (1) retrieve the data (memory_retrieve/web_search), (2) perform the action (command_automate with dependsOn:[0]).
-- SCREEN DISPLAY: when a step asks to show/display/put content ON THE SCREEN (the user's desktop — "on the screen", "on my screen", "show it on screen"), use estimatedIntent:'screen_display'. As a dependent step it paints the previous step's output (use dependsOn + dataTemplate). EXAMPLES: "find X and show it on the screen" → [web_search, screen_display dependsOn:[0]] | "look up the verse and put it on my screen" → [web_search, screen_display dependsOn:[0]]. "clear the screen"/"take that off the screen" → single screen_display step. NOT for reading the screen (screen_intelligence) or UI highlights (command_automate).
+- SCREEN DISPLAY: when a step asks to show/display/put content ON THE SCREEN (the user's desktop — "on the screen", "on my screen", "show it on screen"), use estimatedIntent:'screen_display'. As a dependent step it paints the previous step's output (use dependsOn + dataTemplate). MANDATORY: any message that ends with "…(and|then) show/display/put it on (the|my) screen" MUST end with a screen_display step depending on the fetch step — never a single-step intent. EXAMPLES: "find X and show it on the screen" → [web_search, screen_display dependsOn:[0]] | "look up the verse and put it on my screen" → [web_search, screen_display dependsOn:[0]]. "clear the screen"/"take that off the screen" → single screen_display step. NOT for reading the screen (screen_intelligence) or UI highlights (command_automate).
 - PRIORITY RULE - EPISODIC MEMORY RETRIEVAL (check before NAMED SERVICE rule): When the user asks about PAST activity, screen history, or what they were doing on/in <appName> at a PRIOR time → memory_retrieve, NOT command_automate. Key signals: time references ("yesterday", "this morning", "this week", "recent", "earlier", "around 2 PM"), past tense ("was", "did", "were", "listening", "working"), or "what was on my screen". The user wants to recall past screen captures from episodic memory, not interact with the service now. EXAMPLES: "What was I working on in <appName> yesterday?" → memory_retrieve | "Show me my recent <appName> activity." → memory_retrieve | "Summarize my <appName> conversations from this morning." → memory_retrieve | "What did my <appName> look like this week?" → memory_retrieve | "What music was I listening to?" → memory_retrieve | "Find anything about the <topic> I saw earlier." → memory_retrieve | "What was on my screen around 2 PM today?" → memory_retrieve
 - PRIORITY RULE - NAMED SERVICE/PLATFORM INTERACTION: When a user mentions a specific named service, website, platform, or application AND wants to find, search, locate, extract, or interact with content on that specific service → command_automate. Key distinction: "find workout videos" (general knowledge) vs "find workout videos on [named service]" (automation).
 - PRIORITY RULE - CONTENT/LINK EXTRACTION: Any request to extract, retrieve, get, or obtain specific links, URLs, or structured content from a targeted source → command_automate.
@@ -442,21 +442,47 @@ module.exports = async function decomposePromptV2(state) {
   // the LLM decomposer, which can emit screen_display as a dependsOn step.
   if (_tc.isScreenOutput && !_hasMultiGoalConjunction) {
     logger.info(`[Node:DecomposePromptV2] Screen-output guard: routing to screen_display (action=${_tc.screenOutputAction || 'show'} kind=${_tc.screenOutputKind || 'text'}) — skipping command_automate short-circuit`);
-    const subPrompts = [{
+
+    // Fetch→display: "show me john 3:16 on my screen" names fresh content to
+    // look up — emit web_search → screen_display(dependsOn). Referential
+    // phrasing ("show it/the whole chapter") resolves from history instead,
+    // and kinds that carry their own content (emoji/effect/image/payload)
+    // never need a fetch step.
+    const _kind = _tc.screenOutputKind || 'text';
+    const _action = _tc.screenOutputAction || 'show';
+    const _REFERENTIAL_RE = /\b(it|that|this|them|those|the\s+(result|answer|chapter|verse|response|reply|output|list|chart|graph|data|one)|whole\s+\w+|above|previous|again)\b/i;
+    const _needsFetch = _action === 'show'
+      && ['text', 'chart'].includes(_kind)
+      && !_tc.screenOutputContent
+      && !_tc.screenOutputPayload
+      && !_REFERENTIAL_RE.test(message);
+
+    const displayStep = {
       text: message,
       estimatedIntent: 'screen_display',
       confidence: 0.9,
-      order: 0,
-      dependsOn: [],
+      order: _needsFetch ? 1 : 0,
+      dependsOn: _needsFetch ? [0] : [],
       isLongRunning: false,
       dataTemplate: null,
-    }];
+    };
+    const subPrompts = _needsFetch
+      ? [{
+          text: message,
+          estimatedIntent: 'web_search',
+          confidence: 0.9,
+          order: 0,
+          dependsOn: [],
+          isLongRunning: false,
+          dataTemplate: null,
+        }, displayStep]
+      : [displayStep];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
       ts: new Date().toISOString(), message, carriedHint: null,
       parser: 'screen-output-guard', intent: 'screen_display',
-      subPromptCount: 1, durationMs,
-      subPrompts: [{ order: 0, text: message, estimatedIntent: 'screen_display', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+      subPromptCount: subPrompts.length, durationMs,
+      subPrompts: subPrompts.map(s => ({ order: s.order, text: s.text, estimatedIntent: s.estimatedIntent, dependsOn: s.dependsOn, isLongRunning: false, dataTemplate: null })),
     });
     _emitIntentDecided(state, 'screen_display', 0.9);
     return {

@@ -28,6 +28,7 @@ module.exports = {
   _decomposedBy:       { writer: 'decomposePromptV2', readers: 'tests, logs', lifecycle: 'run', note: 'which guard/path produced the intentPlan' },
   _decomposedIntent:   { writer: 'decomposePromptV2', readers: 'parseIntentV2', lifecycle: 'run' },
   _forceAnswerContext: { writer: 'resolveReferencesV2', readers: 'answer', lifecycle: 'step' },
+  _directAnswer: { writer: 'screenOutput', readers: 'answer', lifecycle: 'step' },
   _llmDateRange:       { writer: 'resolveReferencesV2', readers: 'retrieveMemory', lifecycle: 'step' },
   _profileFallback:    { writer: 'retrieveMemory', readers: 'extractStepResult', lifecycle: 'step' },
 
