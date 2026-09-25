@@ -371,7 +371,11 @@ describe('ASK_USER run-group resume regressions', () => {
   });
 
   it('forwards the blocked step index from final pause events', () => {
-    expect(builderSrc).toContain('stepIndex: state.pendingQuestion.stepIndex,');
+    // The ask_user pause forwarding lives in nodes/advanceQueue.js (extracted
+    // from the logConversation edge) — pin the field there.
+    const queueSrc = fs.readFileSync(path.join(__dirname, '../src/nodes/advanceQueue.js'), 'utf8');
+    expect(queueSrc).toContain('stepIndex: pq.stepIndex,');
+    expect(queueSrc).toContain('agentId:  pq.agentId || null,');
   });
 
   it('changes only the blocked renderer step back to running', () => {

@@ -36,6 +36,14 @@ const summarizeMultiIntentNode = require('./nodes/summarizeMultiIntent');
 const resolveUserContextNode = require('./nodes/resolveUserContext');
 const gatherPlanContextNode = require('./nodes/gatherPlanContext');
 const clarifyNode = require('./nodes/clarify');
+const advanceQueueNode = require('./nodes/advanceQueue');
+const preparePostScreenNode = require('./nodes/preparePostScreen');
+const prepareReplanNode = require('./nodes/prepareReplan');
+const flagHollowFailureNode = require('./nodes/flagHollowFailure');
+const flagStepFailureNode = require('./nodes/flagStepFailure');
+const surfacePlanFailureNode = require('./nodes/surfacePlanFailure');
+const routeIntentNode = require('./nodes/routeIntent');
+const extractStepResult = require('./utils/extractStepResult');
 const executeIntrospectNode = require('./nodes/executeIntrospect');
 const executeSettingsNode = require('./nodes/executeSettings');
 const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
@@ -45,101 +53,8 @@ const resolveAgentNode = require('./nodes/resolveAgent');
 
 // assessRisk and detectOperationType removed — grill-mode pipeline deleted
 
-/**
- * Extract the most useful short result string from a completed intent step.
- * Used to populate state.dataContext[N] for injection into dependent steps.
- *
- * Returns either a plain string (≤2000 chars) or an object { summary, file }
- * when the full result exceeds 2000 chars and was written to a pipeline buffer file.
- */
-function extractStepResult(state) {
-  const intent = state.intent?.type;
-  const logger = state.logger || console;
-
-  // Debug logging
-  logger.info(`[extractStepResult] intent=${intent}, filteredMemories=${Array.isArray(state.filteredMemories) ? state.filteredMemories.length : 'N/A'}`);
-  if (Array.isArray(state.filteredMemories) && state.filteredMemories.length > 0) {
-    logger.info(`[extractStepResult] First memory keys: ${Object.keys(state.filteredMemories[0]).join(', ')}`);
-  }
-
-  // memory_retrieve: use first memory's text (field is 'text', not 'source_text')
-  if (intent === 'memory_retrieve' && Array.isArray(state.filteredMemories) && state.filteredMemories.length > 0) {
-    const result = state.filteredMemories
-      .slice(0, 3)
-      .map(m => m.text || m.source_text || m.extracted_text || '')
-      .filter(Boolean)
-      .join(' | ')
-      .slice(0, 2000);
-    logger.info(`[extractStepResult] Extracted ${result.length} chars from ${state.filteredMemories.length} memories`);
-    return result;
-  }
-
-  // memory_retrieve with profile fallback (when semantic search returns nothing but profile has the data)
-  if (intent === 'memory_retrieve' && state._profileFallback) {
-    const result = `Profile: ${state._profileFallback.key} = ${state._profileFallback.value}`;
-    logger.info(`[extractStepResult] Extracted profile fallback: ${result.slice(0, 100)}...`);
-    return result;
-  }
-
-  // memory_retrieve with conversation history (when no memories but conversation has relevant info)
-  if (intent === 'memory_retrieve' && Array.isArray(state.conversationHistory) && state.conversationHistory.length > 0) {
-    const result = state.conversationHistory
-      .slice(0, 5)
-      .map(m => m.content || m.text || '')
-      .filter(Boolean)
-      .join(' | ')
-      .slice(0, 2000);
-    logger.info(`[extractStepResult] Extracted ${result.length} chars from ${state.conversationHistory.length} conversation messages`);
-    return result;
-  }
-
-  // web_search: use top result snippet
-  if (intent === 'web_search' && Array.isArray(state.contextDocs) && state.contextDocs.length > 0) {
-    return state.contextDocs
-      .slice(0, 2)
-      .map(d => d.snippet || d.title || '')
-      .filter(Boolean)
-      .join(' | ')
-      .slice(0, 2000);
-  }
-
-  // command_automate: use answer or last skill stdout — buffer to file if > 2000 chars
-  if (intent === 'command_automate') {
-    const raw = state.answer || (() => {
-      if (Array.isArray(state.skillResults)) {
-        const last = state.skillResults.filter(r => r.ok && r.stdout).pop();
-        return last ? last.stdout : null;
-      }
-      return null;
-    })();
-    if (raw) {
-      if (raw.length <= 2000) return raw;
-      // Write full content to a pipeline buffer file; return summary + file ref
-      try {
-        const _fs = require('fs');
-        const _os = require('os');
-        const _path = require('path');
-        const runId  = state._runId || state.sessionId || `run_${Date.now()}`;
-        const stepN  = state.intentResults ? state.intentResults.length : 0;
-        const bufDir = _path.join(_os.homedir(), '.thinkdrop', 'pipeline', runId);
-        _fs.mkdirSync(bufDir, { recursive: true });
-        const filePath = _path.join(bufDir, `step_${stepN}.md`);
-        _fs.writeFileSync(filePath, raw, 'utf8');
-        return { summary: raw.slice(0, 2000), file: filePath };
-      } catch (_) {
-        return raw.slice(0, 2000); // fallback: truncate if file write fails
-      }
-    }
-  }
-
-  // memory_store: use the answer set by storeMemory node
-  if (intent === 'memory_store') {
-    return state.answer?.slice(0, 2000) || `Got it! I'll remember that.`;
-  }
-
-  // Default: use state.answer if available
-  return state.answer?.slice(0, 2000) || state.message?.slice(0, 200) || '';
-}
+// extractStepResult lives in ./utils/extractStepResult — shared with the
+// advanceQueue node (the queue runner extracted from the logConversation edge).
 
 class StateGraphBuilder {
   /**
@@ -308,6 +223,13 @@ class StateGraphBuilder {
       executeSettings: (state) => executeSettingsNode({ ...state, logger }),
       createSkillFromHistory: (state) => createSkillFromHistoryNode({ ...state, logger, mcpAdapter, llmBackend }),
       planExecutor: (state) => planExecutorNode({ ...state, logger, mcpAdapter, llmBackend }),
+      advanceQueue: (state) => advanceQueueNode({ ...state, logger, mcpAdapter, llmBackend }),
+      preparePostScreen: (state) => preparePostScreenNode({ ...state, logger, mcpAdapter }),
+      prepareReplan: (state) => prepareReplanNode({ ...state, logger }),
+      flagHollowFailure: (state) => flagHollowFailureNode({ ...state, logger }),
+      flagStepFailure: (state) => flagStepFailureNode({ ...state, logger }),
+      surfacePlanFailure: (state) => surfacePlanFailureNode({ ...state, logger }),
+      routeIntent: (state) => routeIntentNode({ ...state, logger }),
     };
     
     // Intent-based routing (matches DistilBERT classifier intents)
@@ -341,175 +263,11 @@ class StateGraphBuilder {
         return 'enrichIntent';
       },
 
-      // enrichIntent router: handles MODE B re-routing + MODE A gap/resolve routing
-      enrichIntent: async (state) => {
-        const intentType = state.intent?.type || 'general_query';
-        
-        // Disable plan correction mode if a new session was created AND this is a new prompt (not plan execution)
-        // Plan execution requests (with _planFile) should still work even with new sessions
-        if (state._newSessionCreated && state._planCorrectionMode && !state._planFile) {
-          logger.info('[StateGraph:Router] New session created for new prompt - disabling plan correction mode');
-          state._planCorrectionMode = false;
-          state._planCorrectionText = null;
-          state._basePlanFile = null;
-          state._skillPlanJson = null;
-          state._planCorrectionSourcePrompt = null;
-        }
-        
-        logger.info(`[StateGraph:Router] enrichIntent exit — intent: ${intentType} | _planFile: ${!!state._planFile} | _planMode: ${!!state._planMode}`);
-
-        // ── Screen follow-up: inject prior screen context before routing ─────
-        // When classifyTask detected isScreenFollowUp=true and we have a recent
-        // screen context file, attach the OCR text to state.context so answer.js
-        // injects it into systemInstructions regardless of which intent was classified.
-        if (state._taskClassification?.isScreenFollowUp && state._priorScreenContext?.contextText) {
-          logger.info(`[StateGraph:Router] isScreenFollowUp=true — injecting prior screen context (${state._priorScreenContext.contextText.length} chars)`);
-          state.context = state._priorScreenContext.contextText;
-          state.screenContext = state._priorScreenContext;
-          state._needsContextInterpretation = true;
-        }
-
-        // ── Screen follow-up knowledge query: bypass automation entirely ────────
-        // classifyTask already classified this as taskType='query' — the user is
-        // asking a knowledge question about what's on screen, not requesting an action.
-        // Route directly to answer which already has state.context (OCR text) injected above.
-        // BUT: Don't override if decomposePromptV2 clearly identified command_automate
-        // with high confidence - this indicates a genuine automation request.
-        if (
-          state._taskClassification?.isScreenFollowUp &&
-          state._taskClassification?.taskType === 'query' &&
-          !state._taskClassification?.isAppUiInspection && // Never override named-app UI inspection tasks
-          intentType === 'command_automate' &&
-          (!state.intent || state.intent.confidence < 0.65) && // Only override genuinely absent/uncertain intents (0.7 is decompose default, not low-confidence)
-          !state._planMode // Don't override during plan execution
-        ) {
-          logger.info(`[StateGraph:Router] isScreenFollowUp+query — overriding low-confidence command_automate → answer`);
-          state.intent = { type: 'general_knowledge', confidence: 0.95, entities: [], requiresMemoryAccess: false };
-          return 'answer';
-        }
-
-        // ── Lazy screen grab: referential message but no screen context available ───
-        // classifyTask set needsFreshScreen=true: message is deictic/ambiguous but
-        // there is no PRIOR SCREEN CONTEXT block. Capture fresh screen content first,
-        // then route to the correct handler with enriched context.
-        // Guard: !state._needsFreshScreen prevents re-triggering after the grab completes.
-        if (state._taskClassification?.needsFreshScreen && !state._needsFreshScreen) {
-          logger.info(`[StateGraph:Router] needsFreshScreen=true — auto-capturing screen before routing (intent: ${intentType})`);
-          state._needsFreshScreen = true;
-          state._postScreenIntent = intentType;
-          return 'screenIntelligence';
-        }
-
-        // Enrichment gaps remain — ask user first (surface the question via logConversation)
-        if (Array.isArray(state.enrichmentNeeded) && state.enrichmentNeeded.length > 0) {
-          logger.debug('[StateGraph:Router] enrichIntent: gaps unresolved — asking user');
-          return 'logConversation';
-        }
-
-        // ── Skill creation from conversation history ───────────────────────────
-        // classifyTask detected skill_creation intent — user wants to turn code/script
-        // from previous conversation into a reusable skill. Route to createSkillFromHistory.
-        // CRITICAL: Only route to skill creation if it's a follow-up referring to previous code
-        if (state._taskClassification?.taskType === 'skill_creation' && 
-            state._taskClassification?.isFollowUp === true) {
-          logger.info('[StateGraph:Router] skill_creation + isFollowUp detected — routing to createSkillFromHistory');
-          return 'createSkillFromHistory';
-        }
-
-        // ── _skillPlan resume fast-path ──────────────────────────────────────
-        // Plan is pre-built (e.g. ask_user resume) — skip resolveUserContext,
-        // resolveAgent, preflightAgents, gatherPlanContext and go straight to planSkills.
-        // Also fast-route on _skipTrainingGate (proceed_anyway resume) so planSkills
-        // generates a real plan without re-running preflight/gather nodes.
-        if (intentType === 'command_automate' && (state._skillPlan || state._skipTrainingGate) && !state.recoveryContext) {
-          logger.debug('[StateGraph:Router] enrichIntent: _skillPlan/_skipTrainingGate resume — skipping to planSkills');
-          return 'planSkills';
-        }
-
-        // ── planMode step short-circuit ────────────────────────────────────
-        // planExecutor already set intent+message for this step — skip
-        // resolveUserContext, gatherPlanContext and go straight to planSkills.
-        if (intentType === 'command_automate' && state._planMode && state._planFile) {
-          logger.debug('[StateGraph:Router] enrichIntent: _planMode step — skipping to planSkills');
-          return 'planSkills';
-        }
-
-        if (intentType === 'command_automate') {
-          // Skill already installed (parseSkill matched) — skip creatorPlanning,
-          // go straight to resolveUserContext → gatherPlanContext → planSkills.
-          // BUT: if the skill is a stub (no index.cjs on disk), we must go through gatherContext
-          // first so credentials/service info are collected before the skill build kicks off.
-          if (state.matchedSkillName) {
-            const _fs = require('fs');
-            const _os = require('os');
-            const _path = require('path');
-            const _dotName = state.matchedSkillName;
-            const _underscoreName = _dotName.replace(/\./g, '_');
-            // Check both dot-notation and underscore directories
-            const _candidates = [_dotName, _underscoreName].filter((v, i, a) => a.indexOf(v) === i);
-            let _found = false;
-            for (const _dirName of _candidates) {
-              const _skillDir = _path.join(_os.homedir(), '.thinkdrop', 'skills', _dirName);
-              const _skillExec = _path.join(_skillDir, 'index.cjs');
-              const _skillMd   = _path.join(_skillDir, 'skill.md');
-              const _apiJson   = _path.join(_skillDir, 'api.json');
-              const _cliJson   = _path.join(_skillDir, 'cli.json');
-              if (_fs.existsSync(_skillExec) || _fs.existsSync(_skillMd) || _fs.existsSync(_apiJson) || _fs.existsSync(_cliJson)) {
-                logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is installed (dir=${_dirName}) — skipping to resolveUserContext`);
-                _found = true;
-                break;
-              }
-            }
-            if (_found) return 'resolveUserContext';
-            // Stub-only: no index.cjs on disk — fall through to resolveUserContext which handles it
-            logger.debug(`[StateGraph:Router] enrichIntent: matchedSkillName="${_dotName}" is stub — routing to resolveUserContext`);
-            state.matchedSkillName = null;
-            // fall through below
-          }
-          // gatherContext + creatorPlanning both bypassed — route to resolveUserContext → planSkills
-          logger.debug('[StateGraph:Router] enrichIntent: command_automate — resolveUserContext');
-          return 'resolveUserContext';
-        }
-
-        // All other intents: route the same as parseIntent used to
-        if (intentType === 'set_constraint') {
-          return 'storeConstraint';
-        }
-        if (intentType === 'lift_constraint') {
-          return 'liftConstraint';
-        }
-        if (intentType === 'memory_store') {
-          return 'storeMemory';
-        }
-        if (intentType === 'memory_retrieve') {
-          return 'retrieveMemory';
-        }
-        if (intentType === 'command_execute' || intentType === 'command_guide') {
-          return 'executeCommand';
-        }
-        if (intentType === 'plan_execute') {
-          return 'planExecutor';
-        }
-        if (intentType === 'screen_intelligence') {
-          return 'screenIntelligence';
-        }
-        if (intentType === 'system_settings') {
-          return 'executeSettings';
-        }
-        if (intentType === 'system_introspect') {
-          return 'executeIntrospect';
-        }
-        if (intentType === 'app_control_start') {
-          return 'parseProject';
-        }
-        if (intentType === 'web_search' || intentType === 'question' || intentType === 'general_knowledge') {
-          return 'webSearch';
-        }
-        if (intentType === 'greeting') {
-          return 'answer';
-        }
-        return 'retrieveMemory';
-      },
+      // enrichIntent → routeIntent: all post-enrichment routing decisions
+      // (screen follow-up injection, lazy grab, resume fast-paths, intent map)
+      // live in the routeIntent node. This edge is pure.
+      enrichIntent: 'routeIntent',
+      routeIntent: (state) => state._advanceRoute || 'retrieveMemory',
 
       // Introspection path: executeIntrospect → answer → logConversation
       executeIntrospect: 'answer',
@@ -569,29 +327,13 @@ class StateGraphBuilder {
           return 'end';
         }
         if (state.planError && !state.skillPlan) {
-          logger.debug(`[StateGraph:Router] planSkills failed: ${state.planError}`);
-          // If all providers failed, surface this to the user instead of silent fallback
-          if (state.planError.includes('All LLM providers failed')) {
-            state.answer = "I'm unable to process your request right now because all AI providers are currently unavailable. This is likely due to rate limits or API key issues. Please check your provider settings or try again in a few minutes.";
-            logger.info('[StateGraph:Router] All providers failed — surfacing error to user');
-            // Emit progress event to update UI immediately (don't leave it stuck on "Planning steps...")
-            if (typeof state.progressCallback === 'function') {
-              try {
-                state.progressCallback({
-                  type: 'planning_failed',
-                  message: state.answer,
-                  error: state.planError,
-                  source: 'planSkills'
-                });
-              } catch (err) {
-                logger.warn('[StateGraph:Router] Failed to emit planning_failed progress event:', err.message);
-              }
-            }
-          }
-          return 'logConversation';
+          logger.debug(`[StateGraph:Router] planSkills failed: ${state.planError} → surfacePlanFailure`);
+          return 'surfacePlanFailure';
         }
         return 'executeCommand';
       },
+      // Provider outage → answer + progress event, then logConversation
+      surfacePlanFailure: 'logConversation',
 
       // executeCommand cycle: next step, recover on failure, or done
       executeCommand: (state) => {
@@ -610,18 +352,10 @@ class StateGraphBuilder {
           return 'logConversation';
         }
         // Fallback: failedStep set without recoveryAction (e.g. smartFill, project.builder)
-        // Route to evaluateSkills for default recovery/replan
+        // flagStepFailure builds recoveryContext, then → evaluateSkills
         if (state.failedStep) {
-          logger.warn(`[StateGraph:Router] executeCommand: failedStep without recoveryAction → evaluateSkills (fallback)`);
-          state.recoveryAction = 'replan';
-          state.recoveryContext = {
-            failedSkill: state.failedStep.skill,
-            failureReason: state.failedStep.error,
-            succeededSteps: (state.skillResults || [])
-              .filter(r => r.ok)
-              .map(r => ({ step: r.step, skill: r.skill, description: r.description, result: (r.stdout || r.result || '').toString().slice(0, 200) })),
-          };
-          return 'evaluateSkills';
+          logger.warn(`[StateGraph:Router] executeCommand: failedStep without recoveryAction → flagStepFailure (fallback)`);
+          return 'flagStepFailure';
         }
         // Any pendingQuestion means "pause for user input" — scout-select,
         // agent ask_user, or a bare question from an ask_user/guard step.
@@ -650,10 +384,9 @@ class StateGraphBuilder {
       reviewExecution: (state) => {
         const verdict = state.reviewVerdict;
         if (verdict === 'FAILED') {
-          logger.info(`[StateGraph:Router] reviewExecution FAILED → evaluateSkills (hollow result — attempt REPLAN)`);
-          state.recoveryAction = 'replan';
-          state.recoveryContext = { failureReason: 'Hollow result — review judged execution as FAILED' };
-          return 'evaluateSkills';
+          // Hollow result — flagHollowFailure sets recoveryAction/Context, then → evaluateSkills
+          logger.info(`[StateGraph:Router] reviewExecution FAILED → flagHollowFailure (hollow result — attempt REPLAN)`);
+          return 'flagHollowFailure';
         }
         if (verdict === 'ASK_USER') {
           logger.info('[StateGraph:Router] reviewExecution ASK_USER → logConversation');
@@ -673,87 +406,40 @@ class StateGraphBuilder {
       evaluateSkills: (state) => {
         const verdict = state.evaluationVerdict;
         if (verdict === 'FIX' && state.evaluationFix) {
-          // CRITICAL FIX: Preserve singleStepReplan context when routing to planSkills
-          // This prevents full replan when only one step failed
-          if (state.recoveryAction === 'replan_step') {
-            logger.info(`[StateGraph:Router] evaluateSkills FIX → planSkills (single-step replan, retry ${state.evaluationRetryCount})`);
-            // Preserve singleStepReplan flag in state for planSkillsV2 to detect
-            state.singleStepReplan = true;
-          } else {
-            logger.info(`[StateGraph:Router] evaluateSkills FIX → planSkills (full replan, retry ${state.evaluationRetryCount})`);
-          }
-          return 'planSkills';
+          // Replan needed — prepareReplan sets singleStepReplan (edge stays pure)
+          logger.info(`[StateGraph:Router] evaluateSkills FIX → prepareReplan (${state.recoveryAction === 'replan_step' ? 'single-step' : 'full'}, retry ${state.evaluationRetryCount})`);
+          return 'prepareReplan';
         }
         // recoverSkill set recoveryAction='replan' or 'replan_step' — evaluateSkills was inserted in that path.
         // If no FIX rule was derived (PASS fallback), still continue to planSkills with recoveryContext.
         if (verdict === 'PASS' && (state.recoveryAction === 'replan' || state.recoveryAction === 'replan_step') && state.recoveryContext) {
-          // Also preserve singleStepReplan for PASS path
-          if (state.recoveryAction === 'replan_step') {
-            logger.debug(`[StateGraph:Router] evaluateSkills PASS (failure path) → planSkills with recoveryContext (single-step replan)`);
-            state.singleStepReplan = true;
-          } else {
-            logger.debug(`[StateGraph:Router] evaluateSkills PASS (failure path) → planSkills with recoveryContext (full replan)`);
-          }
-          return 'planSkills';
+          logger.debug(`[StateGraph:Router] evaluateSkills PASS (failure path) → prepareReplan (${state.recoveryAction === 'replan_step' ? 'single-step' : 'full'})`);
+          return 'prepareReplan';
         }
         return 'logConversation';
       },
 
       
-      // Screen intelligence path
+      // Screen intelligence path — pure edge. The lazy screen-grab prep
+      // (state injection + postIntent routing decision) lives in the
+      // preparePostScreen node.
       screenIntelligence: (state) => {
         // If already has answer (from vision API), log and end
         if (state.answer && !state._needsFreshScreen) {
           return 'logConversation';
         }
-
-        // ── Lazy screen grab cycle: fresh context captured, route to original intent ──
+        // Lazy screen grab cycle: fresh context captured → prepare handoff
         if (state._needsFreshScreen && state.context) {
-          logger.info(`[StateGraph:Router] _needsFreshScreen — fresh context captured, routing based on postIntent: ${state._postScreenIntent}`);
-
-          // Inject fresh capture into _priorScreenContext shape so downstream nodes see it
-          state._priorScreenContext = {
-            timestamp:   new Date().toISOString(),
-            appName:     state.screenContext?.appName     || null,
-            windowTitle: state.screenContext?.windowTitle || null,
-            url:         state.screenContext?.url         || null,
-            contextText: state.context,
-          };
-          state._taskClassification = {
-            ...(state._taskClassification || {}),
-            isScreenFollowUp: true,
-            followUpTarget: state.screenContext?.windowTitle || state.screenContext?.appName || null,
-          };
-
-          // Clear flags so multi-intent queue steps don't re-trigger
-          state._needsFreshScreen = false;
-          const postIntent = state._postScreenIntent || 'general_knowledge';
-          state._postScreenIntent = null;
-
-          // command_automate / scheduling: enrich resolvedMessage, proceed through automation path
-          if (postIntent === 'command_automate' || postIntent === 'scheduling') {
-            const subject = state.screenContext?.windowTitle || state.screenContext?.appName || '';
-            if (subject && state.resolvedMessage) {
-              state.resolvedMessage = `[Screen context: ${subject}] ${state.resolvedMessage}`;
-              logger.info(`[StateGraph:Router] _needsFreshScreen — enriched resolvedMessage for ${postIntent}`);
-            }
-            return 'resolveUserContext';
-          }
-
-          // memory intents: subject injected via _priorScreenContext, route normally
-          if (postIntent === 'memory_retrieve') return 'retrieveMemory';
-          if (postIntent === 'memory_store') return 'storeMemory';
-
-          // web_search: subject prepended by webSearch.js via _priorScreenContext
-          if (postIntent === 'web_search') return 'webSearch';
-
-          // query / general_knowledge / ambiguous / greeting → answer with injected context
-          return 'answer';
+          return 'preparePostScreen';
         }
-
         // Otherwise, process with LLM
         return 'answer';
       },
+      preparePostScreen: (state) => state._advanceRoute || 'answer',
+      // Replan prep — sets singleStepReplan before planSkills (pure edge below)
+      prepareReplan: 'planSkills',
+      flagHollowFailure: 'evaluateSkills',
+      flagStepFailure: 'evaluateSkills',
       
       // Web search path
       webSearch: 'retrieveMemory',
@@ -779,305 +465,13 @@ class StateGraphBuilder {
       answer: 'logConversation',
       synthesize: 'logConversation',
       summarizeMultiIntent: 'logConversation',
-      // Multi-intent queue runner.
-      // Each time logConversation completes for a step, this conditional checks whether
-      // more steps remain in intentQueue and loops back through enrichIntent.
-      // Once the queue is empty and isMultiIntent=true it routes to summarizeMultiIntent.
-      // summarizeMultiIntent sets isMultiIntent=false so the final logConversation exits here.
-      logConversation: async (state) => {
-        // ── Single-intent ask_user pause (end-of-pipeline) ────────────────────
-        // If a single-intent run escalated to ASK_USER, surface the question card
-        // here before exiting to end. Otherwise the user gets a silent spinner.
-        if (!state.isMultiIntent && state.recoveryAction === 'ask_user' && state.pendingQuestion) {
-          logger.info('[StateGraph:Router] Single-intent ask_user pause — surfacing question');
-          if (typeof state.progressCallback === 'function') {
-            try {
-              const _pqOpts = state.pendingQuestion.options || [];
-              state.progressCallback({
-                type:    'ask_user',
-                question: state.pendingQuestion.question,
-                options:  _pqOpts,
-                stepIndex: state.pendingQuestion.stepIndex,
-                agentId: state.pendingQuestion.agentId || null,
-                source:  'single_intent_pause',
-                // Forward ALL pendingQuestion fields so the renderer can show
-                // PartialFailureCard for agent failures (not just the generic banner).
-                _isAgentAskUser: state.pendingQuestion._isAgentAskUser === true,
-                partialProgress: state.pendingQuestion.partialProgress || null,
-                currentUrl: state.pendingQuestion.currentUrl || null,
-                keepSession: state.pendingQuestion.keepSession === true,
-                originalTask: state.pendingQuestion.originalTask || null,
-                skill: state.pendingQuestion.skill || null,
-                freeText: true,
-              });
-            } catch (_) {}
-          }
-          return 'end';
-        }
-
-        // ── Multi-intent ask_user pause (mid-pipeline) ─────────────────────────
-        // If the current step ended with recoveryAction='ask_user' and there are
-        // still steps in the queue, pause and surface the question. When the user
-        // answers, the graph resumes with the pipeline state intact.
-        if (state.isMultiIntent && state.recoveryAction === 'ask_user' && state.pendingQuestion) {
-          logger.info('[StateGraph:Router] Multi-intent ask_user pause (mid-pipeline) — surfacing question');
-          if (typeof state.progressCallback === 'function') {
-            try {
-              const _mqOpts = state.pendingQuestion.options || [];
-              state.progressCallback({
-                type:    'ask_user',
-                question: state.pendingQuestion.question,
-                options:  _mqOpts,
-                stepIndex: state.pendingQuestion.stepIndex,
-                agentId: state.pendingQuestion.agentId || null,
-                source:  'multi_intent_pause',
-                _isAgentAskUser: state.pendingQuestion._isAgentAskUser === true,
-                partialProgress: state.pendingQuestion.partialProgress || null,
-                currentUrl: state.pendingQuestion.currentUrl || null,
-                keepSession: state.pendingQuestion.keepSession === true,
-                originalTask: state.pendingQuestion.originalTask || null,
-                skill: state.pendingQuestion.skill || null,
-                freeText: true,
-              });
-            } catch (_) {}
-          }
-          return 'end';
-        }
-
-        // ── More steps remain — execute next sub-intent ──────────────────────
-        if (state.isMultiIntent && Array.isArray(state.intentQueue) && state.intentQueue.length > 0) {
-
-          // 1. Collect this step's result
-          const completedStep = {
-            step:      state.intentResults?.length ?? 0,
-            intent:    state.intent?.type,
-            subPrompt: state.intent?.subPrompt || state.message,
-            result:    extractStepResult(state),
-          };
-
-          state.intentResults = [...(state.intentResults || []), completedStep];
-          state.dataContext   = { ...(state.dataContext || {}), [completedStep.step]: completedStep.result };
-
-          // Emit step-done progress event
-          if (typeof state.progressCallback === 'function') {
-            try {
-              state.progressCallback({
-                type:      'intent:pipeline_step',
-                step:      completedStep.step + 1,
-                total:     completedStep.step + 1 + state.intentQueue.length + 1,
-                intent:    completedStep.intent,
-                subPrompt: completedStep.subPrompt,
-                result:    (completedStep.result || '').slice(0, 100),
-                status:    'done',
-              });
-            } catch (_) { /* progress callback must never block execution */ }
-          }
-
-          // 2. Pop next step
-          const [nextStep, ...remaining] = state.intentQueue;
-
-          // 3. Resolve {{result[N]}} placeholders in the sub-prompt text
-          // dataContext[N] may be a plain string or { summary, file } object — use summary for text substitution
-          let resolvedText = nextStep.text;
-          for (const depIdx of (nextStep.dependsOn || [])) {
-            const dep = state.dataContext[depIdx];
-            const depResult = (dep && typeof dep === 'object') ? (dep.summary || '') : (dep || '');
-            resolvedText = resolvedText.replace(
-              new RegExp(`\\{\\{result\\[${depIdx}\\]\\}\\}`, 'g'),
-              depResult
-            );
-          }
-
-          // 4. Resolve dataTemplate into _dataPrefix
-          let dataPrefix = null;
-          if (nextStep.dataTemplate) {
-            dataPrefix = nextStep.dataTemplate;
-            for (const depIdx of (nextStep.dependsOn || [])) {
-              const dep = state.dataContext[depIdx];
-              const depResult = (dep && typeof dep === 'object') ? (dep.summary || '') : (dep || '');
-              dataPrefix = dataPrefix.replace(
-                new RegExp(`\\{\\{result\\[${depIdx}\\]\\}\\}`, 'g'),
-                depResult
-              );
-            }
-          }
-
-          // Fallback: If no dataTemplate but has dependencies, auto-inject as prefix
-          if (!dataPrefix && (nextStep.dependsOn || []).length > 0) {
-            const depResults = (nextStep.dependsOn || []).map(depIdx => {
-              const dep = state.dataContext[depIdx];
-              return (dep && typeof dep === 'object') ? (dep.summary || '') : (dep || '');
-            }).filter(Boolean);
-            if (depResults.length > 0) {
-              dataPrefix = `Context from previous step:\n${depResults.join('\n')}\n\n`;
-            }
-          }
-
-          // Resolve _dataFile: carry the full-content buffer file from dependent steps (if any)
-          let dataFile = null;
-          for (const depIdx of (nextStep.dependsOn || [])) {
-            const dep = state.dataContext[depIdx];
-            if (dep && typeof dep === 'object' && dep.file) { dataFile = dep.file; break; }
-          }
-
-          // 5. Phase 3: Long-running async dispatch
-          if (nextStep.isLongRunning) {
-            const taskRunner = require('./nodes/taskRunner');
-            const { randomUUID } = require('crypto');
-            const taskId = (typeof randomUUID === 'function') ? randomUUID() : 'task_' + Date.now();
-
-            // Parse completion signal from dataTemplate if present
-            // e.g. dataTemplate: "waitForContent: Game build complete"
-            let completionSignal = 'waitForContent';
-            let completionArg    = 'complete';
-            if (nextStep.dataTemplate) {
-              const m = nextStep.dataTemplate.match(/^waitFor(Content|Selector):\s*(.+)$/i);
-              if (m) {
-                completionSignal = 'waitFor' + m[1];
-                completionArg    = m[2].trim();
-              }
-            }
-
-            await taskRunner.dispatch({
-              taskId,
-              subPrompt:        nextStep.text,
-              intent:           nextStep.intent,
-              stepOrder:        nextStep.order,
-              completionSignal,
-              completionArg,
-              planContext: {
-                intentResults: state.intentResults || [],
-                dataContext:   state.dataContext   || {},
-                intentQueue:   remaining,
-              },
-              originalPrompt:   state.originalPrompt || state.message,
-              sessionId:        (state.context && state.context.sessionId) || state.sessionId || null,
-              onComplete: async (tid, result) => {
-                logger.info(`[StateGraph:LongTask] Task ${tid} done — result ready for queue resume`);
-                if (typeof state.progressCallback === 'function') {
-                  state.progressCallback({
-                    type:      'long_task_resume',
-                    taskId:    tid,
-                    stepOrder: nextStep.order,
-                    result:    result ? result.slice(0, 500) : '',
-                  });
-                }
-              },
-              onTimeout: async (tid, pendingSteps, reason) => {
-                logger.warn(`[StateGraph:LongTask] Task ${tid} timed out — surfacing ASK_USER`);
-                state.answer              = `The task "${nextStep.text.slice(0, 80)}" didn't complete — ${reason}. Would you like to retry, skip this step, or cancel?`;
-                state.askUserReason       = reason;
-                state.pendingStepsAfterTimeout = pendingSteps;
-                if (typeof state.progressCallback === 'function') {
-                  state.progressCallback({
-                    type:         'ask_user',
-                    question:     state.answer,
-                    options:      ['Retry', 'Skip this step', 'Cancel all'],
-                    taskId:       tid,
-                    pendingSteps: pendingSteps.length,
-                  });
-                }
-              },
-              progressCallback: state.progressCallback || null,
-              logger,
-            });
-
-            // Update state — mark queue consumed up to this dispatched step
-            state.intentQueue  = remaining;
-            state._longTaskId  = taskId;
-            logger.info(`[StateGraph:LongTask] Async task ${taskId} dispatched — holding in logConversation`);
-            // Hold here: graph stays alive; taskRunner fires completion async via IPC
-            return 'logConversation';
-          }
-
-          logger.info(`[StateGraph:IntentQueue] Step ${completedStep.step + 1} done → executing step ${completedStep.step + 2}/${completedStep.step + 2 + remaining.length}: ${nextStep.intent} — "${resolvedText.slice(0, 60)}"`);
-
-          // Emit step-starting progress event
-          if (typeof state.progressCallback === 'function') {
-            try {
-              state.progressCallback({
-                type:      'intent:pipeline_step',
-                step:      completedStep.step + 2,
-                total:     completedStep.step + 2 + remaining.length,
-                intent:    nextStep.intent,
-                subPrompt: nextStep.text,
-                status:    'running',
-              });
-            } catch (_) { /* progress callback must never block execution */ }
-          }
-
-          // 6. Reset state for next step — clear previous step output to prevent bleed
-          Object.assign(state, {
-            message:          resolvedText,
-            resolvedMessage:  resolvedText,
-            _dataPrefix:      dataPrefix,
-            _dataFile:        dataFile,
-            intent: {
-              type:       nextStep.intent,
-              confidence: nextStep.confidence,
-              subPrompt:  nextStep.text,
-              entities:   [],
-            },
-            intentQueue:       remaining,
-            conversationLogged: false,
-            // Clear previous step's output so it doesn't bleed into this step
-            answer:            null,
-            filteredMemories:  [],
-            contextDocs:       [],
-            searchResults:     [],
-            skillResults:      [],
-            skillPlan:         null,
-            skillCursor:       0,
-            commandExecuted:   false,
-            commandOutput:     null,
-            executionResult:   null,
-            failedStep:        null,
-            recoveryAction:    null,
-            carriedIntent:     null,
-            enrichmentNeeded:  [],
-            matchedSkillName:  null,
-            // Referent + pause/verdict state from the previous step must not
-            // bleed into the next one — a queued step is a fresh sub-intent,
-            // not a reply to the same card/question.
-            pendingQuestion:   null,
-            reviewVerdict:     null,
-            evaluationVerdict: null,
-            evaluationFix:     null,
-            recoveryContext:   null,
-            singleStepReplan:  null,
-            scoutPending:      false,
-            _thoughtAttachment: null,
-            _needsFreshScreen: false,
-            _postScreenIntent: null,
-            _taskClassification: state._taskClassification ? {
-              ...state._taskClassification,
-              isFollowUp:        false,
-              isThoughtReply:    false,
-              followUpTarget:    null,
-              needsClarification: false,
-              resolution:        'resolved',
-            } : null,
-          });
-
-          return 'enrichIntent';
-        }
-
-        // ── Queue exhausted — collect final step and summarize ────────────────
-        if (state.isMultiIntent && Array.isArray(state.intentResults) && state.intentResults.length > 0) {
-          const finalStep = {
-            step:      state.intentResults.length,
-            intent:    state.intent?.type,
-            subPrompt: state.intent?.subPrompt || state.message,
-            result:    extractStepResult(state),
-          };
-          state.intentResults = [...state.intentResults, finalStep];
-          state.dataContext   = { ...state.dataContext, [finalStep.step]: finalStep.result };
-          return 'summarizeMultiIntent';
-        }
-
-        // ── Single-intent path — normal exit ─────────────────────────────────
-        return 'end';
-      },
+      // Multi-intent queue runner lives in the advanceQueue node — this edge
+      // is a pure read of the route it computes (_advanceRoute).
+      // Each time logConversation completes for a step, advanceQueue checks
+      // whether more steps remain in intentQueue and routes back through
+      // enrichIntent. Once the queue is empty it routes to summarizeMultiIntent.
+      logConversation: 'advanceQueue',
+      advanceQueue: (state) => state._advanceRoute || 'end',
     };
     
     return new StateGraph(nodes, edges, {

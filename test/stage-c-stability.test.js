@@ -68,7 +68,7 @@ function buildFullGraph() {
 async function testQueueResetClearsReferentState() {
   console.log('\n--- Multi-intent reset clears referent/pause/verdict state ---');
   const graph = buildFullGraph();
-  const edge = graph.edges.logConversation;
+  const node = graph.nodes.advanceQueue; // queue runner lives in a node now
 
   const state = {
     isMultiIntent: true,
@@ -109,12 +109,12 @@ async function testQueueResetClearsReferentState() {
     logger: silentLogger,
   };
 
-  const next = await edge(state);
-  assert(next === 'enrichIntent', 'routes to enrichIntent for next queued step', next);
-  assert(state.intent?.type === 'memory_store', 'intent switched to next step', state.intent?.type);
+  const patch = await node(state);
+  assert(patch._advanceRoute === 'enrichIntent', 'routes to enrichIntent for next queued step', patch._advanceRoute);
+  assert(patch.intent?.type === 'memory_store', 'intent switched to next step', patch.intent?.type);
 
   // Referent fields cleared — this is the regression the fix addresses
-  const tc = state._taskClassification || {};
+  const tc = patch._taskClassification || {};
   assert(tc.isThoughtReply === false, 'isThoughtReply cleared');
   assert(tc.isFollowUp === false, 'isFollowUp cleared');
   assert(tc.followUpTarget === null, 'followUpTarget cleared');
@@ -123,30 +123,30 @@ async function testQueueResetClearsReferentState() {
   assert(tc.taskType === 'query', 'durable fields (taskType) preserved', tc.taskType);
   assert(tc.activeDocRef === 'doc-123', 'ambient doc ref preserved', tc.activeDocRef);
 
-  assert(state._thoughtAttachment === null, '_thoughtAttachment cleared');
-  assert(state.pendingQuestion === null, 'pendingQuestion cleared');
-  assert(state.reviewVerdict === null, 'reviewVerdict cleared');
-  assert(state.evaluationVerdict === null, 'evaluationVerdict cleared');
-  assert(state.evaluationFix === null, 'evaluationFix cleared');
-  assert(state.recoveryContext === null, 'recoveryContext cleared');
-  assert(state.singleStepReplan === null, 'singleStepReplan cleared');
-  assert(state.scoutPending === false, 'scoutPending cleared');
-  assert(state._needsFreshScreen === false, '_needsFreshScreen cleared');
-  assert(state._postScreenIntent === null, '_postScreenIntent cleared');
+  assert(patch._thoughtAttachment === null, '_thoughtAttachment cleared');
+  assert(patch.pendingQuestion === null, 'pendingQuestion cleared');
+  assert(patch.reviewVerdict === null, 'reviewVerdict cleared');
+  assert(patch.evaluationVerdict === null, 'evaluationVerdict cleared');
+  assert(patch.evaluationFix === null, 'evaluationFix cleared');
+  assert(patch.recoveryContext === null, 'recoveryContext cleared');
+  assert(patch.singleStepReplan === null, 'singleStepReplan cleared');
+  assert(patch.scoutPending === false, 'scoutPending cleared');
+  assert(patch._needsFreshScreen === false, '_needsFreshScreen cleared');
+  assert(patch._postScreenIntent === null, '_postScreenIntent cleared');
 
   // Pre-existing reset behavior — pin it so the fix doesn't regress it
-  assert(state.answer === null, 'answer cleared');
-  assert(Array.isArray(state.searchResults) && state.searchResults.length === 0, 'searchResults cleared');
-  assert(Array.isArray(state.skillResults) && state.skillResults.length === 0, 'skillResults cleared');
-  assert(state.intentQueue.length === 0, 'queue popped');
-  assert(state.intentResults.length === 1, 'step result collected');
-  assert(state.message === 'Remember the result', 'message swapped to next sub-prompt', state.message);
+  assert(patch.answer === null, 'answer cleared');
+  assert(Array.isArray(patch.searchResults) && patch.searchResults.length === 0, 'searchResults cleared');
+  assert(Array.isArray(patch.skillResults) && patch.skillResults.length === 0, 'skillResults cleared');
+  assert(patch.intentQueue.length === 0, 'queue popped');
+  assert(patch.intentResults.length === 1, 'step result collected');
+  assert(patch.message === 'Remember the result', 'message swapped to next sub-prompt', patch.message);
 }
 
 async function testResultPlaceholderStillResolves() {
   console.log('\n--- {{result[N]}} placeholder still resolves after reset ---');
   const graph = buildFullGraph();
-  const edge = graph.edges.logConversation;
+  const node = graph.nodes.advanceQueue;
 
   const state = {
     isMultiIntent: true,
@@ -162,9 +162,9 @@ async function testResultPlaceholderStillResolves() {
     logger: silentLogger,
   };
 
-  const next = await edge(state);
-  assert(next === 'enrichIntent', 'routes to enrichIntent');
-  assert(/RESULT_ALPHA/.test(state.message || ''), 'placeholder resolved in next sub-prompt', state.message);
+  const patch = await node(state);
+  assert(patch._advanceRoute === 'enrichIntent', 'routes to enrichIntent');
+  assert(/RESULT_ALPHA/.test(patch.message || ''), 'placeholder resolved in next sub-prompt', patch.message);
 }
 
 (async () => {
