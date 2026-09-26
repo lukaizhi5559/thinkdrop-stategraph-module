@@ -320,7 +320,10 @@ describe('decomposePromptV2 — screen-observation guard', () => {
       message: 'take a screenshot',
       conversationHistory: [],
       logger: _noopLogger,
-      llmBackend: { generateAnswer: async () => { llmCalled = true; return '0'; } },
+      // The force-classify call is part of the deterministic fast-path — the
+      // *decision* call is what must not fire. Both share taskType
+      // 'classification', so discriminate on the template prompt preamble.
+      llmBackend: { generateAnswer: async (prompt) => { if (!String(prompt).includes('Pick the single local-automation template')) llmCalled = true; return '{"n":0,"args":{}}'; } },
       _taskClassification: { taskType: 'local_system' },
     });
     assertEq(result._decomposedIntent, 'command_automate');

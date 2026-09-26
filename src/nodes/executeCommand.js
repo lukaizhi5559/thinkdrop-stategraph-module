@@ -303,8 +303,25 @@ async function _thinPostFailureHandler(state) {
   }
 
   if (_fastDecision === 2) {
-    // ASK_USER — fall through to the default ask_user handler below
+    // ASK_USER — bound the loop: if this cursor already asked once, the user's
+    // answer rode in on the resume and the step failed the same way — a second
+    // identical question can only produce the same answer (observed: E2E
+    // tasks looping ask→resume→fail→ask forever). Escalate to REPLAN_STEP so
+    // the planner rebuilds the step with the answer in context instead.
+    const _alreadyAsked = (patchHistory || []).some(p => p.action === 'ASK_USER' && p.cursor === skillCursor);
+    if (_alreadyAsked) {
+      logger.info('[ExecuteCommand:ThinRecovery] Fast decision: ASK_USER but this cursor already asked — escalating to REPLAN_STEP');
+      return {
+        ...state,
+        recoveryAction: 'replan_step',
+        recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: failedStep.error, suggestion: 'prior ask_user answer did not unblock the step', constraint: null },
+        replanCount: replanCount + 1,
+        commandExecuted: false,
+      };
+    }
     logger.info('[ExecuteCommand:ThinRecovery] Fast decision: ASK_USER — proceeding to default ask_user handler');
+    // Record the ask so a repeat on this cursor escalates instead of looping.
+    state = { ...state, patchHistory: [...patchHistory, { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }] };
   } else {
     // AUTO_PATCH (3) — run the full JSON generation to get patchedArgs
     logger.info('[ExecuteCommand:ThinRecovery] Fast decision: AUTO_PATCH — running full JSON generation for patchedArgs');
@@ -399,10 +416,26 @@ async function _thinPostFailureHandler(state) {
   const _autoSkipped = _tryAutoSkipIndependentStep(state);
   if (_autoSkipped) return _autoSkipped;
 
+  // Same loop bound as the fast path — a second ask on this cursor replans.
+  // Read state.patchHistory (the fast path may have just recorded this ask).
+  const _ph = Array.isArray(state.patchHistory) ? state.patchHistory : patchHistory;
+  const _alreadyAskedTail = (_ph || []).some(p => p.action === 'ASK_USER' && p.cursor === skillCursor);
+  if (_alreadyAskedTail) {
+    logger.info('[ExecuteCommand:ThinRecovery] ask_user suppressed — cursor already asked; escalating to REPLAN_STEP');
+    return {
+      ...state,
+      recoveryAction: 'replan_step',
+      recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: failedStep.error, suggestion: 'prior ask_user answer did not unblock the step', constraint: null },
+      replanCount: replanCount + 1,
+      commandExecuted: false,
+    };
+  }
+
   return {
     ...state,
     recoveryAction: 'ask_user',
     pendingQuestion: { question: `Step "${failedStep.skill}" failed: ${failedStep.error}. Would you like to retry, skip, or cancel?`, options: ['Retry', 'Skip this step', 'Cancel'] },
+    patchHistory: [...(_ph || []), { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
     commandExecuted: false,
   };
 }
@@ -1541,6 +1574,16 @@ module.exports = async function executeCommand(state) {
     } else if (hasBrowserSteps && lastBrowserResult?.url) {
       const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
       answer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
+    } else if (state._deterministicPlan) {
+      // Deterministic fast-path — no synthesize step runs, so the step stdout
+      // IS the answer (battery %, file contents, ls output). Fall back to the
+      // step description for silent success steps (mv, mkdir, open).
+      const _okSteps = skillResults.filter(r => r && r.ok !== false && r.skill !== 'synthesize');
+      const _outs = _okSteps.filter(r => (r.stdout || '').trim()).map(r => r.stdout.trim());
+      const _lastOk = _okSteps[_okSteps.length - 1];
+      answer = _outs.length
+        ? _outs.join('\n\n')
+        : (_lastOk?.description ? `Done — ${_lastOk.description}` : 'Done.');
     } else {
       answer = failedCount > 0
         ? `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`
@@ -1962,6 +2005,76 @@ module.exports = async function executeCommand(state) {
       skillCursor: skillPlan.length, // skip to end — remaining steps fire on reminder
       commandExecuted: true,
       answer: `⏰ Reminder set: "${label}" at ${targetIso}`,
+    };
+  }
+
+  // ── schedule_cancel pseudo-skill ─────────────────────────────────────────
+  // Cancels pending reminders registered via the schedule pseudo-skill.
+  // GET /reminder.list → match args.query against label/triggerPrompt
+  // (case-insensitive substring; empty query = most recent) → POST
+  // /reminder.cancel. Without this the LLM planner improvised tool.discover /
+  // app.agent flows against the Reminders app — an auth wall and an
+  // ask-user loop — while the reminder lived in SkillScheduler all along.
+  if (skill === 'schedule_cancel') {
+    const query = String(args.query || args.label || '').trim().toLowerCase();
+    const cmdPort = 3007;
+    const _http = require('http');
+    const _get = () => new Promise((resolve) => {
+      const req = _http.request({ hostname: '127.0.0.1', port: cmdPort, path: '/reminder.list', method: 'GET', timeout: 5000 }, (res) => {
+        let body = '';
+        res.on('data', c => { body += c; });
+        res.on('end', () => { try { resolve(JSON.parse(body).reminders || []); } catch (_) { resolve([]); } });
+      });
+      req.on('error', () => resolve([]));
+      req.on('timeout', () => { req.destroy(); resolve([]); });
+      req.end();
+    });
+    const _post = (id) => new Promise((resolve) => {
+      const payload = JSON.stringify({ id });
+      const req = _http.request({ hostname: '127.0.0.1', port: cmdPort, path: '/reminder.cancel', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }, timeout: 5000 }, (res) => {
+        let body = '';
+        res.on('data', c => { body += c; });
+        res.on('end', () => { try { resolve(JSON.parse(body).cancelled === true); } catch (_) { resolve(false); } });
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.write(payload);
+      req.end();
+    });
+    const _reminders = await _get();
+    const _strip = (s) => String(s || '').toLowerCase().replace(/^(the\s+|my\s+|a\s+)/, '').replace(/\s*reminder\s*$/, '').trim();
+    const _q = _strip(query);
+    const matches = _reminders.filter(r => {
+      if (!_q) return true;
+      const hay = `${r.label || ''} ${r.triggerPrompt || ''}`.toLowerCase();
+      return hay.includes(_q) || _q.split(/\s+/).every(w => hay.includes(w));
+    });
+    // args.all → every match; empty query without all → most recent only.
+    const targets = args.all ? matches : (_q ? matches : matches.slice(-1));
+    const cancelled = [];
+    for (const r of targets) {
+      if (await _post(r.id)) cancelled.push(r);
+    }
+    const ok = cancelled.length > 0;
+    const stdout = ok
+      ? `Cancelled ${cancelled.length} reminder(s): ${cancelled.map(r => `"${r.label}"`).join(', ')}`
+      : (_reminders.length ? `No pending reminder matched "${query}" (${_reminders.length} pending)` : 'No pending reminders');
+    logger.info(`[Node:ExecuteCommand] schedule_cancel: ${stdout}`);
+    const _cancelResult = { step: skillCursor + 1, skill, args, description, ok, stdout };
+    const _cancelContract = generateStepContract(_cancelResult, skillCursor);
+    const _cancelFinal = [...skillResults, _cancelResult];
+    if (progressCallback) progressCallback({
+      type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length,
+      skill, description: ok ? `Cancelled "${cancelled.map(r => r.label).join('", "')}"` : 'No matching reminder',
+      stdout,
+    });
+    return {
+      ...state,
+      skillResults: _cancelFinal,
+      stepContracts: [...stepContracts, _cancelContract],
+      skillCursor: skillCursor + 1,
+      commandExecuted: true,
+      answer: ok ? `Cancelled: ${cancelled.map(r => `"${r.label}"`).join(', ')}` : stdout,
     };
   }
 
@@ -4910,6 +5023,15 @@ Please try again or search with different terms.`;
     if (resolvedArgs.action === 'search_scroll' || resolvedArgs.action === 'scroll') {
       stepTimeoutMs = Math.max(stepTimeoutMs, 120000);
     }
+  }
+
+  // ── Deterministic fast-path: hard 10s wall-clock per step ─────────────────
+  // Catalog skills are all quick local ops (shell.run/fs.read/screen.capture/
+  // schedule*) — a step exceeding 10s indicates a hang, not legitimate work.
+  // Steps that genuinely need longer must explicitly opt out via args.timeoutMs
+  // (the plan's stated budget beats the cap).
+  if (Array.isArray(state._deterministicPlan) && !resolvedArgs.timeoutMs) {
+    if (stepTimeoutMs > 10000) stepTimeoutMs = 10000;
   }
   // ── project_build: route to project.builder MCP skill ──────────────────────
   if (skill === 'project_build') {

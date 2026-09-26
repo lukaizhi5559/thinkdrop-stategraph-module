@@ -703,6 +703,30 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };
   }
 
+  // ── Fast-pass: deterministic fast-path plan — catalog skills are ─────────────
+  // self-verifying (fs.read reads the file, screen.capture writes a file,
+  // schedule registers server-side). An ok=true step IS the success signal;
+  // an LLM fulfillment check cannot verify a screenshot and misjudges it as
+  // hollow (observed: clean screen.capture → replan loop).
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+    const _allOk = skillResults.every(r => r.ok !== false);
+    if (_allOk) {
+      const _outputs = (skillResults || [])
+        .filter(r => r.ok !== false)
+        .map(r => {
+          const label = `${r.skill || 'step'}${r.args?.action ? '/' + r.args.action : ''}`;
+          const out = String(r.stdout || r.result || '').trim();
+          return `[${label}]:${out ? '\n' + out.slice(0, 300) : ' completed'}`;
+        });
+      const answer = _outputs.length
+        ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}`
+        : 'Done.';
+      logger.info('[Node:ReviewExecution] Deterministic plan — all steps ok, skipping LLM review');
+      return { ...state, reviewVerdict: 'UNVERIFIABLE', answer };
+    }
+    // A failed deterministic step still goes through normal review/recovery.
+  }
+
   // ── Fast-pass: shell-only plan where every step exited cleanly ───────────────
   // When all steps are shell.run/cli.agent and every step exited with ok=true and
   // exitCode 0 — the LLM review would return PASS 100% of the time.
@@ -722,7 +746,21 @@ module.exports = async function reviewExecution(state) {
       });
     if (_allClean) {
       logger.info('[Node:ReviewExecution] Shell-only plan — all steps exited cleanly, skipping LLM review');
-      return { ...state, reviewVerdict: 'UNVERIFIABLE' };
+      // Pure-interaction plans never reach synthesize — without an answer here
+      // the completion event carries an empty result (observed: "open the
+      // Notes app" → task done, result ''). Mirror the LogConversation
+      // richText shape so the answer and the transcript agree.
+      const _outputs = (skillResults || [])
+        .filter(r => r.ok !== false)
+        .map(r => {
+          const label = `${r.skill || 'step'}${r.args?.action ? '/' + r.args.action : ''}`;
+          const out = String(r.stdout || r.result || '').trim();
+          return `[${label}]:${out ? '\n' + out.slice(0, 300) : ' completed'}`;
+        });
+      const answer = _outputs.length
+        ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}`
+        : 'Done.';
+      return { ...state, reviewVerdict: 'UNVERIFIABLE', answer };
     }
   }
 

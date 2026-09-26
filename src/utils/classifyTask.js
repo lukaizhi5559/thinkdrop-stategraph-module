@@ -35,7 +35,7 @@
  */
 
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE } = require('./textPatterns.cjs');
+const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE } = require('./textPatterns.cjs');
 
 // ── Deterministic screen-output detection ──────────────────────────────────
 // The LLM's isScreenOutput flag is advisory — phrasing is unambiguous enough
@@ -592,6 +592,32 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       'memory_retrieve', 'general_knowledge', 'greeting', 'screen_display', 'multi_step',
     ]);
 
+    // Action/passive coherence: taskType and suggestedIntent come from the
+    // same call but flake independently — "read the file /tmp/x" emitted
+    // taskType:'local_file' + suggestedIntent:'general_knowledge', and the
+    // merge's concur-rule then amplified the contradiction into a blind
+    // text answer. Contradictory fields → drop the suggestion so the
+    // decompose arbitration (number call + hint veto) decides instead.
+    const _ACTION_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser', 'messaging', 'scheduling']);
+    const _PASSIVE_INTENTS = new Set(['general_knowledge', 'web_search', 'screen_intelligence', 'memory_retrieve', 'memory_store', 'greeting']);
+    // A literal filesystem path is ground truth — "read the file /tmp/x.txt"
+    // flaked to taskType:'query' once, letting a passive suggestedIntent carry
+    // it to a "I can't read files" hallucination. Any POSIX path token in the
+    // message means the task touches the filesystem; coerce a passive typing.
+    if (FILE_PATH_RE.test(classifiedMessage)
+        && (!parsed.taskType || parsed.taskType === 'query' || parsed.taskType === 'ambiguous')) {
+      logger.info(`[classifyTask] Literal path in message but taskType='${parsed.taskType}' — coercing to local_file`);
+      parsed.taskType = 'local_file';
+    }
+
+    const _rawSuggested = _VALID_SUGGESTED_INTENTS.has(parsed.suggestedIntent) ? parsed.suggestedIntent : null;
+    const _contradicts = _rawSuggested && (
+      (_ACTION_TASK_TYPES.has(parsed.taskType) && _PASSIVE_INTENTS.has(_rawSuggested) && _rawSuggested !== 'screen_display')
+      || ((parsed.taskType === 'query' || parsed.taskType === 'ambiguous') && _rawSuggested === 'command_automate')
+    );
+    // screen_display exempt: it pairs with isScreenOutput, which the
+    // screen-output guard re-derives lexically anyway.
+
     // Deterministic consistency: a resolved file/url target never needs screen
     // OCR. The LLM has emitted isScreenFollowUp:true alongside activeDocRef:"url"
     // (observed on "print this page for me") — normalize rather than trust.
@@ -620,7 +646,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       activeDocRef,
       activeDocTarget:     null, // resolved by caller from live context
       mediaListing:        _VALID_MEDIA_LISTINGS.has(parsed.mediaListing) ? parsed.mediaListing : 'none',
-      suggestedIntent:     _VALID_SUGGESTED_INTENTS.has(parsed.suggestedIntent) ? parsed.suggestedIntent : null,
+      suggestedIntent:     _contradicts ? null : _rawSuggested,
       isScreenOutput:      !!parsed.isScreenOutput,
       screenOutputAction:  ['show', 'clear'].includes(parsed.screenOutputAction) ? parsed.screenOutputAction : null,
       screenOutputKind:    ['text', 'emoji', 'image', 'chart', 'effect', 'alert', 'deck', 'scene'].includes(parsed.screenOutputKind) ? parsed.screenOutputKind : null,

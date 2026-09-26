@@ -55,6 +55,10 @@ function _shouldBypassGather(state) {
   const tc = state._taskClassification || {};
   if (tc.needsClarification === true) return false;
 
+  // Deterministic plan was force-classified at decompose — args are
+  // message-verbatim and validated, nothing to clarify or gather for.
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) return true;
+
   // Scheduling tasks always go through the grill loop — the _askLLMDecision
   // fast call already knows to ask about missing notification/delivery methods,
   // and the scheduling short-circuit generates the question directly. Bypassing
@@ -383,7 +387,9 @@ module.exports = async function gatherPlanContext(state) {
   // failure-risk lens would question. The grill loop has its own cheap
   // fast-decision exit for fully-specified tasks.
   // Falls back to legacy if the grill loop fails for any reason.
-  if (GRILL_MODE) {
+  // Deterministic fast-path skips the grill entirely — a force-classified
+  // plan has verbatim validated args; there is nothing to question.
+  if (GRILL_MODE && !(Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0)) {
     try {
       logger.info('[Node:GatherPlanContext] Grill-Me mode enabled — running batched Q&A loop');
       return await _runGrillLoop(state, logger);
@@ -410,8 +416,16 @@ module.exports = async function gatherPlanContext(state) {
   let baseMsg = resolvedMessage || message || '';
   if (!_isIsoSession && tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp &&
       !baseMsg.includes('(Context from prior turn:')) {
-    baseMsg = `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
-    logger.info(`[Node:GatherPlanContext] Follow-up target injected: "${tc.followUpTarget}"`);
+    // A resolved literal path is a BINDING, not context — "that file" must
+    // resolve to it and no other path in conversation history may substitute
+    // (observed: planner appended to a Desktop file from an older turn while
+    // followUpTarget correctly said /tmp/e2e/notes.txt — nearly wrote to a
+    // real user file).
+    const _isPathTarget = /^\/|~\/|^\.\.?\\?\//.test(String(tc.followUpTarget).trim());
+    baseMsg = _isPathTarget
+      ? `${baseMsg}\n\n(Resolved referent — "that file"/"it" refers to exactly ${tc.followUpTarget}. Use this path verbatim; ignore other file paths from earlier turns.)`
+      : `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
+    logger.info(`[Node:GatherPlanContext] Follow-up target injected: "${tc.followUpTarget}"${_isPathTarget ? ' (binding path)' : ''}`);
   }
 
   const originalMsg = state.originalMessage || state.message || baseMsg;
@@ -837,7 +851,10 @@ async function _runGrillLoop(state, logger) {
   let baseMsg = resolvedMessage || message || '';
   if (!_isIsoSession && tc.isFollowUp && tc.followUpTarget && !tc.isScreenFollowUp &&
       !baseMsg.includes('(Context from prior turn:')) {
-    baseMsg = `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
+    const _isPathTarget = /^\/|~\/|^\.\.?\\?\//.test(String(tc.followUpTarget).trim());
+    baseMsg = _isPathTarget
+      ? `${baseMsg}\n\n(Resolved referent — "that file"/"it" refers to exactly ${tc.followUpTarget}. Use this path verbatim; ignore other file paths from earlier turns.)`
+      : `${baseMsg}\n\n(Context from prior turn: ${tc.followUpTarget})`;
   }
   const originalMsg = state.originalMessage || state.message || baseMsg;
   const priorAnswers = Array.isArray(state.planGatheringAnswers) ? state.planGatheringAnswers : [];

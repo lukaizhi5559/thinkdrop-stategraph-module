@@ -440,3 +440,68 @@ describe('decomposePromptV2 — screen-output lexical fallback (isScreenOutput f
     assertEq(r._decomposedBy, 'screen-observation-guard');
   });
 });
+
+describe('classifyTask/decompose — action-passive coherence', () => {
+  it('action taskType + passive suggestedIntent → suggestion dropped, escalates', async () => {
+    // "read the file /tmp/x and tell me what it says" emitted
+    // taskType:'local_file' + suggestedIntent:'general_knowledge' and the
+    // merge amplified it into a "I can't read files" hallucination.
+    const backend = {
+      generateAnswer: async (q) => {
+        if (/subPrompts/i.test(String(q))) {
+          return JSON.stringify({ subPrompts: [{ text: 'read the file /tmp/e2e/hello.txt', estimatedIntent: 'command_automate', order: 0, dependsOn: [], isLongRunning: false }] });
+        }
+        return '4'; // number call: general_knowledge — wrong on purpose
+      },
+    };
+    const r = await _decompose('read the file /tmp/e2e/hello.txt and tell me what it says', backend,
+      { taskType: 'local_file', activeDocRef: 'file', followUpTarget: '/tmp/e2e/hello.txt', isFollowUp: true, suggestedIntent: 'general_knowledge' });
+    // The contradiction must NOT be silently trusted — either the suggestion
+    // was nulled upstream (classifyTask coherence) or the decision site
+    // escalates a passive pick on an action taskType to full decompose.
+    assertEq(r._decomposedIntent, 'command_automate');
+  });
+
+  it('passive taskType + command_automate suggestedIntent → classifyTask nulls it', async () => {
+    const { classifyTask } = require('../src/utils/classifyTask');
+    const tc = await classifyTask('what is photosynthesis', [],
+      { generateAnswer: async () => JSON.stringify({ taskType: 'query', suggestedIntent: 'command_automate' }) },
+      { info() {}, debug() {}, warn() {}, error() {} });
+    assertEq(tc.suggestedIntent, null);
+  });
+
+  it('action taskType + passive suggestedIntent → classifyTask nulls it', async () => {
+    const { classifyTask } = require('../src/utils/classifyTask');
+    const tc = await classifyTask('read the file /tmp/x.txt', [],
+      { generateAnswer: async () => JSON.stringify({ taskType: 'local_file', suggestedIntent: 'general_knowledge' }) },
+      { info() {}, debug() {}, warn() {}, error() {} });
+    assertEq(tc.suggestedIntent, null);
+  });
+
+  it('coherent action pair (local_file + command_automate) survives', async () => {
+    const { classifyTask } = require('../src/utils/classifyTask');
+    const tc = await classifyTask('read the file /tmp/x.txt', [],
+      { generateAnswer: async () => JSON.stringify({ taskType: 'local_file', suggestedIntent: 'command_automate' }) },
+      { info() {}, debug() {}, warn() {}, error() {} });
+    assertEq(tc.suggestedIntent, 'command_automate');
+  });
+});
+
+describe('decompose — device-state guard', () => {
+  it('battery question → command_automate even when hint disagrees', async () => {
+    const r = await _decompose("what's my battery percentage",
+      { generateAnswer: async () => '4' },
+      { taskType: 'local_system', suggestedIntent: 'command_automate', webAccessMode: 'none' },
+      'general_knowledge');
+    assertEq(r._decomposedIntent, 'command_automate');
+    assertEq(r._decomposedBy, 'device-state-guard');
+  });
+
+  it('device-state with flaky query taskType still → command_automate', async () => {
+    const r = await _decompose('how much disk space do I have',
+      { generateAnswer: async () => '4' },
+      { taskType: 'query', suggestedIntent: 'general_knowledge', webAccessMode: 'none' },
+      'general_knowledge');
+    assertEq(r._decomposedIntent, 'command_automate');
+  });
+});

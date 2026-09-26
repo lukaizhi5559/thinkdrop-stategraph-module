@@ -106,7 +106,7 @@ describe('decomposePromptV2 — media-search guard', () => {
       taskType: 'browser', targetService: 'amazon', webAccessMode: 'public_read', mediaListing: 'video',
     });
     assertEq(r._decomposedIntent, 'command_automate');
-    assertEq(r._decomposedBy, 'local-short-circuit');
+    assert(['local-short-circuit', 'site-service-guard'].includes(r._decomposedBy), `expected deterministic automation parser, got ${r._decomposedBy}`);
   });
 
   it('image listing + no targetService → web_search', async () => {
@@ -145,7 +145,7 @@ describe('decomposePromptV2 — media-search guard', () => {
       taskType: 'browser', targetService: 'youtube', webAccessMode: 'interactive', mediaListing: 'none',
     });
     assertEq(r._decomposedIntent, 'command_automate');
-    assertEq(r._decomposedBy, 'local-short-circuit');
+    assert(['local-short-circuit', 'site-service-guard'].includes(r._decomposedBy), `expected deterministic automation parser, got ${r._decomposedBy}`);
   });
 });
 

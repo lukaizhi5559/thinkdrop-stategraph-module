@@ -450,6 +450,13 @@ module.exports = async function resolveUserContext(state) {
     catch (_) { /* progress callback must never block execution */ }
   }
 
+  // ── Deterministic fast-path: a compiled plan needs zero user context ──────
+  // (not even the pass-through self:email hydrate — catalog skills never read it)
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+    logger.debug(`[Node:ResolveUserContext] deterministic plan — pass-through`);
+    return { ...state, resolveUserContextDone: true };
+  }
+
   // ── Quick-exit: nothing self-referential in this message ─────────────────
   if (!_hasSelfReferentialContext(state, msg)) {
     // Bridge/cron prompts never trigger the full resolver, but planSkills needs

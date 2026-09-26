@@ -25,6 +25,10 @@ const decomposePromptV2 = require('../src/nodes/decomposePromptV2.js');
 // Mock backend: script responses by maxTokens — 5 = number call, 400 = plan.
 const _backend = (numberCall, planCall) => ({
   generateAnswer: async (prompt, opts, params) => {
+    // The deterministic fast-path classify call is neither the number call
+    // nor the plan call — discriminate on its prompt preamble so it never
+    // counts as either.
+    if (typeof prompt === 'string' && prompt.includes('Pick the single local-automation template')) return '{"n":0,"args":{}}';
     const mt = (params && params.maxTokens) || (opts && opts.maxTokens) || 0;
     if (mt <= 10) return typeof numberCall === 'function' ? numberCall() : numberCall;
     return typeof planCall === 'function' ? planCall() : planCall;
@@ -202,5 +206,45 @@ describe('_decomposeDecision — backend failure fallback', () => {
   it('both attempts throw + no hint → 0 (command_automate), taskType absent so no escalation', async () => {
     const r = await _decompose('do x', _backend(() => { throw new Error('down'); }), {});
     assert.equal(r._decomposedIntent, 'command_automate');
+  });
+});
+
+describe('_decomposeDecision — capture vs display (Stage 5 regression)', () => {
+  it('"take a screenshot of my screen" is NOT screen_display even when isScreenOutput flakes true', async () => {
+    // Bug: screen-output-guard emitted [web_search, screen_display] which
+    // hallucinated a captured screenshot. Capture is a local OS action.
+    const r = await _decompose('take a screenshot of my screen',
+      _backend('0', _plan('command_automate')),
+      { taskType: 'local_system', isScreenOutput: true, screenOutputKind: 'image' });
+    assert.notEqual(r._decomposedBy, 'screen-output-guard');
+    assert.equal(r._decomposedIntent, 'command_automate');
+  });
+
+  it('real display prompts still route to screen_display', async () => {
+    const r = await _decompose('show fireworks on my screen',
+      _backend('0', _plan('web_search')),
+      { taskType: 'query', isScreenOutput: true, screenOutputKind: 'effect' });
+    assert.equal(r._decomposedBy, 'screen-output-guard');
+    assert.equal(r._decomposedIntent, 'screen_display');
+  });
+});
+
+describe('_decomposeDecision — public-research path exemption (Stage 5 regression)', () => {
+  it('"search the web for X and save it to /tmp/y" does not collapse to single web_search', async () => {
+    // Bug: public-research-guard swallowed the file-write half — plan was a
+    // lone web_search and nothing got saved.
+    const r = await _decompose('search the web for the current time in Tokyo and save it to /tmp/e2e/tokyo.txt',
+      _backend('0', _plan('command_automate')),
+      { taskType: 'browser', webAccessMode: 'public_read', targetService: null });
+    assert.notEqual(r._decomposedBy, 'public-research-guard');
+    assert.equal(r._decomposedIntent, 'command_automate');
+  });
+
+  it('pure public research (no path) still routes to web_search', async () => {
+    const r = await _decompose('look online for reviews of the new iphone',
+      _backend('0', _plan('command_automate')),
+      { taskType: 'browser', webAccessMode: 'public_read', targetService: null });
+    assert.equal(r._decomposedBy, 'public-research-guard');
+    assert.equal(r._decomposedIntent, 'web_search');
   });
 });

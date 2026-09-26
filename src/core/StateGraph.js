@@ -63,7 +63,10 @@ class StateGraph {
       abortSignal: abortSignal || null,
     };
 
-    let currentNode = this.startNode;
+    // Start edge may be a function (same contract as conditional edges) —
+    // e.g. routing resumed plans (_planFile) straight to planExecutor.
+    let currentNode = typeof this.startNode === 'function' ? await this.startNode(state) : this.startNode;
+    state.currentNode = currentNode;
     // Per-node visit counts for real loop detection. Recovery cycles
     // (execute → evaluate → recover → execute) legitimately revisit a node
     // a few times; more than MAX_NODE_VISITS means the graph is stuck.

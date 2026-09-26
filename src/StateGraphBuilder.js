@@ -236,7 +236,11 @@ class StateGraphBuilder {
     
     // Intent-based routing (matches DistilBERT classifier intents)
     const edges = {
-      start: 'resolveReferences',
+      // Resume fast-path: an approved/stored plan re-enters with _planFile —
+      // go straight to planExecutor instead of re-running the full
+      // classify/decompose/agent/plan chain (which burned ~15–30s per resume
+      // on dead-endpoint enrich calls and repeat LLM passes).
+      start: (state) => state._planFile ? 'planExecutor' : 'resolveReferences',
       // clarify is the pre-routing resolution gate: needs_clarification → ask
       // the user (grill batch) + re-classify once; resolved/declined_ack pass.
       resolveReferences: 'clarify',

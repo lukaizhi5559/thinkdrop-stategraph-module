@@ -83,7 +83,7 @@ function _selectPriorSynthesis(conversationHistory = []) {
 // are exempt — they wait for input or exit early, so a trailing synthesize
 // would be unreachable or wrong.
 const _SYNTHESIZE_EXEMPT_SKILLS = new Set([
-  'synthesize', 'ask_user', 'needs_skill', 'schedule', 'api_suggest',
+  'synthesize', 'ask_user', 'needs_skill', 'schedule', 'schedule_cancel', 'api_suggest',
   'profile.store_secret', 'smartFill',
   // edit.agent ends a plan with its own completion UX — a draft card +
   // Apply button or an applied-edit result. A trailing "confirm" synthesize
@@ -507,7 +507,7 @@ Example: [{"skill": "web.agent", "args": {"action": "...", "query": "..."}, "run
     // Hard guard: strip runGroup from skills that must never run in parallel,
     // regardless of what the LLM returned
     const SEQUENTIAL_ONLY_SKILLS = new Set([
-      'synthesize', 'schedule', 'shell.run',
+      'synthesize', 'schedule', 'schedule_cancel', 'shell.run',
       'api_suggest', 'needs_skill', 'ask_user',
       'profile.store_secret', 'smartFill',
     ]);
@@ -1629,6 +1629,74 @@ async function planSkillsV2(state) {
         return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: cached.planFile };
       }
     } catch (_e) { logger.debug(`[Node:PlanSkillsV2] Cache check error: ${_e.message}`); }
+  }
+
+  // ── Deterministic fast-path plan — force-classified at decompose ──────────
+  // localPlanTemplates compiled this plan with a validated template — skip ALL
+  // planning: no grill, no preflight dependency, no 84k LLM prompt. The normal
+  // approval gate is still honored (plan file + awaitingPlanApproval) so
+  // planApprovalMode='always' users keep their review pass.
+  if (!recoveryContext && Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+    const detPlan = state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 }));
+    logger.info(`[Node:PlanSkillsV2] Deterministic plan adopted (${state._deterministicTemplate || 'template'}, ${detPlan.length} step${detPlan.length !== 1 ? 's' : ''}) — skipping LLM planning`);
+    let _detPlanFile = null;
+    try {
+      const _detPlanId = `plan_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const _detMd = serializeSkillPlanToMd(detPlan, userMessage, _detPlanId, state.context?.sessionId || 'unknown');
+      _detPlanFile = path.join(PLANS_DIR, `${_detPlanId}.md`);
+      fs.writeFileSync(_detPlanFile, _detMd, 'utf8');
+    } catch (_) {}
+    let _detApprovalMode = 'multi_step';
+    try {
+      const _dsp = path.join(os.homedir(), '.thinkdrop', 'settings.json');
+      if (fs.existsSync(_dsp)) {
+        const _dsd = JSON.parse(fs.readFileSync(_dsp, 'utf8'));
+        if (_dsd.planApprovalMode && ['always', 'multi_step', 'auto'].includes(_dsd.planApprovalMode)) _detApprovalMode = _dsd.planApprovalMode;
+      }
+    } catch (_) {}
+    const _detNeedsApproval = !state.userApproved && (
+      _detApprovalMode === 'always' ||
+      (_detApprovalMode === 'multi_step' && detPlan.length >= 2));
+    if (_detNeedsApproval) {
+      const _detContent = _detPlanFile ? fs.readFileSync(_detPlanFile, 'utf8') : '';
+      if (progressCallback) progressCallback({
+        type: 'plan:generated', planFile: _detPlanFile, planId: _detPlanFile?.split('/').pop()?.replace(/\.md$/, '') || null,
+        content: _detContent, skillPlanJson: Buffer.from(JSON.stringify(detPlan)).toString('base64'),
+        deterministic: true,
+      });
+      return { ...state, awaitingPlanApproval: true, _skillPlanFile: _detPlanFile, skillPlan: null, skillCursor: 0, planError: null, recoveryContext: null };
+    }
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: detPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate', deterministic: true });
+    return { ...state, skillPlan: detPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: _detPlanFile };
+  }
+
+  // ── Pre-LLM reminder-cancel intercept ────────────────────────────────────
+  // "cancel my stretch reminder" → deterministic schedule_cancel step. Without
+  // this the LLM planned tool.discover/app.agent flows against the Reminders
+  // app — auth walls and ask-user loops — while the reminder lives in
+  // SkillScheduler (registered by the schedule pseudo-skill).
+  if (!recoveryContext && /\b(cancel|delete|remove|clear|stop|turn\s+off|disable)\b/i.test(userMessage)
+      && /\b(reminder|reminders|alarm|alarms|alert|alerts|scheduled\s+\w+|cron)\b/i.test(userMessage)) {
+    const _cancelQuery = String(userMessage)
+      // Strip injected context markers — "(Context from prior turn: …)" /
+      // "(Resolved referent — …)" are pipeline metadata, not reminder text.
+      .replace(/\s*\((?:Context from prior turn|Resolved referent)[^)]*\)/gi, ' ')
+      .replace(/^.*?\b(?:cancel|delete|remove|clear|stop|turn\s+off|disable)\b/i, '')
+      .replace(/\b(?:my|the|a|an|that|this|all|every|pending|please)\b/gi, ' ')
+      .replace(/\b(?:reminder|reminders|alarm|alarms|alert|alerts|cron|scheduled|schedule|task|tasks|job|jobs)\b.*$/i, ' ')
+      .replace(/\s+/g, ' ').trim();
+    const _cancelAll = /\b(all|every)\s+(?:of\s+)?(?:my\s+|the\s+)?(?:pending\s+)?(?:reminder|reminders|alarm|alarms|alert|alerts)\b/i.test(userMessage)
+      || /\b(?:reminder|alarm)s?\s+(?:I|i)\s+(?:have|set)\b/i.test(userMessage) && /\b(all|every)\b/i.test(userMessage);
+    const cancelPlan = [{
+      step: 1,
+      skill: 'schedule_cancel',
+      args: _cancelAll ? { query: _cancelQuery, all: true } : { query: _cancelQuery },
+      description: _cancelAll ? 'Cancel all pending reminders'
+        : (_cancelQuery ? `Cancel reminder matching "${_cancelQuery}"` : 'Cancel pending reminder'),
+    }];
+    logger.info(`[Node:PlanSkillsV2] Reminder-cancel intercept: schedule_cancel query="${_cancelQuery}"`);
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: cancelPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+    return { ...state, skillPlan: cancelPlan, skillCursor: 0, planError: null, recoveryContext: null };
   }
 
   // ── Pre-LLM recurring reminder intercept ─────────────────────────────────

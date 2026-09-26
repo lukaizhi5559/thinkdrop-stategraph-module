@@ -506,6 +506,15 @@ module.exports = async function preflightAgents(state) {
   const logger = state.logger || console;
   const mcpAdapter = state.mcpAdapter;
   const progressCallback = state.progressCallback || null;
+
+  // ── Deterministic fast-path: generic local skills need no agent preflight ──
+  // _deterministicPlan steps are all catalog skills (fs.read/shell.run/schedule…)
+  // — no service agents to auth, no CLI checks to run.
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+    logger.info(`[Node:PreflightAgents] Deterministic plan (${state._deterministicTemplate || 'template'}) — skipping agent preflight`);
+    return { ...state, preflightResult: { agents: [], skipped: 'deterministic' } };
+  }
+
   let userMessage = state.resolvedMessage || state.message || '';
   // Inject follow-up target context so preflight consumers (deep-link resolution,
   // cli preflight_check, tool.discover, agent-relevance filter) see the full task
@@ -2606,6 +2615,11 @@ module.exports = async function preflightAgents(state) {
       preflightDone: true,
       planError,
       preflightAuthRequired: isAuthRequired,
+      // Which agents failed auth — handoffRunner carries these into the
+      // pending-resume ctx so "proceed" bypasses the actual failures. Without
+      // it the resume replays with an empty bypass list → auth-required again
+      // → infinite auth-resume loop (observed in E2E).
+      preflightAuthAgents: authFailures.map(f => f.agentId).filter(Boolean),
       preflightResult: {
         warnings,
         agents: agentReadiness,

@@ -15,6 +15,7 @@
  */
 
 const { classifyTask, deriveResolution } = require('../utils/classifyTask');
+const { forceClassifyLocalPlan, looksLikeLocalOp } = require('../utils/localPlanTemplates');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE } = require('../utils/textPatterns.cjs');
 
@@ -121,9 +122,11 @@ const path = require('path');
 // (600s in main.js/stub) is sized for long-running automation calls, not
 // context reads. Observed: a wedged user-memory service held
 // getActiveAppContext for a full 10min client timeout inside
-// resolveReferences. Bound every enrichment call in this node to 10s,
+// resolveReferences. Bound every enrichment call in this node to 2.5s,
 // single attempt — every call site already degrades gracefully on failure.
-const _ENRICH_OPTS = { timeoutMs: 10_000, maxRetries: 1 };
+// (Was 10s: a dead endpoint burned ~20s/task when several calls serialized —
+// these are best-effort context reads, never worth blocking the pipeline for.)
+const _ENRICH_OPTS = { timeoutMs: 2_500, maxRetries: 1 };
 
 async function getRecentMonitorCapture(mcpAdapter, logger) {
   // Primary: live monitor via user-memory MCP (max 5s stale)
@@ -550,6 +553,13 @@ module.exports = async function resolveReferencesV2(state) {
       resolution: 'resolved',
     };
   } else {
+    // Prefire the deterministic-plan classify in parallel with classifyTask
+    // when the message lexically resembles a local op — the two LLM calls
+    // otherwise serialize (~7s + ~3s). Decompose awaits this promise via
+    // _classifyDeterministic; a resolved followUpTarget reclassifies there.
+    const _detPrefire = looksLikeLocalOp(message)
+      ? forceClassifyLocalPlan(message, null, state.llmBackend || null, logger).catch(() => null)
+      : null;
     _taskClassification = await classifyTask(
       message,
       conversationHistory,
@@ -558,6 +568,9 @@ module.exports = async function resolveReferencesV2(state) {
       priorScreenSummary,
       _activeAppContext,
     );
+    if (_detPrefire && _taskClassification && typeof _taskClassification === 'object') {
+      _taskClassification._detPrefirePromise = _detPrefire;
+    }
   }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
 

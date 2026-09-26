@@ -42,6 +42,20 @@ const AGENT_CANONICAL_MAP = {
   'google_slides.agent': 'google.agent',
 };
 
+// Generic local-resource nouns are never real services. The LLM occasionally
+// nominates them for creation ("run X in the terminal" → terminal.agent,
+// create:true type:cli), which sends preflight into brew-install on a
+// nonexistent formula. Shell/terminal/console/file/screen tasks are handled by
+// generic skills (shell.run, fs.*, app.agent, screen.capture) — drop create
+// specs that name one of these.
+const GENERIC_LOCAL_NOUNS = new Set([
+  'terminal', 'shell', 'console', 'cmd', 'commandline', 'command_line',
+  'bash', 'zsh', 'sh', 'powershell', 'terminal.app', 'iterm',
+  'file', 'files', 'folder', 'folders', 'finder', 'directory',
+  'desktop', 'screen', 'system', 'computer', 'machine', 'os', 'macos',
+  'fs', 'filesystem', 'path', 'process', 'clipboard', 'keyboard', 'mouse',
+]);
+
 // Known service hostname aliases for verification. Smaller and more stable than a
 // full URL map; the primary source of truth is discovered via web.agent.
 const SERVICE_HOST_ALIASES = {
@@ -140,7 +154,15 @@ function _messageMentionsServiceOrAgent(userMessage, registeredAgents) {
   for (const token of tokens) {
     if (token.length < 3) continue; // skip very short tokens (a, an, the)
     for (const name of names) {
-      if (fuzzyMatch(token, name)) return true;
+      // Fuzzy matching short service names against arbitrary message words is
+      // dictionary roulette — "line"~linear and "entry"~etsy (both dist 2)
+      // defeated the local-file skip and let ResolveAgent invent fs.agent for
+      // "append the line 'second entry' to /tmp/e2e/log.txt". A missed typo
+      // only falls through to LLM selection (which still reads the message);
+      // a false hit silently bypasses the skip. Exact match for short names,
+      // fuzzy only for long ones where collisions are rare.
+      if (token === name) return true;
+      if (name.length >= 8 && fuzzyMatch(token, name)) return true;
     }
   }
   return false;
@@ -164,7 +186,10 @@ function _messageMentionsAgent(userMessage, agentId, service) {
   }
   for (const token of tokens) {
     for (const name of names) {
-      if (name.length >= 3 && fuzzyMatch(token, name)) return true;
+      // Same collision class as _messageMentionsServiceOrAgent — fuzzy on
+      // short names matches common words ("help"~yelp). Exact for <8 chars.
+      if (token === name) return true;
+      if (name.length >= 8 && fuzzyMatch(token, name)) return true;
     }
   }
   return false;
@@ -623,6 +648,15 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
       create = false;
     }
 
+    // Generic local nouns are not services — drop unregistered ones entirely
+    // (shell.run / fs.* / app.agent / screen.capture handle them). This prevents
+    // "run X in the terminal" → terminal.agent → brew install terminal.
+    const _noun = String(service || agentId).replace(/\.agent$/, '').toLowerCase();
+    if (!exists && GENERIC_LOCAL_NOUNS.has(_noun)) {
+      logger.info(`[Node:ResolveAgent] Dropping fabricated local-noun agent ${agentId} (service='${service}') — generic skills handle local OS/shell/file tasks`);
+      continue;
+    }
+
     // Never create per-service 'app' agents through this path — desktop app
     // control is handled by the generic app.agent skill, and the app.agent
     // build_agent contract requires appName (not service), which this pipeline
@@ -709,6 +743,12 @@ module.exports = async function resolveAgent(state) {
   // ── Skip: wrong intent ─────────────────────────────────────────────────────
   if (intent?.type !== 'command_automate') {
     return { ...state, resolveAgentResult: { agents: [], reasoning: 'Non-command intent', question: null } };
+  }
+
+  // ── Skip: deterministic plan — catalog skills never need service agents ────
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+    logger.info(`[Node:ResolveAgent] Deterministic plan (${state._deterministicTemplate || 'template'}) — skipping agent selection`);
+    return { ...state, resolveAgentResult: { agents: [], reasoning: 'deterministic plan', question: null } };
   }
 
   // ── Skip: already resolved for this exact message ──────────────────────────

@@ -7,7 +7,8 @@ const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
-const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { _classifyDeterministic } = require('../utils/localPlanTemplates.js');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeDecomposeLog(entry) {
@@ -65,8 +66,10 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - Navigation commands (goto, navigate to, open + specific site) → command_automate, NOT web_search
 - Any task that involves interacting with a specific website or web service (sending, asking, navigating, posting, filling forms, etc.) → command_automate
 - PRIORITY RULE - FILE/FOLDER ANALYSIS (takes precedence over user info rules): When the message starts with "[Folder:" or involves analyzing/listing/describing files/folders/images on the local filesystem (e.g., "[Folder: /path] tell me what files are here", "what are these images about", "analyze files in /path/to/folder"), use SINGLE command_automate step. This requires shell commands to list and read actual files, NOT memory_retrieve or web_search which will hallucinate.
+- PRIORITY RULE - FILE/FOLDER WRITE (same precedence): When the message creates, writes, appends, renames, moves, copies, or deletes a local file/folder — especially with a literal path like /tmp/x.txt or ~/doc — use SINGLE command_automate step, even when the file's CONTENT mentions memory/search/display words ("create a file /tmp/notes.txt with the words remember milk" is a file write, NOT a memory store or web search). Shell file ops do the work; no retrieval step is needed to produce literal content.
 - PRIORITY RULE - USER INFO WITH ACTION: When the request is about USER INFO (family, profile, personal data, relationships like mom/dad/wife/cousin, phone numbers, emails, addresses, contacts) AND also requires an external action (send, email, post, fill, submit, create, share), use SINGLE command_automate step. The user.agent skill retrieves the info internally.
 - PRIORITY RULE - USER INFO ONLY: When the request is ONLY asking to show/list/tell/display USER INFO with NO external action (e.g. "who is my wife", "list my family", "what is my mom's phone", "tell me about my contacts"), use SINGLE memory_retrieve step. Do NOT use command_automate for pure info lookup.
+- PRIORITY RULE - DEVICE TELEMETRY (overrides USER INFO ONLY): "my" + device/hardware state is NOT user info — battery percentage, disk space, storage, RAM/memory usage, uptime, wifi/bluetooth status, volume, brightness, CPU, IP address, hostname, OS version all require a live OS probe → command_automate. EXAMPLES: "what's my battery percentage" → command_automate | "how much disk space do I have" → command_automate | "is my wifi on" → command_automate | "check my uptime" → command_automate | "how much ram is free" → command_automate. These are never memory_retrieve or general_knowledge — nothing stored can answer them.
 - EXAMPLES OF memory_retrieve: "who is my wife" → memory_retrieve | "list all info about my family" → memory_retrieve | "what do you know about my mom" → memory_retrieve | "tell me about my contacts" → memory_retrieve | "show my saved addresses" → memory_retrieve
 - EXAMPLES of command_automate (user info + action): "send my family info via email" → command_automate | "email my wife's number to John" → command_automate | "post about my mom on Facebook" → command_automate | "share my contact list" → command_automate
 - PRIORITY RULE - KNOWLEDGE vs SEARCH vs ACTION (when no specific website/tool is mentioned): For general questions without browser/tool interaction: Use general_knowledge for math/calculations ("convert 88s to minutes", "what is 5*7"), timeless facts ("who wrote Pride and Prejudice"), and definitions ("what is blockchain"). Use web_search for time-sensitive info (prices, news, "latest", "current"). Use command_automate ONLY when specific website interaction, tool usage, or external action is required.
@@ -511,9 +514,23 @@ module.exports = async function decomposePromptV2(state) {
   // SCREEN_OUTPUT_RE fills the flag the classifier missed. Passive observation
   // questions are excluded via SCREEN_OBSERVATION_RE (they never mutate).
   const _lookupThenDisplay = LOOKUP_THEN_DISPLAY_RE.test(message);
+  // A capture request is the opposite of display output — "take a screenshot
+  // of my screen" flaked isScreenOutput:true and produced a
+  // [web_search, screen_display] plan that hallucinated the capture.
+  const _isScreenCapture = SCREEN_CAPTURE_RE.test(message);
   const _screenOutputLex = (SCREEN_OUTPUT_RE.test(message) || _lookupThenDisplay)
-    && !SCREEN_OBSERVATION_RE.test(message);
-  if ((_tc.isScreenOutput || _screenOutputLex)
+    && !SCREEN_OBSERVATION_RE.test(message) && !_isScreenCapture;
+  // classifyTask flakes isScreenOutput on file-write phrasing ("create a file
+  // at /tmp/x containing the text Y" → true). A literal path + file op is a
+  // filesystem task — content goes to disk, never to the display surface.
+  const _fileOpShape = FILE_PATH_RE.test(message)
+    && (/\b(file|folder|directory)\b|\.\w{2,6}\b/i.test(message)
+        || /\b(create|write|append|save|store|rename|move|copy|read|list)\b/i.test(message));
+  if (_tc.isScreenOutput && _fileOpShape && !_screenOutputLex) {
+    logger.info('[Node:DecomposePromptV2] isScreenOutput clamped — literal file path + file verb (classifier flake)');
+  }
+  const _screenOutFlag = (_tc.isScreenOutput && !_fileOpShape) || _screenOutputLex;
+  if (_screenOutFlag && !_isScreenCapture
       && (!_hasMultiGoalConjunction || _lookupThenDisplay)) {
     logger.info(`[Node:DecomposePromptV2] Screen-output guard: routing to screen_display (action=${_tc.screenOutputAction || 'show'} kind=${_tc.screenOutputKind || 'text'}) — skipping command_automate short-circuit`);
 
@@ -643,7 +660,16 @@ module.exports = async function decomposePromptV2(state) {
   // site/service is named, route to the web_search intent (existing cheap path:
   // webSearch node → answer). Named-site research stays command_automate so the
   // planner can use web.agent preferDomain — but it still won't get an agent.
-  if (_tc.webAccessMode === 'public_read' && !_tc.targetService && !_hasMultiGoalConjunction) {
+  // Exemption: a deterministic command_automate hint means the comms guesser
+  // saw an imperative action ("open the Notes app" flaked to
+  // webAccessMode:public_read once → routed to a useless web search). The
+  // guesser's command_automate arms are action-verb-verified; a flaky
+  // webAccessMode field cannot veto them.
+  // A literal filesystem path means the task embeds a file op ("search the web
+  // for X and save it to /tmp/y") — not pure public research. The path is
+  // ground truth; let the decomposer/agent path see the save half.
+  if (_tc.webAccessMode === 'public_read' && !_tc.targetService && !_hasMultiGoalConjunction
+      && _carriedHint !== 'command_automate' && !FILE_PATH_RE.test(message)) {
     logger.info(`[Node:DecomposePromptV2] Public-research guard: routing to web_search (taskType=${_tc.taskType}) — skipping command_automate short-circuit`);
     const subPrompts = [{
       text: message,
@@ -734,7 +760,88 @@ module.exports = async function decomposePromptV2(state) {
   // trusting the label.
   const _hintDisagreesWithAutomation = _carriedHint
     && _carriedHint !== 'command_automate'
-    && _SINGLE_STEP_INTENTS.includes(_carriedHint);
+    && _SINGLE_STEP_INTENTS.includes(_carriedHint)
+    // A literal path overrides the veto — "create a file /tmp/x.txt" drew a
+    // web_search hint off the word "remember" and produced a
+    // [web_search, screen_display] plan for a file write. The path token is
+    // ground truth; the task touches the filesystem regardless of the hint.
+    && !FILE_PATH_RE.test(message);
+  // Device-state queries ("what's my battery percentage", "check disk space",
+  // "is my wifi on") can ONLY be answered by an OS probe — there is no text
+  // answer to hallucinate. This is as deterministic as the screen-output
+  // guard: fire regardless of a disagreeing hint (the comms guesser emitted
+  // 'general_knowledge' for battery because the phrasing has no action verb)
+  // and regardless of taskType flakiness (classifyTask typed battery both
+  // 'local_system' and 'query' across runs).
+  if (DEVICE_STATE_RE.test(message) && !_hasMultiGoalConjunction) {
+    logger.info('[Node:DecomposePromptV2] Device-state guard → single-step command_automate');
+    const subPrompts = [{
+      text: message, estimatedIntent: 'command_automate', confidence: 0.9,
+      order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
+    }];
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'device-state-guard', intent: 'command_automate',
+      subPromptCount: 1, durationMs: Date.now() - t0,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'command_automate', 0.9);
+    const _devTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'device-state-guard', intentPlan: subPrompts,
+      ...(_devTmpl ? { _deterministicPlan: _devTmpl.skillPlan, _deterministicTemplate: _devTmpl.template, _deterministicLowRisk: _devTmpl.lowRisk } : {}) };
+  }
+
+  // Named-service site interaction ("search amazon for wireless headphones")
+  // — taskType 'browser' + a resolved targetService + a site verb means a
+  // real service-agent task (amazon.agent exists). The hint layer guesses
+  // web_search for site-search shapes, and llmDecompose once chose
+  // memory_retrieve off "show me the top results" — both hallucinate a
+  // fetch that never ran. Site interaction is command_automate by design.
+  if (_tc.taskType === 'browser' && _tc.targetService && !_hasMultiGoalConjunction
+      && /\b(search|find|look\s+for|browse|shop|buy|order|get|open|go\s+to|navigate|check|compare|price|add\s+to\s+cart|cart|deal|result)/i.test(message)) {
+    logger.info(`[Node:DecomposePromptV2] Named-service site guard → command_automate (service=${_tc.targetService})`);
+    const subPrompts = [{
+      text: message, estimatedIntent: 'command_automate', confidence: 0.88,
+      order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
+    }];
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'site-service-guard', intent: 'command_automate',
+      subPromptCount: 1, durationMs: Date.now() - t0,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'command_automate', 0.88);
+    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'site-service-guard', intentPlan: subPrompts };
+  }
+
+  // Fetch+save composition ("search the web for X and save it to /path") —
+  // the literal output path makes the second goal unambiguous. Emit the
+  // two-intent shape directly instead of trusting llmDecompose, which has
+  // collapsed this to a lone web_search and silently dropped the file write.
+  const _fsPathGlobal = new RegExp(FILE_PATH_RE.source, 'g' + (FILE_PATH_RE.flags.includes('i') ? 'i' : ''));
+  const _fetchSavePaths = [...String(message).matchAll(_fsPathGlobal)].map(m => m[0].trim());
+  const _fetchSavePath = _fetchSavePaths[_fetchSavePaths.length - 1] || null;
+  if (_fetchSavePath
+      && /\b(search|look\s+up|find|google|fetch|check|get|what(?:'s| is| are)?|who|current|latest|when)\b/i.test(message)
+      && /\b(save|write|store|put|record|download|export)\b/i.test(message)) {
+    const _dst = _fetchSavePath.replace(/[.,;:'")\]]+$/, '');
+    logger.info(`[Node:DecomposePromptV2] Fetch+save guard → [web_search, command_automate] (dst=${_dst})`);
+    const subPrompts = [
+      { text: message, estimatedIntent: 'web_search', confidence: 0.9,
+        order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null },
+      { text: `Save the retrieved result to ${_dst}`, estimatedIntent: 'command_automate', confidence: 0.9,
+        order: 1, dependsOn: [0], isLongRunning: false,
+        dataTemplate: `Save this result to ${_dst}: {{result[0]}}` },
+    ];
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'fetch-save-guard', intent: 'command_automate',
+      subPromptCount: 2, durationMs: Date.now() - t0, subPrompts,
+    });
+    _emitIntentDecided(state, 'command_automate', 0.9);
+    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'fetch-save-guard', intentPlan: subPrompts };
+  }
+
   if (_SINGLE_STEP_TASK_TYPES.has(_tc.taskType) && !_tc.needsFreshScreen && !_hasMultiGoalConjunction && !_hintDisagreesWithAutomation) {
     logger.info(`[Node:DecomposePromptV2] Local short-circuit: single-step command_automate (taskType=${_tc.taskType}, no multi-goal conjunction) — skipping LLM decision`);
     const subPrompts = [{
@@ -754,11 +861,15 @@ module.exports = async function decomposePromptV2(state) {
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
     _emitIntentDecided(state, 'command_automate', 0.85);
+    // Force-classified fast-path: one small call compiles the skillPlan for
+    // unambiguous local ops — skips preflight/grill/the 84k plan prompt.
+    const _localTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
     return {
       ...state,
       _decomposedIntent: 'command_automate',
       _decomposedBy: 'local-short-circuit',
       intentPlan: subPrompts,
+      ...(_localTmpl ? { _deterministicPlan: _localTmpl.skillPlan, _deterministicTemplate: _localTmpl.template, _deterministicLowRisk: _localTmpl.lowRisk } : {}),
     };
   }
   // Conversation-recall meta-questions → memory_retrieve (NOT general_knowledge)
@@ -897,7 +1008,17 @@ module.exports = async function decomposePromptV2(state) {
     || _tc.isScreenFollowUp === true
     || _tc.needsFreshScreen === true
     || SCREEN_OBSERVATION_RE.test(message);
-  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification' || _ambientMisref) && !_hasMultiGoalConjunction && !_screenReferent) {
+  // An imperative action message carries its own referent — "text mom that
+  // I'll be late" was flagged isFollowUp (busy history) with null target and
+  // got routed to memory_retrieve, which then claimed "Message sent". When
+  // the classifier's own fields name an action (command_automate suggestion,
+  // resolved service, interactive actions), the isFollowUp flag is the flake,
+  // not the intent.
+  const _actionableMessage = _ACTION_TASK_TYPES.has(_tc.taskType)
+    && (_tc.suggestedIntent === 'command_automate'
+        || _tc.targetService
+        || (_tc.interactiveActions && _tc.interactiveActions.length > 0));
+  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification' || _ambientMisref) && !_hasMultiGoalConjunction && !_screenReferent && !_actionableMessage) {
     logger.info(`[Node:DecomposePromptV2] Unresolved-follow-up guard: ${_ambientMisref ? 'bare deictic misresolved to ambient ' + _tc.activeDocRef : (_tc.resolution === 'needs_clarification' ? 'resolution=needs_clarification' : 'isFollowUp with null followUpTarget')} — routing to memory_retrieve (answer from history), skipping web_search on literal text`);
     const subPrompts = [{
       text: message,
@@ -929,7 +1050,15 @@ module.exports = async function decomposePromptV2(state) {
   // followUpTarget) is a topical query about the card — never greeting or
   // chitchat. "let's chat about this" with a card attached must not reach the
   // 4-turn number-call, which lacks the card context and drifts.
-  if (_tc.isThoughtReply && _tc.followUpTarget && !_hasMultiGoalConjunction) {
+  // Exemption: an imperative action message is not a card reply — "send an
+  // email to myself" flaked isThoughtReply (busy history) and got buried as
+  // memory_retrieve. Same action-evidence rule as the follow-up guard.
+  const _actionableThought = _ACTION_TASK_TYPES.has(_tc.taskType)
+    && (_tc.suggestedIntent === 'command_automate'
+        || _tc.targetService
+        || (_tc.interactiveActions && _tc.interactiveActions.length > 0)
+        || _carriedHint === 'command_automate');
+  if (_tc.isThoughtReply && _tc.followUpTarget && !_hasMultiGoalConjunction && !_actionableThought) {
     const _thoughtIntent = _tc.webAccessMode === 'none' ? 'memory_retrieve' : 'web_search';
     logger.info(`[Node:DecomposePromptV2] Thought-reply guard: routing to ${_thoughtIntent} for attached card "${String(_tc.followUpTarget).slice(0, 60)}"`);
     const subPrompts = [{
@@ -1001,6 +1130,29 @@ module.exports = async function decomposePromptV2(state) {
   if (_fastDecision === 0 && _tc.taskType && !_ACTION_TASK_TYPES.has(_tc.taskType)
       && !_tc.targetService && !(_tc.interactiveActions && _tc.interactiveActions.length)) {
     logger.info(`[Node:DecomposePromptV2] number-call chose command_automate but taskType='${_tc.taskType}' with no action signals — escalating to full llmDecompose`);
+    _fastDecision = 7;
+  }
+
+  // Mirror check: a PASSIVE pick (general_knowledge/web_search/etc.) on an
+  // action-typed task is the same contradiction, flipped. "read the file
+  // /tmp/x.txt" came back taskType:'local_file' but the decision path picked
+  // general_knowledge → the answer hallucinated "I can't read files". A
+  // passive intent on an action type means one of the two signals is wrong —
+  // escalate to the full decomposer which sees the file-path/action context.
+  // Corroboration required: bare taskType is itself flaky ("ramen
+  // restaurants" typed local_system → the hint veto deliberately overrides
+  // it). Only escalate when the message or typed fields carry independent
+  // action evidence — a literal path, a named service, interactive actions,
+  // or expected file output. A bare label stays a coin flip the veto owns.
+  const _corroboratesAction = _tc.targetService
+    || (_tc.interactiveActions && _tc.interactiveActions.length > 0)
+    || _tc.expectsFileOutput
+    || _tc.activeDocRef === 'file'
+    || FILE_PATH_RE.test(message);
+  if (_fastDecision >= 0 && _fastDecision <= 6 && _corroboratesAction
+      && _ACTION_TASK_TYPES.has(_tc.taskType)
+      && ['general_knowledge', 'web_search', 'screen_intelligence', 'memory_retrieve', 'memory_store', 'greeting'].includes(_SINGLE_STEP_INTENTS[_fastDecision])) {
+    logger.info(`[Node:DecomposePromptV2] decision chose ${_SINGLE_STEP_INTENTS[_fastDecision]} but taskType='${_tc.taskType}' carries corroborated action evidence — escalating to full llmDecompose`);
     _fastDecision = 7;
   }
 
@@ -1119,12 +1271,19 @@ module.exports = async function decomposePromptV2(state) {
     });
 
     _emitIntentDecided(state, sp.estimatedIntent, sp.confidence || 0.85);
+    // Single command_automate outcome via the LLM path — still adopt a
+    // force-classified plan when the prefire/call hits (classifyTask flakes
+    // around the local guards must not strand a valid compiled plan).
+    const _llmTmpl = sp.estimatedIntent === 'command_automate'
+      ? await _classifyDeterministic(message, _tc, state.llmBackend, logger)
+      : null;
     return {
       ...state,
       _decomposedIntent: sp.estimatedIntent,
       _decomposedBy: 'llm',
       ...(llmDateRange ? { _llmDateRange: llmDateRange } : {}),
       intentPlan: [sp],
+      ...(_llmTmpl ? { _deterministicPlan: _llmTmpl.skillPlan, _deterministicTemplate: _llmTmpl.template, _deterministicLowRisk: _llmTmpl.lowRisk } : {}),
     };
   }
 
@@ -1142,11 +1301,16 @@ module.exports = async function decomposePromptV2(state) {
   collapsed.forEach((sp, i) => logger.info(`  [${i}] "${sp.text}" → ${sp.estimatedIntent}`));
 
   _emitIntentDecided(state, collapsed[0]?.estimatedIntent, collapsed[0]?.confidence || 0.85);
+  // Same adoption for collapsed single-step command_automate outcomes.
+  const _collapsedTmpl = (collapsed.length === 1 && collapsed[0]?.estimatedIntent === 'command_automate')
+    ? await _classifyDeterministic(message, _tc, state.llmBackend, logger)
+    : null;
   return {
     ...state,
     _decomposedIntent: collapsed[0]?.estimatedIntent,
     _decomposedBy: 'llm',
     ...(llmDateRange ? { _llmDateRange: llmDateRange } : {}),
     intentPlan: collapsed,
+    ...(_collapsedTmpl ? { _deterministicPlan: _collapsedTmpl.skillPlan, _deterministicTemplate: _collapsedTmpl.template, _deterministicLowRisk: _collapsedTmpl.lowRisk } : {}),
   };
 };
