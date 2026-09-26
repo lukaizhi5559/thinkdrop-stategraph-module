@@ -811,7 +811,12 @@ module.exports = async function decomposePromptV2(state) {
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
     _emitIntentDecided(state, 'command_automate', 0.88);
-    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'site-service-guard', intentPlan: subPrompts };
+    // Adopt a force-classified plan when it hits — "open youtube.com" is a
+    // plain url_open, not a service-agent task, and shouldn't pay for agent
+    // selection + the full planning prompt.
+    const _siteTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'site-service-guard', intentPlan: subPrompts,
+      ...(_siteTmpl ? { _deterministicPlan: _siteTmpl.skillPlan, _deterministicTemplate: _siteTmpl.template, _deterministicLowRisk: _siteTmpl.lowRisk } : {}) };
   }
 
   // Fetch+save composition ("search the web for X and save it to /path") —
