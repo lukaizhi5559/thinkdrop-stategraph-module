@@ -206,6 +206,7 @@ module.exports = async function parseIntentV2(state) {
         message:         firstSub.text,
         resolvedMessage: firstSub.text,
         intentPlan:      [firstSub],
+        _subParse:       true,
       });
 
       const intentQueue = intentPlan.slice(1).map(sp => ({
@@ -215,6 +216,17 @@ module.exports = async function parseIntentV2(state) {
       }));
 
       intentQueue.forEach(sp => logger.debug(`[Node:ParseIntentV2] Queue [${sp.order}] "${sp.text.slice(0, 60)}" → ${sp.intent}`));
+
+      // Log the WHOLE plan under the original message — the recursive call's
+      // first-sub entry must not be the last matching row for this message
+      // (the E2E harness reads intent+subs off the newest matching entry;
+      // [web_search, screen_display] was being reported as bare web_search).
+      writeIntentLog({
+        ts: new Date().toISOString(), message: classifyMessage, carriedHint: null,
+        parser: 'multi-intent-pipeline', intent: firstSub.estimatedIntent || 'command_automate',
+        subPromptCount: intentPlan.length, durationMs: 0,
+        subPrompts: intentPlan.map(sp => ({ order: sp.order, text: sp.text, estimatedIntent: sp.estimatedIntent || 'command_automate', dependsOn: sp.dependsOn || [], isLongRunning: !!sp.isLongRunning })),
+      });
 
       return { ...firstResult, intentQueue, intentResults: [], dataContext: {}, isMultiIntent: true, originalPrompt: message };
     }
@@ -303,7 +315,11 @@ module.exports = async function parseIntentV2(state) {
     }
 
     logger.debug(`[Node:ParseIntentV2] intentPlan passthrough → ${finalIntent} (${finalConf}): "${classifyMessage.slice(0, 80)}"`);
-    writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'llm-decompose', intent: finalIntent, confidence: finalConf, subPromptCount: 1, durationMs: 0, subPrompts: [{ order: 0, text: sp.text, estimatedIntent: finalIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }] });
+    // Recursive sub-parses (multi-intent firstSub) skip the log — the parent
+    // writes a 'multi-intent-pipeline' row covering the full plan instead.
+    if (!state._subParse) {
+      writeIntentLog({ ts: new Date().toISOString(), message: classifyMessage, carriedHint: null, parser: 'llm-decompose', intent: finalIntent, confidence: finalConf, subPromptCount: 1, durationMs: 0, subPrompts: [{ order: 0, text: sp.text, estimatedIntent: finalIntent, dependsOn: [], isLongRunning: sp.isLongRunning, dataTemplate: sp.dataTemplate }] });
+    }
 
     _emitIntentDecided(state, finalIntent, finalConf);
     return {

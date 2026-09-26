@@ -210,11 +210,26 @@ describe('decomposePromptV2 — screen-output guard', () => {
   });
 
   it('multi-goal screen request falls through to normal pipeline', async () => {
+    // A conjunction whose second half is NOT a simple fetch→display still
+    // needs the LLM decomposer (e.g. display + an unrelated action).
+    const r = await _decompose('show the answer on my screen and also email it to sam', {
+      taskType: 'query', isScreenOutput: true, screenOutputAction: 'show',
+    });
+    // hasMultiGoal + no lookup verb → guard skipped → fast decision '0' → command_automate
+    assert(r._decomposedBy !== 'screen-output-guard', `guard should not fire on multi-goal (got ${r._decomposedBy})`);
+  });
+
+  it('lookup+display multi-goal is deterministic — not LLM flake surface', async () => {
+    // "find … and show it on the screen" decomposes to the same two-step plan
+    // every time; routing it through llmDecompose let the digit pick
+    // command_automate (observed E2E flake: 110s plan+preflight on a display).
     const r = await _decompose('find the weather and also show it on the screen', {
       taskType: 'query', isScreenOutput: true, screenOutputAction: 'show',
     });
-    // hasMultiGoal → guard skipped → fast decision '0' → command_automate
-    assert(r._decomposedBy !== 'screen-output-guard', `guard should not fire on multi-goal (got ${r._decomposedBy})`);
+    assertEq(r._decomposedBy, 'screen-output-guard');
+    assertEq(r.intentPlan.length, 2);
+    assertEq(r.intentPlan[0].estimatedIntent, 'web_search');
+    assertEq(r.intentPlan[1].estimatedIntent, 'screen_display');
   });
 
   it('isScreenOutput false → guard does not fire', async () => {
@@ -460,6 +475,39 @@ describe('screenOutput node', () => {
       });
       assertEq(posted.length, 0);
       assert(/nothing on hand/i.test(r._directAnswer));
+    });
+
+    // chart kind + inline "name N" data → deterministic parse, POSTs a chart
+    // payload even when classifyTask's screenOutputPayload is absent (observed
+    // E2E flake: "pie chart: apples 5, bananas 3" fell to the no-data answer).
+    await _withMockFetch(null, async (posted) => {
+      const r = await screenOutput({
+        logger: _noopLogger,
+        message: 'show a pie chart on my screen: apples 5, bananas 3',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart' },
+        conversationHistory: [],
+      });
+      assertEq(posted.length, 1, 'chart display must POST');
+      assertEq(posted[0].url, 'http://127.0.0.1:3010/screen/display');
+      const chart = posted[0].body.chart;
+      assertEq(chart.type, 'pie');
+      assertEq(chart.data.length, 2);
+      assertEq(chart.data[0].label, 'apples');
+      assertEq(chart.data[0].value, 5);
+      assertEq(chart.data[1].label, 'bananas');
+      assertEq(chart.data[1].value, 3);
+    });
+
+    // chart kind + NO inline data anywhere → honest no-data answer, no POST
+    await _withMockFetch(null, async (posted) => {
+      const r = await screenOutput({
+        logger: _noopLogger,
+        message: 'show a pie chart on my screen',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart' },
+        conversationHistory: [],
+      });
+      assertEq(posted.length, 0);
+      assert(/no chart data/i.test(r._directAnswer));
     });
 
     // server unreachable → honest failure

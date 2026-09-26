@@ -349,3 +349,94 @@ describe('decomposePromptV2 — classifyTask suggestedIntent merge', () => {
     assertEq(r._decomposedIntent, 'general_knowledge');
   });
 });
+
+describe('decomposePromptV2 — screen-output guard lexical completion', () => {
+  const _tc = (extra) => ({ taskType: 'local_system', isScreenOutput: true, screenOutputAction: 'show', ...extra });
+  const _noCall = { generateAnswer: async () => { throw new Error('must not be called'); } };
+
+  it('effect kind inferred lexically — no fetch step even when classifier omits it', async () => {
+    // Flaky path observed in E2E: classifier emitted kind 'text' + no content
+    // → guard added web_search sub → search answer hallucinated the display.
+    const r = await _decompose('make confetti appear on my screen', _noCall,
+      _tc({ screenOutputKind: 'text' }));
+    assertEq(r._decomposedIntent, 'screen_display');
+    assertEq(r.intentPlan.length, 1, 'effect must not emit a fetch step');
+    assertEq(r.intentPlan[0].estimatedIntent, 'screen_display');
+    assertEq(r._taskClassification.screenOutputKind, 'effect');
+  });
+
+  it('emoji kind inferred from the pictograph itself', async () => {
+    const r = await _decompose('put a 🎉 emoji on my screen', _noCall,
+      _tc({ screenOutputKind: 'text' }));
+    assertEq(r.intentPlan.length, 1);
+    assertEq(r._taskClassification.screenOutputKind, 'emoji');
+  });
+
+  it('image kind inferred from an image URL in the message', async () => {
+    const r = await _decompose('show this image on my screen: https://example.com/cat.png', _noCall,
+      _tc({ screenOutputKind: 'text' }));
+    assertEq(r.intentPlan.length, 1);
+    assertEq(r._taskClassification.screenOutputKind, 'image');
+  });
+
+  it('quoted content extracted — no fetch step for literal display', async () => {
+    const r = await _decompose('show "meeting at 3pm" on my screen', _noCall,
+      _tc({ screenOutputKind: 'text' }));
+    assertEq(r.intentPlan.length, 1, 'quoted content must not emit a fetch step');
+    assertEq(r._taskClassification.screenOutputContent, 'meeting at 3pm');
+  });
+
+  it('literal-payload lead ("the word X") extracted as content', async () => {
+    const r = await _decompose('put the word DONE on the screen', _noCall,
+      _tc({ screenOutputKind: 'text' }));
+    assertEq(r.intentPlan.length, 1);
+    assertEq(r._taskClassification.screenOutputContent, 'DONE');
+  });
+
+  it('fetchable referent still gets the web_search → display chain', async () => {
+    const r = await _decompose('show me john 3:16 on my screen', _noCall,
+      _tc({ screenOutputKind: 'text' }));
+    assertEq(r.intentPlan.length, 2, 'fresh-content request keeps the fetch step');
+    assertEq(r.intentPlan[0].estimatedIntent, 'web_search');
+    assertEq(r.intentPlan[1].estimatedIntent, 'screen_display');
+    assertEq(r.intentPlan[1].dependsOn[0], 0);
+  });
+
+  it('referential display ("show that") never fetches', async () => {
+    const r = await _decompose('show that on my screen', _noCall,
+      _tc({ screenOutputKind: 'text' }));
+    assertEq(r.intentPlan.length, 1);
+    assertEq(r._taskClassification.screenOutputContent ?? null, null,
+      'bare referential must not become literal content');
+  });
+});
+
+describe('decomposePromptV2 — screen-output lexical fallback (isScreenOutput flake)', () => {
+  const _noCall = { generateAnswer: async () => { throw new Error('must not be called'); } };
+
+  it('lexical display signal routes when isScreenOutput flag is absent', async () => {
+    // Observed flake: "look up the current bitcoin price and show it on my
+    // screen" → classifyTask omitted isScreenOutput → llmDecompose chose
+    // command_automate (109s plan+preflight for a display request).
+    const r = await _decompose('show fireworks on the screen', _noCall,
+      { taskType: 'query' });  // no isScreenOutput
+    assertEq(r._decomposedIntent, 'screen_display');
+    assertEq(r._decomposedBy, 'screen-output-guard');
+  });
+
+  it('lookup+display conjunction emits deterministic web_search→screen_display', async () => {
+    const r = await _decompose('look up the current bitcoin price and show it on my screen', _noCall,
+      { taskType: 'query' });  // no isScreenOutput
+    assertEq(r.intentPlan.length, 2);
+    assertEq(r.intentPlan[0].estimatedIntent, 'web_search');
+    assertEq(r.intentPlan[1].estimatedIntent, 'screen_display');
+    assertEq(r.intentPlan[1].dependsOn[0], 0);
+  });
+
+  it('observation questions still excluded from the display fallback', async () => {
+    const r = await _decompose("what's on my screen", _noCall,
+      { taskType: 'query' });
+    assertEq(r._decomposedIntent, 'screen_intelligence');
+    assertEq(r._decomposedBy, 'screen-observation-guard');
+  });
+});

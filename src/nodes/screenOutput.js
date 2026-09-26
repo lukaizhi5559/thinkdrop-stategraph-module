@@ -108,7 +108,26 @@ module.exports = async function screenOutput(state) {
       break;
     }
     case 'chart': {
-      // Data sources: classifier payload → prior step result object.
+      // Data sources: classifier payload → prior step result object → inline
+      // "name N" pairs in the message itself ("pie chart: apples 5, bananas 3"
+      // — the format the no-data error below asks for). classifyTask's
+      // screenOutputPayload flakes; the inline parse is deterministic.
+      if (!payload.chart) {
+        const pairRe = /([A-Za-z][\w \-']{0,30}?)\s*[:=]?\s*(\d+(?:\.\d+)?)/g;
+        const tail = message.includes(':') ? message.slice(message.lastIndexOf(':') + 1) : message;
+        const data = [];
+        let pm;
+        while ((pm = pairRe.exec(tail)) !== null) {
+          const label = pm[1].trim().replace(/,$/, '');
+          if (label && !/^(?:pie|donut|bar|line|area|stat|chart|graph)$/i.test(label)) {
+            data.push({ label, value: parseFloat(pm[2]) });
+          }
+        }
+        if (data.length >= 2) {
+          const tm = message.match(/\b(pie|donut|bar|line|area|stat)\b/i);
+          payload.chart = { type: tm ? tm[1].toLowerCase() : 'pie', data, xKey: 'label', yKey: 'value' };
+        }
+      }
       if (!payload.chart) {
         const results = Array.isArray(state.intentResults) ? state.intentResults : [];
         const last = results[results.length - 1];

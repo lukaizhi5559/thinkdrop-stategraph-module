@@ -859,7 +859,7 @@ Please try asking: "help me track down the video links for each one of these wor
     };
 
   } catch (error) {
-    logger.error('[Node:Answer] Failed to generate answer:', error.message);
+    logger.error('[Node:Answer] Failed to generate answer:', error.message, error.stack);
 
     // Provider outage — surface a clean explanation instead of a raw error blob
     const _errMsg = error?.message || String(error);

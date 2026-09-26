@@ -7,7 +7,7 @@ const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
-const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE } = require('../utils/textPatterns.cjs');
+const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeDecomposeLog(entry) {
@@ -505,7 +505,16 @@ module.exports = async function decomposePromptV2(state) {
   // screenOutput node → POST /screen/display|clear on the overlay server.
   // Multi-goal messages ("search X and show it on the screen") fall through to
   // the LLM decomposer, which can emit screen_display as a dependsOn step.
-  if (_tc.isScreenOutput && !_hasMultiGoalConjunction) {
+  //
+  // isScreenOutput is one flaky classifyTask field — the utterance carries the
+  // signal lexically (display verb → "on my screen" / clear / effect word), so
+  // SCREEN_OUTPUT_RE fills the flag the classifier missed. Passive observation
+  // questions are excluded via SCREEN_OBSERVATION_RE (they never mutate).
+  const _lookupThenDisplay = LOOKUP_THEN_DISPLAY_RE.test(message);
+  const _screenOutputLex = (SCREEN_OUTPUT_RE.test(message) || _lookupThenDisplay)
+    && !SCREEN_OBSERVATION_RE.test(message);
+  if ((_tc.isScreenOutput || _screenOutputLex)
+      && (!_hasMultiGoalConjunction || _lookupThenDisplay)) {
     logger.info(`[Node:DecomposePromptV2] Screen-output guard: routing to screen_display (action=${_tc.screenOutputAction || 'show'} kind=${_tc.screenOutputKind || 'text'}) — skipping command_automate short-circuit`);
 
     // Fetch→display: "show me john 3:16 on my screen" names fresh content to
@@ -513,14 +522,27 @@ module.exports = async function decomposePromptV2(state) {
     // phrasing ("show it/the whole chapter") resolves from history instead,
     // and kinds that carry their own content (emoji/effect/image/payload)
     // never need a fetch step.
-    const _kind = _tc.screenOutputKind || 'text';
+    //
+    // Kind/content resolution: classifyTask's screenOutputKind +
+    // screenOutputContent fields flake independently ("make confetti appear"
+    // → kind:'text' + no content → a spurious fetch step ran web_search and
+    // its answer hallucinated the display). The utterance carries the kind
+    // lexically — inferScreenOutput shares screenOutput.js's vocabulary — so
+    // an inferred kind/content completes or corrects the flaky fields here
+    // and is written back into _taskClassification for the screenOutput node.
+    const _inferred = inferScreenOutput(message);
+    const _kind = _inferred.kind
+      || _tc.screenOutputKind
+      || 'text';
+    const _content = _tc.screenOutputContent || _inferred.content || null;
     const _action = _tc.screenOutputAction || 'show';
     const _REFERENTIAL_RE = /\b(it|that|this|them|those|the\s+(result|answer|chapter|verse|response|reply|output|list|chart|graph|data|one)|whole\s+\w+|above|previous|again)\b/i;
-    const _needsFetch = _action === 'show'
-      && ['text', 'chart'].includes(_kind)
-      && !_tc.screenOutputContent
-      && !_tc.screenOutputPayload
-      && !_REFERENTIAL_RE.test(message);
+    const _needsFetch = _lookupThenDisplay
+      || (_action === 'show'
+        && ['text', 'chart'].includes(_kind)
+        && !_content
+        && !_tc.screenOutputPayload
+        && !_REFERENTIAL_RE.test(message));
 
     const displayStep = {
       text: message,
@@ -554,6 +576,11 @@ module.exports = async function decomposePromptV2(state) {
       ...state,
       _decomposedIntent: 'screen_display',
       _decomposedBy: 'screen-output-guard',
+      _taskClassification: {
+        ..._tc,
+        screenOutputKind: _kind,
+        ...(_content && !_tc.screenOutputContent ? { screenOutputContent: _content } : {}),
+      },
       intentPlan: subPrompts,
     };
   }
