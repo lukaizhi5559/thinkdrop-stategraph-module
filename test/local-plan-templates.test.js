@@ -128,8 +128,8 @@ describe('fallthrough to LLM planner', () => {
     assert.equal(await _hit('read /tmp/x', 'I am not sure'), null);
   });
 
-  it('classify call throwing returns null', async () => {
-    assert.equal(await _hit('read /tmp/x', new Error('provider down')), null);
+  it('classify call throwing returns __error sentinel (retried upstream)', async () => {
+    assert.equal(await _hit('read /tmp/x', new Error('provider down')), '__error');
   });
 
   it('missing backend returns null', async () => {

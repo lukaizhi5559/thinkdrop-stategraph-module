@@ -42,8 +42,21 @@ function looksLikeLocalOp(message) {
 // with classifyTask (saves the serial ~2–4s). A resolved followUpTarget means
 // the prefire ran with incomplete context → reclassify with the target.
 async function _classifyDeterministic(message, tc, llmBackend, logger) {
+  // One bounded inline retry for a failed/stalled classify — a healthy
+  // provider answers this small prompt in ~2-5s, so a fresh call usually
+  // lands even when the first hit a dead stream or tripped breaker.
+  const retryOnce = async () => {
+    const retry = await Promise.race([
+      forceClassifyLocalPlan(message, tc, llmBackend, logger),
+      new Promise(res => setTimeout(() => res('__timeout'), 20000)),
+    ]).catch(() => '__timeout');
+    return retry === '__timeout' || retry === '__error' ? null : retry;
+  };
   const hasTarget = tc && typeof tc.followUpTarget === 'string' && tc.followUpTarget;
-  if (hasTarget) return forceClassifyLocalPlan(message, tc, llmBackend, logger);
+  if (hasTarget) {
+    const hit = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
+    return hit === '__error' ? retryOnce() : hit;
+  }
   if (tc && tc._detPrefirePromise) {
     // Bound the wait — a real template hit resolves in ~2-5s. A stalled
     // provider can hold the classify call for 60s+; awaiting it serializes a
@@ -53,21 +66,9 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
         tc._detPrefirePromise,
         new Promise(res => setTimeout(() => res('__timeout'), 8000)),
       ]);
-      if (hit === '__timeout') {
-        // One inline retry, itself bounded — a healthy provider answers this
-        // small prompt in ~2-5s; if the prefire stalled mid-stream a fresh
-        // call usually lands. Total added latency is capped ~28s vs the old
-        // failure mode (a dead 60s call holding the critical path).
-        logger?.info('[localPlanTemplates] prefired classify timed out at 8s — retrying once inline');
-        const retry = await Promise.race([
-          forceClassifyLocalPlan(message, tc, llmBackend, logger),
-          new Promise(res => setTimeout(() => res('__timeout'), 20000)),
-        ]).catch(() => null);
-        if (retry === '__timeout') {
-          logger?.info('[localPlanTemplates] inline classify retry timed out at 20s — falling to LLM planner');
-          return null;
-        }
-        return retry;
+      if (hit === '__timeout' || hit === '__error') {
+        logger?.info(`[localPlanTemplates] prefired classify ${hit === '__timeout' ? 'timed out at 8s' : 'failed'} — retrying once inline`);
+        return retryOnce();
       }
       if (hit) return hit;
       // Prefired classify returned null — same prompt/context, re-calling
@@ -75,7 +76,8 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
       return null;
     } catch (_) { return null; }
   }
-  return forceClassifyLocalPlan(message, tc, llmBackend, logger);
+  const hit = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
+  return hit === '__error' ? retryOnce() : hit;
 }
 
 // Every path arg must appear verbatim in the message or equal a resolved
@@ -448,7 +450,7 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
     };
   } catch (err) {
     logger?.debug?.(`[localPlanTemplates] classify call failed: ${err.message}`);
-    return null;
+    return '__error';
   }
 }
 
