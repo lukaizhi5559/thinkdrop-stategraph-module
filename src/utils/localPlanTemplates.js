@@ -286,7 +286,7 @@ const TEMPLATES = [
     // planning prompt — the task text is the user's message verbatim, so the
     // model cannot invent instructions.
     n: 14, id: 'service_task', lowRisk: false, external: true,
-    describe: 'action on a named external service the user explicitly named (post/send/add/search/create/play on twitter/x, gmail, todoist, slack, github, spotify, amazon, notion, reddit, linkedin, youtube, etc.) — args: {service}',
+    describe: 'action on an external service (post/send/add/search/create/play on twitter/x, gmail, todoist, slack, github, spotify, amazon, notion, reddit, linkedin, youtube, etc.) — args: {service}. Generic service nouns count: "send an email/mail" → gmail, "text message/sms" → sms, "calendar event" → google_calendar.',
     validate: (a, m) => {
       const name = _canonicalService(a.service);
       if (!name) return 'bad service name';
