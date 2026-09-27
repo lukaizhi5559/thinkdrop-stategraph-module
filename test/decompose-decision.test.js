@@ -28,7 +28,7 @@ const _backend = (numberCall, planCall) => ({
     // The deterministic fast-path classify call is neither the number call
     // nor the plan call — discriminate on its prompt preamble so it never
     // counts as either.
-    if (typeof prompt === 'string' && prompt.includes('Pick the single local-automation template')) return '{"n":0,"args":{}}';
+    if (typeof prompt === 'string' && /Pick the single (local-automation )?template/.test(prompt)) return '{"n":0,"args":{}}';
     const mt = (params && params.maxTokens) || (opts && opts.maxTokens) || 0;
     if (mt <= 10) return typeof numberCall === 'function' ? numberCall() : numberCall;
     return typeof planCall === 'function' ? planCall() : planCall;

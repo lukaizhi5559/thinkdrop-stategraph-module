@@ -186,3 +186,37 @@ describe('validators reject unsafe or hallucinated output', () => {
     assert.equal(await _hit('open Notes', _json(9, { app: 'Notes"; rm -rf ~; "', op: 'open' })), null);
   });
 });
+
+describe('service_task (external tier)', () => {
+  it('pins the named service agent and marks the plan external', async () => {
+    const hit = await _hit('post a tweet saying hello world', _json(14, { service: 'twitter' }));
+    assert.equal(hit.template, 'service_task');
+    assert.equal(hit.external, true);
+    assert.equal(hit.serviceAgent, 'twitter.agent');
+    assert.equal(hit.skillPlan[0].skill, 'browser.agent');
+    assert.equal(hit.skillPlan[0].args.agentId, 'twitter.agent');
+    // task is the verbatim user message — no model-synthesized instructions
+    assert.equal(hit.skillPlan[0].args.task, 'post a tweet saying hello world');
+    assert.equal(hit.skillPlan[1].skill, 'synthesize');
+  });
+
+  it('accepts x.com alias → twitter.agent', async () => {
+    const hit = await _hit('post on x.com saying hi', _json(14, { service: 'x.com' }));
+    assert.equal(hit.serviceAgent, 'twitter.agent');
+  });
+
+  it('rejects a service not named in the message', async () => {
+    const hit = await _hit('post a tweet saying hello world', _json(14, { service: 'slack' }));
+    assert.equal(hit, null);
+  });
+
+  it('rejects malformed service names', async () => {
+    assert.equal(await _hit('run it on todoist', _json(14, { service: 'todoist"; rm -rf' })), null);
+    assert.equal(await _hit('run it on todoist', _json(14, { service: '' })), null);
+  });
+
+  it('external hits are not marked lowRisk', async () => {
+    const hit = await _hit('add buy milk to my todoist', _json(14, { service: 'todoist' }));
+    assert.equal(hit.lowRisk, false);
+  });
+});

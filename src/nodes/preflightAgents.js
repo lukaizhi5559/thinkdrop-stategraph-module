@@ -509,8 +509,9 @@ module.exports = async function preflightAgents(state) {
 
   // ── Deterministic fast-path: generic local skills need no agent preflight ──
   // _deterministicPlan steps are all catalog skills (fs.read/shell.run/schedule…)
-  // — no service agents to auth, no CLI checks to run.
-  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+  // — no service agents to auth, no CLI checks to run. External service
+  // templates (_deterministicExternal) DO need preflight — auth is the point.
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0 && !state._deterministicExternal) {
     logger.info(`[Node:PreflightAgents] Deterministic plan (${state._deterministicTemplate || 'template'}) — skipping agent preflight`);
     return { ...state, preflightResult: { agents: [], skipped: 'deterministic' } };
   }

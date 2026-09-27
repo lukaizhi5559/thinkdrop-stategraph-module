@@ -10,9 +10,25 @@ const { suggestIntent } = require('../utils/routeTable');
 const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
 const { _classifyDeterministic } = require('../utils/localPlanTemplates.js');
 
-const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
+// Spread helper — deterministic-plan state fields, including the external
+// service tier (service templates pin an agent but keep normal preflight).
+function _detState(tmpl) {
+  if (!tmpl) return {};
+  return {
+    _deterministicPlan: tmpl.skillPlan,
+    _deterministicTemplate: tmpl.template,
+    _deterministicLowRisk: tmpl.lowRisk,
+    ...(tmpl.external ? { _deterministicExternal: true, _deterministicServiceAgent: tmpl.serviceAgent } : {}),
+  };
+}
+
+const INTENT_LOG_PATH = process.env.INTENT_LOG_PATH || path.join(process.cwd(), 'logs', 'intent-classifier.log');
+let _intentLogDirEnsured = false;
 function writeDecomposeLog(entry) {
-  try { fs.appendFileSync(INTENT_LOG_PATH, JSON.stringify(entry) + '\n', 'utf8'); }
+  try {
+    if (!_intentLogDirEnsured) { fs.mkdirSync(path.dirname(INTENT_LOG_PATH), { recursive: true }); _intentLogDirEnsured = true; }
+    fs.appendFileSync(INTENT_LOG_PATH, JSON.stringify(entry) + '\n', 'utf8');
+  }
   catch (_) {}
 }
 
@@ -788,7 +804,7 @@ module.exports = async function decomposePromptV2(state) {
     _emitIntentDecided(state, 'command_automate', 0.9);
     const _devTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'device-state-guard', intentPlan: subPrompts,
-      ...(_devTmpl ? { _deterministicPlan: _devTmpl.skillPlan, _deterministicTemplate: _devTmpl.template, _deterministicLowRisk: _devTmpl.lowRisk } : {}) };
+      ..._detState(_devTmpl) };
   }
 
   // Named-service site interaction ("search amazon for wireless headphones")
@@ -816,7 +832,7 @@ module.exports = async function decomposePromptV2(state) {
     // selection + the full planning prompt.
     const _siteTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'site-service-guard', intentPlan: subPrompts,
-      ...(_siteTmpl ? { _deterministicPlan: _siteTmpl.skillPlan, _deterministicTemplate: _siteTmpl.template, _deterministicLowRisk: _siteTmpl.lowRisk } : {}) };
+      ..._detState(_siteTmpl) };
   }
 
   // Fetch+save composition ("search the web for X and save it to /path") —
@@ -874,7 +890,7 @@ module.exports = async function decomposePromptV2(state) {
       _decomposedIntent: 'command_automate',
       _decomposedBy: 'local-short-circuit',
       intentPlan: subPrompts,
-      ...(_localTmpl ? { _deterministicPlan: _localTmpl.skillPlan, _deterministicTemplate: _localTmpl.template, _deterministicLowRisk: _localTmpl.lowRisk } : {}),
+      ..._detState(_localTmpl),
     };
   }
   // Conversation-recall meta-questions → memory_retrieve (NOT general_knowledge)
@@ -1288,7 +1304,7 @@ module.exports = async function decomposePromptV2(state) {
       _decomposedBy: 'llm',
       ...(llmDateRange ? { _llmDateRange: llmDateRange } : {}),
       intentPlan: [sp],
-      ...(_llmTmpl ? { _deterministicPlan: _llmTmpl.skillPlan, _deterministicTemplate: _llmTmpl.template, _deterministicLowRisk: _llmTmpl.lowRisk } : {}),
+      ..._detState(_llmTmpl),
     };
   }
 
@@ -1316,6 +1332,6 @@ module.exports = async function decomposePromptV2(state) {
     _decomposedBy: 'llm',
     ...(llmDateRange ? { _llmDateRange: llmDateRange } : {}),
     intentPlan: collapsed,
-    ...(_collapsedTmpl ? { _deterministicPlan: _collapsedTmpl.skillPlan, _deterministicTemplate: _collapsedTmpl.template, _deterministicLowRisk: _collapsedTmpl.lowRisk } : {}),
+    ..._detState(_collapsedTmpl),
   };
 };

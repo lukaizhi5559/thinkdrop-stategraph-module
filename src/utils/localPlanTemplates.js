@@ -45,8 +45,18 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
   const hasTarget = tc && typeof tc.followUpTarget === 'string' && tc.followUpTarget;
   if (hasTarget) return forceClassifyLocalPlan(message, tc, llmBackend, logger);
   if (tc && tc._detPrefirePromise) {
+    // Bound the wait — a real template hit resolves in ~2-5s. A stalled
+    // provider can hold the classify call for 60s+; awaiting it serializes a
+    // dead call into the critical path when the right answer was n=0 anyway.
     try {
-      const hit = await tc._detPrefirePromise;
+      const hit = await Promise.race([
+        tc._detPrefirePromise,
+        new Promise(res => setTimeout(() => res('__timeout'), 8000)),
+      ]);
+      if (hit === '__timeout') {
+        logger?.debug?.('[localPlanTemplates] prefired classify timed out at 8s — falling to LLM planner');
+        return null;
+      }
       if (hit) return hit;
       // Prefired classify returned null — same prompt/context, re-calling
       // would return the same. Fall through to LLM planner.
@@ -251,7 +261,72 @@ const TEMPLATES = [
       args: a.all === true ? { query: String(a.query || '').trim(), all: true } : { query: String(a.query || '').trim() },
       description: a.all === true ? 'Cancel all pending reminders' : `Cancel reminder matching "${String(a.query || '').trim()}"` }],
   },
+  {
+    // External-service tier: pin the named service's browser agent and let
+    // preflight handle auth/routing. Skips LLM agent selection + the full
+    // planning prompt — the task text is the user's message verbatim, so the
+    // model cannot invent instructions.
+    n: 14, id: 'service_task', lowRisk: false, external: true,
+    describe: 'action on a named external service the user explicitly named (post/send/add/search/create/play on twitter/x, gmail, todoist, slack, github, spotify, amazon, notion, reddit, linkedin, youtube, etc.) — args: {service}',
+    validate: (a, m) => {
+      const name = _canonicalService(a.service);
+      if (!name) return 'bad service name';
+      // The service (or one of its aliases) must be mentioned in the message —
+      // the model cannot route to a service the user didn't ask for.
+      const needles = SERVICE_ALIASES[name] || [name];
+      if (!needles.some(al => new RegExp(`\\b${al.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(m))) {
+        return 'service not named in message';
+      }
+      return null;
+    },
+    build: (a, m) => {
+      const name = _canonicalService(a.service);
+      return [
+        { skill: 'browser.agent', stepType: 'on-page-action',
+          args: { action: 'run', agentId: `${name}.agent`, task: m },
+          description: `${name}: ${String(m).slice(0, 60)}` },
+        { skill: 'synthesize', stepType: 'verify',
+          args: { prompt: 'Report whether the requested action completed, in one short sentence.' },
+          description: 'Report outcome' },
+      ];
+    },
+  },
 ];
+
+// Service aliases — the user says "tweet"/"x"/"email", the agent is
+// twitter.agent/gmail.agent. Canonical name maps to the <name>.agent registry id.
+const SERVICE_ALIASES = {
+  twitter:  ['twitter', 'tweet', 'x.com'],
+  gmail:    ['gmail', 'email', 'e-mail', 'mail'],
+  todoist:  ['todoist', 'todo'],
+  slack:    ['slack'],
+  github:   ['github'],
+  spotify:  ['spotify'],
+  amazon:   ['amazon'],
+  youtube:  ['youtube', 'yt'],
+  notion:   ['notion'],
+  reddit:   ['reddit'],
+  linkedin: ['linkedin'],
+  facebook: ['facebook', 'fb'],
+  linear:   ['linear'],
+  sms:      ['sms', 'text message', 'imessage'],
+  google_calendar: ['google calendar', 'calendar'],
+  google_docs:     ['google docs'],
+  google_sheets:   ['google sheets'],
+};
+function _canonicalService(svc) {
+  const s = String(svc || '').trim().toLowerCase().replace(/\.agent$/, '').replace(/\s+/g, '_');
+  if (!s) return null;
+  if (SERVICE_ALIASES[s]) return s;
+  if (s === 'x' || s === 'x.com') return 'twitter';
+  for (const [canon, aliases] of Object.entries(SERVICE_ALIASES)) {
+    if (aliases.includes(s)) return canon;
+  }
+  // Unknown service — still allow if it's a plausible agent name mentioned in
+  // the message; validate() enforces the mention check separately.
+  if (!/^[a-z][a-z0-9_]{0,30}$/.test(s)) return null;
+  return s;
+}
 
 function _dirname(p) {
   const s = String(p).replace(/\/+$/, '');
@@ -263,7 +338,7 @@ function _dirname(p) {
 // ── Force-classify call ──────────────────────────────────────────────────────
 // Returns { template, args } | null. The prompt lists templates with arg
 // schemas; the model responds {n: 0..N, args: {...}}. n=0/none → fall through.
-const _CLASSIFY_PROMPT = (message, resolvedTarget) => `Pick the single local-automation template that implements the user's request, and extract its arguments. Reply with STRICT JSON only: {"n": <number>, "args": {...}} — n=0 only if NO template fits (needs an external service like slack/gmail, or multiple independent goals like "read A then email it to B").
+const _CLASSIFY_PROMPT = (message, resolvedTarget) => `Pick the single template that implements the user's request, and extract its arguments. Reply with STRICT JSON only: {"n": <number>, "args": {...}} — n=0 only if NO template fits (ambiguous, or multiple independent goals like "read A then email it to B").
 
 TEMPLATES:
 ${TEMPLATES.map(t => `${t.n}. ${t.id}: ${t.describe}`).join('\n')}
@@ -280,7 +355,9 @@ EXAMPLES:
 "append 'milk' to ~/todo.txt" → {"n": 2, "args": {"path": "~/todo.txt", "content": "milk"}}
 "what's my battery percentage" → {"n": 6, "args": {"kind": "battery"}}
 "open https://a.com" → {"n": 10, "args": {"url": "https://a.com"}}
-"post hello to twitter" → {"n": 0, "args": {}}
+"post hello to twitter" → {"n": 14, "args": {"service": "twitter"}}
+"send a slack message to #eng" → {"n": 14, "args": {"service": "slack"}}
+"check the weather" → {"n": 0, "args": {}}
 ${resolvedTarget ? `RESOLVED TARGET (the file/app the user's referent points at): ${resolvedTarget}` : ''}
 USER: ${message}`;
 
@@ -339,7 +416,7 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
       logger?.info?.(`[localPlanTemplates] ${tmpl.id} validation failed: ${err} — LLM plan fallback`);
       return null;
     }
-    const skillPlan = tmpl.build(args).map((s, i) => ({ step: i + 1, ...s }));
+    const skillPlan = tmpl.build(args, message).map((s, i) => ({ step: i + 1, ...s }));
     for (const s of skillPlan) {
       const cmdStr = `${s.args?.cmd || ''} ${(s.args?.argv || []).join(' ')}`;
       if (DANGEROUS_CMD_RE.test(cmdStr)) {
@@ -348,7 +425,10 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
       }
     }
     logger?.info?.(`[localPlanTemplates] force-classified → ${tmpl.id} (${skillPlan.length} step, lowRisk=${tmpl.lowRisk})`);
-    return { skillPlan, template: tmpl.id, lowRisk: tmpl.lowRisk };
+    return {
+      skillPlan, template: tmpl.id, lowRisk: tmpl.lowRisk,
+      ...(tmpl.external ? { external: true, serviceAgent: `${_canonicalService(args.service)}.agent` } : {}),
+    };
   } catch (err) {
     logger?.debug?.(`[localPlanTemplates] classify call failed: ${err.message}`);
     return null;

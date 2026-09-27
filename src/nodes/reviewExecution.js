@@ -329,6 +329,30 @@ module.exports = async function reviewExecution(state) {
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };
   }
 
+  // ── Fast-pass: deterministic fast-path plan (local tier) — catalog skills are
+  // self-verifying (fs.read reads the file, screen.capture writes a file,
+  // schedule registers server-side). An ok=true step IS the success signal; an
+  // LLM fulfillment check cannot verify a screenshot and misjudges it as hollow
+  // (observed: clean screen.capture → assessBrowserFulfillment "raw=1" → replan
+  // loop). External service plans (browser.agent) keep normal review — a pinned
+  // agent can still legitimately fail fulfillment. A failed deterministic step
+  // falls through to normal review/recovery.
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0 && !state._deterministicExternal) {
+    if (skillResults.every(r => r.ok !== false)) {
+      const _outputs = skillResults
+        .map(r => {
+          const label = `${r.skill || 'step'}${r.args?.action ? '/' + r.args.action : ''}`;
+          const out = String(r.stdout || r.result || '').trim();
+          return `[${label}]:${out ? '\n' + out.slice(0, 300) : ' completed'}`;
+        });
+      const answer = _outputs.length
+        ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}`
+        : 'Done.';
+      logger.info('[Node:ReviewExecution] Deterministic plan — all steps ok, skipping LLM review');
+      return { ...state, reviewVerdict: 'UNVERIFIABLE', answer };
+    }
+  }
+
   // ── external.skill short-circuit ────────────────────────────────────────────
   // external.skill returns a structured object (e.g. { success: true, navigatedTo: "..." }).
   // It does NOT produce page text — content-based hollow checks must never fire on these
@@ -708,25 +732,6 @@ module.exports = async function reviewExecution(state) {
   // schedule registers server-side). An ok=true step IS the success signal;
   // an LLM fulfillment check cannot verify a screenshot and misjudges it as
   // hollow (observed: clean screen.capture → replan loop).
-  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
-    const _allOk = skillResults.every(r => r.ok !== false);
-    if (_allOk) {
-      const _outputs = (skillResults || [])
-        .filter(r => r.ok !== false)
-        .map(r => {
-          const label = `${r.skill || 'step'}${r.args?.action ? '/' + r.args.action : ''}`;
-          const out = String(r.stdout || r.result || '').trim();
-          return `[${label}]:${out ? '\n' + out.slice(0, 300) : ' completed'}`;
-        });
-      const answer = _outputs.length
-        ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}`
-        : 'Done.';
-      logger.info('[Node:ReviewExecution] Deterministic plan — all steps ok, skipping LLM review');
-      return { ...state, reviewVerdict: 'UNVERIFIABLE', answer };
-    }
-    // A failed deterministic step still goes through normal review/recovery.
-  }
-
   // ── Fast-pass: shell-only plan where every step exited cleanly ───────────────
   // When all steps are shell.run/cli.agent and every step exited with ok=true and
   // exitCode 0 — the LLM review would return PASS 100% of the time.

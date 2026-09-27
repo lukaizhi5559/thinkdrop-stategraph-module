@@ -5030,7 +5030,7 @@ Please try again or search with different terms.`;
   // schedule*) — a step exceeding 10s indicates a hang, not legitimate work.
   // Steps that genuinely need longer must explicitly opt out via args.timeoutMs
   // (the plan's stated budget beats the cap).
-  if (Array.isArray(state._deterministicPlan) && !resolvedArgs.timeoutMs) {
+  if (Array.isArray(state._deterministicPlan) && !state._deterministicExternal && !resolvedArgs.timeoutMs) {
     if (stepTimeoutMs > 10000) stepTimeoutMs = 10000;
   }
   // ── project_build: route to project.builder MCP skill ──────────────────────
@@ -6495,7 +6495,10 @@ Please try again or search with different terms.`;
       } else if (raw.result?.tree) {
         fsReadStdout = raw.result.tree;
       } else if (raw.files && Array.isArray(raw.files)) {
-        fsReadStdout = raw.files.map(f => f.path || f).join('\n');
+        const _withContent = raw.files.filter(f => f && typeof f === 'object' && typeof f.content === 'string' && f.content.length);
+        fsReadStdout = _withContent.length
+          ? _withContent.map(f => f.content).join('\n\n')
+          : raw.files.map(f => f.path || f).join('\n');
       }
     }
 

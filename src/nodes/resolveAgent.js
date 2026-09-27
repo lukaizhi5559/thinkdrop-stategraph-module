@@ -745,6 +745,17 @@ module.exports = async function resolveAgent(state) {
     return { ...state, resolveAgentResult: { agents: [], reasoning: 'Non-command intent', question: null } };
   }
 
+  // ── Deterministic plan: external service templates pin the agent (no LLM
+  // selection round) so preflight can still auth-check it ────────────────
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0 && state._deterministicExternal) {
+    const svcAgent = state._deterministicServiceAgent;
+    logger.info(`[Node:ResolveAgent] Deterministic service plan — pinned agent ${svcAgent}`);
+    return { ...state, resolveAgentResult: {
+      agents: [{ agentId: svcAgent, role: resolvedMessage || message || '', exists: true, create: false, type: 'browser' }],
+      reasoning: 'deterministic service template', question: null,
+    } };
+  }
+
   // ── Skip: deterministic plan — catalog skills never need service agents ────
   if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
     logger.info(`[Node:ResolveAgent] Deterministic plan (${state._deterministicTemplate || 'template'}) — skipping agent selection`);

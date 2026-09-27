@@ -57,7 +57,9 @@ function _shouldBypassGather(state) {
 
   // Deterministic plan was force-classified at decompose — args are
   // message-verbatim and validated, nothing to clarify or gather for.
-  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) return true;
+  // External service templates still need this check — unauthed agents
+  // gathered below must surface the auth prompt.
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0 && !state._deterministicExternal) return true;
 
   // Scheduling tasks always go through the grill loop — the _askLLMDecision
   // fast call already knows to ask about missing notification/delivery methods,
