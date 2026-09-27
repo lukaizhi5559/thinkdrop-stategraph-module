@@ -488,7 +488,7 @@ module.exports = async function decomposePromptV2(state) {
   // "read the file and tell me what it says" — anaphoric report-continuation
   // ("it"/"the result" refers back to clause 1's output), not a new goal.
   // "tell me how long my mac has been on" introduces NEW data → still multi.
-  const _AND_REPORT_BACK = /\band\s+(?:then\s+)?(?:tell|show|read)\s+me\s+(?:what\s+(?:it|that|they|he|she)\b|if\s+(?:it|that|they)\b|the\s+(?:result|answer|output)\b)/i;
+  const _AND_REPORT_BACK = /\band\s+(?:then\s+)?(?:tell|show|read)\s+me\s+(?:what\s+(?:it|that|they|he|she)\b|if\s+(?:it|that|they)\b|the\s+(?:result|answer|output|results|top\s+\w+|findings|summary|answer)\b)/i;
   // "if X then Y" is a conditional, not sequencing — the then-clause is not a
   // second goal.
   const _IF_THEN = /\bif\b[^.;]*\bthen\b/i;

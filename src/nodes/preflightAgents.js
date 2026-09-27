@@ -2252,6 +2252,11 @@ module.exports = async function preflightAgents(state) {
       // open (transport error → probe skipped) — same as every other probe.
       }, { timeoutMs: 60 * 1000 }).catch((err) => ({
         ok: false,
+        // Transport failure = probe inconclusive, not an auth denial — mark
+        // unverifiable so the task parks on a sign-in/bypass card instead of
+        // hard-failing planning (observed: wedged :3007 socket → todoist task
+        // died outright even though auth itself was fine).
+        unverifiable: true,
         error: `auth check transport error: ${err?.message || 'unknown error'}`,
       }));
       const authPayload = authRes?.data || authRes || {};
