@@ -54,8 +54,20 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
         new Promise(res => setTimeout(() => res('__timeout'), 8000)),
       ]);
       if (hit === '__timeout') {
-        logger?.debug?.('[localPlanTemplates] prefired classify timed out at 8s — falling to LLM planner');
-        return null;
+        // One inline retry, itself bounded — a healthy provider answers this
+        // small prompt in ~2-5s; if the prefire stalled mid-stream a fresh
+        // call usually lands. Total added latency is capped ~28s vs the old
+        // failure mode (a dead 60s call holding the critical path).
+        logger?.info('[localPlanTemplates] prefired classify timed out at 8s — retrying once inline');
+        const retry = await Promise.race([
+          forceClassifyLocalPlan(message, tc, llmBackend, logger),
+          new Promise(res => setTimeout(() => res('__timeout'), 20000)),
+        ]).catch(() => null);
+        if (retry === '__timeout') {
+          logger?.info('[localPlanTemplates] inline classify retry timed out at 20s — falling to LLM planner');
+          return null;
+        }
+        return retry;
       }
       if (hit) return hit;
       // Prefired classify returned null — same prompt/context, re-calling
@@ -219,7 +231,12 @@ const TEMPLATES = [
       if (/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}([/?#][^\s]*)?$/i.test(raw)) return null;
       return 'bad url';
     },
-    build: (a) => [{ skill: 'shell.run', args: { cmd: 'open', argv: [String(a.url).trim()] }, description: `Open ${a.url}` }],
+    build: (a) => {
+      // macOS `open` treats a bare host as a file path — add the scheme.
+      const raw = String(a.url).trim();
+      const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+      return [{ skill: 'shell.run', args: { cmd: 'open', argv: [url] }, description: `Open ${url}` }];
+    },
   },
   {
     n: 11, id: 'shell_cmd', lowRisk: false,
