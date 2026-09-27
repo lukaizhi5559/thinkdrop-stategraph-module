@@ -381,7 +381,12 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
   if (parsed) {
     logger.debug(`[Node:DecomposePromptV2] Parsed JSON: ${JSON.stringify(parsed).slice(0, 200)}...`);
     if (onParsed) onParsed(parsed); // Pass parsed JSON to main function
-    const subPrompts = parsed.subPrompts || parsed.sub_prompts;
+    // Models sometimes emit a bare array of sub-prompts instead of the
+    // {"subPrompts":[...]} envelope — accept it (observed: remind prompts
+    // silently lost intentPlan → rule-fallback guessed general_knowledge and
+    // the answer hallucinated "I've scheduled a reminder").
+    const subPrompts = parsed.subPrompts || parsed.sub_prompts
+      || (Array.isArray(parsed) ? parsed : null);
     if (!Array.isArray(subPrompts) || subPrompts.length < 1) {
       logger.warn(`[Node:DecomposePromptV2] No valid subPrompts array found - parsed.subPrompts: ${JSON.stringify(parsed.subPrompts)}, parsed.sub_prompts: ${JSON.stringify(parsed.sub_prompts)}`);
       return null;

@@ -445,7 +445,7 @@ module.exports = async function parseIntentV2(state) {
     fallbackIntent = 'command_automate';
     logger.info(`[Node:ParseIntentV2] Social media action on named platform → command_automate: "${classifyMessage.slice(0, 60)}"`);
   }
-  else if (/\b(goto|go to|navigate|open|close|quit|exit|minimize|hide|show|stop|kill|launch|start|visit|click|run|execute|install|send|create|rename|move|delete|download|resize|maximize|scroll|type|press|drag|watch|stream|play|view|browse|load|fetch|scrape|automate|interact)\b/.test(lower)) fallbackIntent = 'command_automate';
+  else if (/\b(goto|go to|navigate|open|close|quit|exit|minimize|hide|show|stop|kill|launch|start|visit|click|run|execute|install|send|create|rename|move|delete|download|resize|maximize|scroll|type|press|drag|watch|stream|play|view|browse|load|fetch|scrape|automate|interact|remind|reminder|alarm|alert me|wake me)\b/.test(lower)) fallbackIntent = 'command_automate';
   // NEW: Content discovery on named platforms → command_automate (browser automation needed)
   else if (hasContentDiscovery && hasNamedPlatform) {
     fallbackIntent = 'command_automate';
