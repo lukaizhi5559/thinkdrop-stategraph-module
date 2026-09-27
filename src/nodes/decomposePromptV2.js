@@ -475,8 +475,24 @@ module.exports = async function decomposePromptV2(state) {
   const _rawHint = typeof state._carriedHint === 'string' ? state._carriedHint : null;
   const _carriedHint = _rawHint ? (_HINT_VOCAB[_rawHint] || _rawHint) : null;
   const _msgLower = String(message || '').toLowerCase();
-  const _MULTI_GOAL_CONJUNCTIONS = /\b(and\s+then|also|after\s+that|additionally|plus|furthermore|then\s+also)\b|;\s*[a-z]/i;
-  const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower);
+  // Plain "and" alone is not a multi-goal signal ("set volume and brightness"
+  // is one goal) — but "and <action verb>" introduces an independent clause:
+  // "set my volume to 30 AND open apple.com" was being swallowed whole by the
+  // device-state guard, so the second goal got LLM-planned (and hallucinated a
+  // clarify step) instead of splitting into sub-prompts.
+  const _MULTI_GOAL_CONJUNCTIONS = /\b(and\s+then|also|after\s+that|additionally|plus|furthermore|then\s+also)\b|;\s*[a-z]|\band\s+(?:then\s+)?(?:open|launch|start|run|create|write|delete|remove|move|rename|copy|take|capture|grab|set|remind|schedule|send|post|tweet|email|text|message|search|find|look\s+up|check|list|show|tell|add|make|download|save|read|print|close|quit|restart|mute|shut)\b|\b(?:and\s+)?then\s+(?:open|launch|start|run|create|write|delete|remove|move|rename|copy|take|capture|grab|set|remind|schedule|send|post|tweet|email|text|message|search|find|look\s+up|check|list|show|tell|read|print|save|close|quit)\b|\band\s+(?:then\s+)?(?:how\s+(?:much|many|long|often|old|far)|what(?:'s|\s+is|\s+are|\s+was)|when|where|who|which)\b/i;
+  // "open slack and send a message" / "open youtube and play X" are ONE
+  // compound service task, not two goals — the second verb acts inside the
+  // thing just opened. Only a real cross-domain conjunction counts.
+  const _OPEN_THEN_SERVICE_ACTION = /\b(?:open|launch)\s+[^.]*?\band\s+(?:then\s+)?(?:play|send|post|tweet|email|text|message|search|find|watch|look\s+up|check|show|read)\b/i;
+  // "read the file and tell me what it says" — anaphoric report-continuation
+  // ("it"/"the result" refers back to clause 1's output), not a new goal.
+  // "tell me how long my mac has been on" introduces NEW data → still multi.
+  const _AND_REPORT_BACK = /\band\s+(?:then\s+)?(?:tell|show|read)\s+me\s+(?:what\s+(?:it|that|they|he|she)\b|if\s+(?:it|that|they)\b|the\s+(?:result|answer|output)\b)/i;
+  // "if X then Y" is a conditional, not sequencing — the then-clause is not a
+  // second goal.
+  const _IF_THEN = /\bif\b[^.;]*\bthen\b/i;
+  const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower) && !_OPEN_THEN_SERVICE_ACTION.test(_msgLower) && !_AND_REPORT_BACK.test(_msgLower) && !_IF_THEN.test(_msgLower);
   const _SINGLE_STEP_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser']);
   const _ACTION_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser', 'messaging', 'scheduling']);
   // Ambient-artifact misresolution: a bare-deictic continuation ("tell me
@@ -1225,6 +1241,30 @@ module.exports = async function decomposePromptV2(state) {
     return state;
   }
 
+  // Deterministic conjunction split — the conjunction detector fired but the
+  // LLM still merged everything into one sub-prompt (observed: "set my volume
+  // to 30 percent and open apple.com" → single passthrough → det classify miss
+  // on the merged text → expensive/lossy LLM plan). Split at the conjunction
+  // boundary so each clause takes its own deterministic template path.
+  if (_hasMultiGoalConjunction && Array.isArray(subPrompts) && subPrompts.length === 1) {
+    const parts = String(message).split(/\b(?:and|then)\s+(?=(?:then\s+)?(?:open|launch|start|run|create|write|delete|remove|move|rename|copy|take|capture|grab|set|remind|schedule|send|post|tweet|email|text|message|search|find|look\s+up|check|list|show|tell|add|make|download|save|read|print|close|quit|restart|mute|shut|how|what|when|where|who|which)\b)/i)
+      .map(s => s.replace(/\s+/g, ' ').trim())
+      .filter(s => s.length > 3);
+    if (parts.length > 1) {
+      const inherited = subPrompts[0] && subPrompts[0].estimatedIntent;
+      logger.info(`[Node:DecomposePromptV2] Conjunction split — LLM merged ${parts.length} goals into one sub-prompt; splitting deterministically`);
+      subPrompts = parts.map((text, i) => ({
+        text,
+        estimatedIntent: inherited || null,
+        confidence: 0.7,
+        order: i,
+        dependsOn: [],
+        isLongRunning: false,
+        dataTemplate: null,
+      }));
+    }
+  }
+
   // Filter out sub-prompts that are just repeats of previous user messages (catch LLM hallucinations)
   // Only filter exact matches, not partial matches, to avoid filtering legitimate platform-specific queries
   // GRACE PERIOD: Don't filter if the similar message is >5 minutes old (user likely re-asking intentionally)
@@ -1313,8 +1353,13 @@ module.exports = async function decomposePromptV2(state) {
     };
   }
 
-  // Multiple sub-prompts — collapse linear CA chains
-  const collapsed = collapseLinearCAChain(subPrompts, message, logger);
+  // Multiple sub-prompts — collapse linear CA chains. Skip the collapse when a
+  // real multi-goal conjunction was detected: ParseIntentV2's own grouping
+  // merges consecutive CA sub-prompts AND tries per-part deterministic
+  // composition (multi-compose), which the merged single text cannot hit —
+  // observed: "set volume + open apple.com" collapsed to one → sel=0 → LLM
+  // plan with a bogus ask_user step.
+  const collapsed = _hasMultiGoalConjunction ? subPrompts : collapseLinearCAChain(subPrompts, message, logger);
 
   writeDecomposeLog({
     ts: new Date().toISOString(), message, carriedHint: _carriedHint,

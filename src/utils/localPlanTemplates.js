@@ -256,7 +256,7 @@ const TEMPLATES = [
   },
   {
     n: 12, id: 'remind_create', lowRisk: false,
-    describe: 'set a one-shot reminder/alarm — args: {delayMs (number, ms from now) or time (clock time like "18:30"), label (what to remind about)}',
+    describe: 'set a one-shot reminder/alarm — args: {delayMs (number, ms from now) or time (clock time like "18:30"), label (what to remind about)}. Still pick this when the requested time is odd or in the past — the schedule step resolves and reports that at execution, planning must not route it to a calendar agent',
     validate: (a) => {
       if (typeof a.label !== 'string' || !a.label.trim()) return 'label missing';
       const d = Number(a.delayMs);

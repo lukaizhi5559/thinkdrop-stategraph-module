@@ -2246,7 +2246,11 @@ module.exports = async function preflightAgents(state) {
           preflightProbe: true,
           requireCookieConfirmation: !!a._requireCookieConfirmation,
         },
-      }, { timeoutMs: 10 * 60 * 1000 }).catch((err) => ({
+      // 60s cap — a wedged command-service must not swallow the whole task
+      // budget (observed: 600s auth probe stall on a dead MCP socket turned a
+      // "remind me" task into a 10-minute timeout). On timeout this fails
+      // open (transport error → probe skipped) — same as every other probe.
+      }, { timeoutMs: 60 * 1000 }).catch((err) => ({
         ok: false,
         error: `auth check transport error: ${err?.message || 'unknown error'}`,
       }));

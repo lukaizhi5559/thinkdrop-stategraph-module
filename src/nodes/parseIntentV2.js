@@ -4,6 +4,7 @@ const fs   = require('fs');
 const path = require('path');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { SCREEN_OBSERVATION_RE } = require('../utils/textPatterns.cjs');
+const { forceClassifyLocalPlan } = require('../utils/localPlanTemplates.js');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeIntentLog(entry) {
@@ -171,6 +172,34 @@ module.exports = async function parseIntentV2(state) {
           const mergedText = group.map(g => g.text).join('; ');
           const mergedDependsOn = [...new Set(group.flatMap(g => g.dependsOn || []))].sort((a, b) => a - b);
           const anyLongRunning = group.some(g => g.isLongRunning);
+          // Deterministic composition — classify each sub-prompt against the
+          // local-plan catalog. If every one hits a local (non-external)
+          // template, concatenate the compiled plans and skip merged LLM
+          // planning entirely. Observed failure: "set volume + open apple.com"
+          // → planner emitted a bogus ask_user step ("which page?") for a URL
+          // that was verbatim in the prompt, looping ask→replan→ask.
+          // Any miss or external template falls back to the merged LLM plan
+          // (multi-agent external plans need the unified preflight/auth path).
+          let _detCompose = null;
+          try {
+            const hits = [];
+            let allLocal = true;
+            for (const g of group) {
+              const hit = await forceClassifyLocalPlan(g.text, state._taskClassification, state.llmBackend, logger);
+              if (!hit || hit === '__error' || hit.external) { allLocal = false; break; }
+              hits.push(hit);
+            }
+            if (allLocal && hits.length === group.length) {
+              _detCompose = {
+                steps: hits.flatMap(h => h.skillPlan),
+                templates: hits.map(h => h.template),
+                lowRisk: hits.every(h => h.lowRisk),
+              };
+              logger.info(`[Node:ParseIntentV2] multi-compose: ${_detCompose.templates.join(' + ')} → ${_detCompose.steps.length} deterministic steps — skipping merged LLM planning`);
+            }
+          } catch (e) {
+            logger.debug(`[Node:ParseIntentV2] multi-compose classify failed: ${e.message} — merged LLM path`);
+          }
           grouped.push({
             text:            mergedText,
             estimatedIntent: 'command_automate',
@@ -179,6 +208,7 @@ module.exports = async function parseIntentV2(state) {
             dependsOn:       mergedDependsOn,
             isLongRunning:   anyLongRunning,
             dataTemplate:    group[0].dataTemplate || null,
+            _detCompose,
           });
           logger.info(`[Node:ParseIntentV2] Merged ${group.length} consecutive command_automate sub-prompts into one: "${mergedText.slice(0, 80)}"`);
         }
@@ -326,6 +356,13 @@ module.exports = async function parseIntentV2(state) {
       ...state,
       intent: { type: finalIntent, confidence: finalConf, entities: [], requiresMemoryAccess: finalIntent === 'memory_retrieve' },
       metadata: { parser: 'decompose-passthrough', processingTimeMs: 0 },
+      // Composed deterministic plan from the multi-sub-prompt merge — adopted
+      // by planSkillsV2's _deterministicPlan fast-path (skips LLM planning).
+      ...(sp._detCompose ? {
+        _deterministicPlan: sp._detCompose.steps,
+        _deterministicTemplate: `multi_compose:${sp._detCompose.templates.join('+')}`,
+        _deterministicLowRisk: sp._detCompose.lowRisk,
+      } : {}),
     };
   }
 
