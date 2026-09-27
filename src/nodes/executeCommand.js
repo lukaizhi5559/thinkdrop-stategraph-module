@@ -191,6 +191,39 @@ async function _thinPostFailureHandler(state) {
 
   if (!failedStep) return state;
 
+  // Deterministic-plan short-circuit — a compiled step failing (usually the
+  // 10s wall-clock cap under load) must not escalate into LLM replanning or a
+  // re-approval round. Retry the same step with a real 60s timeout twice,
+  // then surface the honest failure to the user.
+  if (state._deterministicPlan && !state._deterministicExternal) {
+    const _detRetries = (patchHistory || []).filter(p => p.action === 'DET_RETRY' && p.cursor === skillCursor).length;
+    if (_detRetries < 2) {
+      const patchedPlan = [...skillPlan];
+      if (patchedPlan[skillCursor]) {
+        patchedPlan[skillCursor] = { ...patchedPlan[skillCursor], args: { ...patchedPlan[skillCursor].args, timeoutMs: 60000 } };
+      }
+      logger.info(`[ExecuteCommand:ThinRecovery] DET_RETRY ${_detRetries + 1}/2: ${failedStep.skill} step ${skillCursor + 1} (${(failedStep.error || 'failed').slice(0, 80)}) — re-running with 60s timeout, no LLM replan`);
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        recoveryNote: '',
+        patchHistory: [...patchHistory, { action: 'DET_RETRY', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        stepRetryCount: stepRetryCount + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
+    logger.warn(`[ExecuteCommand:ThinRecovery] deterministic plan exhausted retries on ${failedStep.skill} — asking user`);
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      pendingQuestion: { question: `Step "${failedStep.skill}" failed: ${failedStep.error}. Retry or cancel?`, options: ['Retry', 'Cancel'] },
+      patchHistory: [...patchHistory, { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      commandExecuted: false,
+    };
+  }
+
   // OAuth failure short-circuit — same as recoverSkill
   if (failedStep.needsOAuth) {
     const skillLabel = failedStep.args?.name || failedStep.skill || 'this skill';
