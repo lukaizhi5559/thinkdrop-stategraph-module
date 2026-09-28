@@ -79,6 +79,15 @@ module.exports = async function advanceQueue(state) {
     const intentResults = [...(state.intentResults || []), completedStep];
     const dataContext   = { ...(state.dataContext || {}), [completedStep.step]: completedStep.result };
 
+    // Accumulate search docs across queue steps — contextDocs is reset below so
+    // a later step doesn't bleed results, but the feed's item cards (handoffRunner)
+    // still need the full set (e.g. image-search docs from a fetch step before
+    // screen_display wipes them).
+    const _allContextDocs = [
+      ...(Array.isArray(state._allContextDocs) ? state._allContextDocs : []),
+      ...(Array.isArray(state.contextDocs) ? state.contextDocs : []),
+    ];
+
     // Emit step-done progress event
     if (typeof state.progressCallback === 'function') {
       try {
@@ -212,6 +221,7 @@ module.exports = async function advanceQueue(state) {
         dataContext,
         intentQueue:  remaining,
         _longTaskId:  taskId,
+        _allContextDocs,
       };
     }
 
@@ -247,6 +257,7 @@ module.exports = async function advanceQueue(state) {
       intentResults,
       dataContext,
       intentQueue:       remaining,
+      _allContextDocs,
       conversationLogged: false,
       // Clear previous step's output so it doesn't bleed into this step
       answer:            null,
@@ -309,6 +320,13 @@ module.exports = async function advanceQueue(state) {
       _advanceRoute: 'summarizeMultiIntent',
       intentResults: [...state.intentResults, finalStep],
       dataContext:   { ...state.dataContext, [finalStep.step]: finalStep.result },
+      // Keep every step's docs — the final contextDocs belongs to the last
+      // step only (screen_display has none), so item extraction needs the
+      // accumulated set.
+      _allContextDocs: [
+        ...(Array.isArray(state._allContextDocs) ? state._allContextDocs : []),
+        ...(Array.isArray(state.contextDocs) ? state.contextDocs : []),
+      ],
     };
   }
 
