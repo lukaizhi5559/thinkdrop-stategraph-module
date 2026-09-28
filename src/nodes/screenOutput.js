@@ -26,6 +26,8 @@
 const OVERLAY_PORT = process.env.OVERLAY_CONTROL_PORT || 3010;
 const BASE = `http://127.0.0.1:${OVERLAY_PORT}`;
 
+const { inferScreenOutput } = require('../utils/textPatterns.cjs');
+
 const EFFECT_RE = /\b(emoji[\s-]?rain|fireworks?|confetti|snow|rain)\b/i;
 const EMOJI_RE = /\p{Extended_Pictographic}/u;
 
@@ -67,6 +69,39 @@ function _stepResultText(state) {
   return text.trim() || null;
 }
 
+/** "Mon: 4" / "apples = 5" pairs → chart rows. Used for both the inline
+ *  message tail and prior-step text (journal_stats/sys_query output). */
+function _pairsToRows(text) {
+  if (!text) return [];
+  const pairRe = /([A-Za-z][\w \-']{0,30}?)\s*[:=]?\s*(\d+(?:\.\d+)?)(?=%?\s*(?:[,;]|$))/gm;
+  const data = [];
+  let pm;
+  while ((pm = pairRe.exec(text)) !== null) {
+    const label = pm[1].trim().replace(/,$/, '');
+    if (label && !/^(?:pie|donut|bar|line|area|stat|chart|graph)$/i.test(label)) {
+      data.push({ label, value: parseFloat(pm[2]) });
+    }
+  }
+  return data;
+}
+
+/** Free text → deck slides: blank lines split slides; first line of each
+ *  block becomes the title, "- "/"• " lines become bullets, the rest body. */
+function _textToSlides(text) {
+  if (!text) return [];
+  const blocks = String(text).split(/\n\s*\n/).map(b => b.trim()).filter(Boolean).slice(0, 8);
+  return blocks.map(b => {
+    const lines = b.split('\n').map(l => l.trim()).filter(Boolean);
+    const bullets = lines.filter(l => /^[-•*]\s+/.test(l)).map(l => l.replace(/^[-•*]\s+/, ''));
+    const rest = lines.filter(l => !/^[-•*]\s+/.test(l));
+    const slide = {};
+    if (rest.length) slide.title = rest[0].slice(0, 200);
+    if (rest.length > 1) slide.body = rest.slice(1).join('\n').slice(0, 4000);
+    if (bullets.length) slide.bullets = bullets.slice(0, 20);
+    return (slide.title || slide.body || slide.bullets) ? slide : null;
+  }).filter(Boolean);
+}
+
 module.exports = async function screenOutput(state) {
   const logger = state.logger || console;
   const tc = state._taskClassification || {};
@@ -87,7 +122,10 @@ module.exports = async function screenOutput(state) {
   }
 
   // ── Show ───────────────────────────────────────────────────────────────────
-  const kind = tc.screenOutputKind || 'text';
+  // tc.screenOutputKind flakes to null across plan-pause/resume (the resumed
+  // run rebuilds _taskClassification from scratch). The utterance carries the
+  // kind lexically — inferScreenOutput fills the gap before the text default.
+  const kind = tc.screenOutputKind || inferScreenOutput(message).kind || 'text';
   const payload = { kind };
 
   // Structured data emitted by the classifier (chart data, deck slides, alert
@@ -113,16 +151,8 @@ module.exports = async function screenOutput(state) {
       // — the format the no-data error below asks for). classifyTask's
       // screenOutputPayload flakes; the inline parse is deterministic.
       if (!payload.chart) {
-        const pairRe = /([A-Za-z][\w \-']{0,30}?)\s*[:=]?\s*(\d+(?:\.\d+)?)/g;
         const tail = message.includes(':') ? message.slice(message.lastIndexOf(':') + 1) : message;
-        const data = [];
-        let pm;
-        while ((pm = pairRe.exec(tail)) !== null) {
-          const label = pm[1].trim().replace(/,$/, '');
-          if (label && !/^(?:pie|donut|bar|line|area|stat|chart|graph)$/i.test(label)) {
-            data.push({ label, value: parseFloat(pm[2]) });
-          }
-        }
+        const data = _pairsToRows(tail);
         if (data.length >= 2) {
           const tm = message.match(/\b(pie|donut|bar|line|area|stat)\b/i);
           payload.chart = { type: tm ? tm[1].toLowerCase() : 'pie', data, xKey: 'label', yKey: 'value' };
@@ -136,6 +166,20 @@ module.exports = async function screenOutput(state) {
         else if (r && Array.isArray(r.data) && r.data.length) {
           const m = message.match(/\b(pie|donut|bar|line|area|stat)\b/i);
           payload.chart = { type: m ? m[1].toLowerCase() : 'pie', data: r.data };
+        }
+      }
+      // Prior-step text ("Mon: 4\nTue: 7") from a gather step — journal_stats
+      // and sys_query print label:number lines the pair parser turns into
+      // rows. Exactly one row coerces to a stat card unless a chart type was
+      // named ("a bar chart of my battery" stays a bar with one bar).
+      if (!payload.chart) {
+        const data = _pairsToRows(_stepResultText(state));
+        if (data.length) {
+          const tm = message.match(/\b(pie|donut|bar|line|area|stat)\b/i);
+          const type = tm ? tm[1].toLowerCase() : (data.length === 1 ? 'stat' : 'bar');
+          payload.chart = type === 'stat'
+            ? { type: 'stat', data: [{ label: data[0].label, value: data[0].value }] }
+            : { type, data, xKey: 'label', yKey: 'value' };
         }
       }
       if (!payload.chart) {
@@ -157,6 +201,20 @@ module.exports = async function screenOutput(state) {
         const last = results[results.length - 1];
         const r = last && last.result && typeof last.result === 'object' ? last.result : null;
         if (r && r.deck && Array.isArray(r.deck.slides)) payload.deck = r.deck;
+      }
+      // Free text → slides: prior gather/answer text or an inline
+      // "slides: A / B / C" shape in the message itself.
+      if (!payload.deck) {
+        const inline = message.match(/\bslides?\b[^:\n]{0,30}:\s*(.+)$/i);
+        let slides = null;
+        if (inline) {
+          slides = inline[1].split(/\s*\/\s*/).map(t => ({ title: t.trim() })).filter(s => s.title).slice(0, 8);
+        } else {
+          slides = _textToSlides(tc.screenOutputContent || _stepResultText(state));
+        }
+        if (slides && slides.length) {
+          payload.deck = { slides, transition: 'fade', slideMs: 5000, controls: true };
+        }
       }
       if (!payload.deck) {
         return {
@@ -200,6 +258,20 @@ module.exports = async function screenOutput(state) {
         };
       }
       if (tc.screenOutputContent) payload.caption = tc.screenOutputContent;
+      break;
+    }
+    case 'three': {
+      // Preset 3D scenes — deterministic parse from the message; an explicit
+      // payload.three from the classifier merges over the inferred defaults.
+      if (!payload.three) {
+        const m = message.match(/\b(starfield|particles?|wave|cube|knot|globe)\b/i);
+        let scene = m ? m[1].toLowerCase().replace(/s$/, '') : null;
+        if (!scene && /\b(?:spinning|rotating|wireframe|3\s?-?d)\b/i.test(message)) scene = 'cube';
+        payload.three = { scene: scene || 'starfield' };
+      }
+      const em = message.match(EMOJI_RE);
+      if (em) payload.emoji = em[0];
+      if (tc.screenOutputContent) payload.three.text = tc.screenOutputContent;
       break;
     }
     default: {

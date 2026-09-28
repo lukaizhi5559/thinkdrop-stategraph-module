@@ -54,6 +54,10 @@ module.exports = async function preparePostScreen(state) {
   // web_search: subject prepended by webSearch.js via _priorScreenContext
   if (postIntent === 'web_search') { patch._advanceRoute = 'webSearch'; return patch; }
 
+  // screen_display: GhostLayer output is independent of the captured screen —
+  // continue to the display node, not the generic answer path
+  if (postIntent === 'screen_display') { patch._advanceRoute = 'screenOutput'; return patch; }
+
   // query / general_knowledge / ambiguous / greeting → answer with injected context
   patch._advanceRoute = 'answer';
   return patch;

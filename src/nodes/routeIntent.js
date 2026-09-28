@@ -72,7 +72,11 @@ module.exports = async function routeIntent(state) {
   // there is no PRIOR SCREEN CONTEXT block. Capture fresh screen content first,
   // then route to the correct handler with enriched context.
   // Guard: !state._needsFreshScreen prevents re-triggering after the grab completes.
-  if (state._taskClassification?.needsFreshScreen && !state._needsFreshScreen) {
+  // screen_display never needs screen OCR — the payload renders on GhostLayer,
+  // the capture just stalls the display and (worse) preparePostScreen used to
+  // reroute it into answer ("display a spinning cube" → LLM answered with
+  // terminal commands instead of painting WebGL).
+  if (state._taskClassification?.needsFreshScreen && !state._needsFreshScreen && intentType !== 'screen_display') {
     logger.info(`[Node:RouteIntent] needsFreshScreen=true — auto-capturing screen before routing (intent: ${intentType})`);
     patch._needsFreshScreen = true;
     patch._postScreenIntent = intentType;

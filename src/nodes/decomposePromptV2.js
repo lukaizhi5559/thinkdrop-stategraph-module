@@ -7,7 +7,7 @@ const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
-const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
 const { _classifyDeterministic } = require('../utils/localPlanTemplates.js');
 
 // Spread helper — deterministic-plan state fields, including the external
@@ -555,14 +555,24 @@ module.exports = async function decomposePromptV2(state) {
   // of my screen" flaked isScreenOutput:true and produced a
   // [web_search, screen_display] plan that hallucinated the capture.
   const _isScreenCapture = SCREEN_CAPTURE_RE.test(message);
-  const _screenOutputLex = (SCREEN_OUTPUT_RE.test(message) || _lookupThenDisplay)
-    && !SCREEN_OBSERVATION_RE.test(message) && !_isScreenCapture;
   // classifyTask flakes isScreenOutput on file-write phrasing ("create a file
   // at /tmp/x containing the text Y" → true). A literal path + file op is a
   // filesystem task — content goes to disk, never to the display surface.
   const _fileOpShape = FILE_PATH_RE.test(message)
     && (/\b(file|folder|directory)\b|\.\w{2,6}\b/i.test(message)
         || /\b(create|write|append|save|store|rename|move|copy|read|list)\b/i.test(message));
+  // Visual-kind nouns imply a display even without "on screen" — "show me a
+  // pie chart of my activity" is only satisfiable by painting it. Carve-outs:
+  // a named app (chart belongs inside Excel/Keynote), a resolved targetService,
+  // and file ops (the artifact goes to disk).
+  // "chart in Excel" / "slides on PowerPoint" — the artifact lives inside a
+  // named app (app automation). Bare app mentions don't carve: "chart of
+  // browsers: arc, safari" puts safari in the DATA, not the destination.
+  const _visualIntoApp = VISUAL_INTO_APP_RE.test(message) && NAMED_APP_RE.test(message);
+  const _visualKind = SCREEN_VISUAL_KIND_RE.test(message)
+    && !_visualIntoApp && !_tc.targetService && !_fileOpShape;
+  const _screenOutputLex = (SCREEN_OUTPUT_RE.test(message) || _lookupThenDisplay || _visualKind)
+    && !SCREEN_OBSERVATION_RE.test(message) && !_isScreenCapture;
   if (_tc.isScreenOutput && _fileOpShape && !_screenOutputLex) {
     logger.info('[Node:DecomposePromptV2] isScreenOutput clamped — literal file path + file verb (classifier flake)');
   }
@@ -593,10 +603,15 @@ module.exports = async function decomposePromptV2(state) {
     const _REFERENTIAL_RE = /\b(it|that|this|them|those|the\s+(result|answer|chapter|verse|response|reply|output|list|chart|graph|data|one)|whole\s+\w+|above|previous|again)\b/i;
     const _needsFetch = _lookupThenDisplay
       || (_action === 'show'
-        && ['text', 'chart'].includes(_kind)
+        && ['text', 'chart', 'deck'].includes(_kind)
         && !_content
         && !_tc.screenOutputPayload
         && !_REFERENTIAL_RE.test(message));
+
+    // Local-data subjects ("my task activity", "my battery") gather through
+    // command_automate (journal_stats/sys_query templates) — web_search would
+    // hallucinate data the device itself owns.
+    const _localGather = LOCAL_DATA_SUBJECT_RE.test(message) || DEVICE_STATE_RE.test(message);
 
     const displayStep = {
       text: message,
@@ -606,18 +621,42 @@ module.exports = async function decomposePromptV2(state) {
       dependsOn: _needsFetch ? [0] : [],
       isLongRunning: false,
       dataTemplate: null,
+      // Carried on the queue item so advanceQueue can rebuild
+      // _taskClassification on resume — a plan-pause/resume drops
+      // _taskClassification entirely, which used to leave the display
+      // step at kind=auto (→ text) instead of the inferred chart/deck.
+      screenOutputKind: _kind,
+      screenOutputContent: _content,
+      screenOutputAction: _action,
     };
-    const subPrompts = _needsFetch
-      ? [{
-          text: message,
-          estimatedIntent: 'web_search',
-          confidence: 0.9,
-          order: 0,
-          dependsOn: [],
-          isLongRunning: false,
-          dataTemplate: null,
-        }, displayStep]
-      : [displayStep];
+    const fetchStep = {
+      text: message,
+      estimatedIntent: _localGather ? 'command_automate' : 'web_search',
+      confidence: 0.9,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    };
+    // A lone command_automate gather step would otherwise take the full
+    // agent/preflight/LLM-plan pipeline (observed: "plot a bar chart of my
+    // task activity" → resolveAgent asked "which task manager?" then the LLM
+    // plan collapsed to 0 steps). The data is a local stats query — det-
+    // classify it now and attach _detCompose so planSkills adopts the
+    // deterministic journal_stats/sys_query plan directly.
+    if (_needsFetch && _localGather) {
+      const gatherText = `summarize my ${/conversation|chat|message/i.test(message) ? 'conversation' : 'task'} activity per day over the past week`;
+      try {
+        const hit = await _classifyDeterministic(gatherText, _tc, state.llmBackend, logger);
+        if (hit && hit !== '__error' && !hit.external) {
+          fetchStep._detCompose = { steps: hit.skillPlan, templates: [hit.template], lowRisk: hit.lowRisk };
+          logger.info(`[Node:DecomposePromptV2] local gather det-classified → ${hit.template}`);
+        }
+      } catch (e) {
+        logger.debug(`[Node:DecomposePromptV2] local gather classify failed: ${e.message}`);
+      }
+    }
+    const subPrompts = _needsFetch ? [fetchStep, displayStep] : [displayStep];
     const durationMs = Date.now() - t0;
     writeDecomposeLog({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,

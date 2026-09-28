@@ -277,14 +277,20 @@ module.exports = async function advanceQueue(state) {
       _thoughtAttachment: null,
       _needsFreshScreen: false,
       _postScreenIntent: null,
-      _taskClassification: state._taskClassification ? {
-        ...state._taskClassification,
+      _taskClassification: {
+        ...(state._taskClassification || {}),
         isFollowUp:         false,
         isThoughtReply:     false,
         followUpTarget:     null,
         needsClarification: false,
         resolution:         'resolved',
-      } : null,
+        // Screen fields ride on the queue item — a plan-pause/resume
+        // rebuilds _taskClassification from scratch and the display kind
+        // would otherwise default to text.
+        ...(nextStep.screenOutputKind    ? { isScreenOutput: true, screenOutputKind: nextStep.screenOutputKind }       : {}),
+        ...(nextStep.screenOutputContent ? { screenOutputContent: nextStep.screenOutputContent } : {}),
+        ...(nextStep.screenOutputAction  ? { screenOutputAction: nextStep.screenOutputAction }   : {}),
+      },
     };
   }
 

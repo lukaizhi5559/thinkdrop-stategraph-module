@@ -310,7 +310,41 @@ const TEMPLATES = [
       ];
     },
   },
+  {
+    n: 15, id: 'journal_stats', lowRisk: true,
+    describe: 'summarize or count the user\'s ThinkDrop task, app, or conversation activity per day / over a period (e.g. "my activity over the past week", "my task history") — args: {days? (default 7)}. Prints "Day: N" lines the caller turns into a chart or table.',
+    validate: () => null,
+    build: (a) => [{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', _journalStatsCmd(a)] }, description: 'Summarize task activity' }],
+  },
 ];
+
+/** journal_stats gather step — buckets ~/.thinkdrop/task-journal.json entries
+ *  by weekday over `days` days, printing "Mon: 4" lines. When the journal has
+ *  fewer than two buckets it falls back to conversation-history message counts
+ *  (conversation-service :3004) so "my activity" still resolves to real data. */
+function _journalStatsCmd(a) {
+  const days = Math.min(30, Math.max(1, Math.round(Number(a && a.days) || 7)));
+  return `node -e '
+const fs=require("fs"),os=require("os"),path=require("path"),http=require("http");
+const DAYS=${days},now=Date.now(),rows={};
+const bump=(ts)=>{const d=new Date(ts);if(!isNaN(d)&&now-d.getTime()<=DAYS*864e5&&d.getTime()<=now+6e4){const k=d.toDateString().slice(0,3);rows[k]=(rows[k]||0)+1;}};
+const emit=()=>{const order=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];const out=order.filter(d=>rows[d]!=null).map(d=>d+": "+rows[d]);console.log(out.length?out.join("\\n"):"No recorded activity in the last "+DAYS+" days");};
+try{const j=JSON.parse(fs.readFileSync(path.join(os.homedir(),".thinkdrop/task-journal.json"),"utf8"));for(const t of (Array.isArray(j)?j:[]))bump(Number(t.createdAt||t.startedAt||0));}catch(e){}
+if(Object.keys(rows).length>=2){emit();}
+else{
+  try{
+    const body=JSON.stringify({requestId:"journal_stats",payload:{startDate:new Date(now-DAYS*864e5).toISOString(),endDate:new Date(now).toISOString(),limit:500}});
+    const req=http.request({host:"127.0.0.1",port:3004,path:"/message.listByDate",method:"POST",headers:{"Content-Type":"application/json","Content-Length":Buffer.byteLength(body)},timeout:4000},(res)=>{
+      let raw="";res.on("data",c=>raw+=c);res.on("end",()=>{
+        try{const env=JSON.parse(raw);const msgs=(env&&env.data&&env.data.messages)||(env&&env.messages)||[];
+          for(const m of msgs){const ts=typeof m.timestamp==="number"?m.timestamp:Date.parse(m.timestamp||m.created_at||0);bump(ts);}
+          emit();}catch(e){emit();}});
+    });
+    req.on("error",emit);req.on("timeout",()=>{req.destroy();emit();});
+    req.write(body);req.end();
+  }catch(e){emit();}
+}'`;
+}
 
 // Service aliases — the user says "tweet"/"x"/"email", the agent is
 // twitter.agent/gmail.agent. Canonical name maps to the <name>.agent registry id.
