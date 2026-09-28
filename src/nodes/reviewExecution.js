@@ -343,7 +343,7 @@ module.exports = async function reviewExecution(state) {
         .map(r => {
           const label = `${r.skill || 'step'}${r.args?.action ? '/' + r.args.action : ''}`;
           const out = String(r.stdout || r.result || '').trim();
-          return `[${label}]:${out ? '\n' + out.slice(0, 300) : ' completed'}`;
+          return `[${label}]:${out ? '\n' + out.slice(0, 2000) : ' completed'}`;
         });
       const answer = _outputs.length
         ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}`
@@ -760,7 +760,7 @@ module.exports = async function reviewExecution(state) {
         .map(r => {
           const label = `${r.skill || 'step'}${r.args?.action ? '/' + r.args.action : ''}`;
           const out = String(r.stdout || r.result || '').trim();
-          return `[${label}]:${out ? '\n' + out.slice(0, 300) : ' completed'}`;
+          return `[${label}]:${out ? '\n' + out.slice(0, 2000) : ' completed'}`;
         });
       const answer = _outputs.length
         ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}`
