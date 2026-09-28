@@ -7,7 +7,8 @@ const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
-const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, SCRIPTURE_REF_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { TEMPLATES: _LOCAL_TEMPLATES } = require('../utils/localPlanTemplates.js');
 const { _classifyDeterministic } = require('../utils/localPlanTemplates.js');
 
 // Spread helper — deterministic-plan state fields, including the external
@@ -595,10 +596,17 @@ module.exports = async function decomposePromptV2(state) {
     // an inferred kind/content completes or corrects the flaky fields here
     // and is written back into _taskClassification for the screenOutput node.
     const _inferred = inferScreenOutput(message);
+    // A scripture ref pins kind=text lexically — the classifier has flaked
+    // screenOutputKind:'effect' on these ("show me exodus 2" → effect), and
+    // an effect kind would skip the fetch entirely.
+    const _scriptureRef = message.match(SCRIPTURE_REF_RE);
     const _kind = _inferred.kind
-      || _tc.screenOutputKind
+      || (_scriptureRef ? null : _tc.screenOutputKind)
       || 'text';
-    const _content = _tc.screenOutputContent || _inferred.content || null;
+    // Classifier-generated content ("Making a slideshow of dog photos…",
+    // "Showing exodus 2…") is a caption, not data — scripture and image decks
+    // must still fetch. (Deck case handled by _imageDeckNeedsFetch below.)
+    const _content = _scriptureRef ? null : (_tc.screenOutputContent || _inferred.content || null);
     const _action = _tc.screenOutputAction || 'show';
     const _REFERENTIAL_RE = /\b(it|that|this|them|those|the\s+(result|answer|chapter|verse|response|reply|output|list|chart|graph|data|one)|whole\s+\w+|above|previous|again)\b/i;
     // Image needs a fetch when the message carries no URL/path — the subject
@@ -625,6 +633,11 @@ module.exports = async function decomposePromptV2(state) {
     // hallucinate data the device itself owns.
     const _localGather = LOCAL_DATA_SUBJECT_RE.test(message) || DEVICE_STATE_RE.test(message);
 
+    // Scripture refs ("exodus 2", "john 3:16") — deterministic bible-api.com
+    // fetch. web_search paints whatever snippet ranked (observed: "exodus 2"
+    // → a reddit post title plastered across the screen).
+    const _scriptureMatch = _needsFetch && _kind === 'text' && _scriptureRef;
+
     const displayStep = {
       text: message,
       estimatedIntent: 'screen_display',
@@ -643,7 +656,7 @@ module.exports = async function decomposePromptV2(state) {
     };
     const fetchStep = {
       text: message,
-      estimatedIntent: _localGather ? 'command_automate' : 'web_search',
+      estimatedIntent: (_localGather || _scriptureMatch) ? 'command_automate' : 'web_search',
       confidence: 0.9,
       order: 0,
       dependsOn: [],
@@ -673,6 +686,19 @@ module.exports = async function decomposePromptV2(state) {
         }
       } catch (e) {
         logger.debug(`[Node:DecomposePromptV2] local gather classify failed: ${e.message}`);
+      }
+    }
+    // Scripture — the ref is already extracted; build the bible_verse plan
+    // directly, no classify round-trip.
+    if (_needsFetch && _scriptureMatch) {
+      const tmpl = _LOCAL_TEMPLATES.find(t => t.id === 'bible_verse');
+      const ref = _scriptureMatch[0].trim();
+      if (tmpl && !tmpl.validate({ ref }, message)) {
+        fetchStep._detCompose = {
+          steps: tmpl.build({ ref }, message).map((s, i) => ({ step: i + 1, ...s })),
+          templates: ['bible_verse'], lowRisk: true,
+        };
+        logger.info(`[Node:DecomposePromptV2] scripture gather → bible_verse det plan (ref="${ref}")`);
       }
     }
     const subPrompts = _needsFetch ? [fetchStep, displayStep] : [displayStep];

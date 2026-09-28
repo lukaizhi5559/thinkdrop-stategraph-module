@@ -23,7 +23,30 @@ const COMBINE_SYSTEM_PROMPT = `You are combining the results of a multi-step tas
 Each step's result is labeled below. Synthesise them into a single, natural response.
 Do NOT say "Step 1", "Step 2" etc. in the final answer — write as if it flows naturally.
 Be concise. If some steps retrieved data that fed into a later step, only mention the final outcome.
+A screen_display step whose result begins with "Displayed" succeeded — the content IS on the user's screen; report it as done.
 CRITICAL: If any step FAILED or returned "(no result)" or an error, you MUST report the failure accurately. NEVER claim success for a step that failed. State clearly what went wrong and what the user may need to do.`;
+
+/** Step results can be objects (web_search returns {summary, imageUrl, images};
+ *  command_automate can return {summary, file}). Interpolating them raw gives
+ *  "[object Object]" — which the combine LLM then reports as a corrupted
+ *  result. Serialize each shape into readable text first. */
+function _stringifyStepResult(result) {
+  if (result == null) return '';
+  if (typeof result === 'string') return result;
+  if (typeof result === 'object') {
+    const parts = [];
+    if (typeof result.summary === 'string' && result.summary) parts.push(result.summary);
+    if (Array.isArray(result.images) && result.images.length) {
+      parts.push(`Found ${result.images.length} image result(s); first: ${result.images[0]}`);
+    } else if (typeof result.imageUrl === 'string' && result.imageUrl) {
+      parts.push(`Image: ${result.imageUrl}`);
+    }
+    if (typeof result.file === 'string' && result.file) parts.push(`(full output at ${result.file})`);
+    if (parts.length) return parts.join('\n');
+    try { return JSON.stringify(result).slice(0, 500); } catch (_) { return String(result); }
+  }
+  return String(result);
+}
 
 module.exports = async function summarizeMultiIntent(state) {
   const logger = state.logger || console;
@@ -43,7 +66,7 @@ module.exports = async function summarizeMultiIntent(state) {
   // ── Build the labelled sections block ─────────────────────────────────────
   const sections = intentResults
     .map((r) => {
-      const result = r.result || '(no result)';
+      const result = _stringifyStepResult(r.result) || '(no result)';
       const isFailed = !r.result || r.failed || /could not|error|failed|not found/i.test(result);
       const prefix = isFailed ? '[FAILED] ' : '';
       return `${prefix}[Step ${r.step + 1} - ${r.intent}]: ${result}`;

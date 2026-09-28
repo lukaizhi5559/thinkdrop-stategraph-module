@@ -316,7 +316,20 @@ const TEMPLATES = [
     validate: () => null,
     build: (a) => [{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', _journalStatsCmd(a)] }, description: 'Summarize task activity' }],
   },
+  {
+    n: 16, id: 'bible_verse', lowRisk: true,
+    describe: 'fetch a bible passage/verse text by reference (e.g. "john 3:16", "psalm 23", "exodus 2") — args: {ref}. Prints "Reference\\nPassage text" (bible-api.com).',
+    validate: (a) => (typeof a.ref === 'string' && /^[\w .:–-]{1,40}$/i.test(a.ref.trim()) ? null : 'arg.ref missing/unsafe'),
+    build: (a) => [{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', _bibleCmd(a)] }, description: `Fetch ${a.ref}` }],
+  },
 ];
+
+/** bible_verse — bible-api.com (free, no key). Prints "Reference" then the
+ *  passage text so a screen_display step paints scripture, not JSON. */
+function _bibleCmd(a) {
+  const ref = String(a && a.ref || '').trim().slice(0, 40).replace(/[^\w .:–-]/g, '');
+  return `curl -s --max-time 8 "https://bible-api.com/${encodeURIComponent(ref)}" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{const j=JSON.parse(d);if(j.error){console.log("Could not find passage: ${ref.replace(/'/g, "")}")}else{console.log(((j.reference||"")+"\\n"+(j.text||"")).trim())}}catch(e){console.log(d.slice(0,1500))}})'`;
+}
 
 /** journal_stats gather step — buckets ~/.thinkdrop/task-journal.json entries
  *  by weekday over `days` days, printing "Mon: 4" lines. When the journal has

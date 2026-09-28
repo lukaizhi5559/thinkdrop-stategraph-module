@@ -416,10 +416,14 @@ module.exports = async function screenOutput(state) {
   }
 
   logger.info(`[Node:ScreenOutput] displayed id=${res.json?.id} kind=${payload.kind}`);
+  // Descriptive result — summarizeMultiIntent feeds this to the combine LLM;
+  // "Displayed an image "mario" on screen" reads as confirmed success where
+  // bare "On screen." made the LLM hedge that nothing was confirmed painted.
+  const subject = payload.title || payload.text || payload.image?.alt
+    || (typeof payload.three?.scene === 'string' ? payload.three.scene : null)
+    || payload.effect || payload.kind;
   return {
     ...state,
-    _directAnswer: kind === 'effect'
-      ? `## Screen\n\nOn screen — ${payload.effect}.`
-      : '## Screen\n\nOn screen.',
+    _directAnswer: `## Screen\n\nDisplayed ${payload.kind}${subject && subject !== payload.kind ? ` "${String(subject).slice(0, 80)}"` : ''} on screen.`,
   };
 };
