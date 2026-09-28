@@ -52,14 +52,21 @@ function extractStepResult(state) {
     return result;
   }
 
-  // web_search: use top result snippet
+  // web_search: use top result snippet. Image results carry their URLs so a
+  // dependent screen_display step can paint them ("pic of X" → image kind).
   if (intent === 'web_search' && Array.isArray(state.contextDocs) && state.contextDocs.length > 0) {
-    return state.contextDocs
+    const summary = state.contextDocs
       .slice(0, 2)
       .map(d => d.snippet || d.title || '')
       .filter(Boolean)
       .join(' | ')
       .slice(0, 2000);
+    const images = state.contextDocs
+      .map(d => d.imageUrl)
+      .filter(u => typeof u === 'string' && /^https?:\/\//.test(u))
+      .slice(0, 12);
+    if (images.length) return { summary, imageUrl: images[0], images };
+    return summary;
   }
 
   // command_automate: use answer or last skill stdout — buffer to file if > 2000 chars

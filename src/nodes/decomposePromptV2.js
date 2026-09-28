@@ -7,7 +7,7 @@ const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
-const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
 const { _classifyDeterministic } = require('../utils/localPlanTemplates.js');
 
 // Spread helper — deterministic-plan state fields, including the external
@@ -601,7 +601,19 @@ module.exports = async function decomposePromptV2(state) {
     const _content = _tc.screenOutputContent || _inferred.content || null;
     const _action = _tc.screenOutputAction || 'show';
     const _REFERENTIAL_RE = /\b(it|that|this|them|those|the\s+(result|answer|chapter|verse|response|reply|output|list|chart|graph|data|one)|whole\s+\w+|above|previous|again)\b/i;
+    // Image needs a fetch when the message carries no URL/path — the subject
+    // ("pic of sonic") is the search query, not the content.
+    const _imageNeedsFetch = _kind === 'image'
+      && !SCREEN_IMG_URL_RE.test(message) && !SCREEN_IMG_PATH_RE.test(message);
+    // Photo-slideshows need the image fetch even when the classifier
+    // hallucinated screenOutputContent ("Making a slideshow of dog photos
+    // on your screen.") — a caption isn't data, the slide images are.
+    const _imageDeckNeedsFetch = _kind === 'deck'
+      && /\b(?:pics?|photos?|pictures?|images?)\b/i.test(message)
+      && !_tc.screenOutputPayload;
     const _needsFetch = _lookupThenDisplay
+      || _imageNeedsFetch
+      || _imageDeckNeedsFetch
       || (_action === 'show'
         && ['text', 'chart', 'deck'].includes(_kind)
         && !_content
@@ -637,6 +649,13 @@ module.exports = async function decomposePromptV2(state) {
       dependsOn: [],
       isLongRunning: false,
       dataTemplate: null,
+      // Image fetches force the brave-image provider — carried on the queue
+      // item so advanceQueue rebuilds mediaListing on the step's tc (the
+      // resumed/fresh step classification doesn't see the screen context).
+      // Photo-slideshows gather images too — "slideshow of dog photos" is a
+      // deck whose slide images come from the same brave-image fetch.
+      ...((_kind === 'image' || (_kind === 'deck' && /\b(?:pics?|photos?|pictures?|images?)\b/i.test(message)))
+        ? { mediaListing: 'image' } : {}),
     };
     // A lone command_automate gather step would otherwise take the full
     // agent/preflight/LLM-plan pipeline (observed: "plot a bar chart of my
@@ -673,6 +692,11 @@ module.exports = async function decomposePromptV2(state) {
         ..._tc,
         screenOutputKind: _kind,
         ...(_content && !_tc.screenOutputContent ? { screenOutputContent: _content } : {}),
+        // Step 0 is the fetch — the webSearch node reads mediaListing from
+        // tc to pick the brave-image provider; the queue-item copy covers
+        // any resume path.
+        ...((_kind === 'image' || (_kind === 'deck' && /\b(?:pics?|photos?|pictures?|images?)\b/i.test(message))) && _needsFetch
+          ? { mediaListing: 'image' } : {}),
       },
       intentPlan: subPrompts,
     };

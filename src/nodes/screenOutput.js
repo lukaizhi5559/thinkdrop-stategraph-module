@@ -102,6 +102,59 @@ function _textToSlides(text) {
   }).filter(Boolean);
 }
 
+/** Code the generated scene must never contain — the sandboxed iframe gives
+ *  an opaque origin, but we still cut the obvious exfil/escape vectors. The
+ *  harness (new Function) lives outside the generated body. */
+const SCENE_FORBIDDEN_RE = /\b(?:import|require|fetch|XMLHttpRequest|WebSocket|EventSource|navigator\.sendBeacon|eval|document\.(?:write|cookie)|localStorage|sessionStorage|indexedDB|open\s*\()\b|new\s+Function|https?:\/\//i;
+
+const SCENE_GEN_SYSTEM = [
+  'You write three.js scenes for a sandboxed overlay. Output ONLY JavaScript — no markdown, no explanation.',
+  'The code you write is the BODY of `function build(THREE, ctx)`.',
+  'ctx = { scene, camera, renderer, width, height } — a renderer, camera (z=6), ambient + directional light already exist.',
+  'Add meshes/lines/points to ctx.scene with THREE. For animation return `{ tick(t) }` — tick(t) runs every frame, t = elapsed seconds.',
+  'Keep geometry under ~200k vertices. Use additive colors on transparent background. Camera is fixed at z=6; keep content within roughly x,y ∈ [-4,4].',
+  'NO imports, NO fetch/network calls, NO DOM access beyond ctx, NO eval/Function. THREE only.',
+].join('\n');
+
+/** LLM-generated three.js scene → { js, libs:['three'] } for kind:'scene'.
+ *  Returns null on any failure — callers fall back to a preset. */
+async function _generateThreeScene(message, state, logger) {
+  const llm = state.llmBackend;
+  if (!llm || typeof llm.generateAnswer !== 'function') return null;
+  try {
+    const ctrl = Promise.race([
+      llm.generateAnswer(
+        `Scene request: ${message}`,
+        { query: message, context: { systemInstructions: SCENE_GEN_SYSTEM, intent: 'screen_display' } },
+        { maxTokens: 2000, temperature: 0.4, taskType: 'codegen' }
+      ),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('scene-gen timeout')), 30000)),
+    ]);
+    let raw = String(await ctrl || '');
+    // Strip markdown fences if the model wrapped the code anyway.
+    raw = raw.replace(/^```(?:js|javascript)?\s*/im, '').replace(/```\s*$/m, '').trim();
+    // Models keep writing `import * as THREE from '...'` despite the prompt —
+    // THREE is injected by the harness, so strip import/export statements
+    // rather than reject the scene outright.
+    raw = raw.replace(/^\s*import\s[^;]*;?\s*$/gim, '')
+             .replace(/^\s*export\s+(?:default\s+)?/gim, '');
+    if (!raw || raw.length > 60000 || SCENE_FORBIDDEN_RE.test(raw)) {
+      logger.warn(`[Node:ScreenOutput] scene-gen rejected (len=${raw.length}, forbidden=${SCENE_FORBIDDEN_RE.test(raw)})`);
+      return null;
+    }
+    // Sanity: the body should touch THREE/scene — a prose answer isn't a scene.
+    if (!/\bTHREE\./.test(raw) && !/\bscene\./.test(raw)) {
+      logger.warn('[Node:ScreenOutput] scene-gen produced no THREE/scene usage — falling back to preset');
+      return null;
+    }
+    logger.info(`[Node:ScreenOutput] scene-gen ok (${raw.length} chars)`);
+    return { js: raw, libs: ['three'] };
+  } catch (e) {
+    logger.warn(`[Node:ScreenOutput] scene-gen failed: ${e.message}`);
+    return null;
+  }
+}
+
 module.exports = async function screenOutput(state) {
   const logger = state.logger || console;
   const tc = state._taskClassification || {};
@@ -216,6 +269,27 @@ module.exports = async function screenOutput(state) {
           payload.deck = { slides, transition: 'fade', slideMs: 5000, controls: true };
         }
       }
+      // Image-search gathers → slide images: a "slideshow of X pics" fetch
+      // returns images[] — one slide per image when the text made no slides.
+      {
+        const last = (state.intentResults || [])[ (state.intentResults || []).length - 1 ];
+        const r = last && last.result && typeof last.result === 'object' ? last.result : null;
+        const imgs = r && Array.isArray(r.images) ? r.images : [];
+        if (imgs.length) {
+          if (!payload.deck) {
+            payload.deck = {
+              slides: imgs.slice(0, 8).map((u, i) => ({ image: u, title: `${i + 1}` })),
+              transition: 'fade', slideMs: 5000, controls: true,
+            };
+          } else {
+            // Fill slides that lack an image, front to back.
+            let i = 0;
+            for (const s of payload.deck.slides) {
+              if (!s.image && imgs[i]) s.image = imgs[i++];
+            }
+          }
+        }
+      }
       if (!payload.deck) {
         return {
           ...state,
@@ -252,9 +326,18 @@ module.exports = async function screenOutput(state) {
       if (urlM) payload.url = urlM[0];
       else if (pathM) payload.path = pathM[0];
       else {
+        // Prior-step image search — extractStepResult carries
+        // { summary, imageUrl, images } for web_search results that have
+        // image results (brave-image).
+        const last = (state.intentResults || [])[ (state.intentResults || []).length - 1 ];
+        const r = last && last.result && typeof last.result === 'object' ? last.result : null;
+        if (r && r.imageUrl) payload.url = r.imageUrl;
+        else if (r && Array.isArray(r.images) && r.images[0]) payload.url = r.images[0];
+      }
+      if (!payload.url && !payload.path) {
         return {
           ...state,
-          _directAnswer: '## Screen\n\nNo image URL or file path found in that request. Try "show this image on the screen: <url-or-path>".',
+          _directAnswer: '## Screen\n\nNo image on hand — name a picture (e.g. "pic of the golden gate") or give me a URL/path.',
         };
       }
       if (tc.screenOutputContent) payload.caption = tc.screenOutputContent;
@@ -265,13 +348,35 @@ module.exports = async function screenOutput(state) {
       // payload.three from the classifier merges over the inferred defaults.
       if (!payload.three) {
         const m = message.match(/\b(starfield|particles?|wave|cube|knot|globe)\b/i);
-        let scene = m ? m[1].toLowerCase().replace(/s$/, '') : null;
-        if (!scene && /\b(?:spinning|rotating|wireframe|3\s?-?d)\b/i.test(message)) scene = 'cube';
-        payload.three = { scene: scene || 'starfield' };
+        const scene = m ? m[1].toLowerCase().replace(/s$/, '') : null;
+        if (scene) payload.three = { scene };
+        // No generic "3d → cube" mapping: requests that name a subject the
+        // presets can't express ("face", "heart") must reach the generative
+        // fallback below — that's the whole point of it.
+      }
+      // Generative fallback: no preset matched — an LLM writes the scene
+      // body (harness provides THREE/renderer/camera/RAF) and it runs as a
+      // 'scene' kind inside the sandboxed SceneScreen iframe. Generation
+      // failure falls back to the starfield preset so the prompt still
+      // paints something.
+      if (!payload.three) {
+        const gen = await _generateThreeScene(message, state, logger);
+        if (gen) {
+          payload.kind = 'scene';
+          payload.scene = gen;
+          payload.title = payload.title || tc.screenOutputContent || null;
+          // Interactive phrasing ("let me drag/play with…") opts into
+          // click-through lifting; ambient scenes stay non-interactive.
+          if (/\b(?:drag|click|play|interact|control|orbit|move)\b/i.test(message)) {
+            payload.blocking = true;
+          }
+        } else {
+          payload.three = { scene: 'starfield' };
+        }
       }
       const em = message.match(EMOJI_RE);
       if (em) payload.emoji = em[0];
-      if (tc.screenOutputContent) payload.three.text = tc.screenOutputContent;
+      if (tc.screenOutputContent && payload.three) payload.three.text = tc.screenOutputContent;
       break;
     }
     default: {

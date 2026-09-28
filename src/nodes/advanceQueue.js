@@ -290,6 +290,9 @@ module.exports = async function advanceQueue(state) {
         ...(nextStep.screenOutputKind    ? { isScreenOutput: true, screenOutputKind: nextStep.screenOutputKind }       : {}),
         ...(nextStep.screenOutputContent ? { screenOutputContent: nextStep.screenOutputContent } : {}),
         ...(nextStep.screenOutputAction  ? { screenOutputAction: nextStep.screenOutputAction }   : {}),
+        // Fetch-step hints ride the queue too — "pic of X" → web_search must
+        // see mediaListing:'image' so it forces the brave-image provider.
+        ...(nextStep.mediaListing        ? { mediaListing: nextStep.mediaListing }               : {}),
       },
     };
   }
