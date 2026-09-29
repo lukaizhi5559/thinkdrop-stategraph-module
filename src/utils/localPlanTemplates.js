@@ -15,7 +15,8 @@ const { parseLlmJson } = require('./parseLlmJson');
  *     followUpTarget — the model cannot invent filesystem targets
  *   - compiled commands go through a dangerous-command denylist
  *   - content args are base64-encoded into the shell command (no quoting bugs)
- *   - no rm/delete templates exist — destructive ops stay on the LLM plan
+ *   - no rm-style hard delete exists — file_delete moves to ~/.Trash so the
+ *     action is recoverable; irreversible deletes stay on the LLM plan
  *
  * Contract:
  *   const { forceClassifyLocalPlan } = require('./localPlanTemplates');
@@ -70,7 +71,7 @@ function _extractNavQuery(message) {
 // Lexical pre-gate: only fire the classify call when the message could
 // plausibly be a local op. This is a TRIGGER, not a decision — a miss just
 // means no prefire (the decompose site still calls the classifier directly).
-const _PRE_GATE_RE = /(?:^|[\s"'`(\[])(?:~?\/[^\s"'`)]+|\.\.?\/[^\s"'`)]+)|\b(?:battery|disk|uptime|volume|mute|unmute|screenshot|screen\s?shot|terminal|shell|open|launch|quit|remind\w*|alarm|cancel|schedule|process|wifi|bluetooth|hostname|memory|cpu|copy|move|rename|append|write|create|read|list|file|goto|go\s+to|visit|navigate|browse|page)\b/i;
+const _PRE_GATE_RE = /(?:^|[\s"'`(\[])(?:~?\/[^\s"'`)]+|\.\.?\/[^\s"'`)]+)|\b(?:battery|disk|uptime|volume|mute|unmute|screenshot|screen\s?shot|screen|terminal|shell|open|launch|quit|remind\w*|alarm|cancel|schedule|process|wifi|bluetooth|hostname|memory|cpu|copy|move|rename|append|write|create|read|list|file|delete|trash|remove|goto|go\s+to|visit|navigate|browse|page)\b/i;
 function looksLikeLocalOp(message) {
   return _PRE_GATE_RE.test(String(message || ''));
 }
@@ -93,7 +94,7 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
   const hasTarget = tc && typeof tc.followUpTarget === 'string' && tc.followUpTarget;
   // Templates that consume the resolved file target — only these need a
   // re-classify with full context when the prefire ran without it.
-  const _TARGET_TEMPLATES = new Set(['file_create', 'file_append', 'file_read', 'file_list', 'file_move']);
+  const _TARGET_TEMPLATES = new Set(['file_create', 'file_append', 'file_read', 'file_list', 'file_move', 'file_delete']);
   if (tc && tc._detPrefirePromise) {
     // Bound the wait — a real template hit resolves in ~2-5s. A stalled
     // provider can hold the classify call for 60s+; awaiting it serializes a
@@ -204,7 +205,7 @@ const TEMPLATES = [
   },
   {
     n: 3, id: 'file_read', lowRisk: true,
-    describe: 'read/show the contents of a file — args: {path}',
+    describe: 'read a file or answer a question about a file\'s contents ("read X", "what does this file say", "what\'s this file about", "summarize this file") — args: {path}',
     validate: (a, m, t) => _validatePaths(a, ['path'], m, t),
     build: (a) => [{ skill: 'fs.read', args: { action: 'read', path: a.path }, description: `Read ${a.path}` }],
   },
@@ -352,8 +353,13 @@ const TEMPLATES = [
     },
     build: (a, m) => {
       const name = _canonicalService(a.service);
+      // No stepType — a forced 'on-page-action' makes browser.agent skip
+      // deep-link resolution AND unset URL-first (browser.agent.cjs run()),
+      // which breaks compose/send tasks (e.g. gmail #inbox?compose=new).
+      // _isOnPageAction/classifyTaskIntent already distinguish genuine
+      // on-page verbs (reply, like, add to cart) from navigation intents.
       return [
-        { skill: 'browser.agent', stepType: 'on-page-action',
+        { skill: 'browser.agent',
           args: { action: 'run', agentId: `${name}.agent`, task: m },
           description: `${name}: ${String(m).slice(0, 60)}` },
         { skill: 'synthesize', stepType: 'verify',
@@ -384,7 +390,7 @@ const TEMPLATES = [
     build: (a, m) => [
       // timeoutMs opts out of the 10s deterministic cap — focus wait + copy
       // retries legitimately run to ~15s on a slow-loading page.
-      { skill: 'app.agent', args: { action: 'scan_page', timeoutMs: 25000 }, description: 'Read the open browser page' },
+      { skill: 'app.agent', args: { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 }, description: 'Read the open browser page' },
       { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's question using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
     ],
   },
@@ -428,10 +434,33 @@ const TEMPLATES = [
         : SITE_SEARCH_URLS[siteKey](String(a.query || '').trim() || _extractNavQuery(m));
       return [
         { skill: 'app.agent', args: { action: 'navigate_url', url, timeoutMs: 15000 }, description: `Open ${url.slice(0, 70)}` },
-        { skill: 'app.agent', args: { action: 'scan_page', timeoutMs: 25000 }, description: 'Read the loaded page' },
+        { skill: 'app.agent', args: { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 }, description: 'Read the loaded page' },
         { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's request using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
       ];
     },
+  },
+  {
+    // Recoverable delete — mv to ~/.Trash, never rm. protectedPaths: [] opts
+    // the step out of the attachment sandbox (executeCommand only injects
+    // protectedPaths when the arg is absent): the attached file IS the user's
+    // explicit delete target, so guarding it would deny the requested op and
+    // mis-route to edit.agent. The path is still verbatim-validated.
+    n: 20, id: 'file_delete', lowRisk: false,
+    describe: 'delete/trash a file or folder by moving it to ~/.Trash (recoverable) — args: {path}. Pick this for delete/remove/trash of a named or attached file.',
+    validate: (a, m, t) => _validatePaths(a, ['path'], m, t),
+    build: (a) => {
+      const base = String(a.path).replace(/\/+$/, '').split('/').pop().replace(/["`$\\;|&<>(){}]/g, '');
+      return [{ skill: 'shell.run', args: {
+        cmd: 'bash', argv: ['-c', `mv ${_q(a.path)} "$HOME/.Trash/${base}-$(date +%Y%m%d-%H%M%S)"`],
+        protectedPaths: [],
+      }, description: `Move ${a.path} to Trash` }];
+    },
+  },
+  {
+    n: 21, id: 'screen_read', lowRisk: true,
+    describe: 'read or describe what is currently on the user\'s screen — visible text via OCR ("what\'s on my screen", "what am I looking at", "read my screen") — args: {}',
+    validate: () => null,
+    build: () => [{ skill: 'screen.capture', args: { timeoutMs: 30000 }, description: 'Read the screen' }],
   },
 ];
 
@@ -522,18 +551,23 @@ ${TEMPLATES.map(t => `${t.n}. ${t.id}: ${t.describe}`).join('\n')}
 
 RULES:
 - reporting the result ("tell me", "show me", "what it says") is part of the op — NOT a second goal
-- path args must be copied VERBATIM from the message (or the resolved target below)
+- path args must be copied VERBATIM from the message (or the resolved target below) — including paths inside [File: ...] attachment tags
 - url must be copied verbatim from the message
 - shell_cmd cmd must be the exact command the user quoted
+- file_delete MOVES the file to ~/.Trash (recoverable) — it is the right pick for "delete/remove/trash this file"
 - never invent paths, URLs, commands, or content
 
 EXAMPLES:
 "read /tmp/a.txt and tell me what it says" → {"n": 3, "args": {"path": "/tmp/a.txt"}}
+"[File: /tmp/notes.txt] what's this about" → {"n": 3, "args": {"path": "/tmp/notes.txt"}}
 "append 'milk' to ~/todo.txt" → {"n": 2, "args": {"path": "~/todo.txt", "content": "milk"}}
 "what's my battery percentage" → {"n": 6, "args": {"kind": "battery"}}
 "open https://a.com" → {"n": 10, "args": {"url": "https://a.com"}}
 "post hello to twitter" → {"n": 14, "args": {"service": "twitter"}}
 "send a slack message to #eng" → {"n": 14, "args": {"service": "slack"}}
+"send an email to bob about the meeting" → {"n": 14, "args": {"service": "gmail"}}
+"delete the file /tmp/old.txt" → {"n": 20, "args": {"path": "/tmp/old.txt"}}
+"what's on my screen" → {"n": 21, "args": {}}
 "check the weather" → {"n": 0, "args": {}}
 "what's the cheapest item on this page" → {"n": 17, "args": {}} (when a page is open)
 "goto amazon and search for baby clothes" → {"n": 19, "args": {"site": "amazon", "query": "baby clothes"}}
@@ -620,4 +654,4 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
   }
 }
 
-module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE };
+module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS };

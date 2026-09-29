@@ -251,6 +251,36 @@ describe('webSearch — video listing query hint + limit', () => {
     assert(!adapter.calls[1].args.provider, 'retry must not force a provider');
   });
 
+  it('visual follow-up keeps the resolved followUpTarget in the query', async () => {
+    // Regression: "show me some pics" after a sourdough search used to search
+    // the literal message text, dropping the resolved topic entirely.
+    const adapter = _mkAdapter();
+    await webSearch({
+      message: 'show me some pics',
+      mcpAdapter: adapter,
+      logger: _noopLogger,
+      _mediaListing: 'image',
+      _taskClassification: { isFollowUp: true, followUpTarget: 'sourdough bread', mediaListing: 'image' },
+    });
+    const q = adapter.calls[0].args.query;
+    assert(/sourdough bread/i.test(q), `query should contain resolved topic — got "${q}"`);
+    assert(/pics/i.test(q), `query should keep visual phrasing — got "${q}"`);
+    assertEq(adapter.calls[0].args.provider, 'brave-image');
+  });
+
+  it('visual follow-up does not duplicate a topic already in the message', async () => {
+    const adapter = _mkAdapter();
+    await webSearch({
+      message: 'show me sourdough bread pics',
+      mcpAdapter: adapter,
+      logger: _noopLogger,
+      _mediaListing: 'image',
+      _taskClassification: { isFollowUp: true, followUpTarget: 'sourdough bread', mediaListing: 'image' },
+    });
+    const q = adapter.calls[0].args.query;
+    assertEq((q.match(/sourdough bread/gi) || []).length, 1, `topic should appear once — got "${q}"`);
+  });
+
   it('non-media queries keep limit=3, no provider, no keyword injection', async () => {
     const adapter = _mkAdapter();
     await webSearch({

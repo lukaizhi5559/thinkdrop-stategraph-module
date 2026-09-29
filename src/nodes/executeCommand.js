@@ -1623,15 +1623,24 @@ module.exports = async function executeCommand(state) {
       const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
       answer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
     } else if (state._deterministicPlan) {
-      // Deterministic fast-path — no synthesize step runs, so the step stdout
-      // IS the answer (battery %, file contents, ls output). Fall back to the
-      // step description for silent success steps (mv, mkdir, open).
-      const _okSteps = skillResults.filter(r => r && r.ok !== false && r.skill !== 'synthesize');
-      const _outs = _okSteps.filter(r => (r.stdout || '').trim()).map(r => r.stdout.trim());
-      const _lastOk = _okSteps[_okSteps.length - 1];
-      answer = _outs.length
-        ? _outs.join('\n\n')
-        : (_lastOk?.description ? `Done — ${_lastOk.description}` : 'Done.');
+      // Deterministic fast-path — a synthesize step may be appended at plan
+      // time (_ensureSynthesizeStep); its output IS the answer when present.
+      // Otherwise the step stdout is the answer (battery %, file contents, ls
+      // output), falling back to the description for silent steps (mv, open).
+      const _synth = [...skillResults].reverse().find(r =>
+        r && r.skill === 'synthesize' && r.ok !== false
+        && ((typeof r.result === 'string' && r.result.trim()) || (r.stdout || '').trim())
+      );
+      if (_synth) {
+        answer = (typeof _synth.result === 'string' && _synth.result.trim() ? _synth.result : _synth.stdout).trim();
+      } else {
+        const _okSteps = skillResults.filter(r => r && r.ok !== false && r.skill !== 'synthesize');
+        const _outs = _okSteps.filter(r => (r.stdout || '').trim()).map(r => r.stdout.trim());
+        const _lastOk = _okSteps[_okSteps.length - 1];
+        answer = _outs.length
+          ? _outs.join('\n\n')
+          : (_lastOk?.description ? `Done — ${_lastOk.description}` : 'Done.');
+      }
     } else {
       answer = failedCount > 0
         ? `Completed ${completedCount}/${skillPlan.length} steps (${failedCount} failed).`
@@ -4595,6 +4604,27 @@ Please try again or search with different terms.`;
     // Strip [DATA FROM PRIOR STEP] and [CONTENT OF ...] injection blocks
     _task = _task.replace(/\[DATA FROM PRIOR STEP\][^[]*?(?=\[|$)/gs, '').trim();
     _task = _task.replace(/\[CONTENT OF [^\]]*\][^[]*?(?=\[|$)/gs, '').trim();
+    // Follow-up messaging safety net — when the plan (deterministic service_task
+    // template, semantic cache, or LLM) produced a task that still references
+    // prior-turn content by referent ("this info", "that", "the results") without
+    // inlining it, append the resolved prior content so the agent doesn't invent
+    // a placeholder body (observed: "Here is the information you requested."
+    // instead of the actual prior answer).
+    const _tc2 = state._taskClassification || {};
+    const _isCommAgent = /gmail|mail|email|slack|imessage|sms|text|whatsapp|teams|discord|message/i.test(String(resolvedArgs.agentId || ''));
+    const _hasQuotedBody = /"[^"]{2,}"|'[^']{2,}'/.test(_task);
+    const _hasReferent = /\b(this|that|these|those|the above|the result|the answer)\b/i.test(_task) || !!_tc2.followUpTarget;
+    if (_priorSynth && !_hasQuotedBody && _hasReferent && !_task.includes('EMAIL BODY') &&
+        (_tc2.taskType === 'messaging' || (_tc2.isFollowUp && _isCommAgent))) {
+      const _body = String(_priorSynth)
+        .replace(/={2,}\s*Source:[^\n]*\n?[\s\S]*?(?=\n\s*={2,}\s*Source:|$)/gi, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+      if (_body) {
+        _task = `${_task}\n\nEMAIL BODY — use this content verbatim as the message body (it is what the user means by the prior-turn reference):\n---\n${_body.slice(0, 2500)}\n---`;
+        logger.info(`[Node:ExecuteCommand] browser.agent: injected prior content into task (${_body.length} chars, followUp=${!!_tc2.isFollowUp})`);
+      }
+    }
     if (_task !== resolvedArgs.task) {
       resolvedArgs = { ...resolvedArgs, task: _task };
     }

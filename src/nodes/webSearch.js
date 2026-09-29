@@ -55,9 +55,14 @@ module.exports = async function webSearch(state) {
       // The web-search service has its own intent classifier that detects images, art, etc.
       const visualIntentPattern = /\b(show|see|look|pics?|pictures?|images?|photos?|art|artwork|drawings?|visual|gallery)\b/i;
       if (visualIntentPattern.test(message)) {
-        // Use the full original message (cleaned) so web-search can properly classify
-        query = message.replace(/^(search for|search|find|look up|google)\s+/i, '').trim();
-        logger.info(`[Node:WebSearch] isFollowUp with visual intent — using original message: "${query}"`);
+        // Keep the visual phrasing (the service's classifier keys off it) but
+        // prepend the resolved topic — the raw message ("show me some pics")
+        // alone is context-free and returns random stock results.
+        const cleanedMsg = message.replace(/^(search for|search|find|look up|google)\s+/i, '').trim();
+        query = cleanedMsg.toLowerCase().includes(String(tc.followUpTarget).toLowerCase())
+          ? cleanedMsg
+          : `${tc.followUpTarget} ${cleanedMsg}`;
+        logger.info(`[Node:WebSearch] isFollowUp with visual intent — query resolved to topic: "${query}"`);
       } else {
         query = tc.followUpTarget;
         logger.info(`[Node:WebSearch] isFollowUp — using followUpTarget as query: "${query}"`);

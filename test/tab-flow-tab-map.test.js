@@ -305,6 +305,203 @@ describe('_mergeConversationHistory (chronological ordering)', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  5. Merged sub-plan steps — type satisfies click-field, click satisfies send
+// ══════════════════════════════════════════════════════════════════════════════
+describe('_subPlanStepMatchesFlowStep (merged sub-plan semantics)', () => {
+
+  it('type sub-step satisfies a "click <field>" flow step (click folded into type)', () => {
+    const ok = _subPlanStepMatchesFlowStep(
+      { action: 'type', target: 'To recipients', value: 'bob@example.com' },
+      { tier: 4, action: "click the 'To recipients' field" }
+    );
+    assert(ok, 'typing focuses the field — merged click+type should match');
+  });
+
+  it('click Send satisfies a "press Ctrl+Enter to send" flow step', () => {
+    const ok = _subPlanStepMatchesFlowStep(
+      { action: 'click', target: 'Send' },
+      { tier: 4, action: "press 'Ctrl+Enter' to send the email" }
+    );
+    assert(ok, 'click send is a valid submit path for a press-send flow step');
+  });
+});
+
+describe('_resyncFlowIndex (submit-by-any-means + merged click-field)', () => {
+
+  const gmailFlow = [
+    { tier: 4, action: "click the 'To recipients' field" },
+    { tier: 4, action: "fill 'Subject' with 'Sourdough'" },
+    { tier: 4, action: "click 'Send'" },
+    { tier: 0, action: 'done' },
+  ];
+
+  it('advances a click-field step when the named field was filled', () => {
+    const idx = _resyncFlowIndex(gmailFlow, 0,
+      [{ label: 'To recipients', value: 'bob@x.com' }], [], _noopLogger);
+    assertEq(idx, 1);
+  });
+
+  it('"click Send" satisfied by a Ctrl+Enter shortcut in history', () => {
+    const idx = _resyncFlowIndex(gmailFlow, 2, [],
+      ["Shortcut 'Control+Enter' → ok"], _noopLogger);
+    assertEq(idx, 4, 'modifier+Enter is a submit accelerator — satisfies click Send');
+  });
+
+  it('"press Ctrl+Enter to send" satisfied by a click Send in history', () => {
+    const flow = [
+      { tier: 4, action: "press 'Ctrl+Enter' to send the email" },
+      { tier: 0, action: 'done' },
+    ];
+    const idx = _resyncFlowIndex(flow, 0, [],
+      ["click 'Send' → page changed"], _noopLogger);
+    assertEq(idx, 2, 'quoted key-combo target must not block the submit-by-any-means check');
+  });
+
+  it('does not advance submit steps on unrelated history', () => {
+    const idx = _resyncFlowIndex(gmailFlow, 2, [],
+      ["click 'Archive' → ok"], _noopLogger);
+    assertEq(idx, 2);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  6. _selectPriorSynthesis — plain-prose fallback (follow-up email body)
+// ══════════════════════════════════════════════════════════════════════════════
+describe('_selectPriorSynthesis (plain assistant-prose fallback)', () => {
+
+  let _selectPriorSynthesis;
+  try {
+    _selectPriorSynthesis = require('../src/nodes/planSkillsV2.js')._selectPriorSynthesis;
+  } catch (e) {
+    console.log(`  [skip] planSkillsV2 not loadable: ${e.message}`);
+  }
+
+  if (_selectPriorSynthesis) {
+    it('falls back to recent assistant prose when no "Step outputs:" marker exists', () => {
+      const hist = [
+        { role: 'user', content: 'what the best way to make sourdough bread?' },
+        { role: 'assistant', content: 'To make great sourdough bread you need a mature starter, strong bread flour, and an autolyse rest. Mix 500g flour with 350g water, fold every 30 minutes for 4 hours, then shape and cold-proof overnight before baking at 450°F in a Dutch oven.' },
+      ];
+      const out = _selectPriorSynthesis(hist);
+      assert(out && out.includes('sourdough'), 'expected the sourdough answer to be selected');
+    });
+
+    it('prefers "Step outputs:" syntheses over plain prose', () => {
+      const hist = [
+        { role: 'assistant', content: 'Some earlier plain answer about the weather being nice today for a walk.' },
+        { role: 'user', content: 'find stores' },
+        { role: 'assistant', content: 'Step outputs:\n[synthesize]:\nTarget at 123 Main St, Walmart at 456 Oak Ave\n' },
+      ];
+      const out = _selectPriorSynthesis(hist);
+      assert(out && out.includes('Target at 123 Main St'), `expected structured synthesis, got: ${out}`);
+    });
+
+    it('skips send-confirmation messages', () => {
+      const hist = [
+        { role: 'user', content: 'send that to bob@x.com' },
+        { role: 'assistant', content: 'Confirmed sent — the email was sent successfully to bob@x.com with all of the requested content included.' },
+      ];
+      const out = _selectPriorSynthesis(hist);
+      assert(!out || !/confirmed sent/i.test(out), `should not return the confirmation itself, got: ${out}`);
+    });
+
+    it('skips acknowledgements and short replies', () => {
+      const hist = [
+        { role: 'assistant', content: 'Got it! I understand what you need.' },
+        { role: 'assistant', content: 'Here is the real content: the quarterly revenue grew 12% year over year to $4.2M, driven mostly by enterprise contracts.' },
+      ];
+      const out = _selectPriorSynthesis(hist);
+      assert(out && out.includes('quarterly revenue'), `expected substantive prose, got: ${out}`);
+    });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  7. Send-API detection — Gmail nested endpoints + correlated fallback
+// ══════════════════════════════════════════════════════════════════════════════
+describe('_SEND_ENDPOINT_RE / _detectSuccessfulSend', () => {
+
+  const { _SEND_ENDPOINT_RE, _SEND_EXCLUDE_RE, _detectSuccessfulSend, _markSubmitAttempt, _clearSubmitMarker } = browserAgent;
+  const browserEngine = require('../../mcp-services/command-service/src/skills/browser-engine.cjs');
+  const _origGetNetLog = browserEngine.getNetLog;
+
+  it('matches Gmail nested send path /sync/u/0/i/s', () => {
+    assert(_SEND_ENDPOINT_RE.test('https://mail.google.com/sync/u/0/i/s?rt=c'));
+    assert(_SEND_ENDPOINT_RE.test('/sync/u/0/i/s'));
+    assert(_SEND_ENDPOINT_RE.test('/sync/u/12/i/s'));
+  });
+
+  it('does NOT match the draft autosave endpoint /sync/u/0/i/d', () => {
+    assert(!_SEND_ENDPOINT_RE.test('https://mail.google.com/sync/u/0/i/d?rt=c'));
+  });
+
+  it('_SEND_EXCLUDE_RE excludes draft/label/read mutations', () => {
+    assert(_SEND_EXCLUDE_RE.test('/sync/u/0/i/d'));
+    assert(_SEND_EXCLUDE_RE.test('https://mail.google.com/sync/u/0/labels'));
+    assert(_SEND_EXCLUDE_RE.test('/sync/u/0/read'));
+    assert(!_SEND_EXCLUDE_RE.test('/sync/u/0/i/s'));
+  });
+
+  it('detects send via named endpoint without a submit marker', () => {
+    browserEngine.getNetLog = () => [
+      { method: 'POST', status: 200, url: 'https://mail.google.com/sync/u/0/i/s?rt=c', ts: Date.now() },
+    ];
+    try {
+      assert(_detectSuccessfulSend('sess-x'), 'named endpoint → send detected');
+    } finally { browserEngine.getNetLog = _origGetNetLog; }
+  });
+
+  it('detects send via submit-correlated 2xx POST to the same host', () => {
+    _markSubmitAttempt('sess-y', 'mail.google.com');
+    browserEngine.getNetLog = () => [
+      { method: 'POST', status: 200, url: 'https://mail.google.com/some/renamed/rpc', ts: Date.now() },
+    ];
+    try {
+      assert(_detectSuccessfulSend('sess-y'), 'correlated POST after submit marker → send detected');
+    } finally {
+      browserEngine.getNetLog = _origGetNetLog;
+      _clearSubmitMarker('sess-y');
+    }
+  });
+
+  it('does NOT correlate draft autosaves to the submit marker', () => {
+    _markSubmitAttempt('sess-z', 'mail.google.com');
+    browserEngine.getNetLog = () => [
+      { method: 'POST', status: 200, url: 'https://mail.google.com/sync/u/0/i/d', ts: Date.now() },
+    ];
+    try {
+      assert(!_detectSuccessfulSend('sess-z'), 'draft save must not count as a send');
+    } finally {
+      browserEngine.getNetLog = _origGetNetLog;
+      _clearSubmitMarker('sess-z');
+    }
+  });
+
+  it('does NOT correlate POSTs to a different host', () => {
+    _markSubmitAttempt('sess-w', 'mail.google.com');
+    browserEngine.getNetLog = () => [
+      { method: 'POST', status: 200, url: 'https://analytics.example.com/beacon', ts: Date.now() },
+    ];
+    try {
+      assert(!_detectSuccessfulSend('sess-w'), 'cross-host POST must not count');
+    } finally {
+      browserEngine.getNetLog = _origGetNetLog;
+      _clearSubmitMarker('sess-w');
+    }
+  });
+
+  it('ignores non-2xx and non-mutation entries', () => {
+    browserEngine.getNetLog = () => [
+      { method: 'GET', status: 200, url: 'https://mail.google.com/sync/u/0/i/s', ts: Date.now() },
+      { method: 'POST', status: 403, url: 'https://mail.google.com/sync/u/0/i/s', ts: Date.now() },
+    ];
+    try {
+      assert(!_detectSuccessfulSend('sess-v'), 'GET/403 must not count');
+    } finally { browserEngine.getNetLog = _origGetNetLog; }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  Summary
 // ══════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(70)}`);

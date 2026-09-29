@@ -632,6 +632,39 @@ describe('_captureStreamingResponse — Stop button stability confirmation', () 
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
+// 10. Send-API detection — the duplicate-send root cause
+// ══════════════════════════════════════════════════════════════════════════════
+describe('_SEND_ENDPOINT_RE — Gmail nested send endpoint (duplicate-send fix)', () => {
+
+  // Root cause of the observed double-send: Gmail's send RPC is
+  //   POST https://mail.google.com/sync/u/0/i/s
+  // The old regex `/sync/[^/]*/i/s` only spanned ONE path segment after /sync/
+  // and could not cross /u/0/ — so the deterministic send-guard never fired,
+  // the flow-index stall re-composed, and the email was sent twice.
+
+  const { _SEND_ENDPOINT_RE, _SEND_EXCLUDE_RE } =
+    require('../../mcp-services/command-service/src/skills/browser.agent.cjs');
+
+  it('matches the real Gmail send RPC /sync/u/0/i/s', () => {
+    expect(_SEND_ENDPOINT_RE.test('https://mail.google.com/sync/u/0/i/s?rt=c')).toBe(true);
+  });
+
+  it('matches multi-user Gmail accounts (/sync/u/N/i/s)', () => {
+    expect(_SEND_ENDPOINT_RE.test('/sync/u/1/i/s')).toBe(true);
+    expect(_SEND_ENDPOINT_RE.test('/sync/u/12/i/s')).toBe(true);
+  });
+
+  it('does NOT match the draft autosave endpoint /sync/u/0/i/d', () => {
+    expect(_SEND_ENDPOINT_RE.test('https://mail.google.com/sync/u/0/i/d?rt=c')).toBe(false);
+  });
+
+  it('draft autosave is caught by the exclusion regex (correlated-fallback safety)', () => {
+    expect(_SEND_EXCLUDE_RE.test('https://mail.google.com/sync/u/0/i/d')).toBe(true);
+    expect(_SEND_EXCLUDE_RE.test('https://mail.google.com/sync/u/0/i/s')).toBe(false);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
 // Summary
 // ══════════════════════════════════════════════════════════════════════════════
 console.log(`\n${'═'.repeat(72)}`);

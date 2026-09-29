@@ -1,12 +1,12 @@
 'use strict';
 
 // Regression: lintFileEditPlan drops a trailing confirm-synthesize, but
-// _ensureSynthesizeForAppFlow used to re-push one because edit.agent wasn't in
+// _ensureSynthesizeStep used to re-push one because edit.agent wasn't in
 // _SYNTHESIZE_EXEMPT_SKILLS — the saved plan kept the confabulating step and the
 // run ended with a chat summary instead of the draft/apply UX.
 
 const { lintFileEditPlan, getProtectedPaths } = require('../src/utils/planHelpers');
-const { _ensureSynthesizeForAppFlow } = require('../src/nodes/planSkillsV2');
+const { _ensureSynthesizeStep } = require('../src/nodes/planSkillsV2');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -36,13 +36,30 @@ check('lint rewrote saveToFile→edit.agent', linted[1]?.skill === 'edit.agent' 
 check('lint dropped confirm step', linted.length === 2 && rewrites.some(r => r.kind === 'drop-confirm-step'));
 
 // The post-lint pipeline step that used to resurrect the confirm step.
-const final = _ensureSynthesizeForAppFlow(linted, 'fix the spelling/grammar mistake in this file');
+const final = _ensureSynthesizeStep(linted, 'fix the spelling/grammar mistake in this file');
 check('ensure does NOT re-add synthesize after edit.agent', final.length === 2 && final.every(s => s.skill !== 'synthesize'),
   JSON.stringify(final.map(s => s.skill)));
 
 // Sanity: a plan ending on a non-exempt skill still gets a synthesize.
-const other = _ensureSynthesizeForAppFlow([{ skill: 'shell.run', args: { cmd: 'ls' }, description: 'list' }], 'list the files');
+const other = _ensureSynthesizeStep([{ skill: 'shell.run', args: { cmd: 'ls' }, description: 'list' }], 'list the files');
 check('ensure still adds synthesize for non-exempt endings', other.length === 2 && other[1].skill === 'synthesize');
+
+// Flavor selection — read/question prompts get the "answer" prompt, mutations
+// get "confirm/summarize", and the step is idempotent + exempt-aware.
+const _readPlan = _ensureSynthesizeStep([{ skill: 'fs.read', args: { action: 'read', path: '/tmp/x' } }], "[File: /tmp/x]\n\nwhat's this about");
+check('file question gets answer-flavor synthesize', _readPlan.length === 2 && /Answer the user's original question/.test(_readPlan[1].args.prompt), _readPlan[1]?.args?.prompt);
+
+const _delPlan = _ensureSynthesizeStep([{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', 'mv x ~/.Trash/'] } }], 'delete this file /tmp/x');
+check('delete gets summarize-flavor synthesize', _delPlan.length === 2 && /Summarize what was done/.test(_delPlan[1].args.prompt), _delPlan[1]?.args?.prompt);
+
+const _screenPlan = _ensureSynthesizeStep([{ skill: 'screen.capture', args: {} }], "what's on my screen");
+check('screen read gets answer-flavor synthesize', _screenPlan.length === 2 && /Answer the user's original question/.test(_screenPlan[1].args.prompt));
+
+const _dupPlan = _ensureSynthesizeStep([{ skill: 'shell.run', args: { cmd: 'ls' } }, { skill: 'synthesize', args: { prompt: 'x' } }], 'do a thing');
+check('existing synthesize is not duplicated', _dupPlan.length === 2 && _dupPlan.filter(s => s.skill === 'synthesize').length === 1);
+
+const _schedPlan = _ensureSynthesizeStep([{ skill: 'schedule', args: { time: '18:00', label: 'x' } }], 'remind me at 6pm');
+check('schedule ending stays exempt', _schedPlan.length === 1);
 
 // getProtectedPaths — attachment-tag extraction for the shell.run sandbox.
 const attachDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lint-prot-'));

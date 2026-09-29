@@ -19,6 +19,7 @@ const fs   = require('fs');
 const os   = require('os');
 
 const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan } = require('../utils/planHelpers');
+const { SITE_SEARCH_URLS } = require('../utils/localPlanTemplates');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
@@ -69,9 +70,24 @@ function _selectPriorSynthesis(conversationHistory = []) {
     if (body.length >= 30) return body;
   }
   const last = candidates[candidates.length - 1];
-  if (!last) return null;
-  const body = extract(last);
-  return body.length ? body : null;
+  if (last) {
+    const body = extract(last);
+    if (body.length) return body;
+  }
+  // Fallback: no 'Step outputs:'-marked synthesis (e.g. the prior turn answered
+  // directly — a research/chat reply stored as plain prose). Use the most recent
+  // substantive assistant message so referents like "email this info" still
+  // resolve to real content instead of a generic placeholder.
+  const ACK_RE = /^(got\s+it\b|i'?ll\b|i\s+understand\b|based\s+on\b|understood\b|sure[,!\s]|of\s+course[,!\s]|happy\s+to\b|done\b|ok\b|okay\b|yes\b|no\b)/i;
+  for (let i = conversationHistory.length - 1; i >= 0; i--) {
+    const m = conversationHistory[i];
+    if (m.role !== 'assistant' || m.sender === 'system' || m.role === 'system') continue;
+    const c = _sanitizeSynthesisBody(String(m.content || '').trim());
+    if (c.length < 30) continue;
+    if (CONFIRM_RE.test(c) || ACK_RE.test(c)) continue;
+    return c.slice(0, 2000);
+  }
+  return null;
 }
 
 // ── Hard guard: action plans must always end with synthesize ─────────────────
@@ -92,7 +108,7 @@ const _SYNTHESIZE_EXEMPT_SKILLS = new Set([
   'edit.agent',
 ]);
 
-function _ensureSynthesizeForAppFlow(skillPlan, userMessage) {
+function _ensureSynthesizeStep(skillPlan, userMessage) {
   if (!Array.isArray(skillPlan) || skillPlan.length === 0) return skillPlan;
   if (skillPlan.some(s => s.skill === 'synthesize')) return skillPlan;
 
@@ -102,21 +118,118 @@ function _ensureSynthesizeForAppFlow(skillPlan, userMessage) {
   const msgLower = (userMessage || '').toLowerCase();
   const _EDIT_VERBS = /\b(add|edit|modify|write|create|update|delete|remove|insert|replace|rename|move|fix|implement|generate|build|scaffold|extract|convert|translate|format|lint|debug|patch|apply)\b/;
   const _READ_VERBS = /\b(examine|read|summarize|explain|tell me about|what does|what is|describe|show me|review|analyze|inspect|investigate|find|locate|search|list|get|fetch|query|check|verify|confirm|report|present|ask)\b/;
-  const isAppAnswer = lastStep.skill === 'app.agent' &&
-    (lastStep.args?.action === 'run_app_flow' || lastStep.args?.action === 'run_agent');
+  // Read-typed endings produce content to answer with — "what's this about"
+  // needs the answer flavor, not "Done — ran the step". Covers the read
+  // pseudo-skills and read actions on the agent skills.
+  const _READ_ENDING_SKILLS = new Set(['fs.read', 'doc.read', 'screen.capture', 'image.analyze', 'web.agent', 'web.crawl']);
+  const _READ_ENDING_ACTIONS = {
+    'app.agent':     new Set(['run_app_flow', 'run_agent', 'scan_page', 'get_recent_ocr', 'read_screen']),
+    'browser.act':   new Set(['getPageText', 'waitForStableText']),
+    'browser.agent': new Set(['scan_page']),
+  };
+  const _QUESTION_RE = /^(?:what|what's|whats|who|whom|whose|where|when|why|how|which|is|are|was|were|do|does|did|can|could|tell me|show me|describe|summarize|explain)\b/i;
+  const lastAction = lastStep.args?.action;
+  const isReadEnding = _READ_ENDING_SKILLS.has(lastStep.skill)
+    || !!(_READ_ENDING_ACTIONS[lastStep.skill] && _READ_ENDING_ACTIONS[lastStep.skill].has(lastAction));
+  const isQuestion = _QUESTION_RE.test((userMessage || '').trim()) || /\?\s*$/.test(userMessage || '');
   const isEdit = _EDIT_VERBS.test(msgLower) && !_READ_VERBS.test(msgLower);
+  const wantsAnswer = !isEdit && (isReadEnding || isQuestion || _READ_VERBS.test(msgLower));
 
-  const synthesizePrompt = isAppAnswer && !isEdit
-    ? `Answer the user's original question based on the app agent's result. Original question: ${userMessage}`
+  const synthesizePrompt = wantsAnswer
+    ? `Answer the user's original question using the step output above. Original question: ${userMessage}`
     : isEdit
       ? `Summarize what was done in response to: ${userMessage}`
       : `Confirm what was done in response to: ${userMessage}`;
 
   skillPlan.push({
     skill: 'synthesize',
-    description: isAppAnswer && !isEdit ? 'Present the answer to the user' : 'Confirm the result to the user',
+    description: wantsAnswer ? 'Present the answer to the user' : 'Confirm the result to the user',
     args: { prompt: synthesizePrompt },
   });
+  return skillPlan;
+}
+
+// ── Preflight deep-link injection ────────────────────────────────────────────
+// The preflight deep-link is resolved per agentId using the full task context.
+// It's always more accurate than what the LLM guessed. The deepLinkMap is keyed
+// by agentId, so:
+//   - Different agents → different URLs (fixes cross-agent URL contamination)
+//   - Same agent in multiple steps → same URL → browser.agent skips re-navigation
+// Exception: template variables ({{bestUrl}}, {{PREV_OUTPUT}}) are preserved —
+// they come from prior step output, not the LLM's guess.
+// Used by BOTH the LLM plan path and the deterministic-template path (det plans
+// previously bypassed this entirely — the gmail compose URL resolved in
+// preflight never reached browser.agent run's args.url → urlFirstNav=false).
+function _injectPreflightDeepLinks(skillPlan, state, logger) {
+  if (!Array.isArray(skillPlan)) return skillPlan;
+  const _log = logger || console;
+  const deepLinkMap = new Map();
+  const pfAgents = state?.preflightResult?.agents || [];
+  for (const a of pfAgents) {
+    if (a?.agentId && a?.deepLinkUrl) {
+      deepLinkMap.set(a.agentId.toLowerCase(), { url: a.deepLinkUrl, source: a.deepLinkSource || null });
+    }
+  }
+  if (deepLinkMap.size === 0) return skillPlan;
+
+  // Track which agents have already received a URL — only inject for the FIRST
+  // same-agent step. Subsequent steps must NOT get a creation deep-link URL
+  // because it triggers urlFirstNav=true → classifyDeepLinkType=creation →
+  // disables tiers 2,3,4 (Meta+F, Shortcuts, Tab-Map) needed for content entry.
+  const _urlInjectedAgents = new Set();
+  for (const step of skillPlan) {
+    if (step.skill === 'browser.agent' && step.args?.action === 'run' && step.args?.agentId) {
+      const dl = deepLinkMap.get(step.args.agentId.toLowerCase());
+      if (dl?.url) {
+        // Don't override template variables — they come from prior step output
+        const _isTemplateVar = step.args.url && /\{\{[^}]+\}\}/.test(step.args.url);
+        if (_isTemplateVar) {
+          _log.info(`[Node:PlanSkillsV2] Preserving template URL for ${step.args.agentId}: ${step.args.url}`);
+        } else if (_urlInjectedAgents.has(step.args.agentId.toLowerCase())) {
+          // Second+ step for same agent — strip URL so urlFirstNav=false and
+          // all tiers (Tab-Map, Shortcuts) are available for content entry
+          if (step.args.url) {
+            const _oldUrl = step.args.url;
+            delete step.args.url;
+            _log.info(`[Node:PlanSkillsV2] Stripped URL from subsequent same-agent step for ${step.args.agentId} ("${_oldUrl}" → none — would disable content-entry tiers)`);
+          }
+        } else {
+          const _hadUrl = !!step.args.url;
+          const _oldUrl = step.args.url || null;
+          step.args.url = dl.url;
+          _urlInjectedAgents.add(step.args.agentId.toLowerCase());
+          if (_hadUrl && _oldUrl !== dl.url) {
+            _log.warn(`[Node:PlanSkillsV2] Overrode LLM URL for ${step.args.agentId}: "${_oldUrl}" → "${dl.url}" (source=${dl.source || 'unknown'})`);
+          } else {
+            _log.info(`[Node:PlanSkillsV2] Injected deep-link URL for ${step.args.agentId}: ${dl.url} (source=${dl.source || 'unknown'})`);
+          }
+        }
+      }
+    }
+
+    // app.agent navigate_url steps have no agentId — match by URL host
+    // against agents whose startUrl host resolved a deep-link in preflight.
+    // Corrects LLM-guessed URLs on authed services with the real deep link.
+    if (step.skill === 'app.agent' && step.args?.action === 'navigate_url' && step.args?.url) {
+      const _isTemplateVar = /\{\{[^}]+\}\}/.test(step.args.url);
+      if (!_isTemplateVar) {
+        try {
+          const _stepHost = new URL(step.args.url).hostname.replace(/^www\./, '').toLowerCase();
+          const _match = pfAgents.find(a => {
+            if (!a?.deepLinkUrl || !a?.startUrl) return false;
+            try {
+              const _agentHost = new URL(a.startUrl).hostname.replace(/^www\./, '').toLowerCase();
+              return _stepHost === _agentHost || _stepHost.endsWith('.' + _agentHost);
+            } catch (_) { return false; }
+          });
+          if (_match && _match.deepLinkUrl !== step.args.url) {
+            _log.info(`[Node:PlanSkillsV2] Overrode navigate_url URL for host ${_stepHost}: "${step.args.url}" → "${_match.deepLinkUrl}" (source=${_match.deepLinkSource || 'unknown'})`);
+            step.args.url = _match.deepLinkUrl;
+          }
+        } catch (_) { /* non-fatal */ }
+      }
+    }
+  }
   return skillPlan;
 }
 
@@ -140,11 +253,21 @@ function _sanitizeSkillPlan(skillPlan, state) {
   const _msgForUrls = state?.resolvedMessage || state?.message || '';
   const _allowedUrls = new Set((_msgForUrls.match(/https?:\/\/[^\s"'<>)\]]+/gi) || []));
   if (_urlHint) _allowedUrls.add(_urlHint);
+  // Preflight-resolved deep links are injected into steps before sanitize runs
+  // (see _injectPreflightDeepLinks) — trusted, not invented.
+  for (const a of (state?.preflightResult?.agents || [])) {
+    if (a?.deepLinkUrl) _allowedUrls.add(a.deepLinkUrl);
+  }
+  const _NAV_URL_ACTIONS = new Set(['navigate_url', 'navigate', 'goto']);
+  const _isNavStep = (step) =>
+    (step?.skill === 'app.agent' || step?.skill === 'browser.act')
+    && _NAV_URL_ACTIONS.has(step.args?.action);
   const _guardStepUrls = (step) => {
     const fields = step?.skill === 'shell.run'
       ? [step.args?.cmd, step.args?.goal, ...(Array.isArray(step.args?.argv) ? step.args.argv : [])]
-      : step?.skill === 'web.crawl' ? [step.args?.url] : [];
-    const bad = [];
+      : step?.skill === 'web.crawl' ? [step.args?.url]
+      : _isNavStep(step) ? [step.args?.url] : [];
+    let bad = [];
     for (const f of fields) {
       if (typeof f !== 'string') continue;
       for (const m of f.matchAll(/https?:\/\/[^\s"'<>)\]]+/gi)) {
@@ -152,6 +275,30 @@ function _sanitizeSkillPlan(skillPlan, state) {
       }
     }
     if (!bad.length) return;
+    // Nav-step URLs are destinations, not data — different repair than
+    // substitute/ask_user. Deterministic search-template hosts (google.com/
+    // search?q=…, youtube.com/results?…, etc.) are sanctioned planner output —
+    // keep them. When the user literally named the site (e.g. "goto cathay
+    // pacific" → cathaypacific.com), only the deep path was invented — strip to
+    // the origin so the step lands on the real homepage instead of a 404.
+    if (_isNavStep(step)) {
+      const _hostLabel = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').split('.')[0].toLowerCase(); } catch (_) { return ''; } };
+      const _msgNorm = _msgForUrls.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const _named = [];
+      bad = bad.filter((u) => {
+        const label = _hostLabel(u);
+        if (label && SITE_SEARCH_URLS[label]) return false; // sanctioned search template
+        const norm = label.replace(/[^a-z0-9]/g, '');
+        if (norm.length >= 3 && _msgNorm.includes(norm)) { _named.push(u); return false; }
+        return true;
+      });
+      for (const u of _named) {
+        const origin = (() => { try { const p = new URL(u); return `${p.protocol}//${p.host}`; } catch (_) { return u; } })();
+        if (typeof step.args.url === 'string') step.args.url = step.args.url.split(u).join(origin);
+        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: nav step URL had invented path — stripped ${u} → ${origin}`);
+      }
+      if (!bad.length) return;
+    }
     if (_urlHint) {
       const sub = (s) => typeof s === 'string' ? bad.reduce((acc, u) => acc.split(u).join(_urlHint), s) : s;
       if (step.skill === 'shell.run') {
@@ -1337,7 +1484,7 @@ async function planSkillsV2(state) {
     // The plan was built with plan-time context — the live URL may have been
     // resolved while it waited for approval. Satisfy pending {{_ctx_url_N}}
     // tokens (and drop their ask_user gates) against the fresh context.
-    const _resolvedPlan = _resolveCtxUrlTokens(state.skillPlan, state._priorScreenContext?.url, state._gatheredVars, logger);
+    const _resolvedPlan = _ensureSynthesizeStep(_resolveCtxUrlTokens(state.skillPlan, state._priorScreenContext?.url, state._gatheredVars, logger), userMessage);
     logger.info(`[Node:PlanSkillsV2] planExecutor passthrough — ${_resolvedPlan.length} steps pre-built, skipping planning`);
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: _resolvedPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
     return { ...state, skillPlan: _resolvedPlan, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null };
@@ -1357,9 +1504,10 @@ async function planSkillsV2(state) {
 
   // ── Project skill plan passthrough ────────────────────────────────────────
   if (state.projectSkillPlan && Array.isArray(state.projectSkillPlan) && state.projectSkillPlan.length > 0) {
+    const _guardedPlan = _ensureSynthesizeStep([...state.projectSkillPlan], userMessage);
     logger.info(`[Node:PlanSkillsV2] Using project skill plan: ${state.projectSkillPlan[0].skill}`);
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: state.projectSkillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args, runGroup: s.runGroup || undefined })), intent: 'command_automate' });
-    return { ...state, skillPlan: state.projectSkillPlan, skillCursor: 0, planError: null, recoveryContext: null };
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args, runGroup: s.runGroup || undefined })), intent: 'command_automate' });
+    return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null };
   }
 
   // ── Named plan recall fast-path ───────────────────────────────────────────
@@ -1367,7 +1515,7 @@ async function planSkillsV2(state) {
     const { findPlanByName } = require('../utils/planCacheHelpers');
     const recalled = findPlanByName(state._recallPlanName, PLANS_DIR, logger);
     if (recalled && Array.isArray(recalled.plan) && recalled.plan.length > 0) {
-      const _guardedPlan = _ensureSynthesizeForAppFlow(recalled.plan, userMessage);
+      const _guardedPlan = _ensureSynthesizeStep(recalled.plan, userMessage);
       logger.info(`[Node:PlanSkillsV2] Named plan recall: "${state._recallPlanName}" → ${_guardedPlan.length} steps`);
       if (progressCallback) progressCallback({ type: 'plan:found_existing', planName: state._recallPlanName });
       return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: recalled.planFile };
@@ -1389,7 +1537,7 @@ async function planSkillsV2(state) {
         // since resolved in live context.
         const _resolvedPlan = _resolveCtxUrlTokens(decoded, state._priorScreenContext?.url, state._gatheredVars, logger);
         // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
-        const _guardedPlan = _ensureSynthesizeForAppFlow(_resolvedPlan, userMessage);
+        const _guardedPlan = _ensureSynthesizeStep(_resolvedPlan, userMessage);
         const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
@@ -1403,7 +1551,10 @@ async function planSkillsV2(state) {
   // ── Login resume fast-path ────────────────────────────────────────────────
   if (state._loginResumeSkillPlan && !recoveryContext) {
     logger.info('[Node:PlanSkillsV2] Login resume: returning existing plan as-is');
-    return { ...state, skillPlan: state._loginResumeSkillPlan, skillCursor: 0, planError: null };
+    const _resumePlan = Array.isArray(state._loginResumeSkillPlan)
+      ? _ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage)
+      : state._loginResumeSkillPlan;
+    return { ...state, skillPlan: _resumePlan, skillCursor: 0, planError: null };
   }
 
   // ── Creator shortcut: skill already built by creatorPlanning ─────────────
@@ -1431,9 +1582,10 @@ async function planSkillsV2(state) {
       }
       
       plan.push({ skill: 'external.skill', description: `Run ${_csName}`, args: { name: _csName } });
-      
-      if (progressCallback) progressCallback({ type: 'plan_ready', steps: plan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-      return { ...state, skillPlan: plan, skillCursor: 0, planError: null, recoveryContext: null };
+
+      const _guardedPlan = _ensureSynthesizeStep(plan, userMessage);
+      if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+      return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null };
     }
   }
 
@@ -1569,6 +1721,35 @@ async function planSkillsV2(state) {
     priorSynthesizedContent = _selectPriorSynthesis(conversationHistory) || '';
   }
 
+  // ── Messaging body extraction (shared) ──────────────────────────────────
+  // Computed ONCE here so both the deterministic service_task fast-path and the
+  // LLM planner inject the same content. Without this the deterministic branch
+  // returns before the injection below and the email body falls back to a
+  // generic placeholder (observed: "Here is the information you requested."
+  // instead of the actual prior answer).
+  const isMessagingTask = state._taskClassification?.taskType === 'messaging';
+  const _hasExplicitBody = /\b(say|saying|with\s+message|body\s*:|message\s*:|tell\s+(?:them|him|her|me)\s+(?:that\s+)?")/i.test(userMessage)
+    || /"[^"]{2,}"/.test(userMessage)
+    || /'[^']{2,}'/.test(userMessage);
+  let _messagingBody = '';
+  if (isMessagingTask && priorSynthesizedContent && !_hasExplicitBody) {
+    _messagingBody = _sanitizeSynthesisBody(priorSynthesizedContent);
+    if (/^here is the raw data returned/i.test(_messagingBody.trim()) ||
+        /^\[shell\.run\]:\s*[\[{]/m.test(_messagingBody)) {
+      const _jsonMatch = _messagingBody.match(/```json\n([\s\S]*?)\n```/) ||
+                         _messagingBody.match(/\[shell\.run\]:\n*([\s\S]+)/);
+      if (_jsonMatch) {
+        const _parsed = parseLlmJson(_jsonMatch[1], logger, 'Node:PlanSkillsV2:messagingBody');
+        if (_parsed) {
+          const _items = Array.isArray(_parsed) ? _parsed : (_parsed?.items || []);
+          if (_items.length > 0) {
+            _messagingBody = _items.map(item => `• ${item.summary || item.title || JSON.stringify(item)}`).join('\n');
+          }
+        }
+      }
+    }
+  }
+
   // For non-follow-up command_automate tasks, previous conversation results
   // (assistant syntheses, system events, etc.) can falsely imply the task is
   // already complete. The current user request is already in the User request
@@ -1632,7 +1813,7 @@ async function planSkillsV2(state) {
     try {
       const cached = await findSimilarCompletePlan(userMessage, PLANS_DIR, logger);
       if (cached && Array.isArray(cached.plan) && cached.plan.length > 0) {
-        const _guardedPlan = _ensureSynthesizeForAppFlow(cached.plan, userMessage);
+        const _guardedPlan = _ensureSynthesizeStep(cached.plan, userMessage);
         if (_guardedPlan.length > cached.plan.length) {
           logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}" — appended synthesize step`);
         } else {
@@ -1650,7 +1831,25 @@ async function planSkillsV2(state) {
   // approval gate is still honored (plan file + awaitingPlanApproval) so
   // planApprovalMode='always' users keep their review pass.
   if (!recoveryContext && Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
-    const detPlan = state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 }));
+    // Preflight may have already resolved a deep-link for the pinned service
+    // (e.g. gmail compose URL) — inject it into browser.agent run args.url so
+    // browser.agent selects URL-first navigation instead of a blind start page.
+    const detPlan = _ensureSynthesizeStep(
+      _injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger),
+      userMessage);
+    // Messaging follow-up body: the service_task template passes the raw
+    // message as task ("send this info to X"), so the browser agent never sees
+    // the actual content and invents a placeholder body. Attach the resolved
+    // prior-turn content to the task so the agent types it verbatim.
+    if (_messagingBody) {
+      for (const _s of detPlan) {
+        if (_s?.skill === 'browser.agent' && _s.args && typeof _s.args.task === 'string' &&
+            !_s.args.task.includes('EMAIL BODY')) {
+          _s.args = { ..._s.args, task: `${_s.args.task}\n\nEMAIL BODY — use this content verbatim as the message body (it is what the user means by "this info"/the prior result):\n---\n${_messagingBody}\n---` };
+          logger.info(`[Node:PlanSkillsV2] Deterministic plan: injected prior content into ${_s.args.agentId || 'browser.agent'} task (${_messagingBody.length} chars)`);
+        }
+      }
+    }
     logger.info(`[Node:PlanSkillsV2] Deterministic plan adopted (${state._deterministicTemplate || 'template'}, ${detPlan.length} step${detPlan.length !== 1 ? 's' : ''}) — skipping LLM planning`);
     let _detPlanFile = null;
     try {
@@ -1680,11 +1879,14 @@ async function planSkillsV2(state) {
         type: 'plan:generated', planFile: _detPlanFile, planId: _detPlanFile?.split('/').pop()?.replace(/\.md$/, '') || null,
         content: _detContent, skillPlanJson: Buffer.from(JSON.stringify(detPlan)).toString('base64'),
         deterministic: true,
+        // Preserved through plan:approve → _resumePriorSynthesizedContent so
+        // executeCommand can still substitute {{BODY}} in agent-path steps.
+        priorSynthesizedContent: priorSynthesizedContent || '',
       });
-      return { ...state, awaitingPlanApproval: true, _skillPlanFile: _detPlanFile, skillPlan: null, skillCursor: 0, planError: null, recoveryContext: null };
+      return { ...state, awaitingPlanApproval: true, _skillPlanFile: _detPlanFile, skillPlan: null, skillCursor: 0, planError: null, recoveryContext: null, priorSynthesizedContent: priorSynthesizedContent || '' };
     }
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: detPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate', deterministic: true });
-    return { ...state, skillPlan: detPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: _detPlanFile };
+    return { ...state, skillPlan: detPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: _detPlanFile, priorSynthesizedContent: priorSynthesizedContent || '' };
   }
 
   // ── Pre-LLM reminder-cancel intercept ────────────────────────────────────
@@ -1711,9 +1913,10 @@ async function planSkillsV2(state) {
       description: _cancelAll ? 'Cancel all pending reminders'
         : (_cancelQuery ? `Cancel reminder matching "${_cancelQuery}"` : 'Cancel pending reminder'),
     }];
+    const _guardedCancelPlan = _ensureSynthesizeStep(cancelPlan, userMessage);
     logger.info(`[Node:PlanSkillsV2] Reminder-cancel intercept: schedule_cancel query="${_cancelQuery}"`);
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: cancelPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-    return { ...state, skillPlan: cancelPlan, skillCursor: 0, planError: null, recoveryContext: null };
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedCancelPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+    return { ...state, skillPlan: _guardedCancelPlan, skillCursor: 0, planError: null, recoveryContext: null };
   }
 
   // ── Pre-LLM recurring reminder intercept ─────────────────────────────────
@@ -1721,9 +1924,10 @@ async function planSkillsV2(state) {
     try {
       const reminderResult = buildReminderSkill(userMessage, state, logger);
       if (reminderResult && Array.isArray(reminderResult.plan) && reminderResult.plan.length > 0) {
-        logger.info(`[Node:PlanSkillsV2] Reminder skill intercept: ${reminderResult.plan.length} steps`);
-        if (progressCallback) progressCallback({ type: 'plan_ready', steps: reminderResult.plan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-        return { ...state, skillPlan: reminderResult.plan, skillCursor: 0, planError: null, recoveryContext: null };
+        const _guardedReminderPlan = _ensureSynthesizeStep(reminderResult.plan, userMessage);
+        logger.info(`[Node:PlanSkillsV2] Reminder skill intercept: ${_guardedReminderPlan.length} steps`);
+        if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedReminderPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+        return { ...state, skillPlan: _guardedReminderPlan, skillCursor: 0, planError: null, recoveryContext: null };
       }
     } catch (_) {}
   }
@@ -1990,9 +2194,10 @@ async function planSkillsV2(state) {
       description: `Run domain skill: ${state.matchedSkillName}`,
       args: { name: state.matchedSkillName, ...(state.matchedSkillParams || {}) },
     });
-    
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: domainPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-    return { ...state, skillPlan: domainPlan, skillCursor: 0, planError: null, recoveryContext: null, domainSkillFastPath: true };
+
+    const _guardedDomainPlan = _ensureSynthesizeStep(domainPlan, userMessage);
+    if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedDomainPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+    return { ...state, skillPlan: _guardedDomainPlan, skillCursor: 0, planError: null, recoveryContext: null, domainSkillFastPath: true };
   }
 
   // ── Contract-driven fast-path (shell skills) ──────────────────────────────
@@ -2018,8 +2223,9 @@ async function planSkillsV2(state) {
           }
           contractPlan.push({ skill: 'shell.run', description: selectedCmd.heading, args: { cmd: 'bash', argv: ['-c', code] } });
 
-          if (progressCallback) progressCallback({ type: 'plan_ready', steps: contractPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-          return { ...state, skillPlan: contractPlan, skillCursor: 0, planError: null, recoveryContext: null };
+          const _guardedContractPlan = _ensureSynthesizeStep(contractPlan, userMessage);
+          if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedContractPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+          return { ...state, skillPlan: _guardedContractPlan, skillCursor: 0, planError: null, recoveryContext: null };
         }
       } catch (_) {}
     }
@@ -2142,8 +2348,9 @@ async function planSkillsV2(state) {
         args: { action: 'run', agentId: normalizedMatchedAgentId, task: userMessage },
         description: `Execute trained recipe: ${matchedRecipe.skillName}`
       }];
-      if (progressCallback) progressCallback({ type: 'plan_ready', steps: fastPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-      return { ...state, skillPlan: fastPlan, skillCursor: 0, planError: null, recoveryContext: null, _trainedRecipeMap };
+      const _guardedFastPlan = _ensureSynthesizeStep(fastPlan, userMessage);
+      if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedFastPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
+      return { ...state, skillPlan: _guardedFastPlan, skillCursor: 0, planError: null, recoveryContext: null, _trainedRecipeMap };
     } else {
       logger.info(`[Node:PlanSkillsV2] No trained recipe match found, falling through to LLM planning`);
     }
@@ -2247,35 +2454,14 @@ async function planSkillsV2(state) {
   // a user.agent/browser step to re-fetch content that's already available.
   // Use _taskClassification.taskType === 'messaging' (LLM-based) instead of regex —
   // regex matched nouns like "text" in "visible text on my screen" causing plan poisoning.
+  // isMessagingTask/_hasExplicitBody/_messagingBody are computed earlier (above
+  // the deterministic fast-path) so both plan paths share the same content.
   let messagingBodyNote = '';
-  const isMessagingTask = state._taskClassification?.taskType === 'messaging';
-  const _hasExplicitBody = /\b(say|saying|with\s+message|body\s*:|message\s*:|tell\s+(?:them|him|her|me)\s+(?:that\s+)?")/i.test(userMessage)
-    || /"[^"]{2,}"/.test(userMessage)
-    || /'[^']{2,}'/.test(userMessage);
-  if (isMessagingTask && priorSynthesizedContent && !_hasExplicitBody) {
-    // Strip internal "=== Source:" dumps first — priorSynthesizedContent can
-    // arrive via _selectPriorSynthesis OR resume state, so sanitize again here.
-    let _sanitizedBody = _sanitizeSynthesisBody(priorSynthesizedContent);
-    if (/^here is the raw data returned/i.test(_sanitizedBody.trim()) ||
-        /^\[shell\.run\]:\s*[\[{]/m.test(_sanitizedBody)) {
-      const _jsonMatch = _sanitizedBody.match(/```json\n([\s\S]*?)\n```/) ||
-                         _sanitizedBody.match(/\[shell\.run\]:\n*([\s\S]+)/);
-      if (_jsonMatch) {
-        const _parsed = parseLlmJson(_jsonMatch[1], logger, 'Node:PlanSkillsV2:messagingBody');
-        if (_parsed) {
-          const _items = Array.isArray(_parsed) ? _parsed : (_parsed?.items || []);
-          if (_items.length > 0) {
-            _sanitizedBody = _items.map(item => `• ${item.summary || item.title || JSON.stringify(item)}`).join('\n');
-          }
-        }
-      }
-    }
-    if (_sanitizedBody) {
-      messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${_sanitizedBody}\n---\nDo NOT add a user.agent step to re-fetch this content — it is already provided above. Only add steps to resolve the recipient address (if unknown) and to send the email.`;
-      logger.info(`[Node:PlanSkillsV2] Injected prior synthesized content as messaging body (${_sanitizedBody.length} chars)`);
-    } else {
-      logger.info('[Node:PlanSkillsV2] Prior synthesis sanitized to empty — skipping messaging body injection');
-    }
+  if (_messagingBody) {
+    messagingBodyNote = `\n\n⚠️ MESSAGE BODY — CRITICAL:\nThe user said "${userMessage}". The content they want sent is from the PREVIOUS task. Use this EXACT content as the message body (do not summarize or replace with a placeholder):\n---\n${_messagingBody}\n---\nDo NOT add a user.agent step to re-fetch this content — it is already provided above. Only add steps to resolve the recipient address (if unknown) and to send the email.`;
+    logger.info(`[Node:PlanSkillsV2] Injected prior synthesized content as messaging body (${_messagingBody.length} chars)`);
+  } else if (isMessagingTask && priorSynthesizedContent && !_hasExplicitBody) {
+    logger.info('[Node:PlanSkillsV2] Prior synthesis sanitized to empty — skipping messaging body injection');
   }
 
   // ── SMS gateway injection ─────────────────────────────────────────────────
@@ -2776,82 +2962,9 @@ The user's request does NOT match any installed skill.
   }
 
   // ── Inject direct deep-link URLs from preflight ───────────────────────────
-  // The preflight deep-link is resolved per agentId using the full task context.
-  // It's always more accurate than what the LLM guessed. The deepLinkMap is keyed
-  // by agentId, so:
-  //   - Different agents → different URLs (fixes cross-agent URL contamination)
-  //   - Same agent in multiple steps → same URL → browser.agent skips re-navigation
-  // Exception: template variables ({{bestUrl}}, {{PREV_OUTPUT}}) are preserved —
-  // they come from prior step output, not the LLM's guess.
-
-  if (Array.isArray(skillPlan)) {
-    const deepLinkMap = new Map();
-    const pfAgents = state?.preflightResult?.agents || [];
-    for (const a of pfAgents) {
-      if (a?.agentId && a?.deepLinkUrl) {
-        deepLinkMap.set(a.agentId.toLowerCase(), { url: a.deepLinkUrl, source: a.deepLinkSource || null });
-      }
-    }
-
-    // Track which agents have already received a URL — only inject for the FIRST
-    // same-agent step. Subsequent steps must NOT get a creation deep-link URL
-    // because it triggers urlFirstNav=true → classifyDeepLinkType=creation →
-    // disables tiers 2,3,4 (Meta+F, Shortcuts, Tab-Map) needed for content entry.
-    const _urlInjectedAgents = new Set();
-    for (const step of skillPlan) {
-      if (step.skill === 'browser.agent' && step.args?.action === 'run' && step.args?.agentId) {
-        const dl = deepLinkMap.get(step.args.agentId.toLowerCase());
-        if (dl?.url) {
-          // Don't override template variables — they come from prior step output
-          const _isTemplateVar = step.args.url && /\{\{[^}]+\}\}/.test(step.args.url);
-          if (_isTemplateVar) {
-            logger.info(`[Node:PlanSkillsV2] Preserving template URL for ${step.args.agentId}: ${step.args.url}`);
-          } else if (_urlInjectedAgents.has(step.args.agentId.toLowerCase())) {
-            // Second+ step for same agent — strip URL so urlFirstNav=false and
-            // all tiers (Tab-Map, Shortcuts) are available for content entry
-            if (step.args.url) {
-              const _oldUrl = step.args.url;
-              delete step.args.url;
-              logger.info(`[Node:PlanSkillsV2] Stripped URL from subsequent same-agent step for ${step.args.agentId} ("${_oldUrl}" → none — would disable content-entry tiers)`);
-            }
-          } else {
-            const _hadUrl = !!step.args.url;
-            const _oldUrl = step.args.url || null;
-            step.args.url = dl.url;
-            _urlInjectedAgents.add(step.args.agentId.toLowerCase());
-            if (_hadUrl && _oldUrl !== dl.url) {
-              logger.warn(`[Node:PlanSkillsV2] Overrode LLM URL for ${step.args.agentId}: "${_oldUrl}" → "${dl.url}" (source=${dl.source || 'unknown'})`);
-            } else {
-              logger.info(`[Node:PlanSkillsV2] Injected deep-link URL for ${step.args.agentId}: ${dl.url} (source=${dl.source || 'unknown'})`);
-            }
-          }
-        }
-      }
-
-      // app.agent navigate_url steps have no agentId — match by URL host
-      // against agents whose startUrl host resolved a deep-link in preflight.
-      // Corrects LLM-guessed URLs on authed services with the real deep link.
-      if (step.skill === 'app.agent' && step.args?.action === 'navigate_url' && step.args?.url) {
-        const _isTemplateVar = /\{\{[^}]+\}\}/.test(step.args.url);
-        if (!_isTemplateVar) {
-          try {
-            const _stepHost = new URL(step.args.url).hostname.replace(/^www\./, '').toLowerCase();
-            const _match = pfAgents.find(a => {
-              if (!a?.deepLinkUrl || !a?.startUrl) return false;
-              try {
-                const _agentHost = new URL(a.startUrl).hostname.replace(/^www\./, '').toLowerCase();
-                return _stepHost === _agentHost || _stepHost.endsWith('.' + _agentHost);
-              } catch (_) { return false; }
-            });
-            if (_match && _match.deepLinkUrl !== step.args.url) {
-              logger.info(`[Node:PlanSkillsV2] Overrode navigate_url URL for host ${_stepHost}: "${step.args.url}" → "${_match.deepLinkUrl}" (source=${_match.deepLinkSource || 'unknown'})`);
-              step.args.url = _match.deepLinkUrl;
-            }
-          } catch (_) { /* non-fatal */ }
-        }
-      }
-    }
-  }
+  // Shared with the deterministic-template path (which adopts plans before the
+  // LLM section below) — see _injectPreflightDeepLinks for the mechanics.
+  skillPlan = _injectPreflightDeepLinks(skillPlan, state, logger);
 
   // ── Clarification / error objects from LLM ────────────────────────────────
   if (!Array.isArray(skillPlan) && skillPlan?.ask) {
@@ -2871,7 +2984,7 @@ The user's request does NOT match any installed skill.
         const retryRaw = await backend.generateAnswer(enrichedQuery, payload, payload.options, null);
         const retryPlan = parsePlan(retryRaw, logger);
         if (retryPlan && Array.isArray(retryPlan)) {
-          const _guardedPlan = _ensureSynthesizeForAppFlow(retryPlan, userMessage);
+          const _guardedPlan = _ensureSynthesizeStep(retryPlan, userMessage);
           if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
           return { ...state, skillPlan: _guardedPlan, skillCursor: 0, recoveryContext: null, planError: null };
         }
@@ -3246,7 +3359,7 @@ The user's request does NOT match any installed skill.
 
   // ── Synthesize guard: every action plan ends with a confirmation ────────────
   if (Array.isArray(skillPlan)) {
-    skillPlan = _ensureSynthesizeForAppFlow(skillPlan, userMessage);
+    skillPlan = _ensureSynthesizeStep(skillPlan, userMessage);
   }
 
   // ── Resolved file path injection: pass structured path to app.agent steps ──
@@ -3362,5 +3475,8 @@ module.exports._buildSystemPrompt = _buildSystemPrompt;
 module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;
 module.exports._selectPriorSynthesis = _selectPriorSynthesis;
 module.exports._sanitizeSkillPlan = _sanitizeSkillPlan;
-module.exports._ensureSynthesizeForAppFlow = _ensureSynthesizeForAppFlow;
+module.exports._ensureSynthesizeStep = _ensureSynthesizeStep;
+module.exports._injectPreflightDeepLinks = _injectPreflightDeepLinks;
+// Back-compat alias — external callers/tests may still import the old name.
+module.exports._ensureSynthesizeForAppFlow = _ensureSynthesizeStep;
 module.exports._resolveCtxUrlTokens = _resolveCtxUrlTokens;

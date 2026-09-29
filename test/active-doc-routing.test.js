@@ -35,7 +35,7 @@ function check(name, cond, extra = '') {
 
 const resolveReferencesV2 = require('../src/nodes/resolveReferencesV2');
 const parseIntentV2 = require('../src/nodes/parseIntentV2');
-const { _sanitizeSkillPlan, _resolveCtxUrlTokens } = require('../src/nodes/planSkillsV2');
+const { _sanitizeSkillPlan, _resolveCtxUrlTokens, _injectPreflightDeepLinks } = require('../src/nodes/planSkillsV2');
 const { _stripAttachmentTags } = require('../src/utils/classifyTask');
 
 const _logger = { info: () => {}, warn: () => {}, debug: () => {}, error: () => {} };
@@ -208,6 +208,91 @@ async function main() {
     ], { _priorScreenContext: { url: 'https://www.seriouseats.com/recipe' }, message: 'print this page' });
     check('context URL → untouched',
       plan[0].skill === 'shell.run' && plan[0].args.argv[1].includes('seriouseats.com'));
+  });
+
+  // ── 6d. _sanitizeSkillPlan — nav-step invented URL guard ──────────────────
+  // The real incident: "goto cathay pacific and see fligths from jfk to hk"
+  // produced app.agent navigate_url → cathaypacific.com/cx/en_US/book-a-trip/
+  // flight-search.html — an LLM-invented deep path that 404'd. The site was
+  // real and named; only the path was hallucinated → strip to origin.
+  await describe('_sanitizeSkillPlan — nav-step URL guard (app.agent navigate_url)', () => {
+    // Invented deep path on a user-named host → strip to origin.
+    let plan = _sanitizeSkillPlan([
+      { skill: 'app.agent', args: { action: 'navigate_url', url: 'https://www.cathaypacific.com/cx/en_US/book-a-trip/flight-search.html' }, description: 'open' },
+    ], { _priorScreenContext: null, message: 'goto cathay pacific and see fligths from jfk to hk' });
+    check('named-host invented deep path → stripped to origin',
+      plan[0].skill === 'app.agent' && plan[0].args.url === 'https://www.cathaypacific.com');
+
+    // Sanctioned deterministic search-template host → kept verbatim even
+    // though the URL isn't in the message (plan-skills-app.md documents it).
+    plan = _sanitizeSkillPlan([
+      { skill: 'app.agent', args: { action: 'navigate_url', url: 'https://www.youtube.com/results?search_query=test' }, description: 'open' },
+    ], { _priorScreenContext: null, message: 'open youtube and search for test' });
+    check('whitelisted search-template host → kept',
+      plan[0].skill === 'app.agent' && plan[0].args.url === 'https://www.youtube.com/results?search_query=test');
+
+    // Verbatim user-typed URL → untouched.
+    plan = _sanitizeSkillPlan([
+      { skill: 'app.agent', args: { action: 'navigate_url', url: 'https://example.com/deep/path' }, description: 'open' },
+    ], { _priorScreenContext: null, message: 'open https://example.com/deep/path' });
+    check('user-typed nav URL → untouched',
+      plan[0].args.url === 'https://example.com/deep/path');
+
+    // Preflight-resolved deep link injected by _injectPreflightDeepLinks →
+    // trusted, must NOT be flagged as invented.
+    plan = _sanitizeSkillPlan([
+      { skill: 'app.agent', args: { action: 'navigate_url', url: 'https://mail.google.com/mail/u/0/#inbox?compose=new' }, description: 'open' },
+    ], { _priorScreenContext: null, message: 'open gmail compose',
+         preflightResult: { agents: [{ agentId: 'gmail.agent', deepLinkUrl: 'https://mail.google.com/mail/u/0/#inbox?compose=new', startUrl: 'https://mail.google.com' }] } });
+    check('preflight deep link → untouched',
+      plan[0].args.url === 'https://mail.google.com/mail/u/0/#inbox?compose=new');
+
+    // Invented host the user never named → existing ask_user behavior.
+    plan = _sanitizeSkillPlan([
+      { skill: 'app.agent', args: { action: 'navigate_url', url: 'https://totally-invented.example.com/deep' }, description: 'open' },
+    ], { _priorScreenContext: null, message: 'open the thing' });
+    check('invented unnamed host → ask_user inserted', plan[0].skill === 'ask_user');
+  });
+
+  // ── 6e. _injectPreflightDeepLinks — det/LLM plan URL injection ────────────
+  // service_task det plans previously bypassed this entirely — the gmail
+  // compose URL resolved in preflight never reached browser.agent run's
+  // args.url → urlFirstNav=false → Tab-Map flailed on the inbox.
+  await describe('_injectPreflightDeepLinks — preflight deep-link injection', () => {
+    const pfState = { preflightResult: { agents: [
+      { agentId: 'gmail.agent', deepLinkUrl: 'https://mail.google.com/mail/u/0/#inbox?compose=new', startUrl: 'https://mail.google.com' },
+    ] } };
+
+    let plan = _injectPreflightDeepLinks([
+      { skill: 'browser.agent', args: { action: 'run', agentId: 'gmail.agent', task: 'send me an email' } },
+      { skill: 'synthesize', args: { prompt: 'x' } },
+    ], pfState, _logger);
+    check('browser.agent run gets args.url from preflight deep link',
+      plan[0].args.url === 'https://mail.google.com/mail/u/0/#inbox?compose=new');
+    check('non-agent step untouched', plan[1].args.url === undefined);
+
+    // Second same-agent step must NOT receive the creation URL (would disable
+    // content-entry tiers via urlFirstNav/creation deepLinkType).
+    plan = _injectPreflightDeepLinks([
+      { skill: 'browser.agent', args: { action: 'run', agentId: 'gmail.agent', task: 'a' } },
+      { skill: 'browser.agent', args: { action: 'run', agentId: 'gmail.agent', task: 'b' } },
+    ], pfState, _logger);
+    check('first same-agent step injected', plan[0].args.url === 'https://mail.google.com/mail/u/0/#inbox?compose=new');
+    check('second same-agent step not injected', plan[1].args.url === undefined);
+
+    // app.agent navigate_url host-match override (LLM guessed URL on an
+    // authed service host → corrected to the real deep link).
+    plan = _injectPreflightDeepLinks([
+      { skill: 'app.agent', args: { action: 'navigate_url', url: 'https://mail.google.com/mail/u/0/#inbox' } },
+    ], pfState, _logger);
+    check('navigate_url host-match override',
+      plan[0].args.url === 'https://mail.google.com/mail/u/0/#inbox?compose=new');
+
+    // No preflight agents → no-op.
+    plan = _injectPreflightDeepLinks([
+      { skill: 'browser.agent', args: { action: 'run', agentId: 'gmail.agent', task: 'a' } },
+    ], { preflightResult: { agents: [] } }, _logger);
+    check('no preflight agents → no-op', plan[0].args.url === undefined);
   });
 
   // ── 6c. _resolveCtxUrlTokens — resume-time context reconciliation ──────────

@@ -111,6 +111,29 @@ describe('template compilation', () => {
     assert.equal(hit.template, 'shell_cmd');
     assert.equal(hit.skillPlan[0].args.argv[1], 'echo stage five works');
   });
+
+  it('file_delete compiles to a recoverable mv → ~/.Trash with sandbox opt-out', async () => {
+    const msg = 'delete this file [File: /tmp/e2e/old.txt]';
+    const hit = await _hit(msg, _json(20, { path: '/tmp/e2e/old.txt' }));
+    assert.equal(hit.template, 'file_delete');
+    assert.equal(hit.skillPlan.length, 1);
+    const step = hit.skillPlan[0];
+    assert.equal(step.skill, 'shell.run');
+    assert.match(step.args.argv[1], /mv '\/tmp\/e2e\/old\.txt'/);
+    assert.match(step.args.argv[1], /\.Trash\//);
+    assert.doesNotMatch(step.args.argv[1], /\brm\b/);
+    // protectedPaths: [] — explicit opt-out so the attachment sandbox doesn't
+    // block the user-requested delete of the attached path.
+    assert.deepEqual(step.args.protectedPaths, []);
+    assert.equal(hit.lowRisk, false);
+  });
+
+  it('screen_read compiles to screen.capture', async () => {
+    const hit = await _hit("what's on my screen", _json(21, {}));
+    assert.equal(hit.template, 'screen_read');
+    assert.equal(hit.skillPlan[0].skill, 'screen.capture');
+    assert.equal(hit.lowRisk, true);
+  });
 });
 
 // ── Fallthrough ────────────────────────────────────────────────────────────
@@ -185,6 +208,21 @@ describe('validators reject unsafe or hallucinated output', () => {
   it('app_control rejects shell-injection app names', async () => {
     assert.equal(await _hit('open Notes', _json(9, { app: 'Notes"; rm -rf ~; "', op: 'open' })), null);
   });
+
+  it('file_delete rejects an invented path', async () => {
+    const hit = await _hit('delete this file [File: /tmp/e2e/old.txt]', _json(20, { path: '/tmp/e2e/other.txt' }));
+    assert.equal(hit, null);
+  });
+
+  it('file_delete rejects a relative path', async () => {
+    const hit = await _hit('delete this file', _json(20, { path: 'old.txt' }));
+    assert.equal(hit, null);
+  });
+
+  it('file_delete accepts the resolved followUpTarget', async () => {
+    const hit = await _hit('delete that file', _json(20, { path: '/tmp/e2e/old.txt' }), { followUpTarget: '/tmp/e2e/old.txt' });
+    assert.equal(hit.template, 'file_delete');
+  });
 });
 
 describe('service_task (external tier)', () => {
@@ -198,6 +236,9 @@ describe('service_task (external tier)', () => {
     // task is the verbatim user message — no model-synthesized instructions
     assert.equal(hit.skillPlan[0].args.task, 'post a tweet saying hello world');
     assert.equal(hit.skillPlan[1].skill, 'synthesize');
+    // No forced stepType — 'on-page-action' would make browser.agent skip
+    // deep-link resolution and unset URL-first navigation entirely.
+    assert.equal(hit.skillPlan[0].stepType, undefined);
   });
 
   it('accepts x.com alias → twitter.agent', async () => {

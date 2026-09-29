@@ -393,11 +393,13 @@ describe('decomposePromptV2 — screen-output guard lexical completion', () => {
     assertEq(r._taskClassification.screenOutputContent, 'DONE');
   });
 
-  it('fetchable referent still gets the web_search → display chain', async () => {
+  it('fetchable referent still gets the fetch → display chain', async () => {
     const r = await _decompose('show me john 3:16 on my screen', _noCall,
       _tc({ screenOutputKind: 'text' }));
     assertEq(r.intentPlan.length, 2, 'fresh-content request keeps the fetch step');
-    assertEq(r.intentPlan[0].estimatedIntent, 'web_search');
+    // Scripture refs route to the deterministic bible_verse plan
+    // (command_automate), not web_search — ranked snippets painted junk.
+    assertEq(r.intentPlan[0].estimatedIntent, 'command_automate');
     assertEq(r.intentPlan[1].estimatedIntent, 'screen_display');
     assertEq(r.intentPlan[1].dependsOn[0], 0);
   });
