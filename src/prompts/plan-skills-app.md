@@ -72,6 +72,37 @@ The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or mo
 | `clipboard_backup` | Save current clipboard contents to DB before overwriting |
 | `clipboard_restore` | Restore previously backed-up clipboard from DB |
 
+### Phase 4B — Real-Browser URL-First Lane (navigate_url / scan_page / print_page)
+
+These actions drive the user's REAL default browser — no Playwright, no bot walls (real cookies/session), and the user keeps the page in front of them. Prefer this lane for any "goto <site> and look up/read/search X" or "question about this page" task.
+
+| Action | What it does | Verification |
+|--------|-------------|--------------|
+| `navigate_url` | `{ url, appName?, via? }` — `via:'open'` (default browser, new tab — default for fresh "goto") or `via:'type'` (Cmd+L → just-type → Enter, current tab). `via:'auto'` picks automatically. | Waits a per-category settle time; verify content via `scan_page` |
+| `scan_page` | `{ appName?, url?, useCache?, maxWaitMs? }` — grabs the URL from the address bar, copies the full rendered page (Cmd+L → Cmd+C → Tab → Cmd+A → Cmd+C), saves to `~/.thinkdrop/copies/`. Copies are cached (5-min TTL) — repeat calls for the same URL return instantly with `cached:true`. | Retries the copy until it exceeds a per-URL-category char floor (SERP ~800, shopping ~2000, social ~1200) or `maxWaitMs`. Returns `thin:true` on legit sparse pages, `bot_detected` error on Cloudflare/CAPTCHA walls. |
+| `print_page` | `{ appName? }` — Cmd+P → Enter | Unverifiable by design — reports `verified:false` |
+
+**Goto a site and read/search — real browser:**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "navigate_url", "url": "https://www.google.com/search?q=new+tesla+cars" }, "description": "Open Google search for new tesla cars in the default browser" },
+  { "skill": "app.agent", "args": { "action": "scan_page" }, "description": "Copy the rendered results page" },
+  { "skill": "synthesize", "args": { "prompt": "Summarize the results for the user" }, "description": "Present findings" }
+]
+```
+Deterministic search-URL templates work directly in `navigate_url` (google.com/search?q=…, amazon.com/s?k=…, youtube.com/results?search_query=…).
+
+**Question about the current page** ("any comments on this page about X"):
+```json
+[
+  { "skill": "app.agent", "args": { "action": "scan_page" }, "description": "Copy the current page text (served from ~/.thinkdrop/copies cache when fresh)" },
+  { "skill": "synthesize", "args": { "prompt": "Answer the user's question from the copied page text" }, "description": "Answer from page copy" }
+]
+```
+Follow-up questions within 5 minutes hit the `scan_page` cache — emit the same step again; do NOT re-navigate. If the task needs the copy on disk, `scan_page` returns `savedTo` (also exposed as `{{LAST_SUCCESSFUL.outputs.filePaths[0]}}`) for a `fs.read` step.
+
+If `scan_page` returns `bot_detected` or fails (no browser available), fall back to `web.crawl { url }` — never `browser.agent` for read-only tasks.
+
 ## Common Patterns
 
 **Open app then run shortcut:**
@@ -175,14 +206,14 @@ When the user asks to perform a multi-step task in a desktop app that requires m
 
 When user asks to "copy all text", "extract text from page", "get page content", "copy all the text on this site", or anything that requires copying/extracting text from a browser tab or app page:
 
-**CRITICAL — ALWAYS use the single `extract_content_via_clipboard` action.**
+**CRITICAL — ALWAYS use `scan_page` for browser pages (it additionally captures the URL, verifies load via per-category char floor, and caches the copy to `~/.thinkdrop/copies/`).** Use `extract_content_via_clipboard` only for non-browser app categories.
 - NEVER generate a multi-step `execute_shortcut` chain (Cmd+L, Tab, Cmd+A, Cmd+C) for this purpose.
-- `extract_content_via_clipboard` handles app focus, the shortcut chain, clipboard backup/restore, and the `pbpaste` retrieval internally.
+- These actions handle app focus, the shortcut chain, clipboard backup/restore, and the `pbpaste` retrieval internally.
 
 **Example plan for "Copy all the text on this page":**
 ```json
 [
-  { "skill": "app.agent", "args": { "action": "extract_content_via_clipboard", "appName": "<AppName>", "category": "browser" }, "description": "Select-all + copy page text via clipboard (backs up and restores clipboard)" },
+  { "skill": "app.agent", "args": { "action": "scan_page", "appName": "<AppName>" }, "description": "Copy the rendered page text via clipboard (backs up and restores clipboard)" },
   { "skill": "synthesize", "args": { "prompt": "Present the extracted page text to user in a clear, organized format. Include headings if the page had clear section structure." }, "description": "Present extracted text to user" }
 ]
 ```
@@ -190,7 +221,7 @@ When user asks to "copy all text", "extract text from page", "get page content",
 **Cross-domain example — "Copy all text and save to a file on the desktop":**
 ```json
 [
-  { "skill": "app.agent", "args": { "action": "extract_content_via_clipboard", "appName": "<AppName>", "category": "browser" }, "description": "Copy all text from the current browser page to the clipboard" },
+  { "skill": "app.agent", "args": { "action": "scan_page", "appName": "<AppName>" }, "description": "Copy all text from the current browser page to the clipboard" },
   { "skill": "shell.run", "args": { "goal": "Write the clipboard contents to a plain-text file on the desktop: pbpaste > ~/Desktop/<filename>.txt" }, "description": "Save clipboard content to a file on the desktop" },
   { "skill": "synthesize", "args": { "prompt": "Confirm to the user that the file was saved to the desktop and report the file path." }, "description": "Confirm desktop file saved" }
 ]
@@ -202,12 +233,12 @@ When the user asks to read, scroll, summarize, or tell them about the content cu
 
 | Active category | Correct action | Direction / notes |
 |---|---|---|
-| `browser` | `extract_content_via_clipboard` | Use the Cmd+L → Tab → Cmd+A → Cmd+C chain. NEVER use `scroll`, `passive_read_scroll`, or `search_scroll` for browser content. **Exception: when `URL:` is present in ACTIVE SCREEN CONTEXT, prefer `web.crawl { url }` first — it is deterministic (no focus/clipboard churn). Use `extract_content_via_clipboard` as the fallback for bot-blocked, auth'd, or JS-only pages where crawl fails.** |
+| `browser` | `scan_page` | Full-page copy via Cmd+L → Cmd+C (URL) → Tab → Cmd+A → Cmd+C, saved to `~/.thinkdrop/copies/` (5-min cache — repeat calls are free). NEVER use `scroll`, `passive_read_scroll`, or `search_scroll` for browser content. It reads the user's REAL rendered page — auth'd and bot-blocked pages included. **Fallback: `web.crawl { url }` when no browser is available or scan_page fails.** |
 | `editor`, `chat`, `terminal` | `passive_read_scroll` | `direction: "up"` — jump to the bottom, then scroll up to accumulate history. |
 | `email`, `design`, `document` | `passive_read_scroll` | `direction: "down"` — start at the top, scroll down. |
 | `other` | `passive_read_scroll` | `direction: "down"` unless the goal clearly indicates searching for a recent item at the bottom. |
 
-CRITICAL: If the active screen is a browser, ignore phrases like "scroll this page", "read this page", "tell me about this" — always use `extract_content_via_clipboard` and then `synthesize` (or `web.crawl` when `URL:` is present, per the note above).
+CRITICAL: If the active screen is a browser, ignore phrases like "scroll this page", "read this page", "tell me about this" — always use `scan_page` and then `synthesize` (fall back to `web.crawl` only when no browser is available).
 
 ## Screen Highlighting — GhostLayer Overlay
 

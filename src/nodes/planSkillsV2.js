@@ -743,7 +743,10 @@ function _buildSystemPrompt(userMessage, state) {
     && _browserIsOpen
     && /\b(click|open|select|tap|activate)\b/i.test(userMessage || '');
 
-  const _needsApp = _isNativeDesktopTask || _isBrowserNavTask || _isBrowserInPageClick || _tc?.taskType === 'app_automation';
+  const _needsApp = _isNativeDesktopTask || _isBrowserNavTask || _isBrowserInPageClick || _tc?.taskType === 'app_automation'
+    // A live-page referent ("this page") is read via app.agent scan_page —
+    // load the app appendix so the planner sees the Phase-4B signatures.
+    || _tc?.activeDocRef === 'url';
 
   const _needsShell = _tc?.taskType === 'local_file'
     || !!_tc?.activeDocRef // doc tasks need shell recipes (lp, textutil, Chrome→PDF, screencapture)
@@ -1129,13 +1132,23 @@ This task is classified as **${_tc.webAccessMode}**. It requires NO login, NO se
 - <code>browser.agent</code> 
 - <code>browser.act</code> 
 - <code>playwright.agent</code> 
-- <code>app.agent</code> 
 - Any service-specific agent like <code>etsy.agent</code> or <code>amazon.agent</code> 
+
+**ALLOWED app.agent actions (real-browser lane — NOT playwright):** <code>navigate_url</code>, <code>scan_page</code>, <code>print_page</code>. These drive the user's REAL default browser (open URL + clipboard page copy to ~/.thinkdrop/copies) — they are fast, never bot-blocked, and leave the page visible. All other app.agent actions remain forbidden here.
 
 **Correct sequence for site search + extract:** 
 1. <code>web.agent</code> with <code>action: "site_search"</code> and <code>domain</code> + <code>query</code> 
 2. <code>web.crawl</code> with <code>url: "{{bestUrl}}"</code>, <code>extractItems: true</code>, and optional <code>fallbackUrls: "{{fallbackUrls}}"</code> 
 3. <code>synthesize</code> to summarize the extracted items 
+
+**Real-browser alternative (preferred when the user says "goto/open <site>" — they want to SEE the page):**
+1. <code>app.agent { action: "navigate_url", url: "<search-or-page url>" }</code> — site-search URL templates like https://www.google.com/search?q=QUERY or https://www.amazon.com/s?k=QUERY work directly
+2. <code>app.agent { action: "scan_page" }</code> — copies the rendered page to ~/.thinkdrop/copies/
+3. <code>synthesize</code>
+
+**Already-open page referent ("this page", "on this page", questions about the current tab):** when ACTIVE SCREEN CONTEXT shows a browser URL, emit <code>app.agent { action: "scan_page" }</code> directly — the page is already loaded, so NO <code>navigate_url</code> step. Prefer this over <code>web.crawl</code> on the same URL — the user's real rendered page carries their session (no bot wall, no stale snapshot). <code>web.crawl</code> is the fallback only.
+
+**Fallback ordering:** if scan_page returns ok:false (no browser available, bot_detected), fall back to the web.agent → web.crawl sequence above.
 
 If the user asks to "click the first result", treat that as selecting the first extracted URL for a follow-up <code>web.crawl</code>, NOT a browser click.`;
   }
@@ -1654,9 +1667,13 @@ async function planSkillsV2(state) {
         if (_dsd.planApprovalMode && ['always', 'multi_step', 'auto'].includes(_dsd.planApprovalMode)) _detApprovalMode = _dsd.planApprovalMode;
       }
     } catch (_) {}
+    // lowRisk deterministic plans (read-only templates: page reads, file
+    // reads, system queries) skip the multi_step gate — an approval card for
+    // "scan the open page then summarize it" is friction with no safety value.
+    // planApprovalMode='always' still gates everything, as the user asked.
     const _detNeedsApproval = !state.userApproved && (
       _detApprovalMode === 'always' ||
-      (_detApprovalMode === 'multi_step' && detPlan.length >= 2));
+      (_detApprovalMode === 'multi_step' && detPlan.length >= 2 && !state._deterministicLowRisk));
     if (_detNeedsApproval) {
       const _detContent = _detPlanFile ? fs.readFileSync(_detPlanFile, 'utf8') : '';
       if (progressCallback) progressCallback({
@@ -2625,10 +2642,18 @@ The user's request does NOT match any installed skill.
   const _postWebMode = state._taskClassification?.webAccessMode;
   if (Array.isArray(skillPlan) && (_postWebMode === 'public_read' || _postWebMode === 'download')) {
     const _forbiddenPublicSkills = new Set(['browser.agent', 'browser.act', 'playwright.agent', 'app.agent']);
+    // Real-browser lane is explicitly allowed for public_read — navigate_url /
+    // scan_page / print_page drive the user's own browser (no Playwright, no
+    // bot wall; scan_page reads the already-open tab). Any OTHER app.agent
+    // action still rewrites; 'download' mode rewrites everything (scan_page
+    // can't fetch files).
+    const _PUBLIC_REAL_BROWSER_ACTIONS = new Set(['navigate_url', 'scan_page', 'print_page']);
     const _publicWebListingSignals = /\b(?:search|find|look up|show|pics|pictures|images|listings|products|items|for sale|on sale|cheap|deals)\b/i;
     let _rewritten = 0;
     skillPlan = skillPlan.flatMap((step) => {
       if (!_forbiddenPublicSkills.has(step.skill)) return [step];
+      if (step.skill === 'app.agent' && _postWebMode === 'public_read'
+          && _PUBLIC_REAL_BROWSER_ACTIONS.has(step.args?.action)) return [step];
       _rewritten++;
       const _taskText = step.args?.task || userMessage || '';
       const _svc = step.args?.agentId?.replace(/\.agent$/, '') || step.args?.appName || '';
@@ -2800,6 +2825,29 @@ The user's request does NOT match any installed skill.
               logger.info(`[Node:PlanSkillsV2] Injected deep-link URL for ${step.args.agentId}: ${dl.url} (source=${dl.source || 'unknown'})`);
             }
           }
+        }
+      }
+
+      // app.agent navigate_url steps have no agentId — match by URL host
+      // against agents whose startUrl host resolved a deep-link in preflight.
+      // Corrects LLM-guessed URLs on authed services with the real deep link.
+      if (step.skill === 'app.agent' && step.args?.action === 'navigate_url' && step.args?.url) {
+        const _isTemplateVar = /\{\{[^}]+\}\}/.test(step.args.url);
+        if (!_isTemplateVar) {
+          try {
+            const _stepHost = new URL(step.args.url).hostname.replace(/^www\./, '').toLowerCase();
+            const _match = pfAgents.find(a => {
+              if (!a?.deepLinkUrl || !a?.startUrl) return false;
+              try {
+                const _agentHost = new URL(a.startUrl).hostname.replace(/^www\./, '').toLowerCase();
+                return _stepHost === _agentHost || _stepHost.endsWith('.' + _agentHost);
+              } catch (_) { return false; }
+            });
+            if (_match && _match.deepLinkUrl !== step.args.url) {
+              logger.info(`[Node:PlanSkillsV2] Overrode navigate_url URL for host ${_stepHost}: "${step.args.url}" → "${_match.deepLinkUrl}" (source=${_match.deepLinkSource || 'unknown'})`);
+              step.args.url = _match.deepLinkUrl;
+            }
+          } catch (_) { /* non-fatal */ }
         }
       }
     }

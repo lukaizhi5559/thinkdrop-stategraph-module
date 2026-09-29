@@ -825,8 +825,13 @@ module.exports = async function resolveAgent(state) {
   // Exception: a follow-up that continues an established agent-based task keeps
   // the selection path (the prior turn's agent may be needed).
   const _webMode = _tcLocal?.webAccessMode;
-  if ((_webMode === 'download' || _webMode === 'public_read') && !_tcLocal?.isFollowUp) {
-    logger.info(`[Node:ResolveAgent] webAccessMode=${_webMode} — skipping agent selection (public web task, generic skills only): "${userMessage.slice(0, 80)}"`);
+  // A follow-up that refers to the live page (activeDocRef='url') is a page
+  // read, not a continuation of an agent task — observed: "cheapest price on
+  // this page" ran a full LLM agent selection + preflight for amazon.agent
+  // when all it needed was app.agent scan_page.
+  if ((_webMode === 'download' || _webMode === 'public_read')
+      && (!_tcLocal?.isFollowUp || _tcLocal?.activeDocRef === 'url')) {
+    logger.info(`[Node:ResolveAgent] webAccessMode=${_webMode} — skipping agent selection (public web task${_tcLocal?.isFollowUp ? ', url-doc follow-up' : ''}, generic skills only): "${userMessage.slice(0, 80)}"`);
     return {
       ...state,
       resolveAgentResult: {

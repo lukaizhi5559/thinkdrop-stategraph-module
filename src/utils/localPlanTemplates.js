@@ -29,10 +29,48 @@ const DANGEROUS_CMD_RE = /\b(?:rm\s+-(?:r|f|rf|fr)|rmdir|mkfs|dd\s+.*of=|shutdow
 const _q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const _b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
 
+// Site-search URL constructors for page_nav_scan — deterministic templates,
+// never model-invented. Only the verbatim query text is interpolated.
+const _eq = (s) => encodeURIComponent(String(s || '').trim());
+const SITE_SEARCH_URLS = {
+  google:        q => `https://www.google.com/search?q=${_eq(q)}`,
+  bing:          q => `https://www.bing.com/search?q=${_eq(q)}`,
+  duckduckgo:    q => `https://duckduckgo.com/?q=${_eq(q)}`,
+  amazon:        q => `https://www.amazon.com/s?k=${_eq(q)}`,
+  ebay:          q => `https://www.ebay.com/sch/i.html?_nkw=${_eq(q)}`,
+  etsy:          q => `https://www.etsy.com/search?q=${_eq(q)}`,
+  youtube:       q => `https://www.youtube.com/results?search_query=${_eq(q)}`,
+  wikipedia:     q => `https://en.wikipedia.org/wiki/Special:Search?search=${_eq(q)}`,
+  reddit:        q => `https://www.reddit.com/search/?q=${_eq(q)}`,
+  github:        q => `https://github.com/search?q=${_eq(q)}&type=repositories`,
+  stackoverflow: q => `https://stackoverflow.com/search?q=${_eq(q)}`,
+  yelp:          q => `https://www.yelp.com/search?find_desc=${_eq(q)}`,
+  // HN's front page IS the top-stories listing — no real /search verb needed.
+  hackernews:    () => `https://news.ycombinator.com/`,
+  'hacker news': () => `https://news.ycombinator.com/`,
+  news_ycombinator: () => `https://news.ycombinator.com/`,
+  twitter:       q => `https://x.com/search?q=${_eq(q)}`,
+  x:             q => `https://x.com/search?q=${_eq(q)}`,
+};
+
+// Deterministic query extraction for nav-scan when the classifier returns a
+// site but no query ("goto amazon and search for mechanical pencils" →
+// {url:"amazon"}). Strip nav verbs + site names + filler; the remainder is
+// the search text. Empty remainder → let the LLM planner handle it.
+function _extractNavQuery(message) {
+  let q = ` ${String(message || '')} `;
+  q = q.replace(/\b(?:go(?:\s*to)?|goto|open|navigate(?:\s+to)?|visit|search(?:\s+for)?|look\s*(?:up|for)|find|browse|check(?:\s+out)?|show\s+me|and\s+(?:then\s+)?(?:search|look|find)|tell\s+me(?:\s+about)?)\b/gi, ' ');
+  for (const key of Object.keys(SITE_SEARCH_URLS)) {
+    q = q.replace(new RegExp(`\\b${key}\\b`, 'gi'), ' ');
+  }
+  q = q.replace(/\b(?:please|the|a|an|for|on|in|and|then|to|of|me|some|any)\b/gi, ' ');
+  return q.replace(/\s+/g, ' ').replace(/^[\s.,;:!?'"]+|[\s.,;:!?'"]+$/g, '').trim();
+}
+
 // Lexical pre-gate: only fire the classify call when the message could
 // plausibly be a local op. This is a TRIGGER, not a decision — a miss just
 // means no prefire (the decompose site still calls the classifier directly).
-const _PRE_GATE_RE = /(?:^|[\s"'`(\[])(?:~?\/[^\s"'`)]+|\.\.?\/[^\s"'`)]+)|\b(?:battery|disk|uptime|volume|mute|unmute|screenshot|screen\s?shot|terminal|shell|open|launch|quit|remind\w*|alarm|cancel|schedule|process|wifi|bluetooth|hostname|memory|cpu|copy|move|rename|append|write|create|read|list|file)\b/i;
+const _PRE_GATE_RE = /(?:^|[\s"'`(\[])(?:~?\/[^\s"'`)]+|\.\.?\/[^\s"'`)]+)|\b(?:battery|disk|uptime|volume|mute|unmute|screenshot|screen\s?shot|terminal|shell|open|launch|quit|remind\w*|alarm|cancel|schedule|process|wifi|bluetooth|hostname|memory|cpu|copy|move|rename|append|write|create|read|list|file|goto|go\s+to|visit|navigate|browse|page)\b/i;
 function looksLikeLocalOp(message) {
   return _PRE_GATE_RE.test(String(message || ''));
 }
@@ -53,10 +91,9 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
     return retry === '__timeout' || retry === '__error' ? null : retry;
   };
   const hasTarget = tc && typeof tc.followUpTarget === 'string' && tc.followUpTarget;
-  if (hasTarget) {
-    const hit = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
-    return hit === '__error' ? retryOnce() : hit;
-  }
+  // Templates that consume the resolved file target — only these need a
+  // re-classify with full context when the prefire ran without it.
+  const _TARGET_TEMPLATES = new Set(['file_create', 'file_append', 'file_read', 'file_list', 'file_move']);
   if (tc && tc._detPrefirePromise) {
     // Bound the wait — a real template hit resolves in ~2-5s. A stalled
     // provider can hold the classify call for 60s+; awaiting it serializes a
@@ -70,11 +107,26 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
         logger?.info(`[localPlanTemplates] prefired classify ${hit === '__timeout' ? 'timed out at 8s' : 'failed'} — retrying once inline`);
         return retryOnce();
       }
-      if (hit) return hit;
+      // File templates need the resolved target the prefire didn't have —
+      // everything else (page_nav_scan, url_open, sys_query…) is context-
+      // complete, so keep the hit rather than paying for a re-classify
+      // that can return different args and fail validation on a flake.
+      if (hit && (!hasTarget || !_TARGET_TEMPLATES.has(hit.template))) return hit;
+      // Prefire ran before classifyTask — when it lacked the live-page context
+      // (ACTIVE PAGE line + activeDocRef for template validation) its null is
+      // not decisive for url-doc tasks. Re-classify with the full tc.
+      if (tc.activeDocRef === 'url' || (hasTarget && (!hit || _TARGET_TEMPLATES.has(hit.template)))) {
+        const hit2 = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
+        return hit2 === '__error' ? retryOnce() : hit2;
+      }
       // Prefired classify returned null — same prompt/context, re-calling
       // would return the same. Fall through to LLM planner.
       return null;
     } catch (_) { return null; }
+  }
+  if (hasTarget) {
+    const hit = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
+    return hit === '__error' ? retryOnce() : hit;
   }
   const hit = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
   return hit === '__error' ? retryOnce() : hit;
@@ -322,6 +374,65 @@ const TEMPLATES = [
     validate: (a) => (typeof a.ref === 'string' && /^[\w .:–-]{1,40}$/i.test(a.ref.trim()) ? null : 'arg.ref missing/unsafe'),
     build: (a) => [{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', _bibleCmd(a)] }, description: `Fetch ${a.ref}` }],
   },
+  {
+    // Read the page already open in the user's real browser — one clipboard
+    // copy through app.agent scan_page. No playwright, no bot walls, the
+    // user's own sessions apply. Gated on resolveReferencesV2's url doc ref.
+    n: 17, id: 'page_scan', lowRisk: true,
+    describe: 'read/copy the currently open browser page and answer the user\'s question about it ("this page", "the page open", "on this page", "what does it say") — args: {}. Requires an open page (ACTIVE PAGE line below).',
+    validate: (a, m, t, tc) => tc?.activeDocRef === 'url' ? null : 'no active url doc',
+    build: (a, m) => [
+      // timeoutMs opts out of the 10s deterministic cap — focus wait + copy
+      // retries legitimately run to ~15s on a slow-loading page.
+      { skill: 'app.agent', args: { action: 'scan_page', timeoutMs: 25000 }, description: 'Read the open browser page' },
+      { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's question using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
+    ],
+  },
+  {
+    n: 18, id: 'page_print', lowRisk: true,
+    describe: 'print the currently open browser page (Cmd+P) — args: {}. Requires an open page.',
+    validate: (a, m, t, tc) => tc?.activeDocRef === 'url' ? null : 'no active url doc',
+    build: () => [{ skill: 'app.agent', args: { action: 'print_page', timeoutMs: 15000 }, description: 'Print the open page' }],
+  },
+  {
+    // "goto <site> and look up/search <query>" — navigate the real browser to
+    // a deterministic site-search URL (whitelist, never model-invented), then
+    // scan the loaded page. One template covers the whole lane-A corpus shape.
+    n: 19, id: 'page_nav_scan', lowRisk: true,
+    describe: `open a page in the browser and read/answer from it — args: {site, query} for named sites (site: one of ${Object.keys(SITE_SEARCH_URLS).join('|')}, query: verbatim search text) OR {url} only when the message contains a literal URL/host. "goto amazon and search X" → {site:"amazon",query:"X"}, never {url:"amazon"}.`,
+    validate: (a, m) => {
+      const raw = String(a.url || '').trim();
+      const siteKey = SITE_SEARCH_URLS[raw.toLowerCase()] ? raw.toLowerCase()
+        : (SITE_SEARCH_URLS[String(a.site || '').trim().toLowerCase()] ? String(a.site).trim().toLowerCase() : null);
+      if (siteKey) {
+        // Query: model-supplied (must be verbatim) or deterministically
+        // extracted (message-derived by construction — can't invent content).
+        const q = String(a.query || '').trim() || _extractNavQuery(m);
+        if (q.length < 2 || q.length > 200) return 'query missing/too long';
+        return null;
+      }
+      if (raw) {
+        if (!m.includes(raw)) return 'url not message-verbatim';
+        if (/^https?:\/\//i.test(raw)) { try { new URL(raw); return null; } catch (_) { return 'bad url'; } }
+        if (/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}([/?#][^\s]*)?$/i.test(raw)) return null;
+        return 'bad url';
+      }
+      return 'site not in search-url whitelist';
+    },
+    build: (a, m) => {
+      const raw = String(a.url || '').trim();
+      const siteKey = SITE_SEARCH_URLS[raw.toLowerCase()] ? raw.toLowerCase()
+        : String(a.site || '').trim().toLowerCase();
+      const url = raw && !SITE_SEARCH_URLS[raw.toLowerCase()]
+        ? (/^https?:\/\//i.test(raw) ? raw : `https://${raw}`)
+        : SITE_SEARCH_URLS[siteKey](String(a.query || '').trim() || _extractNavQuery(m));
+      return [
+        { skill: 'app.agent', args: { action: 'navigate_url', url, timeoutMs: 15000 }, description: `Open ${url.slice(0, 70)}` },
+        { skill: 'app.agent', args: { action: 'scan_page', timeoutMs: 25000 }, description: 'Read the loaded page' },
+        { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's request using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
+      ];
+    },
+  },
 ];
 
 /** bible_verse — bible-api.com (free, no key). Prints "Reference" then the
@@ -404,7 +515,7 @@ function _dirname(p) {
 // ── Force-classify call ──────────────────────────────────────────────────────
 // Returns { template, args } | null. The prompt lists templates with arg
 // schemas; the model responds {n: 0..N, args: {...}}. n=0/none → fall through.
-const _CLASSIFY_PROMPT = (message, resolvedTarget) => `Pick the single template that implements the user's request, and extract its arguments. Reply with STRICT JSON only: {"n": <number>, "args": {...}} — n=0 only if NO template fits (ambiguous, or multiple independent goals like "read A then email it to B").
+const _CLASSIFY_PROMPT = (message, resolvedTarget, activePage) => `Pick the single template that implements the user's request, and extract its arguments. Reply with STRICT JSON only: {"n": <number>, "args": {...}} — n=0 only if NO template fits (ambiguous, or multiple independent goals like "read A then email it to B").
 
 TEMPLATES:
 ${TEMPLATES.map(t => `${t.n}. ${t.id}: ${t.describe}`).join('\n')}
@@ -424,7 +535,10 @@ EXAMPLES:
 "post hello to twitter" → {"n": 14, "args": {"service": "twitter"}}
 "send a slack message to #eng" → {"n": 14, "args": {"service": "slack"}}
 "check the weather" → {"n": 0, "args": {}}
+"what's the cheapest item on this page" → {"n": 17, "args": {}} (when a page is open)
+"goto amazon and search for baby clothes" → {"n": 19, "args": {"site": "amazon", "query": "baby clothes"}}
 ${resolvedTarget ? `RESOLVED TARGET (the file/app the user's referent points at): ${resolvedTarget}` : ''}
+${activePage ? `ACTIVE PAGE: the user has a browser page open right now (${activePage}) — "this page"/"the page" refers to it, prefer template 17/18` : ''}
 USER: ${message}`;
 
 async function forceClassifyLocalPlan(message, taskClassification, llmBackend, logger) {
@@ -432,8 +546,13 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
   const resolvedTarget = (taskClassification && typeof taskClassification.followUpTarget === 'string'
     && /^(?:~?\/|\.{1,2}\/)/.test(taskClassification.followUpTarget))
     ? taskClassification.followUpTarget : null;
+  // Live page in the user's real browser — lets the model pick page_scan/
+  // page_print for "this page" questions instead of falling to n=0.
+  const activePage = (taskClassification && taskClassification.activeDocRef === 'url'
+    && typeof taskClassification.activeDocTarget === 'string')
+    ? taskClassification.activeDocTarget.slice(0, 120) : null;
   try {
-    const prompt = _CLASSIFY_PROMPT(message, resolvedTarget);
+    const prompt = _CLASSIFY_PROMPT(message, resolvedTarget, activePage);
     // query MUST carry the full prompt — generateAnswer sends payload.query,
     // not the first arg (that param is only a fallback). Passing the raw
     // message here made the model answer the task instead of classifying it.
@@ -477,7 +596,7 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
       return null;
     }
     const args = parsed.args && typeof parsed.args === 'object' ? parsed.args : {};
-    const err = tmpl.validate(args, message, resolvedTarget);
+    const err = tmpl.validate(args, message, resolvedTarget, taskClassification);
     if (err) {
       logger?.info?.(`[localPlanTemplates] ${tmpl.id} validation failed: ${err} — LLM plan fallback`);
       return null;

@@ -258,6 +258,47 @@ async function main() {
       _stripAttachmentTags('what does [Thought: x] mean') === 'what does [Thought: x] mean');
   });
 
+  // ── decomposePromptV2 — active-doc guard (observed bug: "what's the
+  //    cheapest price on this page" → web_search while Amazon was open) ──────
+  await describe('decomposePromptV2 — active-doc guard before web_search guards', async () => {
+    const decomposePromptV2 = require('../src/nodes/decomposePromptV2');
+    const _stubLlm = { generateAnswer: async () => '{}' }; // _classifyDeterministic miss → no template
+    const _mk = (tc, extra = {}) => decomposePromptV2({
+      message: 'what the cheapest price of clothes on this page',
+      _taskClassification: { ...BASE_CLASSIFY, taskType: 'query', webAccessMode: 'public_read', ...tc },
+      llmBackend: _stubLlm, logger: _logger,
+      ...extra,
+    });
+
+    let r = await _mk({ activeDocRef: 'url', activeDocTarget: 'https://www.amazon.com/s?k=baby+clothes', suggestedIntent: 'screen_intelligence' }, { _carriedHint: 'web_search' });
+    check('url ref + public_read + web_search hint → command_automate', r.intentPlan?.[0]?.estimatedIntent === 'command_automate');
+    check('url ref → decomposedBy active-doc-guard', r._decomposedBy === 'active-doc-guard');
+
+    r = await _mk({ activeDocRef: 'file', activeDocTarget: '/tmp/x.md', suggestedIntent: 'screen_intelligence' }, { _carriedHint: 'web_search' });
+    check('file ref + public_read → command_automate', r.intentPlan?.[0]?.estimatedIntent === 'command_automate');
+    check('file ref → decomposedBy active-doc-guard', r._decomposedBy === 'active-doc-guard');
+
+    r = await decomposePromptV2({
+      message: 'what is on my screen',
+      _taskClassification: { ...BASE_CLASSIFY, taskType: 'query', webAccessMode: 'public_read', activeDocRef: 'screen' },
+      _carriedHint: 'web_search', llmBackend: _stubLlm, logger: _logger,
+    });
+    check('screen ref + public_read → screen_intelligence (not web_search)', r.intentPlan?.[0]?.estimatedIntent === 'screen_intelligence');
+
+    r = await _mk({ activeDocRef: null, suggestedIntent: 'web_search' }, { _carriedHint: 'web_search' });
+    check('no ref + public_read → still web_search (guard preserved)', r.intentPlan?.[0]?.estimatedIntent === 'web_search');
+
+    // Bare deictic misresolved to an ambient url — belongs to memory_retrieve.
+    r = await decomposePromptV2({
+      message: 'tell me more about that',
+      _taskClassification: { ...BASE_CLASSIFY, taskType: 'query', webAccessMode: 'public_read', activeDocRef: 'url' },
+      _carriedHint: 'web_search', llmBackend: _stubLlm, logger: _logger,
+    });
+    check('bare deictic + ambient url ref → not command_automate', r.intentPlan?.[0]?.estimatedIntent !== 'command_automate',
+      `got ${r.intentPlan?.[0]?.estimatedIntent}`);
+    check('bare deictic + ambient url ref → memory_retrieve', r.intentPlan?.[0]?.estimatedIntent === 'memory_retrieve');
+  });
+
   // ── Summary ────────────────────────────────────────────────────────────────
   console.log(`\n${'═'.repeat(70)}`);
   console.log(`  ${_passed} passed, ${_failed} failed`);

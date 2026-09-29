@@ -4,7 +4,7 @@ const fs   = require('fs');
 const path = require('path');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { SCREEN_OBSERVATION_RE } = require('../utils/textPatterns.cjs');
-const { forceClassifyLocalPlan } = require('../utils/localPlanTemplates.js');
+const { forceClassifyLocalPlan, _classifyDeterministic } = require('../utils/localPlanTemplates.js');
 
 const INTENT_LOG_PATH = path.join(process.cwd(), 'logs', 'intent-classifier.log');
 function writeIntentLog(entry) {
@@ -196,6 +196,24 @@ module.exports = async function parseIntentV2(state) {
                 lowRisk: hits.every(h => h.lowRisk),
               };
               logger.info(`[Node:ParseIntentV2] multi-compose: ${_detCompose.templates.join(' + ')} → ${_detCompose.steps.length} deterministic steps — skipping merged LLM planning`);
+            } else {
+              // Per-part classify failed — often a false split: "goto google
+              // and search X" decomposed into "goto google" (unclassifiable
+              // alone) + "search X". The FULL message may still hit a compound
+              // template (page_nav_scan). Adopt it only when every part is a
+              // nav/read verb — a mutating part must never be silently
+              // absorbed into a single read-only template.
+              const _READ_ONLY_PART = /^\s*(?:goto|go\s+to|open|visit|navigate(?:\s+to)?|search|look\s*(?:up|for)|find|browse|check(?:\s+out)?|read|tell\s+me|what|summar\w*|copy|print|show)/i;
+              const _MUTATING = /\b(?:set|post|send|delete|remove|create|write|append|rename|move|add\s+to\s+cart|buy|order|purchase|click|type|fill|submit|download|install|sign\s+up|log\s*in|follow|like|comment|reply|book|schedule|cancel|save|turn|volume|mute|quit)\b/i;
+              const _allReadOnly = group.every(g => _READ_ONLY_PART.test(g.text) && !_MUTATING.test(g.text));
+              if (_allReadOnly) {
+                const merged = await _classifyDeterministic(
+                  state.message || mergedText, state._taskClassification, state.llmBackend, logger);
+                if (merged && merged !== '__error' && merged !== '__timeout' && !merged.external) {
+                  _detCompose = { steps: merged.skillPlan, templates: [merged.template], lowRisk: merged.lowRisk };
+                  logger.info(`[Node:ParseIntentV2] multi-compose: per-part classify failed — merged full-message hit (${merged.template}) adopted`);
+                }
+              }
             }
           } catch (e) {
             logger.debug(`[Node:ParseIntentV2] multi-compose classify failed: ${e.message} — merged LLM path`);

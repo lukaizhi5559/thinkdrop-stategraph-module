@@ -9,7 +9,7 @@ const { suggestIntent } = require('../utils/routeTable');
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
 const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, SCRIPTURE_REF_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
 const { TEMPLATES: _LOCAL_TEMPLATES } = require('../utils/localPlanTemplates.js');
-const { _classifyDeterministic } = require('../utils/localPlanTemplates.js');
+const { _classifyDeterministic, looksLikeLocalOp } = require('../utils/localPlanTemplates.js');
 
 // Spread helper — deterministic-plan state fields, including the external
 // service tier (service templates pin an agent but keep normal preflight).
@@ -485,7 +485,7 @@ module.exports = async function decomposePromptV2(state) {
   // "open slack and send a message" / "open youtube and play X" are ONE
   // compound service task, not two goals — the second verb acts inside the
   // thing just opened. Only a real cross-domain conjunction counts.
-  const _OPEN_THEN_SERVICE_ACTION = /\b(?:open|launch)\s+[^.]*?\band\s+(?:then\s+)?(?:play|send|post|tweet|email|text|message|search|find|watch|look\s+up|check|show|read)\b/i;
+  const _OPEN_THEN_SERVICE_ACTION = /\b(?:open|launch|go\s*to|goto|visit|navigate\s+to|browse\s+to|head\s+to)\s+[^.]*?\band\s+(?:then\s+)?(?:play|send|post|tweet|email|text|message|search|find|watch|look\s+up|check|show|read)\b/i;
   // "read the file and tell me what it says" — anaphoric report-continuation
   // ("it"/"the result" refers back to clause 1's output), not a new goal.
   // "tell me how long my mac has been on" introduces NEW data → still multi.
@@ -735,6 +735,42 @@ module.exports = async function decomposePromptV2(state) {
   // This replaces the old IMAGE_REQUEST_RES regex guard: the classifier sees
   // conversation history, so media-less follow-ups ("pull list with links")
   // resolve correctly via followUpTarget.
+  // ── Deterministic fast lane — a compiled template hit IS the decomposition ─
+  // forceClassifyLocalPlan already ran in parallel with classifyTask (prefire),
+  // so by this point its verdict is usually free. A hit means the message is a
+  // known catalog op (page_scan/page_nav_scan/url_open/file_*/sys_*/schedule*/
+  // service_task) — emit one command_automate sub-prompt with the compiled plan
+  // and skip the number-call AND llmDecompose entirely. Saves ~3-6s of serial
+  // LLM calls whose only job was confirming "command_automate".
+  // Runs BEFORE the media-search/public-research guards: an explicit nav
+  // instruction to a named site ("goto youtube and find X") is a browse task
+  // the real browser handles — mediaListing describing the CONTENT must not
+  // divert it to Brave. Non-nav media asks ("show me cat videos") don't match
+  // any template and fall through to the guards unchanged.
+  // Multi-goal conjunctions stay on the LLM path — templates are single-goal.
+  // External templates (service_task) carry _deterministicExternal → preflight
+  // still auth-checks the pinned agent.
+  if (!_hasMultiGoalConjunction
+      && (_tc._detPrefirePromise || looksLikeLocalOp(message))) {
+    const _fastTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    if (_fastTmpl) {
+      logger.info(`[Node:DecomposePromptV2] Deterministic fast lane → command_automate (${_fastTmpl.template}, ${_fastTmpl.skillPlan.length} steps)`);
+      const subPrompts = [{
+        text: message, estimatedIntent: 'command_automate', confidence: 0.9,
+        order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
+      }];
+      writeDecomposeLog({
+        ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+        parser: 'deterministic-fastlane', intent: 'command_automate',
+        subPromptCount: 1, durationMs: Date.now() - t0,
+        subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+      });
+      _emitIntentDecided(state, 'command_automate', 0.9);
+      return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'deterministic-fastlane',
+        intentPlan: subPrompts, ..._detState(_fastTmpl) };
+    }
+  }
+
   const _mediaListing = _tc.mediaListing || 'none';
   // Image requests on a NAMED site ("pics of baby clothes on amazon") stay
   // command_automate → site_search → web.crawl → extractItems (structured
@@ -778,6 +814,36 @@ module.exports = async function decomposePromptV2(state) {
       intentPlan: subPrompts,
     };
   }
+  // ── Active-doc guard — BEFORE the public-research/web_search guards ────────
+  // resolveReferencesV2 already validated the referent: url/file refs carry a
+  // resolved activeDocTarget, and unresolvable refs were downgraded to
+  // 'screen'. A live-doc question ("what's the cheapest price on this page")
+  // can never be answered by Brave — observed: web_search returned generic
+  // results while the Amazon page sat open. Route deterministically to
+  // command_automate so the planner can emit app.agent scan_page / fs.read —
+  // the same verdict parseIntentV2's activeDocRef override encodes, made
+  // deterministic one hop earlier so a contradicting carried hint cannot veto
+  // it. _ambientMisref exempted: a bare deictic ("tell me more about that")
+  // flaked to an ambient url belongs to memory_retrieve, not a page fetch.
+  if (['file', 'url'].includes(_tc.activeDocRef) && _tc.activeDocTarget
+      && !_ambientMisref && !_hasMultiGoalConjunction) {
+    logger.info(`[Node:DecomposePromptV2] Active-doc guard → command_automate (ref=${_tc.activeDocRef} target=${String(_tc.activeDocTarget).slice(0, 80)})`);
+    const subPrompts = [{
+      text: message, estimatedIntent: 'command_automate', confidence: 0.9,
+      order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
+    }];
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'active-doc-guard', intent: 'command_automate',
+      subPromptCount: 1, durationMs: Date.now() - t0,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'command_automate', 0.9);
+    const _docTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'active-doc-guard', intentPlan: subPrompts,
+      ..._detState(_docTmpl) };
+  }
+
   // ── Public-research guard — checked BEFORE the command_automate short-circuit ──
   // classifyTask marks "look online for X" / "any new X recently" as
   // taskType=browser + webAccessMode=public_read, which would otherwise
@@ -794,8 +860,13 @@ module.exports = async function decomposePromptV2(state) {
   // A literal filesystem path means the task embeds a file op ("search the web
   // for X and save it to /tmp/y") — not pure public research. The path is
   // ground truth; let the decomposer/agent path see the save half.
+  // activeDocRef means the referent is the live doc/page/screen — file/url
+  // refs were already caught by the active-doc guard above; a 'screen' ref
+  // belongs to the screen-observation guard (OCR answer), never a literal
+  // Brave query on "what's on my screen".
   if (_tc.webAccessMode === 'public_read' && !_tc.targetService && !_hasMultiGoalConjunction
-      && _carriedHint !== 'command_automate' && !FILE_PATH_RE.test(message)) {
+      && _carriedHint !== 'command_automate' && !FILE_PATH_RE.test(message)
+      && !_tc.activeDocRef) {
     logger.info(`[Node:DecomposePromptV2] Public-research guard: routing to web_search (taskType=${_tc.taskType}) — skipping command_automate short-circuit`);
     const subPrompts = [{
       text: message,
@@ -846,6 +917,10 @@ module.exports = async function decomposePromptV2(state) {
     !_tc.needsFreshScreen &&
     !_tc.targetService &&
     !_tc.requiresDOM &&
+    // An active-doc referent ("this page", "the file") is a live-doc question,
+    // not a resolved web topic — url/file refs already routed to
+    // command_automate above; a 'screen' ref belongs to screen-observation.
+    !_tc.activeDocRef &&
     !_ambientMisref &&
     !_hasMultiGoalConjunction
   ) {

@@ -72,6 +72,14 @@ module.exports = async function parseSkill(state) {
     return state;
   }
 
+  // Fast-path: deterministic plan compiled upstream — the skill set is already
+  // fixed, so the semantic match (skill.listNames + LLM call, ~3-5s) can only
+  // produce noise like "just.scrape" matching a page-read question.
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+    logger.info(`[Node:ParseSkill] Deterministic plan (${state._deterministicTemplate || 'template'}) — skipping skill match`);
+    return state;
+  }
+
   const classifyMessage = (resolvedMessage || message || '').trim();
 
   if (!classifyMessage) return state;

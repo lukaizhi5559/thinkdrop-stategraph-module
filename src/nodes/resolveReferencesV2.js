@@ -557,8 +557,15 @@ module.exports = async function resolveReferencesV2(state) {
     // when the message lexically resembles a local op — the two LLM calls
     // otherwise serialize (~7s + ~3s). Decompose awaits this promise via
     // _classifyDeterministic; a resolved followUpTarget reclassifies there.
+    // tc-lite for the prefire: the live page URL is already known from
+    // memory.getActiveAppContext, so page_scan/page_print can hit even
+    // before classifyTask lands. Without it the prefired classify ran with
+    // tc=null and could never select the url-doc templates.
+    const _detPrefireTc = _activeAppContext?.url
+      ? { activeDocRef: 'url', activeDocTarget: _activeAppContext.url }
+      : null;
     const _detPrefire = looksLikeLocalOp(message)
-      ? forceClassifyLocalPlan(message, null, state.llmBackend || null, logger).catch(() => null)
+      ? forceClassifyLocalPlan(message, _detPrefireTc, state.llmBackend || null, logger).catch(() => null)
       : null;
     _taskClassification = await classifyTask(
       message,
@@ -676,6 +683,22 @@ module.exports = async function resolveReferencesV2(state) {
     } else {
       _taskClassification.activeDocRef = 'screen';
     }
+  } else if (_taskClassification.activeDocRef === 'screen') {
+    // The classifier flakes between 'screen' and 'url' on identical page
+    // referents ("what's on this page" → screen_intelligence one run, a real
+    // scan the next). When the live app is a browser AND the message uses
+    // page words, the referent is the page — scan_page reads the tab URL
+    // itself at exec time, so a missing context URL is not disqualifying.
+    const _liveApp = String(_priorScreenContext?.appName || '');
+    const _liveIsBrowser = _priorScreenContext?.category === 'browser'
+      || /\b(?:chrome|safari|edge|brave|arc|firefox|opera|vivaldi|orion|helium|zen)\b/i.test(_liveApp);
+    const _liveUrl = _priorScreenContext?.url || null;
+    if ((_liveUrl || _liveIsBrowser)
+        && /\b(?:this|the|current|open)\s+(?:page|site|website|tab|article|listing)\b|\bon\s+this\s+(?:page|site|website|tab)\b/i.test(message || '')) {
+      _taskClassification.activeDocRef = 'url';
+      _taskClassification.activeDocTarget = _liveUrl;
+      logger.info(`[Node:ResolveReferencesV2] screen→url upgrade: page-referring message + live browser (${_liveApp || 'unknown'}${(_liveUrl || '').slice(0, 60) ? ' ' + _liveUrl.slice(0, 60) : ''})`);
+    }
   }
 
   // ── Deixis fallback: "the file" + live document ──────────────────────────────
@@ -686,8 +709,18 @@ module.exports = async function resolveReferencesV2(state) {
   // fill the null — the classifier's own resolution always wins, this only
   // fires when it produced nothing.
   if (!_taskClassification.activeDocRef) {
+    // Page deixis + live browser → url referent (same flake class as the
+    // screen→url upgrade above, but here the classifier emitted nothing).
+    const _liveAppN = String(_priorScreenContext?.appName || '');
+    const _liveBrowserN = _priorScreenContext?.url || _priorScreenContext?.category === 'browser'
+      || /\b(?:chrome|safari|edge|brave|arc|firefox|opera|vivaldi|orion|helium|zen)\b/i.test(_liveAppN);
+    if (_liveBrowserN && /\b(?:this|the|current|open)\s+(?:page|site|website|tab|article|listing)\b|\bon\s+this\s+(?:page|site|website|tab)\b/i.test(message || '')) {
+      _taskClassification.activeDocRef = 'url';
+      _taskClassification.activeDocTarget = _priorScreenContext?.url || null;
+      logger.info(`[Node:ResolveReferencesV2] deixis fallback: page-referring message + live browser (${_liveAppN || 'unknown'}) → activeDocRef=url`);
+    }
     const _dfp = _priorScreenContext?.filePath || null;
-    if (_dfp && /\b(?:the|this|that|my)\s+(?:file|document|doc|text\s+file|note)\b/i.test(message || '')) {
+    if (!_taskClassification.activeDocRef && _dfp && /\b(?:the|this|that|my)\s+(?:file|document|doc|text\s+file|note)\b/i.test(message || '')) {
       try {
         if (fs.existsSync(_dfp)) {
           _taskClassification.activeDocRef = 'file';

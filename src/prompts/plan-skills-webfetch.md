@@ -74,6 +74,14 @@ Domain-specific patterns for PUBLIC web tasks — downloading files and reading 
   { "skill": "synthesize", "args": { "prompt": "Summarize/answer using the page content." }, "description": "Summarize page" }
 ]
 ```
+**Live-page variant — the referent is the currently open tab** ("this page", "on this page", ACTIVE SCREEN CONTEXT shows the URL): prefer the real-browser lane — it reads the user's actual rendered page (their session, no bot wall):
+```json
+[
+  { "skill": "app.agent", "args": { "action": "scan_page" }, "description": "Copy the current page text to ~/.thinkdrop/copies (5-min cache)" },
+  { "skill": "synthesize", "args": { "prompt": "Answer the user's question using the page content." }, "description": "Answer from the page" }
+]
+```
+Use `web.crawl` on the same URL only when no browser is available or `scan_page` returns `bot_detected`/fails.
 
 **Extract videos/media from a page:**
 ```json

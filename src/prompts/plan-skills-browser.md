@@ -2,6 +2,10 @@
 
 Domain-specific guidance for `browser.agent` and `web.agent`. General skill list, routing hierarchy, output format, and template variables are in the base prompt.
 
+### `browser.agent` is for INTERACTIVE tasks only
+
+URL-first read/search/extract tasks do NOT belong to `browser.agent` — they go through the real-browser lane in `app.agent` (see plan-skills-app.md Phase 4B): `navigate_url` (open the URL in the user's real default browser) → `scan_page` (copy the rendered page to ~/.thinkdrop/copies). This is faster than playwright, is never bot-blocked (real session/cookies), and leaves the page in front of the user. Use `browser.agent` ONLY when the task needs DOM interaction: login/auth flows, forms, add-to-cart, filters, multi-step page flows, AI chatbots.
+
 ### When to use `web.agent` before `browser.agent`
 
 - **Public research / search / look-up (no login needed):** `web.agent` (`research_domain` or `search_and_navigate`) → `synthesize`. NEVER use `browser.agent` — no session needed. Use `web.crawl {{bestUrl}}` first if the full page text is required.

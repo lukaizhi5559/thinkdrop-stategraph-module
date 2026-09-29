@@ -100,6 +100,8 @@ If no authenticated route exists for a service, preflight will surface auth requ
 | Public web research / read a public page | `web.agent` (`research_domain` \| `site_search` \| `search_and_navigate`) or `web.crawl { url }` → `synthesize` (NEVER browser.agent) |
 | Named-site listing/search ("search <site> for X", "show pics of X on <site>") | `web.agent { action: 'site_search', domain, query }` → `web.crawl { url: '{{bestUrl}}', extractItems: true }` → `synthesize` |
 | Bot-blocking site or uncertain URL | `web.agent search_and_navigate` → `web.crawl { url: '{{bestUrl}}' }` → `synthesize` (escalate to `browser.agent` only if web.crawl fails) |
+| Goto/open a site + look up/search/read (user wants to SEE the page — "goto google and look up X", "open amazon and find Y") | `app.agent { action:'navigate_url', url:'<search-or-page url>' }` → `app.agent { action:'scan_page' }` → `synthesize` — real default browser, NOT playwright |
+| Question about the currently-open browser page ("any comments about X on this page") | `app.agent { action:'scan_page' }` → `synthesize` — page copies cached at ~/.thinkdrop/copies for 5 min |
 | Raw public URL (read/extract) | `web.crawl { url, maxChars: 12000 }` → `synthesize` (use `browser.agent` only if login/interaction needed) |
 | Raw URL (interactive — login, form, click) | `browser.agent { action: 'run', task, url }` |
 | Local file ops, scripts, git (no specific third-party CLI tool needed) | `shell.run` |
@@ -116,9 +118,9 @@ If no authenticated route exists for a service, preflight will surface auth requ
 - "watch", "transcribe", "get transcript", "extract from video" → `video.agent` (always wins over ytdlp.agent)
 - "download video", "convert to mp3" → `cli.agent { action: 'run', agentId: 'ytdlp.agent' }`
 - "search <video-platform> for X" → `video.agent { action: 'find_and_watch_tutorial' }` → `synthesize`
-- "goto", "visit", "open site" (public — no login) → `web.crawl` or `web.agent` → `synthesize`
+- "goto", "visit", "open site" (public — no login) → `app.agent navigate_url` + `scan_page` → `synthesize` (real browser — never bot-blocked; `web.crawl`/`web.agent` only when no browser is available or the task is purely headless research)
 - "goto", "visit", "open site" (login/interaction needed) → `browser.agent`
-- "look up", "search", "find X on <site>" (public research) → `web.agent` → `synthesize`
+- "look up", "search", "find X on <site>" (public research, no browse intent) → `web.agent` → `synthesize`
 - "download <file>", "get an mp3/pdf/image" (public asset) → `web.agent find_download` → `shell.run curl` → `file` verify
 - "convert", "process file" → CLI first (but NOT "transcribe video" → `video.agent`)
 

@@ -625,6 +625,21 @@ function generateStepContract(stepResult, stepIndex) {
       };
       break;
 
+    case 'app.agent':
+      // scan_page / extract_content_via_clipboard return { content, savedTo, url };
+      // surface savedTo as filePaths so {{LAST_SUCCESSFUL.outputs.filePaths[0]}}
+      // and fs.read follow-ups can reference the page copy on disk.
+      contract.outputs = {
+        content:  { type: 'text', value: stepResult.content || stepResult.stdout || '' },
+        url:      { type: 'text', value: stepResult.url || '' },
+        savedTo:  { type: 'text', value: stepResult.savedTo || '' },
+        filePaths: { type: 'array', value: [stepResult.savedTo].filter(Boolean) },
+        stdout:   { type: 'text', value: stepResult.stdout || stepResult.content || '' },
+        output:   { type: 'text', value: stepResult.output || '' },
+        result:   { type: 'object', value: stepResult.result || null }
+      };
+      break;
+
     default:
       // Generic contract for any skill
       contract.outputs = {
