@@ -72,12 +72,26 @@ module.exports = async function routeIntent(state) {
   // there is no PRIOR SCREEN CONTEXT block. Capture fresh screen content first,
   // then route to the correct handler with enriched context.
   // Guard: !state._needsFreshScreen prevents re-triggering after the grab completes.
-  // screen_display never needs screen OCR — the payload renders on GhostLayer,
-  // the capture just stalls the display and (worse) preparePostScreen used to
-  // reroute it into answer ("display a spinning cube" → LLM answered with
-  // terminal commands instead of painting WebGL).
-  if (state._taskClassification?.needsFreshScreen && !state._needsFreshScreen && intentType !== 'screen_display') {
-    logger.info(`[Node:RouteIntent] needsFreshScreen=true — auto-capturing screen before routing (intent: ${intentType})`);
+  // screen_display skips the grab for pure-paint kinds — "display a spinning
+  // cube" used to get rerouted into answer and stall on a capture it never
+  // needed. DATA-bearing kinds (chart/deck/text/alert/image) whose message
+  // references on-screen content DO need it ("chart the data on this page"):
+  // the grab is lexical so it fires even when the classifier resolved the
+  // referent away (activeDocRef url/file), and is skipped when a recent
+  // monitor capture already supplied _priorScreenContext.
+  const { inferScreenOutput } = require('../utils/textPatterns.cjs');
+  const _PAINT_ONLY_KINDS = new Set(['effect', 'three', 'scene', 'emoji']);
+  const _SCREEN_DATA_REF_RE = /\b(?:this|the|that)\s+(?:page|screen|data|tab|site|window|table)\b|\b(?:data|info|numbers?|stats?|values?|table|content|text|chart)\s+(?:on|from|in|of)\s+(?:this|the|my)\s+(?:page|screen|site|tab|window)\b|\b(?:from|of)\s+(?:the|my|this)\s+screen\b/i;
+  const _sdKind = intentType === 'screen_display'
+    ? (state._taskClassification?.screenOutputKind || inferScreenOutput(state.message || '').kind || 'text')
+    : null;
+  const _sdNeedsScreen = intentType === 'screen_display'
+    && !_PAINT_ONLY_KINDS.has(_sdKind)
+    && _SCREEN_DATA_REF_RE.test(state.message || '')
+    && !state._priorScreenContext?.contextText;
+  if (!state._needsFreshScreen
+      && ((state._taskClassification?.needsFreshScreen && intentType !== 'screen_display') || _sdNeedsScreen)) {
+    logger.info(`[Node:RouteIntent] ${_sdNeedsScreen ? 'screen_display data-ref' : 'needsFreshScreen=true'} — auto-capturing screen before routing (intent: ${intentType})`);
     patch._needsFreshScreen = true;
     patch._postScreenIntent = intentType;
     patch._advanceRoute = 'screenIntelligence';

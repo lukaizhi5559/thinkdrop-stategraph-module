@@ -69,21 +69,107 @@ function _stepResultText(state) {
   return text.trim() || null;
 }
 
-/** "Mon: 4" / "apples = 5" pairs → chart rows. Used for both the inline
- *  message tail and prior-step text (journal_stats/sys_query output). */
+/** Numeric token → value: "$83,165.29" → 83165.29, "1.66T" → 1.66e12,
+ *  "38.2B" → 3.82e10, "2.30%" → 2.3. Covers the stat formats real pages and
+ *  answers actually use — bare `\d+(\.\d+)?` parsing missed all of these. */
+function _parseNum(raw, suffix) {
+  if (raw == null) return null;
+  const n = parseFloat(String(raw).replace(/[$€£,\s]/g, ''));
+  if (!Number.isFinite(n)) return null;
+  const mult = { K: 1e3, M: 1e6, B: 1e9, T: 1e12 }[String(suffix || '').toUpperCase()] || 1;
+  return n * mult;
+}
+
+/** "Mon: 4" / "apples = 5" / "Market Cap $1.66T" pairs → chart rows. Used for
+ *  the inline message tail, prior-step text, prior assistant answers, and
+ *  screen OCR text (label:number formats survive OCR reasonably well). */
 function _pairsToRows(text) {
   if (!text) return [];
-  const pairRe = /([A-Za-z][\w \-']{0,30}?)\s*[:=]?\s*(\d+(?:\.\d+)?)(?=%?\s*(?:[,;]|$))/gm;
+  const pairRe = /(\w[\w .\-'()&/]{0,40}?)\s*[:=–—-]?\s*[$€£]?\s*(-?\d[\d,]*(?:\.\d+)?)\s*([KMBTkmbt])?\s*%?\s*(?=[,;\n]|$)/gm;
   const data = [];
   let pm;
   while ((pm = pairRe.exec(text)) !== null) {
-    const label = pm[1].trim().replace(/,$/, '');
-    if (label && !/^(?:pie|donut|bar|line|area|stat|chart|graph)$/i.test(label)) {
-      data.push({ label, value: parseFloat(pm[2]) });
+    const label = pm[1].trim().replace(/[,:;=–—-]+$/, '');
+    const value = _parseNum(pm[2], pm[3]);
+    // Label must carry at least one letter — "500 600" is a bare number
+    // sequence, not a name→value pair. "24h Volume" is a real label though.
+    if (label && /[A-Za-z]/.test(label) && value != null && !/^(?:pie|donut|bar|line|area|stat|chart|graph|ocr confidence|visible text|screen content|app|window|url)$/i.test(label)) {
+      data.push({ label, value });
     }
   }
   return data;
 }
+
+/** Chart type from the message — "stacked chart" degrades to 'bar' (the
+ *  renderer is single-series; true stacking needs multi-key rows + isStack). */
+function _chartType(message, fallback) {
+  const tm = String(message || '').match(/\b(stacked|pie|donut|bar|line|area|stat)\b/i);
+  if (!tm) return fallback;
+  const t = tm[1].toLowerCase();
+  return t === 'stacked' ? 'bar' : t;
+}
+
+function _chartFromRows(data, message, noTypeFallback) {
+  if (!data || !data.length) return null;
+  const type = _chartType(message, null) || (data.length === 1 ? 'stat' : (noTypeFallback || 'bar'));
+  return type === 'stat'
+    ? { type: 'stat', data: [{ label: data[0].label, value: data[0].value }] }
+    : { type, data, xKey: 'label', yKey: 'value' };
+}
+
+const CHART_EXTRACT_SYSTEM = [
+  'You extract chart data from text for a screen overlay.',
+  'Output ONLY valid JSON: {"type":"pie|donut|bar|line|area|stat","data":[{"label":"name","value":0}]}.',
+  'Pick ONE coherent series — prefer a group of same-unit stats or the metric the request names. Max 12 rows.',
+  'Values must be plain numbers: apply $/€, thousands commas, and K/M/B/T/% scaling yourself ("$1.66T" → 1660000000000, "38.2B" → 38200000000).',
+  'If the text has no chartable series, output {"data":[]}. No markdown, no explanation.',
+].join('\n');
+
+/** LLM fallback: free text (prior answer / screen OCR) → validated chart
+ *  rows. Returns {type, data} or null — caller keeps the honest no-data
+ *  failure when extraction comes back empty. */
+async function _extractChartFromText(text, message, state, logger) {
+  const llm = state.llmBackend;
+  if (!llm || typeof llm.generateAnswer !== 'function' || !text) return null;
+  try {
+    const raw = String(await Promise.race([
+      llm.generateAnswer(
+        `Chart request: ${message}\n\nSource text:\n${String(text).slice(0, 6000)}`,
+        { query: message, context: { systemInstructions: CHART_EXTRACT_SYSTEM, intent: 'screen_display' } },
+        { maxTokens: 500, temperature: 0, taskType: 'extract' }
+      ),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('chart-extract timeout')), 15000)),
+    ]) || '');
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) return null;
+    const parsed = JSON.parse(m[0]);
+    const data = (Array.isArray(parsed.data) ? parsed.data : [])
+      .map(r => {
+        const label = String(r?.label ?? '').trim().slice(0, 60);
+        let value = r?.value;
+        if (typeof value === 'string') {
+          const sm = value.match(/([KMBT])\s*$/i);
+          value = _parseNum(value, sm ? sm[1] : null);
+        } else {
+          value = Number(value);
+        }
+        return { label, value };
+      })
+      .filter(r => r.label && Number.isFinite(r.value))
+      .slice(0, 20);
+    if (!data.length) return null;
+    const type = ['pie', 'donut', 'bar', 'line', 'area', 'stat'].includes(parsed.type) ? parsed.type : null;
+    return { type, data };
+  } catch (e) {
+    logger.warn(`[Node:ScreenOutput] chart-extract failed: ${e.message}`);
+    return null;
+  }
+}
+
+/** Message references content living on the screen/page — "this data",
+ *  "this page", "the data on screen". Gates screen-OCR sources so ambient
+ *  captures can't feed unrelated chart requests. */
+const SCREEN_DATA_REF_RE = /\b(?:this|the|that)\s+(?:page|screen|data|tab|site|window|table)\b|\b(?:data|info|numbers?|stats?|values?|table|content|text|chart)\s+(?:on|from|in|of)\s+(?:this|the|my)\s+(?:page|screen|site|tab|window)\b|\b(?:from|of)\s+(?:the|my|this)\s+screen\b/i;
 
 /** Free text → deck slides: blank lines split slides; first line of each
  *  block becomes the title, "- "/"• " lines become bullets, the rest body. */
@@ -207,8 +293,7 @@ module.exports = async function screenOutput(state) {
         const tail = message.includes(':') ? message.slice(message.lastIndexOf(':') + 1) : message;
         const data = _pairsToRows(tail);
         if (data.length >= 2) {
-          const tm = message.match(/\b(pie|donut|bar|line|area|stat)\b/i);
-          payload.chart = { type: tm ? tm[1].toLowerCase() : 'pie', data, xKey: 'label', yKey: 'value' };
+          payload.chart = { type: _chartType(message, 'pie'), data, xKey: 'label', yKey: 'value' };
         }
       }
       if (!payload.chart) {
@@ -217,8 +302,7 @@ module.exports = async function screenOutput(state) {
         const r = last && last.result && typeof last.result === 'object' ? last.result : null;
         if (r && r.chart && typeof r.chart === 'object') payload.chart = r.chart;
         else if (r && Array.isArray(r.data) && r.data.length) {
-          const m = message.match(/\b(pie|donut|bar|line|area|stat)\b/i);
-          payload.chart = { type: m ? m[1].toLowerCase() : 'pie', data: r.data };
+          payload.chart = { type: _chartType(message, 'pie'), data: r.data };
         }
       }
       // Prior-step text ("Mon: 4\nTue: 7") from a gather step — journal_stats
@@ -227,12 +311,43 @@ module.exports = async function screenOutput(state) {
       // named ("a bar chart of my battery" stays a bar with one bar).
       if (!payload.chart) {
         const data = _pairsToRows(_stepResultText(state));
-        if (data.length) {
-          const tm = message.match(/\b(pie|donut|bar|line|area|stat)\b/i);
-          const type = tm ? tm[1].toLowerCase() : (data.length === 1 ? 'stat' : 'bar');
-          payload.chart = type === 'stat'
-            ? { type: 'stat', data: [{ label: data[0].label, value: data[0].value }] }
-            : { type, data, xKey: 'label', yKey: 'value' };
+        if (data.length) payload.chart = _chartFromRows(data, message);
+      }
+      // Referential sources — "present this data as a chart" points at the
+      // previous assistant answer or the content on screen, not the message
+      // itself. Screen text is only consulted when the message actually
+      // references the screen (ambient OCR must not feed unrelated charts);
+      // the prior assistant answer is consulted either way, like the text
+      // and alert kinds already do.
+      if (!payload.chart) {
+        const convoText = _lastAssistantText(state.conversationHistory);
+        const screenText = (typeof state.screenContext?.text === 'string' && state.screenContext.text)
+          || (typeof state._priorScreenContext?.contextText === 'string' && state._priorScreenContext.contextText)
+          || (typeof state.context === 'string' && state.context)
+          || null;
+        const screenRef = SCREEN_DATA_REF_RE.test(message)
+          || tc.isScreenFollowUp || tc.needsFreshScreen || tc.activeDocRef === 'screen';
+        const sources = screenRef ? [screenText, convoText] : [convoText];
+        for (const t of sources) {
+          const data = _pairsToRows(t);
+          if (data.length) {
+            payload.chart = _chartFromRows(data, message);
+            logger.info(`[Node:ScreenOutput] chart rows from ${t === screenText ? 'screen-context' : 'conversation'} pairs (${data.length} rows)`);
+            break;
+          }
+        }
+        // LLM extraction — prose answers ("BTC trades at $83,165, volume
+        // $12.43B") and OCR tables don't survive label:number parsing.
+        for (const t of sources) {
+          if (payload.chart || !t) continue;
+          const ext = await _extractChartFromText(t, message, state, logger);
+          if (ext) {
+            const type = _chartType(message, null) || ext.type || (ext.data.length === 1 ? 'stat' : 'bar');
+            payload.chart = type === 'stat'
+              ? { type, data: ext.data.slice(0, 1) }
+              : { type, data: ext.data, xKey: 'label', yKey: 'value' };
+            logger.info(`[Node:ScreenOutput] chart rows from ${t === screenText ? 'screen-context' : 'conversation'} LLM-extract (${ext.data.length} rows)`);
+          }
         }
       }
       if (!payload.chart) {

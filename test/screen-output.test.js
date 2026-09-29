@@ -299,6 +299,50 @@ describe('routeIntent — screen_display route', () => {
     });
     assertEq(r._advanceRoute, 'screenOutput');
   });
+
+  it('screen_display + data kind + screen-referential message + no prior capture → lazy grab', async () => {
+    const r = await routeIntent({
+      logger: _noopLogger,
+      message: 'chart the data on this page',
+      intent: { type: 'screen_display', confidence: 0.9 },
+      _taskClassification: { isScreenOutput: true, screenOutputKind: 'chart' },
+    });
+    assertEq(r._advanceRoute, 'screenIntelligence');
+    assertEq(r._needsFreshScreen, true);
+    assertEq(r._postScreenIntent, 'screen_display');
+  });
+
+  it('screen_display + data kind + screen-ref → skips grab when prior capture exists', async () => {
+    const r = await routeIntent({
+      logger: _noopLogger,
+      message: 'chart the data on this page',
+      intent: { type: 'screen_display', confidence: 0.9 },
+      _taskClassification: { isScreenOutput: true, screenOutputKind: 'chart' },
+      _priorScreenContext: { contextText: 'Price $83,165' },
+    });
+    assertEq(r._advanceRoute, 'screenOutput');
+  });
+
+  it('screen_display + paint-only kind → still no capture (spinning-cube regression)', async () => {
+    const r = await routeIntent({
+      logger: _noopLogger,
+      message: 'display a spinning cube on my screen',
+      intent: { type: 'screen_display', confidence: 0.9 },
+      _taskClassification: { isScreenOutput: true, screenOutputKind: 'three', needsFreshScreen: true },
+    });
+    assertEq(r._advanceRoute, 'screenOutput');
+    assertEq(r._needsFreshScreen, undefined);
+  });
+
+  it('non-display intent + needsFreshScreen → still captures (unchanged)', async () => {
+    const r = await routeIntent({
+      logger: _noopLogger,
+      message: 'what does this error mean',
+      intent: { type: 'general_knowledge', confidence: 0.8 },
+      _taskClassification: { needsFreshScreen: true },
+    });
+    assertEq(r._advanceRoute, 'screenIntelligence');
+  });
 });
 
 describe('screenOutput node', () => {
@@ -505,6 +549,93 @@ describe('screenOutput node', () => {
         message: 'show a pie chart on my screen',
         _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart' },
         conversationHistory: [],
+      });
+      assertEq(posted.length, 0);
+      assert(/no chart data/i.test(r._directAnswer));
+    });
+
+    // chart + screen-referential message + _priorScreenContext → rows parsed
+    // from OCR text with real-world number formats ($83,165.29 / $1.66T / %).
+    await _withMockFetch(null, async (posted) => {
+      const r = await screenOutput({
+        logger: _noopLogger,
+        message: 'present this data in a stacked chart on my screen',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart', isScreenFollowUp: true },
+        _priorScreenContext: {
+          contextText: 'Bitcoin Price $83,165.29\nMarket Cap $1.66T\n24h Volume $38.2B',
+        },
+        conversationHistory: [],
+      });
+      assertEq(posted.length, 1, 'screen-context chart must POST');
+      const chart = posted[0].body.chart;
+      assertEq(chart.type, 'bar'); // 'stacked' degrades to 'bar'
+      assert(chart.data.length >= 2, `expected ≥2 rows, got ${JSON.stringify(chart.data)}`);
+      const cap = chart.data.find(d => /market cap/i.test(d.label));
+      assert(cap, 'Market Cap row missing');
+      assertEq(cap.value, 1.66e12);
+      const price = chart.data.find(d => /price/i.test(d.label));
+      assertEq(price.value, 83165.29);
+    });
+
+    // chart + screen-referential message + state.screenContext.text — the
+    // fresh-capture shape (lazy grab / preparePostScreen path).
+    await _withMockFetch(null, async (posted) => {
+      await screenOutput({
+        logger: _noopLogger,
+        message: 'chart the data on this page',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart', needsFreshScreen: true },
+        screenContext: { text: 'Sales Q1 120\nSales Q2 150\nSales Q3 210' },
+        conversationHistory: [],
+      });
+      assertEq(posted.length, 1);
+      assertEq(posted[0].body.chart.data.length, 3);
+    });
+
+    // chart + NO screen reference → ambient screen context must NOT be read
+    // (pollution guard): falls to honest no-data even though OCR text exists.
+    await _withMockFetch(null, async (posted) => {
+      const r = await screenOutput({
+        logger: _noopLogger,
+        message: 'show a bar chart of quarterly goals',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart' },
+        _priorScreenContext: { contextText: 'Bitcoin Price $83,165.29\nMarket Cap $1.66T' },
+        conversationHistory: [],
+      });
+      assertEq(posted.length, 0);
+      assert(/no chart data/i.test(r._directAnswer));
+    });
+
+    // chart + prior assistant answer with prose numbers → LLM extraction.
+    await _withMockFetch(null, async (posted) => {
+      await screenOutput({
+        logger: _noopLogger,
+        message: 'make a chart of this data on my screen',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart' },
+        conversationHistory: [
+          // prose with no label:number adjacency — pairs can't parse, LLM must
+          { role: 'assistant', content: 'Bitcoin jumped to eighty-three thousand dollars while daily volume stayed strong.' },
+        ],
+        llmBackend: {
+          generateAnswer: async () => '{"type":"bar","data":[{"label":"BTC price","value":83165},{"label":"24h volume","value":12430000000}]}',
+        },
+      });
+      assertEq(posted.length, 1, 'LLM-extract chart must POST');
+      const chart = posted[0].body.chart;
+      assertEq(chart.type, 'bar');
+      assertEq(chart.data.length, 2);
+      assertEq(chart.data[0].value, 83165);
+    });
+
+    // LLM extract returning junk → honest failure preserved.
+    await _withMockFetch(null, async (posted) => {
+      const r = await screenOutput({
+        logger: _noopLogger,
+        message: 'chart this data on my screen',
+        _taskClassification: { isScreenOutput: true, screenOutputAction: 'show', screenOutputKind: 'chart' },
+        conversationHistory: [
+          { role: 'assistant', content: 'Nothing numeric here.' },
+        ],
+        llmBackend: { generateAnswer: async () => '{"data":[]}' },
       });
       assertEq(posted.length, 0);
       assert(/no chart data/i.test(r._directAnswer));
