@@ -25,7 +25,13 @@ If no notification method is specified, default to `synthesize` so ThinkDrop sho
 2. One output step based on the method above
 3. (Optional) `synthesize` to confirm the reminder was scheduled/sent
 
+### Recurring schedules (daily/weekly reports, repeated tasks)
+When the request repeats ("daily report", "every morning", "each weekday", "every 2 hours"), set `recur` on the `schedule` step — do NOT use a one-shot delayMs. Accepted recur values: `daily`, `hourly`, `weekdays`, `weekends`, `weekly`, `monthly`, `every morning`, `every evening`, `every <dayname>`, `every N minutes|hours|days`, or a raw cron expression. Combine with `time` (e.g. "8:00 AM") to pin the time of day; default is 9:00 AM local.
+
+Recurring fires re-run the steps that follow the `schedule` step each time (pendingSteps), so the action steps (e.g. calendar read → synthesize report) come AFTER schedule as usual.
+
 ### Examples
 - "Remind me to take out the trash in 1 minute via ThinkDrop alert" → [schedule delayMs=60000 label="Trash reminder"], [synthesize prompt="ThinkDrop alert: Take out the trash"]
 - "Email me a reminder to call mom in 5 minutes" → [schedule delayMs=300000], [shell.run ... send email with subject "Call mom" and body "Time to call mom"]
-- "Remind me to stand up every 30 minutes" → [schedule delayMs=1800000 isRecurring=true], [synthesize prompt="Stand up and stretch"]
+- "Remind me to stand up every 30 minutes" → [schedule recur="every 30 minutes"], [synthesize prompt="Stand up and stretch"]
+- "Give me a daily report of events on my calendar at 8 AM" → [schedule recur="daily" time="8:00 AM" label="Daily calendar report"], [<steps that fetch calendar events>], [synthesize prompt="Report today's calendar events"]

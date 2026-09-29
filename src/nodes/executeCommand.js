@@ -1919,6 +1919,15 @@ module.exports = async function executeCommand(state) {
   // then returns immediately. No blocking setTimeout countdown.
   if (skill === 'schedule') {
     const { time, delayMs: rawDelayMs, label: _rawLabel } = args;
+    // Recurring schedules: planner may emit recur/cron/every/frequency.
+    // "daily report" → recur 'daily' (fires every day via node-cron).
+    const _recur = args.recur || args.cron || args.every || args.frequency || null;
+    const _msgForRecur = (state.message || state.resolvedMessage || '').toLowerCase();
+    const recur = _recur || (
+      /\b(daily|every day|each day|every morning|every evening|every night|weekdays?|weekends?|weekly|monthly|hourly)\b/.test(_msgForRecur)
+        ? (_msgForRecur.match(/\b(daily|every day|each day|every morning|every evening|every night|weekdays?|weekends?|weekly|monthly|hourly)\b/)?.[1] || null)
+        : null
+    );
     const _synthStepForLabel = skillPlan.slice(skillCursor + 1).find(s => s.skill === 'synthesize');
     const _synthPromptForLabel = _synthStepForLabel?.args?.prompt || '';
     const _fallbackLabel = _synthPromptForLabel
@@ -1957,7 +1966,7 @@ module.exports = async function executeCommand(state) {
       }
       if (td) { if (td <= now) td.setDate(td.getDate() + 1); waitMs = td.getTime() - now.getTime(); }
     }
-    if (waitMs <= 0) {
+    if (waitMs <= 0 && !recur) {
       logger.info('[Node:ExecuteCommand] schedule: no valid future time — skipping');
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: 'Schedule: skipped', stdout: 'Skipped' });
       const skipResult = { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: 'Skipped — time already passed' };
@@ -2008,7 +2017,7 @@ module.exports = async function executeCommand(state) {
     const cmdPort = 3007;
     try {
       const http = require('http');
-      const payload = JSON.stringify({ id: reminderId, delayMs: waitMs, label, triggerIntent, triggerPrompt, pendingSteps });
+      const payload = JSON.stringify({ id: reminderId, delayMs: waitMs, label, triggerIntent, triggerPrompt, pendingSteps, recur, time });
       const req = http.request({ hostname: '127.0.0.1', port: cmdPort, path: '/reminder.register', method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }, timeout: 5000 });
       req.on('error', (e) => logger.warn(`[Node:ExecuteCommand] schedule: reminder register failed: ${e.message}`));
       req.write(payload);
@@ -2018,7 +2027,7 @@ module.exports = async function executeCommand(state) {
     if (progressCallback) progressCallback({ type: 'schedule_registered', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: `⏰ Reminder set — ${label} at ${targetIso}`, targetTime: targetIso, label, reminderId });
     // Emit all_done so the UI spinner resolves — the schedule step is the last synchronous step.
     // Remaining deferred steps execute later via the skill-scheduler; they don't block the UI.
-    const _scheduleResult = { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: `Reminder set for ${targetIso} — "${label}"` };
+    const _scheduleResult = { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: recur ? `Recurring schedule set (${recur}) — "${label}"` : `Reminder set for ${targetIso} — "${label}"` };
     const _scheduleFinalResults = [...skillResults, _scheduleResult];
     // Indices of steps that come after the schedule step — these are deferred (run when reminder fires)
     const _deferredStepIndices = skillPlan.slice(skillCursor + 1).map((_, i) => skillCursor + 1 + i);

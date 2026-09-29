@@ -1826,7 +1826,7 @@ async function planSkillsV2(state) {
               const canonicalAgentId = (typeof a.id === 'string' && a.id)
                 ? (a.id.endsWith('.agent') ? a.id : `${a.id}.agent`)
                 : a.id;
-              const baseLine = `- ${canonicalAgentId}: ${a.type} agent${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`;
+              const baseLine = `- ${canonicalAgentId}: ${a.type} agent${a.status === 'not_installed' ? ' [CLI NOT INSTALLED — must install before use]' : ''}${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`;
               agentLines.push(baseLine);
               const svc = (canonicalAgentId || '').replace('.agent', '').toLowerCase();
               if (svc) _registeredAgentServiceMap[svc] = canonicalAgentId;
@@ -1866,7 +1866,7 @@ async function planSkillsV2(state) {
               }
             }
 
-            agentContextNote = `\n\nREGISTERED AGENTS (use browser.agent { action: "run", agentId: "<id>", task: "..." } for these — do NOT use raw browser.act navigate):\n${agentLines.join('\n')}`;
+            agentContextNote = `\n\nREGISTERED AGENTS (use the matching executor — type 'cli' → cli.agent { action: "run", agentId: "<id>", task: "..." }; type 'browser' → browser.agent { action: "run", agentId: "<id>", task: "..." }. Agents with status 'not_installed' need their CLI installed first):\n${agentLines.join('\n')}`;
 
             if (trainedRecipeLines.length > 0) {
               agentContextNote += `\n\nTRAINED RECIPES (when user mentions these, use browser.agent/cli.agent — NOT external.skill):\n${trainedRecipeLines.join('\n')}`;
