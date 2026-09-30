@@ -18,7 +18,7 @@ const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
 
-const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan } = require('../utils/planHelpers');
+const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan, CONFIRM_ONLY_RE } = require('../utils/planHelpers');
 const { SITE_SEARCH_URLS } = require('../utils/localPlanTemplates');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
@@ -140,6 +140,13 @@ function _ensureSynthesizeStep(skillPlan, userMessage) {
     : isEdit
       ? `Summarize what was done in response to: ${userMessage}`
       : `Confirm what was done in response to: ${userMessage}`;
+
+  // Confirm-only prompts are hollow work — lintFileEditPlan drops them at
+  // execution (CONFIRM_ONLY_RE + <400 chars), leaving a phantom step in the
+  // progress UI. Skip the append outright so the plan and the card agree.
+  if (synthesizePrompt.length < 400 && CONFIRM_ONLY_RE.test(synthesizePrompt)) {
+    return skillPlan;
+  }
 
   skillPlan.push({
     skill: 'synthesize',

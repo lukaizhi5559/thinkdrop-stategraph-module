@@ -355,4 +355,4 @@ function _lintFileEditPlan(plan, logger, ctx = {}) {
   return { plan: steps, rewrites };
 }
 
-module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths };
+module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths, CONFIRM_ONLY_RE: _CONFIRM_ONLY_RE };
