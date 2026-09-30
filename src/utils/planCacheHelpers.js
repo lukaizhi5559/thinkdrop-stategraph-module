@@ -31,6 +31,55 @@ const SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 // ── Semantic similarity thresholds ────────────────────────────────────────────
 /** Minimum cosine similarity to surface a plan as a suggestion (modal). */
 const SEMANTIC_SUGGEST_THRESHOLD = 0.50;
+/**
+ * Cosine threshold for slot-gated auto-execute. A semantic match at/above this
+ * AND identical extracted slots (emails/URLs/paths/quotes/numbers) means the
+ * prompt is a paraphrase of the cached one — safe to run without the modal.
+ * Below it, or with any slot mismatch, the hit stays a suggestion modal.
+ */
+const SLOT_AUTOEXECUTE_THRESHOLD = 0.90;
+
+// ── Slot extraction for one-to-one cache safety ───────────────────────────────
+// "Goto Amazon and add baby wipes" vs "On Amazon add baby wipes to my cart" —
+// same slots (none) → paraphrase → auto-exec. "Email somebody@gmail.com" vs
+// "Email dentist info to jake@gmail.com" — recipient slots differ → never
+// auto-exec, or the plan would run with the wrong address.
+const _SLOT_RES = {
+  emails: /[a-z0-9._%+-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+/gi,
+  urls: /https?:\/\/[^\s"'<>)\]]+|\b(?:[a-z0-9-]+\.)+(?:com|net|org|io|ai|dev|app|co|edu|gov|info|me|us|uk|de|fr|jp|au|ca)(?:\/[^\s"'<>)\]]*)?/gi,
+  filePaths: /~\/[^\s"']+|\/(?:Users|home|tmp|var|opt|etc)\/[^\s"']+|[\w.-]+\/[\w./-]+/g,
+  quotedStrings: /"([^"\n]{1,120})"|'([^'\n]{1,120})'|“([^”\n]{1,120})”/g,
+  numbers: /\b\d+(?:[.,:]\d+)*\b/g,
+};
+
+function extractSlots(text) {
+  const slots = {};
+  // Emails overlap the URL regex — strip them first so they don't double-count.
+  const stripped = String(text || '').replace(_SLOT_RES.emails, ' ');
+  for (const [key, re] of Object.entries(_SLOT_RES)) {
+    const src = key === 'emails' ? String(text || '') : stripped;
+    re.lastIndex = 0;
+    const hits = [];
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const val = (m[1] || m[2] || m[3] || m[0]).toLowerCase().trim();
+      if (val) hits.push(val);
+    }
+    slots[key] = [...new Set(hits)].sort();
+  }
+  return slots;
+}
+
+function slotSetsEqual(a, b) {
+  const sa = typeof a === 'string' ? extractSlots(a) : a;
+  const sb = typeof b === 'string' ? extractSlots(b) : b;
+  for (const key of Object.keys(_SLOT_RES)) {
+    const A = sa[key] || [], B = sb[key] || [];
+    if (A.length !== B.length) return false;
+    if (!A.every((v, i) => v === B[i])) return false;
+  }
+  return true;
+}
 
 // ── Cache invalidation: deprecated browser.act plans for named services ───────
 const _NAMED_SERVICE_RE = /\b(google|biblegateway|wikipedia|duckduckgo|reddit|youtube|stackoverflow|amazon|ebay|twitter|x\.com|facebook|instagram|pinterest|linkedin|yelp|tripadvisor|imdb|spotify|netflix|hulu|twitch|tiktok|chatgpt|gemini|perplexity|claude|grok|deepseek|mistral|copilot|midjourney|suno|notion|slack|discord|telegram|whatsapp|github|gitlab|bitbucket)\b/i;
@@ -341,7 +390,7 @@ function findPlanByName(planName, logger) {
   try {
     if (!fs.existsSync(PLANS_DIR)) return null;
     const files = fs.readdirSync(PLANS_DIR)
-      .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
+      .filter(f => f.endsWith('.md') && f.startsWith('plan'))
       .sort().reverse()
       .slice(0, 50);
 
@@ -386,6 +435,40 @@ function findPlanByName(planName, logger) {
 
 // ── Disk-based plan similarity search (semantic embeddings) ──────────────────
 
+// ── Dead-plan sweep (housekeeping) ───────────────────────────────────────────
+// Plans that never finished stay 'pending'/'failed' forever — invisible to the
+// cache but cluttering ~/.thinkdrop/plans. Sweep them once an hour; 'complete'
+// plans are cache content and are NEVER touched.
+let _lastSweepAt = 0;
+const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+const STALE_PLAN_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+function sweepStalePlans(logger, maxAgeMs = STALE_PLAN_MAX_AGE_MS) {
+  const t = Date.now();
+  if (t - _lastSweepAt < SWEEP_INTERVAL_MS) return 0;
+  _lastSweepAt = t;
+  if (!fs.existsSync(PLANS_DIR)) return 0;
+  let removed = 0;
+  try {
+    for (const file of fs.readdirSync(PLANS_DIR)) {
+      if (!file.endsWith('.md') || !file.startsWith('plan')) continue;
+      const planPath = path.join(PLANS_DIR, file);
+      try {
+        const st = fs.statSync(planPath);
+        if (t - st.mtimeMs < maxAgeMs) continue;
+        const head = fs.readFileSync(planPath, 'utf8').slice(0, 800);
+        const statusMatch = head.match(/^status:\s*(.+)/m);
+        const status = statusMatch ? statusMatch[1].trim() : 'pending';
+        if (status === 'complete') continue; // cache content — never delete
+        fs.unlinkSync(planPath);
+        removed++;
+      } catch (_) {}
+    }
+    if (removed) logger && logger.info(`[PlanCache] Swept ${removed} stale pending/failed plan(s)`);
+  } catch (_) {}
+  return removed;
+}
+
 /**
  * Collect candidate completed plans from disk.
  * Returns array of { planPath, file, title, planPrompt, jsonMatch } for scoring.
@@ -393,9 +476,10 @@ function findPlanByName(planName, logger) {
  * @returns {Array}
  */
 function _collectCandidatePlans(sessionId = null) {
+  sweepStalePlans(null);
   if (!fs.existsSync(PLANS_DIR)) return [];
   let files = fs.readdirSync(PLANS_DIR)
-    .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
+    .filter(f => f.endsWith('.md') && f.startsWith('plan'))
     .sort().reverse();
   
   // If sessionId is provided, only search plans from current session
@@ -535,8 +619,14 @@ async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = n
         try { fs.unlinkSync(best.planPath); } catch (_) {}
         return null;
       }
+      // Slot-gated auto-execute: a near-identical paraphrase (cosine ≥ 0.90)
+      // whose extracted slots are identical is the same plan re-asked — run it
+      // without the modal. Any slot difference (different email, URL, path,
+      // quoted string, number) means different args → stay a suggestion.
+      const _slotsEqual = slotSetsEqual(best.planPrompt, prompt);
+      const _autoExec = bestScore >= SLOT_AUTOEXECUTE_THRESHOLD && _slotsEqual;
       logger && logger.info(
-        `[PlanCache] Semantic match found (cosine=${bestScore.toFixed(3)}, autoExecute=false): ${best.file}`
+        `[PlanCache] Semantic match found (cosine=${bestScore.toFixed(3)}, slots=${_slotsEqual ? 'equal' : 'DIFFER'}, autoExecute=${_autoExec}): ${best.file}`
       );
       return {
         planFile: best.planPath,
@@ -544,7 +634,7 @@ async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = n
         file: best.file,
         similarity: bestScore,
         skillPlan,
-        autoExecute: false,
+        autoExecute: _autoExec,
         content: best.content,
       };
     } catch (_) { return null; }
@@ -720,7 +810,7 @@ function findMostRecentPlanInSession(sessionId, logger, maxAgeMinutes = 10) {
   try {
     if (!fs.existsSync(PLANS_DIR)) return null;
     let files = fs.readdirSync(PLANS_DIR)
-      .filter(f => f.endsWith('.md') && f.startsWith('plan-'))
+      .filter(f => f.endsWith('.md') && f.startsWith('plan'))
       .sort().reverse();
 
     if (sessionId) {
@@ -802,6 +892,10 @@ function _findPendingPlanFromList(items, maxAgeMinutes, logger) {
 
 module.exports = {
   SEMANTIC_SUGGEST_THRESHOLD,
+  SLOT_AUTOEXECUTE_THRESHOLD,
+  extractSlots,
+  slotSetsEqual,
+  sweepStalePlans,
   normalizePrompt,
   cosineDistance,
   findSimilarCompletePlan,

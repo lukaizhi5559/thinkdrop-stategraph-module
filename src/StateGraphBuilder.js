@@ -23,6 +23,7 @@ const logConversationNode = require('./nodes/logConversation');
 const resolveReferencesNode = require('./nodes/resolveReferencesV2');
 const parseSkillNode = require('./nodes/parseSkill');
 const checkPlanCacheNode = require('./nodes/checkPlanCache');
+const fastLanePlanNode = require('./nodes/fastLanePlan');
 const synthesizeNode = require('./nodes/synthesize');
 const enrichIntentNode = require('./nodes/enrichIntentV2');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
@@ -56,6 +57,26 @@ const screenOutputNode = require('./nodes/screenOutput');
 
 // extractStepResult lives in ./utils/extractStepResult — shared with the
 // advanceQueue node (the queue runner extracted from the logConversation edge).
+
+// ── Per-node progress events ──────────────────────────────────────────────────
+// Wraps every node so the renderer can show which pipeline stage is running
+// ("Planning steps…", "Checking agent readiness…") instead of a silent gap
+// between the ack phrase and the first step event. The event is lightweight —
+// {type:'node', node:<name>} — and only fires when the caller supplied a
+// progressCallback (handoff/serial automation runs always do).
+function _wrapNodesWithProgress(nodes) {
+  const wrapped = {};
+  for (const [name, fn] of Object.entries(nodes)) {
+    wrapped[name] = async (state) => {
+      const cb = state?.progressCallback;
+      if (typeof cb === 'function') {
+        try { cb({ type: 'node', node: name }); } catch (_) { /* progress is best-effort */ }
+      }
+      return fn(state);
+    };
+  }
+  return wrapped;
+}
 
 class StateGraphBuilder {
   /**
@@ -197,6 +218,7 @@ class StateGraphBuilder {
       parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       checkPlanCache: (state) => checkPlanCacheNode({ ...state, logger }),
+      fastLanePlan: (state) => fastLanePlanNode({ ...state, logger }),
       enrichIntent: (state) => enrichIntentNode({ ...state, logger, mcpAdapter }),
       resolveUserContext: (state) => resolveUserContextNode({ ...state, logger, mcpAdapter }),
       gatherPlanContext: (state) => gatherPlanContextNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -256,7 +278,11 @@ class StateGraphBuilder {
         }
         return 'checkPlanCache';
       },
-      checkPlanCache: 'parseSkill',
+      // checkPlanCache may inject _skillPlan (cache hit); fastLanePlan injects
+      // a fixed browse plan when taskClassification proves a simple public-web
+      // lookup. Either way, _skillPlan downstream cascades to planSkills.
+      checkPlanCache: 'fastLanePlan',
+      fastLanePlan: 'parseSkill',
       parseSkill: (state) => {
         // parseIntent has already run upstream — always proceed to enrichIntent.
         // parseSkill may have set matchedSkillName via strategies 1/2 (exact/phrase match)
@@ -485,7 +511,7 @@ class StateGraphBuilder {
       advanceQueue: (state) => state._advanceRoute || 'end',
     };
     
-    return new StateGraph(nodes, edges, {
+    return new StateGraph(_wrapNodesWithProgress(nodes), edges, {
       logger,
       mcpAdapter,
       debug: options.debug || false

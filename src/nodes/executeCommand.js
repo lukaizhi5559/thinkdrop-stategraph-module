@@ -3973,14 +3973,17 @@ CRITICAL RULES:
         _progressTimers.push(timer);
       });
 
+      // Stream tokens to the UI as they arrive while buffering — if a later
+      // pass corrects the answer (apology retry, schema retry, hallucination
+      // guard), the final block pushes a \x00REPLACE\x00 with the fixed text.
+      let _streamedSynth = '';
+      const _synthOnToken = typeof streamCallback === 'function'
+        ? (tok) => { if (tok) { _streamedSynth += tok; streamCallback(tok); } }
+        : null;
       try {
-        // Always generate silently first (pass null for streamCallback) so we can
-        // inspect the answer before streaming. Streaming the apology text to the UI
-        // and then correcting it on retry causes the Summary panel to show "I apologize"
-        // even when the retry succeeds. We stream the final confirmed answer below.
         let _synthThinking = '';
         const _synthOnReasoning = (r) => { if (r) _synthThinking += r; };
-        synthesisAnswer = await llmBackend.generateAnswer(synthesisQuery, synthPayload, synthPayload.options, null, _synthOnReasoning);
+        synthesisAnswer = await llmBackend.generateAnswer(synthesisQuery, synthPayload, synthPayload.options, _synthOnToken, _synthOnReasoning);
         if (_synthThinking) state._synthThinking = _synthThinking;
         logger.debug(`[Node:ExecuteCommand] synthesize: LLM answer generated (${synthesisAnswer.length} chars${_synthThinking ? `, thinking: ${_synthThinking.length} chars` : ''})`);
 
@@ -4125,11 +4128,17 @@ Please try again or search with different terms.`;
       }
 
       // ── Stream the final confirmed answer ─────────────────────────────────
-      // We deliberately held back the streamCallback above to avoid streaming
-      // an apology that the retry then corrects. Now that synthesisAnswer is final,
-      // stream it unconditionally (whether it came from the initial call or the retry).
+      // Tokens already streamed live via _synthOnToken. If a correction pass
+      // changed the answer after streaming (apology/schema retry, hallucination
+      // guard), push a REPLACE so the live bubble swaps to the final text.
       if (typeof streamCallback === 'function' && synthesisAnswer && !synthesisAnswer.startsWith('[Synthesis')) {
-        streamCallback(synthesisAnswer);
+        if (!_streamedSynth) {
+          streamCallback(synthesisAnswer);
+        } else if (_streamedSynth !== synthesisAnswer) {
+          streamCallback('\x00REPLACE\x00' + synthesisAnswer);
+        }
+        // Prevent the all-done path from re-pushing the same answer text.
+        state._answerStreamed = true;
       }
     } else {
       logger.warn('[Node:ExecuteCommand] synthesize: no llmBackend in state — skipping LLM call');

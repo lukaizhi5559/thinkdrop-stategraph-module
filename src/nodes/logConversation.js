@@ -21,6 +21,53 @@ const path = require('path');
 const { storePersonalProfileFact } = require('../utils/personalProfile');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
+/**
+ * Plan status flip at the true terminal node.
+ *
+ * The router sends finished plans straight to reviewExecution → evaluateSkills
+ * → logConversation, so executeCommand's `skillCursor >= skillPlan.length`
+ * all_done branch (which flips plan file status pending→complete) never runs
+ * on the normal path — plan files stayed 'pending' forever and checkPlanCache's
+ * disk search (which only accepts status:'complete') starved.
+ *
+ * Flips status only when the cursor actually walked off the end of the plan —
+ * mid-plan exits (ask_user pause, plan-approval gate) leave it pending. On
+ * 'complete', also warms the session cache so an exact repeat is zero-I/O
+ * auto-execute.
+ */
+function _finalizePlanFile(state, logger) {
+  const planFile = state._skillPlanFile;
+  if (typeof planFile !== 'string' || !planFile) return;
+  const plan = state.skillPlan;
+  if (!Array.isArray(plan) || plan.length === 0) return;
+  if ((state.skillCursor ?? 0) < plan.length) return; // paused mid-plan
+  const results = state.skillResults || [];
+  if (results.length === 0) return;
+  // Dedupe retried steps: keep the ok:true record per step index.
+  const deduped = results.reduce((acc, r) => {
+    const idx = acc.findIndex(x => x.step === r.step);
+    if (idx === -1) acc.push(r);
+    else if (r.ok && !acc[idx].ok) acc[idx] = r;
+    return acc;
+  }, []);
+  const allOk = deduped.every(r => r && r.ok !== false);
+  const newStatus = allOk ? 'complete' : 'failed';
+  try {
+    const md = fs.readFileSync(planFile, 'utf8');
+    const updated = md.replace(/^(status:\s*)(pending|failed|running)(\s*)$/m, `$1${newStatus}$3`);
+    if (updated === md) return;
+    fs.writeFileSync(planFile, updated, 'utf8');
+    logger.info(`[Node:LogConversation] Plan file status → ${newStatus}: ${planFile}`);
+    if (newStatus === 'complete') {
+      try {
+        const { _sessionCacheKey, _sessionCacheSet } = require('../utils/planCacheHelpers');
+        const msg = state.resolvedMessage || state.message;
+        if (msg) _sessionCacheSet(_sessionCacheKey(msg, state.context?.sessionId || null), plan);
+      } catch (_) {}
+    }
+  } catch (_) {}
+}
+
 let EXTRACT_PROMPT = null;
 function loadExtractPrompt() {
   if (EXTRACT_PROMPT) return EXTRACT_PROMPT;
@@ -37,6 +84,9 @@ module.exports = async function logConversation(state) {
   const logger = state.logger || console;
 
   logger.debug('[Node:LogConversation] Logging conversation turn...');
+
+  // Flip plan file status at the terminal node — independent of message logging
+  _finalizePlanFile(state, logger);
 
   // Nothing to log if no message or answer
   if (!message && !answer) {

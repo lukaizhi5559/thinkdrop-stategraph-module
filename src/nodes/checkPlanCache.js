@@ -82,7 +82,7 @@ module.exports = async function checkPlanCache(state) {
 
   if (similarPlan.autoExecute) {
     logger.info(
-      `[Node:CheckPlanCache] Disk exact match → auto-execute: ${similarPlan.file}`
+      `[Node:CheckPlanCache] Disk match → auto-execute (cosine=${similarPlan.similarity?.toFixed?.(3) || 'exact'}): ${similarPlan.file}`
     );
     _sessionCacheSet(cacheKey, similarPlan.skillPlan);
     return {
