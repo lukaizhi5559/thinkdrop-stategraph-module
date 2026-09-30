@@ -303,7 +303,7 @@ const TEMPLATES = [
   },
   {
     n: 10, id: 'url_open', lowRisk: true,
-    describe: 'open a URL or a named website/service in the browser — args: {url} (URL/host verbatim from the message) OR {site} (named site/service verbatim, e.g. "gmail" in "goto gmail in the browser")',
+    describe: 'open a URL or a named website/service in the browser — navigation ONLY, no search/read after it ("goto gmail", "open github") — args: {url} (URL/host verbatim from the message) OR {site} (named site/service verbatim). If the message also asks to search/read/check content on the site → use service_browse.',
     validate: (a, m) => {
       const raw = String(a.url || '').trim();
       if (raw) {
@@ -388,7 +388,7 @@ const TEMPLATES = [
     // planning prompt — the task text is the user's message verbatim, so the
     // model cannot invent instructions.
     n: 14, id: 'service_task', lowRisk: false, external: true,
-    describe: 'action on an external service (post/send/add/search/create/play on twitter/x, gmail, todoist, slack, github, spotify, amazon, notion, reddit, linkedin, youtube, etc.) — args: {service}. Generic service nouns count: "send an email/mail" → gmail, "text message/sms" → sms, "calendar event" → google_calendar.',
+    describe: 'mutating/interactive action on an external service (post/send/add/create/play/reply/forward/compose on twitter/x, gmail, todoist, slack, github, spotify, amazon, notion, reddit, linkedin, youtube, etc.) — args: {service}. Generic service nouns count: "send an email/mail" → gmail, "text message/sms" → sms, "calendar event" → google_calendar. Read-only check/search/list on a service → use service_browse instead.',
     validate: (a, m, t, tc) => {
       const name = _canonicalService(a.service);
       if (!name) return 'bad service name';
@@ -518,6 +518,54 @@ const TEMPLATES = [
     describe: 'read or describe what is currently on the user\'s screen — visible text via OCR ("what\'s on my screen", "what am I looking at", "read my screen") — args: {}',
     validate: () => null,
     build: () => [{ skill: 'screen.capture', args: { timeoutMs: 30000 }, description: 'Read the screen' }],
+  },
+  {
+    // Read-only task on a named external service — "goto gmail and search for
+    // emails from pastor wendal unread", "check my linkedin notifications".
+    // app.agent nav_task resolves a deep-link via browser.agent's cheap tiers
+    // (appKnowledge, criteria/search templates, caches, web.agent, LLM suggest
+    // — no browser-engine spawn), navigates the user's real browser, and reads
+    // the page. It escalates internally to browser.agent run for mutations,
+    // compose/creation deep-links, unresolved targets, or login walls, so a
+    // marginal pick still lands on the full-automation path.
+    //
+    // Deliberately NOT external:true — that flag pins <svc>.agent in
+    // resolveAgent and triggers the auth preflight (a browser spawn — the cost
+    // this template exists to avoid). nav_task does its own login-wall detect
+    // and escalates only when the real session is actually logged out.
+    n: 22, id: 'service_browse', lowRisk: true,
+    describe: 'read-only task on a named external service — check/search/list/read/show unread emails, messages, posts, orders, notifications, inbox ("goto gmail and search for emails from pastor wendal unread", "check my linkedin notifications") — args: {service}. NOT for send/compose/post/create/add/reply/book/buy — those are service_task.',
+    validate: (a, m, t, tc) => {
+      const name = _canonicalService(a.service);
+      if (!name) return 'bad service name';
+      // Same public-read veto as service_task — "biblehub look up X" is a
+      // website fetch, not a service task.
+      if (tc?.webAccessMode === 'public_read' || tc?.isBrowseOnly === true) {
+        return 'public-read browse task — not a service task';
+      }
+      const needles = SERVICE_ALIASES[name] || [name];
+      if (!needles.some(al => new RegExp(`\\b${al.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(m))) {
+        return 'service not named in message';
+      }
+      if (!/\b(read|check|list|show|unread|search|find|look\s*up|view|see|browse|emails?|messages?|notifications?|inbox|orders?|posts?|threads?|mentions?|reviews?|comments?)\b/i.test(m)) {
+        return 'no read cue — use service_task or url_open';
+      }
+      // Any mutation cue → the task needs DOM actions; nav_task would escalate
+      // anyway, so fail fast to service_task/LLM planning instead.
+      if (/\b(send|compose|reply|forward|post|tweet|publish|create|upload|book|schedule|buy|purchase|checkout|place\s+order|delete|remove|dm|comment|like|follow|subscribe|add\s+(?:to|a|an|the|new))\b/i.test(m)) {
+        return 'mutation cue — use service_task';
+      }
+      return null;
+    },
+    build: (a, m) => {
+      const name = _canonicalService(a.service);
+      // timeoutMs covers the internal escalation worst case (full browser.agent
+      // run ~2min) — the fast lane itself finishes well under 15s.
+      return [
+        { skill: 'app.agent', args: { action: 'nav_task', service: name, task: m, timeoutMs: 180000 }, description: `${name}: ${String(m).slice(0, 60)}` },
+        { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's request using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
+      ];
+    },
   },
 ];
 

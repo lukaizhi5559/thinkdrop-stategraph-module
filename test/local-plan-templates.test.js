@@ -261,3 +261,43 @@ describe('service_task (external tier)', () => {
     assert.equal(hit.lowRisk, false);
   });
 });
+
+describe('service_browse (read-only service lane)', () => {
+  it('compiles to app.agent nav_task + synthesize for a gmail search task', async () => {
+    const msg = 'goto gmail and search for emails from pastor wendal unread';
+    const hit = await _hit(msg, _json(22, { service: 'gmail' }));
+    assert.equal(hit.template, 'service_browse');
+    assert.equal(hit.external, undefined);
+    assert.equal(hit.skillPlan[0].skill, 'app.agent');
+    assert.equal(hit.skillPlan[0].args.action, 'nav_task');
+    assert.equal(hit.skillPlan[0].args.service, 'gmail');
+    assert.equal(hit.skillPlan[0].args.task, msg);
+    assert.equal(hit.skillPlan[1].skill, 'synthesize');
+  });
+
+  it('rejects mutation tasks (send/compose → service_task)', async () => {
+    const hit = await _hit('goto gmail and send an email to bob', _json(22, { service: 'gmail' }));
+    assert.equal(hit, null);
+  });
+
+  it('rejects pure navigation with no read cue (→ url_open)', async () => {
+    const hit = await _hit('goto gmail for me', _json(22, { service: 'gmail' }));
+    assert.equal(hit, null);
+  });
+
+  it('rejects a service not named in the message', async () => {
+    const hit = await _hit('check my unread emails', _json(22, { service: 'slack' }));
+    assert.equal(hit, null);
+  });
+
+  it('rejects public_read classification (website fetch, not a service task)', async () => {
+    const hit = await _hit('biblehub look up john 3:16', _json(22, { service: 'biblehub' }), { webAccessMode: 'public_read' });
+    assert.equal(hit, null);
+  });
+
+  it('accepts service aliases (linkedin notifications)', async () => {
+    const hit = await _hit('check my linkedin notifications', _json(22, { service: 'linkedin' }));
+    assert.equal(hit.template, 'service_browse');
+    assert.equal(hit.skillPlan[0].args.service, 'linkedin');
+  });
+});
