@@ -2833,7 +2833,7 @@ The user's request does NOT match any installed skill.
     // bot wall; scan_page reads the already-open tab). Any OTHER app.agent
     // action still rewrites; 'download' mode rewrites everything (scan_page
     // can't fetch files).
-    const _PUBLIC_REAL_BROWSER_ACTIONS = new Set(['navigate_url', 'scan_page', 'print_page']);
+    const _PUBLIC_REAL_BROWSER_ACTIONS = new Set(['navigate_url', 'scan_page', 'print_page', 'read_url']);
     const _publicWebListingSignals = /\b(?:search|find|look up|show|pics|pictures|images|listings|products|items|for sale|on sale|cheap|deals)\b/i;
     let _rewritten = 0;
     skillPlan = skillPlan.flatMap((step) => {
@@ -2853,12 +2853,20 @@ The user's request does NOT match any installed skill.
       }
       // public_read
       const _hasListingSignal = _publicWebListingSignals.test(_taskText) || _publicWebListingSignals.test(userMessage);
+      // search_and_navigate (not research_domain) — it exists to resolve a
+      // navigable URL; research_domain is a guidance extractor that happens to
+      // return bestUrl as a byproduct. preferDomain + a resolved-target query
+      // stop baseline-50 junk (a YouTube Short once beat biblehub.net for a
+      // "biblehub john 3:16" task when preferDomain was null and the query was
+      // the raw sentence).
+      const _rwQuery = step.args?.query || state._taskClassification?.followUpTarget || _taskText;
+      const _rwDomain = _svc || state._taskClassification?.targetService || undefined;
       const _webAgentStep = {
         skill: 'web.agent',
         args: _svc
-          ? { action: 'site_search', domain: _svc, query: _taskText }
-          : { action: 'research_domain', query: _taskText },
-        description: step.description || `Search the web for: ${_taskText.slice(0, 80)}`,
+          ? { action: 'site_search', domain: _svc, query: _rwQuery }
+          : { action: 'search_and_navigate', query: _rwQuery, preferDomain: _rwDomain },
+        description: step.description || `Search the web for: ${_rwQuery.slice(0, 80)}`,
       };
       const _crawlStep = {
         skill: 'web.crawl',

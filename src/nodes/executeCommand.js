@@ -1622,9 +1622,10 @@ module.exports = async function executeCommand(state) {
     } else if (hasBrowserSteps && lastBrowserResult?.url) {
       const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
       answer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
-    } else if (state._deterministicPlan) {
-      // Deterministic fast-path — a synthesize step may be appended at plan
-      // time (_ensureSynthesizeStep); its output IS the answer when present.
+    } else if (state._deterministicPlan || state._fastLane) {
+      // Deterministic fast-path and browse fast-lane — a synthesize step may
+      // be appended at plan time (_ensureSynthesizeStep); its output IS the
+      // answer when present.
       // Otherwise the step stdout is the answer (battery %, file contents, ls
       // output), falling back to the description for silent steps (mv, open).
       const _synth = [...skillResults].reverse().find(r =>
@@ -1706,7 +1707,10 @@ module.exports = async function executeCommand(state) {
       commandOutput: stepSummaries,
       activeBrowserSessionId,
       answer,
-      sessionFileCreations
+      sessionFileCreations,
+      // Clear stale recovery state — a DET_RETRY's 'auto_patch' left set would
+      // re-enter this node past plan end (router guard also covers this).
+      recoveryAction: null,
     };
   }
 
@@ -1919,7 +1923,8 @@ module.exports = async function executeCommand(state) {
       commandExecuted: true,
       failedStep: null,
       activeBrowserSessionId: null,
-      activeBrowserUrl: null
+      activeBrowserUrl: null,
+      recoveryAction: null,
     };
   }
 
@@ -2071,6 +2076,7 @@ module.exports = async function executeCommand(state) {
       skillCursor: skillPlan.length, // skip to end — remaining steps fire on reminder
       commandExecuted: true,
       answer: `⏰ Reminder set: "${label}" at ${targetIso}`,
+      recoveryAction: null,
     };
   }
 
@@ -3954,7 +3960,11 @@ CRITICAL RULES:
           userId: context?.userId,
           intent: 'command_automate'
         },
-        options: { maxTokens: _schemaMaxTokens, temperature: 0.2, fastMode: false, taskType: 'complex' }
+        // Fast-lane synthesis is page-text → formatted answer — 'heavy' chain
+        // (groq/gemini-flash-lite heads at ~400-500 tok/s) serves it in a few
+        // seconds vs 'complex' which can land on a ~25 tok/s paid tail. Full
+        // pipeline keeps 'complex' for larger contexts/schemas.
+        options: { maxTokens: _schemaMaxTokens, temperature: 0.2, fastMode: false, taskType: (state._fastLane || state._taskClassification?.webAccessMode === 'public_read') ? 'heavy' : 'complex' }
       };
       // ── Progress indicator timers ────────────────────────────────────────────
       // Long synthesis calls need periodic user feedback so they don't appear hung
@@ -5048,7 +5058,10 @@ Please try again or search with different terms.`;
     });
   }
 
-  if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepStartDescription });
+  // Include args so consumers (driveProgressDrop's control lock, pre-focus)
+  // can inspect the action — plan:step_start is gated on _skillPlanFile which
+  // injected plans (fast lane, cache hits) never get.
+  if (progressCallback) progressCallback({ type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, args: resolvedArgs, description: stepStartDescription });
 
   // Handle _waitBeforeMs injected by recoverSkill AUTO_PATCH for mid-navigation retries
   if (resolvedArgs._waitBeforeMs) {
@@ -6111,8 +6124,20 @@ Please try again or search with different terms.`;
         const _host = _crawlUrl.hostname.replace(/^www\./, '');
         const _svcKey = _host.split('.')[0].toLowerCase().replace(/[^a-z0-9_]/g, '');
         const _candidateAgentId = `${_svcKey}.agent`;
+        // Wrong-site guard: when the classifier named a target service, a crawl
+        // URL on a DIFFERENT site means search mis-resolved — running that site's
+        // agent extract fetches wrong-domain content (youtube.agent once served
+        // YouTube nav chrome for a BibleHub question). Treat as no match.
+        const _targetSvcKey = String(state._taskClassification?.targetService || '')
+          .toLowerCase().replace(/^https?:\/\//, '').replace(/^www\./, '')
+          .split(/[./]/)[0].replace(/[^a-z0-9_]/g, '');
+        const _siteMismatch = !!_targetSvcKey && _targetSvcKey !== _svcKey;
+        if (_siteMismatch) {
+          logger.info(`[Node:ExecuteCommand] web.crawl ${raw?.botBlocked ? 'bot-blocked' : '0 items'} on ${_host} — mismatches target service "${state._taskClassification.targetService}", skipping service-agent fallback`);
+        }
         // Check if this agent is registered as a browser agent
-        const _agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+        const _agRes = _siteMismatch ? null
+          : await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
         const _agents = _agRes?.data || _agRes || [];
         const _matching = Array.isArray(_agents) ? _agents.find(a => a?.id === _candidateAgentId && a?.type === 'browser') : null;
         if (_matching) {

@@ -749,11 +749,36 @@ module.exports = async function resolveAgent(state) {
   // selection round) so preflight can still auth-check it ────────────────
   if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0 && state._deterministicExternal) {
     const svcAgent = state._deterministicServiceAgent;
-    logger.info(`[Node:ResolveAgent] Deterministic service plan — pinned agent ${svcAgent}`);
-    return { ...state, resolveAgentResult: {
-      agents: [{ agentId: svcAgent, role: resolvedMessage || message || '', exists: true, create: false, type: 'browser' }],
-      reasoning: 'deterministic service template', question: null,
-    } };
+    // Verify the pinned agent is actually registered before asserting
+    // exists:true — a template can pin a service that was never onboarded
+    // ("biblehub look up X" → biblehub.agent), and the hardcoded flag sent
+    // preflight down a route=unknown dead-end. Missing → drop the det plan
+    // entirely and fall through to LLM selection (its path can create a real
+    // agent via startUrl resolution instead of asserting existence).
+    let _pinVerified = !mcpAdapter || !svcAgent; // no registry to check → pin
+    if (mcpAdapter && svcAgent) {
+      try {
+        const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+        const registered = (agRes?.data || agRes || []).filter(a => a && a.id);
+        _pinVerified = registered.some(a => String(a.id).toLowerCase() === String(svcAgent).toLowerCase());
+      } catch (_) { _pinVerified = true; /* registry unreachable — pin anyway */ }
+    }
+    if (_pinVerified) {
+      logger.info(`[Node:ResolveAgent] Deterministic service plan — pinned agent ${svcAgent}`);
+      return { ...state, resolveAgentResult: {
+        agents: [{ agentId: svcAgent, role: resolvedMessage || message || '', exists: true, create: false, type: 'browser' }],
+        reasoning: 'deterministic service template', question: null,
+      } };
+    }
+    logger.info(`[Node:ResolveAgent] Pinned agent ${svcAgent} not registered — dropping deterministic service plan, falling back to LLM planning`);
+    state = {
+      ...state,
+      _deterministicPlan: null,
+      _deterministicTemplate: null,
+      _deterministicLowRisk: null,
+      _deterministicExternal: null,
+      _deterministicServiceAgent: null,
+    };
   }
 
   // ── Skip: deterministic plan — catalog skills never need service agents ────

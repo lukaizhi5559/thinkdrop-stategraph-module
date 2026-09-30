@@ -376,7 +376,12 @@ class StateGraphBuilder {
       executeCommand: (state) => {
         // Thin recovery handler already ran inline in executeCommand and set recoveryAction.
         // Route based on recoveryAction instead of going through recoverSkill node.
-        if (state.recoveryAction === 'auto_patch') {
+        // Guard: a stale 'auto_patch' (e.g. DET_RETRY's flag surviving a
+        // terminal return) must not re-enter executeCommand once the plan has
+        // no remaining steps — that loops until the cycle detector aborts and
+        // skips reviewExecution/logConversation.
+        if (state.recoveryAction === 'auto_patch'
+            && Array.isArray(state.skillPlan) && state.skillCursor < state.skillPlan.length) {
           logger.debug('[StateGraph:Router] executeCommand: auto_patch → retry executeCommand');
           return 'executeCommand';
         }

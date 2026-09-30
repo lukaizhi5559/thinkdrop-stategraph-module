@@ -81,6 +81,20 @@ function looksLikeLocalOp(message) {
 // with classifyTask (saves the serial ~2–4s). A resolved followUpTarget means
 // the prefire ran with incomplete context → reclassify with the target.
 async function _classifyDeterministic(message, tc, llmBackend, logger) {
+  // The resolveReferencesV2 prefire classifies with a tc-lite (no
+  // webAccessMode) — a service_task hit there survives validate, so veto
+  // external (service-pinned) templates against the REAL classification at
+  // this chokepoint: a public-read/browse task never needs a service agent
+  // (a website is not a service; "biblehub look up X" pins a nonexistent
+  // biblehub.agent and dead-ends preflight on route=unknown).
+  const _accept = (hit) => {
+    if (hit && hit !== '__error' && hit.external
+        && tc && (tc.webAccessMode === 'public_read' || tc.isBrowseOnly === true)) {
+      logger?.info?.(`[localPlanTemplates] ${hit.template} pinned a service agent but tc is public-read/browse — vetoing; not a service task`);
+      return null;
+    }
+    return hit;
+  };
   // One bounded inline retry for a failed/stalled classify — a healthy
   // provider answers this small prompt in ~2-5s, so a fresh call usually
   // lands even when the first hit a dead stream or tripped breaker.
@@ -106,19 +120,19 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
       ]);
       if (hit === '__timeout' || hit === '__error') {
         logger?.info(`[localPlanTemplates] prefired classify ${hit === '__timeout' ? 'timed out at 8s' : 'failed'} — retrying once inline`);
-        return retryOnce();
+        return _accept(await retryOnce());
       }
       // File templates need the resolved target the prefire didn't have —
       // everything else (page_nav_scan, url_open, sys_query…) is context-
       // complete, so keep the hit rather than paying for a re-classify
       // that can return different args and fail validation on a flake.
-      if (hit && (!hasTarget || !_TARGET_TEMPLATES.has(hit.template))) return hit;
+      if (hit && (!hasTarget || !_TARGET_TEMPLATES.has(hit.template))) return _accept(hit);
       // Prefire ran before classifyTask — when it lacked the live-page context
       // (ACTIVE PAGE line + activeDocRef for template validation) its null is
       // not decisive for url-doc tasks. Re-classify with the full tc.
       if (tc.activeDocRef === 'url' || (hasTarget && (!hit || _TARGET_TEMPLATES.has(hit.template)))) {
         const hit2 = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
-        return hit2 === '__error' ? retryOnce() : hit2;
+        return _accept(hit2 === '__error' ? await retryOnce() : hit2);
       }
       // Prefired classify returned null — same prompt/context, re-calling
       // would return the same. Fall through to LLM planner.
@@ -127,10 +141,10 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
   }
   if (hasTarget) {
     const hit = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
-    return hit === '__error' ? retryOnce() : hit;
+    return _accept(hit === '__error' ? await retryOnce() : hit);
   }
   const hit = await forceClassifyLocalPlan(message, tc, llmBackend, logger);
-  return hit === '__error' ? retryOnce() : hit;
+  return _accept(hit === '__error' ? await retryOnce() : hit);
 }
 
 // Every path arg must appear verbatim in the message or equal a resolved
@@ -269,28 +283,63 @@ const TEMPLATES = [
       return null;
     },
     build: (a) => {
-      const cmd = /quit/i.test(a.op)
-        ? `osascript -e 'tell application "${String(a.app).replace(/"/g, '\\"')}" to quit'`
-        : `open -a ${_q(a.app)}`;
-      return [{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', cmd] }, description: `${a.op} ${a.app}` }];
+      if (/quit/i.test(a.op)) {
+        const cmd = `osascript -e 'tell application "${String(a.app).replace(/"/g, '\\"')}" to quit'`;
+        return [{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', cmd] }, description: `${a.op} ${a.app}` }];
+      }
+      // Plan-time resolution: installed app → `open -a`; registered/known
+      // service (gmail, youtube, …) → real-browser navigate. "open gmail" has
+      // no desktop app — the start_url in ~/.thinkdrop/agents wins.
+      const app = _resolveInstalledApp(a.app);
+      if (app.installed) {
+        return [{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', `open -a ${_q(app.appName)}`] }, description: `${a.op} ${app.appName}` }];
+      }
+      const home = _serviceHomeUrl(a.app);
+      if (home) {
+        return [{ skill: 'app.agent', args: { action: 'navigate_url', url: home, timeoutMs: 15000 }, description: `Open ${home}` }];
+      }
+      return [{ skill: 'shell.run', args: { cmd: 'bash', argv: ['-c', `open -a ${_q(a.app)}`] }, description: `${a.op} ${a.app}` }];
     },
   },
   {
     n: 10, id: 'url_open', lowRisk: true,
-    describe: 'open a URL in the default browser — args: {url}',
+    describe: 'open a URL or a named website/service in the browser — args: {url} (URL/host verbatim from the message) OR {site} (named site/service verbatim, e.g. "gmail" in "goto gmail in the browser")',
     validate: (a, m) => {
       const raw = String(a.url || '').trim();
-      if (!raw || !m.includes(raw)) return 'url not message-verbatim';
-      // Accept full URLs and bare hosts ("youtube.com") — `open` handles both.
-      if (/^https?:\/\//i.test(raw)) { try { new URL(raw); return null; } catch (_) { return 'bad url'; } }
-      if (/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}([/?#][^\s]*)?$/i.test(raw)) return null;
-      return 'bad url';
+      if (raw) {
+        if (!m.includes(raw)) return 'url not message-verbatim';
+        // Accept full URLs and bare hosts ("youtube.com") — `open` handles both.
+        if (/^https?:\/\//i.test(raw)) { try { new URL(raw); return null; } catch (_) { return 'bad url'; } }
+        if (/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}([/?#][^\s]*)?$/i.test(raw)) return null;
+        return 'bad url';
+      }
+      const site = String(a.site || '').trim();
+      if (!site) return 'url/site missing';
+      // Site name must be verbatim in the message and a plausible single
+      // site/service token — resolution itself happens in build (registry
+      // start_url → SITE_SEARCH_URLS → web-agent discovery).
+      if (!m.toLowerCase().includes(site.toLowerCase())) return 'site not message-verbatim';
+      if (!/^[a-z0-9][a-z0-9 ._-]{0,39}$/i.test(site)) return 'bad site name';
+      return null;
     },
     build: (a) => {
-      // macOS `open` treats a bare host as a file path — add the scheme.
-      const raw = String(a.url).trim();
-      const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
-      return [{ skill: 'shell.run', args: { cmd: 'open', argv: [url] }, description: `Open ${url}` }];
+      const raw = String(a.url || '').trim();
+      if (raw) {
+        // macOS `open` treats a bare host as a file path — add the scheme.
+        const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+        return [{ skill: 'shell.run', args: { cmd: 'open', argv: [url] }, description: `Open ${url}` }];
+      }
+      const site = String(a.site).trim();
+      const home = _serviceHomeUrl(site);
+      if (home) {
+        return [{ skill: 'app.agent', args: { action: 'navigate_url', url: home, timeoutMs: 15000 }, description: `Open ${home}` }];
+      }
+      // Discovery tier — the plan shape is fixed; web.agent resolves the site's
+      // canonical URL at execution ("goto cathay pacific" needs no table entry).
+      return [
+        { skill: 'web.agent', args: { action: 'search_and_navigate', query: site, preferDomain: site }, description: `Resolve ${site}` },
+        { skill: 'app.agent', args: { action: 'navigate_url', url: '{{bestUrl}}', timeoutMs: 15000 }, description: 'Open resolved site' },
+      ];
     },
   },
   {
@@ -340,9 +389,17 @@ const TEMPLATES = [
     // model cannot invent instructions.
     n: 14, id: 'service_task', lowRisk: false, external: true,
     describe: 'action on an external service (post/send/add/search/create/play on twitter/x, gmail, todoist, slack, github, spotify, amazon, notion, reddit, linkedin, youtube, etc.) — args: {service}. Generic service nouns count: "send an email/mail" → gmail, "text message/sms" → sms, "calendar event" → google_calendar.',
-    validate: (a, m) => {
+    validate: (a, m, t, tc) => {
       const name = _canonicalService(a.service);
       if (!name) return 'bad service name';
+      // A public_read classification means the task was already judged a
+      // read-only browse — pinning a service agent contradicts that. "biblehub
+      // look up X" is a website fetch, not a service action; service_task must
+      // never fire here or it pins a nonexistent biblehub.agent and preflight
+      // dead-ends on route=unknown.
+      if (tc?.webAccessMode === 'public_read' || tc?.isBrowseOnly === true) {
+        return 'public-read browse task — not a service action';
+      }
       // The service (or one of its aliases) must be mentioned in the message —
       // the model cannot route to a service the user didn't ask for.
       const needles = SERVICE_ALIASES[name] || [name];
@@ -532,6 +589,59 @@ function _canonicalService(svc) {
   // the message; validate() enforces the mention check separately.
   if (!/^[a-z][a-z0-9_]{0,30}$/.test(s)) return null;
   return s;
+}
+
+// ── open/goto target resolution ──────────────────────────────────────────────
+// Resolve a named target ("gmail", "spotify", "youtube") to a browser URL or an
+// installed desktop app — decided at PLAN time so the step emits exactly one
+// correct command instead of a compound guess.
+
+// Named service → its canonical URL. Sources, in order:
+//   1. the registered agent's start_url (~/.thinkdrop/agents/<name>.agent.md) —
+//      the registry is the maintained source of truth (gmail → mail.google.com)
+//   2. SITE_SEARCH_URLS origins (youtube → https://www.youtube.com)
+function _serviceHomeUrl(name) {
+  const canon = _canonicalService(name);
+  if (canon) {
+    try {
+      const _fs = require('fs');
+      const _p = require('path');
+      const _os = require('os');
+      const md = _p.join(_os.homedir(), '.thinkdrop', 'agents', `${canon}.agent.md`);
+      if (_fs.existsSync(md)) {
+        const m = /^start_url:\s*(\S+)\s*$/m.exec(_fs.readFileSync(md, 'utf8'));
+        if (m && /^https?:\/\//i.test(m[1])) return m[1];
+      }
+    } catch (_) { /* registry unreadable — fall through */ }
+  }
+  const key = String(name || '').trim().toLowerCase();
+  if (SITE_SEARCH_URLS[key]) {
+    try { return new URL(SITE_SEARCH_URLS[key]('')).origin; } catch (_) { /* fall through */ }
+  }
+  return null;
+}
+
+// Named target → installed desktop app. Reuses probeDesktopApp's candidate-name
+// aliases + filesystem scan (adds /System/Applications — Mail/Calendar/Notes
+// live there on modern macOS). Sync; a miss returns {installed:false}.
+function _resolveInstalledApp(name) {
+  try {
+    const { _deriveAppNames, _scanApplicationsForApp } = require('./probeDesktopApp');
+    const hit = _scanApplicationsForApp(_deriveAppNames(name));
+    if (hit.installed) return hit;
+  } catch (_) { /* fall through to extra dir scan */ }
+  // System apps dir (Mail.app, Calendar.app, Notes.app, …)
+  try {
+    const _fs = require('fs');
+    const needle = String(name || '').trim().toLowerCase();
+    for (const entry of _fs.readdirSync('/System/Applications')) {
+      const base = entry.replace(/\.app$/i, '').toLowerCase();
+      if (base === needle || base.endsWith(` ${needle}`)) {
+        return { installed: true, appName: entry.replace(/\.app$/i, '') };
+      }
+    }
+  } catch (_) { /* no system dir */ }
+  return { installed: false, appName: null };
 }
 
 function _dirname(p) {

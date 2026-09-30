@@ -6,9 +6,14 @@
  * Runs right after checkPlanCache. When taskClassification (resolveReferencesV2)
  * already proves the request is a simple public-web lookup — browse-only, no
  * DOM interaction, no login, no clarification needed — inject a fixed
- * [web.agent → web.crawl → synthesize] plan as _skillPlan instead of paying for
- * the full PlanSkillsV2 LLM planning pass (a ~78k-char prompt for what is
- * always the same 3 steps).
+ * [web.agent → app.agent read_url → synthesize] plan as _skillPlan instead of
+ * paying for the full PlanSkillsV2 LLM planning pass (a ~78k-char prompt for
+ * what is always the same 3 steps).
+ *
+ * read_url is the tiered fetch: invisible HTTP (~1s) → real-browser copy
+ * (~5s, dodges bot walls via the user's session) → web.crawl playwright
+ * fallback — so the plan stays 3 steps while the retry ladder lives inside
+ * the skill.
  *
  * The injected _skillPlan rides the existing pre-built-plan machinery:
  * parseSkill/enrichIntent pass through, routeIntent skips resolveUserContext /
@@ -32,19 +37,21 @@ function _extractUrl(message) {
   return null;
 }
 
-function _eligible(state) {
-  if (state.intent?.type !== 'command_automate') return false;
-  // A pre-built plan (cache hit, resume, approval round-trip) always wins.
-  if (state._skillPlan?.length || state._planFile || state._forceNewPlan) return false;
-  if (state.recoveryContext || state.isMultiIntent || state._planCorrectionMode) return false;
-
-  const tc = state._taskClassification;
+// taskClassification-only eligibility — shared with decomposePromptV2, which
+// short-circuits its LLM call when this passes (the gate can't drift apart or
+// decompose would skip the call for prompts the lane then rejects).
+function isBrowseFastLaneTc(tc) {
   if (!tc) return false;
   if (tc.isBrowseOnly !== true) return false;
   if (tc.requiresDOM === true) return false;
   if (tc.webAccessMode !== 'public_read') return false;
   if (tc.needsClarification === true) return false;
-  if (tc.isFollowUp === true || tc.isThoughtReply === true) return false;
+  // Resolved browse follow-ups ("yes, look up the Greek words" → followUpTarget
+  // resolves to a concrete topic) are just as fixed-shape as fresh lookups —
+  // the veto stays only for follow-ups whose referent never resolved.
+  const _resolvedFollowUp = !!(tc.followUpTarget)
+    && (!tc.resolution || tc.resolution === 'resolved');
+  if ((tc.isFollowUp === true || tc.isThoughtReply === true) && !_resolvedFollowUp) return false;
   if (tc.resolution && tc.resolution !== 'resolved') return false;
   // Any screen/identity/content nuance needs the full planner.
   if (tc.isScreenFollowUp || tc.needsFreshScreen || tc.isAppUiInspection ||
@@ -56,6 +63,14 @@ function _eligible(state) {
   return true;
 }
 
+function _eligible(state) {
+  if (state.intent?.type !== 'command_automate') return false;
+  // A pre-built plan (cache hit, resume, approval round-trip) always wins.
+  if (state._skillPlan?.length || state._planFile || state._forceNewPlan) return false;
+  if (state.recoveryContext || state.isMultiIntent || state._planCorrectionMode) return false;
+  return isBrowseFastLaneTc(state._taskClassification);
+}
+
 module.exports = async function fastLanePlan(state) {
   const logger = state.logger || console;
   if (!_eligible(state)) return state;
@@ -64,35 +79,40 @@ module.exports = async function fastLanePlan(state) {
   if (!message) return state;
 
   const url = _extractUrl(message);
+  const fetchStep = {
+    skill: 'app.agent',
+    args: {
+      action: 'read_url',
+      url: url || '{{bestUrl}}',
+      fallbackUrls: url ? undefined : '{{fallbackUrls}}',
+      cleanup: 'close',           // answer-only lookup — close the temp tab
+      httpFirst: true,
+      crawlFallback: true,
+    },
+    description: url ? `Read ${url.slice(0, 80)}` : 'Read the resolved page',
+  };
   const synthStep = {
     skill: 'synthesize',
-    stepType: 'verify',
     args: {
       prompt: `Answer the user's request using the fetched page content. If the page content is missing or does not answer the question, say so plainly — do not invent facts. User asked: "${message.slice(0, 300)}"`,
     },
     description: 'Answer from fetched page content',
   };
 
+  // Resolved follow-up targets are cleaner queries than the raw continuation
+  // message; targetService biases the domain ranking ("biblehub look up…"
+  // once returned a YouTube Short because preferDomain was null).
+  const _tc2 = state._taskClassification || {};
+  const _searchQuery = String(_tc2.followUpTarget || message).trim() || message;
   const plan = url
-    ? [
-        {
-          skill: 'web.crawl',
-          args: { url, maxChars: 14000, hidden: true, extractItems: true },
-          description: `Fetch ${url.slice(0, 80)}`,
-        },
-        synthStep,
-      ]
+    ? [fetchStep, synthStep]
     : [
         {
           skill: 'web.agent',
-          args: { action: 'search_and_navigate', query: message },
-          description: `Search the web for: "${message.slice(0, 80)}"`,
+          args: { action: 'search_and_navigate', query: _searchQuery, preferDomain: _tc2.targetService || undefined },
+          description: `Search the web for: "${_searchQuery.slice(0, 80)}"`,
         },
-        {
-          skill: 'web.crawl',
-          args: { url: '{{bestUrl}}', fallbackUrls: '{{fallbackUrls}}', maxChars: 14000, hidden: true, extractItems: true },
-          description: 'Fetch the resolved page',
-        },
+        fetchStep,
         synthStep,
       ];
 
@@ -102,5 +122,21 @@ module.exports = async function fastLanePlan(state) {
       state.progressCallback({ type: 'node', node: 'fastLanePlan', label: 'Fast lane — direct web lookup', icon: 'bolt' });
     } catch (_) {}
   }
-  return { ...state, _skillPlan: plan, _fastLane: true };
+
+  // The executing plan is the injected fast-lane plan, not whatever
+  // deterministic template decomposePromptV2 matched upstream (e.g.
+  // bible_verse) — clear those flags so their per-step timeout cap and
+  // answer-branch assumptions don't leak into this run.
+  return {
+    ...state,
+    _skillPlan: plan,
+    _fastLane: true,
+    _deterministicPlan: null,
+    _deterministicTemplate: null,
+    _deterministicLowRisk: null,
+    _deterministicExternal: null,
+    _deterministicServiceAgent: null,
+  };
 };
+
+module.exports.isBrowseFastLaneTc = isBrowseFastLaneTc;

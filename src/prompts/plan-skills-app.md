@@ -72,15 +72,27 @@ The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or mo
 | `clipboard_backup` | Save current clipboard contents to DB before overwriting |
 | `clipboard_restore` | Restore previously backed-up clipboard from DB |
 
-### Phase 4B — Real-Browser URL-First Lane (navigate_url / scan_page / print_page)
+### Phase 4B — Real-Browser URL-First Lane (navigate_url / scan_page / read_url / print_page)
 
 These actions drive the user's REAL default browser — no Playwright, no bot walls (real cookies/session), and the user keeps the page in front of them. Prefer this lane for any "goto <site> and look up/read/search X" or "question about this page" task.
 
 | Action | What it does | Verification |
 |--------|-------------|--------------|
+| `read_url` | `{ url, cleanup?, httpFirst?, crawlFallback?, fallbackUrls? }` — tiered page read: plain HTTP fetch (~1s, invisible) → real-browser tab copy (real cookies — dodges bot walls/captcha) → `web.crawl` playwright fallback. Returns `{ ok, content, url, via }` where `via` = `cache`/`http`/`browser_copy`/`crawl`. | Validates copied text against per-category char floors + bot-wall/error-page/login-wall markers before accepting; `reason` field explains failures (`login_wall`, `bot_detected`, `error_page`, `thin`). |
+| | `cleanup:'close'` | **Answer-only lookups** ("look up X", "what does the page say about Y"): opens a temp tab, copies, then **Cmd+W closes it**. Only used when the user does NOT want the page left open. |
+| | `cleanup:'deselect'` | **Open-and-understand** ("open X", "take me to", "show me the page"): keeps the tab open, clears the select-all highlight. This is the default — when unsure whether the user wants the page, keep it. |
 | `navigate_url` | `{ url, appName?, via? }` — `via:'open'` (default browser, new tab — default for fresh "goto") or `via:'type'` (Cmd+L → just-type → Enter, current tab). `via:'auto'` picks automatically. | Waits a per-category settle time; verify content via `scan_page` |
 | `scan_page` | `{ appName?, url?, useCache?, maxWaitMs? }` — grabs the URL from the address bar, copies the full rendered page (Cmd+L → Cmd+C → Tab → Cmd+A → Cmd+C), saves to `~/.thinkdrop/copies/`. Copies are cached (5-min TTL) — repeat calls for the same URL return instantly with `cached:true`. | Retries the copy until it exceeds a per-URL-category char floor (SERP ~800, shopping ~2000, social ~1200) or `maxWaitMs`. Returns `thin:true` on legit sparse pages, `bot_detected` error on Cloudflare/CAPTCHA walls. |
 | `print_page` | `{ appName? }` — Cmd+P → Enter | Unverifiable by design — reports `verified:false` |
+
+**Read a URL for its content — prefer `read_url` (one step, internal fallback):**
+```json
+[
+  { "skill": "app.agent", "args": { "action": "read_url", "url": "https://biblehub.com/interlinear/john/3-16.htm", "cleanup": "close" }, "description": "Read the page (temp tab, closed after copy)" },
+  { "skill": "synthesize", "args": { "prompt": "Answer using the page content" }, "description": "Present findings" }
+]
+```
+**Mode rules:** `cleanup:'close'` only when the task wants the *information* (research, lookups, "tell me X from this page"). `cleanup:'deselect'` when the task wants the *page itself* open ("open", "go to", "pull up", "show me"). Omit `httpFirst`/`crawlFallback` (defaults on).
 
 **Goto a site and read/search — real browser:**
 ```json
@@ -101,7 +113,7 @@ Deterministic search-URL templates work directly in `navigate_url` (google.com/s
 ```
 Follow-up questions within 5 minutes hit the `scan_page` cache — emit the same step again; do NOT re-navigate. If the task needs the copy on disk, `scan_page` returns `savedTo` (also exposed as `{{LAST_SUCCESSFUL.outputs.filePaths[0]}}`) for a `fs.read` step.
 
-If `scan_page` returns `bot_detected` or fails (no browser available), fall back to `web.crawl { url }` — never `browser.agent` for read-only tasks.
+If `scan_page`/`read_url` returns `bot_detected` or fails (no browser available), fall back to `web.crawl { url }` — never `browser.agent` for read-only tasks. (`read_url` already runs the crawl fallback internally; the explicit fallback step is for `scan_page` plans.)
 
 ## Common Patterns
 

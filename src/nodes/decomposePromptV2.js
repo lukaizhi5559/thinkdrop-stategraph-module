@@ -10,6 +10,7 @@ const { suggestIntent } = require('../utils/routeTable');
 const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, SCRIPTURE_REF_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
 const { TEMPLATES: _LOCAL_TEMPLATES } = require('../utils/localPlanTemplates.js');
 const { _classifyDeterministic, looksLikeLocalOp } = require('../utils/localPlanTemplates.js');
+const { isBrowseFastLaneTc } = require('./fastLanePlan.js');
 
 // Spread helper — deterministic-plan state fields, including the external
 // service tier (service templates pin an agent but keep normal preflight).
@@ -769,6 +770,30 @@ module.exports = async function decomposePromptV2(state) {
       return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'deterministic-fastlane',
         intentPlan: subPrompts, ..._detState(_fastTmpl) };
     }
+  }
+
+  // ── Browse fast-lane short-circuit — no decompose LLM call ──────────────
+  // When classifyTask already proves the request is a simple public-web
+  // lookup (same predicate fastLanePlan gates on — they can't drift), the
+  // decompose call would just echo the prompt back as a lone subPrompt
+  // (~2-3s wasted on the way to a fixed 3-step plan). Emit it directly.
+  // Requires the message be single-goal — multi-intent prompts still need
+  // the LLM split.
+  if (!_hasMultiGoalConjunction && isBrowseFastLaneTc(_tc)) {
+    logger.info('[Node:DecomposePromptV2] Browse fast-lane — emitting single command_automate subPrompt (skipping LLM decompose)');
+    const subPrompts = [{
+      text: message, estimatedIntent: 'command_automate', confidence: 0.9,
+      order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
+    }];
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'browse-fastlane', intent: 'command_automate',
+      subPromptCount: 1, durationMs: Date.now() - t0,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'command_automate', 0.9);
+    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'browse-fastlane',
+      intentPlan: subPrompts };
   }
 
   const _mediaListing = _tc.mediaListing || 'none';
