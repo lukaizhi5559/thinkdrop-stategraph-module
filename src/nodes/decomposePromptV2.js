@@ -7,7 +7,7 @@ const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
-const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, SCRIPTURE_REF_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, LOCAL_FS_PROBE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, SCRIPTURE_REF_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
 const { TEMPLATES: _LOCAL_TEMPLATES } = require('../utils/localPlanTemplates.js');
 const { _classifyDeterministic, looksLikeLocalOp } = require('../utils/localPlanTemplates.js');
 const { isBrowseFastLaneTc } = require('./fastLanePlan.js');
@@ -87,6 +87,7 @@ const DECOMPOSE_SYSTEM_PROMPT = `You decompose a user message for an LLM intent 
 - PRIORITY RULE - FILE/FOLDER WRITE (same precedence): When the message creates, writes, appends, renames, moves, copies, or deletes a local file/folder — especially with a literal path like /tmp/x.txt or ~/doc — use SINGLE command_automate step, even when the file's CONTENT mentions memory/search/display words ("create a file /tmp/notes.txt with the words remember milk" is a file write, NOT a memory store or web search). Shell file ops do the work; no retrieval step is needed to produce literal content.
 - PRIORITY RULE - USER INFO WITH ACTION: When the request is about USER INFO (family, profile, personal data, relationships like mom/dad/wife/cousin, phone numbers, emails, addresses, contacts) AND also requires an external action (send, email, post, fill, submit, create, share), use SINGLE command_automate step. The user.agent skill retrieves the info internally.
 - PRIORITY RULE - USER INFO ONLY: When the request is ONLY asking to show/list/tell/display USER INFO with NO external action (e.g. "who is my wife", "list my family", "what is my mom's phone", "tell me about my contacts"), use SINGLE memory_retrieve step. Do NOT use command_automate for pure info lookup.
+- PRIORITY RULE - LOCAL MACHINE PROBE (same precedence as DEVICE TELEMETRY): Questions about the user's own filesystem or machine artifacts — file/folder counts or contents ("how many files are on my desktop", "what's in my downloads folder"), git status/diff/commit/log, running processes, listening ports, clipboard contents — use SINGLE command_automate step. A shell command is the ONLY way to answer; general_knowledge and web_search hallucinate instructions instead of the answer.
 - PRIORITY RULE - DEVICE TELEMETRY (overrides USER INFO ONLY): "my" + device/hardware state is NOT user info — battery percentage, disk space, storage, RAM/memory usage, uptime, wifi/bluetooth status, volume, brightness, CPU, IP address, hostname, OS version all require a live OS probe → command_automate. EXAMPLES: "what's my battery percentage" → command_automate | "how much disk space do I have" → command_automate | "is my wifi on" → command_automate | "check my uptime" → command_automate | "how much ram is free" → command_automate. These are never memory_retrieve or general_knowledge — nothing stored can answer them.
 - EXAMPLES OF memory_retrieve: "who is my wife" → memory_retrieve | "list all info about my family" → memory_retrieve | "what do you know about my mom" → memory_retrieve | "tell me about my contacts" → memory_retrieve | "show my saved addresses" → memory_retrieve
 - EXAMPLES of command_automate (user info + action): "send my family info via email" → command_automate | "email my wife's number to John" → command_automate | "post about my mom on Facebook" → command_automate | "share my contact list" → command_automate
@@ -241,7 +242,7 @@ function _decisionRoleLabel(m) {
     : 'Assistant (proactive card)';
 }
 
-async function _decomposeDecision(message, llmBackend, conversationHistory, logger, carriedHint = null) {
+async function _decomposeDecision(message, llmBackend, conversationHistory, logger, carriedHint = null, taskClassification = null) {
   const recentCtx = (conversationHistory || []).slice(-4)
     .map(m => `${_decisionRoleLabel(m)}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
@@ -269,6 +270,7 @@ DECISION RULES (check in order):
 - "what is blockchain/what is 5*7" → 5 (general knowledge)
 - "what app am I in/what's on my screen" → 1 (screen observation)
 - "look online for X / find info about X / any new X out recently / what's the latest X" → 2 (web research with NO named site to interact with — NOT command_automate)
+- Questions whose answer requires probing the user's OWN machine — file/folder counts or contents ("how many files are on my desktop", "what's in my downloads"), git status/diff/commit, running processes, listening ports, clipboard contents → 0 (command_automate). There is no text answer to recall — a shell command must run.
 - "search the web / google X / look up X online" → 2 (web search — no site interaction)
 - Naming a site to INTERACT with (post/send/create/add to cart/log in/fill a form) → 0; naming a site only to look something up on it → 2
 - When in doubt → 0 (command_automate is the safest single-step default)
@@ -299,7 +301,14 @@ EXAMPLES:
   const hintLine = hintIdx >= 0
     ? `\nUpstream routing hint (deterministic comms-layer classifier): ${carriedHint} — use it unless the message clearly implies otherwise.`
     : '';
-  const userPrompt = `Message: "${message}"${contextBlock}${hintLine}\nIntent? (0–7)`;
+  // Surface the semantic classifyTask verdict alongside the regex hint —
+  // the two disagree exactly on question-shaped action requests, and the
+  // arbiter used to see only the weaker (regex) signal.
+  const tc = taskClassification || {};
+  const tcLine = tc.taskType
+    ? `\nSemantic classifier verdict: taskType=${tc.taskType}${tc.targetService ? `, targetService=${tc.targetService}` : ''} — local_file/local_system/app_automation/browser mean the request requires a real action on the user's machine; query/ambiguous mean no tool is needed.`
+    : '';
+  const userPrompt = `Message: "${message}"${contextBlock}${hintLine}${tcLine}\nIntent? (0–7)`;
 
   // Parse contract: a bare digit is trusted; a single distinct digit embedded
   // in short text is extracted. Multiple distinct digits (enumerated echoes —
@@ -891,6 +900,7 @@ module.exports = async function decomposePromptV2(state) {
   // Brave query on "what's on my screen".
   if (_tc.webAccessMode === 'public_read' && !_tc.targetService && !_hasMultiGoalConjunction
       && _carriedHint !== 'command_automate' && !FILE_PATH_RE.test(message)
+      && !LOCAL_FS_PROBE_RE.test(message)
       && !_tc.activeDocRef) {
     logger.info(`[Node:DecomposePromptV2] Public-research guard: routing to web_search (taskType=${_tc.taskType}) — skipping command_automate short-circuit`);
     const subPrompts = [{
@@ -991,7 +1001,11 @@ module.exports = async function decomposePromptV2(state) {
     // web_search hint off the word "remember" and produced a
     // [web_search, screen_display] plan for a file write. The path token is
     // ground truth; the task touches the filesystem regardless of the hint.
-    && !FILE_PATH_RE.test(message);
+    && !FILE_PATH_RE.test(message)
+    // Local-probe anchors are ground truth the same way paths are — "how
+    // many files are on my desktop" drew a general_knowledge hint off the
+    // question words and vetoed a correct local_system classification.
+    && !LOCAL_FS_PROBE_RE.test(message);
   // Device-state queries ("what's my battery percentage", "check disk space",
   // "is my wifi on") can ONLY be answered by an OS probe — there is no text
   // answer to hallucinate. This is as deterministic as the screen-output
@@ -1015,6 +1029,29 @@ module.exports = async function decomposePromptV2(state) {
     const _devTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'device-state-guard', intentPlan: subPrompts,
       ..._detState(_devTmpl) };
+  }
+
+  // Local filesystem/git probe — "how many files are on my desktop", "git
+  // status", "what's on my clipboard". Same no-text-answer logic as the
+  // device-state guard: a shell command is the only answer path, and a
+  // question-word hint (general_knowledge) or a flaky taskType must not
+  // talk the pipeline out of executing it.
+  if (LOCAL_FS_PROBE_RE.test(message) && !_hasMultiGoalConjunction) {
+    logger.info('[Node:DecomposePromptV2] Local-probe guard → single-step command_automate');
+    const subPrompts = [{
+      text: message, estimatedIntent: 'command_automate', confidence: 0.9,
+      order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
+    }];
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'local-probe-guard', intent: 'command_automate',
+      subPromptCount: 1, durationMs: Date.now() - t0,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'command_automate', 0.9);
+    const _fsTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'local-probe-guard', intentPlan: subPrompts,
+      ..._detState(_fsTmpl) };
   }
 
   // Named-service site interaction ("search amazon for wireless headphones")
@@ -1344,7 +1381,7 @@ module.exports = async function decomposePromptV2(state) {
     logger.info(`[Node:DecomposePromptV2] classifyTask suggestedIntent=${_suggestedIntent} (hint=${_carriedHint || 'none'} — concur/abstain) — skipping number call`);
     _fastDecision = _suggestedIdx;
   } else {
-    _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint);
+    _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint, _tc);
   }
 
   // Contradiction check: command_automate is the heaviest route (plan +
