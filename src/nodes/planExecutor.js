@@ -160,6 +160,14 @@ module.exports = async function planExecutor(state) {
   // overwrite user files via synthesize saveToFile.
   skillPlan = lintFileEditPlan(skillPlan, logger, { prompt: originalPrompt }).plan;
 
+  // Atomic browser agents: migrate browser.agent run steps in saved plan files
+  // to the atomic skills (url.first.agent / dom.act / turn.loop.agent) when the
+  // ATOMIC_BROWSER_AGENTS flag is on — same net as planSkillsV2's fast paths.
+  try {
+    const { _rewriteBrowserStepsToAtomicAgents } = require('./planSkillsV2');
+    skillPlan = _rewriteBrowserStepsToAtomicAgents(skillPlan, logger);
+  } catch (_) {}
+
   logger.info(`[Node:PlanExecutor] Built skillPlan[${skillPlan.length}] — handing to planSkills → executeCommand`);
 
   // 5. Return setup state — planSkills passthrough → executeCommand runs all steps in one pass.

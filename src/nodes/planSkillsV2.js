@@ -108,6 +108,90 @@ const _SYNTHESIZE_EXEMPT_SKILLS = new Set([
   'edit.agent',
 ]);
 
+// ── Atomic browser agents (Phase 6 of the monolith decomposition) ───────────
+// When ATOMIC_BROWSER_AGENTS is enabled, browser.agent {action:'run'} steps are
+// rewritten post-generation to the deterministic atomic skills based on the
+// planner-emitted stepType:
+//   navigate        → url.first.agent   (deep-link resolution + nav + auth gate)
+//   on-page-action  → dom.act           (runtime router picks the tier executor)
+//   verify          → turn.loop.agent   (verify-only turn loop, no mutations)
+//   extract / none  → left as browser.agent (legacy path until Phase 7)
+// A valid step.agentHint (just.type/meta.find/shortcut.keys/tab.map/gesture/
+// arrow.grid/turn.loop .agent) is carried into dom.act args for the router.
+const _ATOMIC_BROWSER_AGENTS = /^(1|true|yes)$/i.test(process.env.ATOMIC_BROWSER_AGENTS || '');
+const _ONPAGE_AGENT_HINTS = new Set([
+  'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent',
+  'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent',
+]);
+
+// Deterministic stepType inference for browser.agent steps that lack one —
+// keeps cached/legacy plans migratable instead of falling through untouched.
+const _NAV_TASK_RE = /\b(go to|goto|open|navigate|visit|log ?in|sign ?in|search\b.{0,40}\bon\b)\b/i;
+const _VERIFY_TASK_RE = /\b(confirm|verify|check|make sure|ensure|validate)\b/i;
+function _inferStepType(step) {
+  const a = step?.args || {};
+  const t = String(a.task || a.goal || '');
+  if (a.url || _NAV_TASK_RE.test(t)) return 'navigate';
+  if (_VERIFY_TASK_RE.test(t)) return 'verify';
+  return 'on-page-action';
+}
+
+function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
+  if (!_ATOMIC_BROWSER_AGENTS || !Array.isArray(skillPlan)) return skillPlan;
+  const _clean = (o) => { for (const k of Object.keys(o)) if (o[k] === undefined) delete o[k]; return o; };
+  // Track which agents already have a navigation step in this plan — a legacy
+  // nav+act fused step (no stepType, e.g. localPlanTemplates service_task) must
+  // split into url.first + dom.act so navigation isn't silently dropped.
+  const _navigatedAgents = new Set(
+    skillPlan
+      .filter(s => s?.skill === 'url.first.agent' || (s?.skill === 'browser.agent' && s.args?.action === 'run' && s.stepType === 'navigate'))
+      .map(s => String(s.args?.agentId || '').toLowerCase())
+  );
+  const _out = [];
+  let _rewritten = 0;
+  for (const step of skillPlan) {
+    if (step?.skill !== 'browser.agent' || step.args?.action !== 'run') { _out.push(step); continue; }
+    const a = step.args || {};
+    const agentKey = String(a.agentId || '').toLowerCase();
+    const hint = (step.agentHint || a.agentHint || null);
+    const validHint = hint && _ONPAGE_AGENT_HINTS.has(hint) ? hint : null;
+    const stepType = step.stepType || _inferStepType(step);
+    switch (stepType) {
+      case 'navigate':
+        _out.push({ ...step, skill: 'url.first.agent',
+          args: _clean({ task: a.task, agentId: a.agentId, url: a.url, service: a.service, sessionId: a.sessionId, headed: a.headed }) });
+        _navigatedAgents.add(agentKey);
+        _rewritten++;
+        break;
+      case 'verify':
+        _out.push({ ...step, skill: 'turn.loop.agent',
+          args: _clean({ goal: a.task, mode: 'verify', agentId: a.agentId, sessionId: a.sessionId, url: a.url }) });
+        _rewritten++;
+        break;
+      case 'on-page-action': {
+        // Fused nav+act step (no nav step for this agent earlier in the plan):
+        // prepend a url.first.agent step so the session actually navigates.
+        if (agentKey && !_navigatedAgents.has(agentKey)) {
+          _out.push({ ...step, skill: 'url.first.agent', stepType: 'navigate',
+            description: `Navigate to ${a.agentId || 'service'}`,
+            args: _clean({ task: a.task, agentId: a.agentId, url: a.url, service: a.service, sessionId: a.sessionId, headed: a.headed }) });
+          _navigatedAgents.add(agentKey);
+          _rewritten++;
+        }
+        const _actArgs = _clean({ task: a.task, agentId: a.agentId, url: undefined, sessionId: a.sessionId, pageCategory: a.pageCategory, agentContext: a.agentContext });
+        if (validHint) _actArgs.agentHint = validHint;
+        _out.push({ ...step, skill: 'dom.act', args: _actArgs });
+        _rewritten++;
+        break;
+      }
+      default:
+        _out.push(step); // 'extract' — keep legacy browser.agent
+    }
+  }
+  if (_rewritten) logger?.info(`[Node:PlanSkillsV2] atomic-agents: rewrote ${_rewritten} browser.agent step(s) to atomic skills`);
+  return _out;
+}
+
 function _ensureSynthesizeStep(skillPlan, userMessage) {
   if (!Array.isArray(skillPlan) || skillPlan.length === 0) return skillPlan;
   if (skillPlan.some(s => s.skill === 'synthesize')) return skillPlan;
@@ -1079,7 +1163,7 @@ function _buildSystemPrompt(userMessage, state) {
   // the LLM to copy the browser.agent pattern instead of using web.agent.
   const _isPublicWebMode = ['download', 'public_read'].includes(_tc?.webAccessMode);
   if (!_isPublicWebMode) {
-  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser.agent steps)\n\nFor every \`browser.agent\` step, you MUST include a \`stepType\` field with one of these values:\n\n- \`"navigate"\` — step that opens a URL, searches, or goes to a page (e.g., "Search Amazon for X", "Go to YouTube", "Open Gmail")\n- \`"on-page-action"\` — step that clicks/types/selects on the CURRENT page (e.g., "Click the first result, then click Add to Cart", "Fill in the form and submit")\n- \`"verify"\` — step that confirms a result without further interaction (e.g., "Confirm item added to cart", "Check if the email was sent")\n- \`"extract"\` — step that reads/extracts content (e.g., "Read the search results", "Get the email count")\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT classify it as \`"navigate"\` just because it contains the word "search".\n\nExample: [\n  { "skill": "browser.agent", "stepType": "navigate", "args": { "action": "run", "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "browser.agent", "stepType": "on-page-action", "args": { "action": "run", "agentId": "amazon.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "synthesize", "stepType": "verify", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
+  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit"). Optional \`agentHint\`: \`"shortcut.keys.agent"\` (known app hotkey), \`"turn.loop.agent"\` (dense commerce grid).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction (e.g., "Confirm item added to cart")\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
 
     // ── Commerce routing note ──────────────────────────────────────────────
     // For Amazon/eBay/Etsy add-to-cart, checkout, filter, or sort tasks,
@@ -1094,7 +1178,7 @@ function _buildSystemPrompt(userMessage, state) {
       && Array.isArray(_tc?.interactiveActions)
       && _tc.interactiveActions.some(a => ['add_to_cart', 'checkout', 'place_order', 'filter_ui', 'sort_ui'].includes(a));
     if (_isCommerceMutation) {
-      result += `\n\n## COMMERCE MUTATION ROUTING\n\nThis task involves a commerce mutation (add-to-cart, checkout, filter, sort) on a dense product site. The browser.agent will automatically route to playwright.agent (Turn-Loop) instead of Tab-Map for these steps — you do NOT need to change the skill name. Keep each on-page-action step atomic (one mutation per step, e.g., "click Add to Cart" as one step, then "verify item added" as the next) so Turn-Loop can verify each action before proceeding.`;
+      result += `\n\n## COMMERCE MUTATION ROUTING\n\nThis task involves a commerce mutation (add-to-cart, checkout, filter, sort) on a dense product site. Emit \`dom.act\` steps with \`agentHint: "turn.loop.agent"\` — the Turn-Loop executor targets elements by selector/text and is more reliable than Tab-Map on product grids with 100+ elements. Keep each step atomic (one mutation per step, e.g., "click Add to Cart" as one step, then a \`turn.loop.agent\` verify step).`;
       console.info(`[Node:PlanSkillsV2] Injecting commerce mutation routing note (interactiveActions=${_tc.interactiveActions.join(',')})`);
     }
 
@@ -1544,7 +1628,7 @@ async function planSkillsV2(state) {
         // since resolved in live context.
         const _resolvedPlan = _resolveCtxUrlTokens(decoded, state._priorScreenContext?.url, state._gatheredVars, logger);
         // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
-        const _guardedPlan = _ensureSynthesizeStep(_resolvedPlan, userMessage);
+        const _guardedPlan = _rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger);
         const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
@@ -1559,7 +1643,7 @@ async function planSkillsV2(state) {
   if (state._loginResumeSkillPlan && !recoveryContext) {
     logger.info('[Node:PlanSkillsV2] Login resume: returning existing plan as-is');
     const _resumePlan = Array.isArray(state._loginResumeSkillPlan)
-      ? _ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage)
+      ? _rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger)
       : state._loginResumeSkillPlan;
     return { ...state, skillPlan: _resumePlan, skillCursor: 0, planError: null };
   }
@@ -1841,9 +1925,9 @@ async function planSkillsV2(state) {
     // Preflight may have already resolved a deep-link for the pinned service
     // (e.g. gmail compose URL) — inject it into browser.agent run args.url so
     // browser.agent selects URL-first navigation instead of a blind start page.
-    const detPlan = _ensureSynthesizeStep(
+    const detPlan = _rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
       _injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger),
-      userMessage);
+      userMessage), logger);
     // Messaging follow-up body: the service_task template passes the raw
     // message as task ("send this info to X"), so the browser agent never sees
     // the actual content and invents a placeholder body. Attach the resolved
@@ -3363,6 +3447,11 @@ The user's request does NOT match any installed skill.
     }
   }
 
+  // ── Atomic browser agents: rewrite browser.agent run steps → atomic skills ──
+  if (Array.isArray(skillPlan)) {
+    skillPlan = _rewriteBrowserStepsToAtomicAgents(skillPlan, logger);
+  }
+
   // ── Malformed-step guard: shell.run without cmd/goal → ask_user ────────────
   if (Array.isArray(skillPlan)) {
     skillPlan = _sanitizeSkillPlan(skillPlan, state);
@@ -3495,3 +3584,4 @@ module.exports._injectPreflightDeepLinks = _injectPreflightDeepLinks;
 // Back-compat alias — external callers/tests may still import the old name.
 module.exports._ensureSynthesizeForAppFlow = _ensureSynthesizeStep;
 module.exports._resolveCtxUrlTokens = _resolveCtxUrlTokens;
+module.exports._rewriteBrowserStepsToAtomicAgents = _rewriteBrowserStepsToAtomicAgents;

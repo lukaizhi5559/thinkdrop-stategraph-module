@@ -403,7 +403,8 @@ async function _thinPostFailureHandler(state) {
   const _failedAgentId = failedStep.args?.agentId || failedStep.args?.agent || null;
   const _failedSkill = failedStep.skill || null;
   const _failedOriginalTask = failedStep.args?.task || failedStep.args?.goal || null;
-  if (_failedAgentId && (_failedSkill === 'browser.agent' || _failedSkill === 'cli.agent' || _failedSkill === 'playwright.agent')) {
+  const _AGENT_SKILLS_FOR_RECOVERY = new Set(['browser.agent', 'cli.agent', 'playwright.agent', 'url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
+  if (_failedAgentId && _AGENT_SKILLS_FOR_RECOVERY.has(_failedSkill)) {
     // Derive current URL and sessionId from state or failedStep so the
     // PartialFailureCard can show context and the resume handler can reuse
     // the live browser session.
@@ -5004,9 +5005,12 @@ Please try again or search with different terms.`;
   // Derive session from: (1) last navigate args.sessionId, (2) last navigate returned URL
   // hostname (command service derives session from hostname when no sessionId given),
   // (3) state.activeBrowserSessionId from prior steps.
-  if (skill === 'browser.act' && !resolvedArgs.sessionId && resolvedArgs.action !== 'navigate') {
-    const lastNavigate = [...skillResults].reverse().find(r => r.skill === 'browser.act' && r.args?.action === 'navigate' && r.ok);
-    let inheritedSession = lastNavigate?.args?.sessionId || state.activeBrowserSessionId || null;
+  // Atomic browser agents inherit the same way — a dom.act/tab.map step must land
+  // on the session the url.first.agent step opened.
+  const _SESSION_BROWSER_SKILLS = new Set(['url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
+  if ((skill === 'browser.act' || _SESSION_BROWSER_SKILLS.has(skill)) && !resolvedArgs.sessionId && resolvedArgs.action !== 'navigate') {
+    const lastNavigate = [...skillResults].reverse().find(r => (r.skill === 'browser.act' && r.args?.action === 'navigate' && r.ok) || (_SESSION_BROWSER_SKILLS.has(r.skill) && r.ok && (r.sessionId || r.args?.sessionId)));
+    let inheritedSession = lastNavigate?.args?.sessionId || lastNavigate?.sessionId || state.activeBrowserSessionId || null;
     if (!inheritedSession && lastNavigate?.url) {
       // Derive hostname-based session the same way the command service does
       try {
@@ -6651,6 +6655,9 @@ Please try again or search with different terms.`;
       watchId: skill === 'file.watch' ? (raw.watchId || null) : null,
       _raw: (skill === 'file.bridge' || skill === 'fs.read') ? raw : undefined,
       url: raw.url ?? null,
+      sessionId: raw.sessionId ?? null,
+      resolvedAgent: raw.resolvedAgent ?? null,
+      routeRule: raw.routeRule ?? null,
       items: raw.items ?? null,
       itemStats: raw.itemStats ?? null,
       links: raw.links ?? null,
@@ -7536,13 +7543,22 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
 
     // Track the active browser sessionId and URL for follow-up tasks
     // Extend tracking to browser.agent steps: derive sessionId from agentId
+    const _ATOMIC_SESSION_SKILLS = new Set([
+      'url.first.agent', 'dom.act',
+      'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent',
+      'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent',
+    ]);
     const activeBrowserSessionId =
       (skill === 'browser.act' && stepResult.ok && args.sessionId)
         ? args.sessionId
       : (skill === 'browser.agent' && stepResult.ok && args.agentId)
         ? `${args.agentId.replace('.agent', '')}_agent`
+      : (_ATOMIC_SESSION_SKILLS.has(skill) && stepResult.ok)
+        ? (stepResult.sessionId || resolvedArgs.sessionId
+           || (args.agentId ? `${args.agentId.replace('.agent', '')}_agent` : null)
+           || state.activeBrowserSessionId)
         : state.activeBrowserSessionId || null;
-    const activeBrowserUrl = skill === 'browser.act' && stepResult.ok && raw.url
+    const activeBrowserUrl = (skill === 'browser.act' || _ATOMIC_SESSION_SKILLS.has(skill)) && stepResult.ok && raw.url
       ? raw.url
       : state.activeBrowserUrl || null;
 

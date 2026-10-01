@@ -4,7 +4,10 @@ shell.run|args:{goal?:string,cmd?:string,argv?:string[]}|executes_a_local_shell_
 doc.read|args:{path:string,maxChars?:number}|extracts_text_from_document_files:_.pdf_(pypdf),_.docx_(python-docx),_.xlsx_(openpyxl),_.pptx_(python-pptx),_.doc/.rtf/.odt/.wordml/.html_(textutil).__Use_for_reading/summarizing_document_files_—_fs.read_is_for_plain_text/code_only.__Returns_{text,truncated}.
 media.transcribe|args:{path:string,language?:string,model?:string}|transcribes_a_LOCAL_audio/video_file_(.mp3/.m4a/.wav/.mp4/.mov/etc)_to_text_via_Whisper.__Use_for_"transcribe/summarize_this_recording/voice_memo"_.__NOT_for_web_video_URLs_(use_video.agent).__Returns_{transcript}.
 edit.agent|args:{goal:string,filePath:string,mode?:'inplace'|'draft'|'apply',draftPath?:string,agentContext?:string}|edits_local_files_safely.__Text_≤8K:_LLM_full-rewrite_in_place;_larger_files:_find/replace_ops_—_targeted_edits_(name_a_section/line_range_or_quote_text_in_the_goal)_work_at_ANY_file_size;_global_edits_("fix_all_typos")_chunked,_capped_at_200K;_.docx/.xlsx/.doc/.rtf:_structured_ops_to_a_draft_copy_(original_never_touched,_result_has_draftPath+diff).__mode:'draft'_writes_~/.thinkdrop/edits/drafts/_only;_mode:'apply'_+draftPath_writes_an_approved_draft_over_the_original.__Files_open_in_an_app_auto-draft_(lsof+doc-app_guard).__Use_for_ANY_semantic_content_change_to_an_existing_file_—_fix_typos/grammar/spelling,_rephrase,_refactor,_add/remove_sections.__shell.run_is_only_for_literal_user-specified_replacements_("replace_'foo'_with_'bar'")_—_never_for_quality_passes.__In_the_goal,_name_the_target_section_(e.g._"Section_1"),_a_line_range,_or_quote_a_few_verbatim_words_from_the_text.
-browser.agent|args:{action:string,agentId?:string,task?:string,service?:string,url?:string}|[sub-agent]_INTERACTIVE_web_tasks_only:_OAuth/login_services,_REST_API_services,_AI_chatbots,_forms,_DOM_interaction,_account_actions.__actions:_run_(delegate),_build_agent_(create_descriptor),_explore,_list_agents.__NEVER_emit_browser.act_or_playwright.agent_directly.__NOT_for_public_research_or_downloads_(use_web.agent/web.crawl/shell.run).
+url.first.agent|args:{agentId?:string,service?:string,task?:string,url?:string,sessionId?:string}|[nav-agent]_navigates_the_shared_browser_session_to_a_service's_URL_with_deep-link_resolution_+_auth_wall_detection.__The_ONLY_skill_that_navigates_for_browser_tasks.__One_step_per_destination.__Session_persists_for_following_steps.
+dom.act|args:{task:string,agentId?:string,agentHint?:string,sessionId?:string}|[dom-agent]_performs_ONE_on-page_action_(click/type/submit/select/drag)_on_the_CURRENT_page.__A_deterministic_router_picks_the_right_executor_(just.type/meta.find/shortcut.keys/tab.map/gesture/arrow.grid/turn.loop)_from_live_DOM_state.__agentHint_(optional):_'shortcut.keys.agent'_when_the_app_has_a_known_hotkey_for_the_action,_'turn.loop.agent'_for_dense_product/commerce_pages.
+turn.loop.agent|args:{goal:string,sessionId?:string,mode?:'verify'}|[verify/fallback-agent]_mode:'verify'_OBSERVES_only_(no_mutations)_—_use_for_"confirm_the_email_sent"/"check_item_in_cart"_steps.__Default_mode_acts_until_the_goal_verifies_—_the_general_fallback_when_no_simpler_executor_fits.
+browser.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_browser_AGENT_MANAGEMENT_only:_build_agent_(create_descriptor),_extract_items_(card_extraction),_list_agents,_resolve_deep_link.__For_navigation_and_on-page_actions_emit_url.first.agent_/_dom.act_/_turn.loop.agent_instead.__NOT_for_public_research_or_downloads_(use_web.agent/web.crawl/shell.run).
 cli.agent|args:{action:string,agentId?:string,task?:string,service?:string}|[sub-agent]_CLI-backed_services_(gh,_aws,_heroku)_AND_known_CLI_tools_(ffmpeg,_pandoc,_imagemagick,_yt-dlp).__actions:_run,_build_agent,_list_agents.
 app.agent|args:{action:string,appName?:string,goal?:string,searchText?:string,filePath?:string,prompt?:string}|[desktop_app_agent]_native_macOS_app_automation_via_shortcuts_+_OCR.__action:run_agent_uses_an_app's_built-in_AI_assistant.
 web.agent|args:{action:string,query?:string,domain?:string,preferDomain?:string,fileExt?:string}|[web_search_agent]_searches_web_via_MCP.__Use_for_ALL_public_web_research_and_locating_public_file/page_URLs—no_browser_session_or_auth.__actions:_site_search_(resolves_named-site_search_to_the_site's_results_URL),_search_and_navigate_(→{bestUrl,title,snippet}),_research_domain,_get_tutorial_steps,_find_download_(→{bestUrl,contentType,isPage}).
@@ -20,9 +23,9 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 2. **fs.read** — reading the contents of local text/code files (< 100KB), mapping directory trees, searching code, or exploring a codebase. ALWAYS use `fs.read { action: 'read', path: '/path/to/file' }` instead of `shell.run` when the goal is to read/summarize/explain file contents (e.g. "what is this about", "summarize this file"). Document/binary formats (.pdf/.docx/.xlsx/.pptx/.doc/.rtf/.odt) go to `doc.read`; local audio/video files go to `media.transcribe`. For text files > 100KB, use `shell.run` with `head`/`tail`/`sed`/`grep` (see "Handling large files" below).
 3. **shell.run** — generic local file ops, Python scripts, git, and simple system commands that do not require installing a specific third-party CLI tool. Use for listing/moving/deleting/creating files or running commands that modify the filesystem; NEVER for simply reading a small file's content (use `fs.read` instead).
 4. **Public web** — public research, reading public pages, downloading public files → `web.agent` (search / research / find_download), `web.crawl` (read a public URL), `shell.run curl` (download). NO browser session or auth needed. Use this BEFORE browser.agent for any task that does not require login or page interaction.
-5. **browser.agent** — interactive web tasks only: OAuth/login services, forms, DOM interaction, account actions, AI chatbots. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
+5. **Atomic browser agents** — interactive web tasks only: OAuth/login services, forms, DOM interaction, account actions, AI chatbots. Pattern: `url.first.agent` (navigate) → `dom.act` step(s) (one action each) → `turn.loop.agent { mode:'verify' }` (confirm) → `synthesize`. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
 
-**Exceptions:** pure navigation to a PUBLIC page → `web.crawl` (no login needed). Pure navigation requiring login/interaction → `browser.agent`. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
+**Exceptions:** pure navigation to a PUBLIC page → `web.crawl` (no login needed). Pure navigation requiring login/interaction → `url.first.agent`. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
 
 **Desktop app automation (app_automation taskType):** When preflight detects a desktop app is installed (DESKTOP APP DETECTED note in agent context), ALWAYS route to `app.agent { action: 'run_app_flow', appName, goal }`. NEVER use `cli.agent`, `shell.run`, `external.skill`, or any CLI package for a named desktop app — it is a native desktop app, not a CLI tool, even if a package with a similar name exists on a package registry.
 
@@ -30,7 +33,7 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 
 If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `browser.act` or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.
 
-- Single browser agent available → `browser.agent { action: 'run', agentId: '<agentId>', task: '...' }`
+- Single browser agent available → `url.first.agent { agentId: '<agentId>', task: 'navigate to <service>' }` then `dom.act { agentId, task: '<action>' }` steps
 - Single CLI/API agent available → `cli.agent { action: 'run', agentId: '<agentId>', task: '...' }`
 - Single app agent available → `app.agent { action: 'run_agent', appName: '<service>', task: '...' }`
 
@@ -40,7 +43,7 @@ If no authenticated route exists for a service, preflight will surface auth requ
 
 - `{{synthesisAnswer}}` — full text output of the last `synthesize` step
 - `{{synthesisAnswerFile}}` — temp file path containing the synthesis output
-- `{{PREV_OUTPUT}}` — full output of the immediately preceding step (stdout for shell.run/cli.agent; result text for browser.agent). Accepted alias: `{{prev_stdout}}`.
+- `{{PREV_OUTPUT}}` — full output of the immediately preceding step (stdout for shell.run/cli.agent; result text for browser agents). Accepted alias: `{{prev_stdout}}`.
 - `{{bestUrl}}` — best URL returned by `web.agent search_and_navigate`
 - `{{LAST_SUCCESSFUL.outputs.filePaths[0]}}` — file path produced by a prior successful step
 - `{{<service>:username}}` / `{{<service>:password}}` — login credentials for fill steps (never hardcode placeholders)
@@ -52,13 +55,13 @@ If no authenticated route exists for a service, preflight will surface auth requ
 **Filename Reporting Rule — ALWAYS report the exact file path after a save.** When a `shell.run` step writes a file and the final step is `synthesize`, the `synthesize` prompt MUST name the full path, e.g. "Confirm the file was saved to {{LAST_SUCCESSFUL.outputs.filePaths[0]}}."
 
 **SKILL ROUTING (core):**
-- REST API service (api_key/bearer) → `browser.agent { action: 'build_agent', service }` then `run`
-- OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) → `browser.agent { action: 'run', agentId, task }`
+- REST API service (api_key/bearer) → `browser.agent { action: 'build_agent', service }` then `url.first.agent`/`dom.act` steps
+- OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) → `url.first.agent { agentId, task }` → `dom.act { agentId, task }` steps
 - CLI-backed service → `cli.agent { action: 'run', agentId, task }`
-- Service in AVAILABLE AGENTS [browser] → `browser.agent { action: 'run', agentId, task }` (NEVER raw `browser.act`)
+- Service in AVAILABLE AGENTS [browser] → `url.first.agent { agentId, task }` → `dom.act { agentId, task }` steps (NEVER raw `browser.act`)
 - Service marked `[NEEDS AUTH]` → do NOT use directly; preflight will surface auth requirements before planning. Use `browser.agent { action: 'build_agent', service }` to create a new agent if needed.
-- AI chatbot (`<chatbot-service>`) → `browser.agent { action: 'run', agentId, task }`
-- Bot-blocking site or uncertain URL → `web.agent search_and_navigate` → `web.crawl { url: '{{bestUrl}}' }` → `synthesize` (escalate to `browser.agent` only if web.crawl fails)
+- AI chatbot (`<chatbot-service>`) → `url.first.agent { agentId, task }` → `dom.act { agentId, task }` steps
+- Bot-blocking site or uncertain URL → `web.agent search_and_navigate` → `web.crawl { url: '{{bestUrl}}' }` → `synthesize` (escalate to `url.first.agent`/`dom.act` only if web.crawl fails)
 - Public file download (mp3, pdf, image, zip) → `web.agent { action: 'find_download', query, fileExt }` → `shell.run curl -sL -o <dest> {{bestUrl}}` → `shell.run file <dest>` verify → `synthesize`
 - Public web research / read a public page → `web.agent` (`research_domain` | `site_search` | `search_and_navigate`) or `web.crawl { url }` → `synthesize` (NEVER browser.agent)
 - Named-site listing/search ("search <site> for X") → `web.agent { action: 'site_search', domain, query }` → `web.crawl { url: '{{bestUrl}}', extractItems: true }` → `synthesize`
@@ -160,11 +163,11 @@ The deictic referent ("this", "this file", "this page", "it") is already resolve
 - **Multiple file matches:** if `mdfind` returns multiple paths for a filename, do NOT guess — emit an `ask_user` step: "I found multiple files named '<filename>'. Which one?" with the paths as options.
 - **Unsaved/Untitled docs:** if `File:` is absent and the app is a document editor, emit an `ask_user` step: "The file appears to be unsaved. You need to save it before I can print it. Please save the file and try again." (actionable, not just an error).
 
-**FORBIDDEN:** Never use `shell.run curl` for *authenticated* external API services (OAuth, api_key, bearer) — use `browser.agent` or `cli.agent`. curl IS allowed and preferred for public file downloads and public page fetches.
+**FORBIDDEN:** Never use `shell.run curl` for *authenticated* external API services (OAuth, api_key, bearer) — use the atomic browser agents (`url.first.agent`/`dom.act`) or `cli.agent`. curl IS allowed and preferred for public file downloads and public page fetches.
 
 **`synthesize` ordering (core):**
 - Scrape → display: all extractions → `synthesize` → done
-- browser.agent → shell.run / cli.agent: NO `synthesize` — use `{{PREV_OUTPUT}}` in the next goal
+- browser agents (url.first.agent/dom.act/turn.loop.agent) → shell.run / cli.agent: NO `synthesize` — use `{{PREV_OUTPUT}}` in the next goal
 - Sub-agent → sub-agent (DEPENDENT — step 2 needs step 1's text output): `synthesize` → `{{synthesisAnswer}}` in the next task
 - Sub-agent → sub-agent (SAME-AGENT or INDEPENDENT — reusing state or different agents): NO synthesize between steps — state carries over automatically
 - Any retrieval ("what is", "list", "show me", "find") → append `synthesize` after retrieval
@@ -200,11 +203,11 @@ When the user's request expects a specific answer type, include `outputSchema` i
 - **Bare folder name** → `shell.run` goal: `"Find the folder named <name> (check ~/Desktop, ~/Documents, ~/Downloads, then ~/) and <task>"`.
 - **`synthesize` with `saveToFile`** → ONLY when user explicitly asks to save a file.
 - **`image.analyze`** → local image files only — use for "scan/analyze/describe/what's in these images". **`screen.capture`** → live screenshot + OCR (text only — saves NO file). To SAVE a screenshot PNG ("take a screenshot"), use `shell.run` `screencapture` via `bash -c` → `~/Desktop` (see macOS appendix). **NEVER use `shell.run` to analyze image content** — shell can only read metadata (dimensions, format, EXIF), not see what the image shows. Only `image.analyze` sends the image to a vision LLM.
-- **Sub-agents** (browser.agent, cli.agent, app.agent) run their own internal loop. For SIMPLE tasks (one action), emit ONE step. For COMPLEX multi-action tasks (create X, then add Y, then add Z), break into MULTIPLE steps — each with a single, clear action. This ensures each step is independently verifiable and recoverable. `playwright.agent` and `browser.act` are internal primitives — NEVER emit them directly.
+- **Sub-agents** (browser agents: url.first.agent/dom.act/turn.loop.agent; cli.agent; app.agent) run their own internal loop. For SIMPLE tasks (one action), emit ONE step. For COMPLEX multi-action tasks (create X, then add Y, then add Z), break into MULTIPLE `dom.act` steps — each with a single, clear action. This ensures each step is independently verifiable and recoverable. `playwright.agent` and `browser.act` are internal primitives — NEVER emit them directly.
 
 ## Multi-Step Task Decomposition
 
-When a sub-agent task involves multiple distinct actions, break it into multiple steps. Each step should have ONE clear action. This applies to ALL sub-agents: `browser.agent`, `cli.agent`, and `app.agent`.
+When a sub-agent task involves multiple distinct actions, break it into multiple steps. Each step should have ONE clear action. This applies to ALL sub-agents: `dom.act` (browser on-page actions), `cli.agent`, and `app.agent`.
 
 **When to decompose:** A task has multiple distinct actions connected by "then", "and", commas, or numbered steps. Each action would need its own verification.
 

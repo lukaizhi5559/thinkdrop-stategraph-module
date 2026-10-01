@@ -1,181 +1,98 @@
-## Appendix: Browser Automation
+## Appendix: Browser Automation (Atomic Agents)
 
-Domain-specific guidance for `browser.agent` and `web.agent`. General skill list, routing hierarchy, output format, and template variables are in the base prompt.
+Domain-specific guidance for the atomic browser agents and `web.agent`. General skill list, routing hierarchy, output format, and template variables are in the base prompt.
 
-### `browser.agent` is for INTERACTIVE tasks only
+### The browser task pattern (MANDATORY shape)
 
-URL-first read/search/extract tasks do NOT belong to `browser.agent` — they go through the real-browser lane in `app.agent` (see plan-skills-app.md Phase 4B): `navigate_url` (open the URL in the user's real default browser) → `scan_page` (copy the rendered page to ~/.thinkdrop/copies). This is faster than playwright, is never bot-blocked (real session/cookies), and leaves the page in front of the user. Use `browser.agent` ONLY when the task needs DOM interaction: login/auth flows, forms, add-to-cart, filters, multi-step page flows, AI chatbots.
+Interactive browser tasks decompose into **one step per tier** — the plan is the orchestrator, not the agent:
 
-### When to use `web.agent` before `browser.agent`
+1. **`url.first.agent`** — the ONLY step that navigates. Resolves the best URL for the task (deep-link), opens the shared session, detects auth walls. One step per destination.
+   ```json
+   { "skill": "url.first.agent", "args": { "agentId": "<service>.agent", "task": "go to <service> <section>" }, "description": "Navigate to <service>" }
+   ```
+2. **`dom.act`** — ONE on-page action per step (click, type, fill, submit, select, drag). A deterministic router picks the executor (just.type/meta.find/shortcut.keys/tab.map/gesture/arrow.grid/turn.loop) from live DOM state — you do NOT need to pick it.
+   ```json
+   { "skill": "dom.act", "args": { "task": "fill the To field with <recipient>", "agentId": "<service>.agent" }, "description": "Fill recipient" }
+   ```
+   - `agentHint` (optional): only when you KNOW the right executor — `"shortcut.keys.agent"` for apps with known hotkeys (Calendar `c`, Slack `Cmd+K`), `"turn.loop.agent"` for dense product/commerce pages (Amazon/eBay grids).
+3. **`turn.loop.agent { mode:'verify' }`** — confirm a result holds without mutating ("confirm the email was sent", "check the item is in the cart"). Observes only.
+   ```json
+   { "skill": "turn.loop.agent", "args": { "goal": "confirm the email to <recipient> was sent", "mode": "verify" }, "description": "Confirm email sent" }
+   ```
+4. **`synthesize`** — summarize for the user.
 
-- **Public research / search / look-up (no login needed):** `web.agent` (`research_domain` or `search_and_navigate`) → `synthesize`. NEVER use `browser.agent` — no session needed. Use `web.crawl {{bestUrl}}` first if the full page text is required.
-- **Public file download:** `web.agent { action: 'find_download', query, fileExt }` → `shell.run curl -sL -o <dest> {{bestUrl}}` → `shell.run file <dest>` verify. If `find_download` returns `isPage:true`, `web.crawl {{bestUrl}}` to find the real media link first.
-- **Known bot blockers / CAPTCHA:** sites that block automated browsing or present CAPTCHA challenges
-- **Unknown or uncertain domain:** the LLM may guess the wrong URL
-- **Pattern (interactive only):** `web.agent search_and_navigate` → `browser.agent { action: 'run', url: '{{bestUrl}}' }` → `synthesize`
+Consecutive steps reuse the same browser session automatically — no `sessionId` needed, no `synthesize` between browser steps.
 
-### Agent ID naming
+### Canonical examples
 
-Lowercase service name + `.agent` suffix:
-`<service>.agent` (e.g., `<search-service>.agent`, `<wiki-service>.agent`, `<social-service>.agent`, `<chatbot-service>.agent`)
-
-### Examples
-
-**Search a named site — public look-up (NO login/interaction):**
+**Send an email:**
 ```json
 [
-  { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "<query> site:<service>", "preferDomain": "<service>" }, "description": "Look up <query> on <service>" },
-  { "skill": "synthesize", "args": { "prompt": "Present the results clearly to the user" }, "description": "Summarize the <service> results" }
-]
-```
-
-**Search a named site — interactive (filter UI, add to cart, logged-in results):**
-```json
-[
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "look up <query>" }, "description": "Look up <query> on <service>" },
-  { "skill": "synthesize", "args": { "prompt": "Present the results clearly to the user" }, "description": "Summarize the <service> results" }
-]
-```
-
-**Show me / list / find items in my account (DISPLAY task — extract cards):**
-
-When the user asks to show, list, or find items in their authenticated account (emails, messages, posts, documents, issues, etc.), use `browser.agent run` to navigate to the target page, then `browser.agent extract_items` to extract structured cards. The renderer shows the items as cards (image, title, price, link) automatically — the `synthesize` step should give a brief text summary, NOT re-list every item.
-
-```json
-[
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "go to my <inbox/dashboard/list view>" }, "description": "Navigate to <service> <page>" },
-  { "skill": "browser.agent", "args": { "action": "extract_items", "agentId": "<service>.agent" }, "description": "Extract <items> as cards" },
-  { "skill": "synthesize", "args": { "prompt": "Give a brief summary of the results. The cards (image, title, link) are shown to the user automatically — do not re-list every item." }, "description": "Summarize <service> results" }
-]
-```
-
-**Key rules for extract_items:**
-- `extract_items` requires the browser to already be on the target page — always precede it with a `browser.agent run` step that navigates there.
-- Consecutive same-agent steps reuse the same browser session automatically — the `extract_items` step runs on the same session as the preceding `run` step.
-- `extract_items` is for DISPLAY tasks only (show me, list, find). For ACTION tasks (add to cart, send email, post), use `browser.agent run` for the full task and show the outcome text — do NOT use `extract_items`.
-- The `agentId` on the `extract_items` step must match the preceding `run` step so the same session is reused.
-
-**Ask an AI chatbot:**
-```json
-[
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<chatbot-service>.agent", "task": "ask <question>" }, "description": "Ask <chatbot-service> <question>" },
-  { "skill": "synthesize", "args": { "prompt": "Present the AI's answer clearly" }, "description": "Present <chatbot-service> response" }
-]
-```
-
-**Read a raw PUBLIC URL:**
-```json
-[
-  { "skill": "web.crawl", "args": { "url": "https://<site>/page", "maxChars": 12000 }, "description": "Fetch readable text from the page" },
-  { "skill": "synthesize", "args": { "prompt": "Summarize the page content for the user" }, "description": "Summarize page content" }
-]
-```
-Use `browser.agent` for a URL only when reading it requires login or page interaction.
-
-**Bypass a bot blocker:**
-```json
-[
-  { "skill": "web.agent", "args": { "action": "search_and_navigate", "query": "<search query> site:<site>", "preferDomain": "<site>" }, "description": "Find a direct article URL on <site>" },
-  { "skill": "web.crawl", "args": { "url": "{{bestUrl}}", "maxChars": 12000 }, "description": "Read the article (public — no login needed)" },
-  { "skill": "synthesize", "args": { "prompt": "Summarize the article" }, "description": "Summarize the article" }
-]
-```
-If `web.crawl` returns bot-blocked or empty content, escalate to `browser.agent { action: 'run', url: '{{bestUrl}}' }`.
-
-### Content creation tasks (playlists, documents, posts, boards)
-
-When the user asks to CREATE something on a web service (playlist, document, board, post, event), DECOMPOSE the task into MULTIPLE `browser.agent` steps — each with ONE clear action. The browser agent fills forms and clicks buttons; a single monolithic step with many actions will get stuck. Breaking it into steps ensures each action is independently verifiable and recoverable.
-
-**WRONG (one monolithic step — agent gets stuck):**
-```json
-[
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Open <service>, create a <collection> named <name>, and add <items> from <source-A>, <source-B>, and <source-C>" }, "description": "Create <collection> and add <items>" }
-]
-```
-
-**RIGHT (decomposed — browser state carries over between steps):**
-```json
-[
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Open <service> and create a new <collection> named <name>" }, "description": "Create <collection>" },
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Search for <source-A> and add 3 top <items> to the <name> <collection>" }, "description": "Add <source-A> <items>" },
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Search for <source-B> and add 3 top <items> to the <name> <collection>" }, "description": "Add <source-B> <items>" },
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "<service>.agent", "task": "Search for <source-C> and add 3 top <items> to the <name> <collection>" }, "description": "Add <source-C> <items>" },
-  { "skill": "synthesize", "args": { "prompt": "Confirm the <name> <collection> was created with <items> from <source-A>, <source-B>, and <source-C>." }, "description": "Confirm <collection>" }
-]
-```
-
-**Key rules for content creation tasks:**
-- ALWAYS decompose into multiple `browser.agent` steps — one step per distinct action
-- ALWAYS start with the navigation + creation step (go to the service, click Create/New/+, name the item)
-- ALWAYS include each sub-action as a separate step (search for X, add Y, select Z)
-- Consecutive same-agent steps reuse the same browser session automatically — no synthesize between them
-- Use the gathered answers from prior context (e.g., collection name, item list, preferences) directly in the task strings
-- Each task string should be clear and specific — the browser agent follows it literally
-- Always add a final `synthesize` step to confirm the overall task
-- **Block-based document editors** (apps where content is built from discrete blocks via slash commands, `/` menus, or Enter-to-new-block — e.g. page builders, wiki editors, note apps with structured blocks): ALWAYS separate "create the page/document" from "add structured blocks" (todo lists, tables, headings, embeds). Each block type and each set of items is a distinct step. The browser agent cannot reliably create a page AND add multiple blocks in one continuous task — the editor's focus shifts after the title is set, and the agent loses track of where to type.
-
-**WRONG (page + todo list in one step — agent gets stuck after the title):**
-```json
-[
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "[name].agent", "task": "Open <service>, create a new page called 'Weekly Goals', and add a todo list containing Buy pizza, Take out the Trash, and Go fishing" }, "description": "Create page and add todos" }
-]
-```
-
-**RIGHT (decomposed — page creation and block content are separate steps):**
-```json
-[
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "[name].agent", "task": "Open <service> and create a new page called 'Weekly Goals'", "url": "https://<service>.new" }, "description": "Create 'Weekly Goals' page" },
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "[name].agent", "task": "On the 'Weekly Goals' page, add a todo list block with the items: Buy pizza, Take out the Trash, Go fishing" }, "description": "Add todo list items" },
-  { "skill": "synthesize", "args": { "prompt": "Confirm the 'Weekly Goals' page was created with the todo items: Buy pizza, Take out the Trash, Go fishing" }, "description": "Confirm page and todos" }
-]
-```
-
-### Simple single-action exception (DO NOT decompose these)
-
-The decompose rule above applies to tasks with **multiple independent actions** where the agent must search or gather content, OR where the task involves a block-based document editor (page builders, wiki editors, note apps with structured blocks) or structured content (lists, tables, boards, playlists). It does NOT apply to simple single-field forms where the user provides all content and there is only one logical "submit" action.
-
-**Do NOT decompose these — use ONE `browser.agent` step:**
-- **Email/message**: "send email to X with subject Y and body Z"
-- **Social post**: "post 'Hello world' on <service>"
-- **Reply**: "reply to this email/thread/message with '...'"
-- **Comment**: "comment 'Nice work!' on this post/video"
-- **Status/bio update**: "update my status to '...'"
-- **Simple form fill**: "fill out this form with name=X, email=Y and submit"
-
-**RIGHT (one step — user provided all content):**
-```json
-[
-  { "skill": "browser.agent", "args": { "action": "run", "agentId": "[name].agent", "task": "Open <app-name> and send an email to <recipient> with the subject '<subject>' and the body '<body>'" }, "description": "Send the email to <recipient>" },
+  { "skill": "url.first.agent", "args": { "agentId": "gmail.agent", "task": "open Gmail compose", "url": "https://mail.google.com/mail/u/0/#inbox?compose=new" }, "description": "Open Gmail compose" },
+  { "skill": "dom.act", "args": { "agentId": "gmail.agent", "task": "Fill in the email fields — To: <recipient>, Subject: <subject>, Body: <body> — then click Send" }, "description": "Fill and send the email" },
+  { "skill": "turn.loop.agent", "args": { "goal": "confirm the email to <recipient> was sent (compose closed, confirmation toast or sent state visible)", "mode": "verify" }, "description": "Confirm email sent" },
   { "skill": "synthesize", "args": { "prompt": "Confirm the email was sent to <recipient>" }, "description": "Confirm email delivery" }
 ]
 ```
 
-**Key rule:** Only decompose if the task has multiple INDEPENDENT actions, requires the agent to SEARCH for content to add, OR involves a block-based document editor where the agent must create a document and then add structured blocks. Simple "send/post/reply/comment X to Y" with a single form and submit does NOT need decomposition — the agent can fill all fields and submit in one continuous flow.
-
-### Multi-agent browser.agent (independent — NO synthesize between steps)
-
-When steps use different agents and are independent, no synthesize needed between them. Add a final `synthesize` to combine all results.
-
+**Look up + add to cart (commerce):**
 ```json
 [
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"What are the best vegan foods to try?"},"description":"Ask <app-name>"},
-  {"skill":"synthesize","args":{"prompt":"Compare the answers from <app-name>, <app-name>, and <app-name> about the best vegan foods."},"description":"Compare all answers"}
+  { "skill": "url.first.agent", "args": { "agentId": "amazon.agent", "task": "search Amazon for <query>" }, "description": "Search Amazon for <query>" },
+  { "skill": "dom.act", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "open the first result and add it to the cart" }, "description": "Add first result to cart" },
+  { "skill": "turn.loop.agent", "args": { "goal": "confirm the item was added to the cart (cart count incremented or confirmation banner)", "mode": "verify" }, "description": "Confirm added to cart" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the <query> item was added to the cart" }, "description": "Confirm" }
 ]
 ```
 
-**MULTI-AGENT URL RULE:** When a plan has multiple `browser.agent` steps with different `agentId` values, each step MUST have its own URL appropriate for that agent's service. Do NOT copy the URL from one step to another step with a different agentId. If you don't know the correct URL for a service, omit the `url` field — the system will inject the correct deep-link URL per agent from preflight.
+**Create a calendar event (shortcut-driven app):**
+```json
+[
+  { "skill": "url.first.agent", "args": { "agentId": "google_calendar.agent", "task": "open Google Calendar" }, "description": "Open Google Calendar" },
+  { "skill": "dom.act", "args": { "agentId": "google_calendar.agent", "agentHint": "shortcut.keys.agent", "task": "open the create-event dialog (shortcut 'c')" }, "description": "Open create-event dialog" },
+  { "skill": "dom.act", "args": { "agentId": "google_calendar.agent", "task": "fill the event: title <title>, date <date>, time <time>, location <location> — then save" }, "description": "Fill and save event" },
+  { "skill": "turn.loop.agent", "args": { "goal": "confirm the event '<title>' appears on the calendar", "mode": "verify" }, "description": "Confirm event created" },
+  { "skill": "synthesize", "args": { "prompt": "Confirm the calendar event was created" }, "description": "Confirm" }
+]
+```
 
-### browser.agent → shell.run (data passing — synthesize between steps)
+### `browser.agent` is for MANAGEMENT actions only
 
-When step 2 (different skill) needs the text output of step 1, insert `synthesize` and use `{{synthesisAnswer}}`.
+Use `browser.agent` ONLY for: `build_agent` (create a new agent descriptor), `extract_items` (structured card extraction for display), `list_agents`, `resolve_deep_link`. NEVER emit `browser.agent { action: 'run' }` — navigation is `url.first.agent`, on-page actions are `dom.act`, verification is `turn.loop.agent`.
+
+### `dom.act` rules
+
+- **ONE action per step.** "Fill the form and submit" is fine in one step (one continuous form fill). "Add 3 items" is THREE steps. Block-based editors (page builders, wiki editors, note apps) get one step per block type.
+- **`agentHint` is optional** — the router reads live DOM state and picks the right executor. Only hint when you're certain: `shortcut.keys.agent` (known app hotkey), `turn.loop.agent` (dense commerce/product grids), `arrow.grid.agent` (spreadsheet cell entry).
+- If a `dom.act` step fails, the graph replans with a different agent automatically — keep steps atomic so failures stay small.
+
+### `url.first.agent` rules
+
+- Provide `url` when you know the deep link (e.g. Gmail compose `?compose=new`); otherwise give `task` and the resolver finds it.
+- It returns `needsAuth` on sign-in walls — the graph surfaces auth to the user automatically.
+
+### extract_items (display tasks)
+
+"Show me / list / find items in my account" → `url.first.agent` (navigate to list view) → `browser.agent { action:'extract_items', agentId }` → `synthesize` (brief summary — cards render automatically, do not re-list items).
+
+### Public read/search tasks — NO browser agents
+
+Public research, public pages, downloads → `web.agent` / `web.crawl` / `shell.run curl` — no session needed. See the webfetch appendix. Escalate to `url.first.agent` only when `web.crawl` is bot-blocked or the task needs login/interaction.
+
+### Multi-agent plans (independent services)
+
+Steps for different services each get their own `url.first.agent` step with that service's `agentId` — never reuse a URL across agents:
 
 ```json
 [
-  {"skill":"browser.agent","args":{"action":"run","agentId":"[name].agent","task":"Find the top 5 bestselling <items> and their prices"},"description":"Scrape <ecommerce-service> for <items>"},
-  {"skill":"synthesize","args":{"prompt":"Format the <items> data as a CSV with columns: name, price, rating. Data: {{PREV_OUTPUT}}"},"description":"Format as CSV"},
-  {"skill":"shell.run","args":{"goal":"Save this CSV to ~/Desktop/<items>.csv: {{synthesisAnswer}}"},"description":"Save CSV file"},
-  {"skill":"synthesize","args":{"prompt":"Confirm the <items> data was saved to ~/Desktop/<items>.csv."},"description":"Confirm"}
+  {"skill":"url.first.agent","args":{"agentId":"<service-a>.agent","task":"open <service-a>"},"description":"Open <service-a>"},
+  {"skill":"dom.act","args":{"agentId":"<service-a>.agent","task":"<action-a>"},"description":"<action-a>"},
+  {"skill":"url.first.agent","args":{"agentId":"<service-b>.agent","task":"open <service-b>"},"description":"Open <service-b>"},
+  {"skill":"dom.act","args":{"agentId":"<service-b>.agent","task":"<action-b>"},"description":"<action-b>"},
+  {"skill":"synthesize","args":{"prompt":"Compare the results."},"description":"Compare"}
 ]
 ```
+
+### Browser → shell.run data passing
+
+When a later step needs a browser step's text output, insert `synthesize` and use `{{synthesisAnswer}}` / `{{PREV_OUTPUT}}` as usual.
