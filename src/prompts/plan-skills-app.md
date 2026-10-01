@@ -79,8 +79,7 @@ These actions drive the user's REAL default browser — no Playwright, no bot wa
 | Action | What it does | Verification |
 |--------|-------------|--------------|
 | `read_url` | `{ url, cleanup?, httpFirst?, crawlFallback?, fallbackUrls? }` — tiered page read: plain HTTP fetch (~1s, invisible) → real-browser tab copy (real cookies — dodges bot walls/captcha) → `web.crawl` playwright fallback. Returns `{ ok, content, url, via }` where `via` = `cache`/`http`/`browser_copy`/`crawl`. | Validates copied text against per-category char floors + bot-wall/error-page/login-wall markers before accepting; `reason` field explains failures (`login_wall`, `bot_detected`, `error_page`, `thin`). |
-| | `cleanup:'close'` | **Answer-only lookups** ("look up X", "what does the page say about Y"): opens a temp tab, copies, then **Cmd+W closes it**. Only used when the user does NOT want the page left open. |
-| | `cleanup:'deselect'` | **Open-and-understand** ("open X", "take me to", "show me the page"): keeps the tab open, clears the select-all highlight. This is the default — when unsure whether the user wants the page, keep it. |
+| | `cleanup:'deselect'` | **Default — always keep the tab open.** The page is copied, then the select-all highlight is cleared so the user sees the page as they left it. Do NOT emit `cleanup:'close'` — closing the tab is reserved for explicit teardown requests only. |
 | `navigate_url` | `{ url, appName?, via? }` — `via:'open'` (default browser, new tab — default for fresh "goto") or `via:'type'` (Cmd+L → just-type → Enter, current tab). `via:'auto'` picks automatically. | Waits a per-category settle time; verify content via `scan_page` |
 | `scan_page` | `{ appName?, url?, useCache?, maxWaitMs? }` — grabs the URL from the address bar, copies the full rendered page (Cmd+L → Cmd+C → Tab → Cmd+A → Cmd+C), saves to `~/.thinkdrop/copies/`. Copies are cached (5-min TTL) — repeat calls for the same URL return instantly with `cached:true`. | Retries the copy until it exceeds a per-URL-category char floor (SERP ~800, shopping ~2000, social ~1200) or `maxWaitMs`. Returns `thin:true` on legit sparse pages, `bot_detected` error on Cloudflare/CAPTCHA walls. |
 | `print_page` | `{ appName? }` — Cmd+P → Enter | Unverifiable by design — reports `verified:false` |
@@ -88,11 +87,11 @@ These actions drive the user's REAL default browser — no Playwright, no bot wa
 **Read a URL for its content — prefer `read_url` (one step, internal fallback):**
 ```json
 [
-  { "skill": "app.agent", "args": { "action": "read_url", "url": "https://biblehub.com/interlinear/john/3-16.htm", "cleanup": "close" }, "description": "Read the page (temp tab, closed after copy)" },
+  { "skill": "app.agent", "args": { "action": "read_url", "url": "https://biblehub.com/interlinear/john/3-16.htm", "cleanup": "deselect" }, "description": "Read the page (tab stays open)" },
   { "skill": "synthesize", "args": { "prompt": "Answer using the page content" }, "description": "Present findings" }
 ]
 ```
-**Mode rules:** `cleanup:'close'` only when the task wants the *information* (research, lookups, "tell me X from this page"). `cleanup:'deselect'` when the task wants the *page itself* open ("open", "go to", "pull up", "show me"). Omit `httpFirst`/`crawlFallback` (defaults on).
+**Mode rules:** always `cleanup:'deselect'` — the tab stays open for the user either way; omit `cleanup` entirely if unsure (it defaults to deselect). Never `cleanup:'close'` unless the user explicitly asked for the page to be closed afterward. Omit `httpFirst`/`crawlFallback` (defaults on).
 
 **Goto a site and read/search — real browser:**
 ```json

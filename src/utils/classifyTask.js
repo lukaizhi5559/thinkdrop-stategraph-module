@@ -571,8 +571,13 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       return s.split(/[^a-z0-9]+/).filter(t => t.length >= 3).some(t => m.includes(t));
     };
     let parsedTargetService = parsed.targetService || null;
+    // Follow-up replies are bare ("yes", "go ahead") — the service name lives
+    // in the resolved followUpTarget (the accepted offer), not the reply
+    // itself. Check both so a legitimately inherited service isn't dropped.
+    const _mentionCorpus = parsedFollowUpTarget
+      ? `${classifiedMessage} ${parsedFollowUpTarget}` : classifiedMessage;
     if (parsedTargetService && webAccessMode !== 'interactive' && !requiresDOM &&
-        !_serviceMentioned(parsedTargetService, classifiedMessage)) {
+        !_serviceMentioned(parsedTargetService, _mentionCorpus)) {
       logger.info(`[classifyTask] Phantom targetService "${parsedTargetService}" not mentioned in message — dropping (webAccessMode=${webAccessMode})`);
       parsedTargetService = null;
     }

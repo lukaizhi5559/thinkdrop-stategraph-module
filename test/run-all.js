@@ -32,6 +32,7 @@ const TESTS = [
   'resolve-user-context.test.js',
   'grill-me.test.js',
   'public-web-routing.test.js',
+  'fast-lane-plan.test.js',
   'read-extraction-classification.test.js',
   'url-first-regression.test.js',
   'gmail-compose-url-regression.test.js',

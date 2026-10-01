@@ -54,6 +54,33 @@ const _failLlm = { complete: async () => { throw new Error('LLM must not be call
   r = await reviewExecution({ message: 'x', skillPlan: [], skillResults: [], logger });
   check('empty results → UNVERIFIABLE', r.reviewVerdict === 'UNVERIFIABLE', r.reviewVerdict);
 
+  // Deterministic plan + synthesize → answer is the synth text, not the
+  // "Done.\n\nStep outputs:" debug blob (regression: "what's this article
+  // about" showed the blob as the visible answer).
+  r = await reviewExecution({
+    message: "what's this article about",
+    skillPlan: [{ skill: 'app.agent' }, { skill: 'synthesize' }],
+    _deterministicPlan: [{ skill: 'app.agent' }, { skill: 'synthesize' }],
+    skillResults: [
+      { step: 1, skill: 'app.agent', args: { action: 'scan_page' }, ok: true },
+      { step: 2, skill: 'synthesize', ok: true, stdout: 'The article covers new Trump photos.' },
+    ],
+    logger, llmBackend: _failLlm, mcpAdapter: null,
+  });
+  check('deterministic + synthesize → answer is synth text',
+    r.answer === 'The article covers new Trump photos.', JSON.stringify(r.answer).slice(0, 80));
+
+  // Deterministic plan without synthesize keeps the Step outputs blob.
+  r = await reviewExecution({
+    message: 'open notes',
+    skillPlan: [{ skill: 'shell.run' }],
+    _deterministicPlan: [{ skill: 'shell.run' }],
+    skillResults: [{ step: 1, skill: 'shell.run', ok: true }],
+    logger, llmBackend: _failLlm, mcpAdapter: null,
+  });
+  check('deterministic no-synth → Step outputs blob',
+    /Step outputs:/.test(r.answer || ''), JSON.stringify(r.answer).slice(0, 80));
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 })().catch(e => { console.error(e); process.exit(1); });

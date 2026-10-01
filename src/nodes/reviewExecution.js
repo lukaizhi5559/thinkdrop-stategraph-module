@@ -339,15 +339,20 @@ module.exports = async function reviewExecution(state) {
   // falls through to normal review/recovery.
   if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0 && !state._deterministicExternal) {
     if (skillResults.every(r => r.ok !== false)) {
+      // A synthesize step's output IS the user-facing answer — don't bury it in
+      // a "Step outputs:" debug blob (which renders verbatim as the completion).
+      const _synth = [...skillResults].reverse().find(r =>
+        r && r.skill === 'synthesize' && r.ok !== false &&
+        String(r.stdout || r.result || '').trim());
       const _outputs = skillResults
         .map(r => {
           const label = `${r.skill || 'step'}${r.args?.action ? '/' + r.args.action : ''}`;
           const out = String(r.stdout || r.result || '').trim();
           return `[${label}]:${out ? '\n' + out.slice(0, 2000) : ' completed'}`;
         });
-      const answer = _outputs.length
-        ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}`
-        : 'Done.';
+      const answer = _synth
+        ? String(_synth.stdout || _synth.result).trim()
+        : (_outputs.length ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}` : 'Done.');
       logger.info('[Node:ReviewExecution] Deterministic plan — all steps ok, skipping LLM review');
       return { ...state, reviewVerdict: 'UNVERIFIABLE', answer };
     }
@@ -762,9 +767,12 @@ module.exports = async function reviewExecution(state) {
           const out = String(r.stdout || r.result || '').trim();
           return `[${label}]:${out ? '\n' + out.slice(0, 2000) : ' completed'}`;
         });
-      const answer = _outputs.length
-        ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}`
-        : 'Done.';
+      const _synth = [...skillResults].reverse().find(r =>
+        r && r.skill === 'synthesize' && r.ok !== false &&
+        String(r.stdout || r.result || '').trim());
+      const answer = _synth
+        ? String(_synth.stdout || _synth.result).trim()
+        : (_outputs.length ? `Done.\n\nStep outputs:\n${_outputs.join('\n\n')}` : 'Done.');
       return { ...state, reviewVerdict: 'UNVERIFIABLE', answer };
     }
   }

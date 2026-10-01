@@ -96,6 +96,50 @@ async function runTests() {
     }
   }
 
+  section('Search-query URL detection (_hasSearchQueryParam)');
+  const _hasSearchQueryParam = destinationResolver._hasSearchQueryParam;
+  const SEARCH_URL_CASES = [
+    // Query-param search URLs
+    'https://www.amazon.com/s?k=childrens+storybook+bible',
+    'https://www.google.com/search?q=test',
+    'https://www.youtube.com/results?search_query=lofi',
+    // Hash-fragment search URLs (Gmail + SPA routers) — the stale-cache bug:
+    // "search my gmail for vidangel" hit a cached #search/from%3Apastor%20wendal
+    'https://mail.google.com/mail/u/0/#search/from%3Apastor%20wendal',
+    'https://mail.google.com/mail/u/0/#search/vidangel',
+    'https://mail.google.com/mail/u/0/#search=is%3Aunread',
+    'https://app.example.com/#/search?q=foo',
+    'https://app.example.com/#!/search/foo',
+    'https://app.example.com/#/results/foo',
+    'https://app.example.com/#?q=foo',
+    'https://app.example.com/#find/item1',
+  ];
+  const NON_SEARCH_URL_CASES = [
+    // Gmail navigation hashes that must stay cacheable
+    'https://mail.google.com/mail/u/0/#inbox',
+    'https://mail.google.com/mail/u/0/#inbox/FMfcgzQXkSLxKrWxpVwTXJBQvfQzJcvx',
+    'https://mail.google.com/mail/u/0/#inbox?compose=new',
+    'https://mail.google.com/mail/u/0/#label/receipts',
+    'https://mail.google.com/mail/u/0/#category/personal',
+    // Plain anchors / fragments
+    'https://example.com/#section',
+    'https://example.com/#settings',
+    'https://example.com/pricing#plans',
+    'https://example.com/',
+    'not a url',
+    '',
+  ];
+  for (const u of SEARCH_URL_CASES) {
+    await it(`search-query URL: ${u}`, () => {
+      if (_hasSearchQueryParam(u) !== true) throw new Error('expected true');
+    });
+  }
+  for (const u of NON_SEARCH_URL_CASES) {
+    await it(`non-search URL: ${u || '(empty)'}`, () => {
+      if (_hasSearchQueryParam(u) !== false) throw new Error('expected false');
+    });
+  }
+
   await it('exports all 16 intent constants', () => {
     const expected = [
       'chat', 'research', 'search', 'docs', 'console', 'settings', 'mail',

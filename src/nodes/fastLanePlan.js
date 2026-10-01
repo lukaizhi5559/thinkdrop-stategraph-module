@@ -85,7 +85,7 @@ module.exports = async function fastLanePlan(state) {
       action: 'read_url',
       url: url || '{{bestUrl}}',
       fallbackUrls: url ? undefined : '{{fallbackUrls}}',
-      cleanup: 'close',           // answer-only lookup — close the temp tab
+      cleanup: 'deselect',        // keep the tab open, clear the select-all highlight
       httpFirst: true,
       crawlFallback: true,
     },
@@ -104,19 +104,40 @@ module.exports = async function fastLanePlan(state) {
   // once returned a YouTube Short because preferDomain was null).
   const _tc2 = state._taskClassification || {};
   const _searchQuery = String(_tc2.followUpTarget || message).trim() || message;
+  // Named-service tasks go through nav_task's resolve-discovery ladder
+  // (KNOWN_BROWSER_SERVICES → deep-link discovery → read_url) instead of a
+  // bare search — search_and_navigate's preferDomain is only a scoring bias
+  // and picked a dcbridges.org mirror for a "biblegateway" task. browseFallback
+  // keeps the search+read floor when the service isn't registered.
   const plan = url
     ? [fetchStep, synthStep]
-    : [
-        {
-          skill: 'web.agent',
-          args: { action: 'search_and_navigate', query: _searchQuery, preferDomain: _tc2.targetService || undefined },
-          description: `Search the web for: "${_searchQuery.slice(0, 80)}"`,
-        },
-        fetchStep,
-        synthStep,
-      ];
+    : _tc2.targetService
+      ? [
+          {
+            skill: 'app.agent',
+            args: {
+              action: 'nav_task',
+              service: _tc2.targetService,
+              task: _searchQuery,
+              escalate: false,
+              browseFallback: true,
+              timeoutMs: 120000,
+            },
+            description: `${_tc2.targetService}: ${_searchQuery.slice(0, 80)}`,
+          },
+          synthStep,
+        ]
+      : [
+          {
+            skill: 'web.agent',
+            args: { action: 'search_and_navigate', query: _searchQuery },
+            description: `Search the web for: "${_searchQuery.slice(0, 80)}"`,
+          },
+          fetchStep,
+          synthStep,
+        ];
 
-  logger.info(`[Node:FastLanePlan] Browse fast-lane → ${plan.length}-step injected plan (url=${url ? 'literal' : 'search'}) for: "${message.slice(0, 70)}"`);
+  logger.info(`[Node:FastLanePlan] Browse fast-lane → ${plan.length}-step injected plan (url=${url ? 'literal' : _tc2.targetService ? `service:${_tc2.targetService}` : 'search'}) for: "${message.slice(0, 70)}"`);
   if (typeof state.progressCallback === 'function') {
     try {
       state.progressCallback({ type: 'node', node: 'fastLanePlan', label: 'Fast lane — direct web lookup', icon: 'bolt' });

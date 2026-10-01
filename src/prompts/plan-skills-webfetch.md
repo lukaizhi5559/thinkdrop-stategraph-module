@@ -70,11 +70,11 @@ Domain-specific patterns for PUBLIC web tasks — downloading files and reading 
 **Read a specific public page (full text needed) — prefer `app.agent read_url`:** it tries an invisible HTTP fetch first (~1s), escalates to a real-browser tab copy when the page is JS-rendered or bot-walled (real cookies/session), and falls back to `web.crawl` internally — one step covers all three:
 ```json
 [
-  { "skill": "app.agent", "args": { "action": "read_url", "url": "<url>", "cleanup": "close" }, "description": "Read the page content (temp tab, closed after copy)" },
+  { "skill": "app.agent", "args": { "action": "read_url", "url": "<url>", "cleanup": "deselect" }, "description": "Read the page content (tab stays open)" },
   { "skill": "synthesize", "args": { "prompt": "Summarize/answer using the page content." }, "description": "Summarize page" }
 ]
 ```
-Use `cleanup:"deselect"` instead when the user asked to *see* the page ("open", "show me", "pull up") — the tab stays open. Use `web.crawl` directly only when no browser is available or `read_url`/`scan_page` already failed on this URL.
+Always use `cleanup:"deselect"` — the tab stays open for the user. Never `cleanup:"close"` unless the user explicitly asked for the page closed afterward. Use `web.crawl` directly only when no browser is available or `read_url`/`scan_page` already failed on this URL.
 **Live-page variant — the referent is the currently open tab** ("this page", "on this page", ACTIVE SCREEN CONTEXT shows the URL): prefer the real-browser lane — it reads the user's actual rendered page (their session, no bot wall):
 ```json
 [

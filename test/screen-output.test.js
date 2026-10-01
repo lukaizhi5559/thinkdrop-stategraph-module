@@ -146,6 +146,33 @@ describe('classifyTask — phantom targetService guard', () => {
     );
     assertEq(r.targetService, 'facebook');
   });
+
+  it('keeps a service named in followUpTarget on a bare confirmation ("yes" → Thought offer)', async () => {
+    const r = await classifyTask(
+      'yes',
+      [],
+      { generateAnswer: async () => JSON.stringify({
+          taskType: 'browser', targetService: 'biblegateway', webAccessMode: 'public_read',
+          isFollowUp: true, isThoughtReply: true,
+          followUpTarget: 'open BibleGateway and display Exodus 1',
+        }) },
+      _noopLogger,
+    );
+    assertEq(r.targetService, 'biblegateway');
+  });
+
+  it('still drops a service absent from both reply and followUpTarget', async () => {
+    const r = await classifyTask(
+      'yes',
+      [],
+      { generateAnswer: async () => JSON.stringify({
+          taskType: 'browser', targetService: 'biblegateway', webAccessMode: 'public_read',
+          isFollowUp: true, followUpTarget: 'show me chapter 2',
+        }) },
+      _noopLogger,
+    );
+    assertEq(r.targetService, null);
+  });
 });
 
 describe('classifyTask — deterministic screen-output detector', () => {

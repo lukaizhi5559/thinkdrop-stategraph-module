@@ -26,7 +26,7 @@
 const OVERLAY_PORT = process.env.OVERLAY_CONTROL_PORT || 3010;
 const BASE = `http://127.0.0.1:${OVERLAY_PORT}`;
 
-const { inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { inferScreenOutput, SCRIPTURE_REF_RE } = require('../utils/textPatterns.cjs');
 
 const EFFECT_RE = /\b(emoji[\s-]?rain|fireworks?|confetti|snow|rain)\b/i;
 const EMOJI_RE = /\p{Extended_Pictographic}/u;
@@ -196,10 +196,13 @@ const SCENE_FORBIDDEN_RE = /\b(?:import|require|fetch|XMLHttpRequest|WebSocket|E
 const SCENE_GEN_SYSTEM = [
   'You write three.js scenes for a sandboxed overlay. Output ONLY JavaScript — no markdown, no explanation.',
   'The code you write is the BODY of `function build(THREE, ctx)`.',
-  'ctx = { scene, camera, renderer, width, height } — a renderer, camera (z=6), ambient + directional light already exist.',
+  'ctx = { scene, camera, renderer, width, height, canvas, onKey } — a renderer, camera (z=6), ambient + directional light already exist.',
   'Add meshes/lines/points to ctx.scene with THREE. For animation return `{ tick(t) }` — tick(t) runs every frame, t = elapsed seconds.',
-  'Keep geometry under ~200k vertices. Use additive colors on transparent background. Camera is fixed at z=6; keep content within roughly x,y ∈ [-4,4].',
-  'NO imports, NO fetch/network calls, NO DOM access beyond ctx, NO eval/Function. THREE only.',
+  'Keep geometry under ~200k vertices. Use additive colors on transparent background. Camera starts at z=6; keep content within roughly x,y ∈ [-4,4].',
+  'INTERACTION: ctx.onKey(fn) registers a key handler. Keys arrive as names: "up"|"down"|"prev"|"next" (arrow keys), "play" (spacebar), "zoom_in"|"zoom_out"|"zoom_reset" (+/−/0), "reset" (R), "key_w"|"key_a"|"key_s"|"key_d" (WASD).',
+  'Pointer input reaches the canvas while the scene is interactive — use canvas.addEventListener("pointerdown"|"pointermove"|"pointerup"|"wheel", fn) for drag-orbit, click, or scroll-zoom behaviour.',
+  'When the request implies control (drag, orbit, move, play, steer, fly), implement spherical camera orbit: keep { yaw, pitch, dist } state, apply camera.position.set(dist*Math.sin(yaw)*Math.cos(pitch), dist*Math.sin(pitch), dist*Math.cos(yaw)*Math.cos(pitch)); camera.lookAt(0,0,0) each frame — wire pointer drag to yaw/pitch and wheel to dist.',
+  'NO imports, NO fetch/network calls, NO DOM access beyond ctx/canvas listeners, NO eval/Function. THREE only.',
 ].join('\n');
 
 /** LLM-generated three.js scene → { js, libs:['three'] } for kind:'scene'.
@@ -208,15 +211,23 @@ async function _generateThreeScene(message, state, logger) {
   const llm = state.llmBackend;
   if (!llm || typeof llm.generateAnswer !== 'function') return null;
   try {
-    const ctrl = Promise.race([
-      llm.generateAnswer(
+    // 'complex' routing — 'codegen' wasn't a real taskType and the 30s race
+    // fired before the backend could stream (observed: every starfield
+    // fallback was exactly ~30s = this timeout, not a real model failure).
+    // abortSignal + totalTimeoutMs mean a real timeout terminates the pooled
+    // WS request instead of abandoning it mid-stream.
+    const ctrl = new AbortController();
+    const genTimeout = setTimeout(() => ctrl.abort(), 120000);
+    let raw;
+    try {
+      raw = String(await llm.generateAnswer(
         `Scene request: ${message}`,
         { query: message, context: { systemInstructions: SCENE_GEN_SYSTEM, intent: 'screen_display' } },
-        { maxTokens: 2000, temperature: 0.4, taskType: 'codegen' }
-      ),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('scene-gen timeout')), 30000)),
-    ]);
-    let raw = String(await ctrl || '');
+        { maxTokens: 2000, temperature: 0.4, taskType: 'complex', abortSignal: ctrl.signal, totalTimeoutMs: 110000 }
+      ) || '');
+    } finally {
+      clearTimeout(genTimeout);
+    }
     // Strip markdown fences if the model wrapped the code anyway.
     raw = raw.replace(/^```(?:js|javascript)?\s*/im, '').replace(/```\s*$/m, '').trim();
     // Models keep writing `import * as THREE from '...'` despite the prompt —
@@ -443,18 +454,27 @@ module.exports = async function screenOutput(state) {
       else {
         // Prior-step image search — extractStepResult carries
         // { summary, imageUrl, images } for web_search results that have
-        // image results (brave-image).
+        // image results (brave-image). Multi-image results become a Splide
+        // carousel (images[]) — "show pics of X" paints them all, not just
+        // the first hit.
         const last = (state.intentResults || [])[ (state.intentResults || []).length - 1 ];
         const r = last && last.result && typeof last.result === 'object' ? last.result : null;
-        if (r && r.imageUrl) payload.url = r.imageUrl;
-        else if (r && Array.isArray(r.images) && r.images[0]) payload.url = r.images[0];
+        const imgs = r && Array.isArray(r.images) ? r.images.filter(u => typeof u === 'string' && u) : [];
+        if (imgs.length > 1) {
+          payload.images = imgs.slice(0, 20);
+          if (imgs[0]) payload.url = imgs[0]; // fallback src if the carousel path fails
+        } else if (r && r.imageUrl) payload.url = r.imageUrl;
+        else if (imgs[0]) payload.url = imgs[0];
       }
-      if (!payload.url && !payload.path) {
+      if (!payload.url && !payload.path && !(payload.images && payload.images.length)) {
         return {
           ...state,
           _directAnswer: '## Screen\n\nNo image on hand — name a picture (e.g. "pic of the golden gate") or give me a URL/path.',
         };
       }
+      // Carousel chrome (arrows/dots/drag) is real pointer input — capture
+      // on hover so the rest of the screen stays click-through.
+      if (payload.images && payload.images.length > 1) payload.interactive = true;
       if (tc.screenOutputContent) payload.caption = tc.screenOutputContent;
       break;
     }
@@ -469,25 +489,41 @@ module.exports = async function screenOutput(state) {
         // presets can't express ("face", "heart") must reach the generative
         // fallback below — that's the whole point of it.
       }
-      // Generative fallback: no preset matched — an LLM writes the scene
+      // Generative path: no preset matched — an LLM writes the scene
       // body (harness provides THREE/renderer/camera/RAF) and it runs as a
       // 'scene' kind inside the sandboxed SceneScreen iframe. Generation
-      // failure falls back to the starfield preset so the prompt still
-      // paints something.
+      // failure returns an honest error and paints nothing (user decision —
+      // the starfield silent-fallback masked every generation failure).
       if (!payload.three) {
         const gen = await _generateThreeScene(message, state, logger);
         if (gen) {
           payload.kind = 'scene';
           payload.scene = gen;
           payload.title = payload.title || tc.screenOutputContent || null;
+          // Stable id — re-prompts ("make it faster", "now add rings") POST
+          // a fresh scene under the same id so the stage swaps it in place
+          // instead of stacking a second display. That swap IS the loop.
+          payload.id = 'scene:active';
           // Interactive phrasing ("let me drag/play with…") opts into
-          // click-through lifting; ambient scenes stay non-interactive.
-          if (/\b(?:drag|click|play|interact|control|orbit|move)\b/i.test(message)) {
+          // click-through lifting; ambient scenes stay non-interactive
+          // (⌘⇧K still grabs controls live).
+          if (/\b(?:drag|click|play|interact|control|orbit|move|steer|fly|drive|game)\b/i.test(message)) {
             payload.blocking = true;
           }
         } else {
-          payload.three = { scene: 'starfield' };
+          // No silent starfield: a failed generation is an honest error, not
+          // a wrong display. (Old behavior painted the starfield preset and
+          // reported success for the requested scene — deeply confusing.)
+          return {
+            ...state,
+            _directAnswer: "## Screen\n\nCouldn't generate that 3D scene — the scene model timed out or returned unusable code. Try again, or name a preset (starfield, particles, wave, cube, knot, globe).",
+          };
         }
+      }
+      // Same interactive phrasing opts preset scenes into pointer capture —
+      // drag-orbit/wheel-zoom land on the canvas itself.
+      if (payload.three && /\b(?:drag|click|interact|control|orbit|play with)\b/i.test(message)) {
+        payload.blocking = true;
       }
       const em = message.match(EMOJI_RE);
       if (em) payload.emoji = em[0];
@@ -509,11 +545,23 @@ module.exports = async function screenOutput(state) {
         };
       }
       payload.text = content;
-      // Long passages (a whole chapter, a document) need dwell time proportional
-      // to length — the renderer auto-scrolls what doesn't fit.
-      if (content.length > 400) {
-        payload.durationMs = Math.min(180000, Math.max(15000, Math.round(content.length * 45)));
+      // A short literal that's a *reference* rather than content — a scripture
+      // ref ("john 3:16-20"), a bare label — rendered alone at xl looks like a
+      // giant orphaned heading while the actual passage sat in the prior
+      // answer. Promote it to the title and use the assistant's text as the
+      // body. Gated hard: no newlines, <120 chars, and the assistant text must
+      // exist and not be a "Displayed …" screen ack (those start '## Screen').
+      const literal = tc.screenOutputContent;
+      if (literal && literal === content && literal.length < 120 && !literal.includes('\n')) {
+        const prior = _lastAssistantText(state.conversationHistory);
+        if (prior && prior !== literal && !prior.startsWith('## Screen')
+          && (SCRIPTURE_REF_RE.test(literal) || prior.includes(literal))) {
+          payload.title = payload.title || literal;
+          payload.text = prior;
+        }
       }
+      // No auto-duration — all kinds are sticky by default (Esc or
+      // /screen/clear dismisses). Long passages scroll; see TextScreen.
       if (tc.followUpTarget) payload.title = String(tc.followUpTarget).slice(0, 200);
       const em = message.match(EMOJI_RE);
       if (em) payload.emoji = em[0];
