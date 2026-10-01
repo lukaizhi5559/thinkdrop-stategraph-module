@@ -67,11 +67,18 @@ class StateGraph {
     // e.g. routing resumed plans (_planFile) straight to planExecutor.
     let currentNode = typeof this.startNode === 'function' ? await this.startNode(state) : this.startNode;
     state.currentNode = currentNode;
-    // Per-node visit counts for real loop detection. Recovery cycles
-    // (execute → evaluate → recover → execute) legitimately revisit a node
-    // a few times; more than MAX_NODE_VISITS means the graph is stuck.
-    const visitCount = new Map();
+    // Per-node visit tracking for real loop detection, keyed on a progress
+    // marker rather than raw count: a sequential plan legitimately re-enters
+    // executeCommand once per step (observed: a 6-step plan aborted on the
+    // 6th entry even though every visit made progress). Only repeated entry
+    // with NO state progress counts toward the abort — a genuine cycle
+    // (A⇄B with unchanged cursor/results/plan) still trips the limit.
+    const visits = new Map(); // node → { count, marker }
     const MAX_NODE_VISITS = 5;
+    const _progressMarker = (s) => [
+      s.skillCursor, s.skillResults?.length, s.skillPlan?.length,
+      s.evaluationRetryCount, s._skillPlanFile,
+    ].join(':');
     const maxIterations = 50; // Hard bound — safety net behind loop detection
     let iterations = 0;
 
@@ -87,14 +94,17 @@ class StateGraph {
       }
 
       // Loop detection: a node re-entered more than MAX_NODE_VISITS times
-      // means an edge cycle is stuck (e.g. recovery ping-pong). The old check
-      // keyed on `${node}_${iterations}` — unique every pass — so it could
-      // never fire; only maxIterations bounded the run.
-      const visits = (visitCount.get(currentNode) || 0) + 1;
-      visitCount.set(currentNode, visits);
-      if (visits > MAX_NODE_VISITS) {
-        this.logger.warn(`[StateGraph] Loop detected: node "${currentNode}" entered ${visits} times — aborting run`);
-        state.error = `Loop detected: node "${currentNode}" entered ${visits} times`;
+      // *with no progress* means an edge cycle is stuck (e.g. recovery
+      // ping-pong). Progress = any change to the plan cursor, results count,
+      // plan length, retry count, or installed plan file — sequential steps
+      // and fresh replans reset the counter instead of tripping it.
+      const marker = _progressMarker(state);
+      const rec = visits.get(currentNode);
+      const stallCount = (rec && rec.marker === marker) ? rec.count + 1 : 1;
+      visits.set(currentNode, { count: stallCount, marker });
+      if (stallCount > MAX_NODE_VISITS) {
+        this.logger.warn(`[StateGraph] Loop detected: node "${currentNode}" entered ${stallCount} times with no progress — aborting run`);
+        state.error = `Loop detected: node "${currentNode}" entered ${stallCount} times with no progress`;
         state.failedNode = currentNode;
         break;
       }

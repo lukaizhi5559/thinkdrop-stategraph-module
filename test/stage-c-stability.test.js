@@ -55,6 +55,46 @@ async function testRecoveryCyclesAllowed() {
   assert(result.success === true, 'run completes successfully');
 }
 
+async function testSequentialPlanBeyondVisitCap() {
+  console.log('\n--- Sequential plan re-entering a node >5 times still completes ---');
+  // Regression: the raw per-node visit cap aborted any plan that entered
+  // executeCommand a 6th time — a 6-step plan or a plan+retry. Loop
+  // detection is now progress-aware: each entry that advances skillCursor /
+  // skillResults resets the stall counter, so sequential progress never trips.
+  const graph = new StateGraph(
+    {
+      step: async s => ({
+        ...s,
+        skillCursor: (s.skillCursor || 0) + 1,
+        skillResults: [...(s.skillResults || []), { ok: true }],
+      }),
+    },
+    {
+      start: 'step',
+      // 8 sequential steps — the old detector aborted on the 6th entry.
+      step: s => ((s.skillCursor || 0) >= 8 ? 'end' : 'step'),
+    },
+    { logger: silentLogger }
+  );
+  const result = await graph.execute({ skillPlan: new Array(8).fill({}) });
+  assert(!result.error, 'no loop error for 8-step sequential plan', result.error);
+  assert(result.skillCursor === 8, 'all 8 steps ran', `cursor=${result.skillCursor}`);
+}
+
+async function testNoProgressReentryStillAborts() {
+  console.log('\n--- Same-node re-entry with no progress still aborts ---');
+  // The inverse: a node re-entered with an UNCHANGED progress marker must
+  // still trip — this is the genuine-stuck-cycle case the detector exists for.
+  const graph = new StateGraph(
+    { a: async s => s },
+    { start: 'a', a: 'a' },
+    { logger: silentLogger }
+  );
+  const result = await graph.execute({ skillCursor: 0, skillResults: [], skillPlan: [{}] });
+  assert(/Loop detected/.test(result.error || ''), 'no-progress self-loop aborts', result.error);
+  assert(result.iterations < 50, 'aborts before maxIterations', `iterations=${result.iterations}`);
+}
+
 // ── 2. Multi-intent per-step reset ───────────────────────────────────────────
 function buildFullGraph() {
   // full() only needs mcpAdapter OR llmBackend — the edge under test never
@@ -170,6 +210,8 @@ async function testResultPlaceholderStillResolves() {
 (async () => {
   await testLoopDetection();
   await testRecoveryCyclesAllowed();
+  await testSequentialPlanBeyondVisitCap();
+  await testNoProgressReentryStillAborts();
   await testQueueResetClearsReferentState();
   await testResultPlaceholderStillResolves();
   console.log(`\n${'='.repeat(60)}\n  Total: ${passed + failed}  Passed: ${passed}  Failed: ${failed}\n${'='.repeat(60)}`);

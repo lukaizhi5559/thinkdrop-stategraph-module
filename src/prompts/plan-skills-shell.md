@@ -202,6 +202,13 @@ When a prior step (e.g., `app.agent extract_content_via_clipboard`) has placed c
 git remote get-url origin | sed 's/.*github.com[:/]//' | sed 's/\.git$//'
 ```
 
+- **Multi-repo commits ("commit my work", "commit all repos under X"):** a project tree often contains NESTED git repos (e.g. `project/` plus `project/sub/`). NEVER `git add -A` / `git add .` in the outer repo — it stages each nested repo as a gitlink (mode 160000, pseudo-submodule) instead of committing contents. Commit each repo independently, one step per repo or one loop step:
+  1. Discover: `find BASE -name .git -type d -prune` — NO `-maxdepth` (a depth limit misses deeper repos like `mcp-services/*`).
+  2. Per repo: `cd <repo> && git add -A && git status --porcelain | grep -q . && git commit -m "<message from git diff --cached --stat>" || echo "<repo>: nothing to commit"`.
+  3. Verify: one line per repo — name, branch, `git log -1 --oneline`, remaining `git status --short`.
+  - Commit messages must describe the actual diff — never "Work in progress - automated commit".
+  - "Commit my work" = commit ONLY. Never `git push` unless the user explicitly says push.
+
 - **Locating a file by name:** `mdfind -name 'filename' | head -1` (Spotlight, <1s). NEVER use `find /Users` or `find ~` — hangs on network volumes.
 - **Finding a file then reading it:** always 3 steps: (1) `mdfind`, (2) `cat`, (3) `synthesize`.
 - **`find` on user directories — ALWAYS `-maxdepth 1` by default.** No recursion unless user says "recursively / subfolders / children / nested". Use `-exec {} +` (batch) NOT `-exec {} \;` (per-item subprocess, hangs on large trees). Example: `find ~/Desktop -maxdepth 1 -exec CMD {} +`.

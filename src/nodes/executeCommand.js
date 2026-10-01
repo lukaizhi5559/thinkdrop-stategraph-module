@@ -1735,7 +1735,17 @@ module.exports = async function executeCommand(state) {
       : (_prev?.result || '');
     // fs.read returns content in .content (also .tree/.text on some skills) —
     // without these fallbacks {{PREV_OUTPUT}} stays literal and reaches the LLM.
-    const prevStdout = (_prev?.stdout || _prevResultStr || _prev?.content || _prev?.text || _prev?.tree || '').slice(0, 12000);
+    let prevStdout = (_prev?.stdout || _prevResultStr || _prev?.content || _prev?.text || _prev?.tree || '').slice(0, 12000);
+    // A prior step that SUCCEEDED but legitimately emitted nothing (git add,
+    // mkdir, silent writes) must not leave the literal marker for the
+    // unresolved-marker guard to reject — that hard-failed the step and
+    // burned a full replan (observed: task_8346e2cb). Substitute an explicit
+    // sentinel so the next command reads the truth. A FAILED prior step
+    // (ok === false) still falls through to the guard — replanning a chain
+    // built on failed output is correct.
+    if (!prevStdout && _prev && _prev.ok !== false) {
+      prevStdout = '(previous step produced no output)';
+    }
     if (prevStdout) {
       // Case-insensitive: match {{PREV_OUTPUT}} and {{prev_stdout}} (planner sometimes emits lowercase)
       const injectPrev = (val) => typeof val === 'string'

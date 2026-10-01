@@ -385,7 +385,12 @@ class StateGraphBuilder {
           logger.debug('[StateGraph:Router] executeCommand: auto_patch → retry executeCommand');
           return 'executeCommand';
         }
-        if (state.recoveryAction === 'replan' || state.recoveryAction === 'replan_step') {
+        // Gate on an active failure: a stale 'replan' surviving a successful
+        // step (e.g. left set after a full replan installed a new plan) must
+        // not hijack a healthy plan — observed: Plan B exited after step 1
+        // because recoveryAction was never cleared on install.
+        if ((state.recoveryAction === 'replan' || state.recoveryAction === 'replan_step')
+            && (state.failedStep || state.planError)) {
           logger.debug(`[StateGraph:Router] executeCommand: ${state.recoveryAction} → evaluateSkills (failure judge) → planSkills`);
           return 'evaluateSkills';
         }

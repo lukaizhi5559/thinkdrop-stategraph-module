@@ -1494,7 +1494,7 @@ async function planSkillsV2(state) {
     const _resolvedPlan = _ensureSynthesizeStep(_resolveCtxUrlTokens(state.skillPlan, state._priorScreenContext?.url, state._gatheredVars, logger), userMessage);
     logger.info(`[Node:PlanSkillsV2] planExecutor passthrough — ${_resolvedPlan.length} steps pre-built, skipping planning`);
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: _resolvedPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-    return { ...state, skillPlan: _resolvedPlan, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null };
+    return { ...state, skillPlan: _resolvedPlan, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
   }
 
   // ── planMode fast-path: planExecutor dispatched this step (legacy) ─────────
@@ -1506,7 +1506,7 @@ async function planSkillsV2(state) {
       : [{ skill: 'shell.run', description: _stepMsg, args: { goal: _stepMsg } }];
     logger.info(`[Node:PlanSkillsV2] _planMode fast-path — skipping planning for: "${_stepMsg.slice(0, 60)}" (skill: ${_stepPlan[0]?.skill})`);
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: _stepPlan.map((s, i) => ({ index: i, ...s })), intent: state.intent?.type || 'command_automate' });
-    return { ...state, skillPlan: _stepPlan, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null };
+    return { ...state, skillPlan: _stepPlan, skillCursor: 0, planError: null, awaitingPlanApproval: false, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
   }
 
   // ── Project skill plan passthrough ────────────────────────────────────────
@@ -1514,7 +1514,7 @@ async function planSkillsV2(state) {
     const _guardedPlan = _ensureSynthesizeStep([...state.projectSkillPlan], userMessage);
     logger.info(`[Node:PlanSkillsV2] Using project skill plan: ${state.projectSkillPlan[0].skill}`);
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description, args: s.args, runGroup: s.runGroup || undefined })), intent: 'command_automate' });
-    return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null };
+    return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
   }
 
   // ── Named plan recall fast-path ───────────────────────────────────────────
@@ -1525,7 +1525,7 @@ async function planSkillsV2(state) {
       const _guardedPlan = _ensureSynthesizeStep(recalled.plan, userMessage);
       logger.info(`[Node:PlanSkillsV2] Named plan recall: "${state._recallPlanName}" → ${_guardedPlan.length} steps`);
       if (progressCallback) progressCallback({ type: 'plan:found_existing', planName: state._recallPlanName });
-      return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: recalled.planFile };
+      return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, _skillPlanFile: recalled.planFile };
     }
     logger.warn(`[Node:PlanSkillsV2] Named plan recall: "${state._recallPlanName}" not found — falling through to LLM`);
   }
@@ -1548,7 +1548,7 @@ async function planSkillsV2(state) {
         const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
-        return { ...state, skillPlan: _guardedPlan, skillCursor: _startCursor, planError: null, recoveryContext: null, _skillPlanIsResume: false };
+        return { ...state, skillPlan: _guardedPlan, skillCursor: _startCursor, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, _skillPlanIsResume: false };
       }
     } catch (err) {
       logger.warn(`[Node:PlanSkillsV2] _skillPlan fast-path decode failed: ${err.message} — falling through to LLM`);
@@ -1592,7 +1592,7 @@ async function planSkillsV2(state) {
 
       const _guardedPlan = _ensureSynthesizeStep(plan, userMessage);
       if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-      return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null };
+      return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
     }
   }
 
@@ -1827,7 +1827,7 @@ async function planSkillsV2(state) {
           logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}"`);
         }
         if (progressCallback) progressCallback({ type: 'plan:found_existing', planFile: cached.planFile });
-        return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: cached.planFile };
+        return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, _skillPlanFile: cached.planFile };
       }
     } catch (_e) { logger.debug(`[Node:PlanSkillsV2] Cache check error: ${_e.message}`); }
   }
@@ -1890,10 +1890,10 @@ async function planSkillsV2(state) {
         // executeCommand can still substitute {{BODY}} in agent-path steps.
         priorSynthesizedContent: priorSynthesizedContent || '',
       });
-      return { ...state, awaitingPlanApproval: true, _skillPlanFile: _detPlanFile, skillPlan: null, skillCursor: 0, planError: null, recoveryContext: null, priorSynthesizedContent: priorSynthesizedContent || '' };
+      return { ...state, awaitingPlanApproval: true, _skillPlanFile: _detPlanFile, skillPlan: null, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, priorSynthesizedContent: priorSynthesizedContent || '' };
     }
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: detPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate', deterministic: true });
-    return { ...state, skillPlan: detPlan, skillCursor: 0, planError: null, recoveryContext: null, _skillPlanFile: _detPlanFile, priorSynthesizedContent: priorSynthesizedContent || '' };
+    return { ...state, skillPlan: detPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, _skillPlanFile: _detPlanFile, priorSynthesizedContent: priorSynthesizedContent || '' };
   }
 
   // ── Pre-LLM reminder-cancel intercept ────────────────────────────────────
@@ -1923,7 +1923,7 @@ async function planSkillsV2(state) {
     const _guardedCancelPlan = _ensureSynthesizeStep(cancelPlan, userMessage);
     logger.info(`[Node:PlanSkillsV2] Reminder-cancel intercept: schedule_cancel query="${_cancelQuery}"`);
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedCancelPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-    return { ...state, skillPlan: _guardedCancelPlan, skillCursor: 0, planError: null, recoveryContext: null };
+    return { ...state, skillPlan: _guardedCancelPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
   }
 
   // ── Pre-LLM recurring reminder intercept ─────────────────────────────────
@@ -1934,7 +1934,7 @@ async function planSkillsV2(state) {
         const _guardedReminderPlan = _ensureSynthesizeStep(reminderResult.plan, userMessage);
         logger.info(`[Node:PlanSkillsV2] Reminder skill intercept: ${_guardedReminderPlan.length} steps`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedReminderPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-        return { ...state, skillPlan: _guardedReminderPlan, skillCursor: 0, planError: null, recoveryContext: null };
+        return { ...state, skillPlan: _guardedReminderPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
       }
     } catch (_) {}
   }
@@ -2204,7 +2204,7 @@ async function planSkillsV2(state) {
 
     const _guardedDomainPlan = _ensureSynthesizeStep(domainPlan, userMessage);
     if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedDomainPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-    return { ...state, skillPlan: _guardedDomainPlan, skillCursor: 0, planError: null, recoveryContext: null, domainSkillFastPath: true };
+    return { ...state, skillPlan: _guardedDomainPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, domainSkillFastPath: true };
   }
 
   // ── Contract-driven fast-path (shell skills) ──────────────────────────────
@@ -2232,7 +2232,7 @@ async function planSkillsV2(state) {
 
           const _guardedContractPlan = _ensureSynthesizeStep(contractPlan, userMessage);
           if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedContractPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-          return { ...state, skillPlan: _guardedContractPlan, skillCursor: 0, planError: null, recoveryContext: null };
+          return { ...state, skillPlan: _guardedContractPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
         }
       } catch (_) {}
     }
@@ -2357,7 +2357,7 @@ async function planSkillsV2(state) {
       }];
       const _guardedFastPlan = _ensureSynthesizeStep(fastPlan, userMessage);
       if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedFastPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-      return { ...state, skillPlan: _guardedFastPlan, skillCursor: 0, planError: null, recoveryContext: null, _trainedRecipeMap };
+      return { ...state, skillPlan: _guardedFastPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, _trainedRecipeMap };
     } else {
       logger.info(`[Node:PlanSkillsV2] No trained recipe match found, falling through to LLM planning`);
     }
@@ -2417,7 +2417,7 @@ async function planSkillsV2(state) {
   //         intent: state.intent?.type || 'command_automate',
   //       });
   //     }
-  //     return { ...state, skillPlan: _gatePlan, skillCursor: 0, planError: null, recoveryContext: null };
+  //     return { ...state, skillPlan: _gatePlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
   //   }
   // }
 
@@ -2439,7 +2439,7 @@ async function planSkillsV2(state) {
             ];
             logger.info(`[Node:PlanSkillsV2] File-op fast-path: "${userMessage.slice(0, 60)}" → lp ${_fileHint}`);
             if (progressCallback) progressCallback({ type: 'plan_ready', steps: _fastPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-            return { ...state, skillPlan: _fastPlan, skillCursor: 0, planError: null, recoveryContext: null };
+            return { ...state, skillPlan: _fastPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
           }
         }
       } catch (_) { /* non-fatal — fall through to LLM planner */ }
@@ -2697,7 +2697,7 @@ The user's request does NOT match any installed skill.
         skillPlan: newPlan,
         skillCursor: state.skillCursor,  // Stay at same position
         planError: null,
-        recoveryContext: null,  // Clear after use
+        recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null,  // Clear after use
       };
     } else {
       logger.warn(`[Node:PlanSkillsV2] Single-step replan requested but no valid skillPlan found - falling back to full replan`);
@@ -3001,7 +3001,7 @@ The user's request does NOT match any installed skill.
         if (retryPlan && Array.isArray(retryPlan)) {
           const _guardedPlan = _ensureSynthesizeStep(retryPlan, userMessage);
           if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate' });
-          return { ...state, skillPlan: _guardedPlan, skillCursor: 0, recoveryContext: null, planError: null };
+          return { ...state, skillPlan: _guardedPlan, skillCursor: 0, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, planError: null };
         }
       } catch (_) {}
     }
@@ -3456,7 +3456,7 @@ The user's request does NOT match any installed skill.
       skillPlan: null,
       skillCursor: 0,
       planError: null,
-      recoveryContext: null,
+      recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null,
       priorSynthesizedContent: priorSynthesizedContent || '',
     };
   }
@@ -3479,7 +3479,7 @@ The user's request does NOT match any installed skill.
     skillPlan,
     skillCursor: 0,
     planError: null,
-    recoveryContext: null,
+    recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null,
     _skillPlanFile,
     priorSynthesizedContent: priorSynthesizedContent || '',
   };

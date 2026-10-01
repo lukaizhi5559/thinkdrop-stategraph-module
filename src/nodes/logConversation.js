@@ -211,9 +211,11 @@ module.exports = async function logConversation(state) {
           if (!out && r.skill === 'shell.run' && r.cmd && typeof r.cmd === 'string') {
             return `[${label}]:\n(ran: ${r.cmd.trim().slice(0, 300)})`;
           }
-          // For fs.read: include full tree output (filenames are critical for follow-ups)
-          // For others: truncate to 500 chars
-          return `[${label}]:\n${r.skill === 'fs.read' ? r.stdout.trim() : out.slice(0, 500)}`;
+          // For fs.read: include tree output (filenames are critical for
+          // follow-ups) but still bounded — an uncapped fs.read stdout once
+          // produced a ~2MB richText that the conversation service rejected
+          // ("request entity too large"). For others: truncate to 500 chars.
+          return `[${label}]:\n${r.skill === 'fs.read' ? out.slice(0, 4000) : out.slice(0, 500)}`;
         });
       if (keyOutputs.length > 0) {
         // Always append the LLM-generated synthesized answer as a dedicated [synthesize]
@@ -258,6 +260,15 @@ module.exports = async function logConversation(state) {
     // from being persisted as history, which would prime the next LLM call to output code.
     if (richAssistantText && typeof richAssistantText === 'string') {
       richAssistantText = richAssistantText.replace(/^```[\w]*\r?\n?/gm, '').replace(/\r?\n?```\s*$/gm, '').trim();
+    }
+
+    // Hard bound on the persisted turn — conversation-service runs under the
+    // default express.json limit (~100KB), and an uncapped fs.read stdout once
+    // produced a ~2MB richText that was rejected with "request entity too
+    // large". 32KB leaves ample headroom while preserving step summaries.
+    const MAX_RICH_TEXT = 32 * 1024;
+    if (richAssistantText && richAssistantText.length > MAX_RICH_TEXT) {
+      richAssistantText = richAssistantText.slice(0, MAX_RICH_TEXT) + '\n… (output truncated for history)';
     }
 
     // [DEBUG DIAG] Remove after BODY fix confirmed
