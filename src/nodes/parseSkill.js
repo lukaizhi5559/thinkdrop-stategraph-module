@@ -412,7 +412,16 @@ module.exports = async function parseSkill(state) {
   //   logger.debug(`[Node:ParseSkill] Strategy 3 skipped — new session created, allowing fresh plan: "${classifyMessage.substring(0, 80)}"`);
   //   return state;
   // }
-  
+
+  // ENV GATE: semantic matching costs ~1–2s of LLM latency on every
+  // command_automate task and virtually always returns -1 for ordinary
+  // service-routed browser tasks (Google Docs, Gmail…). It remains available
+  // behind THINKDROP_SKILL_SEMANTIC_MATCH=1 for skill-library deployments.
+  if (process.env.THINKDROP_SKILL_SEMANTIC_MATCH !== '1') {
+    logger.debug(`[Node:ParseSkill] Strategy 3 skipped — semantic skill match disabled (THINKDROP_SKILL_SEMANTIC_MATCH!=1): "${classifyMessage.substring(0, 80)}"`);
+    return state;
+  }
+
   if (state.intent?.type !== 'command_automate' || intentConf < 0.75) {
     logger.debug(`[Node:ParseSkill] Strategy 3 skipped — intent is not command_automate: "${classifyMessage.substring(0, 80)}"`);
     return state;

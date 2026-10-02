@@ -266,9 +266,18 @@ const SESSION_CACHE_MAX    = 50;
 /**
  * Canonical normalisation for exact-match cache keys.
  * Lowercases, collapses whitespace, strips leading/trailing punctuation.
+ * Also strips run-injected metadata blocks — "[Additional context: Route: x]",
+ * "[Additional context: question: answer; …]" and similar enrichment gathered
+ * per-run — which vary between identical re-runs and previously broke
+ * exact-match plan caching. User-authored bracket text is left alone.
  */
 function normalizePrompt(text) {
-  return (text || '').toLowerCase().replace(/[^\w\s-]/g, ' ').replace(/\s+/g, ' ').trim();
+  return (text || '')
+    .replace(/\[\s*additional context:[^\]]*\]/gi, ' ')
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function _sessionCacheKey(message, sessionId = null) {
@@ -485,11 +494,11 @@ function _collectCandidatePlans(sessionId = null) {
   // If sessionId is provided, only search plans from current session
   if (sessionId) {
     // Plans are stored with timestamps, so we need to filter by session context
-    // For now, we'll limit to recent plans (last 10) to approximate session scoping
+    // For now, we'll limit to recent plans to approximate session scoping
     // TODO: Implement proper session-scoped plan storage
-    files = files.slice(0, 10);
+    files = files.slice(0, 50);
   } else {
-    files = files.slice(0, 20);
+    files = files.slice(0, 50);
   }
 
   const candidates = [];

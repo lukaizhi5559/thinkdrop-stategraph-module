@@ -7,10 +7,10 @@
  * Runs agent readiness checks BEFORE plan generation:
  *   1. Skill contract fetch (for matchedSkillName)
  *   2. CLI pre-flight (cli.agent preflight_check)
- *   3. Agent registry + trained recipes (agent.list + trainer.agent)
+ *   3. Agent registry (agent.list — single shared snapshot)
  *   4. Installed skills list
- *   5. Disk-scan fallback for trained recipes
- *   6. Browser agent auth check (session profile exists + cookie validity?)
+ *   5. Disk-scan for trained recipes (no trainer.agent calls)
+ *   6. Browser agent auth decision (authentication ledger — edge-triggered)
  *   7. App agent build (app.agent build_agent — Phase 2)
  *   8. vet CLI presence check (secure script installer)
  *   9. Monthly CLI version validation (timestamp-gated, calls validate_agent)
@@ -49,9 +49,13 @@ const { resolveRoute } = require('../utils/resolveRoute');
 
 // ── Preflight state file (monthly validation persistence) ────────────────────
 const PREFLIGHT_STATE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-state.json');
-const PREFLIGHT_AUTH_CACHE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-auth-cache.json');
+// Env-overridable so tests don't pollute the real ledger file. Resolved at
+// call time so tests can set THINKDROP_PREFLIGHT_AUTH_CACHE after require.
+function _authCacheFile() {
+  return process.env.THINKDROP_PREFLIGHT_AUTH_CACHE
+    || path.join(os.homedir(), '.thinkdrop', 'preflight-auth-cache.json');
+}
 const VALIDATION_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-const BROWSER_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days for cookie staleness
 
 // ── Session-level auth cache (persists across StateGraph runs within same process) ──
 // Key: agentId (lowercase)  Value: { ts, authed }
@@ -59,36 +63,55 @@ const BROWSER_SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days for cookie
 const PREFLIGHT_AUTH_CACHE_TTL_MS = 30 * 60 * 1000;
 const _authCache = new Map();
 
-// ── Persistent auth cache (survives app restart) ─────────────────────────────
-// Key: agentId (lowercase)  Value: { ts, authed }
-// TTL: 24 hours — skip the CDP cookie-sniff probe for agents authenticated
-// within this window. The 7-day sessionStale cookie-age check still overrides
-// this (stale cookies force a probe even within 24h).
-const PREFLIGHT_AUTH_CACHE_PERSISTENT_TTL_MS = 24 * 60 * 60 * 1000;
+// ── Persistent auth ledger (survives app restart) ────────────────────────────
+// Key: agentId (lowercase)
+// Value: { ts, authed, lastUsed, needsAuth, lastAuthFailedAt, lastAuthFailedReason }
+//
+// THE LEDGER MODEL: `authed === true` is trusted PERMANENTLY — no TTL. The
+// entry is only invalidated when something OBSERVES auth is broken:
+//   - runtime login-wall re-detection (browser.agent clears authed_at and
+//     writes authed:false + lastAuthFailedAt here), or
+//   - a failed one-time migration verify.
+// This replaces the old 24h TTL + 7-day cookie-mtime gates, which re-verified
+// sessions that were almost never actually dead. Verification now happens on
+// transition edges (first contact / after logout), not per-run.
 let _persistentAuthCache = null; // lazy-loaded
+let _persistentAuthCachePath = null; // path the loaded cache belongs to
+let _persistentAuthCacheMtime = 0; // mtimeMs at last load — cross-process refresh
 
 function _loadPersistentAuthCache() {
-  if (_persistentAuthCache !== null) return _persistentAuthCache;
+  const file = _authCacheFile();
+  // Re-read when the resolved path changes (tests override per-run) or the
+  // file was rewritten since our last load — browser.agent's usage ledger is
+  // written from the command-service process, so mtime is the freshness check.
+  let mtime = 0;
+  try { mtime = fs.statSync(file).mtimeMs; } catch (_) {}
+  if (_persistentAuthCache !== null && _persistentAuthCachePath === file && _persistentAuthCacheMtime === mtime) {
+    return _persistentAuthCache;
+  }
   try {
-    if (fs.existsSync(PREFLIGHT_AUTH_CACHE_FILE)) {
-      _persistentAuthCache = JSON.parse(fs.readFileSync(PREFLIGHT_AUTH_CACHE_FILE, 'utf8'));
-    } else {
-      _persistentAuthCache = {};
-    }
+    _persistentAuthCache = fs.existsSync(file)
+      ? JSON.parse(fs.readFileSync(file, 'utf8'))
+      : {};
   } catch (_) {
     _persistentAuthCache = {};
   }
+  _persistentAuthCachePath = file;
+  _persistentAuthCacheMtime = mtime;
   return _persistentAuthCache;
 }
 
 function _savePersistentAuthCache(data) {
   try {
-    const dir = path.dirname(PREFLIGHT_AUTH_CACHE_FILE);
+    const file = _authCacheFile();
+    const dir = path.dirname(file);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     // Atomic write: temp file + rename to avoid corruption on crash
-    const tmpFile = `${PREFLIGHT_AUTH_CACHE_FILE}.tmp`;
+    const tmpFile = `${file}.tmp`;
     fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf8');
-    fs.renameSync(tmpFile, PREFLIGHT_AUTH_CACHE_FILE);
+    fs.renameSync(tmpFile, file);
+    _persistentAuthCachePath = file;
+    try { _persistentAuthCacheMtime = fs.statSync(file).mtimeMs; } catch (_) {}
   } catch (_) {}
 }
 
@@ -113,17 +136,64 @@ function _getCachedAuth(agentId) {
   return entry;
 }
 
-// Persistent cache check — survives app restart. Returns the cache entry if
-// valid (within 24h), or null. Does NOT check the in-memory cache.
-function _getCachedAuthPersistent(agentId) {
+// ── Ledger read/write ───────────────────────────────────────────────────────
+// `authed` has no TTL — trusted until `authed:false`/`lastAuthFailedAt` is
+// written by a runtime login-wall observation or a failed verify.
+function _getLedgerAuth(agentId) {
   const cache = _loadPersistentAuthCache();
-  const entry = cache[agentId.toLowerCase()];
-  if (!entry) return null;
-  if (Date.now() - entry.ts > PREFLIGHT_AUTH_CACHE_PERSISTENT_TTL_MS) {
-    return null; // expired
-  }
-  return entry;
+  return cache[agentId.toLowerCase()] || null;
 }
+
+function _writeLedgerAuth(agentId, patch) {
+  if (!agentId) return;
+  const cache = _loadPersistentAuthCache();
+  const key = agentId.toLowerCase();
+  cache[key] = { ...(cache[key] || {}), ...patch, ts: Date.now() };
+  _savePersistentAuthCache(cache);
+}
+
+// Written when a verify fails or a runtime login wall is re-detected — next
+// run goes straight to auth-required instead of trusting the stale session.
+function markAgentAuthFailed(agentId, reason) {
+  if (!agentId) return;
+  _authCache.delete(agentId.toLowerCase());
+  _writeLedgerAuth(agentId, {
+    authed: false,
+    lastAuthFailedAt: Date.now(),
+    lastAuthFailedReason: reason || null,
+  });
+}
+
+// Browser-profile existence check — NOT a staleness check. Existence is only
+// the migration signal (pre-ledger session); it cannot prove login.
+const BROWSER_PROFILES_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-profiles');
+function _browserProfileHasCookies(agentId) {
+  const svcKey = (agentId || '').replace(/\.agent$/, '').toLowerCase();
+  try {
+    return fs.existsSync(path.join(BROWSER_PROFILES_DIR, `${svcKey}_agent`, 'Default', 'Cookies'));
+  } catch (_) { return false; }
+}
+
+// ── Static needs-auth knowledge ──────────────────────────────────────────────
+// 1 = interactive use of this service clearly requires an account.
+// 0 = the service's interactive flows work anonymously.
+// Unknown services fall through to a one-time 0/1 LLM judgment, then the
+// answer is recorded in the ledger as `needsAuth` permanently per service.
+const _SERVICE_NEEDS_AUTH = new Map(Object.entries({
+  gmail: 1, google: 1, google_docs: 1, google_sheets: 1, google_calendar: 1,
+  google_drive: 1, google_cloud: 1, google_maps: 1, google_photos: 1,
+  slack: 1, github: 1, notion: 1, linear: 1, figma: 1, spotify: 1,
+  twitter: 1, x: 1, linkedin: 1, facebook: 1, instagram: 1, discord: 1,
+  netflix: 1, dropbox: 1, trello: 1, jira: 1, asana: 1, hubspot: 1,
+  salesforce: 1, stripe: 1, microsoft: 1, onedrive: 1, zoom: 1, teams: 1,
+  chatgpt: 1, openai: 1, claude: 1, anthropic: 1, grok: 1, perplexity: 1,
+  airtable: 1, vercel: 1, netlify: 1, heroku: 1, digitalocean: 1,
+  // Only clearly-anonymous services get 0 — marketplaces (etsy/amazon/ebay…)
+  // are deliberately absent: browsing works anonymously but interactive tasks
+  // (orders, checkout, favorites) need accounts, so first-contact asks the LLM.
+  youtube: 0, reddit: 0, wikipedia: 0, imdb: 0, yelp: 0, craigslist: 0,
+  weather: 0, stackoverflow: 0, stack_exchange: 0, medium: 0, hackernews: 0,
+}));
 
 function _deriveAgentAuthType(descriptor) {
   const m = String(descriptor || '').match(/^type:\s*(\S+)/m);
@@ -564,20 +634,25 @@ module.exports = async function preflightAgents(state) {
     return { ...state, preflightResult: null, preflightDone: true };
   }
 
-  // ── Upfront login-need classification ─────────────────────────────────────
-  // If the prompt clearly does not require sign-in, skip browser auth probes
-  // and the auth popup. This catches public-web tasks like "Open Etsy and
-  // search for X" that resolveAgent may have selected a browser agent for.
-  let _skipBrowserAuthForTask = false;
-  if (state.llmBackend) {
-    const _needsLogin = await _llmNeedsLoginCheck(state.llmBackend, userMessage, logger);
-    if (_needsLogin === 0) {
-      _skipBrowserAuthForTask = true;
-      logger.info('[Node:PreflightAgents] LLM login-need check: prompt does not require sign-in — skipping browser auth probes');
-    } else {
-      logger.info('[Node:PreflightAgents] LLM login-need check: prompt may require sign-in — running browser auth probes');
+  // ── Phase timing instrumentation ──────────────────────────────────────────
+  const _pfT0 = Date.now();
+  const _pfDur = {};
+  const _mark = (k) => { _pfDur[k] = Date.now() - _pfT0; };
+
+  // ── First-contact login-need check (one 0/1 LLM call, lazily fired) ───────
+  // Only used for browser agents with NO evidence either way (no ledger entry,
+  // no profile cookies, not a static-map service, not a public-web task). The
+  // answer is recorded per-service in the ledger as `needsAuth` — so this runs
+  // at most once per service ever, on the transition edge, not per run.
+  let _firstContactLoginNeedPromise = null;
+  const _firstContactLoginNeed = () => {
+    if (_firstContactLoginNeedPromise === null) {
+      _firstContactLoginNeedPromise = state.llmBackend
+        ? _llmNeedsLoginCheck(state.llmBackend, userMessage, logger).catch(() => 1)
+        : Promise.resolve(1);
     }
-  }
+    return _firstContactLoginNeedPromise;
+  };
 
   // ── File reference resolution (app_automation / local_file tasks) ──────────
   // Extract a file/folder name from the user message and probe the filesystem
@@ -690,6 +765,29 @@ module.exports = async function preflightAgents(state) {
     }
   }
 
+  // ── Shared agent registry snapshot ────────────────────────────────────────
+  // The registry used to be fetched 2–3× per run (CLI filter, demote check,
+  // enumeration). One lazy fetch shared by all consumers; invalidated only
+  // when createAgentSpecs actually builds a new agent mid-run.
+  let _agentsSnapshot = null;
+  let _agentsCreated = false;
+  const _fetchAgents = async () => {
+    if (_agentsCreated) { _agentsSnapshot = null; _agentsCreated = false; }
+    if (_agentsSnapshot) return _agentsSnapshot;
+    const res = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+    _agentsSnapshot = Array.isArray(res?.data) ? res.data : (Array.isArray(res) ? res : []);
+    return _agentsSnapshot;
+  };
+
+  // Canonical service lookup key — "google docs"/"googledocs" → google_docs so
+  // routeDecision/probe lookups agree with classification output.
+  const _canonSvc = (s) => {
+    try {
+      const { _canonicalService } = require('../utils/localPlanTemplates');
+      return (_canonicalService(s) || s || '').toLowerCase();
+    } catch (_) { return String(s || '').toLowerCase(); }
+  };
+
   // ── Demote misrouted service/app agents when a local file is the subject ────
   // "Update the file" can get LLM-routed to microsoft_word_online.agent or a
   // code editor before file resolution runs — then preflight surfaces auth
@@ -701,8 +799,7 @@ module.exports = async function preflightAgents(state) {
       && selectedAgentIds.size > 0 && !_tc.targetService) {
     let _regAgents = [];
     try {
-      const _agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
-      _regAgents = (_agRes?.data || _agRes || []).filter(a => a && a.id);
+      _regAgents = (await _fetchAgents()).filter(a => a && a.id);
     } catch (_) {}
     const { _messageMentionsServiceOrAgent } = require('./resolveAgent');
     if (!_messageMentionsServiceOrAgent(userMessage, _regAgents)) {
@@ -773,8 +870,7 @@ module.exports = async function preflightAgents(state) {
   let _isGenericPreflight = false; // true when running discovery scan without typed CLI agents
   if (!recoveryContext && selectedAgentIds.size > 0) {
     try {
-      const agSnapshotRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
-      const agSnapshot = Array.isArray(agSnapshotRes?.data) ? agSnapshotRes.data : (Array.isArray(agSnapshotRes) ? agSnapshotRes : []);
+      const agSnapshot = await _fetchAgents();
       _selectedCliAgents = agSnapshot.filter(a =>
         selectedAgentIds.has(String(a?.id || '').toLowerCase()) && a?.type === 'cli'
       );
@@ -852,6 +948,7 @@ module.exports = async function preflightAgents(state) {
           if (spec._alreadyExisted) {
             logger.info(`[Node:PreflightAgents] Agent ${spec.agentId} already exists — skipping _newlyCreated flag`);
           } else {
+            _agentsCreated = true; // invalidate the shared agent.list snapshot
             logger.info(`[Node:PreflightAgents] Created ${skillName} agent: ${spec.agentId}`);
           }
         } else {
@@ -932,13 +1029,12 @@ module.exports = async function preflightAgents(state) {
       type: 'browser',
       agentId: _newAgentId,
       ready: true,
-      authed: _skipBrowserAuthForTask || _newBypassed,
+      authed: _isPublicWebTask || _newBypassed,
       authBypassed: _newBypassed,
       authType: 'browser_oauth',
       iconUrl: agentIdToIconUrl(_newAgentId, spec.startUrl),
       startUrl: spec.startUrl || null,
-      needsLogin: !(_skipBrowserAuthForTask || _newBypassed),
-      sessionStale: false,
+      needsLogin: !(_isPublicWebTask || _newBypassed),
       _newlyCreated: true,
     });
   }
@@ -1133,8 +1229,7 @@ module.exports = async function preflightAgents(state) {
     // ── Agent registry ────────────────────────────────────────────────────
     (async () => {
       try {
-        const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
-        const allAgents = agRes?.data || agRes || [];
+        const allAgents = await _fetchAgents();
         // Filter to task-relevant agents only — don't check auth for agents
         // the user's task doesn't need (e.g. youtube when sending gmail).
         // If resolveAgent selected agents, always include those regardless of task text.
@@ -1151,7 +1246,6 @@ module.exports = async function preflightAgents(state) {
         }) : [];
         if (Array.isArray(agents) && agents.length > 0) {
           const agentLines = [];
-          const trainedRecipeLines = [];
 
           for (const a of agents) {
             // Skip agents already pre-injected (newly created) to avoid duplicate auth checks
@@ -1160,99 +1254,84 @@ module.exports = async function preflightAgents(state) {
             const svc = (a.id || '').replace('.agent', '').toLowerCase();
             if (svc) _registeredAgentServiceMap[svc] = a.id;
 
-            // ── Fetch trained recipes for this agent ─────────────────────
-            if (a.type === 'browser' || a.type === 'cli') {
-              try {
-                const tsRes = await mcpAdapter.callService('command', 'command.automate', {
-                  skill: 'trainer.agent',
-                  args: { action: 'list_skills', agentId: svc }
-                }, { timeoutMs: 3000 }).catch(() => null);
-                const allSkills = tsRes?.data?.skills || tsRes?.skills || [];
-                const skills = allSkills.filter(s => _allowAutoGeneratedRecipes || s?.autoGenerated !== true);
-                if (skills.length > 0) {
-                  const skillNames = skills.map(s => s.name).join(', ');
-                  const agentTypeSkill = a.type === 'cli' ? 'cli.agent' : 'browser.agent';
-                  trainedRecipeLines.push(`- ${a.id}: [${skillNames}] → use ${agentTypeSkill} { action: "run", agentId: "${a.id}" }`);
-
-                  // Build fuzzy matching map
-                  for (const s of skills) {
-                    const baseName = s.name.toLowerCase();
-                    const variants = [
-                      baseName,
-                      baseName.replace(/_/g, '.'),
-                      baseName.replace(/\./g, ' '),
-                      baseName.replace(/_/g, ' '),
-                      baseName.replace(/\./g, '_'),
-                      baseName.replace(/^[^.]+\./, ''),
-                    ];
-                    for (const v of variants) {
-                      if (!_trainedRecipeMap[v]) {
-                        _trainedRecipeMap[v] = { agentId: a.id, skillName: s.name, agentType: a.type === 'cli' ? 'cli.agent' : 'browser.agent' };
-                      }
-                    }
-                  }
-                }
-              } catch (err) {
-                logger.warn(`[Node:PreflightAgents] trainer.agent call failed for ${svc}: ${err.message}`);
-              }
-            }
-
-            // ── Browser agent auth check (session profile + cookie validity) ──
-            // NOTE: agentLines.push() is deferred to after auth is determined below
+            // ── Browser agent auth decision — the authentication LEDGER ──────
+            // Verification is edge-triggered, not per-run:
+            //   ledger authed / authed_at  → trusted permanently (no probe)
+            //   ledger authed:false / recent failure → auth-required (no probe)
+            //   needsAuth:0 recorded → login not required
+            //   profile Cookies exist, no ledger → pre-ledger session migration:
+            //     optimistic authed + one-time background verify (stamps ledger)
+            //   nothing at all → first contact: static map or one 0/1 LLM call,
+            //     recorded permanently as `needsAuth`
+            // Only a runtime login-wall observation or failed verify flips a
+            // trusted entry — never cookie age or elapsed time.
             if (a.type === 'browser') {
               const iconUrl = agentIdToIconUrl(a.id, a.start_url);
-              const BROWSER_PROFILES_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-profiles');
               const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
               const profileDir = `${svcKey}_agent`;
               const profilePath = path.join(BROWSER_PROFILES_DIR, profileDir);
               const hasSession = fs.existsSync(profilePath);
+              const profileCookies = _browserProfileHasCookies(a.id);
 
-              // Check cookie file age for session validity
-              // Chrome persistent profiles store cookies under Default/Cookies
-              let sessionStale = false;
-              if (hasSession) {
-                try {
-                  const cookieFile = path.join(profilePath, 'Default', 'Cookies');
-                  if (fs.existsSync(cookieFile)) {
-                    const stat = fs.statSync(cookieFile);
-                    const ageMs = Date.now() - stat.mtimeMs;
-                    if (ageMs > BROWSER_SESSION_MAX_AGE_MS) {
-                      sessionStale = true;
-                      warnings.push({
-                        type: 'browser_session_stale',
-                        message: `${a.id} session cookies last modified ${Math.round(ageMs / (24*60*60*1000))}d ago — may need re-auth`,
-                      });
-                    }
-                  }
-                } catch (_) {}
-              }
-
-              // The browser's persistent profile is the source of truth for auth,
-              // but a DuckDB `authed_at` timestamp only proves the user logged in
-              // *once* — it says nothing about whether the session is still valid
-              // right now (cookies may have expired, the user may have logged out,
-              // or the service may have invalidated the session). The in-process
-              // `_authCache` is even less reliable (30 min TTL, never re-checks
-              // the browser).
-              //
-              // So: do NOT short-circuit `authed` to true here. Always treat the
-              // agent as not-yet-verified and let `_authenticateBrowserAgent`
-              // (Phase 1.5 below) call the command-service `browser.agent
-              // authenticate` probe, which does a real-time cookie sniff via
-              // CDP. The probe is fast (a few seconds) and is the only reliable
-              // signal. `authedAt` is preserved as a hint so the probe can skip
-              // the manual-login UI if cookies are already valid.
               const _cachedAuth = _getCachedAuth(a.id);
               const _provisionalAuthedAt = a.authedAt || _cachedAuth?.ts || null;
-              // User chose "proceed without" — treat as authed for this run only.
               const _authBypassed = _bypassAuth.has(a.id.toLowerCase());
-              const _loginNotRequired = !_authBypassed && _skipBrowserAuthForTask;
-              const authed = _authBypassed || _skipBrowserAuthForTask;
-              const _authTag = _authBypassed
-                ? ' [AUTH BYPASSED — running unauthenticated per user choice]'
-                : _loginNotRequired
-                  ? ' [LOGIN NOT REQUIRED — proceeding without sign-in]'
-                  : ' [NEEDS AUTH — user must authenticate before this agent can run]';
+              const _ledger = _getLedgerAuth(a.id);
+              const _ledgerNeedsAuth = _ledger ? _ledger.needsAuth : undefined;
+              // Newest evidence wins: an authed_at / ledger authed stamped
+              // AFTER a failure means the user re-authenticated since — the
+              // failure is stale. authed:false without a newer success fails.
+              const _tsOf = (t) => (typeof t === 'number' ? t : Date.parse(t)) || 0;
+              const _failedAt = _ledger
+                ? Math.max(_ledger.lastAuthFailedAt || 0, _ledger.authed === false ? (_ledger.ts || 0) : 0)
+                : 0;
+              const _authedEvidenceTs = Math.max(
+                _tsOf(_provisionalAuthedAt),
+                _ledger && _ledger.authed === true ? (_ledger.ts || 0) : 0,
+              );
+              const _ledgerFailed = _failedAt > 0 && _failedAt >= _authedEvidenceTs;
+              const _ledgerAuthed = _authedEvidenceTs > _failedAt;
+
+              let authed = false;
+              let _authTag = ' [NEEDS AUTH — user must authenticate before this agent can run]';
+              let _authedReason = '';
+              let _forceAuthRequired = false;
+              if (_authBypassed) {
+                authed = true; _authedReason = 'bypassed';
+                _authTag = ' [AUTH BYPASSED — running unauthenticated per user choice]';
+              } else if (_isPublicWebTask) {
+                authed = true; _authedReason = 'public-web';
+                _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
+              } else if (_ledgerFailed) {
+                _forceAuthRequired = true;
+              } else if (_ledgerAuthed || _provisionalAuthedAt) {
+                authed = true; _authedReason = 'ledger';
+                _authTag = ' [AUTHENTICATED — session on record]';
+              } else if (_ledgerNeedsAuth === 0) {
+                authed = true; _authedReason = 'needsAuth0';
+                _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
+              } else if (profileCookies) {
+                // Pre-ledger session migration — can't prove login from a Cookies
+                // file, but the profile was likely authenticated before tracking
+                // existed. Optimistic authed + one-time background verify below.
+                authed = true; _authedReason = 'profile-migration';
+                _authTag = ' [AUTHENTICATED — existing profile, verifying in background]';
+              } else {
+                // True first contact — nothing known about this service.
+                let _need = _SERVICE_NEEDS_AUTH.get(svcKey);
+                if (_need === undefined) {
+                  _need = await _firstContactLoginNeed();
+                  logger.info(`[Node:PreflightAgents] First-contact login-need for ${a.id}: ${_need}`);
+                }
+                _writeLedgerAuth(a.id, { needsAuth: _need });
+                if (_need === 1) {
+                  _forceAuthRequired = true;
+                } else {
+                  authed = true; _authedReason = 'first-contact-public';
+                  _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
+                }
+              }
+
               agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_authTag}`);
               if (_authBypassed) {
                 warnings.push({
@@ -1266,8 +1345,8 @@ module.exports = async function preflightAgents(state) {
                   iconUrl,
                   message: `${a.id} proceeding without sign-in`,
                 });
-              } else if (_loginNotRequired) {
-                logger.info(`[Node:PreflightAgents] ${a.id} login not required by LLM gate — marking authed for this run only`);
+              } else if (_authedReason && _authedReason !== 'ledger' && _authedReason !== 'profile-migration') {
+                logger.info(`[Node:PreflightAgents] ${a.id} login not required (${_authedReason}) — marking authed`);
                 _emitProgress({
                   type: 'preflight:agent_ready',
                   agentId: a.id,
@@ -1277,7 +1356,7 @@ module.exports = async function preflightAgents(state) {
               }
 
               const _agentAuthType = _deriveAgentAuthType(a.descriptor);
-              agentReadiness.push({
+              const _readiness = {
                 type: 'browser',
                 agentId: a.id,
                 ready: true,
@@ -1287,9 +1366,28 @@ module.exports = async function preflightAgents(state) {
                 iconUrl,
                 startUrl: a.start_url,
                 needsLogin: !authed && !hasSession,
-                sessionStale,
                 authedAt: _provisionalAuthedAt,
-              });
+              };
+              if (_forceAuthRequired) _readiness._forceAuthRequired = true;
+              // One-time migration verify: fire the existing headless
+              // authenticate probe in the background; bounded-await at the
+              // auth boundary so the profile lock is released before any
+              // execution session opens it.
+              if (_authedReason === 'profile-migration' && mcpAdapter) {
+                _readiness._verifyPromise = mcpAdapter.callService('command', 'command.automate', {
+                  skill: 'browser.agent',
+                  args: {
+                    action: 'authenticate',
+                    agentId: a.id,
+                    task: `Authenticate to ${a.id}`,
+                    url: a.start_url,
+                    manualLogin: false,
+                    preflightProbe: true,
+                    requireCookieConfirmation: true,
+                  },
+                }, { timeoutMs: 45000 }).catch(err => ({ ok: false, error: `verify transport error: ${err?.message || 'failed'}` }));
+              }
+              agentReadiness.push(_readiness);
             } else if (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') {
               // Credential agents are not browser-authenticated; they need a stored token.
               const iconUrl = agentIdToIconUrl(a.id, a.start_url);
@@ -1345,10 +1443,6 @@ module.exports = async function preflightAgents(state) {
           }
 
           agentContextNote = `\n\nREGISTERED AGENTS (use browser.agent { action: "run", agentId: "<id>", task: "..." } for these — do NOT use raw browser.act navigate):\n${agentLines.join('\n')}`;
-
-          if (trainedRecipeLines.length > 0) {
-            agentContextNote += `\n\nTRAINED RECIPES (when user mentions these, use browser.agent/cli.agent — NOT external.skill):\n${trainedRecipeLines.join('\n')}`;
-          }
         }
       } catch (_) {}
     })(),
@@ -1727,7 +1821,7 @@ module.exports = async function preflightAgents(state) {
       // Strong desktop app guard: taskType 'app_automation' means the user named
       // a native desktop app. Do not search for CLI packages that happen to share
       // the same name (e.g. "llm-devin" when the user means the desktop app).
-      const _targetSvcForGuard = (_tc.targetService || '').toLowerCase();
+      const _targetSvcForGuard = _canonSvc(_tc.targetService);
       if (_tc?.taskType === 'app_automation' && _targetSvcForGuard) {
         logger.info(`[Node:PreflightAgents] Tool discovery skipped — taskType is app_automation for "${_targetSvcForGuard}"`);
         return;
@@ -1894,11 +1988,53 @@ module.exports = async function preflightAgents(state) {
     // Only runs when THINKDROP_GRILL_MODE=1 and a targetService is classified.
     // Probes the desktop app (installed? capable? logged in?) and TCC permission,
     // then calls resolveRoute for the authoritative route decision.
+    // SKIPPED when a single registered authed browser agent already owns the
+    // service — the single-route mandate below is predetermined in that case
+    // (it doesn't consume probe output), so desktop/TCC probing is dead work.
     (async () => {
       if (!_grillMode) return;
-      const targetSvc = (_tc.targetService || '').toLowerCase();
+      let targetSvc = _canonSvc(_tc.targetService);
       if (!targetSvc) return;
+
+      // Service-family matching — separator-insensitive plus prefix matching
+      // so "google_docs" matches the registered "google" agent (and vice
+      // versa). Prefix requires ≥4 chars on the shorter side so "x.agent"
+      // can't match "xenon".
+      const _normSvc = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const _svcFamilyMatch = (aSvc, tSvc) => {
+        const a = _normSvc(aSvc), t = _normSvc(tSvc);
+        if (!a || !t) return false;
+        if (a === t) return true;
+        const short = Math.min(a.length, t.length);
+        return short >= 4 && (a.startsWith(t) || t.startsWith(a));
+      };
+      const _agentSvcOf = a => a.service || (a.agentId || a.id || '').replace(/\.agent$/, '');
+
       try {
+        // Skip probes when the mandate outcome is already determined:
+        // exactly one registered browser agent for the service family, and the
+        // ledger/registry says it's authed. Uses the shared registry snapshot,
+        // NOT agentReadiness (racy — enumeration runs in the same batch).
+        const _regAgents = await _fetchAgents();
+        const svcAgents = (_regAgents || []).filter(a => _svcFamilyMatch(_agentSvcOf(a), targetSvc));
+        const _browserSvcAgents = svcAgents.filter(a => a.type === 'browser');
+        const _singleAuthedBrowser = _browserSvcAgents.length === 1 && svcAgents.length === 1
+          && (_browserSvcAgents[0].authedAt || _getLedgerAuth(_browserSvcAgents[0].id)?.authed === true);
+        if (_singleAuthedBrowser) {
+          const _a = _browserSvcAgents[0];
+          _routeDecision[targetSvc] = {
+            route: 'browser',
+            agentId: _a.id,
+            reason: 'single registered authed browser agent — mandate predetermined, probes skipped',
+          };
+          // Alias under the agent's own service key so gatherPlanContext's
+          // agent-derived lookup hits even when names differ.
+          const _agentSvc = String(_agentSvcOf(_a) || '').toLowerCase();
+          if (_agentSvc && _agentSvc !== targetSvc) _routeDecision[_agentSvc] = _routeDecision[targetSvc];
+          logger.info(`[Node:PreflightAgents] Grill-Me probes skipped for ${targetSvc} — route predetermined (${_a.id})`);
+          return;
+        }
+
         const [desktopResult, tccResult] = await Promise.all([
           probeDesktopApp(targetSvc, logger),
           probeTCC(logger),
@@ -1909,13 +2045,8 @@ module.exports = async function preflightAgents(state) {
         const cliResult = _preflightCliMap[targetSvc] || null;
         if (cliResult) _probes[targetSvc].cli = cliResult;
 
-        // Find registered agents for this service — separator-insensitive so
-        // "googledocs"/"google docs" match the google_docs.agent id.
-        const _normSvc = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        const svcAgents = (agentReadiness || []).filter(a => {
-          const aSvc = _normSvc(a.service || (a.agentId || '').replace(/\.agent$/, ''));
-          return aSvc === _normSvc(targetSvc);
-        });
+        const svcAgentsR = (agentReadiness || []).filter(a =>
+          _svcFamilyMatch(_agentSvcOf(a), targetSvc));
 
         // Resolve route
         _routeDecision[targetSvc] = resolveRoute({
@@ -1923,9 +2054,15 @@ module.exports = async function preflightAgents(state) {
           desktopProbe: desktopResult,
           tccProbe: tccResult,
           cliProbe: cliResult ? { cli: cliResult.hasCli, installed: cliResult.hasCli, authed: !!cliResult.authUser } : null,
-          registeredAgents: svcAgents.map(a => ({ id: a.agentId, type: a.type, authed: a.authed })),
+          registeredAgents: svcAgentsR.map(a => ({ id: a.agentId, type: a.type, authed: a.authed })),
           taskClassification: _tc,
         }, logger);
+
+        // Alias under each matched agent's service key for lookup consistency.
+        for (const a of svcAgentsR) {
+          const aKey = String(_agentSvcOf(a) || '').toLowerCase();
+          if (aKey && aKey !== targetSvc && !_routeDecision[aKey]) _routeDecision[aKey] = _routeDecision[targetSvc];
+        }
 
         logger.info(`[Node:PreflightAgents] Grill-Me route decision for ${targetSvc}: ${_routeDecision[targetSvc].route} — ${_routeDecision[targetSvc].reason}`);
       } catch (probeErr) {
@@ -1933,6 +2070,7 @@ module.exports = async function preflightAgents(state) {
       }
     })(),
   ]);
+  _mark('parallelBatchMs');
 
   // ── Desktop app routing note + grill on not-installed ──────────────────────
   // When the Grill-Me probe detected a desktop app for the target service:
@@ -1940,7 +2078,7 @@ module.exports = async function preflightAgents(state) {
   //   (b) If not installed AND taskType is app_automation → grill the user
   //       (offer to open the download page)
   {
-    const _targetSvc = (_tc.targetService || '').toLowerCase();
+    const _targetSvc = _canonSvc(_tc.targetService);
     if (_targetSvc && _routeDecision[_targetSvc]) {
       const _route = _routeDecision[_targetSvc].route;
       const _appName = _routeDecision[_targetSvc].probes?.desktop?.appName || _targetSvc;
@@ -2229,11 +2367,51 @@ module.exports = async function preflightAgents(state) {
   }
 
   // ── Browser / credential agent authentication (Phase 1.5) ─────────────────
-  // Any selected browser or credential agent that is not authenticated must
-  // complete auth BEFORE planning. Browser agents open the browser and wait for
-  // OAuth or stored credentials. Credential agents (api_key/bearer/basic) verify
-  // a stored token. Planning is blocked until all agents are authenticated or
-  // auth fails.
+  // THE LEDGER MODEL: browser-agent auth is already decided at enumeration —
+  // a trusted ledger entry skips everything here, and an untrusted one emits
+  // preflight:auth_required directly (no probe). This phase:
+  //   1. awaits any one-time migration verifies fired during enumeration —
+  //      bounded (15s) so the Chrome profile lock releases before execution
+  //      opens the same profile (SingletonLock),
+  //   2. emits auth-required for ledger-untrusted browser agents, and
+  //   3. still runs the real verify probe for credential agents
+  //      (api_key/bearer/basic) — a stored token is real evidence.
+  const _AUTH_BOUNDARY_TIMEOUT_MS = 15 * 1000;
+  for (const a of agentReadiness) {
+    if (!a._verifyPromise) continue;
+    try {
+      const res = await Promise.race([
+        a._verifyPromise,
+        new Promise(r => setTimeout(() => r({ ok: false, verifyTimeout: true }), _AUTH_BOUNDARY_TIMEOUT_MS)),
+      ]);
+      const payload = res?.data || res || {};
+      if (payload && payload.authRequired === true) {
+        logger.info(`[Node:PreflightAgents] ${a.agentId} migration verify: login wall — flipping to auth-required`);
+        a.authed = false;
+        a.ready = false;
+        a._forceAuthRequired = true;
+        markAgentAuthFailed(a.agentId, 'migration verify: auth required');
+      } else if (payload && payload.ok && (payload.authVerified === true || payload.authed === true)) {
+        markAgentAuthed(a.agentId);
+        _emitProgress({
+          type: 'preflight:agent_ready',
+          agentId: a.agentId,
+          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
+          message: `${a.agentId} authenticated (verified)`,
+        });
+        logger.info(`[Node:PreflightAgents] ${a.agentId} migration verify: authenticated — ledger stamped`);
+      } else {
+        // Timeout / transport / unverifiable — keep optimistic authed.
+        // Runtime login-wall detection is the safety net for a truly dead
+        // session; never mark unauthenticated on an inconclusive probe.
+        logger.info(`[Node:PreflightAgents] ${a.agentId} migration verify inconclusive (${payload.error || payload.verifyTimeout ? 'timeout/transport' : 'unverifiable'}) — staying optimistic`);
+      }
+    } catch (verifyErr) {
+      logger.warn(`[Node:PreflightAgents] ${a.agentId} migration verify error: ${verifyErr.message}`);
+    }
+    delete a._verifyPromise;
+  }
+
   const _AUTH_AGENT_TYPES = new Set(['browser', 'api_key', 'bearer', 'basic']);
   const browserAgentsNeedingAuth = agentReadiness.filter(
     a => _AUTH_AGENT_TYPES.has(a.type) && !a.authed
@@ -2288,7 +2466,7 @@ module.exports = async function preflightAgents(state) {
           type: 'preflight:auth_required',
           agentId: a.agentId,
           serviceName: svcKey,
-          authType: a.sessionStale ? 'browser_reauth' : (a.authType || 'browser_oauth'),
+          authType: a.authType || 'browser_oauth',
           iconUrl,
           message: `${a.agentId} requires ${a.authType && a.authType !== 'browser_oauth' ? a.authType : 'login'} before planning`,
         });
@@ -2318,39 +2496,14 @@ module.exports = async function preflightAgents(state) {
       continue;
     }
 
-    // ── LLM login-need gate: if the prompt clearly does not require sign-in,
-    // mark browser agents as authed without running the probe or showing the popup.
-    if (_skipBrowserAuthForTask && a.type === 'browser') {
-      a.authed = true;
-      a.ready = true;
-      _emitProgress({
-        type: 'preflight:agent_ready',
-        agentId: a.agentId,
-        iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
-        message: `${a.agentId} login not required`,
-      });
-      continue;
-    }
-
-    // ── Unauthenticated agent invariant: skip probe, force auth ─────────────
-    // A newly built agent has no persistent profile yet — the probe can only
-    // produce false positives on public landing pages, so force auth directly.
-    //
-    // An agent that has never recorded authed_at (authedAt is null) but was
-    // built in a previous session MAY have valid session cookies in its
-    // persistent Chrome profile (e.g. the user logged in directly via Chrome,
-    // or a previous auth attempt failed before recording authed_at). For these,
-    // let the silent preflight probe run with requireCookieConfirmation=true
-    // so the cookie sniff can detect existing auth and skip the auth banner.
-    const _forceAuth = a._newlyCreated && !_bypassAuth.has((a.agentId || '').toLowerCase());
-    // Never-authenticated (but not newly created) agents require cookie
-    // confirmation before the probe may declare them authenticated.
-    a._requireCookieConfirmation = !a.authedAt && !a._newlyCreated;
-    if (_forceAuth) {
+    // ── Browser agents: the ledger already decided at enumeration ───────────
+    // !authed here means deterministic auth-required — covers _newlyCreated,
+    // ledger-failed (authed:false/lastAuthFailedAt), needsAuth=1, and
+    // first-contact=1. No probe: verification lives on transition edges now.
+    if (a.type === 'browser') {
       const _svcKey = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
       const _iconUrl = a.iconUrl || agentIdToIconUrl(a.agentId);
-      const _reason = 'newly built';
-      logger.info(`[Node:PreflightAgents] ${a.agentId} is ${_reason} — forcing auth without probe`);
+      logger.info(`[Node:PreflightAgents] ${a.agentId} needs auth (${a._newlyCreated ? 'newly built' : 'ledger/first-contact classified'}) — surfacing auth_required without probe`);
       _emitProgress({
         type: 'preflight:auth_required',
         agentId: a.agentId,
@@ -2362,44 +2515,16 @@ module.exports = async function preflightAgents(state) {
       });
       a.authed = false;
       a.ready = false;
-      a.reason = `${_reason} — authentication required`;
+      a.reason = 'authentication required';
       authFailures.push({ agentId: a.agentId, reason: 'auth required' });
       continue;
     }
 
-    // ── 24h persistent auth/usage cache: skip entire probe for recently-used agents ──
-    // If the agent was authenticated OR used within the last 24h (persisted to
-    // disk so it survives app restart) AND the browser session cookies are not
-    // stale (within the 7-day BROWSER_SESSION_MAX_AGE_MS window), skip the
-    // multi-second auth probe entirely — not just the CDP cookie-sniff, but the
-    // whole _authenticateBrowserAgent call. The 7-day stale check is the safety
-    // net: if cookies are old enough to be questionable, ignore the cache and probe.
-    //
-    // The `lastUsed` field is written by browser.agent.cjs actionRun on every
-    // real task execution, so agents that have been used recently (even if auth
-    // was confirmed > 24h ago) get the bypass.
-    if (!a.sessionStale) {
-      const _persistentAuth = _getCachedAuthPersistent(a.agentId);
-      const _authedRecently = _persistentAuth && _persistentAuth.authed;
-      const _usedRecently = _persistentAuth && _persistentAuth.lastUsed &&
-        (Date.now() - _persistentAuth.lastUsed < PREFLIGHT_AUTH_CACHE_PERSISTENT_TTL_MS);
-      if (_authedRecently || _usedRecently) {
-        const _reason = _usedRecently && !_authedRecently
-          ? `used within 24h (lastUsed=${new Date(_persistentAuth.lastUsed).toISOString()})`
-          : 'authed within 24h (persistent cache)';
-        logger.info(`[Node:PreflightAgents] ${a.agentId} ${_reason} — bypassing auth probe entirely`);
-        markAgentAuthed(a.agentId); // refresh both in-memory and persistent cache
-        a.authed = true;
-        a.ready = true;
-        _emitProgress({
-          type: 'preflight:agent_ready',
-          agentId: a.agentId,
-          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
-          message: `${a.agentId} authenticated (cached)`,
-        });
-        continue;
-      }
-    }
+    // ── Credential agents (api_key/bearer/basic): real stored-token verify ──
+    // The probe is kept here — a stored credential is concrete evidence worth
+    // checking, and the askUser/credential-gather flows below are the actual
+    // credential setup UX.
+    a._requireCookieConfirmation = !a.authedAt && !a._newlyCreated;
 
     // Emit actual agentId so main.js cancel handler can derive the correct session
     _emitProgress({
@@ -2656,6 +2781,8 @@ module.exports = async function preflightAgents(state) {
     };
   }
 
+  _mark('authSectionMs');
+
   // ── Single-route mandate (post-auth) ──────────────────────────────────────
   // When a service has exactly one executable route and it is now ready+
   // authed, treat that route as authoritative. The planner is forbidden from
@@ -2760,6 +2887,7 @@ module.exports = async function preflightAgents(state) {
       logger.info(`[Node:PreflightAgents] Deep-link for ${a.agentId}: ${a.deepLinkUrl} (source=${a.deepLinkSource})`);
     }
   }
+  _mark('deepLinkMs');
 
   // ── Disk-scan fallback: load recipes directly from filesystem ────────────────
   try {
@@ -2812,6 +2940,24 @@ module.exports = async function preflightAgents(state) {
   logger.info(`[Node:PreflightAgents] Trained recipe map built: ${mapSize} variants`);
   if (mapSize > 0) {
     state._trainedRecipeMap = _trainedRecipeMap;
+    // Regenerate the planner-facing TRAINED RECIPES note from the final
+    // disk-derived map (the per-agent trainer.agent list_skills calls that
+    // used to build this were removed — disk scan covers the same data free).
+    const _byAgent = {};
+    const _seenSkill = new Set();
+    for (const v of Object.keys(_trainedRecipeMap)) {
+      const r = _trainedRecipeMap[v];
+      if (!r || !r.agentId || !r.skillName) continue;
+      const key = `${r.agentId}|${r.skillName}`;
+      if (_seenSkill.has(key)) continue;
+      _seenSkill.add(key);
+      (_byAgent[r.agentId] = _byAgent[r.agentId] || []).push(r.skillName);
+    }
+    const _recipeLines = Object.entries(_byAgent)
+      .map(([aid, names]) => `- ${aid}: [${[...new Set(names)].join(', ')}] → use browser.agent { action: "run", agentId: "${aid}" }`);
+    if (_recipeLines.length > 0) {
+      agentContextNote += `\n\nTRAINED RECIPES (when user mentions these, use browser.agent/cli.agent — NOT external.skill):\n${_recipeLines.join('\n')}`;
+    }
   }
 
   const selectedReadinessFailures = [];
@@ -2875,6 +3021,7 @@ module.exports = async function preflightAgents(state) {
     // ── Grill-Me Phase A outputs ────────────────────────────────────────────
     probes: _probes,           // { service: { desktop, tcc, cli } }
     routeDecision: _routeDecision, // { service: { route, agentId, reason, probes, createAgent } }
+    durations: _pfDur,          // per-phase ms timings (elapsed since node start)
   };
 
   // Emit complete
@@ -2890,7 +3037,8 @@ module.exports = async function preflightAgents(state) {
     warnings,
   });
 
-  logger.info(`[Node:PreflightAgents] Preflight complete: ${agentReadiness.length} agents checked, ${agentReadiness.filter(a => !a.ready).length} not ready, ${agentReadiness.filter(a => !a.authed).length} need auth`);
+  _mark('totalMs');
+  logger.info(`[Node:PreflightAgents] Preflight complete: ${agentReadiness.length} agents checked, ${agentReadiness.filter(a => !a.ready).length} not ready, ${agentReadiness.filter(a => !a.authed).length} need auth | timings: ${JSON.stringify(_pfDur)}`);
 
   return {
     ...state,
@@ -2909,6 +3057,8 @@ module.exports = async function preflightAgents(state) {
 };
 
 module.exports.markAgentAuthed = markAgentAuthed;
+module.exports.markAgentAuthFailed = markAgentAuthFailed;
+module.exports._getLedgerAuth = _getLedgerAuth;
 module.exports.clearAuthCache = function clearAuthCache(agentId) {
   if (agentId) _authCache.delete(agentId.toLowerCase());
 };

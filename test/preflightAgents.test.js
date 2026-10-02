@@ -115,7 +115,20 @@ function _cleanupBrowserProfile(serviceKey) {
   } catch (_) {}
 }
 
+// ── Test isolation: point the auth ledger at a temp file so tests neither
+// read nor pollute the real ~/.thinkdrop/preflight-auth-cache.json.
+const _TMP_AUTH_CACHE = path.join(os.tmpdir(), `pf-auth-cache-test-${process.pid}.json`);
+process.env.THINKDROP_PREFLIGHT_AUTH_CACHE = _TMP_AUTH_CACHE;
+function _resetLedger(entries = {}) {
+  try { fs.writeFileSync(_TMP_AUTH_CACHE, JSON.stringify(entries, null, 2)); } catch (_) {}
+  if (preflightAgents.clearAuthCache) { /* in-memory per-agent */ }
+}
+function _readLedger() {
+  try { return JSON.parse(fs.readFileSync(_TMP_AUTH_CACHE, 'utf8')); } catch (_) { return {}; }
+}
+
 async function runTests() {
+  _resetLedger({});
   section('Credential agent auth flow');
 
   await it('authenticates an api_key agent after collecting credentials', async () => {
@@ -172,7 +185,8 @@ async function runTests() {
     }
   });
 
-  await it('handles a hard browser.agent authenticate failure', async () => {
+  await it('marks first-contact browser agent auth-required without a probe when no LLM backend', async () => {
+    _resetLedger({});
     const state = makeState({
       agents: [
         { id: 'browserfail.agent', type: 'browser', service: 'browserfail', capabilities: ['navigate', 'interact'], status: 'healthy' },
@@ -183,9 +197,15 @@ async function runTests() {
       userMessage: 'do something with browserfail',
     });
     const result = await preflightAgents(state);
-    if (!result.planError) throw new Error('Expected planError due to hard auth failure');
-    if (!result.planError.includes('network unreachable')) {
-      throw new Error(`Expected failure reason in planError, got: ${result.planError}`);
+    if (!result.planError) throw new Error('Expected planError due to required auth');
+    if (!result.planError.includes('browserfail.agent')) {
+      throw new Error(`Expected agent id in planError, got: ${result.planError}`);
+    }
+    // No authenticate probe — the ledger classified first-contact as needs-auth.
+    const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
+    if (authCalls.length !== 0) throw new Error(`Expected zero authenticate calls, got ${authCalls.length}`);
+    if ((_readLedger()['browserfail.agent'] || {}).needsAuth !== 1) {
+      throw new Error('Expected needsAuth=1 recorded in ledger');
     }
   });
 
@@ -207,9 +227,10 @@ async function runTests() {
     if (authEvents.length !== 2) throw new Error(`Expected two auth_required events (registry scan), got ${authEvents.length}`);
   });
 
-  section('Browser profile always-verify behavior');
+  section('Browser profile migration verify (pre-ledger sessions)');
 
-  await it('triggers authenticate for a browser profile with a cookie older than 7 days', async () => {
+  await it('fires a one-time background verify for an existing profile with no ledger entry', async () => {
+    _resetLedger({});
     const serviceKey = 'preflightstaletest';
     _cleanupBrowserProfile(serviceKey);
     _setupBrowserProfile(serviceKey, 8);
@@ -219,45 +240,135 @@ async function runTests() {
           { id: `${serviceKey}.agent`, type: 'browser', service: serviceKey, capabilities: ['navigate', 'interact'], status: 'healthy' },
         ],
         authSequence: [
-          { ok: true, agentId: `${serviceKey}.agent`, authed: true },
+          { ok: true, agentId: `${serviceKey}.agent`, authed: true, authVerified: true },
         ],
         userMessage: `do something with ${serviceKey}`,
       });
       const result = await preflightAgents(state);
       if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
-      const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'browser.agent' && c.payload?.action === 'authenticate');
-      if (authCalls.length !== 1) throw new Error(`Expected one authenticate call for stale profile, got ${authCalls.length}`);
+      // The migration verify is the ONLY authenticate call — fired once via command.automate
+      const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
+      if (authCalls.length !== 1) throw new Error(`Expected one migration-verify authenticate call, got ${authCalls.length}`);
       const staleWarnings = state._progressEvents.filter(e => e.type === 'preflight:auth_required');
-      if (staleWarnings.length < 1) throw new Error('Expected preflight:auth_required for stale browser session');
+      if (staleWarnings.length !== 0) throw new Error(`Expected no auth_required after a verified profile, got ${staleWarnings.length}`);
+      // Verify stamped the ledger permanently
+      if ((_readLedger()[`${serviceKey}.agent`] || {}).authed !== true) {
+        throw new Error('Expected ledger stamped authed:true after successful verify');
+      }
     } finally {
       _cleanupBrowserProfile(serviceKey);
     }
   });
 
-  await it('always verifies a fresh-profile browser agent instead of trusting cookie age', async () => {
-    const serviceKey = 'preflightfreshtest';
+  await it('flips to auth-required + stamps authed:false when the migration verify hits a login wall', async () => {
+    _resetLedger({});
+    const serviceKey = 'preflightmigfail';
     _cleanupBrowserProfile(serviceKey);
-    _setupBrowserProfile(serviceKey, 3);
+    _setupBrowserProfile(serviceKey, 2);
     try {
       const state = makeState({
         agents: [
           { id: `${serviceKey}.agent`, type: 'browser', service: serviceKey, capabilities: ['navigate', 'interact'], status: 'healthy' },
         ],
         authSequence: [
-          { ok: true, agentId: `${serviceKey}.agent`, authed: true },
+          { ok: false, authRequired: true, error: 'login wall detected' },
         ],
         userMessage: `do something with ${serviceKey}`,
       });
       const result = await preflightAgents(state);
-      if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
-      const agent = (result.preflightResult?.agents || []).find(a => a.agentId === `${serviceKey}.agent`);
-      if (!agent) throw new Error(`${serviceKey}.agent not in preflightResult.agents`);
-      if (!agent.authed) throw new Error('Expected browser agent to be authed after live verify');
-      const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'browser.agent' && c.payload?.action === 'authenticate');
-      if (authCalls.length !== 1) throw new Error(`Expected one authenticate call for fresh profile, got ${authCalls.length}`);
+      if (!result.planError) throw new Error('Expected planError after login-wall verify');
+      const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === `${serviceKey}.agent`);
+      if (authEvents.length < 1) throw new Error('Expected preflight:auth_required after login-wall verify');
+      const entry = _readLedger()[`${serviceKey}.agent`] || {};
+      if (entry.authed !== false || !entry.lastAuthFailedAt) {
+        throw new Error(`Expected ledger authed:false + lastAuthFailedAt, got ${JSON.stringify(entry)}`);
+      }
     } finally {
       _cleanupBrowserProfile(serviceKey);
     }
+  });
+
+  await it('skips auth entirely for a ledger-authed agent (no probe, no LLM)', async () => {
+    const serviceKey = 'ledgerauthedtest';
+    _cleanupBrowserProfile(serviceKey); // no profile — ledger alone is trusted
+    _resetLedger({ [`${serviceKey}.agent`]: { authed: true, ts: Date.now() - 5 * 24 * 60 * 60 * 1000 } });
+    let llmCalls = 0;
+    const state = makeState({
+      agents: [
+        { id: `${serviceKey}.agent`, type: 'browser', service: serviceKey, capabilities: ['navigate', 'interact'], status: 'healthy' },
+      ],
+      authSequence: [
+        { ok: false, error: 'authenticate must not be called for ledger-authed agent' },
+      ],
+      llmBackend: { generateAnswer: async () => { llmCalls++; return '1'; } },
+      userMessage: `do something with ${serviceKey}`,
+    });
+    state.resolveAgentResult = { agents: [{ agentId: `${serviceKey}.agent`, create: false }] };
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
+    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === `${serviceKey}.agent`);
+    if (!agent?.authed) throw new Error('Expected ledger-authed agent authed');
+    const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
+    if (authCalls.length !== 0) throw new Error(`Expected zero authenticate calls, got ${authCalls.length}`);
+    if (llmCalls !== 0) throw new Error(`Expected zero LLM calls for ledger-authed agent, got ${llmCalls}`);
+  });
+
+  await it('goes straight to auth-required for a ledger-failed agent (authed:false, no probe)', async () => {
+    const serviceKey = 'ledgerfailedtest';
+    _resetLedger({ [`${serviceKey}.agent`]: { authed: false, lastAuthFailedAt: Date.now() - 60 * 1000, ts: Date.now() - 60 * 1000 } });
+    const state = makeState({
+      agents: [
+        { id: `${serviceKey}.agent`, type: 'browser', service: serviceKey, capabilities: ['navigate', 'interact'], status: 'healthy' },
+      ],
+      authSequence: [
+        { ok: false, error: 'authenticate must not be called for ledger-failed agent' },
+      ],
+      userMessage: `do something with ${serviceKey}`,
+    });
+    state.resolveAgentResult = { agents: [{ agentId: `${serviceKey}.agent`, create: false }] };
+    const result = await preflightAgents(state);
+    if (!result.planError) throw new Error('Expected planError for ledger-failed agent');
+    const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
+    if (authCalls.length !== 0) throw new Error(`Expected zero authenticate calls, got ${authCalls.length}`);
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === `${serviceKey}.agent`);
+    if (authEvents.length < 1) throw new Error('Expected preflight:auth_required for ledger-failed agent');
+  });
+
+  await it('lets a newer authed_at override an older ledger failure (re-auth wins)', async () => {
+    const serviceKey = 'ledgerreauthtest';
+    const failedAt = Date.now() - 24 * 60 * 60 * 1000;
+    _resetLedger({ [`${serviceKey}.agent`]: { authed: false, lastAuthFailedAt: failedAt, ts: failedAt } });
+    const state = makeState({
+      agents: [
+        { id: `${serviceKey}.agent`, type: 'browser', service: serviceKey, capabilities: ['navigate', 'interact'], status: 'healthy', authedAt: Date.now() - 60 * 1000 },
+      ],
+      userMessage: `do something with ${serviceKey}`,
+    });
+    state.resolveAgentResult = { agents: [{ agentId: `${serviceKey}.agent`, create: false }] };
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
+    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === `${serviceKey}.agent`);
+    if (!agent?.authed) throw new Error('Expected authed — newer authed_at overrides stale failure');
+  });
+
+  await it('treats ledger needsAuth:0 as login-not-required without an LLM call', async () => {
+    const serviceKey = 'needsnoauthtest';
+    _cleanupBrowserProfile(serviceKey);
+    _resetLedger({ [`${serviceKey}.agent`]: { needsAuth: 0, ts: Date.now() } });
+    let llmCalls = 0;
+    const state = makeState({
+      agents: [
+        { id: `${serviceKey}.agent`, type: 'browser', service: serviceKey, capabilities: ['navigate', 'interact'], status: 'healthy' },
+      ],
+      llmBackend: { generateAnswer: async () => { llmCalls++; return '1'; } },
+      userMessage: `do something with ${serviceKey}`,
+    });
+    state.resolveAgentResult = { agents: [{ agentId: `${serviceKey}.agent`, create: false }] };
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
+    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === `${serviceKey}.agent`);
+    if (!agent?.authed) throw new Error('Expected authed for needsAuth:0');
+    if (llmCalls !== 0) throw new Error(`Expected zero LLM calls for needsAuth:0, got ${llmCalls}`);
   });
 
   // ── CLI-first preflight regression tests ───────────────────────────────────
@@ -733,64 +844,101 @@ async function runTests() {
 
   section('LLM login-need gate');
 
-  await it('skips browser auth when LLM says login is not required', async () => {
+  // First-contact tests use a synthetic profile-less service ('firstcontacttest')
+  // so they don't depend on real browser profiles on this machine.
+  const FC = 'firstcontacttest';
+  _cleanupBrowserProfile(FC);
+
+  await it('first-contact LLM "no login" → authed + needsAuth=0 recorded', async () => {
+    _resetLedger({});
     const state = makeState({
       agents: [
-        { id: 'etsy.agent', type: 'browser', service: 'etsy', capabilities: ['navigate', 'interact'], status: 'healthy' },
+        { id: `${FC}.agent`, type: 'browser', service: FC, capabilities: ['navigate', 'interact'], status: 'healthy' },
       ],
       authSequence: [
-        { ok: true, agentId: 'etsy.agent', authed: true, authVerified: true },
+        { ok: true, agentId: `${FC}.agent`, authed: true, authVerified: true },
       ],
-      userMessage: "Open Etsy and search for 'wooden cross wall art' then click the first result",
+      userMessage: `Open ${FC} and search for 'wooden cross wall art' then click the first result`,
       llmBackend: {
         generateAnswer: async () => '0',
       },
     });
-    state.resolveAgentResult = { agents: [{ agentId: 'etsy.agent', create: false }] };
+    state.resolveAgentResult = { agents: [{ agentId: `${FC}.agent`, create: false }] };
     const result = await preflightAgents(state);
     if (result.planError) throw new Error(`Unexpected planError: ${result.planError}`);
-    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === 'etsy.agent');
-    if (!agent) throw new Error('etsy.agent not in preflightResult.agents');
-    if (!agent.authed) throw new Error('Expected etsy.agent to be authed when LLM says no login needed');
-    if (!agent.ready) throw new Error('Expected etsy.agent to be ready when LLM says no login needed');
+    const agent = (result.preflightResult?.agents || []).find(a => a.agentId === `${FC}.agent`);
+    if (!agent) throw new Error(`${FC}.agent not in preflightResult.agents`);
+    if (!agent.authed) throw new Error(`Expected ${FC}.agent to be authed when LLM says no login needed`);
+    if (!agent.ready) throw new Error(`Expected ${FC}.agent to be ready when LLM says no login needed`);
     const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
     if (authCalls.length !== 0) throw new Error(`Expected zero browser.agent authenticate calls when LLM skips auth, got ${authCalls.length}`);
-    const authRequiredEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'etsy.agent');
-    if (authRequiredEvents.length !== 0) throw new Error(`Expected zero preflight:auth_required events for etsy.agent, got ${authRequiredEvents.length}`);
+    const authRequiredEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === `${FC}.agent`);
+    if (authRequiredEvents.length !== 0) throw new Error(`Expected zero preflight:auth_required events for ${FC}.agent, got ${authRequiredEvents.length}`);
+    if ((_readLedger()[`${FC}.agent`] || {}).needsAuth !== 0) {
+      throw new Error(`Expected needsAuth=0 recorded in ledger for ${FC}.agent`);
+    }
   });
 
-  await it('runs browser auth when LLM says login is required', async () => {
+  await it('first-contact LLM "login required" → auth-required without probe + needsAuth=1 recorded', async () => {
+    _resetLedger({});
     const state = makeState({
       agents: [
-        { id: 'etsy.agent', type: 'browser', service: 'etsy', capabilities: ['navigate', 'interact'], status: 'healthy' },
+        { id: `${FC}.agent`, type: 'browser', service: FC, capabilities: ['navigate', 'interact'], status: 'healthy' },
       ],
-      userMessage: 'Post a new listing on Etsy',
+      userMessage: `Post a new listing on ${FC}`,
       llmBackend: {
         generateAnswer: async () => '1',
       },
     });
-    state.resolveAgentResult = { agents: [{ agentId: 'etsy.agent', create: false }] };
+    state.resolveAgentResult = { agents: [{ agentId: `${FC}.agent`, create: false }] };
     const result = await preflightAgents(state);
     if (!result.planError) throw new Error('Expected planError because auth is required');
+    // Deterministic auth-required — the LLM answered once, no browser probe.
     const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
-    if (authCalls.length !== 1) throw new Error(`Expected one browser.agent authenticate call, got ${authCalls.length}`);
+    if (authCalls.length !== 0) throw new Error(`Expected zero browser.agent authenticate calls, got ${authCalls.length}`);
+    if ((_readLedger()[`${FC}.agent`] || {}).needsAuth !== 1) {
+      throw new Error(`Expected needsAuth=1 recorded in ledger for ${FC}.agent`);
+    }
   });
 
-  await it('defaults to running browser auth when LLM backend returns unexpected value', async () => {
+  await it('first-contact with an unexpected LLM answer defaults to auth-required', async () => {
+    _resetLedger({});
     const state = makeState({
       agents: [
-        { id: 'etsy.agent', type: 'browser', service: 'etsy', capabilities: ['navigate', 'interact'], status: 'healthy' },
+        { id: `${FC}.agent`, type: 'browser', service: FC, capabilities: ['navigate', 'interact'], status: 'healthy' },
       ],
-      userMessage: 'Open Etsy and buy a gift',
+      userMessage: `Open ${FC} and buy a gift`,
       llmBackend: {
         generateAnswer: async () => 'maybe',
       },
     });
-    state.resolveAgentResult = { agents: [{ agentId: 'etsy.agent', create: false }] };
+    state.resolveAgentResult = { agents: [{ agentId: `${FC}.agent`, create: false }] };
     const result = await preflightAgents(state);
     if (!result.planError) throw new Error('Expected planError because auth is required');
     const authCalls = state.mcpAdapter.calls.filter(c => c.service === 'command' && c.action === 'command.automate' && c.payload?.skill === 'browser.agent' && c.payload?.args?.action === 'authenticate');
-    if (authCalls.length !== 1) throw new Error(`Expected one browser.agent authenticate call, got ${authCalls.length}`);
+    if (authCalls.length !== 0) throw new Error(`Expected zero browser.agent authenticate calls, got ${authCalls.length}`);
+  });
+
+  await it('first-contact static-map service needs no LLM call (jira → needsAuth=1)', async () => {
+    _resetLedger({});
+    _cleanupBrowserProfile('jira'); // ensure no profile → true first contact
+    let llmCalls = 0;
+    const state = makeState({
+      agents: [
+        { id: 'jira.agent', type: 'browser', service: 'jira', capabilities: ['navigate', 'interact'], status: 'healthy' },
+      ],
+      userMessage: 'create a new jira ticket for the login bug',
+      llmBackend: {
+        generateAnswer: async () => { llmCalls++; return '0'; },
+      },
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'jira.agent', create: false }] };
+    const result = await preflightAgents(state);
+    if (!result.planError) throw new Error('Expected planError — jira requires auth per static map');
+    if (llmCalls !== 0) throw new Error(`Expected zero LLM calls for static-map service, got ${llmCalls}`);
+    if ((_readLedger()['jira.agent'] || {}).needsAuth !== 1) {
+      throw new Error('Expected needsAuth=1 recorded in ledger for jira.agent');
+    }
   });
 
   await it('honors preflightAuthBypass for a newly-created agent even when LLM says login required', async () => {
@@ -819,6 +967,7 @@ async function runTests() {
   section('Mid-run preflight decisions (live bypass / continue / unverifiable)');
 
   await it('clears an auth failure when "Proceed without" lands mid-run', async () => {
+    _resetLedger({});
     const state = makeState({
       agents: [
         { id: 'bypassme.agent', type: 'browser', service: 'bypassme', capabilities: ['navigate'], status: 'healthy' },
@@ -829,12 +978,15 @@ async function runTests() {
       userMessage: 'do something with bypassme',
     });
     state.preflightAuthBypass = [];
-    // Simulate the UI "Proceed without" click landing while the probe runs —
+    // Simulate the UI "Proceed without" click landing while preflight runs —
     // main.js pushes into this same array (shared by reference into live state).
+    // The push rides the guaranteed agent.list call (browser agents no longer
+    // probe in the ledger model — there is no authenticate call to ride).
     const origCall = state.mcpAdapter.callService.bind(state.mcpAdapter);
+    let pushed = false;
     state.mcpAdapter.callService = async (svc, action, payload, opts) => {
       const r = await origCall(svc, action, payload, opts);
-      if (payload?.args?.action === 'authenticate') state.preflightAuthBypass.push('bypassme.agent');
+      if (!pushed && action === 'agent.list') { pushed = true; state.preflightAuthBypass.push('bypassme.agent'); }
       return r;
     };
     const result = await preflightAgents(state);
@@ -848,6 +1000,7 @@ async function runTests() {
   });
 
   await it('parks persistent unverifiable browser probes as auth-required (not hard fail)', async () => {
+    _resetLedger({});
     const state = makeState({
       agents: [
         { id: 'botwall.agent', type: 'browser', service: 'botwall', capabilities: ['navigate'], status: 'healthy' },
@@ -867,24 +1020,25 @@ async function runTests() {
   });
 
   await it('re-verifies agents queued via mid-run auth_continue', async () => {
+    _resetLedger({});
     const state = makeState({
       agents: [
         { id: 'retryagent.agent', type: 'browser', service: 'retryagent', capabilities: ['navigate'], status: 'healthy' },
       ],
       authSequence: [
-        { ok: false, error: 'network unreachable' },
-        { ok: true, agentId: 'retryagent.agent', authed: true },
+        { ok: true, agentId: 'retryagent.agent', authed: true, authVerified: true },
       ],
       userMessage: 'do something with retryagent',
     });
     state._authContinueQueued = [];
-    // Simulate "I've already signed in" landing mid-probe — the first
-    // authenticate call fails, the queued re-verify consumes the second.
+    // Simulate "I've already signed in" landing mid-run — the queued re-verify
+    // consumes the authSequence entry when the auth-continue block runs the
+    // real _authenticateBrowserAgent probe (kept for continue/credential).
     const origCall = state.mcpAdapter.callService.bind(state.mcpAdapter);
     let pushed = false;
     state.mcpAdapter.callService = async (svc, action, payload, opts) => {
       const r = await origCall(svc, action, payload, opts);
-      if (!pushed && payload?.args?.action === 'authenticate') {
+      if (!pushed && action === 'agent.list') {
         pushed = true;
         state._authContinueQueued.push('retryagent.agent');
       }
@@ -948,6 +1102,64 @@ async function runTests() {
   });
 
   try { fs.unlinkSync(demoteTmp); } catch (_) {}
+
+  section('Grill-Me skip + service-family canonicalization');
+
+  await it('skips probes for a single authed browser agent and aliases routeDecision keys', async () => {
+    _resetLedger({});
+    process.env.THINKDROP_GRILL_MODE = '1';
+    const svc = 'familysvc';
+    _cleanupBrowserProfile(svc);
+    try {
+      const state = makeState({
+        agents: [
+          { id: `${svc}.agent`, type: 'browser', service: svc, capabilities: ['navigate'], status: 'healthy', authedAt: Date.now() - 3600000 },
+        ],
+        userMessage: `open ${svc} docs and create a file`,
+      });
+      // classifyTask emits a sub-service name (google_docs-style) while the
+      // registered agent is the family root (google-style).
+      state._taskClassification = { taskType: 'browser', targetService: `${svc}_docs` };
+      state.resolveAgentResult = { agents: [{ agentId: `${svc}.agent`, create: false }] };
+      const result = await preflightAgents(state);
+      const rd = result.routeDecision || result.preflightResult?.routeDecision || {};
+      const canonKey = `${svc}_docs`;
+      if (!rd[canonKey]) throw new Error(`expected routeDecision['${canonKey}'], got keys: ${Object.keys(rd).join(',')}`);
+      if (rd[canonKey].route !== 'browser') throw new Error(`expected route 'browser', got '${rd[canonKey].route}'`);
+      if (!/predetermined/i.test(rd[canonKey].reason || '')) {
+        throw new Error(`expected probes-skipped reason, got: ${rd[canonKey].reason}`);
+      }
+      // Alias under the agent's own service key so gatherPlanContext hits.
+      if (!rd[svc]) throw new Error(`expected alias routeDecision['${svc}'] for gatherPlanContext, got keys: ${Object.keys(rd).join(',')}`);
+    } finally {
+      delete process.env.THINKDROP_GRILL_MODE;
+    }
+  });
+
+  await it('runs real probes when no single authed browser agent owns the service', async () => {
+    _resetLedger({});
+    process.env.THINKDROP_GRILL_MODE = '1';
+    const svc = 'probeplzsvc';
+    _cleanupBrowserProfile(svc);
+    try {
+      const state = makeState({
+        agents: [],
+        userMessage: `use ${svc} for something`,
+      });
+      state._taskClassification = { taskType: 'browser', targetService: svc };
+      state.resolveAgentResult = { agents: [] };
+      const result = await preflightAgents(state);
+      const rd = result.routeDecision || result.preflightResult?.routeDecision || {};
+      // Probe ran — decision exists (route resolved by resolveRoute, likely
+      // 'unknown' with no agents/desktop — just not the skip reason).
+      if (!rd[svc]) throw new Error(`expected routeDecision['${svc}'], got keys: ${Object.keys(rd).join(',')}`);
+      if (/predetermined/i.test(rd[svc].reason || '')) {
+        throw new Error('probes were skipped even though no authed browser agent owns the service');
+      }
+    } finally {
+      delete process.env.THINKDROP_GRILL_MODE;
+    }
+  });
 
   if (_failed === 0) {
     console.log(`✅ All ${_passed} tests passed.`);

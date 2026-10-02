@@ -59,26 +59,31 @@ const MOCK_SKILLS = [
     name: 'gcal.event',
     description: 'Interact with Google Calendar to create, update, and manage calendar events programmatically using the Google Calendar API.',
     summary: 'Google Calendar event creation and management.',
+    execPath: __filename, // any real file — the exec_path guard requires on-disk existence
   },
   {
     name: 'clicksend.send.sms',
     description: 'Send SMS messages using the ClickSend API.',
     summary: 'Send SMS/text messages via ClickSend.',
+    execPath: __filename,
   },
   {
     name: 'desktop.control',
     description: 'Desktop UI automation skill — scroll, type, click, use keyboard shortcuts, interact with native macOS apps, window control.',
     summary: 'macOS desktop automation: scroll, type, shortcut, click, app control.',
+    execPath: __filename,
   },
   {
     name: 'github.pr',
     description: 'Create, list, and comment on GitHub pull requests using the GitHub REST API.',
     summary: 'GitHub pull request management.',
+    execPath: __filename,
   },
   {
     name: 'slack.notify',
     description: 'Send messages to Slack channels via incoming webhook.',
     summary: 'Send Slack channel notifications.',
+    execPath: __filename,
   },
 ];
 
@@ -539,6 +544,10 @@ async function main() {
   console.log('\n' + '═'.repeat(72));
   console.log('  ParseSkill Test Suite');
   console.log('═'.repeat(72));
+
+  // Strategy-3 semantic matching is env-gated off by default in parseSkill.js —
+  // this suite exists to validate that layer, so enable it for the run.
+  process.env.THINKDROP_SKILL_SEMANTIC_MATCH = '1';
 
   // Jest-like runner: since we used a sync harness but async fns,
   // we need to re-execute via a proper async runner below.

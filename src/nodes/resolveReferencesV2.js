@@ -128,6 +128,46 @@ const path = require('path');
 // these are best-effort context reads, never worth blocking the pipeline for.)
 const _ENRICH_OPTS = { timeoutMs: 2_500, maxRetries: 1 };
 
+// ── classifyTask memo (bare-context prompts) ─────────────────────────────────
+// Re-running an identical prompt re-pays the ~2–4s classification LLM call.
+// Memoize per normalized message — only for context-free inputs (no
+// conversation history, no prior screen) AND context-free results (no
+// followUpTarget/activeDocRef, which are context-derived). A stored entry is
+// provably context-free so it is safe to replay under any later context.
+const CLASSIFY_CACHE_FILE = process.env.THINKDROP_CLASSIFY_CACHE
+  || path.join(os.homedir(), '.thinkdrop', 'classify-cache.json');
+const CLASSIFY_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const CLASSIFY_CACHE_MAX = 200;
+let _classifyCache = null;
+function _loadClassifyCache() {
+  if (_classifyCache) return _classifyCache;
+  try { _classifyCache = JSON.parse(fs.readFileSync(CLASSIFY_CACHE_FILE, 'utf8')); }
+  catch (_) { _classifyCache = {}; }
+  return _classifyCache;
+}
+function _classifyMemoKey(msg) {
+  return (msg || '').toLowerCase()
+    .replace(/\[\s*additional context:[^\]]*\]/gi, ' ')
+    .replace(/[^\w\s-]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+function _saveClassifyCache(cache) {
+  try {
+    const keys = Object.keys(cache);
+    if (keys.length > CLASSIFY_CACHE_MAX) {
+      // Evict oldest entries by ts
+      keys.sort((a, b) => (cache[a].ts || 0) - (cache[b].ts || 0));
+      for (const k of keys.slice(0, keys.length - CLASSIFY_CACHE_MAX)) delete cache[k];
+    }
+    const dir = path.dirname(CLASSIFY_CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(CLASSIFY_CACHE_FILE, JSON.stringify(cache, null, 2), 'utf8');
+  } catch (_) { /* non-fatal */ }
+}
+// A result is only memoizable when it carries no context-derived fields.
+function _isContextFreeClassification(tc) {
+  return !!tc && !tc.followUpTarget && !tc.activeDocRef && !tc.needsClarification;
+}
+
 async function getRecentMonitorCapture(mcpAdapter, logger) {
   // Primary: live monitor via user-memory MCP (max 5s stale)
   if (mcpAdapter) {
@@ -564,19 +604,47 @@ module.exports = async function resolveReferencesV2(state) {
     const _detPrefireTc = _activeAppContext?.url
       ? { activeDocRef: 'url', activeDocTarget: _activeAppContext.url }
       : null;
-    const _detPrefire = looksLikeLocalOp(message)
-      ? forceClassifyLocalPlan(message, _detPrefireTc, state.llmBackend || null, logger).catch(() => null)
-      : null;
-    _taskClassification = await classifyTask(
-      message,
-      conversationHistory,
-      state.llmBackend || null,
-      logger,
-      priorScreenSummary,
-      _activeAppContext,
-    );
-    if (_detPrefire && _taskClassification && typeof _taskClassification === 'object') {
-      _taskClassification._detPrefirePromise = _detPrefire;
+    // Memo key — a stored result is context-free by construction
+    // (_isContextFreeClassification), so replay is safe under any current
+    // context. Inputs are only memoized when the MESSAGE ITSELF can't be a
+    // follow-up: ≥4 words, no deictic markers ("it", "again", "same", …),
+    // and no prior screen summary in play. Follow-up-shaped prompts never
+    // get stored, so a cached result can't wrongly suppress resolution.
+    const _FOLLOWUP_HINT_RE = /\b(again|retry|re-?do|same (?:thing|one|as before)|that (?:file|page|doc|email|one|site|tab)|this (?:file|page|doc|email|one|site|tab)|it\b|them\b|those\b|these\b|continue|go on|keep going|previous|last one|the one)\b/i;
+    const _memoKey = (!priorScreenSummary &&
+        String(message || '').trim().split(/\s+/).filter(Boolean).length >= 4 &&
+        !_FOLLOWUP_HINT_RE.test(message))
+      ? _classifyMemoKey(message) : null;
+    if (_memoKey) {
+      const _memoHit = _loadClassifyCache()[_memoKey];
+      if (_memoHit && _memoHit.tc && (Date.now() - (_memoHit.ts || 0)) < CLASSIFY_CACHE_TTL_MS) {
+        _taskClassification = _memoHit.tc;
+        logger.info(`[Node:ResolveReferencesV2] classifyTask memo hit — skipping LLM classification`);
+      }
+    }
+    if (!_taskClassification) {
+      const _detPrefire = looksLikeLocalOp(message)
+        ? forceClassifyLocalPlan(message, _detPrefireTc, state.llmBackend || null, logger).catch(() => null)
+        : null;
+      _taskClassification = await classifyTask(
+        message,
+        conversationHistory,
+        state.llmBackend || null,
+        logger,
+        priorScreenSummary,
+        _activeAppContext,
+      );
+      if (_detPrefire && _taskClassification && typeof _taskClassification === 'object') {
+        _taskClassification._detPrefirePromise = _detPrefire;
+      }
+      // Persist context-free results (strip the live promise first).
+      if (_memoKey && _isContextFreeClassification(_taskClassification)) {
+        const _cache = _loadClassifyCache();
+        const _toStore = { ..._taskClassification };
+        delete _toStore._detPrefirePromise;
+        _cache[_memoKey] = { tc: _toStore, ts: Date.now() };
+        _saveClassifyCache(_cache);
+      }
     }
   }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
