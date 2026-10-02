@@ -69,13 +69,18 @@ function resolveRoute({
   taskClassification = null,
 }, logger = console) {
   const svc = (serviceName || '').toLowerCase();
+  // Separator-insensitive form — classifier emits "googledocs"/"google docs"
+  // while registries use "google_docs". Strip non-alnum on both sides so the
+  // comparisons below can't miss on punctuation/underscore/space variants.
+  const _norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const nsvc = _norm(svc);
   const browserSet = browserServices || _loadBrowserServices();
   const probes = { desktop: desktopProbe, tcc: tccProbe, cli: cliProbe };
 
   // ── Priority 1: CLI ──────────────────────────────────────────────────────
   // Techie users get the most accurate route. CLI must be installed AND authed.
   if (cliProbe && cliProbe.cli && cliProbe.installed && cliProbe.authed) {
-    const cliAgent = registeredAgents.find(a => a.type === 'cli' && a.id?.toLowerCase().includes(svc));
+    const cliAgent = registeredAgents.find(a => a.type === 'cli' && nsvc && _norm(a.id).includes(nsvc));
     const result = {
       route: 'cli',
       agentId: cliAgent?.id || `${svc}.agent`,
@@ -152,7 +157,7 @@ function resolveRoute({
   // ── Priority 3: Browser ──────────────────────────────────────────────────
   // Check for registered browser/app agent first, then browser-services registry.
   const browserAgent = registeredAgents.find(a =>
-    (a.type === 'browser' || a.type === 'app') && a.id?.toLowerCase().includes(svc)
+    (a.type === 'browser' || a.type === 'app') && nsvc && _norm(a.id).includes(nsvc)
   );
 
   if (browserAgent) {
@@ -167,10 +172,12 @@ function resolveRoute({
     return result;
   }
 
-  if (browserSet.has(svc)) {
+  const _registryKey = browserSet.has(svc) ? svc
+    : [...browserSet].find(k => _norm(k) === nsvc);
+  if (_registryKey) {
     const result = {
       route: 'browser',
-      agentId: `${svc}.agent`,
+      agentId: `${_registryKey}.agent`,
       reason: `Service in browser-services registry — will create browser agent`,
       probes,
       createAgent: true,

@@ -23,6 +23,29 @@ const { SITE_SEARCH_URLS } = require('../utils/localPlanTemplates');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
+// Resolve classifyDeepLinkType from command-service (walk up to find
+// mcp-services) — same pattern executeCommand uses. Used to label resolved
+// deep-link URLs in the planner prompt so the LLM knows a creation/search/
+// compose URL already performed that action.
+let _classifyDeepLinkType = null;
+try {
+  let _dir = __dirname;
+  for (let i = 0; i < 8; i++) {
+    const _candidate = path.join(_dir, 'mcp-services', 'command-service', 'src', 'skill-helpers', 'deep-link-types.cjs');
+    if (fs.existsSync(_candidate)) {
+      _classifyDeepLinkType = require(_candidate).classifyDeepLinkType;
+      break;
+    }
+    _dir = path.dirname(_dir);
+  }
+} catch (_) {}
+if (!_classifyDeepLinkType) {
+  _classifyDeepLinkType = (url) => {
+    if (!url) return 'none';
+    return /\/(new|create)(\/|$|\?|#)/i.test(url) ? 'creation' : 'none';
+  };
+}
+
 // Strip internal source-dump blocks from synthesized content before it can be
 // reused as a message body. executeCommand formats page results as
 // "=== Source: <url> ===\n<raw text>" for internal synthesis — those headers
@@ -336,6 +359,64 @@ function _injectPreflightDeepLinks(skillPlan, state, logger) {
     }
   }
   return skillPlan;
+}
+
+// ── Browser-step agentId post-pass ───────────────────────────────────────────
+// Every browser-family step must carry the service agentId — execution groups
+// lanes by args.agentId, so a step without one (observed: a turn.loop verify
+// step) spawns a parallel lane, derives 'default_agent', launches a fresh
+// about:blank browser, and verifies nothing. Fill it from the nearest
+// preceding browser step deterministically — works for LLM and template plans.
+const _BROWSER_STEP_SKILLS = new Set([
+  'browser.agent', 'browser.act', 'url.first.agent', 'dom.act',
+  'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent',
+  'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'playwright.agent',
+]);
+function _fillBrowserStepAgentIds(skillPlan, logger) {
+  if (!Array.isArray(skillPlan)) return skillPlan;
+  const _log = logger || console;
+  let _lastAgentId = null;
+  for (const step of skillPlan) {
+    if (!step || !_BROWSER_STEP_SKILLS.has(step.skill)) continue;
+    if (step.args?.agentId) {
+      _lastAgentId = step.args.agentId;
+    } else if (_lastAgentId) {
+      step.args = { ...(step.args || {}), agentId: _lastAgentId };
+      _log.info(`[Node:PlanSkillsV2] Filled missing agentId="${_lastAgentId}" on ${step.skill} step — keeps it in the same browser session lane`);
+    }
+  }
+  return skillPlan;
+}
+
+// ── Redundant verify-step strip ──────────────────────────────────────────────
+// A turn.loop verify step only earns its ~30-60s when the outcome can fail
+// SILENTLY (an add-to-cart click that no-ops, a send that misfires) — the
+// artifact lives off the current page so step results can't prove it. For
+// create/navigate/read flows the evidence is already in step results (the
+// landed URL, dom.act's ok) — the verify step re-checks what's known and adds
+// a failure surface (observed: Docs verify burned 2 turns on phantom sub-tasks
+// and failed while the doc was correctly created+titled).
+// Driven by the STRUCTURED taskClassification.interactiveActions vocabulary —
+// not regex on step text. No/empty classification → keep verify (fail-safe).
+const _SIDE_EFFECT_ACTIONS = new Set([
+  'add_to_cart', 'checkout', 'place_order', 'send_message', 'send_email',
+  'post', 'comment', 'submit_form', 'delete', 'publish', 'book_reservation',
+]);
+function _stripRedundantVerifySteps(skillPlan, state, logger) {
+  if (!Array.isArray(skillPlan)) return skillPlan;
+  const _log = logger || console;
+  const _actions = state?._taskClassification?.interactiveActions
+    || state?.taskClassification?.interactiveActions
+    || null;
+  if (!Array.isArray(_actions)) return skillPlan; // no classification → fail-safe keep
+  if (_actions.some(a => _SIDE_EFFECT_ACTIONS.has(a))) return skillPlan; // mutation flow → keep
+  const kept = skillPlan.filter(s =>
+    !(s?.skill === 'turn.loop.agent' && (s.args?.mode === 'verify' || s.stepType === 'verify')));
+  const dropped = skillPlan.length - kept.length;
+  if (dropped > 0) {
+    _log.info(`[Node:PlanSkillsV2] Stripped ${dropped} redundant verify step(s) — no side-effect actions in taskClassification ([${_actions.join(', ') || 'none'}])`);
+  }
+  return kept;
 }
 
 // ── Malformed-step guard ─────────────────────────────────────────────────────
@@ -1182,7 +1263,7 @@ function _buildSystemPrompt(userMessage, state) {
   // the LLM to copy the browser.agent pattern instead of using web.agent.
   const _isPublicWebMode = ['download', 'public_read'].includes(_tc?.webAccessMode);
   if (!_isPublicWebMode) {
-  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit"). Optional \`agentHint\`: \`"shortcut.keys.agent"\` (known app hotkey), \`"turn.loop.agent"\` (dense commerce grid).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction (e.g., "Confirm item added to cart")\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
+  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit"). Optional \`agentHint\` (emit when intent is clear): \`"tab.map.agent"\` (default — click/type/fill and navigate-and-extract goals like "search the page for X" or "read the results"), \`"just.type.agent"\` (single-field typing into a focused input), \`"meta.find.agent"\` (locate text on page), \`"shortcut.keys.agent"\` (ONLY when the goal literally asks to press a documented app hotkey — e.g. Gmail 'c' to compose, '/' to search. NOT for create/open/new goals or content searches), \`"turn.loop.agent"\` (dense commerce grid or multi-step goals), \`"gesture.agent"\` (drag/slider/swipe), \`"arrow.grid.agent"\` (spreadsheet cells).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction. Emit ONLY for silent-failure mutations whose outcome isn't provable from step results (add-to-cart, checkout, purchase, submit, send, post, delete). Do NOT emit for create/navigate/read flows — url.first's landed URL and dom.act's result already prove the outcome; synthesize confirms from step results.\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nCRITICAL: EVERY browser step for a service must carry that service's \`args.agentId\` — including \`turn.loop.agent\` verify steps. Steps without agentId run in a parallel lane with no browser session.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "agentId": "amazon.agent", "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
 
     // ── Commerce routing note ──────────────────────────────────────────────
     // For Amazon/eBay/Etsy add-to-cart, checkout, filter, or sort tasks,
@@ -1265,6 +1346,28 @@ function _buildSystemPrompt(userMessage, state) {
     if (_rdLines.length > 0) {
       result += `\n\n## ROUTE DECISIONS (from preflight probes — mandatory)\n\n${_rdLines.join('\n')}`;
     }
+  }
+
+  // Resolved deep-link destinations — url.first.agent will navigate to these
+  // URLs, and the URL itself performs the typed action. Without this block the
+  // planner cannot know that docs.google.com/document/create ALREADY creates
+  // the document, so it emits a redundant "create a new document" step that
+  // downstream agents then fumble (observed: tab-map clicked "Doc home" and
+  // created a second doc).
+  const _pfDestAgents = state.preflightResult?.agents || [];
+  const _destLines = [];
+  for (const _pa of _pfDestAgents) {
+    if (!_pa?.agentId || !_pa?.deepLinkUrl) continue;
+    const _dlType = _classifyDeepLinkType(_pa.deepLinkUrl);
+    const _dlNote =
+      _dlType === 'creation' ? 'CREATION deep link — the URL itself creates the entity (document/event/item) and opens it. Do NOT emit a "create a new X" step — emit only follow-on steps (set title, fill content)'
+      : _dlType === 'compose' ? 'COMPOSE deep link — the compose dialog opens automatically. Do NOT emit a "click Compose/New" step — emit only fill/send steps'
+      : _dlType === 'search' ? 'SEARCH deep link — results are already loaded at this URL. Do NOT emit a step that types the query into a search box'
+      : null;
+    _destLines.push(`- ${_pa.agentId}: ${_pa.deepLinkUrl}${_dlNote ? ` — ${_dlNote}` : ''}`);
+  }
+  if (_destLines.length > 0) {
+    result += `\n\n## RESOLVED DESTINATIONS (url.first.agent will navigate here — mandatory)\n\n${_destLines.join('\n')}`;
   }
 
   // Inject resolved user context (from resolveUserContext node) so planner knows what's available.
@@ -1945,7 +2048,7 @@ async function planSkillsV2(state) {
     // (e.g. gmail compose URL) — inject it into browser.agent run args.url so
     // browser.agent selects URL-first navigation instead of a blind start page.
     const detPlan = _rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
-      _injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger),
+      _stripRedundantVerifySteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger),
       userMessage), logger);
     // Messaging follow-up body: the service_task template passes the raw
     // message as task ("send this info to X"), so the browser agent never sees
@@ -3082,7 +3185,7 @@ The user's request does NOT match any installed skill.
   // ── Inject direct deep-link URLs from preflight ───────────────────────────
   // Shared with the deterministic-template path (which adopts plans before the
   // LLM section below) — see _injectPreflightDeepLinks for the mechanics.
-  skillPlan = _injectPreflightDeepLinks(skillPlan, state, logger);
+  skillPlan = _stripRedundantVerifySteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(skillPlan, state, logger), logger), state, logger);
 
   // ── Clarification / error objects from LLM ────────────────────────────────
   if (!Array.isArray(skillPlan) && skillPlan?.ask) {
@@ -3600,6 +3703,8 @@ module.exports._selectPriorSynthesis = _selectPriorSynthesis;
 module.exports._sanitizeSkillPlan = _sanitizeSkillPlan;
 module.exports._ensureSynthesizeStep = _ensureSynthesizeStep;
 module.exports._injectPreflightDeepLinks = _injectPreflightDeepLinks;
+module.exports._fillBrowserStepAgentIds = _fillBrowserStepAgentIds;
+module.exports._stripRedundantVerifySteps = _stripRedundantVerifySteps;
 // Back-compat alias — external callers/tests may still import the old name.
 module.exports._ensureSynthesizeForAppFlow = _ensureSynthesizeStep;
 module.exports._resolveCtxUrlTokens = _resolveCtxUrlTokens;

@@ -5,6 +5,7 @@ const https = require('https');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 const { fuzzyMatch } = require('../utils/fuzzyMatch');
+const { _canonicalService } = require('../utils/localPlanTemplates');
 
 /**
  * resolveAgent.js — StateGraph node
@@ -593,7 +594,8 @@ Select the right agent(s) for this task, or ask the user if ambiguous.`;
 // Fallback: when the LLM fails but the taskClassification already pinpoints a
 // service, auto-select the matching registered agent instead of asking the user.
 function _targetServiceFallback(registeredAgents, taskClassification, reasoning) {
-  const targetService = (taskClassification?.targetService || taskClassification?.followUpTarget || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+  const _raw = (taskClassification?.targetService || taskClassification?.followUpTarget || '').toLowerCase().replace(/[^a-z0-9_]/g, '');
+  const targetService = _canonicalService(_raw) || _raw;
   if (targetService && Array.isArray(registeredAgents)) {
     const match = registeredAgents.find(a =>
       (a.service || '').toLowerCase() === targetService ||
@@ -692,7 +694,11 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
   // selected when the target service is known.
   // followUpTarget is a conversation topic, not a service/domain. Only the
   // classifier's explicit targetService may trigger domain mismatch correction.
-  const targetService = (taskClassification?.targetService || '').toLowerCase();
+  // Canonicalize first — "googledocs"/"google docs" must resolve to the
+  // registered google_docs.agent, not a phantom googledocs.agent, and the
+  // domain-match below must see "google_docs" (tokens google+docs).
+  const _rawTarget = (taskClassification?.targetService || '').toLowerCase();
+  const targetService = _canonicalService(_rawTarget) || _rawTarget;
   if (targetService) {
     const targetSvcKey = targetService.replace(/[^a-z0-9_]/g, '');
     const targetAgentId = `${targetSvcKey}.agent`;

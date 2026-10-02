@@ -541,8 +541,9 @@ const TEMPLATES = [
       const name = _canonicalService(a.service);
       if (!name) return 'bad service name';
       // Same public-read veto as service_task — "biblehub look up X" is a
-      // website fetch, not a service task.
-      if (tc?.webAccessMode === 'public_read' || tc?.isBrowseOnly === true) {
+      // website fetch, not a service task. (isBrowseOnly deliberately NOT
+      // vetoed — this template IS the read-only lane; that flag is the input.)
+      if (tc?.webAccessMode === 'public_read') {
         return 'public-read browse task — not a service task';
       }
       const needles = SERVICE_ALIASES[name] || [name];
@@ -635,6 +636,12 @@ function _canonicalService(svc) {
   for (const [canon, aliases] of Object.entries(SERVICE_ALIASES)) {
     if (aliases.includes(s)) return canon;
   }
+  // Separator-insensitive fallback — the classifier emits variants like
+  // "googledocs" / "google-docs" that must canonicalize to google_docs.
+  const _norm = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  for (const [canon, aliases] of Object.entries(SERVICE_ALIASES)) {
+    if (_norm(canon) === _norm(s) || aliases.some(al => _norm(al) === _norm(s))) return canon;
+  }
   // Unknown service — still allow if it's a plausible agent name mentioned in
   // the message; validate() enforces the mention check separately.
   if (!/^[a-z][a-z0-9_]{0,30}$/.test(s)) return null;
@@ -704,7 +711,7 @@ function _dirname(p) {
 // ── Force-classify call ──────────────────────────────────────────────────────
 // Returns { template, args } | null. The prompt lists templates with arg
 // schemas; the model responds {n: 0..N, args: {...}}. n=0/none → fall through.
-const _CLASSIFY_PROMPT = (message, resolvedTarget, activePage) => `Pick the single template that implements the user's request, and extract its arguments. Reply with STRICT JSON only: {"n": <number>, "args": {...}} — n=0 only if NO template fits (ambiguous, or multiple independent goals like "read A then email it to B").
+const _CLASSIFY_PROMPT = (message, resolvedTarget, activePage, priorTask) => `Pick the single template that implements the user's request, and extract its arguments. Reply with STRICT JSON only: {"n": <number>, "args": {...}} — n=0 only if NO template fits (ambiguous, or multiple independent goals like "read A then email it to B").
 
 TEMPLATES:
 ${TEMPLATES.map(t => `${t.n}. ${t.id}: ${t.describe}`).join('\n')}
@@ -732,6 +739,7 @@ EXAMPLES:
 "what's the cheapest item on this page" → {"n": 17, "args": {}} (when a page is open)
 "goto amazon and search for baby clothes" → {"n": 19, "args": {"site": "amazon", "query": "baby clothes"}}
 ${resolvedTarget ? `RESOLVED TARGET (the file/app the user's referent points at): ${resolvedTarget}` : ''}
+${priorTask ? `PRIOR TASK CONTEXT: this message is a follow-up continuing a prior turn — the resolved referent is "${priorTask}". Bare continuations ("try again", "continue", "do that", "check again") mean re-run/continue THAT task — classify the template the referent implies (e.g. referent "check my gmail for unread emails" → n=22 service_browse).` : ''}
 ${activePage ? `ACTIVE PAGE: the user has a browser page open right now (${activePage}) — "this page"/"the page" refers to it, prefer template 17/18` : ''}
 USER: ${message}`;
 
@@ -740,13 +748,21 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
   const resolvedTarget = (taskClassification && typeof taskClassification.followUpTarget === 'string'
     && /^(?:~?\/|\.{1,2}\/)/.test(taskClassification.followUpTarget))
     ? taskClassification.followUpTarget : null;
+  // Non-path follow-up referent — the resolved task/subject (e.g. "Check my
+  // Gmail for unread emails from X") for bare continuations ("try again",
+  // "continue", "do that"). Path referents already surface via resolvedTarget;
+  // without this line the classifier sees only "try again" and picks n=0.
+  const priorTask = (taskClassification && taskClassification.isFollowUp === true
+    && typeof taskClassification.followUpTarget === 'string'
+    && taskClassification.followUpTarget.trim() && !resolvedTarget)
+    ? taskClassification.followUpTarget.trim().slice(0, 300) : null;
   // Live page in the user's real browser — lets the model pick page_scan/
   // page_print for "this page" questions instead of falling to n=0.
   const activePage = (taskClassification && taskClassification.activeDocRef === 'url'
     && typeof taskClassification.activeDocTarget === 'string')
     ? taskClassification.activeDocTarget.slice(0, 120) : null;
   try {
-    const prompt = _CLASSIFY_PROMPT(message, resolvedTarget, activePage);
+    const prompt = _CLASSIFY_PROMPT(message, resolvedTarget, activePage, priorTask);
     // query MUST carry the full prompt — generateAnswer sends payload.query,
     // not the first arg (that param is only a fallback). Passing the raw
     // message here made the model answer the task instead of classifying it.
@@ -814,4 +830,4 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
   }
 }
 
-module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS };
+module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS, _canonicalService, SERVICE_ALIASES, _CLASSIFY_PROMPT };

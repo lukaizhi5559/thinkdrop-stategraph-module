@@ -223,6 +223,57 @@ await it('download mode still rewrites scan_page', async () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+section('3 — service-name canonicalization (googledocs → google_docs)');
+// ═══════════════════════════════════════════════════════════════════════════════
+
+await it('canonicalizes targetService variants to google_docs', async () => {
+  const { _canonicalService } = require(path.resolve(__dirname, '..', 'src/utils/localPlanTemplates'));
+  expect(_canonicalService('googledocs')).toBe('google_docs');
+  expect(_canonicalService('google docs')).toBe('google_docs');
+  expect(_canonicalService('Google-Docs')).toBe('google_docs');
+  expect(_canonicalService('google_docs.agent')).toBe('google_docs');
+  expect(_canonicalService('gmail')).toBe('gmail');
+});
+
+await it('classifyTask canonicalizes parsed targetService', async () => {
+  const llmBackend = {
+    generateAnswer: async () => JSON.stringify({
+      taskType: 'browser',
+      targetService: 'googledocs',
+      webAccessMode: 'interactive',
+      interactiveActions: ['create'],
+    }),
+  };
+  const result = await classifyTask("Open Google Docs and create a new document titled 'Q3 Planning Notes'", [], llmBackend, console);
+  expect(result.targetService).toBe('google_docs');
+});
+
+await it('phantom guard keeps canonical service mentioned with separators', async () => {
+  const llmBackend = {
+    generateAnswer: async () => JSON.stringify({
+      taskType: 'browser',
+      targetService: 'googledocs',
+      webAccessMode: 'public_read',
+      interactiveActions: [],
+    }),
+  };
+  const result = await classifyTask('look up my notes template on google docs', [], llmBackend, console);
+  expect(result.targetService).toBe('google_docs');
+});
+
+await it('resolveRoute finds google_docs.agent for uncanonicalized service name', async () => {
+  const { resolveRoute } = require(path.resolve(__dirname, '..', 'src/utils/resolveRoute'));
+  const silent = { info() {}, warn() {} };
+  const r = resolveRoute({
+    serviceName: 'googledocs',
+    desktopProbe: { installed: false },
+    registeredAgents: [{ id: 'google_docs.agent', type: 'browser', authed: true }],
+  }, silent);
+  expect(r.route).toBe('browser');
+  expect(r.agentId).toBe('google_docs.agent');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 console.log(`\n❌ ${_failed} failed, ✅ ${_passed} passed`);
 if (_failed > 0) {
   for (const f of _failures) console.log(`  - ${f.label}: ${f.error}`);

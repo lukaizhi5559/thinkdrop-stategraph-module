@@ -31,11 +31,11 @@ const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATIO
 async function _confirmWebAccessMode(userMessage, llmBackend, logger) {
   if (!llmBackend || !userMessage) return 1;
   try {
-    const prompt = `Does this prompt require a browser session with login, account access, or form submission — or can it be completed with public web search/crawl?
+    const prompt = `Does this prompt require the user's real browser session — login/account access, form submission — OR did the user explicitly ask to open/navigate a website or see the result in a browser or on screen? Or can it be completed with public web search/crawl alone?
 
 Prompt: "${userMessage}"
 
-Answer ONLY "0" (public_read — search, browse, read, download) or "1" (interactive — login, account, form, cart, post, send, play).`;
+Answer ONLY "0" (public_read — search, browse, read, download, no browser surface requested) or "1" (interactive — login, account data, form, cart, post, send, play, or an explicit "open/goto <site>" / "in the browser" / "on my screen" request).`;
     const raw = await llmBackend.generateAnswer(prompt, {
       query: prompt,
       context: { systemInstructions: 'Answer with a single digit: 0 or 1.' },
@@ -780,6 +780,36 @@ module.exports = async function resolveReferencesV2(state) {
       logger.info('[Node:ResolveReferencesV2] binary confirmation: 0 → downgraded to public_read');
     } else {
       logger.info('[Node:ResolveReferencesV2] binary confirmation: 1 → keeping interactive');
+    }
+  }
+
+  // ── Symmetric upgrade — public_read/download + named service ─────────────
+  // The classifier can flake account-owned reads ("check my gmail for unread")
+  // and explicit browser-delivery requests ("show X in the browser") into
+  // public_read, which vetoes the service_browse lane (app.agent nav_task) —
+  // the lane built for exactly these tasks. When a targetService is present,
+  // ask the same binary question; on 1 restore interactive so the service
+  // route can proceed. Trigger is the structured targetService field — no
+  // message regex. public_read with NO named service stays untouched.
+  if ((_taskClassification.webAccessMode === 'public_read' || _taskClassification.webAccessMode === 'download') &&
+      _taskClassification.targetService) {
+    logger.info(`[Node:ResolveReferencesV2] ${_taskClassification.webAccessMode} + targetService="${_taskClassification.targetService}" — running binary confirmation`);
+    const _confirm = await _confirmWebAccessMode(message, state.llmBackend || null, logger);
+    if (_confirm === 1) {
+      _taskClassification.webAccessMode = 'interactive';
+      _taskClassification.isBrowseOnly = false;
+      _taskClassification.isThoughtReply = false;
+      if (_taskClassification.taskType === 'query' || _taskClassification.taskType === 'ambiguous' || !_taskClassification.taskType) {
+        _taskClassification.taskType = 'browser';
+      }
+      if (!Array.isArray(_taskClassification.interactiveActions) || _taskClassification.interactiveActions.length === 0) {
+        _taskClassification.interactiveActions = ['read_account'];
+      }
+      const _PASSIVE = new Set(['general_knowledge', 'web_search', 'screen_intelligence', 'memory_retrieve', 'memory_store', 'greeting']);
+      if (_PASSIVE.has(_taskClassification.suggestedIntent)) _taskClassification.suggestedIntent = 'command_automate';
+      logger.info(`[Node:ResolveReferencesV2] binary confirmation: 1 → upgraded to interactive (service=${_taskClassification.targetService})`);
+    } else {
+      logger.info('[Node:ResolveReferencesV2] binary confirmation: 0 → keeping public_read');
     }
   }
 

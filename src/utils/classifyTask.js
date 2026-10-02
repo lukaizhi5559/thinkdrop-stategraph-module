@@ -36,6 +36,7 @@
 
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE } = require('./textPatterns.cjs');
+const { _canonicalService } = require('./localPlanTemplates');
 
 // ── Deterministic screen-output detection ──────────────────────────────────
 // The LLM's isScreenOutput flag is advisory — phrasing is unambiguous enough
@@ -182,15 +183,19 @@ Field rules:
 
 - webAccessMode: how the task needs to touch the web — pick the CHEAPEST mode that can complete it:
   - "download": the user wants a remote file/asset saved locally (mp3, wav, pdf, image, zip, csv, video, font, etc.) — either from a public URL they gave or found via search. No login, no account, no page interaction. These are handled by web search + curl, NOT by a browser session.
-  - "public_read": the user wants to look up, find, search, read, compare, or check PUBLIC information on the web — including "go to <site> and look up X", "find X on <site>", "search <site> for Y", "any new X out recently", "look online for X". The answer comes from search results or public page text; no login, no clicking through site UI, no form submission.
-  - "interactive": the task requires a real browser session — login/OAuth/account state, sending/posting/messaging, form fill, add-to-cart/checkout, account settings, filter/picker UIs, media playback controls, multi-step page flows, or the user explicitly wants to browse the site themselves ("open X for me", "show me the site"). Also use "interactive" whenever requiresDOM is true, and as the DEFAULT when taskType is "browser" but the needed access is unclear.
+  - "public_read": the user wants to look up, find, search, read, compare, or check PUBLIC information on the web — "find X on <site>", "search <site> for Y", "any new X out recently", "look online for X". The answer comes from search results or public page text; no login, no account data, no clicking through site UI, no form submission, and no request to see it in a browser.
+  - "interactive": the task requires a real browser session — login/OAuth/account state, sending/posting/messaging, form fill, add-to-cart/checkout, account settings, filter/picker UIs, media playback controls, multi-step page flows, OR the user explicitly wants a visible browser/screen surface. Three explicit-interactive cases:
+      a) ACCOUNT DATA: reading the user's OWN account surfaces — my emails/inbox/unread/messages/DMs/notifications/orders/subscriptions/feed ("check my gmail for unread emails", "check my linkedin notifications") — reading your own account requires the logged-in session even though it's a read.
+      b) NAV VERBS: the user directs the browser somewhere — "goto <site>", "open <site>", "navigate to <site>" — including when followed by a read task ("goto youtube and lookup X"). EXCEPTION: search-and-extract-first-result tasks stay public_read per the "click the first result" rule below.
+      c) DELIVERY REQUEST: the user asks to see the result on a surface — "in the browser", "on my screen", "in chrome" ("show videos of X from youtube in the browser").
+      Also use "interactive" whenever requiresDOM is true, and as the DEFAULT when taskType is "browser" but the needed access is unclear.
   - "none": the task does not touch the web (local file/system/app tasks, memory, scheduling, pure knowledge queries).
-  Key distinction — NAMING a site is NOT enough for "interactive": "download a bird sound from freemusicarchive.org" is "download" (public file), "look up cheap X on amazon" is "public_read" (research), but "add X to my amazon cart" is "interactive" (account action). Download/public_read tasks NEVER need a service agent or auth — they use generic web-search/curl/crawl skills.
-  Examples: "Go to eBay and search for 'vintage children's Bible'" → public_read (simple search), "Search Amazon for cheap exercise equipment" → public_read (research), "Add the Bible to my eBay cart" → interactive (account action), "Send an email via Gmail" → interactive (send).
-  Image/listing requests are ALWAYS public_read: "show pics of X on [site]", "show me pictures of X for sale on [site]", "find images of X on [site]", "show X listings on [site]" → public_read. The user wants to SEE product images/listings, not interact with the site. "for sale" / "on sale" / "cheap" / "deals" in these prompts are product DESCRIPTORS, not filter requests.
+  Key distinction — NAMING a site is NOT enough for "interactive": "download a bird sound from freemusicarchive.org" is "download" (public file), "look up cheap X on amazon" is "public_read" (research), but "add X to my amazon cart" is "interactive" (account action), and "check my gmail inbox" is "interactive" (account data). Download/public_read tasks NEVER need a service agent or auth — they use generic web-search/curl/crawl skills.
+  Examples: "Search eBay for 'vintage children's Bible'" → public_read (research — no nav verb, public data), "Search Amazon for cheap exercise equipment" → public_read (research), "Add the Bible to my eBay cart" → interactive (account action), "Send an email via Gmail" → interactive (send), "Check my gmail for unread emails from X" → interactive (account read), "Goto youtube and lookup X" → interactive (nav verb), "show videos of X from youtube in the browser" → interactive (delivery request), "show videos of X from youtube" → public_read (answer-focused).
+  Image/listing requests are public_read UNLESS a delivery request is present: "show pics of X on [site]", "show me pictures of X for sale on [site]", "find images of X on [site]" → public_read, but "show pics of X on my screen" / "...in the browser" → interactive. "for sale" / "on sale" / "cheap" / "deals" in these prompts are product DESCRIPTORS, not filter requests.
   Example: "show pics of baby clothes for sale on amazon" → public_read (research — user wants to see product images, "for sale" describes the products, not a filter action).
 
-- interactiveActions: list the specific interactive actions this prompt requires, or [] if none. Valid actions: login, oauth, add_to_cart, checkout, place_order, send_message, send_email, post, comment, like, share, follow, subscribe, retweet, react, vote, play_media, pause_media, skip_media, shuffle, repeat, fill_form, submit_form, upload, publish, delete, edit, create, update, deploy, merge_pr, approve_pr, assign_task, settings_change, filter_ui, sort_ui, date_picker, book_reservation. Set to [] when the task is simple search, browse, read, download, or lookup — those are NOT interactive actions. When webAccessMode is "interactive", this array MUST be non-empty (list the actions that make it interactive). When webAccessMode is "public_read", "download", or "none", this MUST be [].
+- interactiveActions: list the specific interactive actions this prompt requires, or [] if none. Valid actions: login, oauth, add_to_cart, checkout, place_order, send_message, send_email, post, comment, like, share, follow, subscribe, retweet, react, vote, play_media, pause_media, skip_media, shuffle, repeat, fill_form, submit_form, upload, publish, delete, edit, create, update, deploy, merge_pr, approve_pr, assign_task, settings_change, filter_ui, sort_ui, date_picker, book_reservation, read_account, view_page. Use read_account for account-owned reads (my emails/inbox/notifications/orders) and view_page for explicit browser-delivery or nav-verb requests ("goto X and lookup Y", "show X in the browser"). Set to [] when the task is simple search, browse, read, download, or lookup — those are NOT interactive actions. When webAccessMode is "interactive", this array MUST be non-empty (list the actions that make it interactive). When webAccessMode is "public_read", "download", or "none", this MUST be [].
   IMPORTANT: "for sale" / "on sale" / "cheap" / "deals" / "discount" are product DESCRIPTORS, not filter actions. Do NOT set filter_ui for these. filter_ui requires an EXPLICIT filter/refine request like "filter by price under $50", "sort by rating", "only show prime eligible", "narrow down to size medium". A prompt like "show pics of baby clothes for sale on amazon" has NO interactive actions — set interactiveActions to [].
   IMPORTANT: "click the first result", "open the first product", "follow the first link", "select the first item", or similar phrasing is URL SELECTION for reading/extraction — NOT an interactive DOM action. When the overall goal is to search a site and then read/extract the first result, keep webAccessMode="public_read", requiresDOM=false, and interactiveActions=[]. Only mark it interactive if the user also wants to add-to-cart, checkout, filter, fill a form, or otherwise mutate state on that page.
 
@@ -568,9 +573,14 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       const s = String(svc).toLowerCase();
       if (m.includes(s)) return true;
       // Multi-word services ("google docs") — any ≥3-char token counts
-      return s.split(/[^a-z0-9]+/).filter(t => t.length >= 3).some(t => m.includes(t));
+      if (s.split(/[^a-z0-9]+/).filter(t => t.length >= 3).some(t => m.includes(t))) return true;
+      // Separator-insensitive — "google_docs" is mentioned by "google docs" / "googledocs"
+      const _n = v => v.replace(/[^a-z0-9]/g, '');
+      return _n(m).includes(_n(s));
     };
-    let parsedTargetService = parsed.targetService || null;
+    // Canonicalize BEFORE the mention check so alias/underscore variants
+    // ("googledocs" → google_docs) token-match the verbatim message.
+    let parsedTargetService = parsed.targetService ? _canonicalService(parsed.targetService) : null;
     // Follow-up replies are bare ("yes", "go ahead") — the service name lives
     // in the resolved followUpTarget (the accepted offer), not the reply
     // itself. Check both so a legitimately inherited service isn't dropped.

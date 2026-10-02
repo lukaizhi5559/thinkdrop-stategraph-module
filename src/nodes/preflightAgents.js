@@ -1909,10 +1909,12 @@ module.exports = async function preflightAgents(state) {
         const cliResult = _preflightCliMap[targetSvc] || null;
         if (cliResult) _probes[targetSvc].cli = cliResult;
 
-        // Find registered agents for this service
+        // Find registered agents for this service — separator-insensitive so
+        // "googledocs"/"google docs" match the google_docs.agent id.
+        const _normSvc = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
         const svcAgents = (agentReadiness || []).filter(a => {
-          const aSvc = (a.service || (a.agentId || '').replace(/\.agent$/, '')).toLowerCase();
-          return aSvc === targetSvc;
+          const aSvc = _normSvc(a.service || (a.agentId || '').replace(/\.agent$/, ''));
+          return aSvc === _normSvc(targetSvc);
         });
 
         // Resolve route
@@ -1951,6 +1953,21 @@ module.exports = async function preflightAgents(state) {
           : _routingNote;
         logger.info(`[Node:PreflightAgents] Injected desktop routing note for "${_targetSvc}" (app: "${_appName}")`);
       } else if (_route === 'unknown' && _tc.taskType === 'app_automation') {
+        // Safety: route=unknown can't be right if a registered browser/app
+        // agent matches the service (e.g. uncanonicalized "googledocs" vs
+        // google_docs.agent). Skip the grill — the browser lane can proceed.
+        const _normSvc2 = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const _registeredMatch = (agentReadiness || []).find(a =>
+          _normSvc2(a.service || (a.agentId || '').replace(/\.agent$/, '')) === _normSvc2(_targetSvc));
+        if (_registeredMatch) {
+          logger.warn(`[Node:PreflightAgents] route=unknown for "${_targetSvc}" but a registered agent matches — correcting route to browser (${_registeredMatch.agentId}); name-normalization miss upstream`);
+          _routeDecision[_targetSvc] = {
+            ..._routeDecision[_targetSvc],
+            route: 'browser',
+            agentId: _registeredMatch.agentId,
+            reason: `Registered agent ${_registeredMatch.agentId} matched normalized service name`,
+          };
+        } else {
         // (b) App not installed — grill the user
         const _candidates = (() => {
           try {
@@ -2055,6 +2072,7 @@ module.exports = async function preflightAgents(state) {
             agentContextNote,
           },
         };
+        }
       }
     }
   }

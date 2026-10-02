@@ -150,6 +150,32 @@ Rules:
 // hits the existing unresolved-token skip guard downstream.
 const _READ_ONLY_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search', 'fs.read', 'image.analyze']);
 
+// Atomic browser skills that share a session — used by the per-step arg
+// enrichment (serial + runGroup paths) and the session-tracking block.
+const _SESSION_BROWSER_SKILLS = new Set(['url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
+
+// Bucket runGroup steps into lanes keyed by agentId. Browser-family steps
+// with no explicit agentId (turn.loop verify steps commonly omit it) must
+// NOT spawn a parallel lane — they depend on the session/url state produced
+// by earlier steps. Bucket them into the most recent browser lane so they
+// run sequentially with a session to inherit; otherwise the step derives
+// 'default_agent', launches a fresh about:blank browser, and verifies nothing.
+function _bucketGroupLanes(groupSteps) {
+  const _isBrowserStep = (s) => _SESSION_BROWSER_SKILLS.has(s) || s === 'playwright.agent' || s === 'browser.agent' || s === 'browser.act';
+  const agentGroups = new Map();
+  let _lastBrowserLane = null;
+  for (const groupStep of groupSteps) {
+    let agentId = groupStep.step.args?.agentId || groupStep.step.skill;
+    if (!groupStep.step.args?.agentId && _isBrowserStep(groupStep.step.skill) && _lastBrowserLane) {
+      agentId = _lastBrowserLane;
+    }
+    if (!agentGroups.has(agentId)) agentGroups.set(agentId, []);
+    agentGroups.get(agentId).push(groupStep);
+    if (_isBrowserStep(groupStep.step.skill)) _lastBrowserLane = agentId;
+  }
+  return agentGroups;
+}
+
 function _tryAutoSkipIndependentStep(state) {
   const { failedStep, skillPlan = [], skillCursor, skillResults = [] } = state;
   const logger = state.logger || console;
@@ -3116,7 +3142,7 @@ module.exports = async function executeCommand(state) {
           if (parts.length === 0) parts.push(r.stdout || '');
           _rawText = parts.join('\n\n');
         } else {
-          _rawText = (typeof r.result === 'string' && r.result) || r.text || (typeof r.stdout === 'string' && r.stdout) || '';
+          _rawText = (typeof r.result === 'string' && r.result) || r.text || (typeof r.content === 'string' && r.content) || (typeof r.stdout === 'string' && r.stdout) || '';
         }
         const analysis = analyzePageContent(_rawText, r.url || r.result?.videoUrl || r.args?.videoUrl, r.args?.agentId);
         let processedText = _collapseRepeatedRuns(_rawText);
@@ -3516,6 +3542,42 @@ module.exports = async function executeCommand(state) {
         return parts.join('\n');
       });
 
+    // ── Generic catch-all collector ──────────────────────────────────────────
+    // Any successful step whose result carries substantial text that no dedicated
+    // collector claimed — covers the atomic browser agents (url.first, dom.act→
+    // tab.map/turn.loop/etc.) and any future skill. Without this, a lane like
+    // app.agent nav_task or turn.loop verify can produce content synthesize
+    // never sees (observed: Gmail results on screen, synthesize reported
+    // "0 results" and hallucinated a no-access refusal).
+    const _COLLECTED_SKILLS = new Set([
+      'browser.act', 'app.agent', 'browser.agent', 'cli.agent', 'external.skill',
+      'web.agent', 'video.agent', 'playwright.agent', 'shell.run', 'web.crawl',
+      'file.bridge', 'fs.read', 'image.analyze', 'user.agent', 'screen.capture',
+      'file.watch', 'system.introspect', 'synthesize', 'ask_user', 'schedule',
+      'needs_skill', 'api_suggest', 'intent.detect',
+    ]);
+    const _genericText = (r) =>
+      (typeof r.content === 'string' && r.content) ||
+      (typeof r.result === 'string' && r.result) ||
+      (typeof r.text === 'string' && r.text) ||
+      (typeof r.output === 'string' && r.output) ||
+      (typeof r.accumulatedText === 'string' && r.accumulatedText) ||
+      (typeof r.stdout === 'string' && r.stdout) ||
+      (typeof r.raw?.finalResult === 'string' && r.raw.finalResult) ||
+      (typeof r.raw?.output === 'string' && r.raw.output) ||
+      (typeof r.raw?.content === 'string' && r.raw.content) ||
+      null;
+    const genericResults = skillResults
+      .filter(r => r.ok && r.step > lastSynthesizeStep && r.skill && !_COLLECTED_SKILLS.has(r.skill))
+      .map(r => {
+        const text = _genericText(r);
+        // Skip empty/tiny outputs and action-confirmation strings (those are
+        // already surfaced via actionOutcomeNotes).
+        if (!text || text.trim().length < 50 || text.startsWith('Completed:')) return null;
+        return `=== ${r.skill} (step ${r.step}${r.description ? `: ${String(r.description).slice(0, 60)}` : ''}) ===\n${text}`;
+      })
+      .filter(Boolean);
+
     const allContextParts = [
       ...pageTextResults.map(p => `=== Source: ${p.url || p.source} ===\n${p.text}`),
       ...processedShellResults,
@@ -3533,6 +3595,7 @@ module.exports = async function executeCommand(state) {
       ...fileWatchResults,
       ...systemIntrospectResults,
       ...externalSkillResults,
+      ...genericResults,
     ];
 
     // ── Blocked/skipped step notes — surface failures so synthesis can't ────
@@ -3556,6 +3619,16 @@ module.exports = async function executeCommand(state) {
     let _truthfulnessNote = '';
     if (_anyFailed || _anyBlocked) {
       _truthfulnessNote = '\n\n[SYSTEM NOTE: One or more prior steps FAILED or were BLOCKED. Do NOT claim the task succeeded. Report what was attempted and what failed. If a download was requested, confirm the file exists at the path AND its type matches the request before claiming success — "HTML document" or "No such file or directory" means the download FAILED.]';
+    }
+    // Zero-content guard: when no collector produced context AND prior steps
+    // failed, the LLM invents capability excuses ("I don't have access to
+    // Gmail") instead of reporting the actual failure. Name the failure.
+    if (allContextParts.length === 0 && (_anyFailed || _anyBlocked)) {
+      const _failLines = skillResults
+        .filter(r => r && r.ok === false && r.step > lastSynthesizeStep && r.error)
+        .map(r => `- ${r.skill}${r.resolvedAgent ? `→${r.resolvedAgent}` : ''} (step ${r.step}): ${String(r.error).slice(0, 160)}`)
+        .join('\n');
+      _truthfulnessNote += `\n\n[SYSTEM NOTE: No page content was retrieved this run. Report the specific step failure(s) below — do NOT claim missing access, missing capability, or invent reasons.${_failLines ? `\n\nFailed steps:\n${_failLines}` : ''}]`;
     }
 
     // ── Prior synthesize results as fallback context ─────────────────────────
@@ -3668,7 +3741,16 @@ module.exports = async function executeCommand(state) {
     let synthesisPrompt = args.prompt || description || 'Compare and summarize the results from each source.';
 
     // ── User question — used by chunk+filter pass and synthesis prompt ────
-    const _userQuestion = state.originalMessage || state.resolvedMessage || state.message || synthesisPrompt;
+    const _userQuestionRaw = state.originalMessage || state.resolvedMessage || state.message || synthesisPrompt;
+    // Follow-up continuations ("try again", "continue", "lets do that") read
+    // literally as the question — append the resolved referent so synthesis
+    // answers the real task instead of the bare continuation words.
+    const _followRef = state._taskClassification?.isFollowUp === true
+      && typeof state._taskClassification?.followUpTarget === 'string'
+      ? state._taskClassification.followUpTarget.trim() : '';
+    const _userQuestion = _followRef
+      ? `${_userQuestionRaw}\n(Referring to prior task: ${_followRef.slice(0, 300)})`
+      : _userQuestionRaw;
 
     // Check if this is an email-related synthesis task
     const isEmailTask = /email|mail|send|draft|message/i.test(synthesisPrompt) || 
@@ -4999,109 +5081,114 @@ Please try again or search with different terms.`;
     }
   }
 
-  // ── Session inheritance: browser.act steps with no sessionId inherit from last navigate ──
-  // Without this, actions like waitForStableText/getPageText with no sessionId open a new
-  // blank tab instead of targeting the page that was just navigated to.
-  // Derive session from: (1) last navigate args.sessionId, (2) last navigate returned URL
-  // hostname (command service derives session from hostname when no sessionId given),
-  // (3) state.activeBrowserSessionId from prior steps.
-  // Atomic browser agents inherit the same way — a dom.act/tab.map step must land
-  // on the session the url.first.agent step opened.
-  const _SESSION_BROWSER_SKILLS = new Set(['url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
-  if ((skill === 'browser.act' || _SESSION_BROWSER_SKILLS.has(skill)) && !resolvedArgs.sessionId && resolvedArgs.action !== 'navigate') {
-    const lastNavigate = [...skillResults].reverse().find(r => (r.skill === 'browser.act' && r.args?.action === 'navigate' && r.ok) || (_SESSION_BROWSER_SKILLS.has(r.skill) && r.ok && (r.sessionId || r.args?.sessionId)));
-    let inheritedSession = lastNavigate?.args?.sessionId || lastNavigate?.sessionId || state.activeBrowserSessionId || null;
-    if (!inheritedSession && lastNavigate?.url) {
-      // Derive hostname-based session the same way the command service does
-      try {
-        inheritedSession = new URL(lastNavigate.url).hostname;
-      } catch (_) {}
-    }
-    if (inheritedSession) {
-      resolvedArgs = { ...resolvedArgs, sessionId: inheritedSession };
-      logger.info(`[Node:ExecuteCommand] Session inherit: "${inheritedSession}" → ${resolvedArgs.action} (lastNavigate.url=${lastNavigate?.url})`);
-    } else {
-      logger.info(`[Node:ExecuteCommand] Session inherit: no session found for ${resolvedArgs.action} (lastNavigate=${JSON.stringify(lastNavigate?.url)}, active=${state.activeBrowserSessionId})`);
-    }
-  }
+  // ── Browser-step arg enrichment (shared by serial + runGroup paths) ─────────
+  // Without session inheritance, actions like waitForStableText/getPageText
+  // with no sessionId open a new blank tab instead of targeting the page that
+  // was just navigated to. Derive session from: (1) last navigate
+  // args.sessionId, (2) last navigate returned URL hostname (command service
+  // derives session from hostname when no sessionId given), (3)
+  // state.activeBrowserSessionId. Atomic browser agents inherit the same way —
+  // a dom.act/tab.map step must land on the session url.first.agent opened.
+  //
+  // The cumulative-context + prior-nav + fill-memory layers below give each
+  // atomic step the digest of prior browser steps (nav targets + deep-link
+  // semantics + outcomes) appended to agentContext.
+  //
+  // extraResults: same-run-group results already completed — they aren't in
+  // skillResults yet, but sequential same-lane steps must see each other's
+  // session.
+  function _enrichBrowserStepArgs(skillName, args, extraResults = []) {
+    let out = args;
+    const _allResults = extraResults.length ? [...skillResults, ...extraResults] : skillResults;
 
-  // ── Cumulative browser-step context ────────────────────────────────────────
-  // Each atomic browser step runs blind without it: a compose deep-link step
-  // opened a dialog the NEXT step can't know about unless we say so. Build a
-  // digest of every prior browser step (nav targets + deep-link semantics +
-  // per-step outcomes + failures) and append it to agentContext, which flows
-  // through dom.act → the routed agent → _llmNextAction's prompt block.
-  if (_SESSION_BROWSER_SKILLS.has(skill)) {
-    const _dlGloss = (t) => t === 'compose' || t === 'creation'
-      ? ' — deep link auto-opens the compose/create dialog; it should ALREADY be open, do NOT click Compose/New again'
-      : t === 'search' ? ' — already on the results/listing page; do not search again'
-      : '';
-    const _ctxLines = skillResults
-      .map((r, i) => ({ i, r }))
-      .filter(({ r }) => r && _SESSION_BROWSER_SKILLS.has(r.skill) || r?.skill === 'browser.agent' || r?.skill === 'browser.act')
-      .map(({ i, r }) => {
-        const _who = r.resolvedAgent ? `${r.skill}→${r.resolvedAgent}` : r.skill;
-        if (r.skill === 'url.first.agent') {
-          return `Step ${i + 1} (${_who}): ${r.ok ? 'landed' : 'FAILED to reach'} ${r.url || 'unknown'}${r.ok ? _dlGloss(r.deepLinkType) : ` (${r.error || 'error'})`}`;
-        }
-        if (r.skill === 'browser.act' && r.args?.action === 'navigate') {
-          return `Step ${i + 1} (${_who}): navigated to ${r.url || r.args?.url || 'unknown'}`;
-        }
-        const _acts = Array.isArray(r.actionHistory) && r.actionHistory.length
-          ? r.actionHistory.slice(-3).join('; ')
-          : (r.output || r.stdout || r.result?.summary || '');
-        const _actsStr = _acts ? `: ${String(_acts).slice(0, 160)}` : '';
-        return `Step ${i + 1} (${_who}): ${r.ok ? 'done' : 'FAILED'}${_actsStr}${r.ok ? '' : ` (${r.error || 'error'})`}`;
-      });
-    // Replan/resume seed: skillResults is empty on a restarted plan, but the
-    // browser session persisted — restore the nav line so the step's LLM still
-    // knows the page state (e.g. compose dialog already open).
-    if (!_ctxLines.length && state.lastBrowserNav?.url) {
-      _ctxLines.push(`Earlier (resumed): url.first.agent landed ${state.lastBrowserNav.url}${_dlGloss(state.lastBrowserNav.deepLinkType)}`);
-    }
-    if (_ctxLines.length) {
-      const _ctxNote = `Browser session state so far:\n${_ctxLines.join('\n')}`;
-      resolvedArgs = {
-        ...resolvedArgs,
-        agentContext: [resolvedArgs.agentContext, _ctxNote].filter(Boolean).join('\n\n'),
-      };
-      logger.info(`[Node:ExecuteCommand] Browser ctx → ${skill}: ${_ctxLines.length} prior step(s)`);
-    }
-    // Structured prior-nav signal: the most recent url.first result carries
-    // url + deepLinkType. dom.act uses these (via deepLinkOpensOverlay) to
-    // wait for an auto-opened dialog and suppress the tab-map focus reset
-    // that would dismiss it (Escape + top-left click closes Gmail compose).
-    // Falls back to state.lastBrowserNav so replans/ask_user resumes — which
-    // restart with an empty skillResults — keep the overlay expectation.
-    const _lastNav = [...skillResults].reverse().find(r => r && r.ok && r.skill === 'url.first.agent' && r.url)
-      || (state.lastBrowserNav?.url ? { url: state.lastBrowserNav.url, deepLinkType: state.lastBrowserNav.deepLinkType } : null);
-    if (_lastNav) {
-      resolvedArgs = {
-        ...resolvedArgs,
-        priorNavUrl: resolvedArgs.priorNavUrl || _lastNav.url,
-        priorNavType: resolvedArgs.priorNavType || _lastNav.deepLinkType || 'none',
-      };
+    if ((skillName === 'browser.act' || _SESSION_BROWSER_SKILLS.has(skillName)) && !out.sessionId && out.action !== 'navigate') {
+      const lastNavigate = [..._allResults].reverse().find(r => (r.skill === 'browser.act' && r.args?.action === 'navigate' && r.ok) || (_SESSION_BROWSER_SKILLS.has(r.skill) && r.ok && (r.sessionId || r.args?.sessionId)));
+      let inheritedSession = lastNavigate?.args?.sessionId || lastNavigate?.sessionId || state.activeBrowserSessionId || null;
+      if (!inheritedSession && lastNavigate?.url) {
+        // Derive hostname-based session the same way the command service does
+        try {
+          inheritedSession = new URL(lastNavigate.url).hostname;
+        } catch (_) {}
+      }
+      if (inheritedSession) {
+        out = { ...out, sessionId: inheritedSession };
+        logger.info(`[Node:ExecuteCommand] Session inherit: "${inheritedSession}" → ${out.action || skillName} (lastNavigate.url=${lastNavigate?.url})`);
+      } else {
+        logger.info(`[Node:ExecuteCommand] Session inherit: no session found for ${out.action || skillName} (lastNavigate=${JSON.stringify(lastNavigate?.url)}, active=${state.activeBrowserSessionId})`);
+      }
     }
 
-    // Structured fill memory: fields filled by earlier browser steps this run
-    // (skillResults) plus the persisted ledger (state.domFilled, survives
-    // replans). Passed to the agent as priorFilledFields — tab.map.agent seeds
-    // its [FILLED] markers from it, gated on the live URL matching priorNavUrl
-    // / the fill's recorded url so a navigated page gets a clean slate.
-    const _priorFilled = [
-      ...skillResults.flatMap(r => (r && Array.isArray(r.filledFields)) ? r.filledFields : []),
-      ...(Array.isArray(state.domFilled) ? state.domFilled : []),
-    ].filter(f => f && (f.label || f.value));
-    if (_priorFilled.length) {
-      const _seenFill = new Set();
-      const _dedupFilled = _priorFilled.filter(f => {
-        const k = `${String(f.label || '').toLowerCase()}|${String(f.value || '').toLowerCase()}`;
-        if (_seenFill.has(k)) return false;
-        _seenFill.add(k); return true;
-      });
-      resolvedArgs = { ...resolvedArgs, priorFilledFields: _dedupFilled };
+    if (_SESSION_BROWSER_SKILLS.has(skillName)) {
+      const _dlGloss = (t) => t === 'compose'
+        ? ' — deep link auto-opens the compose dialog; it should ALREADY be open, do NOT click Compose/New again'
+        : t === 'creation'
+          ? ' — the entity was ALREADY created by this URL and is open on screen; do NOT click New/Create or navigate back to a home/dashboard page — remaining steps act on the created page'
+          : t === 'search' ? ' — already on the results/listing page; do not search again'
+          : '';
+      const _ctxLines = _allResults
+        .map((r, i) => ({ i, r }))
+        .filter(({ r }) => r && _SESSION_BROWSER_SKILLS.has(r.skill) || r?.skill === 'browser.agent' || r?.skill === 'browser.act')
+        .map(({ i, r }) => {
+          const _who = r.resolvedAgent ? `${r.skill}→${r.resolvedAgent}` : r.skill;
+          if (r.skill === 'url.first.agent') {
+            return `Step ${i + 1} (${_who}): ${r.ok ? 'landed' : 'FAILED to reach'} ${r.url || 'unknown'}${r.ok ? _dlGloss(r.deepLinkType) : ` (${r.error || 'error'})`}`;
+          }
+          if (r.skill === 'browser.act' && r.args?.action === 'navigate') {
+            return `Step ${i + 1} (${_who}): navigated to ${r.url || r.args?.url || 'unknown'}`;
+          }
+          const _acts = Array.isArray(r.actionHistory) && r.actionHistory.length
+            ? r.actionHistory.slice(-3).join('; ')
+            : (r.output || r.stdout || r.result?.summary || '');
+          const _actsStr = _acts ? `: ${String(_acts).slice(0, 160)}` : '';
+          return `Step ${i + 1} (${_who}): ${r.ok ? 'done' : 'FAILED'}${_actsStr}${r.ok ? '' : ` (${r.error || 'error'})`}`;
+        });
+      // Replan/resume seed: skillResults is empty on a restarted plan, but the
+      // browser session persisted — restore the nav line so the step's LLM still
+      // knows the page state (e.g. compose dialog already open).
+      if (!_ctxLines.length && state.lastBrowserNav?.url) {
+        _ctxLines.push(`Earlier (resumed): url.first.agent landed ${state.lastBrowserNav.url}${_dlGloss(state.lastBrowserNav.deepLinkType)}`);
+      }
+      if (_ctxLines.length) {
+        const _ctxNote = `Browser session state so far:\n${_ctxLines.join('\n')}`;
+        out = {
+          ...out,
+          agentContext: [out.agentContext, _ctxNote].filter(Boolean).join('\n\n'),
+        };
+        logger.info(`[Node:ExecuteCommand] Browser ctx → ${skillName}: ${_ctxLines.length} prior step(s)`);
+      }
+      // Structured prior-nav signal: dom.act uses these (via
+      // deepLinkOpensOverlay) to wait for an auto-opened dialog and suppress
+      // the tab-map focus reset that would dismiss it.
+      const _lastNav = [..._allResults].reverse().find(r => r && r.ok && r.skill === 'url.first.agent' && r.url)
+        || (state.lastBrowserNav?.url ? { url: state.lastBrowserNav.url, deepLinkType: state.lastBrowserNav.deepLinkType } : null);
+      if (_lastNav) {
+        out = {
+          ...out,
+          priorNavUrl: out.priorNavUrl || _lastNav.url,
+          priorNavType: out.priorNavType || _lastNav.deepLinkType || 'none',
+        };
+      }
+
+      // Structured fill memory: fields filled by earlier browser steps
+      // (results + persisted state.domFilled) → priorFilledFields.
+      const _priorFilled = [
+        ..._allResults.flatMap(r => (r && Array.isArray(r.filledFields)) ? r.filledFields : []),
+        ...(Array.isArray(state.domFilled) ? state.domFilled : []),
+      ].filter(f => f && (f.label || f.value));
+      if (_priorFilled.length) {
+        const _seenFill = new Set();
+        const _dedupFilled = _priorFilled.filter(f => {
+          const k = `${String(f.label || '').toLowerCase()}|${String(f.value || '').toLowerCase()}`;
+          if (_seenFill.has(k)) return false;
+          _seenFill.add(k); return true;
+        });
+        out = { ...out, priorFilledFields: _dedupFilled };
+      }
     }
+    return out;
   }
+
+  resolvedArgs = _enrichBrowserStepArgs(skill, resolvedArgs);
 
   const externalSkillName = skill === 'external.skill' && resolvedArgs.name ? resolvedArgs.name : null;
   // Build a human-readable label: "browser.act — navigate (perplexity)", "shell.run — bash", etc.
@@ -5574,14 +5661,7 @@ Please try again or search with different terms.`;
     
     // Group steps by agentId to avoid Chrome session conflicts
     // Steps with same agentId (especially browser.agent) must run sequentially
-    const agentGroups = new Map();
-    for (const groupStep of groupSteps) {
-      const agentId = groupStep.step.args?.agentId || groupStep.step.skill;
-      if (!agentGroups.has(agentId)) {
-        agentGroups.set(agentId, []);
-      }
-      agentGroups.get(agentId).push(groupStep);
-    }
+    const agentGroups = _bucketGroupLanes(groupSteps);
     
     logger.info(`[Node:ExecuteCommand] runGroup "${groupId}": ${groupSteps.length} steps grouped by ${agentGroups.size} agent(s) - executing different agents in parallel, same agent sequentially`);
 
@@ -5613,8 +5693,11 @@ Please try again or search with different terms.`;
     const _runProtectedPaths = state._protectedPaths
       || _getProtG(state.resolvedMessage || state.message || '');
 
-    const _dispatchGroupStep = async ({ idx, step: gs }) => {
-      const gsArgs = gs.args || {};
+    const _dispatchGroupStep = async ({ idx, step: gs, priorResults = [] }) => {
+      // Browser parity with the serial path — inherit sessionId from prior
+      // browser results (incl. same-lane steps already finished in this group),
+      // append the cumulative browser-step digest, priorNav and fill memory.
+      const gsArgs = _enrichBrowserStepArgs(gs.skill, gs.args || {}, priorResults);
       const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
       const _callArgs = _isAgent
         ? { ...gsArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn${state._handoffTaskId ? `?taskId=${encodeURIComponent(state._handoffTaskId)}` : ''}`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
@@ -5694,6 +5777,8 @@ Please try again or search with different terms.`;
           return {
             idx,
             step: gs,
+            skill: gs.skill,
+            args: _callArgs,
             ok: raw?.ok === true,
             result: raw?.result ?? raw?.stdout ?? null,
             stdout: raw?.stdout ?? null,
@@ -5709,6 +5794,48 @@ Please try again or search with different terms.`;
             options: raw?.options ?? [],
             needsCredentials: raw?.needsCredentials === true,
             needsLogin: raw?.needsLogin === true,
+            // Browser/session fields — session inherit, the cumulative digest,
+            // and the synthesize collectors all read these (mirrors the serial
+            // stepResult shape at ~stepResult builder).
+            url: raw?.url ?? null,
+            sessionId: raw?.sessionId ?? _callArgs?.sessionId ?? null,
+            resolvedAgent: raw?.resolvedAgent ?? null,
+            routeRule: raw?.routeRule ?? null,
+            deepLinkType: raw?.deepLinkType ?? null,
+            actionHistory: Array.isArray(raw?.actionHistory) ? raw.actionHistory : null,
+            filledFields: Array.isArray(raw?.filledFields) ? raw.filledFields : null,
+            clickedRefs: Array.isArray(raw?.clickedRefs) ? raw.clickedRefs : null,
+            items: raw?.items ?? null,
+            itemStats: raw?.itemStats ?? null,
+            links: raw?.links ?? null,
+            pageContext: raw?.pageContext ?? null,
+            output: raw?.output ?? null,
+            stateChanged: raw?.stateChanged ?? null,
+            needsManualStep: raw?.needsManualStep || false,
+            verified: raw?.verified !== undefined ? raw.verified : null,
+            goalVerified: raw?.goalVerified === true ? true : (raw?.goalVerified === false ? false : null),
+            postconditionVerified: raw?.postconditionVerified === true ? true : null,
+            reason: raw?.reason || null,
+            suggestion: raw?.suggestion || null,
+            partialProgress: raw?.partialProgress || null,
+            // app.agent / content fields — nav_task returns { content } and
+            // the synthesize app.agent collector reads these.
+            content: raw?.content || null,
+            text: raw?.text || null,
+            summary: raw?.summary || null,
+            accumulatedText: raw?.accumulatedText || null,
+            afterOCR: raw?.afterOCR || null,
+            stopReason: raw?.stopReason || null,
+            found: raw?.found ?? null,
+            anchoredAt: raw?.anchoredAt || null,
+            source: raw?.source || null,
+            context: raw?.context || null,
+            grid: raw?.grid || null,
+            shortcuts: raw?.shortcuts || null,
+            boundaries: raw?.boundaries || null,
+            sections: raw?.sections || null,
+            focused: raw?.focused ?? null,
+            status: raw?.status || null,
             raw,
           };
         } catch (err) {
@@ -5734,6 +5861,8 @@ Please try again or search with different terms.`;
           return {
             idx,
             step: gs,
+            skill: gs.skill,
+            args: _callArgs,
             ok: false,
             error: err.message,
             stderr: err.stack || null,
@@ -5762,7 +5891,7 @@ Please try again or search with different terms.`;
       }
       const results = [];
       for (const step of steps) {
-        results.push(await _dispatchGroupStep(step));
+        results.push(await _dispatchGroupStep({ ...step, priorResults: results }));
       }
       return results;
     })());
@@ -5834,7 +5963,7 @@ Please try again or search with different terms.`;
 
         if (decision === 'skip') {
           logger.info(`[Node:ExecuteCommand] parallel login: skipping ${svc?.agentId}`);
-          return { idx: r.idx, step: gs, ok: false, skipped: true, result: null, stdout: null, error: 'Skipped by user', raw: null };
+          return { idx: r.idx, step: gs, skill: gs.skill, ok: false, skipped: true, result: null, stdout: null, error: 'Skipped by user', raw: null };
         }
 
         // 'login' or 'try_without' — re-dispatch with appropriate flags
@@ -5851,9 +5980,9 @@ Please try again or search with different terms.`;
         try {
           const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: 300000, signal: state.abortSignal });
           const raw = res?.data || res;
-          return { idx: r.idx, step: gs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, raw };
+          return { idx: r.idx, step: gs, skill: gs.skill, args: _callArgs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, url: raw?.url ?? null, sessionId: raw?.sessionId ?? null, content: raw?.content || null, output: raw?.output || null, raw };
         } catch (err) {
-          return { idx: r.idx, step: gs, ok: false, error: err.message, result: null, stdout: null, raw: null };
+          return { idx: r.idx, step: gs, skill: gs.skill, args: _callArgs, ok: false, error: err.message, result: null, stdout: null, raw: null };
         }
       }));
 
@@ -5878,7 +6007,7 @@ Please try again or search with different terms.`;
         step: r.idx + 1,
         idx: r.idx,
         skill: r.step?.skill,
-        args: r.step?.args || {},
+        args: r.args || r.step?.args || {},
         description: r.step?.description,
         ok: r.ok,
         skipped: r.skipped || false,
@@ -5892,6 +6021,45 @@ Please try again or search with different terms.`;
         options: r.options || [],
         needsCredentials: r.needsCredentials === true,
         needsLogin: r.needsLogin === true,
+        // Browser/session + content fields — session inherit, the digest, and
+        // the synthesize collectors read top-level fields (mirrors serial).
+        url: r.url ?? null,
+        sessionId: r.sessionId ?? null,
+        resolvedAgent: r.resolvedAgent ?? null,
+        routeRule: r.routeRule ?? null,
+        deepLinkType: r.deepLinkType ?? null,
+        actionHistory: r.actionHistory || null,
+        filledFields: r.filledFields || null,
+        clickedRefs: r.clickedRefs || null,
+        items: r.items ?? null,
+        itemStats: r.itemStats ?? null,
+        links: r.links ?? null,
+        pageContext: r.pageContext ?? null,
+        output: r.output ?? null,
+        stateChanged: r.stateChanged ?? null,
+        needsManualStep: r.needsManualStep || false,
+        verified: r.verified !== undefined ? r.verified : null,
+        goalVerified: r.goalVerified === true ? true : (r.goalVerified === false ? false : null),
+        postconditionVerified: r.postconditionVerified === true ? true : null,
+        reason: r.reason || null,
+        suggestion: r.suggestion || null,
+        partialProgress: r.partialProgress || null,
+        content: r.content || null,
+        text: r.text || null,
+        summary: r.summary || null,
+        accumulatedText: r.accumulatedText || null,
+        afterOCR: r.afterOCR || null,
+        stopReason: r.stopReason || null,
+        found: r.found ?? null,
+        anchoredAt: r.anchoredAt || null,
+        source: r.source || null,
+        context: r.context || null,
+        grid: r.grid || null,
+        shortcuts: r.shortcuts || null,
+        boundaries: r.boundaries || null,
+        sections: r.sections || null,
+        focused: r.focused ?? null,
+        status: r.status || null,
         raw: r.raw || null,
         runGroup: groupId,
       };
@@ -5965,6 +6133,43 @@ Please try again or search with different terms.`;
       }
     }
 
+    // ── Browser session tracking for grouped steps ────────────────────────────
+    // Mirrors the serial block (~activeBrowserSessionId) — without this, group
+    // results never update activeBrowserSessionId/lastBrowserNav/domFilled, so
+    // later steps lose the session (observed: url.first in gmail_agent →
+    // turn.loop fell back to default_agent/about:blank).
+    let grpActiveBrowserSessionId = state.activeBrowserSessionId || null;
+    let grpActiveBrowserUrl = state.activeBrowserUrl || null;
+    let grpLastBrowserNav = state.lastBrowserNav || null;
+    let grpDomFilled = Array.isArray(state.domFilled) ? [...state.domFilled] : null;
+    for (const g of groupResults) {
+      if (!g.ok) continue;
+      const sk = g.skill;
+      if (sk === 'browser.act' && g.args?.sessionId) {
+        grpActiveBrowserSessionId = g.args.sessionId;
+      } else if (sk === 'browser.agent' && g.args?.agentId) {
+        grpActiveBrowserSessionId = `${g.args.agentId.replace('.agent', '')}_agent`;
+      } else if (_SESSION_BROWSER_SKILLS.has(sk)) {
+        grpActiveBrowserSessionId = g.sessionId || g.args?.sessionId
+          || (g.args?.agentId ? `${g.args.agentId.replace('.agent', '')}_agent` : null)
+          || grpActiveBrowserSessionId;
+      } else {
+        continue;
+      }
+      if (g.url) grpActiveBrowserUrl = g.url;
+      if (sk === 'url.first.agent' && g.url) {
+        grpLastBrowserNav = { url: g.url, deepLinkType: g.deepLinkType || 'none', sessionId: grpActiveBrowserSessionId, at: Date.now() };
+      }
+      if (Array.isArray(g.filledFields) && g.filledFields.length) {
+        grpDomFilled = [
+          ...(grpDomFilled || []),
+          ...g.filledFields
+            .filter(f => f && (f.label || f.value))
+            .map(f => ({ ref: f.ref || null, label: f.label || '', value: f.value ?? '', url: g.url || grpLastBrowserNav?.url || grpActiveBrowserUrl || null, sessionId: grpActiveBrowserSessionId })),
+        ];
+      }
+    }
+
     const agentQuestion = groupResults.find(r => r.askUser && !r.skipped);
     if (agentQuestion) {
       return {
@@ -5975,6 +6180,10 @@ Please try again or search with different terms.`;
         webAgentFallbackUrls: newWebAgentFallbackUrls,
         webAgentBestIsPage: newWebAgentBestIsPage,
         webAgentBestVerified: newWebAgentBestVerified,
+        activeBrowserSessionId: grpActiveBrowserSessionId,
+        activeBrowserUrl: grpActiveBrowserUrl,
+        lastBrowserNav: grpLastBrowserNav,
+        domFilled: grpDomFilled,
         skillCursor: nextCursor,
         commandExecuted: false,
         failedStep: null,
@@ -6010,6 +6219,10 @@ Please try again or search with different terms.`;
         webAgentFallbackUrls: newWebAgentFallbackUrls,
         webAgentBestIsPage: newWebAgentBestIsPage,
         webAgentBestVerified: newWebAgentBestVerified,
+        activeBrowserSessionId: grpActiveBrowserSessionId,
+        activeBrowserUrl: grpActiveBrowserUrl,
+        lastBrowserNav: grpLastBrowserNav,
+        domFilled: grpDomFilled,
           skillCursor: nextCursor,
           commandExecuted: false,
           failedStep: null, // Don't set — let synthesize run first
@@ -6024,6 +6237,10 @@ Please try again or search with different terms.`;
         webAgentFallbackUrls: newWebAgentFallbackUrls,
         webAgentBestIsPage: newWebAgentBestIsPage,
         webAgentBestVerified: newWebAgentBestVerified,
+        activeBrowserSessionId: grpActiveBrowserSessionId,
+        activeBrowserUrl: grpActiveBrowserUrl,
+        lastBrowserNav: grpLastBrowserNav,
+        domFilled: grpDomFilled,
         skillCursor: nextCursor,
         commandExecuted: false,
         failedStep: firstFailure,
@@ -8366,3 +8583,4 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
 module.exports.generateStepContract = generateStepContract;
 module.exports._extractFilePathsFromArgv = _extractFilePathsFromArgv;
 module.exports._thinPostFailureHandler = _thinPostFailureHandler;
+module.exports._bucketGroupLanes = _bucketGroupLanes;
