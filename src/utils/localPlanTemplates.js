@@ -410,14 +410,16 @@ const TEMPLATES = [
     },
     build: (a, m) => {
       const name = _canonicalService(a.service);
-      // No stepType — a forced 'on-page-action' makes browser.agent skip
-      // deep-link resolution AND unset URL-first (browser.agent.cjs run()),
-      // which breaks compose/send tasks (e.g. gmail #inbox?compose=new).
-      // _isOnPageAction/classifyTaskIntent already distinguish genuine
-      // on-page verbs (reply, like, add to cart) from navigation intents.
+      // Atomic browser agents: url.first resolves the deep link and navigates
+      // (e.g. gmail #inbox?compose=new), then dom.act routes the on-page work
+      // to the right executor (tab.map for compose forms). Splitting nav from
+      // action keeps each step deterministic — no internal sub-planning.
       return [
-        { skill: 'browser.agent',
-          args: { action: 'run', agentId: `${name}.agent`, task: m },
+        { skill: 'url.first.agent', stepType: 'navigate',
+          args: { task: m, agentId: `${name}.agent`, service: name },
+          description: `Navigate to ${name}` },
+        { skill: 'dom.act', stepType: 'on-page-action',
+          args: { task: m, agentId: `${name}.agent` },
           description: `${name}: ${String(m).slice(0, 60)}` },
         { skill: 'synthesize', stepType: 'verify',
           args: { prompt: 'Report whether the requested action completed, in one short sentence.' },

@@ -5025,6 +5025,84 @@ Please try again or search with different terms.`;
     }
   }
 
+  // ── Cumulative browser-step context ────────────────────────────────────────
+  // Each atomic browser step runs blind without it: a compose deep-link step
+  // opened a dialog the NEXT step can't know about unless we say so. Build a
+  // digest of every prior browser step (nav targets + deep-link semantics +
+  // per-step outcomes + failures) and append it to agentContext, which flows
+  // through dom.act → the routed agent → _llmNextAction's prompt block.
+  if (_SESSION_BROWSER_SKILLS.has(skill)) {
+    const _dlGloss = (t) => t === 'compose' || t === 'creation'
+      ? ' — deep link auto-opens the compose/create dialog; it should ALREADY be open, do NOT click Compose/New again'
+      : t === 'search' ? ' — already on the results/listing page; do not search again'
+      : '';
+    const _ctxLines = skillResults
+      .map((r, i) => ({ i, r }))
+      .filter(({ r }) => r && _SESSION_BROWSER_SKILLS.has(r.skill) || r?.skill === 'browser.agent' || r?.skill === 'browser.act')
+      .map(({ i, r }) => {
+        const _who = r.resolvedAgent ? `${r.skill}→${r.resolvedAgent}` : r.skill;
+        if (r.skill === 'url.first.agent') {
+          return `Step ${i + 1} (${_who}): ${r.ok ? 'landed' : 'FAILED to reach'} ${r.url || 'unknown'}${r.ok ? _dlGloss(r.deepLinkType) : ` (${r.error || 'error'})`}`;
+        }
+        if (r.skill === 'browser.act' && r.args?.action === 'navigate') {
+          return `Step ${i + 1} (${_who}): navigated to ${r.url || r.args?.url || 'unknown'}`;
+        }
+        const _acts = Array.isArray(r.actionHistory) && r.actionHistory.length
+          ? r.actionHistory.slice(-3).join('; ')
+          : (r.output || r.stdout || r.result?.summary || '');
+        const _actsStr = _acts ? `: ${String(_acts).slice(0, 160)}` : '';
+        return `Step ${i + 1} (${_who}): ${r.ok ? 'done' : 'FAILED'}${_actsStr}${r.ok ? '' : ` (${r.error || 'error'})`}`;
+      });
+    // Replan/resume seed: skillResults is empty on a restarted plan, but the
+    // browser session persisted — restore the nav line so the step's LLM still
+    // knows the page state (e.g. compose dialog already open).
+    if (!_ctxLines.length && state.lastBrowserNav?.url) {
+      _ctxLines.push(`Earlier (resumed): url.first.agent landed ${state.lastBrowserNav.url}${_dlGloss(state.lastBrowserNav.deepLinkType)}`);
+    }
+    if (_ctxLines.length) {
+      const _ctxNote = `Browser session state so far:\n${_ctxLines.join('\n')}`;
+      resolvedArgs = {
+        ...resolvedArgs,
+        agentContext: [resolvedArgs.agentContext, _ctxNote].filter(Boolean).join('\n\n'),
+      };
+      logger.info(`[Node:ExecuteCommand] Browser ctx → ${skill}: ${_ctxLines.length} prior step(s)`);
+    }
+    // Structured prior-nav signal: the most recent url.first result carries
+    // url + deepLinkType. dom.act uses these (via deepLinkOpensOverlay) to
+    // wait for an auto-opened dialog and suppress the tab-map focus reset
+    // that would dismiss it (Escape + top-left click closes Gmail compose).
+    // Falls back to state.lastBrowserNav so replans/ask_user resumes — which
+    // restart with an empty skillResults — keep the overlay expectation.
+    const _lastNav = [...skillResults].reverse().find(r => r && r.ok && r.skill === 'url.first.agent' && r.url)
+      || (state.lastBrowserNav?.url ? { url: state.lastBrowserNav.url, deepLinkType: state.lastBrowserNav.deepLinkType } : null);
+    if (_lastNav) {
+      resolvedArgs = {
+        ...resolvedArgs,
+        priorNavUrl: resolvedArgs.priorNavUrl || _lastNav.url,
+        priorNavType: resolvedArgs.priorNavType || _lastNav.deepLinkType || 'none',
+      };
+    }
+
+    // Structured fill memory: fields filled by earlier browser steps this run
+    // (skillResults) plus the persisted ledger (state.domFilled, survives
+    // replans). Passed to the agent as priorFilledFields — tab.map.agent seeds
+    // its [FILLED] markers from it, gated on the live URL matching priorNavUrl
+    // / the fill's recorded url so a navigated page gets a clean slate.
+    const _priorFilled = [
+      ...skillResults.flatMap(r => (r && Array.isArray(r.filledFields)) ? r.filledFields : []),
+      ...(Array.isArray(state.domFilled) ? state.domFilled : []),
+    ].filter(f => f && (f.label || f.value));
+    if (_priorFilled.length) {
+      const _seenFill = new Set();
+      const _dedupFilled = _priorFilled.filter(f => {
+        const k = `${String(f.label || '').toLowerCase()}|${String(f.value || '').toLowerCase()}`;
+        if (_seenFill.has(k)) return false;
+        _seenFill.add(k); return true;
+      });
+      resolvedArgs = { ...resolvedArgs, priorFilledFields: _dedupFilled };
+    }
+  }
+
   const externalSkillName = skill === 'external.skill' && resolvedArgs.name ? resolvedArgs.name : null;
   // Build a human-readable label: "browser.act — navigate (perplexity)", "shell.run — bash", etc.
   function buildRichDescription(sk, args) {
@@ -5097,6 +5175,13 @@ Please try again or search with different terms.`;
   // polls up to 45s, and any LLM-supplied timeoutMs:5000 would kill these before they finish.
   if (skill === 'browser.act') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 30000);
+  }
+  // Atomic browser skills run bounded inner loops (settle waits, DOM probes,
+  // multi-step LLM pick→act cycles). 60s kills them mid-loop while the server
+  // keeps executing — client reports timeout, server produces a zombie result.
+  // Same 5-min budget as app.agent; progress callbacks keep the UI live.
+  if (_SESSION_BROWSER_SKILLS.has(skill)) {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 300000);
   }
   // web.crawl launches playwright-cli, navigates, waits for JS render — needs at least 45s.
   if (skill === 'web.crawl') {
@@ -6658,6 +6743,10 @@ Please try again or search with different terms.`;
       sessionId: raw.sessionId ?? null,
       resolvedAgent: raw.resolvedAgent ?? null,
       routeRule: raw.routeRule ?? null,
+      deepLinkType: raw.deepLinkType ?? null,
+      actionHistory: Array.isArray(raw.actionHistory) ? raw.actionHistory : null,
+      filledFields: Array.isArray(raw.filledFields) ? raw.filledFields : null,
+      clickedRefs: Array.isArray(raw.clickedRefs) ? raw.clickedRefs : null,
       items: raw.items ?? null,
       itemStats: raw.itemStats ?? null,
       links: raw.links ?? null,
@@ -7561,6 +7650,24 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
     const activeBrowserUrl = (skill === 'browser.act' || _ATOMIC_SESSION_SKILLS.has(skill)) && stepResult.ok && raw.url
       ? raw.url
       : state.activeBrowserUrl || null;
+    // Persist the last url.first navigation (url + deepLinkType) so replans and
+    // ask_user resumes — which start with an empty skillResults — still know a
+    // compose/creation deep link opened a dialog (→ expectOverlay) and where
+    // the browser session was left. Overwritten by each new url.first nav.
+    const lastBrowserNav = (skill === 'url.first.agent' && stepResult.ok && (raw.url || stepResult.url))
+      ? { url: raw.url || stepResult.url, deepLinkType: raw.deepLinkType || stepResult.deepLinkType || 'none', sessionId: activeBrowserSessionId, at: Date.now() }
+      : state.lastBrowserNav || null;
+    // Cumulative filled-field ledger: survives replans/ask_user resumes (empty
+    // skillResults) the same way lastBrowserNav does. Each entry carries the
+    // page url it was filled on so cross-page seeding can't poison a new page.
+    const domFilled = (stepResult.ok && Array.isArray(raw.filledFields) && raw.filledFields.length)
+      ? [
+          ...(Array.isArray(state.domFilled) ? state.domFilled : []),
+          ...raw.filledFields
+            .filter(f => f && (f.label || f.value))
+            .map(f => ({ ref: f.ref || null, label: f.label || '', value: f.value ?? '', url: raw.url || lastBrowserNav?.url || activeBrowserUrl || null, sessionId: activeBrowserSessionId })),
+        ]
+      : state.domFilled || null;
 
     // ── Post-navigate scan ────────────────────────────────────────────────────
     // After every successful navigate OR press Enter (form submit → navigation),
@@ -8071,6 +8178,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         failedStep: null,
         activeBrowserSessionId,
         activeBrowserUrl,
+        lastBrowserNav,
+        domFilled,
         lastOpenedFilePath,
         webAgentBestUrl: newWebAgentBestUrl,
         webAgentFallbackUrls: newWebAgentFallbackUrls,
@@ -8107,6 +8216,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         failedStep: null,
         activeBrowserSessionId,
         activeBrowserUrl,
+        lastBrowserNav,
+        domFilled,
         lastOpenedFilePath,
         webAgentBestUrl: newWebAgentBestUrl,
         webAgentFallbackUrls: newWebAgentFallbackUrls,
@@ -8137,6 +8248,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       failedStep: null,
       activeBrowserSessionId,
       activeBrowserUrl,
+      lastBrowserNav,
+        domFilled,
       lastOpenedFilePath,
       webAgentBestUrl: newWebAgentBestUrl,
       webAgentFallbackUrls: newWebAgentFallbackUrls,

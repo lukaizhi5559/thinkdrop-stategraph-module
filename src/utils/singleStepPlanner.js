@@ -55,7 +55,9 @@ Available skills:
 - fs.read: Read files/directories. Args: { path, filePath, dir, action: 'tree'|'list' }
 - fs.write: Write files. Args: { path, filePath, content }
 - browser.act: Browser actions. Args: { action, url, sessionId }
-- browser.agent: Browser automation. Args: { action, agentId, task }
+- url.first.agent: Navigate to a service/page via deep link. Args: { agentId, task, url? }
+- dom.act: On-page action (fill/click/submit) — routes to the right executor. Args: { task, agentId, agentHint? }
+- turn.loop.agent: Verify a browser goal was achieved. Args: { goal, mode: 'verify', agentId }
 - web.agent: Web search/navigation. Args: { action, query }
 - synthesize: LLM synthesis. Args: { prompt }
 

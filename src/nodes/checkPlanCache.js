@@ -84,6 +84,12 @@ module.exports = async function checkPlanCache(state) {
     logger.info(
       `[Node:CheckPlanCache] Disk match → auto-execute (cosine=${similarPlan.similarity?.toFixed?.(3) || 'exact'}): ${similarPlan.file}`
     );
+    // Legacy plans still carrying browser.agent {action:'run'} steps get
+    // rewritten to atomic agents downstream — surface that in logs so the
+    // rewrite path is diagnosable.
+    if (similarPlan.skillPlan?.some(s => s?.skill === 'browser.agent' && s.args?.action === 'run')) {
+      logger.info('[Node:CheckPlanCache] cached plan contains legacy browser.agent step(s) — will rewrite to atomic agents in planSkills');
+    }
     _sessionCacheSet(cacheKey, similarPlan.skillPlan);
     return {
       ...state,

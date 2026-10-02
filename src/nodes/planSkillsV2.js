@@ -118,7 +118,9 @@ const _SYNTHESIZE_EXEMPT_SKILLS = new Set([
 //   extract / none  → left as browser.agent (legacy path until Phase 7)
 // A valid step.agentHint (just.type/meta.find/shortcut.keys/tab.map/gesture/
 // arrow.grid/turn.loop .agent) is carried into dom.act args for the router.
-const _ATOMIC_BROWSER_AGENTS = /^(1|true|yes)$/i.test(process.env.ATOMIC_BROWSER_AGENTS || '');
+// Default ON — prompts emit atomic names directly now, so this is a safety net
+// for stale plans. Set ATOMIC_BROWSER_AGENTS=0/false/no to disable.
+const _ATOMIC_BROWSER_AGENTS = !/^(0|false|no|off)$/i.test(process.env.ATOMIC_BROWSER_AGENTS || '');
 const _ONPAGE_AGENT_HINTS = new Set([
   'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent',
   'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent',
@@ -126,13 +128,19 @@ const _ONPAGE_AGENT_HINTS = new Set([
 
 // Deterministic stepType inference for browser.agent steps that lack one —
 // keeps cached/legacy plans migratable instead of falling through untouched.
+// A fused step (no stepType) is nav+act by definition: action verbs are checked
+// FIRST so the rewrite splits it into url.first.agent + dom.act rather than
+// collapsing to navigate-only. args.url must NOT imply 'navigate' — preflight
+// injects deep links (e.g. gmail ?compose=new) onto fused action steps.
+const _ACT_TASK_RE = /\b(send|email|compose|reply|forward|post|tweet|publish|create|upload|book|schedule|buy|purchase|checkout|order|delete|remove|comment|like|follow|subscribe|add|fill|type|click|enter|submit|sign|rsvp|invite|download|play|read|check|list|show|find|look|view|archive|star|mute|search|message)\b/i;
 const _NAV_TASK_RE = /\b(go to|goto|open|navigate|visit|log ?in|sign ?in|search\b.{0,40}\bon\b)\b/i;
 const _VERIFY_TASK_RE = /\b(confirm|verify|check|make sure|ensure|validate)\b/i;
 function _inferStepType(step) {
   const a = step?.args || {};
   const t = String(a.task || a.goal || '');
-  if (a.url || _NAV_TASK_RE.test(t)) return 'navigate';
+  if (_ACT_TASK_RE.test(t)) return 'on-page-action';
   if (_VERIFY_TASK_RE.test(t)) return 'verify';
+  if (a.url || _NAV_TASK_RE.test(t)) return 'navigate';
   return 'on-page-action';
 }
 
@@ -269,7 +277,11 @@ function _injectPreflightDeepLinks(skillPlan, state, logger) {
   // disables tiers 2,3,4 (Meta+F, Shortcuts, Tab-Map) needed for content entry.
   const _urlInjectedAgents = new Set();
   for (const step of skillPlan) {
-    if (step.skill === 'browser.agent' && step.args?.action === 'run' && step.args?.agentId) {
+    // url.first.agent is the atomic nav step — same deep-link injection applies.
+    const _isNavTarget =
+      (step.skill === 'browser.agent' && step.args?.action === 'run') ||
+      step.skill === 'url.first.agent';
+    if (_isNavTarget && step.args?.agentId) {
       const dl = deepLinkMap.get(step.args.agentId.toLowerCase());
       if (dl?.url) {
         // Don't override template variables — they come from prior step output
@@ -278,8 +290,10 @@ function _injectPreflightDeepLinks(skillPlan, state, logger) {
           _log.info(`[Node:PlanSkillsV2] Preserving template URL for ${step.args.agentId}: ${step.args.url}`);
         } else if (_urlInjectedAgents.has(step.args.agentId.toLowerCase())) {
           // Second+ step for same agent — strip URL so urlFirstNav=false and
-          // all tiers (Tab-Map, Shortcuts) are available for content entry
-          if (step.args.url) {
+          // all tiers (Tab-Map, Shortcuts) are available for content entry.
+          // Legacy browser.agent semantics ONLY: a url.first.agent step is a
+          // pure navigation — its args.url IS the destination, never strip it.
+          if (step.skill === 'browser.agent' && step.args.url) {
             const _oldUrl = step.args.url;
             delete step.args.url;
             _log.info(`[Node:PlanSkillsV2] Stripped URL from subsequent same-agent step for ${step.args.agentId} ("${_oldUrl}" → none — would disable content-entry tiers)`);
@@ -960,7 +974,12 @@ function _buildSystemPrompt(userMessage, state) {
   // ── Determine which domain appendices are relevant ──────────────────────
   // The base prompt is always loaded; selected appendices are concatenated so
   // cross-domain tasks (e.g. browser extraction + file save) see the full toolset.
-  const _needsBrowser = (_tc?.requiresDOM === true) || (_hasExplicitUrl && !_browserIsOpen);
+  const _needsBrowser = (_tc?.requiresDOM === true) || (_hasExplicitUrl && !_browserIsOpen)
+    // Interactive web tasks (send email, add to cart, create event) classify as
+    // taskType:messaging/productivity — not 'browser' — but still need the
+    // atomic browser skills vocabulary (url.first/dom.act/turn.loop).
+    || _tc?.webAccessMode === 'interactive'
+    || (Array.isArray(_tc?.interactiveActions) && _tc.interactiveActions.length > 0);
 
   // Public web tasks (download a file / read public info) get the light-weight
   // webfetch appendix — web.agent + web.crawl + curl patterns, no browser.agent.
