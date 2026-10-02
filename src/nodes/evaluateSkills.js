@@ -106,11 +106,20 @@ module.exports = async function evaluateSkills(state) {
     const _isSynthOk = _lastResult.skill === 'synthesize' && _lastResult.ok !== false;
     const _synthOutput = String(_lastResult.stdout || _lastResult.result || '').trim();
     if (_isSynthOk && _synthOutput.length > 50) {
-      // Verify all prior steps passed
+      // Verify all prior steps passed — "passed" means ok AND none was flagged
+      // unprovenMutation (ok=true with zero mutation evidence for a
+      // mutation-asserting task). A nav-only plan's landed URLs must not take
+      // this early-out.
       const _allPriorOk = skillResults.slice(0, -1).every(r => r.ok !== false);
-      if (_allPriorOk) {
+      const { hasBrowserMutationEvidence } = require('../utils/planHelpers');
+      const _anyUnproven = skillResults.slice(0, -1).some(r => r.unprovenMutation === true)
+        && !hasBrowserMutationEvidence(skillResults);
+      if (_allPriorOk && !_anyUnproven) {
         logger.info(`[Node:EvaluateSkills] Skipping post-run eval — synthesize produced ${_synthOutput.length} chars, all prior steps OK`);
         return { ...state, evaluationVerdict: 'PASS' };
+      }
+      if (_anyUnproven) {
+        logger.info('[Node:EvaluateSkills] unprovenMutation flag present — not taking the synthesize early-out');
       }
     }
   }
@@ -610,7 +619,7 @@ Verdict? (0, 1, or 2)`;
       fastMode: true,
       taskType: 'classification'
     });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
     const result = [0, 1, 2].includes(num) ? num : 0;
     logger.info(`[Node:EvaluateSkills] _evalDecision: verdict=${result} (raw="${(raw || '').trim()}")`);
     return result;

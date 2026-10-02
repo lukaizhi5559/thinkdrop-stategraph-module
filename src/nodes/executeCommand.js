@@ -122,7 +122,7 @@ Rules:
 
   try {
     const raw = await llmBackend.generateAnswer(systemPrompt, userMsg, { temperature: 0.1, maxTokens: 5, taskType: 'classification' });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
     const result = [0, 1, 2, 3].includes(num) ? num : 2;
     logger.info(`[ExecuteCommand:ThinRecovery] _thinRecoveryDecision: ${['REPLAN', 'REPLAN_STEP', 'ASK_USER', 'AUTO_PATCH'][result]} (raw="${(raw || '').trim()}")`);
     return result;
@@ -153,6 +153,32 @@ const _READ_ONLY_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search', 'fs.r
 // Atomic browser skills that share a session — used by the per-step arg
 // enrichment (serial + runGroup paths) and the session-tracking block.
 const _SESSION_BROWSER_SKILLS = new Set(['url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
+
+// Mutation-evidence flag — shared by the serial stepResult builder and the
+// runGroup path. A browser step whose task asserts on-page work but whose
+// result carries ZERO mutation evidence (no action history, no filled fields,
+// no clicks, no routed executor, no verified flag) cannot prove the work
+// happened. Navigation success is not task success — reviewExecution and
+// evaluateSkills treat unprovenMutation as a hollow signal.
+function _flagUnprovenMutation(res, skill, argsLike, raw, logger, stepNum) {
+  try {
+    if (!res || res.ok !== true || !_SESSION_BROWSER_SKILLS.has(skill)) return;
+    if (skill === 'turn.loop.agent' && String(argsLike?.mode || raw?.mode || 'act') === 'verify') return;
+    if (raw?.alreadySatisfied || raw?.mutationApplied) return;
+    if (res.resolvedAgent) return;
+    if (Array.isArray(res.actionHistory) && res.actionHistory.length) return;
+    if (Array.isArray(res.filledFields) && res.filledFields.length) return;
+    if (Array.isArray(res.clickedRefs) && res.clickedRefs.length) return;
+    if (res.verified === true || res.goalVerified === true || res.postconditionVerified === true) return;
+    if (skill !== 'url.first.agent' && (res.stdout || res.output)) return;
+    const { hasMutationResidue } = require('../utils/planHelpers');
+    const text = `${argsLike?.task || ''}\n${argsLike?.goal || ''}\n${res.description || ''}`;
+    if (!hasMutationResidue(text)) return;
+    res.unprovenMutation = true;
+    if (skill === 'url.first.agent') res.navOnly = true;
+    logger?.warn?.(`[Node:ExecuteCommand] step ${stepNum} (${skill}) ok=true but zero mutation evidence for a mutation-asserting task — flagged unprovenMutation`);
+  } catch (_) {}
+}
 
 // Bucket runGroup steps into lanes keyed by agentId. Browser-family steps
 // with no explicit agentId (turn.loop verify steps commonly omit it) must
@@ -1495,9 +1521,11 @@ module.exports = async function executeCommand(state) {
   // over an existing file. Fresh starts only — mid-plan rewrites would
   // desync cursor and UI step indexes.
   if (skillCursor === 0) {
-    const { lintFileEditPlan } = require('../utils/planHelpers');
+    const { lintFileEditPlan, lintAtomicBrowserPlan } = require('../utils/planHelpers');
     const _linted = lintFileEditPlan(skillPlan, logger, { prompt: state.resolvedMessage || state.message });
     if (_linted.rewrites.length > 0) skillPlan = _linted.plan;
+    const _atomicLinted = lintAtomicBrowserPlan(skillPlan, logger, {});
+    if (_atomicLinted.rewrites.length > 0) skillPlan = _atomicLinted.plan;
   }
 
   // Write live plan document on every pass so the UI / debugging tools can track progress
@@ -1575,7 +1603,14 @@ module.exports = async function executeCommand(state) {
     if (state._skillPlanFile) {
       try {
         const _planMd = fs.readFileSync(state._skillPlanFile, 'utf8');
-        const _allOk = skillResults.every(r => r.ok);
+        // unprovenMutation steps reported ok=true with zero mutation evidence.
+        // They only sink the plan when NO browser step produced mutation
+        // evidence — a url.first carrying residue is informational once its
+        // sibling dom.act/turn.loop did the on-page work. A nav-only plan must
+        // not be cached as 'complete' or the cache re-serves it.
+        const { hasBrowserMutationEvidence } = require('../utils/planHelpers');
+        const _allOk = skillResults.every(r => r.ok)
+          && !(skillResults.some(r => r.unprovenMutation) && !hasBrowserMutationEvidence(skillResults));
         const _newStatus = _allOk ? 'complete' : 'failed';
         const _updatedMd = _planMd.replace(/^(status:\s*)(pending|failed)(\s*)$/m, `$1${_newStatus}$3`);
         fs.writeFileSync(state._skillPlanFile, _updatedMd, 'utf8');
@@ -3197,7 +3232,23 @@ module.exports = async function executeCommand(state) {
     // otherwise the LLM only sees stale page dumps and hallucinates a report.
     const actionOutcomeNotes = skillResults
       .filter(r => r.ok && r.step > lastSynthesizeStep && typeof r.result === 'string' && r.result.startsWith('Completed:'))
-      .map(r => `- Step ${r.step} (${r.description || r.skill}): ${r.result.slice(0, 300)}`);
+      .map(r => `- Step ${r.step} (${r.description || r.skill}): ${r.result.slice(0, 300)}`)
+      // Atomic browser steps: report what each provably did. url.first.agent is
+      // navigation-only BY CONTRACT — a landed URL must never read as "task
+      // done"; unprovenMutation steps are labeled unverified.
+      .concat(skillResults
+        .filter(r => r.ok && r.step > lastSynthesizeStep && _SESSION_BROWSER_SKILLS.has(r.skill))
+        .map(r => {
+          const _who = r.resolvedAgent ? `${r.skill}→${r.resolvedAgent}` : r.skill;
+          if (r.skill === 'url.first.agent') {
+            return `- Step ${r.step} (${r.description || _who}): navigated to ${r.url || 'unknown page'} — NAVIGATION ONLY${r.navOnly || r.unprovenMutation ? ' — its task asserted on-page work that produced NO mutation evidence' : ''}`;
+          }
+          const _acts = Array.isArray(r.actionHistory) && r.actionHistory.length
+            ? ` actions: ${r.actionHistory.slice(-3).join('; ')}`
+            : '';
+          const _ev = r.unprovenMutation ? ' — reported ok but produced NO mutation evidence (treat as UNVERIFIED)' : '';
+          return `- Step ${r.step} (${r.description || _who}): ${r.skill} completed${_acts}${_ev}`;
+        }));
 
     // Include shell.run stdout (e.g. cat file output) as well as browser getPageText results
     // Annotate each result with its contract success state so the LLM sees
@@ -3574,7 +3625,10 @@ module.exports = async function executeCommand(state) {
         // Skip empty/tiny outputs and action-confirmation strings (those are
         // already surfaced via actionOutcomeNotes).
         if (!text || text.trim().length < 50 || text.startsWith('Completed:')) return null;
-        return `=== ${r.skill} (step ${r.step}${r.description ? `: ${String(r.description).slice(0, 60)}` : ''}) ===\n${text}`;
+        const _evidenceNote = r.skill === 'url.first.agent'
+          ? ' [NAVIGATION ONLY — this step opened a page; it performed none of the requested on-page work]'
+          : (r.unprovenMutation ? ' [UNVERIFIED — no mutation evidence recorded]' : '');
+        return `=== ${r.skill} (step ${r.step}${r.description ? `: ${String(r.description).slice(0, 60)}` : ''}) ===${_evidenceNote}\n${text}`;
       })
       .filter(Boolean);
 
@@ -5774,11 +5828,12 @@ Please try again or search with different terms.`;
               diff: raw?.diff ?? null,
             });
           }
-          return {
+          const _grpResult = {
             idx,
             step: gs,
             skill: gs.skill,
             args: _callArgs,
+            description: gs.description || null,
             ok: raw?.ok === true,
             result: raw?.result ?? raw?.stdout ?? null,
             stdout: raw?.stdout ?? null,
@@ -5838,6 +5893,8 @@ Please try again or search with different terms.`;
             status: raw?.status || null,
             raw,
           };
+          _flagUnprovenMutation(_grpResult, gs.skill, _callArgs, raw, logger, idx + 1);
+          return _grpResult;
         } catch (err) {
           // On exception, also retry once if first attempt
           if (!isRetry) {
@@ -7026,6 +7083,9 @@ Please try again or search with different terms.`;
       confidence:   skill === 'video.agent' ? (raw.confidence  ?? null) : undefined,
     };
 
+    // Mutation-evidence flag — shared logic in _flagUnprovenMutation.
+    _flagUnprovenMutation(stepResult, skill, resolvedArgs, raw, logger, skillCursor + 1);
+
     // Sandboxed protected-path denial — a sandboxed shell.run step tried to
     // write a user-attached file and the kernel refused (EPERM). Mark it so
     // _thinPostFailureHandler can substitute an edit.agent step
@@ -7191,7 +7251,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
                 },
                 options: { maxTokens: 5, temperature: 0, fastMode: true },
               }, { maxTokens: 5, temperature: 0, fastMode: true, taskType: 'classification' }, null);
-              const _pcNum = parseInt((_pcDecRaw || '').trim().replace(/\D/g, ''), 10);
+              const _pcNum = require('../utils/parseLlmJson').parseNumberDecision(_pcDecRaw);
               _pcFastVerdict = [0, 1, 2].includes(_pcNum) ? _pcNum : 0;
               logger.debug(`[Node:ExecuteCommand] payload.check decision: ${['SUCCESS', 'APP_ERROR', 'PARTIAL_SUCCESS'][_pcFastVerdict]} (raw="${(_pcDecRaw || '').trim()}")`);
             } catch (_pcDecErr) {
@@ -8294,7 +8354,9 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
             else if (r.ok && !acc[idx].ok) { acc[idx] = r; }
             return acc;
           }, []);
-          const _allOk2 = _deduped2.every(r => r.ok);
+          const { hasBrowserMutationEvidence: _hasMutEv2 } = require('../utils/planHelpers');
+          const _allOk2 = _deduped2.every(r => r.ok)
+            && !(_deduped2.some(r => r.unprovenMutation) && !_hasMutEv2(_deduped2));
           const _newStatus2 = _allOk2 ? 'complete' : 'failed';
           const _updatedMd2 = _planMd2.replace(/^(status:\s*)(pending|failed)(\s*)$/m, `$1${_newStatus2}$3`);
           fs.writeFileSync(state._skillPlanFile, _updatedMd2, 'utf8');

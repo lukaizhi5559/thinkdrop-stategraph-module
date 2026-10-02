@@ -192,7 +192,7 @@ Ready? (0, 1, or 2)`;
 
   try {
     const raw = await llmBackend.generateAnswer(userPrompt, { query: userPrompt, context: { systemInstructions: systemPrompt } }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
     const result = (num === 0 || num === 1 || num === 2) ? num : 0;
     logger.info(`[Node:GatherPlanContext] _askLLMDecision: ${['COMPLETE', 'NEED_QUESTION', 'NEED_AUTH'][result]} (raw="${(raw || '').trim()}")`);
     return result;

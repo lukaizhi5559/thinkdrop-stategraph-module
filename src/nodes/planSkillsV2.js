@@ -18,7 +18,7 @@ const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
 
-const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan, CONFIRM_ONLY_RE } = require('../utils/planHelpers');
+const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan, lintAtomicBrowserPlan, CONFIRM_ONLY_RE } = require('../utils/planHelpers');
 const { SITE_SEARCH_URLS } = require('../utils/localPlanTemplates');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
@@ -68,7 +68,7 @@ function _sanitizeSynthesisBody(text) {
 // confirmation — its "Body Content:" field may still carry the data.
 function _selectPriorSynthesis(conversationHistory = []) {
   const MESSAGING_REQ_RE = /\b(email|e-mail|send|mail|message|text|sms|slack|post|share|forward|reply)\b/i;
-  const CONFIRM_RE = /confirmed sent|email (was |has been )?sent|message (was |has been )?sent|i'?ve sent|sent (the|it|that|your)|delivery (failed|status|notification)|mail delivery subsystem|successfully (sent|delivered)|has been delivered/i;
+  const CONFIRM_RE = /confirmed sent|email (was |has been )?sent|message (was |has been )?sent|i'?ve sent|sent (the|it|that|your)|delivery (failed|status|notification)|mail delivery subsystem|successfully (sent|delivered)|has been delivered|summary of actions|actions? (were |was )?completed|task(s)? (was |were )?completed|all steps (succeeded|completed)/i;
   const candidates = [];
   for (let i = 0; i < conversationHistory.length; i++) {
     const m = conversationHistory[i];
@@ -221,6 +221,27 @@ function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
   }
   if (_rewritten) logger?.info(`[Node:PlanSkillsV2] atomic-agents: rewrote ${_rewritten} browser.agent step(s) to atomic skills`);
   return _out;
+}
+
+// Thin wrapper — apply the atomic-browser plan lint and keep only the plan.
+// The lint guarantees a url.first.agent is never a dead end: mutation residue
+// gets a dom.act step spliced in, and pure display-nav is downgraded to the
+// app.agent real-browser lane when nothing reuses the session.
+function _lintAtomicPlan(p, logger) {
+  return lintAtomicBrowserPlan(p, logger, {}).plan;
+}
+
+// interactiveActions vocabulary values that imply on-page mutation — used to
+// reject a plan that is still nav-only end-to-end after the lint.
+const _MUTATION_CLASSIFIED_ACTIONS = new Set([
+  'post', 'save', 'create', 'move', 'delete', 'send', 'reply', 'comment',
+  'add_to_cart', 'checkout', 'place_order', 'filter_ui', 'sort_ui',
+  'fill_form', 'submit_form', 'book', 'schedule', 'upload', 'invite',
+]);
+function _mutationExpected(state) {
+  const _tc = state?._taskClassification || state?.taskClassification;
+  return Array.isArray(_tc?.interactiveActions)
+    && _tc.interactiveActions.some(a => _MUTATION_CLASSIFIED_ACTIONS.has(String(a)));
 }
 
 function _ensureSynthesizeStep(skillPlan, userMessage) {
@@ -1360,14 +1381,14 @@ function _buildSystemPrompt(userMessage, state) {
     if (!_pa?.agentId || !_pa?.deepLinkUrl) continue;
     const _dlType = _classifyDeepLinkType(_pa.deepLinkUrl);
     const _dlNote =
-      _dlType === 'creation' ? 'CREATION deep link — the URL itself creates the entity (document/event/item) and opens it. Do NOT emit a "create a new X" step — emit only follow-on steps (set title, fill content)'
-      : _dlType === 'compose' ? 'COMPOSE deep link — the compose dialog opens automatically. Do NOT emit a "click Compose/New" step — emit only fill/send steps'
+      _dlType === 'creation' ? 'CREATION deep link — the URL creates the blank entity and opens it. Do NOT emit a "create a new X" step, but the URL performs NO other work: every requested field (title, name, dates, columns, content) still REQUIRES follow-on dom.act step(s)'
+      : _dlType === 'compose' ? 'COMPOSE deep link — the compose dialog opens automatically. Do NOT emit a "click Compose/New" step — emit only fill/send steps (dom.act)'
       : _dlType === 'search' ? 'SEARCH deep link — results are already loaded at this URL. Do NOT emit a step that types the query into a search box'
       : null;
     _destLines.push(`- ${_pa.agentId}: ${_pa.deepLinkUrl}${_dlNote ? ` — ${_dlNote}` : ''}`);
   }
   if (_destLines.length > 0) {
-    result += `\n\n## RESOLVED DESTINATIONS (url.first.agent will navigate here — mandatory)\n\n${_destLines.join('\n')}`;
+    result += `\n\n## RESOLVED DESTINATIONS (url.first.agent will navigate here — mandatory)\n\n${_destLines.join('\n')}\n\nurl.first.agent performs NAVIGATION ONLY — it never types, clicks, or fills. After each url.first.agent step, emit the dom.act / turn.loop.agent steps the task still needs (0-N per destination). A url.first.agent step by itself never completes a create/fill/send/add goal. If the task has multiple destinations, emit a url.first.agent + action-step group per destination.\n\nPure display-open requests ("open gmail", "go to calendar", nothing else) need no automation session — emit app.agent { action: "navigate_url", url: "<site url>" } instead of url.first.agent.`;
   }
 
   // Inject resolved user context (from resolveUserContext node) so planner knows what's available.
@@ -1615,7 +1636,7 @@ api_suggest: use as FIRST step when task is RECURRING or programmatic AND the se
 Policy: no sudo/su/passwd. argv is string[] — no shell interpolation.
 Output ONLY a valid JSON array. No explanation, no markdown fences.
 For synthesize steps: keep prompt strings UNDER 200 chars. Use {{EXPAND:<intent>}} for longer prompts.
-For every browser.agent step, include a "stepType" field: "navigate" (opens URL/searches), "on-page-action" (clicks/types on current page), "verify" (confirms result), or "extract" (reads content).
+For every browser step, include a "stepType" field: "navigate" → url.first.agent (opens URL/searches — navigation only), "on-page-action" → dom.act (clicks/types on current page), "verify" → turn.loop.agent mode:'verify' (confirms result), or "extract" → browser.agent extract_items (reads content). A url.first.agent step alone never completes an action goal — follow it with the dom.act steps the task needs.
 If the request cannot be safely automated, output: { "error": "explain why it cannot be done" }`;
 
 const PLANS_DIR = path.join(os.homedir(), '.thinkdrop', 'plans');
@@ -1750,7 +1771,7 @@ async function planSkillsV2(state) {
         // since resolved in live context.
         const _resolvedPlan = _resolveCtxUrlTokens(decoded, state._priorScreenContext?.url, state._gatheredVars, logger);
         // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
-        const _guardedPlan = _rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger);
+        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger), logger);
         const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
@@ -1765,7 +1786,7 @@ async function planSkillsV2(state) {
   if (state._loginResumeSkillPlan && !recoveryContext) {
     logger.info('[Node:PlanSkillsV2] Login resume: returning existing plan as-is');
     const _resumePlan = Array.isArray(state._loginResumeSkillPlan)
-      ? _rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger)
+      ? _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger), logger)
       : state._loginResumeSkillPlan;
     return { ...state, skillPlan: _resumePlan, skillCursor: 0, planError: null };
   }
@@ -1834,7 +1855,7 @@ async function planSkillsV2(state) {
       // requires authentication. Use a REST API alternative (build_agent) or surface the offer again.
       recoveryNote = `\n\nRECOVERY CONTEXT:\n- Previous plan used ${recoveryContext.failedSkill} (a UI information card — NOT a task executor). The card surfaced correctly; the plan is not truly failed.\n- Failure reason reported: ${recoveryContext.failureReason}\n⚠️ CRITICAL AUTH CONSTRAINT: The registered browser agents for this service are marked [NEEDS AUTH] and cannot execute tasks. DO NOT use browser.agent { action: "run" } with any [NEEDS AUTH] agent. You MUST use browser.agent { action: "build_agent", service: "sendgrid" } (or mailgun) to set up a REST API sender, OR surface api_suggest again if the user has not yet chosen a provider.`;
     } else {
-      recoveryNote = `\n\nRECOVERY CONTEXT (previous attempt failed — DO NOT repeat the same plan):\n- Failed step: ${recoveryContext.failedSkill} (step ${recoveryContext.failedStep})\n- Failure reason: ${recoveryContext.failureReason}\n- Actual URL reached: ${recoveryContext.actualUrl || 'unknown'}\n- Suggestion: ${recoveryContext.suggestion}\n- Constraint: ${recoveryContext.constraint || 'none'}\nYou MUST produce a DIFFERENT plan. RECOVERY TOOL CONSTRAINT: Any step that previously used browser.agent { action: "run" } MUST continue to use browser.agent { action: "run" } in the recovery plan.`;
+      recoveryNote = `\n\nRECOVERY CONTEXT (previous attempt failed — DO NOT repeat the same plan):\n- Failed step: ${recoveryContext.failedSkill} (step ${recoveryContext.failedStep})\n- Failure reason: ${recoveryContext.failureReason}\n- Actual URL reached: ${recoveryContext.actualUrl || 'unknown'}\n- Suggestion: ${recoveryContext.suggestion}\n- Constraint: ${recoveryContext.constraint || 'none'}\nYou MUST produce a DIFFERENT plan. RECOVERY TOOL CONSTRAINT: Any step that previously used a browser agent MUST keep the same browser route — url.first.agent for navigation plus dom.act / turn.loop.agent action steps for on-page work.`;
     }
     if (recoveryContext.constraint?.includes('USE GOAL MODE')) {
       recoveryNote += '\n⚠️ GOAL MODE REQUIRED: For any shell.run step, emit { "skill": "shell.run", "args": { "goal": "<plain English description>" } }. Do NOT write args.cmd or args.argv.';
@@ -1941,6 +1962,14 @@ async function planSkillsV2(state) {
   // generic placeholder (observed: "Here is the information you requested."
   // instead of the actual prior answer).
   const isMessagingTask = state._taskClassification?.taskType === 'messaging';
+  // BODY content only applies to messaging/referential tasks — a fresh
+  // create/search/navigate task must not inherit a prior run's synthesized
+  // report as an "extracted param" (observed: a previous run's "# Summary of
+  // Actions Completed" leaked into EXTRACTED PARAMS → BODY for a Google Doc
+  // task and primed the planner to describe completed work).
+  const _contentReferentTask = isMessagingTask
+    || /\b(this|that|these|those|above|previous|prior|earlier|the\s+(?:info|data|results?|answer|output|content|list|addresses?|summary|report|findings|details|text|notes?))\b/i.test(userMessage);
+  const _priorForParams = _contentReferentTask ? priorSynthesizedContent : '';
   const _hasExplicitBody = /\b(say|saying|with\s+message|body\s*:|message\s*:|tell\s+(?:them|him|her|me)\s+(?:that\s+)?")/i.test(userMessage)
     || /"[^"]{2,}"/.test(userMessage)
     || /'[^']{2,}'/.test(userMessage);
@@ -2026,7 +2055,7 @@ async function planSkillsV2(state) {
     try {
       const cached = await findSimilarCompletePlan(userMessage, PLANS_DIR, logger);
       if (cached && Array.isArray(cached.plan) && cached.plan.length > 0) {
-        const _guardedPlan = _ensureSynthesizeStep(cached.plan, userMessage);
+        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(cached.plan, userMessage), logger), logger);
         if (_guardedPlan.length > cached.plan.length) {
           logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}" — appended synthesize step`);
         } else {
@@ -2047,9 +2076,9 @@ async function planSkillsV2(state) {
     // Preflight may have already resolved a deep-link for the pinned service
     // (e.g. gmail compose URL) — inject it into browser.agent run args.url so
     // browser.agent selects URL-first navigation instead of a blind start page.
-    const detPlan = _rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
+    const detPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
       _stripRedundantVerifySteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger),
-      userMessage), logger);
+      userMessage), logger), logger);
     // Messaging follow-up body: the service_task template passes the raw
     // message as task ("send this info to X"), so the browser agent never sees
     // the actual content and invents a placeholder body. Attach the resolved
@@ -2274,8 +2303,10 @@ async function planSkillsV2(state) {
                   const skills = tsRes?.data?.skills || tsRes?.skills || [];
                   if (skills.length > 0) {
                     const skillNames = skills.map(s => s.name).join(', ');
-                    const agentTypeSkill = a.type === 'cli' ? 'cli.agent' : 'browser.agent';
-                    trainedRecipeLines.push(`- ${canonicalAgentId}: [${skillNames}] → use ${agentTypeSkill} { action: "run", agentId: "${canonicalAgentId}" }`);
+                    const agentTypeSkill = a.type === 'cli'
+                      ? `cli.agent { action: "run", agentId: "${canonicalAgentId}" }`
+                      : `url.first.agent { agentId: "${canonicalAgentId}", task: "..." } → dom.act { agentId: "${canonicalAgentId}", task: "..." }`;
+                    trainedRecipeLines.push(`- ${canonicalAgentId}: [${skillNames}] → use ${agentTypeSkill}`);
 
                     for (const s of skills) {
                       const baseName = s.name.toLowerCase();
@@ -2300,7 +2331,7 @@ async function planSkillsV2(state) {
               }
             }
 
-            agentContextNote = `\n\nREGISTERED AGENTS (use the matching executor — type 'cli' → cli.agent { action: "run", agentId: "<id>", task: "..." }; type 'browser' → browser.agent { action: "run", agentId: "<id>", task: "..." }. Agents with status 'not_installed' need their CLI installed first):\n${agentLines.join('\n')}`;
+            agentContextNote = `\n\nREGISTERED AGENTS (use the matching executor — type 'cli' → cli.agent { action: "run", agentId: "<id>", task: "..." }; type 'browser' → atomic browser skills with agentId "<id>": url.first.agent opens the destination, then dom.act / turn.loop.agent steps do the on-page work. Agents with status 'not_installed' need their CLI installed first):\n${agentLines.join('\n')}`;
 
             if (trainedRecipeLines.length > 0) {
               agentContextNote += `\n\nTRAINED RECIPES (when user mentions these, use browser.agent/cli.agent — NOT external.skill):\n${trainedRecipeLines.join('\n')}`;
@@ -2419,7 +2450,7 @@ async function planSkillsV2(state) {
     if (parsed && parsed.commands?.length > 0) {
       logger.info(`[Node:PlanSkillsV2] Contract fast-path: ${parsed.commands.length} templates for "${state.matchedSkillName}"`);
       try {
-        const runtimeParams = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, priorSynthesizedContent);
+        const runtimeParams = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, _priorForParams);
         const sel = parsed.commands.length === 1
           ? { index: 0, substitutions: [], params: {} }
           : await selectCommandTemplate(parsed.commands, userMessage, backend);
@@ -2653,9 +2684,9 @@ async function planSkillsV2(state) {
   }
 
   // ── Build the LLM planning query ──────────────────────────────────────────
-  const runtimeNote = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, priorSynthesizedContent)
+  const runtimeNote = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, _priorForParams)
     ? (() => {
-        const rp = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, priorSynthesizedContent);
+        const rp = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, _priorForParams);
         const hints = Object.entries(rp).filter(([, v]) => v).map(([k, v]) => `- ${k}: ${k === 'BODY' ? v.slice(0, 60) + '…' : v}`).join('\n');
         return hints ? `\n\nEXTRACTED PARAMS (use these in commands):\n${hints}` : '';
       })()
@@ -2707,7 +2738,7 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
       if (route === 'cli_api') {
         choiceLines.push(`- ${svc}: User selected CLI/API route. Use cli.agent or shell.run with API calls. Do NOT use browser.agent for ${svc}.`);
       } else if (route === 'browser') {
-        choiceLines.push(`- ${svc}: User selected Browser Agent route. Use browser.agent { action: "run", agentId: "${svc}.agent", task: "..." }. Do NOT use api_suggest or cli.agent for ${svc}.`);
+        choiceLines.push(`- ${svc}: User selected Browser Agent route. Use the atomic browser skills with agentId "${svc}.agent" (url.first.agent → dom.act / turn.loop.agent). Do NOT use api_suggest or cli.agent for ${svc}.`);
       } else if (route === 'app') {
         choiceLines.push(`- ${svc}: User selected Desktop App route. Use app.agent { action: "run_agent", appName: "${svc}", task: "..." }. Do NOT use browser.agent or api_suggest for ${svc}.`);
       }
@@ -2725,12 +2756,12 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
       if (m.route === 'cli_api') {
         mandateLines.push(`- ${svc}: The only available and authenticated route is CLI/API via ${m.agentId}. You MUST use cli.agent { action: 'run', agentId: '${m.agentId}', task: '...' }. FORBIDDEN: api_suggest, browser.agent, browser.act, app.agent, or any other route for ${svc}.`);
       } else if (m.route === 'browser') {
-        mandateLines.push(`- ${svc}: The only available and authenticated route is ${m.agentId} (browser). You MUST use browser.agent { action: 'run', agentId: '${m.agentId}', task: '...' }. FORBIDDEN: api_suggest, browser.act, cli.agent, app.agent, or raw API calls for ${svc}.`);
+        mandateLines.push(`- ${svc}: The only available and authenticated route is ${m.agentId} (browser). You MUST use the atomic browser skills with agentId '${m.agentId}': url.first.agent to open the destination, then dom.act / turn.loop.agent steps for the on-page work. FORBIDDEN: api_suggest, browser.act, browser.agent, cli.agent, app.agent, or raw API calls for ${svc}.`);
       } else if (m.route === 'app') {
         mandateLines.push(`- ${svc}: The only available and authenticated route is desktop app via ${m.agentId}. You MUST use app.agent { action: 'run_agent', appName: '${svc}', task: '...' }. FORBIDDEN: api_suggest, browser.agent, browser.act, cli.agent, or any other route for ${svc}.`);
       }
     }
-    singleRouteNote = `\n\n⚠️ SINGLE-ROUTE MANDATE — MANDATORY ROUTE FOR THESE SERVICES:\n${mandateLines.join('\n')}\n\nThese services have only one authenticated route available. You MUST use that route and MUST NOT generate api_suggest or alternative routes for them.\n\nIMPORTANT: The single-route mandate specifies WHICH agent to use, NOT how many steps. If the task involves multiple distinct actions (e.g., create X, then add Y, then add Z), emit one step per action — all using the same agentId. State carries over automatically between consecutive same-agent steps. Do NOT combine multiple distinct actions into one monolithic task string.\n`;
+    singleRouteNote = `\n\n⚠️ SINGLE-ROUTE MANDATE — MANDATORY ROUTE FOR THESE SERVICES:\n${mandateLines.join('\n')}\n\nThese services have only one authenticated route available. You MUST use that route and MUST NOT generate api_suggest or alternative routes for them.\n\nIMPORTANT: The single-route mandate specifies WHICH agent to use, NOT how many steps. If the task involves multiple distinct actions or destinations (e.g., create X, then add Y, then add Z), emit one url.first.agent step per destination followed by the dom.act / turn.loop.agent steps that destination's work needs — all using the same agentId. url.first.agent is NAVIGATION-ONLY: it never types, clicks, fills, or saves, so a url.first.agent step alone NEVER completes an action goal. Do NOT combine multiple distinct actions into one monolithic task string.\n`;
     logger.info(`[Node:PlanSkillsV2] Single-route mandate injected: ${JSON.stringify(singleRouteMandate)}`);
   }
 
@@ -3572,6 +3603,16 @@ The user's request does NOT match any installed skill.
   // ── Atomic browser agents: rewrite browser.agent run steps → atomic skills ──
   if (Array.isArray(skillPlan)) {
     skillPlan = _rewriteBrowserStepsToAtomicAgents(skillPlan, logger);
+    const _atomicLint = lintAtomicBrowserPlan(skillPlan, logger, {});
+    skillPlan = _atomicLint.plan;
+    // A mutation-classified task whose plan is STILL nav-only end-to-end was
+    // not repairable by the lint (every destination was described as pure
+    // navigation) — fail honestly rather than let synthesize claim success
+    // from landed URLs.
+    if (_atomicLint.navOnlyPlan && _mutationExpected(state)) {
+      logger.warn(`[Node:PlanSkillsV2] Rejecting nav-only plan for mutation task (interactiveActions=${(state._taskClassification?.interactiveActions || state.taskClassification?.interactiveActions || []).join(',')})`);
+      return { ...state, planError: 'Planned steps only navigate to pages — none perform the requested on-page action. Please try rephrasing the request.', commandExecuted: false };
+    }
   }
 
   // ── Malformed-step guard: shell.run without cmd/goal → ask_user ────────────

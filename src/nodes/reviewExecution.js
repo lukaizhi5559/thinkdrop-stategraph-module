@@ -39,7 +39,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const { parseLlmJson } = require('../utils/parseLlmJson');
+const { parseLlmJson, parseNumberDecision } = require('../utils/parseLlmJson');
+const { ATOMIC_BROWSER_SKILLS, hasBrowserMutationEvidence } = require('../utils/planHelpers');
 
 function loadReviewPrompt() {
   try {
@@ -148,7 +149,7 @@ Contradiction? (0 or 1)`;
         userId: context?.userId || 'local_user',
       },
     }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const num = parseNumberDecision(raw);
     hasContradiction = num === 1;
     logger.info(`[Node:ReviewExecution] assessAnswerContradiction decision: ${hasContradiction ? 'CONTRADICTION' : 'NO_CONTRADICTION'} (raw="${(raw || '').trim()}")`);
   } catch (err) {
@@ -240,7 +241,7 @@ Fulfilled? (0 or 1)`;
       },
     }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const num = parseNumberDecision(raw);
     if (isNaN(num) || (num !== 0 && num !== 1)) {
       throw new Error(`invalid response: "${(raw || '').trim()}"`);
     }
@@ -290,7 +291,7 @@ Verdict? (0 or 1)`;
         intent: state.intent?.type || 'command_automate',
       }
     }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
-    const num = parseInt((raw || '').trim().replace(/\D/g, ''), 10);
+    const num = parseNumberDecision(raw);
     const result = (num === 0 || num === 1) ? num : 0;
     logger.info(`[Node:ReviewExecution] _reviewDecision: verdict=${result === 0 ? 'PASS' : 'VERIFY_NEEDED'} (raw="${(raw || '').trim()}")`);
     return result;
@@ -424,7 +425,11 @@ module.exports = async function reviewExecution(state) {
   const _synthStep = skillResults.find(r => r.skill === 'synthesize' && r.ok !== false);
   const _synthOutput = String(_synthStep?.stdout || _synthStep?.result || '').trim();
   if (_synthStep && _synthOutput.length > 0) {
-    const _hasBrowserStep = (skillPlan || []).some(s => s.skill === 'browser.act' || s.skill === 'browser.agent');
+    // Atomic browser skills count as browser steps — a plan of url.first.agent
+    // + dom.act must reach the snapshot fulfillment check, not short-circuit
+    // here on synthesize output alone (observed: nav-only plan VERIFIED on
+    // landed URLs while the requested mutations never ran).
+    const _hasBrowserStep = (skillPlan || []).some(s => ATOMIC_BROWSER_SKILLS.has(s.skill));
     const _hasPageTextResult = skillResults.some(r =>
       r.skill === 'browser.act' && (
         r.args?.action === 'getPageText' ||
@@ -458,7 +463,7 @@ module.exports = async function reviewExecution(state) {
   // already verified completion, trust it — same precedent as the app.agent
   // stateChanged short-circuit below.
   const _hasVerifiedBrowserMutation = skillResults.some(r =>
-    (r.skill === 'browser.agent' || r.skill === 'playwright.agent') &&
+    ATOMIC_BROWSER_SKILLS.has(r.skill) &&
     r.ok !== false &&
     (r.verified === true || r.goalVerified === true || r.postconditionVerified === true)
   );
@@ -543,9 +548,15 @@ module.exports = async function reviewExecution(state) {
   if (shellSteps.length === 0) {
     // Extract synthesize output
     const synthesizeStep = skillResults.find(r => r.skill === 'synthesize' && r.ok !== false);
-    const synthesizeOutput = synthesizeStep
+    // Steps flagged unprovenMutation reported ok=true with zero mutation
+    // evidence — surface that to the judge instead of letting synthesize's
+    // confidence stand in for proof.
+    const _unprovenMutations = skillResults.filter(r => r.unprovenMutation === true);
+    const synthesizeOutput = (synthesizeStep
       ? String(synthesizeStep.stdout || synthesizeStep.result || '')
-      : '';
+      : '') + (_unprovenMutations.length
+        ? `\n\nEVIDENCE NOTE: ${_unprovenMutations.length} step(s) (${_unprovenMutations.map(r => r.skill).join(', ')}) reported ok=true but produced ZERO mutation evidence — no fields filled, no elements clicked, no actions recorded${_unprovenMutations.some(r => r.navOnly) ? '; at least one was a NAVIGATION-ONLY step whose task asserted on-page work' : ''}.`
+        : '');
 
     // Regex fast-path — obvious hollow signals, no LLM call needed
     const HOLLOW = [
@@ -572,9 +583,13 @@ module.exports = async function reviewExecution(state) {
       // Derive sessionId from the last browser.act step, or from browser.agent as fallback
       const browserSessionId = state.activeBrowserSessionId
         || skillResults.slice().reverse().find(r => r.skill === 'browser.act' && r.args?.sessionId)?.args?.sessionId
+        || skillResults.slice().reverse().find(r => ATOMIC_BROWSER_SKILLS.has(r.skill) && (r.sessionId || r.args?.sessionId))
+          ?.sessionId
+        || skillResults.slice().reverse().find(r => ATOMIC_BROWSER_SKILLS.has(r.skill) && (r.sessionId || r.args?.sessionId))
+          ?.args?.sessionId
         || (() => {
-          // Fallback: browser.agent steps don't have sessionId in args, but we can derive from agentId
-          const r = skillResults.slice().reverse().find(s => s.skill === 'browser.agent' && s.args?.agentId);
+          // Fallback: agent steps don't have sessionId in args, but we can derive from agentId
+          const r = skillResults.slice().reverse().find(s => ATOMIC_BROWSER_SKILLS.has(s.skill) && s.args?.agentId);
           return r ? `${r.args.agentId.replace('.agent', '')}_agent` : null;
         })();
 
@@ -610,6 +625,13 @@ module.exports = async function reviewExecution(state) {
         // LLM judgment overrides regex
         isHollow = !judgment.fulfilled;
         hollowReason = judgment.reason || hollowReason;
+      } else if (_unprovenMutations.length > 0 && !hasBrowserMutationEvidence(skillResults)) {
+        // No judge available — zero-evidence mutation steps are the
+        // deterministic hollow signal, but only when no browser step anywhere
+        // produced real mutation evidence (a residue url.first is informational
+        // once its sibling action step did the work).
+        isHollow = true;
+        hollowReason = `Step(s) reported success but produced zero mutation evidence: ${_unprovenMutations.map(r => r.skill).join(', ')}`;
       }
       // If judgment is null (LLM error), regexHollow from above remains the fallback
     }
@@ -685,7 +707,7 @@ module.exports = async function reviewExecution(state) {
         // Build a synthetic failedStep from the last browser/agent step so recoverSkill
         // has enough context to produce a useful REPLAN suggestion.
         const lastBrowserStep = skillResults.slice().reverse().find(
-          r => r.skill === 'playwright.agent' || r.skill === 'browser.agent' || r.skill === 'browser.act'
+          r => ATOMIC_BROWSER_SKILLS.has(r.skill)
         ) || skillResults[skillResults.length - 1];
 
         const syntheticFailedStep = {

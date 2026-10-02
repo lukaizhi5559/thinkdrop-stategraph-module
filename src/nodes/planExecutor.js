@@ -13,7 +13,7 @@ const fs   = require('fs');
 const path = require('path');
 
 const planScanner = require('../utils/planScanner');
-const { lintFileEditPlan } = require('../utils/planHelpers');
+const { lintFileEditPlan, lintAtomicBrowserPlan } = require('../utils/planHelpers');
 const {
   extractPlanContext,
   getCurrentBrowserContext,
@@ -166,6 +166,7 @@ module.exports = async function planExecutor(state) {
   try {
     const { _rewriteBrowserStepsToAtomicAgents } = require('./planSkillsV2');
     skillPlan = _rewriteBrowserStepsToAtomicAgents(skillPlan, logger);
+    skillPlan = lintAtomicBrowserPlan(skillPlan, logger, {}).plan;
   } catch (_) {}
 
   logger.info(`[Node:PlanExecutor] Built skillPlan[${skillPlan.length}] — handing to planSkills → executeCommand`);

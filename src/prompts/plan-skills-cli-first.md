@@ -36,9 +36,10 @@ Then run it:
 - Generates a descriptor with `pre_steps` if needed
 - Stores the agent in the registry for reuse
 
-### Step 3: Fallback to browser.agent if CLI unavailable
+### Step 3: Fallback to the atomic browser lane if CLI unavailable
 ```json
-{ "skill": "browser.agent", "args": { "action": "run", "agentId": "<domain>.agent", "task": "<user goal verbatim>" } }
+{ "skill": "url.first.agent", "args": { "agentId": "<domain>.agent", "task": "open <domain> for <user goal>" } },
+{ "skill": "dom.act", "args": { "agentId": "<domain>.agent", "task": "<user goal verbatim>" } }
 ```
 
 ## pre_steps — LLM-Inferred Input Resolution

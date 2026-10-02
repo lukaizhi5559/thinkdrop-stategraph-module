@@ -6,10 +6,11 @@ Domain-specific guidance for the atomic browser agents and `web.agent`. General 
 
 Interactive browser tasks decompose into **one step per tier** — the plan is the orchestrator, not the agent:
 
-1. **`url.first.agent`** — the ONLY step that navigates. Resolves the best URL for the task (deep-link), opens the shared session, detects auth walls. One step per destination.
+1. **`url.first.agent`** — the ONLY step that navigates the automation session. Resolves the best URL for the task (deep-link), opens the shared session, detects auth walls. **It performs NO on-page interaction** — it never types, clicks, fills, or saves. One step per destination, and every destination may be followed by **0–N** action steps depending on the remaining work. A `url.first.agent` step alone NEVER completes a create/fill/send/add/verify goal — if the task text requests anything beyond "open/show me", emit the action steps too.
    ```json
    { "skill": "url.first.agent", "args": { "agentId": "<service>.agent", "task": "go to <service> <section>" }, "description": "Navigate to <service>" }
    ```
+   **Display-only requests** ("open gmail", "go to calendar", "show me amazon" — the user just wants to SEE the page) don't need an automation session at all: emit `app.agent { "action": "navigate_url", "url": "<site url>" }` to open it in the user's real browser instead.
 2. **`dom.act`** — ONE on-page action per step (click, type, fill, submit, select, drag). A deterministic router picks the executor (just.type/meta.find/shortcut.keys/tab.map/gesture/arrow.grid/turn.loop) from live DOM state — you do NOT need to pick it.
    ```json
    { "skill": "dom.act", "args": { "task": "fill the To field with <recipient>", "agentId": "<service>.agent" }, "description": "Fill recipient" }
@@ -79,9 +80,9 @@ Use `browser.agent` ONLY for: `build_agent` (create a new agent descriptor), `ex
 
 Public research, public pages, downloads → `web.agent` / `web.crawl` / `shell.run curl` — no session needed. See the webfetch appendix. Escalate to `url.first.agent` only when `web.crawl` is bot-blocked or the task needs login/interaction.
 
-### Multi-agent plans (independent services)
+### Multi-agent and multi-destination plans
 
-Steps for different services each get their own `url.first.agent` step with that service's `agentId` — never reuse a URL across agents:
+Steps for different services each get their own `url.first.agent` step with that service's `agentId` — never reuse a URL across agents. Multiple destinations on the SAME agent (e.g., a doc, a calendar event, and a sheet — all `google.agent`) still get **one `url.first.agent` + its own action steps per destination** — the task's goals do not merge into one nav step:
 
 ```json
 [
@@ -90,6 +91,20 @@ Steps for different services each get their own `url.first.agent` step with that
   {"skill":"url.first.agent","args":{"agentId":"<service-b>.agent","task":"open <service-b>"},"description":"Open <service-b>"},
   {"skill":"dom.act","args":{"agentId":"<service-b>.agent","task":"<action-b>"},"description":"<action-b>"},
   {"skill":"synthesize","args":{"prompt":"Compare the results."},"description":"Compare"}
+]
+```
+
+**Multi-destination example** — "create a Doc titled X, add a calendar event for July 15 called Y, and a Sheet named Z with columns A, B, C":
+
+```json
+[
+  {"skill":"url.first.agent","args":{"agentId":"google.agent","task":"create a new Google Doc"},"description":"Navigate to new Doc"},
+  {"skill":"dom.act","args":{"agentId":"google.agent","task":"set the document title to X"},"description":"Set doc title"},
+  {"skill":"url.first.agent","args":{"agentId":"google.agent","task":"open Google Calendar new-event form"},"description":"Navigate to new event"},
+  {"skill":"dom.act","args":{"agentId":"google.agent","task":"fill the event — title Y, date July 15 — then save"},"description":"Fill and save event"},
+  {"skill":"url.first.agent","args":{"agentId":"google.agent","task":"create a new Google Sheet"},"description":"Navigate to new Sheet"},
+  {"skill":"dom.act","args":{"agentId":"google.agent","task":"rename the spreadsheet to Z and add column headers A, B, C"},"description":"Name sheet and add columns"},
+  {"skill":"synthesize","args":{"prompt":"Report what was created."},"description":"Report outcome"}
 ]
 ```
 

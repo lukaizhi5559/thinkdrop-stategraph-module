@@ -189,4 +189,27 @@ function parseLlmJson(text, logger, label = 'parseLlmJson') {
   return null;
 }
 
-module.exports = { parseLlmJson, _stripFences, _extractBalancedJson, _repairJson };
+/**
+ * parseNumberDecision — extract an LLM's numeric menu choice from a reply.
+ *
+ * `parseInt(raw.replace(/\D/g,''))` glued EVERY digit in the response into one
+ * number ("1\n\n…July 15th is missing a time…" → 115), silently swallowing the
+ * prose that followed the choice and failing open to whatever the caller's
+ * out-of-range default was (usually COMPLETE/PASS). Extract the FIRST
+ * standalone digit-run instead — prefer the first non-empty line (where a
+ * bare "1"/"2"/"3" answer lands), then the first digit-run anywhere.
+ */
+function parseNumberDecision(raw) {
+  const t = String(raw || '').trim();
+  if (!t) return NaN;
+  // A line containing ONLY the digit is the strongest signal (bare "1"/"2"/"3").
+  const bare = t.split(/\r?\n/).map(l => l.trim()).find(l => /^\d+$/.test(l));
+  if (bare !== undefined) return parseInt(bare, 10);
+  const firstLine = (t.split(/\r?\n/).find(l => l.trim().length > 0) || '').trim();
+  const lineMatch = firstLine.match(/\d+/);
+  if (lineMatch) return parseInt(lineMatch[0], 10);
+  const anyMatch = t.match(/\d+/);
+  return anyMatch ? parseInt(anyMatch[0], 10) : NaN;
+}
+
+module.exports = { parseLlmJson, parseNumberDecision, _stripFences, _extractBalancedJson, _repairJson };
