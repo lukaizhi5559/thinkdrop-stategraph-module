@@ -174,6 +174,8 @@ The deictic referent ("this", "this file", "this page", "it") is already resolve
 
 **NEVER** use placeholder text like `[<chatbot-service> response]` in step args. Use `{{synthesisAnswer}}` as the sole body content token.
 
+**NEVER invent parameter values.** Every concrete value in step `args`/`task`/`goal` (times, dates, names, titles, recipients, column lists) must come verbatim from the user's request or resolved context. If the user says "add an event on July 15th", the task is `...event on July 15th titled 'X'` — NOT `...at 8am` or any other guessed time. When a required value is missing, keep the step to what the user said (the executor applies the app's defaults) or emit `ask_user` — a guessed value creates an unverifiable step that cannot honestly succeed.
+
 ## Output Schema for synthesize steps
 
 When the user's request expects a specific answer type, include `outputSchema` in the FINAL synthesize step's `args`. The `type` field can be a single type string or an array of types for multi-part questions.

@@ -899,6 +899,30 @@ function _findPendingPlanFromList(items, maxAgeMinutes, logger) {
   return null;
 }
 
+/**
+ * Downgrade a plan file's frontmatter status to `failed` so the plan cache
+ * (which only auto-executes `status: complete` files) stops re-serving a plan
+ * that review found hollow or contradicted. A later honest success can still
+ * flip it back — executeCommand's status write covers pending→complete.
+ * @param {string} filePath — plan_*.md path
+ * @param {string} [reason] — logged context
+ * @param {object} [log] — optional logger
+ * @returns {boolean} true when the file was demoted
+ */
+function demotePlanFile(filePath, reason = '', log = null) {
+  if (!filePath) return false;
+  try {
+    const md = fs.readFileSync(filePath, 'utf8');
+    const updated = md.replace(/^(status:\s*)(complete|pending|running)(\s*)$/m, '$1failed$3');
+    if (updated === md) return false;
+    fs.writeFileSync(filePath, updated, 'utf8');
+    if (log && log.info) log.info(`[planCacheHelpers] Plan file demoted to failed (${reason || 'review rejected'}): ${filePath}`);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 module.exports = {
   SEMANTIC_SUGGEST_THRESHOLD,
   SLOT_AUTOEXECUTE_THRESHOLD,
@@ -928,4 +952,5 @@ module.exports = {
   domainsMatch,
   isCorrectionSignal,
   DOMAIN_ALIASES,
+  demotePlanFile,
 };

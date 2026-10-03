@@ -41,6 +41,7 @@ const fs = require('fs');
 const path = require('path');
 const { parseLlmJson, parseNumberDecision } = require('../utils/parseLlmJson');
 const { ATOMIC_BROWSER_SKILLS, hasBrowserMutationEvidence } = require('../utils/planHelpers');
+const { demotePlanFile } = require('../utils/planCacheHelpers');
 
 function loadReviewPrompt() {
   try {
@@ -693,6 +694,9 @@ module.exports = async function reviewExecution(state) {
               _correctedByReview: true,
             };
           }
+          // The plan's claimed work was contradicted by the page — demote the
+          // plan file so the cache (status:complete only) stops re-serving it.
+          demotePlanFile(state._skillPlanFile, 'answer contradicted by page text', logger);
           return {
             ...state,
             reviewVerdict: 'CORRECTED',
@@ -720,6 +724,10 @@ module.exports = async function reviewExecution(state) {
           _hollowResult: true,
         };
 
+        // A hollow plan must not stay cacheable — demote now. If the replan
+        // genuinely fixes the work, executeCommand flips status back to
+        // complete on completion.
+        demotePlanFile(state._skillPlanFile, `hollow: ${hollowReason}`, logger);
         logger.warn(`[Node:ReviewExecution] Hollow result (pass 1) — routing to recoverSkill for REPLAN: ${hollowReason}`);
         if (progressCallback) {
           progressCallback({
