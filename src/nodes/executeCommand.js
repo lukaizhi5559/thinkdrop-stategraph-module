@@ -1522,7 +1522,7 @@ module.exports = async function executeCommand(state) {
   // desync cursor and UI step indexes.
   if (skillCursor === 0) {
     const { lintFileEditPlan, lintAtomicBrowserPlan } = require('../utils/planHelpers');
-    const _linted = lintFileEditPlan(skillPlan, logger, { prompt: state.resolvedMessage || state.message });
+    const _linted = lintFileEditPlan(skillPlan, logger, { prompt: state.resolvedMessage || state.message, filePath: state._fileResolution?.path || null });
     if (_linted.rewrites.length > 0) skillPlan = _linted.plan;
     const _atomicLinted = lintAtomicBrowserPlan(skillPlan, logger, {});
     if (_atomicLinted.rewrites.length > 0) skillPlan = _atomicLinted.plan;
@@ -5839,6 +5839,9 @@ Please try again or search with different terms.`;
             stdout: raw?.stdout ?? null,
             draftPath: raw?.draftPath ?? null,
             filePath: raw?.filePath ?? null,
+            appliedEdits: raw?.appliedEdits ?? null,
+            missedEdits: raw?.missedEdits ?? null,
+            changed: raw?.changed ?? null,
             openIn: raw?.openIn ?? null,
             diff: raw?.diff ?? null,
             error: raw?.error ?? null,
@@ -7042,6 +7045,7 @@ Please try again or search with different terms.`;
       filePath: raw.filePath ?? null,
       backupPath: raw.backupPath ?? null,
       appliedEdits: raw.appliedEdits ?? null,
+      missedEdits: raw.missedEdits ?? null,
       draftPath: raw.draftPath ?? null,
       mode: raw.mode ?? null,
       changed: raw.changed ?? null,
@@ -8269,6 +8273,25 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       } else if (hasBrowserSteps && lastBrowserResult?.url) {
         const title = lastBrowserResult.title ? ` — "${lastBrowserResult.title}"` : '';
         lastStepAnswer = `Done! Browser is open at ${lastBrowserResult.url}${title}`;
+      } else if ([...updatedResults].reverse().find(r => r.skill === 'edit.agent' && r.ok)) {
+        // ── edit.agent completed — report the draft/write deterministically.
+        // MUST run before the shell.run fallback: earlier gather steps
+        // (folder listings, doc.read output) are not the run's outcome.
+        const _editRes = [...updatedResults].reverse().find(r => r.skill === 'edit.agent' && r.ok);
+        const _editName = (_editRes.filePath || _editRes.args?.filePath || 'the file').split('/').pop();
+        const _opsNote = _editRes.appliedEdits != null
+          ? ` (${_editRes.appliedEdits} edit${_editRes.appliedEdits !== 1 ? 's' : ''} applied${_editRes.missedEdits ? `, ${_editRes.missedEdits} missed — review the diff` : ''})`
+          : '';
+        if (_editRes.draftPath) {
+          lastStepAnswer = _editRes.changed === false
+            ? `No changes needed for ${_editName}.`
+            : `A draft of the requested edits has been created for ${_editName}${_opsNote} — the original is untouched. Review the diff below, then click Apply to write the changes.`;
+        } else {
+          lastStepAnswer = _editRes.changed === false
+            ? `No changes needed for ${_editName}.`
+            : `Updated ${_editName}${_opsNote}.`;
+        }
+        logger.info(`[Node:ExecuteCommand] isLastStep: using edit.agent result as answer (draft=${!!_editRes.draftPath})`);
       } else {
         // ── shell.run readable output: use stdout directly as the answer ─────────
         // When the last step is shell.run and stdout looks like human-readable content
@@ -8300,7 +8323,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
                   {
                     query: originalPrompt,
                     context: {
-                      systemInstructions: `You are a helpful assistant. The user asked: "${originalPrompt}"\n\nBelow is the terminal output. Summarize the key information concisely. Do not repeat everything verbatim.`,
+                      systemInstructions: `You are a helpful assistant. The user asked: "${originalPrompt}"\n\nBelow is the terminal output of an automation step that has ALREADY run successfully on the user's machine. Summarize the key information concisely as it relates to their request. Do not repeat everything verbatim. IMPORTANT: never claim you cannot access, read, or edit files, or that the task cannot be performed — the step already ran; just report what the output shows.`,
                       conversationHistory: [],
                       intent: 'command_automate',
                     },
@@ -8309,7 +8332,10 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
                   { maxTokens: 400, temperature: 0.2, taskType: 'complex' },
                   null
                 ).catch(() => null);
-                lastStepAnswer = (summarized && summarized.trim()) ? summarized.trim() : out.slice(0, 4000);
+                // Refusal guard — an LLM "I cannot access files…" is wrong here;
+                // the step already ran. Fall back to raw output.
+                const _isRefusal = summarized && /\b(cannot|can't|unable to)\b[^.]{0,80}\b(access|read|edit|modify|view|open)\b[^.]{0,50}\b(file|folder|computer|system|device)\b|I (cannot|can't|unable to) (access|assist|complete|perform)/i.test(summarized);
+                lastStepAnswer = (summarized && summarized.trim() && !_isRefusal) ? summarized.trim() : out.slice(0, 4000);
               } catch (_) {
                 lastStepAnswer = out.slice(0, 4000);
               }

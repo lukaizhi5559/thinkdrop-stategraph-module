@@ -18,7 +18,7 @@ const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
 
-const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan, lintAtomicBrowserPlan, CONFIRM_ONLY_RE } = require('../utils/planHelpers');
+const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan, lintAtomicBrowserPlan, CONFIRM_ONLY_RE, FILE_EDIT_INTENT_RE, getAttachedFilePaths } = require('../utils/planHelpers');
 const { SITE_SEARCH_URLS } = require('../utils/localPlanTemplates');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
@@ -2799,7 +2799,14 @@ The user's request does NOT match any installed skill.
   // queries the planner may generate a synthesize-only plan relying on stale
   // conversation history. Force it to always include a shell.run step.
   const _SYSTEM_INFO_KEYWORDS = /\b(disk\s+(storage|space|capacity|usage|info)|memory|ram|cpu|processor|battery|power\s+level|os\s+version|macos\s+version|running\s+processes|display\s+info|screen\s+resolution|usb\s+devices|audio\s+info|sound\s+(card|device))\b/i;
-  const _isSystemInfoQuery = _SYSTEM_INFO_KEYWORDS.test(userMessage || '');
+  // Strip attachment tags + resolved-path notes before the keyword test — a
+  // filename like "kids-weekly-memory-verse.rtf" must not count as a
+  // system-info query ("memory" matched and forced a shell.run→synthesize
+  // plan on a file-edit request).
+  const _deTaggedMsg = String(userMessage || '')
+    .replace(/\[(?:File|Folder|Highlighted|Context|Thought):[^\]]*\]/gi, '')
+    .replace(/\[\s*Resolved file path:[^\]]*\]/gi, '');
+  const _isSystemInfoQuery = _SYSTEM_INFO_KEYWORDS.test(_deTaggedMsg);
   const _systemInfoFreshDataNote = _isSystemInfoQuery
     ? `\n\n⚠️ SYSTEM INFO QUERY — FRESH DATA REQUIRED:\nThis is a system/hardware information query (disk, memory, CPU, battery, etc.).\nSystem info is time-sensitive — ALWAYS include a shell.run step to get CURRENT data, even on follow-up queries.\nDo NOT generate a synthesize-only plan that relies on prior conversation context — the data may be stale.\nRequired plan structure: [shell.run (get system info) → synthesize (summarize for user)]`
     : '';
@@ -2816,6 +2823,19 @@ The user's request does NOT match any installed skill.
   if (_webMode === 'public_read' || _webMode === 'download') {
     _publicWebConstraint = `\n\n⚠️ HARD CONSTRAINT — PUBLIC WEB TASK (webAccessMode=${_webMode}):\nThis task has been classified as a PUBLIC web task. You MUST NOT use \`browser.agent\`.\n- For named-site listing/search ("search <site> for X", "show pics of X on <site>", "find X for sale on <site>"): Use \`web.agent { action: "site_search", domain: "<domain>", query: "<user's search terms>" }\` → \`web.crawl { url: "{{bestUrl}}", extractItems: true }\` → \`synthesize\`. site_search resolves directly to the site's search-results URL (e.g. amazon.com/s?k=…) so the crawl lands on the SERP, not a single product page.\n- For public_read: Use \`web.agent { action: "search_and_navigate", query: "<query> site:<domain>", preferDomain: "<domain>" }\` → \`synthesize\`. If full page text is needed, add \`web.crawl { url: "{{bestUrl}}" }\` before synthesize.\n- For download: Use \`web.agent { action: "find_download", query: "<query>", fileExt: "<ext>" }\` → \`shell.run curl -sL -o <dest> {{bestUrl}}\` → \`shell.run file <dest>\` → \`synthesize\`.\nNaming a website (e.g. amazon, youtube, wikipedia) does NOT require browser.agent — only login/forms/cart/account actions do.\n`;
     logger.info(`[Node:PlanSkillsV2] Injecting public-web hard constraint (webAccessMode=${_webMode})`);
+  }
+
+  // ── File-edit hard constraint — a prompt that attaches a file and asks to
+  // modify it MUST produce an edit.agent step. A read+synthesize plan only
+  // describes the change and leaves the file untouched. Injected last before
+  // the user request (recency bias) so it overrides weaker upstream guidance.
+  let _fileEditConstraint = '';
+  const _attachedEditFile = (_fileRes && (_fileRes.status === 'exact' || _fileRes.status === 'fuzzy') && _fileRes.path)
+    ? _fileRes.path
+    : (getAttachedFilePaths(userMessage)[0]?.resolved || null);
+  if (_attachedEditFile && FILE_EDIT_INTENT_RE.test(_deTaggedMsg)) {
+    _fileEditConstraint = `\n\n⚠️ HARD CONSTRAINT — FILE EDIT TASK:\nThe user attached "${_attachedEditFile}" and asked to modify it. The plan MUST include an edit.agent step:\n{ "skill": "edit.agent", "args": { "goal": "<what to change, including the user's wording>", "filePath": "${_attachedEditFile}", "mode": "draft" } }\nGather steps (doc.read / fs.read / shell.run listings of related folders) MAY precede it — carry their output into the edit via {{PREV_OUTPUT}} in the goal. doc.read + synthesize alone does NOT satisfy an edit request — it only describes the change and leaves the file untouched. The draft + diff is the deliverable.`;
+    logger.info(`[Node:PlanSkillsV2] File-edit constraint injected (file=${_attachedEditFile})`);
   }
 
   const planningQuery = [
@@ -2842,6 +2862,7 @@ The user's request does NOT match any installed skill.
     parallelNote,
     _systemInfoFreshDataNote,
     _publicWebConstraint,
+    _fileEditConstraint,
     `\n\nUser request: "${(runtimeParamMessage || userMessage).replace(/"/g, '\\"').slice(0, 2000)}"`,
   ].filter(Boolean).join('\n');
 
@@ -3206,7 +3227,7 @@ The user's request does NOT match any installed skill.
   // file" rule the LLM keeps ignoring: rewrite those steps to edit.agent and
   // drop trailing confirm-only synthesize steps that confabulate write status.
   if (Array.isArray(skillPlan)) {
-    const _linted = lintFileEditPlan(skillPlan, logger, { prompt: userMessage });
+    const _linted = lintFileEditPlan(skillPlan, logger, { prompt: userMessage, filePath: _fileRes?.path || null });
     if (_linted.rewrites.length > 0) {
       logger.warn(`[Node:PlanSkillsV2] File-edit lint applied ${_linted.rewrites.length} fix(es)`);
       skillPlan = _linted.plan;

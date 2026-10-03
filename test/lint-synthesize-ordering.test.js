@@ -139,10 +139,12 @@ check('null message → empty', Array.isArray(prot) && prot.length === 0);
     JSON.stringify(collapsed));
   check('collapse rewrite recorded', rw1.some(r => r.kind === 'app.agent-keystroke-edit→edit.agent'));
 
-  // Benign app.agent navigation (no mutation) → untouched.
+  // Benign app.agent navigation (no mutation) → the step is kept; the
+  // file-edit backstop still appends edit.agent because the prompt asks to
+  // "Update" an attached file and no edit step exists.
   const navPlan = [{ skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'TextEdit', shortcutOverride: 'Cmd+F', searchText: 'x' } }];
   const { plan: nav } = lintFileEditPlan(navPlan, logger, { prompt });
-  check('non-mutating app.agent steps pass through', nav.length === 1 && nav[0].skill === 'app.agent');
+  check('non-mutating app.agent steps pass through', nav.length === 2 && nav[0].skill === 'app.agent' && nav[1].skill === 'edit.agent', JSON.stringify(nav.map(s => s.skill)));
 
   // Mixed plan (non-file step present) → flagged steps dropped, others kept.
   const mixedPlan = [
@@ -150,8 +152,9 @@ check('null message → empty', Array.isArray(prot) && prot.length === 0);
     { skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'TextEdit', shortcutOverride: 'Cmd+V' } },
   ];
   const { plan: mixed, rewrites: rw2 } = lintFileEditPlan(mixedPlan, logger, { prompt });
-  check('mixed plan drops flagged app.agent step', mixed.length === 1 && mixed[0].skill === 'shell.run'
-    && rw2.some(r => r.kind === 'drop-app.agent-keystroke-edit'), JSON.stringify(mixed));
+  check('mixed plan drops flagged app.agent step', mixed.length === 2 && mixed[0].skill === 'shell.run' && mixed[1].skill === 'edit.agent'
+    && rw2.some(r => r.kind === 'drop-app.agent-keystroke-edit')
+    && rw2.some(r => r.kind === 'append-edit.agent'), JSON.stringify(mixed));
 
   // type_text is a mutation too.
   const typePlan = [

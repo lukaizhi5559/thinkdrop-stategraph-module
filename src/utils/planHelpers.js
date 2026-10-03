@@ -252,6 +252,41 @@ function getProtectedPaths(message) {
   return out;
 }
 
+// Semantic-edit verbs — when a prompt carries one of these alongside an
+// attached file, the plan is a file-edit job and MUST include an edit.agent
+// step. Exported for planSkillsV2's hard-constraint injection.
+const FILE_EDIT_INTENT_RE = /\b(?:update|edit|change|modify|remove|rewrite|rephrase|reword|restructure|reorganize|re-organize|replace|append|insert|fix|correct|translate|annotate|sort|format|clean\s*up)\b/i;
+
+// "delete the file" is a filesystem op, not an edit — edit.agent refuses it.
+const _FILE_DELETE_RE = /\bdelete\s+(?:this|the|that|my)\s+file\b/i;
+
+const _FILE_TAG_RE = /\[File:\s*([^\]]+)\]/gi;
+
+/**
+ * Attached regular files the user handed to this run (File-tag only — folders
+ * are inputs, not edit targets). Returns [{ original, resolved }] like
+ * getProtectedPaths.
+ */
+function getAttachedFilePaths(message) {
+  if (!message || typeof message !== 'string') return [];
+  const out = [];
+  const seen = new Set();
+  for (const m of message.matchAll(_FILE_TAG_RE)) {
+    const original = _expandHomeDir(m[1].trim().replace(/^['"]|['"]$/g, ''));
+    if (!original || seen.has(original)) continue;
+    seen.add(original);
+    let resolved = original;
+    try {
+      resolved = fs.realpathSync(original);
+      if (!fs.statSync(resolved).isFile()) continue;
+    } catch (_) {
+      continue;
+    }
+    out.push({ original, resolved });
+  }
+  return out;
+}
+
 // app.agent actions/shortcuts that mutate document content. Keystroke-edit
 // plans (Cmd+F → Cmd+C → Cmd+V …) bypass every file-edit rail and can pollute
 // the user's live document — a real recovery replan once did exactly that.
@@ -347,6 +382,32 @@ function _lintFileEditPlan(plan, logger, ctx = {}) {
       && _CONFIRM_ONLY_RE.test(String(last.args.prompt))) {
     rewrites.push({ index: steps.length - 1, kind: 'drop-confirm-step' });
     steps = steps.slice(0, -1);
+  }
+
+  // ── Missing-edit backstop ──────────────────────────────────────────────
+  // A prompt that attaches a regular file AND asks to modify it must contain
+  // an edit.agent step — a doc.read/fs.read → synthesize plan that merely
+  // describes the new content is a failed edit (observed: "update this file"
+  // planned as doc.read → shell.run → synthesize, file untouched). Appended
+  // LAST so preceding gather steps (reads, folder listings, synthesized
+  // content) flow into the goal via {{PREV_OUTPUT}}.
+  const _attachedFiles = getAttachedFilePaths(ctx.prompt || '');
+  const _editHaystack = String(ctx.prompt || '')
+    .replace(_ATTACH_TAG_RE, '')
+    .replace(/\[\s*Resolved file path:[^\]]*\]/gi, '');
+  if (_attachedFiles.length > 0
+      && FILE_EDIT_INTENT_RE.test(_editHaystack)
+      && !_FILE_DELETE_RE.test(_editHaystack)
+      && !steps.some(s => s?.skill === 'edit.agent')) {
+    const target = ctx.filePath || _attachedFiles[0].resolved;
+    const baseGoal = _editHaystack.replace(/\s+/g, ' ').trim() || `Edit ${path.basename(target)}`;
+    const goal = steps.length > 0 ? `${baseGoal}\n{{PREV_OUTPUT}}` : baseGoal;
+    rewrites.push({ index: steps.length, kind: 'append-edit.agent', filePath: target });
+    steps = [...steps, {
+      skill: 'edit.agent',
+      args: { goal, filePath: target, mode: 'draft' },
+      description: `Edit ${path.basename(target)}`,
+    }];
   }
 
   if (rewrites.length && logger) {
@@ -536,4 +597,4 @@ function hasBrowserMutationEvidence(results) {
   });
 }
 
-module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths, CONFIRM_ONLY_RE: _CONFIRM_ONLY_RE, lintAtomicBrowserPlan, hasMutationResidue, hasBrowserMutationEvidence, _isActionCapableBrowserStep, ATOMIC_BROWSER_SKILLS: _BROWSER_LANE_SKILLS };
+module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths, getAttachedFilePaths, FILE_EDIT_INTENT_RE, CONFIRM_ONLY_RE: _CONFIRM_ONLY_RE, lintAtomicBrowserPlan, hasMutationResidue, hasBrowserMutationEvidence, _isActionCapableBrowserStep, ATOMIC_BROWSER_SKILLS: _BROWSER_LANE_SKILLS };

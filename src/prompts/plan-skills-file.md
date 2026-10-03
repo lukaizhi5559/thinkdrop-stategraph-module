@@ -26,3 +26,18 @@ A local file is attached or resolved for this task. These rules override any con
 ### Plan shape for a file edit
 
 Single step: `[{ "skill": "edit.agent", "args": { "goal": "<what to change, naming the target>", "filePath": "<resolved path>", "mode": "draft" } }]`. One edit.agent call handles locating, editing, and drafting — do not split into read → transform → write steps.
+
+**Verbs like "update", "remove", "change", "edit", "replace", "fix" on an attached file REQUIRE an edit.agent step.** A plan that only reads the file and answers with new content (doc.read → synthesize) leaves the file untouched — that is a failed plan, not a summary.
+
+**Generative edits** (choose new content — e.g. "pick a new verse for each kid", "update the songs from the worship folder") may gather inputs first, but MUST still end with edit.agent:
+
+```json
+[
+  { "skill": "doc.read", "args": { "filePath": "<attached file>" }, "description": "Read current file contents" },
+  { "skill": "shell.run", "args": { "goal": "List files in <input folder>" }, "description": "List available inputs" },
+  { "skill": "synthesize", "args": { "prompt": "Compose the new content from {{PREV_OUTPUT}} context" }, "description": "Compose new content" },
+  { "skill": "edit.agent", "args": { "goal": "<the request>\n{{PREV_OUTPUT}}", "filePath": "<attached file>", "mode": "draft" }, "description": "Edit the file" }
+]
+```
+
+`.doc`/`.rtf` drafts are produced as `.docx` — clicking Apply in the UI converts back to the original format automatically.

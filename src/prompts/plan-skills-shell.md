@@ -89,7 +89,7 @@ For deterministic window management, prefer `shell.run` osascript over `app.agen
 ]
 ```
 
-**Simple file edits via shell (NOT edit.agent):** For simple string/pattern edits (replace X with Y, delete lines, append), use `sed`/`python3 -c` — deterministic, no LLM cost. `edit.agent` is only for semantic/structural edits (refactor, add section, fix bug). See "Python-First for File Operations" below.
+**Simple file edits via shell (NOT edit.agent):** For simple string/pattern edits (replace X with Y, delete lines, append) on NON-ATTACHED files, use `sed`/`python3 -c` — deterministic, no LLM cost. `edit.agent` is only for semantic/structural edits (refactor, add section, fix bug). Exception: files attached by the user (`[File: …]` tags or preflight-resolved paths) are kernel-protected — ALL writes to them must go through `edit.agent`, even simple replacements; shell writes are denied by sandbox-exec. See "Python-First for File Operations" below.
 
 ## Python-First for File Operations
 

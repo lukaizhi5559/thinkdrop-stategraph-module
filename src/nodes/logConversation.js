@@ -282,6 +282,32 @@ module.exports = async function logConversation(state) {
       const _isRecoveryTurn = !!(state.recoveryAction || state.recoveryQuestion ||
                                  state._isAgentAskUser || state.askUser);
       const _assistantRole = _isRecoveryTurn ? 'system' : 'assistant';
+      // Run artifacts persisted on the message so history-reloaded feed
+      // entries can re-render file links, draft chips, and step counts
+      // (mapHistoryMessage reads metadata.artifacts). Compact caps keep the
+      // row small — conversation-service rejects oversized payloads anyway.
+      const _artifacts = (() => {
+        const results = Array.isArray(state.skillResults) ? state.skillResults : [];
+        const steps = results.filter(r => r && typeof r === 'object').map(r => ({
+          title: r.description || r.skill || 'Step',
+          status: r.skipped ? 'skipped' : r.ok === false ? 'failed' : 'done',
+          skill: r.skill || undefined,
+          output: String(r.error || r.stdout || '').trim().slice(0, 1500) || undefined,
+          savedFilePath: r.savedFilePath || undefined,
+          draftPath: r.draftPath || undefined,
+          openIn: Array.isArray(r.openIn) ? r.openIn : undefined,
+          diff: typeof r.diff === 'string' ? r.diff.slice(0, 4000) : undefined,
+        }));
+        const savedFilePaths = [...(state.savedFilePaths || [])].filter(Boolean);
+        const drafts = results.filter(r => r?.draftPath).map(r => ({
+          draftPath: r.draftPath,
+          filePath: r.filePath || r.args?.filePath || null,
+          openIn: r.openIn || [],
+          diff: typeof r.diff === 'string' ? r.diff.slice(0, 4000) : null,
+        }));
+        if (steps.length === 0 && savedFilePaths.length === 0 && drafts.length === 0) return undefined;
+        return { steps, savedFilePaths, drafts };
+      })();
       logPromises.push(
         mcpAdapter.callService('conversation', 'message.add', {
           sessionId,
@@ -295,6 +321,7 @@ module.exports = async function logConversation(state) {
             // deep-link (mapHistoryMessage reads metadata.taskId). Only
             // handoff tasks carry _handoffTaskId — quick replies have none.
             taskId: state._handoffTaskId || null,
+            artifacts: _artifacts,
             timestamp: new Date().toISOString()
           }
         }).catch(err => {
