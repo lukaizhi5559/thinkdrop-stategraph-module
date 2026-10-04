@@ -812,6 +812,58 @@ module.exports = async function resolveReferencesV2(state) {
     }
   }
 
+  // ── Prior browser turn promotion ──────────────────────────────────────────
+  // main.js caches the previous browser task's execution metadata as
+  // state.priorBrowserContext {sessionId, url, serviceKey, skills, at}. When the
+  // classifier says this prompt is a follow-up about that page/service, promote
+  // it into activeBrowserSessionId/activeBrowserUrl so the planner sees the live
+  // session (no fresh url.first nav) and exec inherits the sessionId.
+  // Promotion requires a COMPATIBLE follow-up — never promote on the bare flag:
+  //   · activeDocRef='url' + live URL host == prior host   (the page is the session's)
+  //   · isFollowUp + targetService matches prior service    ("now add Y to my cart")
+  //   · isFollowUp + browser signals, no targetService      (generic page action)
+  // Veto: targetService names a DIFFERENT service ("now check my gmail" after
+  // amazon → fresh session must plan normally).
+  const _priorBrowser = state.priorBrowserContext || null;
+  if (_priorBrowser && _priorBrowser.sessionId && !state.activeBrowserSessionId) {
+    const _hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } };
+    const _priorHost = _hostOf(_priorBrowser.url);
+    const _liveHost = _hostOf(_taskClassification.activeDocTarget || _priorScreenContext?.url);
+    const _priorService = String(_priorBrowser.serviceKey
+      || _priorBrowser.agentId
+      || String(_priorBrowser.sessionId).replace(/_agent$/, '')).toLowerCase();
+    const _targetService = String(_taskClassification.targetService || '').toLowerCase() || null;
+    const _serviceMatches = _targetService && _priorService
+      && (_targetService.includes(_priorService) || _priorService.includes(_targetService));
+    let _promote = null;
+    if (_taskClassification.activeDocRef === 'url' && _liveHost && _priorHost && _liveHost === _priorHost) {
+      _promote = 'doc-ref:same-host';
+    } else if (_taskClassification.isFollowUp && _serviceMatches) {
+      _promote = 'follow-up:same-service';
+    } else if (_taskClassification.isFollowUp && !_targetService &&
+        (_taskClassification.taskType === 'browser' || _taskClassification.requiresDOM
+         || _taskClassification.webAccessMode === 'interactive'
+         || (Array.isArray(_taskClassification.interactiveActions) && _taskClassification.interactiveActions.length > 0))) {
+      _promote = 'follow-up:browser-signal';
+    } else if (_taskClassification.isFollowUp && _taskClassification.activeDocRef === 'url'
+        && !_targetService && (!_liveHost || _liveHost === _priorHost)) {
+      // "this page" referent on a follow-up where the live app isn't the
+      // automation window (or has no readable URL) — the referent is the
+      // session's page.
+      _promote = 'follow-up:doc-ref';
+    }
+    // Veto: a named different service — the follow-up targets a new destination.
+    if (_promote && _targetService && _priorService && !_serviceMatches) {
+      logger.info(`[Node:ResolveReferencesV2] prior browser turn NOT promoted — targetService="${_targetService}" ≠ prior "${_priorService}"`);
+      _promote = null;
+    }
+    if (_promote) {
+      state.activeBrowserSessionId = _priorBrowser.sessionId;
+      if (_priorBrowser.url) state.activeBrowserUrl = _priorBrowser.url;
+      logger.info(`[Node:ResolveReferencesV2] prior browser turn promoted (${_promote}): session=${_priorBrowser.sessionId} url=${String(_priorBrowser.url || '').slice(0, 60)}`);
+    }
+  }
+
   // ── Validate classifier-resolved file paths ──────────────────────────────────
   // The classifier can hallucinate paths from chat history (e.g. a screenshot
   // timestamp that doesn't correspond to any real file). fs.existsSync-check any

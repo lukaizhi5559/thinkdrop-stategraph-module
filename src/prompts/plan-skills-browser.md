@@ -11,11 +11,12 @@ Interactive browser tasks decompose into **one step per tier** — the plan is t
    { "skill": "url.first.agent", "args": { "agentId": "<service>.agent", "task": "go to <service> <section>" }, "description": "Navigate to <service>" }
    ```
    **Display-only requests** ("open gmail", "go to calendar", "show me amazon" — the user just wants to SEE the page) don't need an automation session at all: emit `app.agent { "action": "navigate_url", "url": "<site url>" }` to open it in the user's real browser instead.
-2. **`dom.act`** — ONE on-page action per step (click, type, fill, submit, select, drag). A deterministic router picks the executor (just.type/meta.find/shortcut.keys/tab.map/gesture/arrow.grid/turn.loop) from live DOM state — you do NOT need to pick it.
+2. **`dom.act`** — ONE on-page action per step (click, type, fill, submit, select, drag, scroll, keypress). A deterministic router picks the executor (just.type/meta.find/shortcut.keys/tab.map/gesture/arrow.grid/turn.loop) from live DOM state — you do NOT need to pick it.
    ```json
    { "skill": "dom.act", "args": { "task": "fill the To field with <recipient>", "agentId": "<service>.agent" }, "description": "Fill recipient" }
    ```
-   - `agentHint` (optional): only when you KNOW the right executor — `"shortcut.keys.agent"` for apps with known hotkeys (Calendar `c`, Slack `Cmd+K`), `"turn.loop.agent"` for dense product/commerce pages (Amazon/eBay grids).
+   - `agentHint` (optional): only when you KNOW the right executor — `"shortcut.keys.agent"` for apps with known hotkeys (Calendar `c`, Slack `Cmd+K`), `"turn.loop.agent"` for dense product/commerce pages (Amazon/eBay grids) and multi-step sequences, `"tab.map.agent"` for multi-field forms/dialogs (fill several fields then submit), `"just.type.agent"` for a focused single-field type or a lone keypress/scroll goal.
+   - `pageCategory` (optional): the site class when known — `ai_chat` (ChatGPT/Claude/Gemini), `email_compose` (Gmail/Outlook compose), `shopping`, `search_engine`, `spreadsheet`, `social_feed`, `messaging`. The runtime re-derives it from the URL anyway — emit it only when you know it.
 3. **`turn.loop.agent { mode:'verify' }`** — confirm a result holds without mutating ("confirm the email was sent", "check the item is in the cart"). Observes only.
    ```json
    { "skill": "turn.loop.agent", "args": { "goal": "confirm the email to <recipient> was sent", "mode": "verify" }, "description": "Confirm email sent" }
@@ -23,6 +24,8 @@ Interactive browser tasks decompose into **one step per tier** — the plan is t
 4. **`synthesize`** — summarize for the user.
 
 Consecutive steps reuse the same browser session automatically — no `sessionId` needed, no `synthesize` between browser steps.
+
+**Live-session continuation:** when a `## ACTIVE BROWSER SESSION` note is present, that session's page is already open. Follow-up goals on it ("scroll down", "click that one", "add the next item to my cart", "what does this page say") are `dom.act`/`turn.loop.agent` (or `browser.act getPageText` for reads) — do NOT emit `url.first.agent` to go back to the same site.
 
 ### Canonical examples
 

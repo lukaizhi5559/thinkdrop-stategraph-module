@@ -302,3 +302,34 @@ describe('service_browse (read-only service lane)', () => {
     assert.equal(hit.skillPlan[0].args.service, 'linkedin');
   });
 });
+
+// Action verbs must not hijack the READ templates — a follow-up like "scroll
+// to the bottom of this page" produces activeDocRef:'url' but is an on-page
+// action (dom.act lane), not a scan_page read of the open browser.
+describe('page_scan / page_print action-verb guard', () => {
+  it('rejects "scroll to the bottom of this page"', async () => {
+    const hit = await _hit('scroll to the bottom of this page', _json(17, {}), { activeDocRef: 'url' });
+    assert.equal(hit, null);
+  });
+
+  it('rejects "click the next item on this page"', async () => {
+    const hit = await _hit('click the next item on this page', _json(17, {}), { activeDocRef: 'url' });
+    assert.equal(hit, null);
+  });
+
+  it('rejects the same action goal for page_print (n:18)', async () => {
+    const hit = await _hit('scroll to the bottom of this page', _json(18, {}), { activeDocRef: 'url' });
+    assert.equal(hit, null);
+  });
+
+  it('still accepts a genuine page read', async () => {
+    const hit = await _hit('what does this page say?', _json(17, {}), { activeDocRef: 'url' });
+    assert.equal(hit.template, 'page_scan');
+    assert.equal(hit.skillPlan[0].skill, 'app.agent');
+  });
+
+  it('still accepts a genuine print request', async () => {
+    const hit = await _hit('print this page', _json(18, {}), { activeDocRef: 'url' });
+    assert.equal(hit.template, 'page_print');
+  });
+});

@@ -1081,7 +1081,11 @@ function _buildSystemPrompt(userMessage, state) {
     // taskType:messaging/productivity — not 'browser' — but still need the
     // atomic browser skills vocabulary (url.first/dom.act/turn.loop).
     || _tc?.webAccessMode === 'interactive'
-    || (Array.isArray(_tc?.interactiveActions) && _tc.interactiveActions.length > 0);
+    || (Array.isArray(_tc?.interactiveActions) && _tc.interactiveActions.length > 0)
+    // A live automation session means follow-ups ("scroll down", "add that one")
+    // are on-page actions — the planner needs the atomic vocabulary even when
+    // the classifier emitted a bare local_system/app-shaped classification.
+    || !!state.activeBrowserSessionId;
 
   // Public web tasks (download a file / read public info) get the light-weight
   // webfetch appendix — web.agent + web.crawl + curl patterns, no browser.agent.
@@ -1284,7 +1288,10 @@ function _buildSystemPrompt(userMessage, state) {
   // the LLM to copy the browser.agent pattern instead of using web.agent.
   const _isPublicWebMode = ['download', 'public_read'].includes(_tc?.webAccessMode);
   if (!_isPublicWebMode) {
-  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit"). Optional \`agentHint\` (emit when intent is clear): \`"tab.map.agent"\` (default — click/type/fill and navigate-and-extract goals like "search the page for X" or "read the results"), \`"just.type.agent"\` (single-field typing into a focused input), \`"meta.find.agent"\` (locate text on page), \`"shortcut.keys.agent"\` (ONLY when the goal literally asks to press a documented app hotkey — e.g. Gmail 'c' to compose, '/' to search. NOT for create/open/new goals or content searches), \`"turn.loop.agent"\` (dense commerce grid or multi-step goals), \`"gesture.agent"\` (drag/slider/swipe), \`"arrow.grid.agent"\` (spreadsheet cells).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction. Emit ONLY for silent-failure mutations whose outcome isn't provable from step results (add-to-cart, checkout, purchase, submit, send, post, delete). Do NOT emit for create/navigate/read flows — url.first's landed URL and dom.act's result already prove the outcome; synthesize confirms from step results.\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nCRITICAL: EVERY browser step for a service must carry that service's \`args.agentId\` — including \`turn.loop.agent\` verify steps. Steps without agentId run in a parallel lane with no browser session.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "agentId": "amazon.agent", "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
+    if (state.activeBrowserSessionId) {
+      result += `\n\n## ACTIVE BROWSER SESSION\n\nA browser automation session is already open${state.activeBrowserUrl ? ` at ${state.activeBrowserUrl}` : ''} (sessionId: "${state.activeBrowserSessionId}"). If this request continues work on that page — scrolling, clicking, typing, adding another item, reading it — emit ONLY \`dom.act\`/\`turn.loop.agent\` steps with args.sessionId "${state.activeBrowserSessionId}". Do NOT emit \`url.first.agent\` unless the user asks for a NEW site/destination — re-navigating disrupts the live session.\n\nFor page READS on that open page, emit \`browser.act\` { action: "getPageText", sessionId: "${state.activeBrowserSessionId}" } — NOT \`app.agent\` scan_page (OS-level clipboard copy cannot read the automation window).`;
+    }
+  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects/scrolls on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit", "scroll to the bottom"). Optional \`agentHint\` (emit when intent is clear): \`"tab.map.agent"\` (multi-field forms and dialogs/overlays — fill several fields then submit; navigate-and-extract goals like "search the page for X" or "read the results"), \`"just.type.agent"\` (single-field typing into a focused or autofocused input — AI chat prompts, search bars — and single keypress/scroll goals like "press Enter" or "scroll to the bottom"), \`"meta.find.agent"\` (locate/click specific named text on the page — e.g. a named conversation in a chat-history list), \`"shortcut.keys.agent"\` (ONLY when the goal literally asks to press a documented app hotkey — e.g. Gmail 'c' to compose, '/' to search. NOT for create/open/new goals or content searches), \`"turn.loop.agent"\` (dense commerce grids, multi-step action sequences, or typing when no input is focused), \`"gesture.agent"\` (drag/slider/swipe), \`"arrow.grid.agent"\` (spreadsheet cells). Emit \`args.pageCategory\` on dom.act steps when the site class is known (\`ai_chat\`, \`email_compose\`, \`shopping\`, \`spreadsheet\`, \`search_engine\`, \`social_feed\`, \`messaging\` — else omit).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction. Emit ONLY for silent-failure mutations whose outcome isn't provable from step results (add-to-cart, checkout, purchase, submit, send, post, delete). Do NOT emit for create/navigate/read flows — url.first's landed URL and dom.act's result already prove the outcome; synthesize confirms from step results.\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nCRITICAL: EVERY browser step for a service must carry that service's \`args.agentId\` — including \`turn.loop.agent\` verify steps. Steps without agentId run in a parallel lane with no browser session.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "agentId": "amazon.agent", "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n`;
 
     // ── Commerce routing note ──────────────────────────────────────────────
     // For Amazon/eBay/Etsy add-to-cart, checkout, filter, or sort tasks,
@@ -3450,6 +3457,80 @@ The user's request does NOT match any installed skill.
         }
       }
     }
+  }
+
+  // ── Active browser session — atomic lane ──────────────────────────────────
+  // The block above covers legacy browser.act; this one handles the atomic
+  // skills (url.first.agent / dom.act / turn.loop.agent / app.agent reads):
+  //   · url.first.agent for the SAME service the session owns → strip (the
+  //     page is already open; re-navigating disrupts it) — kept when the
+  //     message names a different destination (explicit URL or other service).
+  //   · Atomic steps missing sessionId → stamped with the live session.
+  //   · app.agent scan_page reads of the session's page → browser.act
+  //     getPageText (OS-level Cmd+A/C can't focus the automation window).
+  if (effectiveSessionId && Array.isArray(skillPlan)) {
+    const _sessService = String(effectiveSessionId).replace(/_agent$/, '').toLowerCase();
+    const _hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } };
+    const _sessHost = _hostOf(state.activeBrowserUrl);
+    // New-destination signal: explicit URL to a different host, or the message
+    // names a different registered service ("now check my gmail").
+    const _newDestination = (() => {
+      try {
+        const m = String(userMessage || '').match(/https?:\/\/[^\s"'`<>\]]+/i);
+        if (m) {
+          const h = _hostOf(m[0]);
+          if (h && _sessHost && h !== _sessHost) return true;
+        }
+      } catch (_) {}
+      for (const svc of Object.keys(_registeredAgentServiceMap || {})) {
+        const s = String(svc).toLowerCase();
+        if (s && s !== _sessService && new RegExp(`\\b${s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(userMessage || '')) return true;
+      }
+      return false;
+    })();
+
+    if (!_newDestination) {
+      skillPlan = skillPlan.filter(s => {
+        if (s.skill !== 'url.first.agent') return true;
+        const stepService = String(s.args?.agentId || '').replace(/\.agent$/, '').toLowerCase();
+        if (_sessService && _sessService !== 'browser' && stepService === _sessService) {
+          logger.info(`[Node:PlanSkillsV2] Reused live session "${effectiveSessionId}" — stripped url.first.agent ("${String(s.description || s.args?.task || '').slice(0, 60)}")`);
+          return false;
+        }
+        return true;
+      });
+    }
+
+    const _ATOMIC_SESS = new Set(['dom.act', 'turn.loop.agent', 'tab.map.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'gesture.agent', 'arrow.grid.agent']);
+    skillPlan = skillPlan.map(s => (_ATOMIC_SESS.has(s.skill) && s.args && !s.args.sessionId)
+      ? { ...s, args: { ...s.args, sessionId: effectiveSessionId } } : s);
+
+    // Page read on the session's page → in-process getPageText, not OS copy.
+    const _liveHost = _hostOf(state._priorScreenContext?.url);
+    const _readsSessionPage = (_liveHost && _sessHost && _liveHost === _sessHost)
+      || (!_liveHost && state._taskClassification?.isFollowUp);
+    if (_readsSessionPage) {
+      skillPlan = skillPlan.map(s =>
+        (s.skill === 'app.agent' && (s.args?.action === 'scan_page' || s.args?.action === 'read_screen'))
+          ? { ...s, skill: 'browser.act', args: { action: 'getPageText', sessionId: effectiveSessionId } }
+          : s);
+    }
+  }
+
+  // ── Standalone atomic → dom.act ───────────────────────────────────────────
+  // A bare tab.map/just.type/etc. step skips the runtime router's live-DOM
+  // cascade — always route through dom.act with the skill as agentHint so the
+  // pick is revalidated against the page. turn.loop.agent stays standalone
+  // (verify mode + deliberate act-mode picks are valid plan shapes).
+  const _STANDALONE_TO_DOM = new Set(['tab.map.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'gesture.agent', 'arrow.grid.agent']);
+  if (Array.isArray(skillPlan)) {
+    skillPlan = skillPlan.map(s => {
+      if (!_STANDALONE_TO_DOM.has(s?.skill)) return s;
+      const hint = s.skill;
+      logger.info(`[Node:PlanSkillsV2] Standalone ${hint} → dom.act { agentHint: "${hint}" }`);
+      return { ...s, skill: 'dom.act', stepType: s.stepType || 'on-page-action',
+        args: { ...s.args, agentHint: s.args?.agentHint || hint, task: s.args?.task || s.args?.goal } };
+    });
   }
 
   // ── Stamp missing sessionIds ──────────────────────────────────────────────

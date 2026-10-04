@@ -519,6 +519,17 @@ module.exports = async function decomposePromptV2(state) {
   // "what is this" + selection is self-contained, NOT transcript recall.
   const _hasHighlightContext = !!(state.selectedText && String(state.selectedText).trim())
     || /\[Highlighted:/.test(message || '');
+  // A [Highlighted:] tag supplies its own referent — the selected text, never
+  // the live screen. classifyTask's screen-flavored fields on such prompts are
+  // hallucinations of the embedded tag/deictic. Scrub them once so every
+  // downstream consumer — the suggestedIntent concur, fast decision, screen-
+  // observation guard, and _screenReferent — sees clean data.
+  if (_hasHighlightContext) {
+    if (_tc.activeDocRef === 'screen') delete _tc.activeDocRef;
+    _tc.isScreenFollowUp = false;
+    _tc.needsFreshScreen = false;
+    if (_tc.suggestedIntent === 'screen_intelligence') delete _tc.suggestedIntent;
+  }
   const _ambientMisref = DEICTIC_CONTINUATION_RE.test(message)
     && !_hasHighlightContext
     && ['file', 'url'].includes(_tc.activeDocRef)
@@ -866,7 +877,7 @@ module.exports = async function decomposePromptV2(state) {
   // it. _ambientMisref exempted: a bare deictic ("tell me more about that")
   // flaked to an ambient url belongs to memory_retrieve, not a page fetch.
   if (['file', 'url'].includes(_tc.activeDocRef) && _tc.activeDocTarget
-      && !_ambientMisref && !_hasMultiGoalConjunction) {
+      && !_ambientMisref && !_hasMultiGoalConjunction && !_hasHighlightContext) {
     logger.info(`[Node:DecomposePromptV2] Active-doc guard → command_automate (ref=${_tc.activeDocRef} target=${String(_tc.activeDocTarget).slice(0, 80)})`);
     const subPrompts = [{
       text: message, estimatedIntent: 'command_automate', confidence: 0.9,
@@ -1198,7 +1209,7 @@ module.exports = async function decomposePromptV2(state) {
       // observation vocabulary is deterministic; trust it whenever the task
       // isn't classified as an action (imperatives still need planning).
       || (SCREEN_OBSERVATION_RE.test(message) && (!_tc.taskType || !_ACTION_TASK_TYPES.has(_tc.taskType)))
-    ) && !_tc.isScreenOutput;
+    ) && !_tc.isScreenOutput && !_hasHighlightContext;
   if (_isLiveScreenQuery && !_hasMultiGoalConjunction) {
     logger.info('[Node:DecomposePromptV2] Screen-observation guard: routing to screen_intelligence (typed flags) — skipping number call');
     const subPrompts = [{
@@ -1293,7 +1304,7 @@ module.exports = async function decomposePromptV2(state) {
     && (_tc.suggestedIntent === 'command_automate'
         || _tc.targetService
         || (_tc.interactiveActions && _tc.interactiveActions.length > 0));
-  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification' || _ambientMisref) && !_hasMultiGoalConjunction && !_screenReferent && !_actionableMessage) {
+  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification' || _ambientMisref) && !_hasMultiGoalConjunction && !_screenReferent && !_actionableMessage && !_hasHighlightContext) {
     logger.info(`[Node:DecomposePromptV2] Unresolved-follow-up guard: ${_ambientMisref ? 'bare deictic misresolved to ambient ' + _tc.activeDocRef : (_tc.resolution === 'needs_clarification' ? 'resolution=needs_clarification' : 'isFollowUp with null followUpTarget')} — routing to memory_retrieve (answer from history), skipping web_search on literal text`);
     const subPrompts = [{
       text: message,

@@ -5167,12 +5167,25 @@ Please try again or search with different terms.`;
 
     if ((skillName === 'browser.act' || _SESSION_BROWSER_SKILLS.has(skillName)) && !out.sessionId && out.action !== 'navigate') {
       const lastNavigate = [..._allResults].reverse().find(r => (r.skill === 'browser.act' && r.args?.action === 'navigate' && r.ok) || (_SESSION_BROWSER_SKILLS.has(r.skill) && r.ok && (r.sessionId || r.args?.sessionId)));
-      let inheritedSession = lastNavigate?.args?.sessionId || lastNavigate?.sessionId || state.activeBrowserSessionId || null;
+      let inheritedSession = lastNavigate?.args?.sessionId || lastNavigate?.sessionId || null;
       if (!inheritedSession && lastNavigate?.url) {
         // Derive hostname-based session the same way the command service does
         try {
           inheritedSession = new URL(lastNavigate.url).hostname;
         } catch (_) {}
+      }
+      if (!inheritedSession && state.activeBrowserSessionId) {
+        // Stale-session guard: only inherit the preserved session when this
+        // step's agentId names the same service ("amazon.agent" ↔ "amazon_agent")
+        // or the step is service-less. A leftover amazon session must not stamp
+        // onto a later gmail step's args.
+        const _sessSvc = String(state.activeBrowserSessionId).replace(/_agent$/, '').toLowerCase();
+        const _stepSvc = String(out.agentId || '').replace(/\.agent$/, '').toLowerCase();
+        if (!_stepSvc || _stepSvc === _sessSvc) {
+          inheritedSession = state.activeBrowserSessionId;
+        } else {
+          logger.info(`[Node:ExecuteCommand] Session inherit SKIPPED — step agentId "${out.agentId}" ≠ session "${state.activeBrowserSessionId}"`);
+        }
       }
       if (inheritedSession) {
         out = { ...out, sessionId: inheritedSession };

@@ -444,8 +444,13 @@ const TEMPLATES = [
     // copy through app.agent scan_page. No playwright, no bot walls, the
     // user's own sessions apply. Gated on resolveReferencesV2's url doc ref.
     n: 17, id: 'page_scan', lowRisk: true,
-    describe: 'read/copy the currently open browser page and answer the user\'s question about it ("this page", "the page open", "on this page", "what does it say") — args: {}. Requires an open page (ACTIVE PAGE line below).',
-    validate: (a, m, t, tc) => tc?.activeDocRef === 'url' ? null : 'no active url doc',
+    describe: 'read/copy the currently open browser page and answer the user\'s question about it ("this page", "the page open", "on this page", "what does it say") — args: {}. Requires an open page (ACTIVE PAGE line below). READ-only — NEVER for action goals (scroll, click, type, submit on the page).',
+    validate: (a, m, t, tc) => {
+      // Action verbs on the page ("scroll to the bottom of this page") are
+      // on-page actions, not reads — fall to the planner (dom.act lane).
+      if (/\b(scroll|click|type|press|drag|select|submit|navigate|go\s+back|fill|add|delete|buy|check\s*out|zoom|expand|collapse|hover)\b/i.test(String(m || ''))) return 'action-goal, not a page read';
+      return tc?.activeDocRef === 'url' ? null : 'no active url doc';
+    },
     build: (a, m) => [
       // timeoutMs opts out of the 10s deterministic cap — focus wait + copy
       // retries legitimately run to ~15s on a slow-loading page.
@@ -456,7 +461,11 @@ const TEMPLATES = [
   {
     n: 18, id: 'page_print', lowRisk: true,
     describe: 'print the currently open browser page (Cmd+P) — args: {}. Requires an open page.',
-    validate: (a, m, t, tc) => tc?.activeDocRef === 'url' ? null : 'no active url doc',
+    validate: (a, m, t, tc) => {
+      // Same action-verb guard as page_scan — 'print' is intentionally absent.
+      if (/\b(scroll|click|type|press|drag|select|submit|navigate|go\s+back|fill|add|delete|buy|check\s*out|zoom|expand|collapse|hover)\b/i.test(String(m || ''))) return 'action-goal, not a page print';
+      return tc?.activeDocRef === 'url' ? null : 'no active url doc';
+    },
     build: () => [{ skill: 'app.agent', args: { action: 'print_page', timeoutMs: 15000 }, description: 'Print the open page' }],
   },
   {
