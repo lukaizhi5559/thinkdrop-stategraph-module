@@ -514,7 +514,13 @@ module.exports = async function decomposePromptV2(state) {
   // recall). Prompt rule 140 already bans the conflation — enforce it here:
   // the veto suppresses the query-follow-up web_search AND routes to
   // memory_retrieve via the unresolved-follow-up guard below.
+  // A highlighted-text selection rides in the prompt ("[Highlighted: …]" tag
+  // or the selectedText field) and supplies the deictic referent itself —
+  // "what is this" + selection is self-contained, NOT transcript recall.
+  const _hasHighlightContext = !!(state.selectedText && String(state.selectedText).trim())
+    || /\[Highlighted:/.test(message || '');
   const _ambientMisref = DEICTIC_CONTINUATION_RE.test(message)
+    && !_hasHighlightContext
     && ['file', 'url'].includes(_tc.activeDocRef)
     // A deictic followed by an artifact/content noun ("that file", "this
     // error") legitimately resolves to the ambient referent — exempt it.
@@ -1230,6 +1236,7 @@ module.exports = async function decomposePromptV2(state) {
   // transcript). A contradicting hint vetoes — an action/search deictic
   // ("do that again") asks to re-run a task, not recall it.
   if (DEICTIC_CONTINUATION_RE.test(message)
+      && !_hasHighlightContext
       && !_hasMultiGoalConjunction
       && (!_carriedHint || _carriedHint === 'memory_retrieve')) {
     logger.info('[Node:DecomposePromptV2] Deictic-continuation guard: bare deictic resolves via transcript — routing to memory_retrieve, skipping number call');
@@ -1326,7 +1333,7 @@ module.exports = async function decomposePromptV2(state) {
         || _tc.targetService
         || (_tc.interactiveActions && _tc.interactiveActions.length > 0)
         || _carriedHint === 'command_automate');
-  if (_tc.isThoughtReply && _tc.followUpTarget && !_hasMultiGoalConjunction && !_actionableThought) {
+  if (_tc.isThoughtReply && _tc.followUpTarget && !_hasMultiGoalConjunction && !_actionableThought && !_hasHighlightContext) {
     const _thoughtIntent = _tc.webAccessMode === 'none' ? 'memory_retrieve' : 'web_search';
     logger.info(`[Node:DecomposePromptV2] Thought-reply guard: routing to ${_thoughtIntent} for attached card "${String(_tc.followUpTarget).slice(0, 60)}"`);
     const subPrompts = [{

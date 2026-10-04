@@ -3668,7 +3668,17 @@ module.exports = async function executeCommand(state) {
     // ── System instruction: don't claim success when steps failed/blocked ───
     // Deterministic guard — the LLM may still hallucinate success from raw
     // stdout, so inject an explicit instruction when any prior step failed.
-    const _anyFailed = (_stepContracts || []).some(c => c.success === false && c.stepIndex < skillCursor + 1);
+    // Latest-contract-wins: contracts are append-only, so a REPLAN_STEP that
+    // replaced step N leaves the OLD failed contract in the array alongside
+    // the new successful one. Count a step as failed only when its MOST RECENT
+    // contract failed — otherwise a recovered step still triggers the
+    // "do not claim success" note and the answer reports a phantom failure
+    // (task_f605d60d: lp request id queued, answer said "not sent").
+    const _latestByStep = new Map();
+    for (const c of _stepContracts || []) {
+      if (c && typeof c.stepIndex === 'number') _latestByStep.set(c.stepIndex, c);
+    }
+    const _anyFailed = [..._latestByStep.values()].some(c => c.success === false && c.stepIndex < skillCursor + 1);
     const _anyBlocked = skillResults.some(r => (r.botBlocked || r.blocked) && r.step <= skillCursor + 1);
     let _truthfulnessNote = '';
     if (_anyFailed || _anyBlocked) {

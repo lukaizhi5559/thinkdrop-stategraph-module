@@ -1515,7 +1515,7 @@ This task is classified as **${_tc.webAccessMode}**. It requires NO login, NO se
 - <code>playwright.agent</code> 
 - Any service-specific agent like <code>etsy.agent</code> or <code>amazon.agent</code> 
 
-**ALLOWED app.agent actions (real-browser lane — NOT playwright):** <code>navigate_url</code>, <code>scan_page</code>, <code>print_page</code>. These drive the user's REAL default browser (open URL + clipboard page copy to ~/.thinkdrop/copies) — they are fast, never bot-blocked, and leave the page visible. All other app.agent actions remain forbidden here.
+**ALLOWED app.agent actions (real-browser lane — NOT playwright):** <code>navigate_url</code>, <code>scan_page</code>, <code>print_page</code>, <code>read_screen</code>. These drive the user's REAL default browser (open URL + clipboard page copy to ~/.thinkdrop/copies) — they are fast, never bot-blocked, and leave the page visible. All other app.agent actions remain forbidden here.
 
 **Correct sequence for site search + extract:** 
 1. <code>web.agent</code> with <code>action: "site_search"</code> and <code>domain</code> + <code>query</code> 
@@ -3098,7 +3098,7 @@ The user's request does NOT match any installed skill.
     // bot wall; scan_page reads the already-open tab). Any OTHER app.agent
     // action still rewrites; 'download' mode rewrites everything (scan_page
     // can't fetch files).
-    const _PUBLIC_REAL_BROWSER_ACTIONS = new Set(['navigate_url', 'scan_page', 'print_page', 'read_url']);
+    const _PUBLIC_REAL_BROWSER_ACTIONS = new Set(['navigate_url', 'scan_page', 'print_page', 'read_url', 'read_screen']);
     const _publicWebListingSignals = /\b(?:search|find|look up|show|pics|pictures|images|listings|products|items|for sale|on sale|cheap|deals)\b/i;
     let _rewritten = 0;
     skillPlan = skillPlan.flatMap((step) => {

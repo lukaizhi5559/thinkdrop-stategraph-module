@@ -740,9 +740,22 @@ module.exports = async function resolveReferencesV2(state) {
         _taskClassification.activeDocTarget = fp;
       }
     } else {
-      // Classifier said "file" but no live filePath exists — fall back to the
-      // screen-content path rather than a targetless file plan.
-      _taskClassification.activeDocRef = 'screen';
+      // Classifier said "file" but no live filePath exists. Two referents get
+      // conflated here: (a) a file open in a window — needs live context, so
+      // downgrade when there's nothing else to resolve; (b) a CONVERSATIONAL
+      // file (followUpTarget or a filename in the message, e.g. "print that
+      // file" → kids-weekly-memory-verse.rtf) — the preflight name-probe
+      // resolves those by name, so keep 'file' with a null target. Downgrading
+      // (b) to 'screen' starves the whole resolved-file-path pipeline.
+      const _nameHint = `${_taskClassification.followUpTarget || ''} ${message || ''}`;
+      if (/\b[\w.-]+\.[a-zA-Z0-9]{1,10}\b/.test(_nameHint)) {
+        logger.info(`[Node:ResolveReferencesV2] activeDocRef=file, no live doc — keeping 'file' (name resolvable from context: ${_nameHint.match(/\b[\w.-]+\.[a-zA-Z0-9]{1,10}\b/)[0]})`);
+      } else {
+        // No filename anywhere — the referent must have been a screen doc that
+        // no longer exists. Fall back to the screen-content path.
+        logger.info('[Node:ResolveReferencesV2] activeDocRef=file but no live doc and no filename in context — downgrading to screen');
+        _taskClassification.activeDocRef = 'screen';
+      }
     }
   } else if (_taskClassification.activeDocRef === 'url') {
     const u = _priorScreenContext?.url || null;

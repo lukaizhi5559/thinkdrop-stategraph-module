@@ -290,7 +290,7 @@ For multi-agent `browser.agent` examples and `browser.agent → shell.run` data 
 
 **AI chatbot URLs:** Each chatbot service has its own URL — use `web.agent search_and_navigate` if the URL is unknown, or check AVAILABLE AGENTS for the registered agentId.
 
-**screen vs browser:** "what's on my screen" → `screen.capture`. "extract from PUBLIC web page" → `web.crawl`. "extract from PRIVATE web page (login required)" → `browser.agent`.
+**screen vs browser:** "what's on my screen" / "read my screen" → `app.agent { action:'read_screen' }` — real browser page scan when a browser is frontmost, OCR otherwise (never `screen.capture` — plain Tesseract misses rendered page structure). "extract from PUBLIC web page" → `web.crawl`. "extract from PRIVATE web page (login required)" → `browser.agent`.
 
 ## file.bridge
 

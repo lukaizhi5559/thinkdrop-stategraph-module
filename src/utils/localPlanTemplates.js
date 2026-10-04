@@ -517,9 +517,9 @@ const TEMPLATES = [
   },
   {
     n: 21, id: 'screen_read', lowRisk: true,
-    describe: 'read or describe what is currently on the user\'s screen — visible text via OCR ("what\'s on my screen", "what am I looking at", "read my screen") — args: {}',
+    describe: 'read or describe what is currently on the user\'s screen — real browser page scan when a browser is frontmost, OCR otherwise ("what\'s on my screen", "what am I looking at", "read my screen") — args: {}',
     validate: () => null,
-    build: () => [{ skill: 'screen.capture', args: { timeoutMs: 30000 }, description: 'Read the screen' }],
+    build: () => [{ skill: 'app.agent', args: { action: 'read_screen', timeoutMs: 30000 }, description: 'Read the screen' }],
   },
   {
     // Read-only task on a named external service — "goto gmail and search for

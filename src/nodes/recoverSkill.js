@@ -903,10 +903,25 @@ function tryFastRecovery(failedStep, skillPlan, cursor, stepRetryCount, logger, 
     const priorAttempts = patchHistory.filter(p => /AUTO_PATCH|REPLAN/i.test(p)).length;
     if (priorAttempts >= 1) {
       logger.info(`[Node:RecoverSkill] Fast-path: shell.run bash exit 1 after ${priorAttempts} prior attempt(s) — escalating to goal-mode REPLAN`);
+      // Preserve real paths through the replan — a regenerated goal that drops
+      // the resolved absolute path makes the executor hallucinate a search
+      // (observed: mdfind '*.rtf' picking an arbitrary file). Only inject
+      // paths that actually exist — the failure may be a bad path itself.
+      let _knownPathsNote = '';
+      try {
+        const _fs = require('fs');
+        const _src = (Array.isArray(args?.argv) ? args.argv.join(' ') : '') + ' ' + (args?.goal || '') + ' ' + (failedStep?.args?.goal || '');
+        const _paths = (_src.match(/(?:\/Users\/[^\s"'\\)]+|~\/[^\s"'\\)]+)/g) || [])
+          .map(p => p.replace(/^~/, process.env.HOME || ''))
+          .filter(p => { try { return _fs.existsSync(p); } catch (_) { return false; } });
+        if (_paths.length) {
+          _knownPathsNote = ` Known file path(s) that MUST appear verbatim in the goal text: ${_paths.slice(0, 3).map(p => `"${p}"`).join(', ')}.`;
+        }
+      } catch (_) { /* non-fatal */ }
       return {
         action: 'REPLAN',
         suggestion: `Bash command failed ${priorAttempts + 1} times. Switch to args.goal mode — describe the task in plain English and let the shell executor pick the correct tool (python3, bash, osascript, etc.).`,
-        constraint: 'USE GOAL MODE: Do NOT generate args.cmd or args.argv. Emit { "skill": "shell.run", "args": { "goal": "<plain English description of the task>" } } only. The executor will generate a safe, correct command.',
+        constraint: `USE GOAL MODE: Do NOT generate args.cmd or args.argv. Emit { "skill": "shell.run", "args": { "goal": "<plain English description of the task>" } } only. The executor will generate a safe, correct command.${_knownPathsNote}`,
       };
     }
   }

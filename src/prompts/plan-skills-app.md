@@ -83,6 +83,7 @@ These actions drive the user's REAL default browser — no Playwright, no bot wa
 | `navigate_url` | `{ url, appName?, via? }` — `via:'open'` (default browser, new tab — default for fresh "goto") or `via:'type'` (Cmd+L → just-type → Enter, current tab). `via:'auto'` picks automatically. | Waits a per-category settle time; verify content via `scan_page` |
 | `scan_page` | `{ appName?, url?, useCache?, maxWaitMs? }` — grabs the URL from the address bar, copies the full rendered page (Cmd+L → Cmd+C → Tab → Cmd+A → Cmd+C), saves to `~/.thinkdrop/copies/`. Copies are cached (5-min TTL) — repeat calls for the same URL return instantly with `cached:true`. | Retries the copy until it exceeds a per-URL-category char floor (SERP ~800, shopping ~2000, social ~1200) or `maxWaitMs`. Returns `thin:true` on legit sparse pages, `bot_detected` error on Cloudflare/CAPTCHA walls. |
 | `print_page` | `{ appName? }` — Cmd+P → Enter | Unverifiable by design — reports `verified:false` |
+| `read_screen` | `{}` — composite "describe my screen" read. Passively detects the frontmost app: browser → `scan_page` (real page copy, `via:'browser_scan'`); anything else → OCR (`getRecentOCR` → live `screen.capture`, `via:'ocr_cache'`/`'ocr_live'`). Returns `{ ok, text, content, appName, url?, via }`. | Falls back to OCR automatically when `scan_page` fails. **Emit this — not `screen.capture` — for "what's on my screen" / "describe my screen".** |
 
 **Read a URL for its content — prefer `read_url` (one step, internal fallback):**
 ```json

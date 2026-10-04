@@ -679,6 +679,24 @@ module.exports = async function preflightAgents(state) {
       _fileResolution = await _probeFilesystem(mcpAdapter, candidate, logger);
       logger.info(`[Node:PreflightAgents] File resolution: status=${_fileResolution.status}${_fileResolution.path ? `, path=${_fileResolution.path}` : ''}${_fileResolution.candidates ? `, candidates=${_fileResolution.candidates.length}` : ''}`);
 
+      // Ambiguous → deterministic disambiguation first: when exactly one
+      // candidate's full path appears verbatim in the conversation context
+      // (e.g. the original turn's "[File: /abs/path]" attachment or a
+      // "[Resolved file path: /abs/path]" note), that IS the file the user
+      // means — promote to exact with no question. task_f605d60d: two
+      // same-named files (current + exodus1) went ambiguous, no ask fired,
+      // and the planner hallucinated an iCloud path.
+      if (_fileResolution.status === 'ambiguous' && _fileResolution.candidates?.length > 0) {
+        try {
+          const _ctxText = `${JSON.stringify(state.conversationHistory || [])}\n${state.resolvedMessage || ''}\n${state.message || ''}`;
+          const _ctxHits = _fileResolution.candidates.filter(p => _ctxText.includes(p));
+          if (_ctxHits.length === 1) {
+            _fileResolution = { status: 'exact', path: _ctxHits[0] };
+            logger.info(`[Node:PreflightAgents] Ambiguous file resolved by conversation context: ${_ctxHits[0]}`);
+          }
+        } catch (_) { /* keep ambiguous */ }
+      }
+
       // If ambiguous or not found, ask the user for disambiguation
       if (_fileResolution.status === 'ambiguous' && _fileResolution.candidates?.length > 0 && gatherAnswerCallback) {
         const question = `I found ${_fileResolution.candidates.length} files matching "${candidate}". Which one should I use?`;
@@ -717,6 +735,11 @@ module.exports = async function preflightAgents(state) {
       // Enrich resolvedMessage with the resolved path so downstream nodes can use it
       if (_fileResolution.path && _fileResolution.status === 'exact') {
         userMessage = `${userMessage}\n[Resolved file path: ${_fileResolution.path}]`;
+      } else if (_fileResolution.status === 'ambiguous' && _fileResolution.candidates?.length > 0) {
+        // Still ambiguous (no callback or no answer) — inject the REAL
+        // candidate paths so the planner quotes them verbatim instead of
+        // hallucinating a path (task_f605d60d invented an iCloud path).
+        userMessage = `${userMessage}\n[Ambiguous file candidates — pick the most likely, use the path verbatim: ${_fileResolution.candidates.join(' | ')}]`;
       }
     }
   }

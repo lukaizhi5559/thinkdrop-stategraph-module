@@ -72,11 +72,43 @@ module.exports = async function screenIntelligence(state) {
   try {
     let capture = null;
 
+    // ── Step 0: Browser frontmost → real rendered-page scan ──────────────────
+    // app.agent read_screen passively detects the frontmost app and uses
+    // scan_page (real page copy) when a browser is on screen — richer and far
+    // faster than Tesseract OCR. Only attempted when prior context already
+    // says a browser is frontmost; falls through to OCR on any failure.
+    const _priorApp = state._priorScreenContext?.appName || null;
+    const _priorIsBrowser = state._priorScreenContext?.category === 'browser'
+      || getAppCategory(_priorApp) === 'browser';
+    if (_priorIsBrowser) {
+      try {
+        const rs = await mcpAdapter.callService('command', 'command.automate', {
+          skill: 'app.agent',
+          args: { action: 'read_screen', timeoutMs: 30000 }
+        });
+        const rsData = rs.data || rs;
+        if (rsData.ok && (rsData.text || rsData.content)) {
+          capture = {
+            text:        rsData.text || rsData.content,
+            appName:     rsData.appName || _priorApp,
+            windowTitle: rsData.windowTitle || null,
+            url:         rsData.url || null,
+            confidence:  null,
+            timestamp:   new Date().toISOString(),
+            category:    'browser'
+          };
+          logger.debug(`[Node:ScreenIntelligence] Browser frontmost — app.agent read_screen via=${rsData.via} (${capture.text.length} chars)`);
+        }
+      } catch (rsErr) {
+        logger.debug(`[Node:ScreenIntelligence] read_screen failed, falling back to OCR: ${rsErr.message}`);
+      }
+    }
+
     // ── Step 1: Check for a recent OCR capture from user-memory monitor ──────
     // Pass activeAppName so the query only returns captures for the current app.
     // Reduces maxAgeSeconds to 3 to minimize the stale-app race window.
     const _activeAppName = state._priorScreenContext?.appName || null;
-    try {
+    if (!capture) try {
       const recentResult = await mcpAdapter.callService('user-memory', 'memory.getRecentOcr', {
         maxAgeSeconds: 3,
         appName: _activeAppName || undefined

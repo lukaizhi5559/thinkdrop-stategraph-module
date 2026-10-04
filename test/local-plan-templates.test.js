@@ -128,10 +128,11 @@ describe('template compilation', () => {
     assert.equal(hit.lowRisk, false);
   });
 
-  it('screen_read compiles to screen.capture', async () => {
+  it('screen_read compiles to app.agent read_screen', async () => {
     const hit = await _hit("what's on my screen", _json(21, {}));
     assert.equal(hit.template, 'screen_read');
-    assert.equal(hit.skillPlan[0].skill, 'screen.capture');
+    assert.equal(hit.skillPlan[0].skill, 'app.agent');
+    assert.equal(hit.skillPlan[0].args.action, 'read_screen');
     assert.equal(hit.lowRisk, true);
   });
 });

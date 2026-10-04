@@ -8,7 +8,7 @@ Domain-specific guidance for vision/OCR tasks. The base prompt already establish
 |--------|-------|-----|
 | User references image FILES on disk (`.png`, `.jpg`, `.webp`, folder of screenshots) | `image.analyze` | Sends the image to a vision LLM that can describe what it shows |
 | User says "scan/analyze/describe/what's in these images" + folder/file context | `image.analyze` | Vision LLM is the only way to understand image content |
-| User says "what's on my screen" / "read the screen" (live, not a file) | `screen.capture` | Captures the live screen + OCR |
+| User says "what's on my screen" / "read the screen" (live, not a file) | `app.agent { action:'read_screen' }` | Real browser page scan when a browser is frontmost; live screen + OCR otherwise |
 | User wants to LIST files or check file types/metadata | `shell.run` | File listing, not content analysis |
 | User wants to convert/resize/crop images | `cli.agent` (imagemagick) or `shell.run` (sips) | Image processing, not analysis |
 
@@ -78,14 +78,14 @@ If the user says "scan the images in my screenshots folder" without a tagged pat
 ```
 Replace `<name>` with the folder name from the user's message.
 
-## screen.capture action contract
+## app.agent read_screen action contract (live screen reads)
 
-- `query` (string, optional): what to ask about the captured screen. Default: "Describe what's on the screen."
-- Use for LIVE screen content only — not for image files on disk.
+- `read_screen` picks the capture tier itself: real browser page scan (`scan_page`) when a browser is frontmost, screen OCR otherwise. No args needed.
+- Use for LIVE screen content only — not for image files on disk. Prefer it over `screen.capture` for describe-the-screen prompts.
 
 ```json
 [
-  { "skill": "screen.capture", "args": { "query": "What's on my screen right now?" }, "description": "Capture and analyze the live screen" },
+  { "skill": "app.agent", "args": { "action": "read_screen" }, "description": "Read the live screen (browser scan or OCR)" },
   { "skill": "synthesize", "args": { "prompt": "Summarize what's on the screen for the user." }, "description": "Summarize screen content" }
 ]
 ```
@@ -95,6 +95,6 @@ Replace `<name>` with the folder name from the user's message.
 | User says | Skill |
 |-----------|-------|
 | "what's in these images" / "scan the images in [folder]" | `image.analyze` (files on disk) |
-| "what's on my screen" / "read the screen" | `screen.capture` (live screen) |
+| "what's on my screen" / "read the screen" | `app.agent { action:'read_screen' }` (live screen) |
 | "analyze this screenshot" (with `[File: *.png]` tag) | `image.analyze` (file on disk) |
-| "analyze this screenshot" (no file tag, referring to live screen) | `screen.capture` (live screen) |
+| "analyze this screenshot" (no file tag, referring to live screen) | `app.agent { action:'read_screen' }` (live screen) |
