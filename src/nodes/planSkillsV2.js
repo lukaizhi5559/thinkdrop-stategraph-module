@@ -22,6 +22,7 @@ const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPla
 const { SITE_SEARCH_URLS } = require('../utils/localPlanTemplates');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { canonicalAgent } = require('../utils/agentCanonical.cjs');
 
 // Resolve classifyDeepLinkType from command-service (walk up to find
 // mcp-services) — same pattern executeCommand uses. Used to label resolved
@@ -400,6 +401,14 @@ function _fillBrowserStepAgentIds(skillPlan, logger) {
   for (const step of skillPlan) {
     if (!step || !_BROWSER_STEP_SKILLS.has(step.skill)) continue;
     if (step.args?.agentId) {
+      // Canonicalize service-specific agents onto their shared-auth parent —
+      // google_calendar.agent must not spawn a fresh google_calendar_agent
+      // profile (unauthed); it shares google.agent's signed-in session.
+      const _canon = canonicalAgent(step.args.agentId);
+      if (_canon && _canon !== step.args.agentId) {
+        _log.info(`[Node:PlanSkillsV2] Canonicalizing step agent "${step.args.agentId}" → "${_canon}" (shared session/auth)`);
+        step.args.agentId = _canon;
+      }
       _lastAgentId = step.args.agentId;
     } else if (_lastAgentId) {
       step.args = { ...(step.args || {}), agentId: _lastAgentId };

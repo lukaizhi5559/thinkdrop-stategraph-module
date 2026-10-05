@@ -294,7 +294,13 @@ module.exports = async function resolveReferencesV2(state) {
       logger.info(`[Node:ResolveReferencesV2] Isolated session ${sessionId} — skipping conversation history + semantic search`);
     }
 
-    if (sessionId && !_isIsolatedSession) {
+    // Plan-dispatched tasks are self-contained by contract — pulling the
+    // planning conversation back in reintroduces the ORIGINAL multi-part
+    // prompt as a followUpTarget and re-plans everything inside one run.
+    if (state._planTask) {
+      logger.info(`[Node:ResolveReferencesV2] _planTask — skipping conversation history + semantic search (self-contained task prompt)`);
+    }
+    if (sessionId && !_isIsolatedSession && !state._planTask) {
       // Fetch in parallel: recent window (handles coreferences like "that"/"it")
       // + cross-session semantic matches (finds older relevant messages buried
       // under recent unrelated ones, including from rotated sessions).
@@ -646,6 +652,15 @@ module.exports = async function resolveReferencesV2(state) {
         _saveClassifyCache(_cache);
       }
     }
+  }
+  // Plan-dispatched tasks must not carry conversational referents — clear any
+  // follow-up/doc resolution the classifier inferred (there is no history now,
+  // but memo hits and live-screen signals could still produce one).
+  if (state._planTask && _taskClassification && typeof _taskClassification === 'object') {
+    _taskClassification.isFollowUp = false;
+    _taskClassification.followUpTarget = null;
+    _taskClassification.activeDocRef = null;
+    _taskClassification.activeDocTarget = null;
   }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
 
