@@ -63,6 +63,14 @@ module.exports = async function parseIntentV2(state) {
   }
 
   // ── 2. Structural pass-throughs ─────────────────────────────────────────────
+  // Plan-dispatched task (planning lane → planRunner → handoff). The task
+  // prompt is the atomic unit: never merge it into neighbours, never split it
+  // into sub-intents — it already carries the user's approved scope. This is
+  // the adjacency rule: _planTask goes straight to planSkills → execute.
+  if (state._planTask) {
+    logger.info(`[Node:ParseIntentV2] _planTask — forcing command_automate (no merge/decompose): "${(state.message || '').slice(0, 60)}"`);
+    return { ...state, intent: { type: 'command_automate', confidence: 1.0, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'plan-task-passthrough', processingTimeMs: 0 } };
+  }
   if (state._planFile && typeof state._planFile === 'string' && !state._planMode) {
     return { ...state, intent: { type: 'plan_execute', confidence: 1.0, entities: [], requiresMemoryAccess: false }, metadata: { parser: 'plan-execute-passthrough', processingTimeMs: 0 } };
   }

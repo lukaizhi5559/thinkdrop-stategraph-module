@@ -43,8 +43,10 @@ module.exports = async function checkPlanCache(state) {
     return state;
   }
 
-  // Skip when guards are set (recovery, multi-intent, force-new)
-  if (state._forceNewPlan || state.recoveryContext || state.isMultiIntent || state._planCorrectionMode) {
+  // Skip when guards are set (recovery, multi-intent, force-new, plan-runner
+  // task — an approved ThinkDrop plan's task must never be replaced by an
+  // unrelated cached plan for a similar-looking prompt)
+  if (state._forceNewPlan || state.recoveryContext || state.isMultiIntent || state._planCorrectionMode || state._planTask) {
     return state;
   }
 

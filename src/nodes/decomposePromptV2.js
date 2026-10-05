@@ -454,7 +454,7 @@ module.exports = async function decomposePromptV2(state) {
   const logger = state.logger || console;
 
   // ── Structural fast-paths (not NLU — these are pipeline control signals) ──
-  if (state.skillBuildRequest || state.intentPlan || state._planFile || state._skillPlan ||
+  if (state.skillBuildRequest || state.intentPlan || state._planFile || state._skillPlan || state._planTask ||
       state._gatherQuestionPending || state.pendingQuestion?._isGatherPlanQuestion) {
     logger.debug('[Node:DecomposePromptV2] Structural fast-path — skipping decomposition');
     return state;

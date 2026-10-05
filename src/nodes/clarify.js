@@ -115,6 +115,7 @@ module.exports = async function clarify(state) {
   // Pipeline-control states never clarify — they carry their own flow.
   if (state._planFile || state._skillPlan || state.skillBuildRequest || state.intentPlan ||
       state._planCorrectionMode || state._resumeContext || state._gatherQuestionPending ||
+      state._planTask ||
       state.pendingQuestion) {
     return { ...state, _clarified: true, _clarifyOutcome: 'passthrough' };
   }

@@ -35,13 +35,9 @@ const MAX_ROUNDS = 3;
 // from selecting google_docs.agent when the user already has an authenticated
 // google.agent that handles all Google services.
 // NOTE: gmail.agent is NOT mapped to google.agent — it has separate auth.
-const AGENT_CANONICAL_MAP = {
-  'google_docs.agent': 'google.agent',
-  'google_sheets.agent': 'google.agent',
-  'google_calendar.agent': 'google.agent',
-  'google_drive.agent': 'google.agent',
-  'google_slides.agent': 'google.agent',
-};
+// Canonical source: shared/agent-canonical.cjs (also used by planRunner's
+// session-group locking so same-session plan tasks serialize).
+const { AGENT_CANONICAL_MAP } = require('../utils/agentCanonical.cjs');
 
 // Generic local-resource nouns are never real services. The LLM occasionally
 // nominates them for creation ("run X in the terminal" → terminal.agent,
