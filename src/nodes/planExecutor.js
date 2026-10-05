@@ -80,7 +80,7 @@ module.exports = async function planExecutor(state) {
   // 4. Build skillPlan[] for ALL pending steps
   let keytarGet = null;
   try {
-    const keytar = require('keytar');
+    const keytar = require('../../../shared/secret-resolve.cjs').secretStoreAdapter();
     keytarGet = (service, key) => keytar.getPassword(service, key);
   } catch (_) {}
 
