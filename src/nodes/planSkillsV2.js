@@ -434,6 +434,11 @@ const _SIDE_EFFECT_ACTIONS = new Set([
 ]);
 function _stripRedundantVerifySteps(skillPlan, state, logger) {
   if (!Array.isArray(skillPlan)) return skillPlan;
+  // Plan-dispatched tasks (_planTask) carry canon-generated steps — their
+  // verify steps are deliberate commit confirmation, and taskClassification
+  // is thin (interactiveActions:[]) precisely because classification was
+  // skipped. Don't second-guess them.
+  if (state?._planTask === true) return skillPlan;
   const _log = logger || console;
   const _actions = state?._taskClassification?.interactiveActions
     || state?.taskClassification?.interactiveActions
