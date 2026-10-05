@@ -3622,13 +3622,18 @@ The user's request does NOT match any installed skill.
   // ── Fallback browser cleanup ──────────────────────────────────────────────
   // Close any Playwright browsers left open by preflight auth probes or deep-link
   // resolution. The persistent profile retains cookies; only the browser process is killed.
+  // NEVER close a session the plan is about to use or the live continuation
+  // session (state.activeBrowserSessionId) — killing it mid-pipeline leaves
+  // execution acting on about:blank (observed: resolve_deep_link + close-all
+  // destroyed the amazon_agent window before a scroll follow-up ran).
   if (mcpAdapter) {
     try {
+      const _protectedSids = _protectedBrowserSessionIds(state, skillPlan);
       await mcpAdapter.callService('command', 'command.automate', {
         skill: 'browser.act',
-        args: { action: 'close-all' },
+        args: { action: 'close-all', except: _protectedSids },
       }, { timeoutMs: 8000 }).catch(() => {});
-      logger.debug('[Node:PlanSkillsV2] Fallback browser cleanup: close-all sent');
+      logger.debug(`[Node:PlanSkillsV2] Fallback browser cleanup: close-all sent (except=[${_protectedSids.join(',')}])`);
     } catch (_) {}
   }
 
@@ -3839,7 +3844,25 @@ The user's request does NOT match any installed skill.
   };
 }
 
+// SessionIds the fallback browser cleanup must never close: the promoted
+// continuation session, the prior-turn context session, and every sessionId
+// explicitly referenced by a plan step.
+function _protectedBrowserSessionIds(state, skillPlan) {
+  const out = new Set();
+  // lastBrowserNav survives replans/ask_user resumes (persisted ledger) — a
+  // live session recorded there must be protected even if the promotion fields
+  // are absent (e.g. a state path that never ran resolveReferencesV2).
+  for (const sid of [state?.activeBrowserSessionId, state?.priorBrowserContext?.sessionId, state?.lastBrowserNav?.sessionId]) {
+    if (sid) out.add(String(sid));
+  }
+  for (const s of Array.isArray(skillPlan) ? skillPlan : []) {
+    if (s?.args?.sessionId) out.add(String(s.args.sessionId));
+  }
+  return [...out];
+}
+
 module.exports = planSkillsV2;
+module.exports._protectedBrowserSessionIds = _protectedBrowserSessionIds;
 module.exports._buildSystemPrompt = _buildSystemPrompt;
 module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;
 module.exports._selectPriorSynthesis = _selectPriorSynthesis;
