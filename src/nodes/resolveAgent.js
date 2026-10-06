@@ -812,6 +812,30 @@ module.exports = async function resolveAgent(state) {
     return { ...state, resolveAgentResult: { agents: [], reasoning: 'No MCP adapter', question: null } };
   }
 
+  // ── Pinned agent (capability-gap guard / detectAgent regex) ─────────────────
+  // comms-graph may pin a registered agent (e.g. capability.search matched the
+  // prompt to catt.agent). Verify it's actually registered — then bind it
+  // directly, bypassing LLM selection AND the local_system skip below (the pin
+  // is stronger evidence than the taskType heuristic).
+  const _pinned = state._pinnedAgentId && String(state._pinnedAgentId).toLowerCase();
+  if (_pinned && _pinned.endsWith('.agent')) {
+    let _pinOk = true;
+    try {
+      const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+      const registered = (agRes?.data || agRes || []).filter(a => a && a.id);
+      _pinOk = registered.some(a => String(a.id).toLowerCase() === _pinned);
+    } catch (_) { /* registry unreachable — honor the pin anyway */ }
+    if (_pinOk) {
+      logger.info(`[Node:ResolveAgent] Pinned agent ${_pinned} — binding directly`);
+      return { ...state, resolveAgentResult: {
+        agents: [{ agentId: _pinned, role: userMessage, exists: true, create: false }],
+        reasoning: 'pinned by capability guard', question: null,
+        _message: userMessage,
+      } };
+    }
+    logger.warn(`[Node:ResolveAgent] Pinned agent ${_pinned} not registered — dropping pin`);
+  }
+
   // ── Skip: local_system tasks need no service agent ──────────────────────────
   // taskType 'local_system' (from classifyTask) covers OS/shell queries — current
   // time/date, uptime, disk space, battery, hardware info, screen UI interactions.
