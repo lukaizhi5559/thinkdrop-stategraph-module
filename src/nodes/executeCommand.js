@@ -341,6 +341,55 @@ async function _thinPostFailureHandler(state) {
     };
   }
 
+  // ── shell.run goal/install failure → escalate to cli.agent's loop ─────────
+  // A one-shot argv can't observe its own stderr — "Retry" replays the same
+  // failing command forever (observed: npm i -g @nylas/cli → E404 ×4). The
+  // cli.agent run loop reads the error, probes (npm view / brew info / --help),
+  // and picks a different approach — same self-heal pattern as SANDBOX_REROUTE.
+  // Once per cursor: if the agent loop also fails, normal recovery takes over.
+  if (failedStep.skill === 'shell.run'
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => p.action === 'AGENT_ESCALATE' && p.cursor === skillCursor)) {
+    const _goalText = `${failedStep.args?.goal || ''} ${failedStep.description || ''}`.trim();
+    const _argvStr = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
+    const _isGoalMode = !!failedStep.args?.goal;
+    const _installish = /\b(install|set\s?up|setup|get|configure|authenticat\w+|sign\s?in|log\s?in|connect|authoriz\w+|download)\b/i.test(_goalText)
+      || /\b(npm|brew|pip3?|pipx|apt(-get)?|gem|cargo)\s+(install|i|add)\b/i.test(_argvStr);
+    if (_isGoalMode || _installish) {
+      // Install of a named tool → build_agent (discovers the real package,
+      // verifies, registers the agent for later steps). Other goals → the
+      // generic run loop with the failure evidence attached.
+      const _svcM = _argvStr.match(/(?:npm|brew|pip3?|pipx|apt(?:-get)?|gem|cargo)\s+(?:install|i|add)\s+(?:-g\s+|--global\s+)?["']?(@?[\w./@-]+)/i)
+        || _goalText.match(/\b(?:install|set\s?up|setup|get|add)\s+(?:the\s+|a\s+|an\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
+      const _svc = _svcM?.[1]
+        ? (_svcM[1].startsWith('@') ? _svcM[1].split('/')[0].slice(1) : _svcM[1].split('@')[0]).replace(/-?cli$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '')
+        : '';
+      const _evidence = `Previous attempt failed: ${_argvStr || '(argv resolved from goal)'} → ${String(failedStep.error || 'failed').slice(0, 300)}`;
+      const _filler = new Set(['the', 'a', 'an', 'it', 'this', 'my', 'your', 'to', 'on', 'in', 'for', 'with']);
+      const _useBuild = _installish && _svc && !_filler.has(_svc) && _svc.length >= 2;
+      const patchedPlan = [...skillPlan];
+      patchedPlan[skillCursor] = {
+        ...patchedPlan[skillCursor],
+        skill: 'cli.agent',
+        args: _useBuild
+          ? { action: 'build_agent', service: _svc }
+          : { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}` },
+        description: failedStep.description || (_useBuild ? `Install & register ${_svc}` : `Retry agentically: ${(_goalText || _argvStr).slice(0, 60)}`),
+      };
+      logger.info(`[ExecuteCommand:ThinRecovery] AGENT_ESCALATE: shell.run step ${skillCursor + 1} failed (${(failedStep.error || '').slice(0, 80)}) — substituting cli.agent ${_useBuild ? `build_agent service=${_svc}` : 'generic run'}`);
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        recoveryNote: `The direct command failed — handing this step to the CLI agent so it can see the error and try a different approach.`,
+        patchHistory: [...patchHistory, { action: 'AGENT_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        stepRetryCount: stepRetryCount + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
+  }
+
   // No LLM backend — surface to user
   if (!llmBackend) {
     return {
@@ -780,6 +829,11 @@ function _extractFilePathsFromText(text) {
 
   // Match common file path patterns
   const patterns = [
+    // Whole-line absolute paths — handles spaces and U+202F narrow no-break
+    // space (macOS "Screenshot 2026-10-05 at 4.09.25 PM.png"), which the
+    // whitespace-delimited patterns below can never match.
+    /(?:^|\n)[ \t]*(\/[^\n]+?\.\w{1,10})[ \t]*(?=\n|$)/g,
+    /(?:^|\n)[ \t]*(~\/[^\n]+?\.\w{1,10})[ \t]*(?=\n|$)/g,
     // Absolute paths: /Users/name/... or ~/...
     /(?:^|\s)(\/[^\s\n]+\.\w+)(?=\s|$)/gm,
     /(?:^|\s)(~\/[^\s\n]+\.\w+)(?=\s|$)/gm,
@@ -1012,11 +1066,14 @@ function autoInjectFromContracts(args, skill, stepContracts = [], logger) {
 
       // From shell.run stdout
       if (contract.skill === 'shell.run' && contract.outputs?.filePaths?.value?.length > 0) {
-        const imagePath = contract.outputs.filePaths.value.find(p =>
+        const imagePaths = contract.outputs.filePaths.value.filter(p =>
           /\.(png|jpg|jpeg|gif|webp|bmp|tiff|heic)$/i.test(p)
         );
-        if (imagePath) {
-          newArgs.filePath = imagePath;
+        if (imagePaths.length > 0) {
+          newArgs.filePath = imagePaths[0];
+          // Pass all discovered images so "analyze all screenshots" actually
+          // covers every file — image.analyze iterates filePaths when present.
+          if (imagePaths.length > 1) newArgs.filePaths = imagePaths;
           injected = true;
           break;
         }
@@ -1024,11 +1081,12 @@ function autoInjectFromContracts(args, skill, stepContracts = [], logger) {
 
       // From fs.read files
       if (contract.skill === 'fs.read' && contract.outputs?.files?.value?.length > 0) {
-        const imagePath = contract.outputs.files.value.find(f =>
+        const imagePaths = contract.outputs.files.value.filter(f =>
           /\.(png|jpg|jpeg|gif|webp|bmp|tiff|heic)$/i.test(f)
         );
-        if (imagePath) {
-          newArgs.filePath = imagePath;
+        if (imagePaths.length > 0) {
+          newArgs.filePath = imagePaths[0];
+          if (imagePaths.length > 1) newArgs.filePaths = imagePaths;
           injected = true;
           break;
         }
@@ -1108,6 +1166,88 @@ function autoInjectFromContracts(args, skill, stepContracts = [], logger) {
   }
 
   return newArgs;
+}
+
+/**
+ * Resolve step args for the runGroup dispatch path. The serial path resolves
+ * args before dispatch (autoInjectFromContracts, {{PREV_OUTPUT}}, {{CONTRACT[N]}}
+ * and friends); group steps previously skipped all of it, so a literal
+ * "{{PREV_OUTPUT}}" reached the skill — e.g. image.analyze received
+ * filePath="{{PREV_OUTPUT}}", extname() returned '', and the step failed with
+ * "Unsupported image format: .".
+ *
+ * @param {Object} rawArgs - The step's raw args (gs.args)
+ * @param {string} skill - The step's skill name
+ * @param {Object} ctx - { skillResults, priorResults, stepContracts, logger }
+ *   priorResults: same-lane group results already completed (lanes run
+ *   sequentially, so their results precede this step).
+ * @returns {{ args: Object, error: string|null }} — error set when an
+ *   unresolved {{...}} token remains; caller must NOT dispatch in that case.
+ */
+function _resolveGroupStepArgs(rawArgs, skill, ctx = {}) {
+  const { skillResults = [], priorResults = [], stepContracts = [], logger = console } = ctx;
+  let resolved = autoInjectFromContracts({ ...(rawArgs || {}) }, skill, stepContracts, logger);
+
+  // {{PREV_OUTPUT}} / {{prev_stdout}} — output of the immediately preceding
+  // completed step. Mirrors the serial block (~PREV_OUTPUT template injection):
+  // browser.agent stores page text in .result, fs.read in .content/.tree.
+  const history = priorResults.length ? [...skillResults, ...priorResults] : skillResults;
+  const prev = history[history.length - 1];
+  if (prev) {
+    const prevResultStr = typeof prev?.result === 'object' && prev?.result !== null
+      ? JSON.stringify(prev.result)
+      : (prev?.result || '');
+    let prevStdout = (prev?.stdout || prevResultStr || prev?.content || prev?.text || prev?.tree || '').slice(0, 12000);
+    if (!prevStdout && prev?.ok !== false) prevStdout = '(previous step produced no output)';
+    if (prevStdout) {
+      for (const k of Object.keys(resolved)) {
+        if (typeof resolved[k] === 'string') {
+          resolved[k] = resolved[k]
+            .replace(/\{\{PREV_OUTPUT\}\}/gi, prevStdout)
+            .replace(/\{\{prev_stdout\}\}/gi, prevStdout);
+        }
+      }
+    }
+  }
+
+  // {{CONTRACT[N]}} / {{PREV_CONTRACT}} / {{LAST_SUCCESSFUL}} / {{LAST_WITH_OUTPUT}}
+  if (stepContracts.length > 0) {
+    for (const k of Object.keys(resolved)) {
+      const v = resolved[k];
+      if (typeof v !== 'string' || !v.includes('{{')) continue;
+      resolved[k] = v.replace(
+        /\{\{(CONTRACT\[\d+\]|PREV_CONTRACT|LAST_SUCCESSFUL|LAST_WITH_OUTPUT)([^}]*)\}\}/g,
+        (match, contractRef, fieldPath) => {
+          const val = resolveContractPath(stepContracts, contractRef + fieldPath);
+          if (val === null || val === undefined) {
+            // Same salvage rule as the serial path: for filePaths/files refs,
+            // grab the first recorded path from any prior contract.
+            const salvaged = /filePaths|files/i.test(fieldPath)
+              ? stepContracts.flatMap(c =>
+                  (c.outputs?.filePaths?.value || []).filter(s => typeof s === 'string'))[0]
+              : undefined;
+            logger.warn(`[Node:ExecuteCommand] runGroup contract ref not found: ${match}${salvaged ? ` — salvaged "${salvaged}"` : ' — substituting empty string'}`);
+            return salvaged ?? '';
+          }
+          return typeof val === 'object' ? JSON.stringify(val) : String(val);
+        }
+      );
+    }
+  }
+
+  // Fail fast on any leftover {{...}} token — a literal template must never
+  // reach a skill. Broader than the serial guard (which only checks
+  // PREV_OUTPUT/prev_stdout) because grouped steps have no business carrying
+  // unresolved tokens of any kind.
+  const leftover = Object.values(resolved).find(v => typeof v === 'string' && /\{\{[^}]+\}\}/.test(v));
+  if (leftover) {
+    const token = leftover.match(/\{\{[^}]+\}\}/)[0];
+    const err = `Unresolved template token ${token} in runGroup step args — replan with a concrete value or remove runGroup from this step`;
+    logger.warn(`[Node:ExecuteCommand] ${err}`);
+    return { args: resolved, error: err };
+  }
+
+  return { args: resolved, error: null };
 }
 
 /**
@@ -5771,10 +5911,31 @@ Please try again or search with different terms.`;
       || _getProtG(state.resolvedMessage || state.message || '');
 
     const _dispatchGroupStep = async ({ idx, step: gs, priorResults = [] }) => {
+      // Resolve {{PREV_OUTPUT}}/{{CONTRACT[]}} refs and auto-inject missing args
+      // BEFORE dispatch — group steps previously got raw args, so literal
+      // {{...}} tokens reached the skill (image.analyze got filePath=
+      // "{{PREV_OUTPUT}}" → extname '' → "Unsupported image format: .").
+      const _resolved = _resolveGroupStepArgs(gs.args || {}, gs.skill, {
+        skillResults, priorResults, stepContracts, logger,
+      });
+      if (_resolved.error) {
+        if (progressCallback) progressCallback({
+          type: 'step_failed', stepIndex: idx, totalSteps: skillPlan.length,
+          skill: gs.skill, description: gs.description, error: _resolved.error, runGroup: groupId,
+        });
+        return {
+          idx, step: gs, skill: gs.skill,
+          args: gs.args || {},
+          ok: false, error: _resolved.error, stderr: null,
+          result: null, stdout: null,
+          askUser: false, question: null, options: [],
+          needsCredentials: false, needsLogin: false, raw: null,
+        };
+      }
       // Browser parity with the serial path — inherit sessionId from prior
       // browser results (incl. same-lane steps already finished in this group),
       // append the cumulative browser-step digest, priorNav and fill memory.
-      const gsArgs = _enrichBrowserStepArgs(gs.skill, gs.args || {}, priorResults);
+      const gsArgs = _enrichBrowserStepArgs(gs.skill, _resolved.args, priorResults);
       const _isAgent = gs.skill === 'cli.agent' || gs.skill === 'browser.agent';
       const _callArgs = _isAgent
         ? { ...gsArgs, _stepType: gs.stepType || null, _taskClassification: state._taskClassification || null, _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn${state._handoffTaskId ? `?taskId=${encodeURIComponent(state._handoffTaskId)}` : ''}`, _stepIndex: idx, context: { ...(gsArgs.context || {}), _dataFile: state.synthesisAnswerFile || null } }
@@ -8693,5 +8854,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
 // Test-only exports
 module.exports.generateStepContract = generateStepContract;
 module.exports._extractFilePathsFromArgv = _extractFilePathsFromArgv;
+module.exports._extractFilePathsFromText = _extractFilePathsFromText;
+module.exports._resolveGroupStepArgs = _resolveGroupStepArgs;
+module.exports.autoInjectFromContracts = autoInjectFromContracts;
 module.exports._thinPostFailureHandler = _thinPostFailureHandler;
 module.exports._bucketGroupLanes = _bucketGroupLanes;

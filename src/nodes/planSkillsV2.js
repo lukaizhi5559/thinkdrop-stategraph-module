@@ -568,10 +568,53 @@ function _sanitizeSkillPlan(skillPlan, state) {
     if (_inserted) { _guardedPlan.push(_inserted); _urlVarIdx++; }
     delete step?._urlVarIdx;
     if (step?.skill === 'shell.run') {
+      // ── Install/setup/auth goals must run through cli.agent's loop ────────
+      // A one-shot argv can't observe its own stderr — a wrong package name or
+      // interactive prompt dead-ends in a blind "Retry" loop. cli.agent sees
+      // the error and picks a different approach (real package lookup, brew
+      // fallback, PTY for menus). Deterministic rewrite — the LLM directive
+      // above is guidance; this catches the misses.
+      const _goalText = `${step.args?.goal || ''} ${step.description || ''}`;
+      const _setupM = _goalText.match(/\b(install|set\s?up|setup|get|add|download)\s+(?:the\s+|a\s+|an\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
+      const _authM  = _goalText.match(/\b(authenticat\w+|sign\s?in|log\s?in|connect|configure|authoriz\w+)\b/i);
+      // Explicit-argv installs too — "npm install -g <pkg>" / "brew install <x>"
+      // emitted as literal cmd/argv (the Nylas E404 was exactly this shape).
+      const _PM = new Set(['npm', 'npm3', 'npx', 'brew', 'pip', 'pip3', 'pipx', 'gem', 'cargo', 'apt', 'apt-get', 'brew']);
+      let _pkgArgv = null;
+      if (Array.isArray(step.args?.argv) && _PM.has(step.args?.cmd)) {
+        const _verbIdx = step.args.argv.findIndex(a => /^(install|i|add|add-global)$/.test(a));
+        if (_verbIdx >= 0) {
+          _pkgArgv = step.args.argv.find((a, i) => i > _verbIdx && typeof a === 'string' && a && !a.startsWith('-')) || null;
+        }
+      }
+      if ((step.args?.goal && (_setupM || _authM)) || _pkgArgv) {
+        // Service name: argv package beats goal text — "@nylas/cli" → "nylas",
+        // "nylas-cli" → "nylas", "pkg@1.2" → "pkg".
+        const _pkgSvc = _pkgArgv
+          ? (_pkgArgv.startsWith('@') ? _pkgArgv.split('/')[0].slice(1) : _pkgArgv.split('@')[0]).replace(/-?cli$/i, '')
+          : '';
+        const _svcRaw = _pkgSvc || _setupM?.[2] || '';
+        const _svc = _svcRaw.toLowerCase().replace(/[^a-z0-9]/g, '');
+        const _filler = new Set(['the', 'a', 'an', 'it', 'this', 'my', 'your', 'to', 'on', 'in', 'for', 'with']);
+        if (_authM && !_setupM) {
+          // auth/configure/connect — generic cli.agent run (drives PTY auth
+          // menus itself); agentId left off so the generic loop handles it
+          // whether or not a registered agent exists.
+          step.skill = 'cli.agent';
+          step.args = { action: 'run', task: (_goalText || step.description || '').trim() };
+          _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: rewrote shell.run auth/setup step → cli.agent run "${step.args.task.slice(0, 80)}"`);
+        } else if (_svc && !_filler.has(_svc) && _svc.length >= 2) {
+          // install/setup of a named tool → build_agent discovers the real
+          // package (no hallucinated names), installs, verifies, registers.
+          step.skill = 'cli.agent';
+          step.args = { action: 'build_agent', service: _svc };
+          _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: rewrote shell.run install step → cli.agent build_agent service="${_svc}"`);
+        }
+      }
       // Coerce argv object entries to strings — the planner LLM sometimes wraps
       // file paths in {"file": "..."} objects instead of plain strings.
       // {"file": "/path"} → "/path", {"path": "/path"} → "/path", anything else → String(a)
-      if (Array.isArray(step.args?.argv)) {
+      if (step.skill === 'shell.run' && Array.isArray(step.args?.argv)) {
         step.args.argv = step.args.argv.map(a => {
           if (typeof a === 'string') return a;
           if (a && typeof a === 'object') {
@@ -583,7 +626,8 @@ function _sanitizeSkillPlan(skillPlan, state) {
         });
       }
       // Missing cmd/goal → fill from context or convert to ask_user
-      if (!step.args?.cmd && !step.args?.goal) {
+      // (skip when the step was just rewritten to cli.agent above)
+      if (step.skill === 'shell.run' && !step.args?.cmd && !step.args?.goal) {
         const _msg = state?.resolvedMessage || state?.message || '';
         // If we have a file hint + user message, fill in goal so shell.run's
         // internal LLM can resolve it (e.g. "print this file" + File: /path)
@@ -882,6 +926,23 @@ Example: [{"skill": "web.agent", "args": {"action": "...", "query": "..."}, "run
     analyzedPlan = analyzedPlan.map(step =>
       SEQUENTIAL_ONLY_SKILLS.has(step.skill) ? { ...step, runGroup: undefined } : step
     );
+
+    // Hard guard: strip runGroup from steps with template-variable deps.
+    // The runGroup dispatch path sends raw args — {{PREV_OUTPUT}}, {{CONTRACT[N]}},
+    // {{LAST_SUCCESSFUL}} etc. only resolve in the serial path — so a grouped
+    // template step would dispatch literal tokens to the skill (observed:
+    // image.analyze receiving literal "{{PREV_OUTPUT}}" as filePath).
+    let strippedTemplateGroups = 0;
+    analyzedPlan = analyzedPlan.map(step => {
+      if (!step.runGroup) return step;
+      const stepText = JSON.stringify(step.args || {}) + ' ' + (step.description || '');
+      if (!/\{\{[^}]+\}\}/.test(stepText)) return step;
+      strippedTemplateGroups++;
+      return { ...step, runGroup: undefined };
+    });
+    if (strippedTemplateGroups > 0) {
+      logger.info(`[Node:PlanSkillsV2] Stripped runGroup from ${strippedTemplateGroups} template-dependent step(s) — group dispatch cannot resolve {{...}} refs`);
+    }
 
     // Deterministic merge: if every step is independent (no {{variable}} dependencies)
     // and none are sequential-only, collapse all parallelizable steps into a single
@@ -1519,6 +1580,18 @@ When a task requires installing a tool or generating a document on macOS, score 
 
 **When multiple tiers can accomplish the task:** always go T1 → T2, document WHY in a synthesize step if you use T3+.`;
   }
+
+  // ── Tool setup/auth policy — applies to every task type ──────────────────
+  // A one-shot shell.run argv is the wrong executor for install/setup/auth
+  // goals: a wrong package name or unexpected prompt dead-ends with no way to
+  // observe and adapt. cli.agent's run loop sees stderr and self-corrects.
+  result += `\n\n## TOOL SETUP & AUTH POLICY — ALWAYS FOLLOW THIS
+
+A step whose goal is to install, set up, configure, authenticate, sign in to, or connect a CLI tool or service MUST use \`cli.agent\`, never \`shell.run\`:
+
+- Install / get a tool working: \`{ "skill": "cli.agent", "args": { "action": "build_agent", "service": "<name>" } }\` — discovers the real package (never a guessed name), installs, verifies, and registers the agent so later steps can use it.
+- Authenticate / sign in / connect / configure: \`{ "skill": "cli.agent", "args": { "action": "run", "agentId": "<svc>.agent", "task": "<the goal>" } }\` when the agent is registered; otherwise \`{ "action": "run", "task": "<the goal>" }\` (no agentId — the generic loop drives the CLI, including interactive prompts).
+- NEVER emit \`shell.run\` argv for an install/setup/auth goal — a guessed package name cannot be corrected by retrying. \`shell.run\` stays for known deterministic commands (uname, which, file moves, opening a URL).`;
 
   // ── Public web mode hard guard ──────────────────────────────────────────
   // Some base prompts and agent-selection paths leak browser.agent examples.
