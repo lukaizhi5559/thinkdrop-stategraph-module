@@ -12,6 +12,24 @@ const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 const MAX_EVAL_RETRIES = 4;
 
+// ThinkDrop environment map — where state, logs, and services live. Injected
+// into failure-path prompts so recovery/replan hints reference real paths
+// instead of guessing. Walks up to find shared/system-map.cjs.
+let _sysMap = null;
+try {
+  let _dir = __dirname;
+  for (let i = 0; i < 8 && !_sysMap; i++) {
+    const _c = path.join(_dir, 'shared', 'system-map.cjs');
+    if (fs.existsSync(_c)) _sysMap = require(_c);
+    _dir = path.dirname(_dir);
+  }
+} catch (_) {}
+const ENV_HINT = _sysMap
+  ? `\n\nThinkDrop environment (for retryHint/ruleText grounding):\n${_sysMap.renderEnvironment()}\n`
+    + `Logs live in <project>/logs/ — command.log (command-service/skill errors), comms-graph.log (planning/resume), main.log (Electron/overlay). `
+    + `Saved plans and failed task history live in ~/.thinkdrop/plans/. If the error looks like a ThinkDrop-internal failure rather than a user-facing command failure, the retryHint should say which log to check.`
+  : '';
+
 function loadEvalPrompt() {
   try {
     return fs.readFileSync(path.join(__dirname, '../prompts/evaluate-skills.md'), 'utf8').trim();
@@ -369,7 +387,7 @@ module.exports = async function evaluateSkills(state) {
   }
   logger.info(`[Node:EvaluateSkills] Fast verdict: ${_fastVerdict === 1 ? 'FIX' : 'ASK_USER'} — running full JSON generation for details`);
 
-  const systemPrompt = isFailurePath ? FAILURE_EVAL_SYSTEM_PROMPT : EVAL_SYSTEM_PROMPT;
+  const systemPrompt = (isFailurePath ? FAILURE_EVAL_SYSTEM_PROMPT : EVAL_SYSTEM_PROMPT) + ENV_HINT;
 
   const failureSection = isFailurePath && recoveryContext ? `
 FAILURE ANALYSIS:

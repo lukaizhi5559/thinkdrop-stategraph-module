@@ -33,6 +33,26 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
+
+// ── Terminal activity ticker — step-boundary lines for the collapsed drawer ──
+// Fire-and-forget POST to main.js /agent-turn → renderer 'terminal:activity'.
+// Mirrors what comms-graph emits for its diagnosis checks so both worlds write
+// to the same ticker line. Never throws, never blocks a step.
+function _emitTerminalActivity(line, kind = 'step') {
+  try {
+    const port = parseInt(process.env.OVERLAY_CONTROL_PORT || '3010', 10);
+    const body = JSON.stringify({ type: 'terminal:activity', kind, line });
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: '/agent-turn', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 2000,
+    }, (res) => { res.resume(); });
+    req.on('error', () => {});
+    req.on('timeout', () => req.destroy());
+    req.end(body);
+  } catch (_) {}
+}
 
 // Resolve classifyDeepLinkType from command-service (walk up to find mcp-services)
 let _classifyDeepLinkType = null;
@@ -6744,7 +6764,13 @@ Please try again or search with different terms.`;
             } else if (evt.type === 'shell:sudo_required') {
               progressCallback({ type: 'step_sudo_required', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'shell.run', message: evt.message, cmd: evt.cmd });
             }
-          }}
+          },
+          // Run the step inside a labeled pane-visible PTY (shell.run falls back
+          // to spawn when the PTY layer is unreachable). Session is per-task so
+          // consecutive steps share the screen.
+          _ptySession: `task:${state._handoffTaskId || state.sessionId || 'run'}`,
+          _progressCallbackUrl: `http://127.0.0.1:${process.env.OVERLAY_CONTROL_PORT || 3010}/agent-turn${state._handoffTaskId ? `?taskId=${encodeURIComponent(state._handoffTaskId)}` : ''}`,
+        }
         : resolvedArgs;
 
     // Tag edit.agent steps that target the currently-open document — the file
@@ -6812,6 +6838,8 @@ Please try again or search with different terms.`;
       }
     }
 
+    _emitTerminalActivity(`step ${skillCursor + 1}/${skillPlan.length} — ${stepStartDescription || skill}`, 'step');
+
     const result = await runWithHeartbeat(
       mcpAdapter.callService('command', 'command.automate', {
         skill,
@@ -6830,6 +6858,14 @@ Please try again or search with different terms.`;
     );
 
     let raw = result.data || result;
+
+    const _stepOk = raw && (raw.ok ?? raw.success);
+    _emitTerminalActivity(
+      _stepOk
+        ? `step ${skillCursor + 1}/${skillPlan.length} done`
+        : `step ${skillCursor + 1}/${skillPlan.length} failed: ${String((raw && (raw.error || raw.stderr)) || 'unknown error').split('\n')[0].slice(0, 120)}`,
+      _stepOk ? 'step' : 'fail'
+    );
 
     // ── Bot-blocked / empty-items fallback: when web.crawl is blocked OR
     // extracts zero items from a search/listing URL and a registered
