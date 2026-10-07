@@ -237,6 +237,11 @@ function _tryAutoSkipIndependentStep(state) {
   };
 }
 
+// Skills whose steps carry their own internal observe→adapt loop — replaying
+// them verbatim (DET_RETRY) is guaranteed-identical output. Shared by the
+// deterministic-plan short-circuit and the agent-failure ask_user path.
+const _AGENT_SKILLS_FOR_RECOVERY = new Set(['browser.agent', 'cli.agent', 'playwright.agent', 'url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
+
 async function _thinPostFailureHandler(state) {
   const { failedStep, skillPlan, skillCursor, skillResults = [], llmBackend, message, resolvedMessage, stepRetryCount = 0, replanCount = 0, patchHistory = [] } = state;
   const logger = state.logger || console;
@@ -294,11 +299,74 @@ async function _thinPostFailureHandler(state) {
     }
   }
 
+  // ── Agent delegateTo handoff — honor the skill's own routing verdict ───────
+  // cli.agent build_agent returns {delegateTo:'browser.agent'} when a service
+  // is OAuth/console-setup-only. Without this branch that diagnosis surfaces as
+  // a bare error and DET_RETRY replays it verbatim. Substitute the delegate
+  // target once per cursor — a real browser walkthrough instead of a dead end.
+  if (failedStep.delegateTo === 'browser.agent'
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => p.action === 'DELEGATE_REROUTE' && p.cursor === skillCursor)) {
+    const _svc = failedStep.args?.service || failedStep.args?.serviceKey
+      || String(failedStep.description || '').match(/\b([a-z0-9][a-z0-9-]{2,})\b/i)?.[1] || '';
+    const patchedPlan = [...skillPlan];
+    patchedPlan[skillCursor] = {
+      ...patchedPlan[skillCursor],
+      skill: 'browser.agent',
+      args: { action: 'build_agent', service: _svc },
+      description: `Set up ${_svc} credentials via browser (OAuth/console)`,
+    };
+    logger.info(`[ExecuteCommand:ThinRecovery] DELEGATE_REROUTE: ${failedStep.skill} step ${skillCursor + 1} delegated to browser.agent (service=${_svc})`);
+    return {
+      ...state,
+      recoveryAction: 'auto_patch',
+      skillPlan: patchedPlan,
+      recoveryNote: `${_svc} needs OAuth setup in their developer console — handing to the browser agent to walk through it.`,
+      patchHistory: [...patchHistory, { action: 'DELEGATE_REROUTE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      stepRetryCount: stepRetryCount + 1,
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
+  // ── cli.agent build/install failure → generic run loop ─────────────────────
+  // build_agent is a deterministic path; when it fails without a delegateTo
+  // (e.g. install failed), the generic observe→adapt run loop gets one shot
+  // with the failure evidence — different mode, real adaptation. Once/cursor.
+  if (failedStep.skill === 'cli.agent' && failedStep.args?.action === 'build_agent'
+      && !failedStep.delegateTo && !failedStep.askUser
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => p.action === 'TERMINAL_DEBUG' && p.cursor === skillCursor)) {
+    const _svc = failedStep.args?.service || '';
+    const patchedPlan = [...skillPlan];
+    patchedPlan[skillCursor] = {
+      ...patchedPlan[skillCursor],
+      args: { action: 'run', task: `${failedStep.description || `Install and set up ${_svc} CLI`} — build_agent failed: ${String(failedStep.error || '').slice(0, 300)}. Diagnose the failure and complete the install a different way.` },
+      description: failedStep.description || `Install & set up ${_svc}`,
+    };
+    logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: cli.agent build_agent step ${skillCursor + 1} failed — falling back to generic run loop`);
+    return {
+      ...state,
+      recoveryAction: 'auto_patch',
+      skillPlan: patchedPlan,
+      recoveryNote: 'The structured installer failed — handing to the CLI agent loop so it can adapt.',
+      patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      stepRetryCount: stepRetryCount + 1,
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
   // Deterministic-plan short-circuit — a compiled step failing (usually the
   // 10s wall-clock cap under load) must not escalate into LLM replanning or a
   // re-approval round. Retry the same step with a real 60s timeout twice,
   // then surface the honest failure to the user.
-  if (state._deterministicPlan && !state._deterministicExternal) {
+  // SKIP for agent skills and already-escalated cursors: cli.agent/browser.agent
+  // carry their own observe→adapt loop, and an escalated step already has its
+  // verdict — replaying identical args is guaranteed-identical failure.
+  const _agentOrEscalated = _AGENT_SKILLS_FOR_RECOVERY.has(failedStep.skill)
+    || (patchHistory || []).some(p => (p.action === 'AGENT_ESCALATE' || p.action === 'DELEGATE_REROUTE') && p.cursor === skillCursor);
+  if (state._deterministicPlan && !state._deterministicExternal && !_agentOrEscalated) {
     const _detRetries = (patchHistory || []).filter(p => p.action === 'DET_RETRY' && p.cursor === skillCursor).length;
     if (_detRetries < 2) {
       const patchedPlan = [...skillPlan];
@@ -312,6 +380,33 @@ async function _thinPostFailureHandler(state) {
         skillPlan: patchedPlan,
         recoveryNote: '',
         patchHistory: [...patchHistory, { action: 'DET_RETRY', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        stepRetryCount: stepRetryCount + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
+    // ── Terminal debug fallback — DET_RETRY exhausted ───────────────────────
+    // Retrying identical argv is spent. Hand the step to cli.agent's
+    // observe→adapt loop once per cursor: it reads the error, probes
+    // registries/help, and tries a different approach — instead of presenting
+    // the user a bare Retry that replays the dead command.
+    if (!(patchHistory || []).some(p => p.action === 'TERMINAL_DEBUG' && p.cursor === skillCursor)) {
+      const _dbgArgv = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
+      const _dbgTask = `${failedStep.args?.goal || failedStep.description || _dbgArgv || 'complete the failed step'} — previous attempts failed: ${(_dbgArgv ? `\`${_dbgArgv}\` → ` : '')}${String(failedStep.error || 'failed').slice(0, 300)}`;
+      const patchedPlan = [...skillPlan];
+      patchedPlan[skillCursor] = {
+        ...patchedPlan[skillCursor],
+        skill: 'cli.agent',
+        args: { action: 'run', task: _dbgTask },
+        description: failedStep.description || 'Diagnose and complete via terminal agent',
+      };
+      logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: ${failedStep.skill} step ${skillCursor + 1} exhausted retries — handing to cli.agent run loop`);
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        recoveryNote: 'Direct retries failed — handing this step to the CLI agent so it can diagnose the error and adapt.',
+        patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
         stepRetryCount: stepRetryCount + 1,
         failedStep: null,
         commandExecuted: false,
@@ -506,7 +601,6 @@ async function _thinPostFailureHandler(state) {
   const _failedAgentId = failedStep.args?.agentId || failedStep.args?.agent || null;
   const _failedSkill = failedStep.skill || null;
   const _failedOriginalTask = failedStep.args?.task || failedStep.args?.goal || null;
-  const _AGENT_SKILLS_FOR_RECOVERY = new Set(['browser.agent', 'cli.agent', 'playwright.agent', 'url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
   if (_failedAgentId && _AGENT_SKILLS_FOR_RECOVERY.has(_failedSkill)) {
     // Derive current URL and sessionId from state or failedStep so the
     // PartialFailureCard can show context and the resume handler can reuse
@@ -6038,6 +6132,11 @@ Please try again or search with different terms.`;
             options: raw?.options ?? [],
             needsCredentials: raw?.needsCredentials === true,
             needsLogin: raw?.needsLogin === true,
+            // cli.agent delegateTo (e.g. OAuth → browser.agent) must survive into
+            // failedStep so _thinPostFailureHandler can honor the handoff.
+            delegateTo: raw?.delegateTo || null,
+            noCli: raw?.noCli === true,
+            isOAuth: raw?.isOAuth === true,
             // Browser/session fields — session inherit, the cumulative digest,
             // and the synthesize collectors all read these (mirrors the serial
             // stepResult shape at ~stepResult builder).
@@ -7218,6 +7317,9 @@ Please try again or search with different terms.`;
       error: raw.error || null,
       executionTime: raw.executionTime || null,
       needsManualStep: raw.needsManualStep || false,
+      delegateTo: raw.delegateTo || null,
+      noCli:      raw.noCli === true,
+      isOAuth:    raw.isOAuth === true,
       instruction: raw.instruction || null,
       reason: raw.reason || null,
       verified: raw.verified !== undefined ? raw.verified : null,

@@ -459,6 +459,43 @@ function _stripRedundantVerifySteps(skillPlan, state, logger) {
 // "print this file" with no File: in context → args:{} → execution fails with
 // "cmd is required"). Convert those into an ask_user step at plan time so the
 // user gets an actionable question instead of a validation error.
+// Proven install recipes — installCmd/installPkg entries written to
+// cli-registry.json by cli.agent after a verified install. Only these package
+// names keep the blind shell.run fast path in plans; everything else routes
+// through cli.agent's observe→adapt loop first.
+let _provenPkgsCache = null;
+let _provenPkgsMtime = 0;
+function _provenInstallPkgs() {
+  const _candidates = [
+    path.join(__dirname, '..', '..', 'mcp-services', 'command-service', 'src', 'cli-registry.json'),
+    path.join(__dirname, '..', '..', '..', 'mcp-services', 'command-service', 'src', 'cli-registry.json'),
+  ];
+  let file = null, mtime = 0;
+  for (const c of _candidates) {
+    try { const m = fs.statSync(c).mtimeMs; if (m) { file = c; mtime = m; break; } } catch (_) {}
+  }
+  if (!file) return _provenPkgsCache || new Set();
+  if (_provenPkgsCache && mtime === _provenPkgsMtime) return _provenPkgsCache;
+  const pkgs = new Set();
+  try {
+    const registry = JSON.parse(fs.readFileSync(file, 'utf8'));
+    for (const svc of Object.values(registry || {})) {
+      for (const provider of Object.values(svc?.providers || {})) {
+        if (provider.installCmd) {
+          const parts = provider.installCmd.trim().split(/\s+/);
+          const idx = parts.findIndex(p => p === 'install' || p === 'i');
+          const pkg = idx >= 0 && parts[idx + 1] ? parts[idx + 1].replace(/^-+/, '') : parts[parts.length - 1];
+          if (pkg) pkgs.add(pkg);
+        }
+        if (provider.installPkg) pkgs.add(provider.installPkg);
+      }
+    }
+    _provenPkgsCache = pkgs;
+    _provenPkgsMtime = mtime;
+  } catch (_) {}
+  return pkgs;
+}
+
 function _sanitizeSkillPlan(skillPlan, state) {
   if (!Array.isArray(skillPlan)) return skillPlan;
   const _log = state?.logger || console;
@@ -587,7 +624,15 @@ function _sanitizeSkillPlan(skillPlan, state) {
           _pkgArgv = step.args.argv.find((a, i) => i > _verbIdx && typeof a === 'string' && a && !a.startsWith('-')) || null;
         }
       }
-      if ((step.args?.goal && (_setupM || _authM)) || _pkgArgv) {
+      // ── Proving-ground gate ────────────────────────────────────────────
+      // A package-manager argv only keeps the blind shell.run fast path when
+      // it's a PROVEN recipe — cli-registry.json installCmd written by a
+      // successful cli.agent install. Unproven argv gets rewritten to
+      // cli.agent so the observe→adapt loop discovers the real package first
+      // (the "@nylas/cli" E404 was a guessed name planned blind).
+      const _provenPkgs = _provenInstallPkgs();
+      const _argvIsProven = _pkgArgv && _provenPkgs.has(_pkgArgv);
+      if ((step.args?.goal && (_setupM || _authM)) || (_pkgArgv && !_argvIsProven)) {
         // Service name: argv package beats goal text — "@nylas/cli" → "nylas",
         // "nylas-cli" → "nylas", "pkg@1.2" → "pkg".
         const _pkgSvc = _pkgArgv
