@@ -32,7 +32,9 @@ Domain-specific guidance for vision/OCR tasks. The base prompt already establish
 
 ### Multiple images in a folder (two-step pattern)
 
-When the user says "scan the images in [folder]" or "analyze all images in [folder]" without naming specific files, use a two-step pattern: Step 1 lists image files with `shell.run`, then emit one `image.analyze` step per image. The system auto-injects `filePath` from prior `shell.run` stdout — but for multiple images, emit explicit `filePath` args using the paths discovered in step 1.
+When the user says "scan the images in [folder]" or "analyze all images in [folder]" without naming specific files, use a two-step pattern: Step 1 lists image files with `shell.run`, then a single `image.analyze` step that **omits `filePath` entirely** — the executor auto-injects all discovered image paths from step 1's output contract (as `filePaths`), and the skill analyzes each one.
+
+**Do NOT use `{{PREV_OUTPUT}}` as `filePath`** — it resolves to the step's entire stdout (a multi-line path list), not a single path. For a specific image, use `{{LAST_SUCCESSFUL.outputs.filePaths[N]}}` (N = 0-based index). Also do NOT set `runGroup` on steps whose args reference prior output — grouped steps run in parallel and cannot depend on earlier output.
 
 #### CRITICAL — image-listing step MUST emit exact `cmd` + `argv`, NEVER `goal`
 
@@ -52,12 +54,13 @@ Full plan example (replace `<FOLDER>` with the actual absolute path):
 
 ```json
 [
-  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "find '<FOLDER>' -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.tiff' -o -iname '*.heic' \\) | sort"] }, "description": "List image files in <FOLDER>" },
-  { "skill": "image.analyze", "args": { "filePath": "/path/to/folder/image1.png", "query": "Describe what this image shows and any visible text" }, "description": "Analyze first image" },
-  { "skill": "image.analyze", "args": { "filePath": "/path/to/folder/image2.png", "query": "Describe what this image shows and any visible text" }, "description": "Analyze second image" },
+  { "skill": "shell.run", "args": { "cmd": "bash", "argv": ["-c", "find \"<FOLDER>\" -maxdepth 1 -type f \\( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.webp' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.tiff' -o -iname '*.heic' \\) | sort"] }, "description": "List image files in <FOLDER>" },
+  { "skill": "image.analyze", "args": { "query": "Describe what this image shows and any visible text" }, "description": "Analyze all discovered images" },
   { "skill": "synthesize", "args": { "prompt": "Summarize the image analysis results for all images. Group similar findings and highlight differences." }, "description": "Summarize all image analyses" }
 ]
 ```
+
+Note: `find` path arguments use **double quotes** so `$HOME`/`$VAR` still expand — never wrap `$HOME` or `~` in single quotes (`find '$HOME/Desktop'` fails with "No such file or directory").
 
 This pattern applies to ALL phrasings of image-analysis requests, including:
 - "scan the images and tell me what they are"

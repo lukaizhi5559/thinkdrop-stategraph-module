@@ -37,6 +37,7 @@ const TESTS = [
   'url-first-regression.test.js',
   'gmail-compose-url-regression.test.js',
   'plan-helpers.test.js',
+  'runGroup-args.test.js',
   'resolveAgent.test.js',
   'active-doc-routing.test.js',
   'phase2-multiintent.test.js',
