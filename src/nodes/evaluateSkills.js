@@ -502,7 +502,9 @@ Output ONLY valid JSON.`;
       logger.warn(`[Node:EvaluateSkills] Bad-rule guard: skipping DuckDB write — rule prescribes commands/routing, not facts. ruleText: "${verdict.ruleText.slice(0, 120)}"`);
     }
 
-    if (isHollowArtifact || ruleRecommendsBrokenTool || rulePrescribesCommand) {
+    let ruleStored = false;
+    const ruleSkipped = isHollowArtifact || ruleRecommendsBrokenTool || rulePrescribesCommand;
+    if (ruleSkipped) {
       if (isHollowArtifact) logger.info(`[Node:EvaluateSkills] Skipping context rule write — failure was a hollow-detection artifact (not a real execution failure)`);
     } else if (mcpAdapter) {
       // Collect ALL hostnames touched during this run (planned + actual redirects).
@@ -522,6 +524,7 @@ Output ONLY valid JSON.`;
             category: verdict.category || 'general',
             source: 'evaluate_skills_auto'
           }, { timeoutMs: 5000 });
+          ruleStored = true;
           logger.info(`[Node:EvaluateSkills] Stored fix rule for "${key}": ${verdict.ruleText}`);
         } catch (storeErr) {
           logger.warn(`[Node:EvaluateSkills] Failed to store rule for "${key}": ${storeErr.message}`);
@@ -529,10 +532,14 @@ Output ONLY valid JSON.`;
       }
     }
 
+    // Only surface ruleText to the UI when a rule was actually persisted —
+    // the guards above reject command/routing rules, and showing them as
+    // "RULE SAVED" when nothing was written lies to the user.
     if (progressCallback) progressCallback({
       type: 'retrying_with_fix',
       message: `Adjusting approach for ${verdict.contextKey} and retrying...`,
-      ruleText: verdict.ruleText,
+      ruleText: ruleStored ? verdict.ruleText : undefined,
+      ruleSkipped: ruleSkipped || undefined,
       contextKey: verdict.contextKey,
       category: verdict.category || 'general',
     });

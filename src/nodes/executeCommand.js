@@ -320,6 +320,9 @@ async function _thinPostFailureHandler(state) {
         action: 'run',
         agentId: `${_svc}.agent`,
         task: `Set up ${_svc} credentials: open the ${_svc} console/login and guide the user through OAuth or API-key creation. Report exactly what the user must provide. Note: no CLI package exists for ${_svc} (npm/brew probed) — credentials are for API/SDK use.`,
+        // OAuth is human-paced — must clear the 10s deterministic-step cap or
+        // the call dies while the user is still at the login page.
+        timeoutMs: 600000,
       },
       description: `Set up ${_svc} credentials via browser (OAuth/console)`,
     };
@@ -362,7 +365,7 @@ async function _thinPostFailureHandler(state) {
     const patchedPlan = [...skillPlan];
     patchedPlan[skillCursor] = {
       ...patchedPlan[skillCursor],
-      args: { action: 'run', task: `${failedStep.description || `Install and set up ${_svc} CLI`} — build_agent failed: ${String(failedStep.error || '').slice(0, 300)}. Diagnose the failure and complete the install a different way.` },
+      args: { action: 'run', task: `${failedStep.description || `Install and set up ${_svc} CLI`} — build_agent failed: ${String(failedStep.error || '').slice(0, 300)}. Diagnose the failure and complete the install a different way.`, timeoutMs: 300000 },
       description: failedStep.description || `Install & set up ${_svc}`,
     };
     logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: cli.agent build_agent step ${skillCursor + 1} failed — falling back to generic run loop`);
@@ -401,7 +404,7 @@ async function _thinPostFailureHandler(state) {
     patchedPlan[skillCursor] = {
       ...patchedPlan[skillCursor],
       skill: 'cli.agent',
-      args: { action: 'run', task: _dbgTask },
+      args: { action: 'run', task: _dbgTask, timeoutMs: 300000 },
       description: failedStep.description || 'Diagnose and complete via terminal agent',
     };
     logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: ${failedStep.skill} step ${skillCursor + 1} failed — handing to cli.agent run loop`);
@@ -457,7 +460,7 @@ async function _thinPostFailureHandler(state) {
       patchedPlan[skillCursor] = {
         ...patchedPlan[skillCursor],
         skill: 'cli.agent',
-        args: { action: 'run', task: _dbgTask },
+        args: { action: 'run', task: _dbgTask, timeoutMs: 300000 },
         description: failedStep.description || 'Diagnose and complete via terminal agent',
       };
       logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: ${failedStep.skill} step ${skillCursor + 1} exhausted retries — handing to cli.agent run loop`);

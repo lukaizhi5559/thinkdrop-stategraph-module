@@ -2215,9 +2215,9 @@ async function planSkillsV2(state) {
     // Preflight may have already resolved a deep-link for the pinned service
     // (e.g. gmail compose URL) — inject it into browser.agent run args.url so
     // browser.agent selects URL-first navigation instead of a blind start page.
-    const detPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
+    const detPlan = _sanitizeSkillPlan(_lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
       _stripRedundantVerifySteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger),
-      userMessage), logger), logger);
+      userMessage), logger), logger), state);
     // Messaging follow-up body: the service_task template passes the raw
     // message as task ("send this info to X"), so the browser agent never sees
     // the actual content and invents a placeholder body. Attach the resolved
