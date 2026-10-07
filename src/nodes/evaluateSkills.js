@@ -481,7 +481,7 @@ Output ONLY valid JSON.`;
     const failedStderr = String(state.failedStep?.stderr || '').toLowerCase();
     const failedStdout = String(state.failedStep?.stdout || '').toLowerCase();
     const failedOutput = failedStderr + ' ' + failedStdout;
-    const BAD_RULE_SIGNALS = /no available formula|no such formula|command not found|modulenotfounderror|no module named|cannot find module|not found|error: no formula/i;
+    const BAD_RULE_SIGNALS = /no available formula|no such formula|command not found|enoent|modulenotfounderror|no module named|cannot find module|not found|error: no formula/i;
     const ruleToolWords = verdict.ruleText.toLowerCase().match(/\b[a-z][a-z0-9_-]{2,}\b/g) || [];
     const ruleRecommendsBrokenTool = ruleToolWords.some(word =>
       word.length > 3 && failedOutput.includes(word) && BAD_RULE_SIGNALS.test(failedOutput)
@@ -490,7 +490,19 @@ Output ONLY valid JSON.`;
       logger.warn(`[Node:EvaluateSkills] Bad-rule guard: skipping DuckDB write — rule recommends a tool that failed in this very run. ruleText: "${verdict.ruleText.slice(0, 120)}"`);
     }
 
-    if (isHollowArtifact || ruleRecommendsBrokenTool) {
+    // Routing-command guard: rules may carry FACTS ("service requires OAuth",
+    // "site needs login") but never concrete commands or skill routing. An
+    // LLM-judged "use shell.run / npm install -g <pkg> / do NOT use cli.agent"
+    // is a guess — and guesses canonized as rules fight the deterministic
+    // probe/routing gates downstream (observed: nylas-cli rules resurrected a
+    // nonexistent @nylas/cli package and banned cli.agent outright).
+    const ROUTING_RX = /npm\s+i(nstall)?\b|brew\s+install\b|pip3?\s+install\b|apt(-get)?\s+install\b|\bshell\.run\b|\bcli\.agent\b|\bbuild_agent\b|\bbrowser\.agent\b|do\s+not\s+use\s+(a\s+)?\w*agent/i;
+    const rulePrescribesCommand = ROUTING_RX.test(verdict.ruleText);
+    if (rulePrescribesCommand) {
+      logger.warn(`[Node:EvaluateSkills] Bad-rule guard: skipping DuckDB write — rule prescribes commands/routing, not facts. ruleText: "${verdict.ruleText.slice(0, 120)}"`);
+    }
+
+    if (isHollowArtifact || ruleRecommendsBrokenTool || rulePrescribesCommand) {
       if (isHollowArtifact) logger.info(`[Node:EvaluateSkills] Skipping context rule write — failure was a hollow-detection artifact (not a real execution failure)`);
     } else if (mcpAdapter) {
       // Collect ALL hostnames touched during this run (planned + actual redirects).

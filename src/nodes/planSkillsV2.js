@@ -3065,13 +3065,18 @@ The user's request does NOT match any installed skill.
       });
       
       // Replace only the failed step, keep rest of plan
-      const newPlan = [
+      let newPlan = [
         ...skillPlanToUse.slice(0, state.skillCursor),
         replacementStep,
         ...skillPlanToUse.slice(state.skillCursor + 1),
       ];
-      
-      logger.info(`[Node:PlanSkillsV2] Single-step replan complete: replaced step ${state.skillCursor} with new ${replacementStep.skill}`);
+
+      // Single-step replan output must clear the same gates as full plans —
+      // unproven install argv, invented URLs, etc. Otherwise the recovery path
+      // silently reintroduces exactly what sanitize strips.
+      newPlan = _sanitizeSkillPlan(newPlan, state);
+
+      logger.info(`[Node:PlanSkillsV2] Single-step replan complete: replaced step ${state.skillCursor} with new ${newPlan[state.skillCursor]?.skill}`);
       
       // Emit plan_ready with single-step replan flag so UI merges instead of replaces
       if (progressCallback) {

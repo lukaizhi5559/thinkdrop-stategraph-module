@@ -312,10 +312,31 @@ async function _thinPostFailureHandler(state) {
     const patchedPlan = [...skillPlan];
     patchedPlan[skillCursor] = {
       ...patchedPlan[skillCursor],
+      // run — not build_agent: a descriptor existing ≠ credentials configured.
+      // run auto-builds the descriptor and actually opens the console for the
+      // user to complete OAuth / create API keys. Evidence rides in the task.
       skill: 'browser.agent',
-      args: { action: 'build_agent', service: _svc },
+      args: {
+        action: 'run',
+        agentId: `${_svc}.agent`,
+        task: `Set up ${_svc} credentials: open the ${_svc} console/login and guide the user through OAuth or API-key creation. Report exactly what the user must provide. Note: no CLI package exists for ${_svc} (npm/brew probed) — credentials are for API/SDK use.`,
+      },
       description: `Set up ${_svc} credentials via browser (OAuth/console)`,
     };
+    // noCli delegation means no binary exists — later steps that invoke the
+    // service's CLI (`<svc> --version`, cmd=<svc>) are doomed; drop them.
+    if (failedStep.noCli) {
+      for (let i = skillCursor + 1; i < patchedPlan.length; i++) {
+        const s = patchedPlan[i];
+        const invokesBin = s.skill === 'shell.run' && _svc
+          && (s.args?.cmd === _svc || (s.args?.argv || []).some(a => a === _svc)
+            || new RegExp(`\\b${_svc}\\s+--?(version|help)\\b`).test([s.args?.cmd, ...(s.args?.argv || [])].filter(Boolean).join(' ')));
+        if (invokesBin) {
+          logger.info(`[ExecuteCommand:ThinRecovery] DELEGATE_REROUTE: dropping doomed CLI step ${i + 1} (${s.description || s.args?.cmd}) — no ${_svc} binary exists`);
+          patchedPlan.splice(i--, 1);
+        }
+      }
+    }
     logger.info(`[ExecuteCommand:ThinRecovery] DELEGATE_REROUTE: ${failedStep.skill} step ${skillCursor + 1} delegated to browser.agent (service=${_svc})`);
     return {
       ...state,
@@ -350,6 +371,45 @@ async function _thinPostFailureHandler(state) {
       recoveryAction: 'auto_patch',
       skillPlan: patchedPlan,
       recoveryNote: 'The structured installer failed — handing to the CLI agent loop so it can adapt.',
+      patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      stepRetryCount: stepRetryCount + 1,
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
+  // ── Universal terminal fallback — observe→adapt before replan/ask ─────────
+  // ANY failed step that wasn't already handled above (not install-escalated,
+  // not a delegation, not an ask-user pause, not already an agent loop) gets
+  // ONE shot through cli.agent's generic run loop — a labeled PTY session the
+  // user can watch — where it reads the real error, probes reality, and adapts.
+  // Without this, non-install failures (ENOENT verify steps, browser.agent
+  // failures, etc.) went straight to LLM replan and replayed the same argv.
+  if (failedStep
+      && failedStep.skill !== 'cli.agent' && failedStep.skill !== 'terminal.agent'
+      && !failedStep.askUser && !failedStep.delegateTo
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => (p.action === 'TERMINAL_DEBUG' || p.action === 'AGENT_ESCALATE' || p.action === 'DELEGATE_REROUTE') && p.cursor === skillCursor)
+      // Timeout-shaped failures in deterministic plans still get the cheap
+      // DET_RETRY with a longer timeout below — an agent loop for a mere
+      // wall-clock timeout is wasted LLM work.
+      && !(state._deterministicPlan && /timed?\s*out|timeout|ETIMEDOUT/i.test(String(failedStep.error || '')))) {
+    const _dbgCmd = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ')
+      || failedStep.args?.task || failedStep.args?.goal || '';
+    const _dbgTask = `Diagnose and complete: "${failedStep.description || _dbgCmd || 'a step'}" failed: ${String(failedStep.error || 'unknown error').slice(0, 300)}${_dbgCmd ? ` (command: \`${_dbgCmd}\`)` : ''}. Probe reality first (command -v, npm view, brew info, --help) before retrying — report honestly if the step is impossible.`;
+    const patchedPlan = [...skillPlan];
+    patchedPlan[skillCursor] = {
+      ...patchedPlan[skillCursor],
+      skill: 'cli.agent',
+      args: { action: 'run', task: _dbgTask },
+      description: failedStep.description || 'Diagnose and complete via terminal agent',
+    };
+    logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: ${failedStep.skill} step ${skillCursor + 1} failed — handing to cli.agent run loop`);
+    return {
+      ...state,
+      recoveryAction: 'auto_patch',
+      skillPlan: patchedPlan,
+      recoveryNote: 'The step failed — handing it to the terminal agent so it can inspect the error and adapt.',
       patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
       stepRetryCount: stepRetryCount + 1,
       failedStep: null,
