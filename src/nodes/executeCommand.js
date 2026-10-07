@@ -7405,6 +7405,7 @@ Please try again or search with different terms.`;
       diff: raw.diff ?? null,
       toolName: raw.toolName || null,
       stderrHint: raw.stderrHint || null,
+      narration: Array.isArray(raw.narration) ? raw.narration : null,
       userAllowlistHint: !!raw.userAllowlistHint,
       commandName: raw.commandName || null,
       userAllowlistPath: raw.userAllowlistPath || null,
@@ -8121,6 +8122,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         description: description || skill,
         error: enrichedStepResult.error,
         stderr: enrichedStepResult.stderr,
+        narration: enrichedStepResult.narration || null,
         userAllowlistHint: enrichedStepResult.userAllowlistHint || false,
         commandName: enrichedStepResult.commandName || null,
       });
@@ -8203,7 +8205,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         ? (stepResult.skillName || resolvedArgs.name || 'external.skill')
         : null;
       const stepDoneDescription = description || (resolvedSkillName ? `external.skill — ${resolvedSkillName}` : skill);
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepDoneDescription, stdout: stepResult.stdout || stepResult.output, exitCode: stepResult.exitCode, draftPath: stepResult.draftPath || null, filePath: stepResult.filePath || null, openIn: stepResult.openIn || null, diff: stepResult.diff || null });
+      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepDoneDescription, stdout: stepResult.stdout || stepResult.output, exitCode: stepResult.exitCode, draftPath: stepResult.draftPath || null, filePath: stepResult.filePath || null, openIn: stepResult.openIn || null, diff: stepResult.diff || null, narration: stepResult.narration || null });
 
       // ── Auth wall detected by waitForStableText or navigate ─────────────────
       // When waitForStableText (or navigate cold-start) returns authRequired:true
