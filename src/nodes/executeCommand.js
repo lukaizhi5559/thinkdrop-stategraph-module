@@ -243,6 +243,57 @@ async function _thinPostFailureHandler(state) {
 
   if (!failedStep) return state;
 
+  // ── shell.run goal/install failure → escalate to cli.agent's loop ─────────
+  // A one-shot argv can't observe its own stderr — "Retry" replays the same
+  // failing command forever (observed: npm i -g @nylas/cli → E404 ×4). The
+  // cli.agent run loop reads the error, probes (npm view / brew info / --help),
+  // and picks a different approach — same self-heal pattern as SANDBOX_REROUTE.
+  // Runs BEFORE the deterministic-plan short-circuit: an install-shaped argv
+  // failure is never fixed by DET_RETRY's longer timeout. Once per cursor:
+  // if the agent loop also fails, normal recovery takes over.
+  if (failedStep.skill === 'shell.run'
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => p.action === 'AGENT_ESCALATE' && p.cursor === skillCursor)) {
+    const _goalText = `${failedStep.args?.goal || ''} ${failedStep.description || ''}`.trim();
+    const _argvStr = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
+    const _isGoalMode = !!failedStep.args?.goal;
+    const _installish = /\b(install|set\s?up|setup|get|configure|authenticat\w+|sign\s?in|log\s?in|connect|authoriz\w+|download)\b/i.test(_goalText)
+      || /\b(npm|brew|pip3?|pipx|apt(-get)?|gem|cargo)\s+(install|i|add)\b/i.test(_argvStr);
+    if (_isGoalMode || _installish) {
+      // Install of a named tool → build_agent (discovers the real package,
+      // verifies, registers the agent for later steps). Other goals → the
+      // generic run loop with the failure evidence attached.
+      const _svcM = _argvStr.match(/(?:npm|brew|pip3?|pipx|apt(?:-get)?|gem|cargo)\s+(?:install|i|add)\s+(?:-g\s+|--global\s+)?["']?(@?[\w./@-]+)/i)
+        || _goalText.match(/\b(?:install|set\s?up|setup|get|add)\s+(?:the\s+|a\s+|an\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
+      const _svc = _svcM?.[1]
+        ? (_svcM[1].startsWith('@') ? _svcM[1].split('/')[0].slice(1) : _svcM[1].split('@')[0]).replace(/-?cli$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '')
+        : '';
+      const _evidence = `Previous attempt failed: ${_argvStr || '(argv resolved from goal)'} → ${String(failedStep.error || 'failed').slice(0, 300)}`;
+      const _filler = new Set(['the', 'a', 'an', 'it', 'this', 'my', 'your', 'to', 'on', 'in', 'for', 'with']);
+      const _useBuild = _installish && _svc && !_filler.has(_svc) && _svc.length >= 2;
+      const patchedPlan = [...skillPlan];
+      patchedPlan[skillCursor] = {
+        ...patchedPlan[skillCursor],
+        skill: 'cli.agent',
+        args: _useBuild
+          ? { action: 'build_agent', service: _svc }
+          : { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}` },
+        description: failedStep.description || (_useBuild ? `Install & register ${_svc}` : `Retry agentically: ${(_goalText || _argvStr).slice(0, 60)}`),
+      };
+      logger.info(`[ExecuteCommand:ThinRecovery] AGENT_ESCALATE: shell.run step ${skillCursor + 1} failed (${(failedStep.error || '').slice(0, 80)}) — substituting cli.agent ${_useBuild ? `build_agent service=${_svc}` : 'generic run'}`);
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        recoveryNote: `The direct command failed — handing this step to the CLI agent so it can see the error and try a different approach.`,
+        patchHistory: [...patchHistory, { action: 'AGENT_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        stepRetryCount: stepRetryCount + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
+  }
+
   // Deterministic-plan short-circuit — a compiled step failing (usually the
   // 10s wall-clock cap under load) must not escalate into LLM replanning or a
   // re-approval round. Retry the same step with a real 60s timeout twice,
@@ -339,55 +390,6 @@ async function _thinPostFailureHandler(state) {
       failedStep: null,
       commandExecuted: false,
     };
-  }
-
-  // ── shell.run goal/install failure → escalate to cli.agent's loop ─────────
-  // A one-shot argv can't observe its own stderr — "Retry" replays the same
-  // failing command forever (observed: npm i -g @nylas/cli → E404 ×4). The
-  // cli.agent run loop reads the error, probes (npm view / brew info / --help),
-  // and picks a different approach — same self-heal pattern as SANDBOX_REROUTE.
-  // Once per cursor: if the agent loop also fails, normal recovery takes over.
-  if (failedStep.skill === 'shell.run'
-      && Array.isArray(skillPlan) && skillPlan[skillCursor]
-      && !(patchHistory || []).some(p => p.action === 'AGENT_ESCALATE' && p.cursor === skillCursor)) {
-    const _goalText = `${failedStep.args?.goal || ''} ${failedStep.description || ''}`.trim();
-    const _argvStr = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
-    const _isGoalMode = !!failedStep.args?.goal;
-    const _installish = /\b(install|set\s?up|setup|get|configure|authenticat\w+|sign\s?in|log\s?in|connect|authoriz\w+|download)\b/i.test(_goalText)
-      || /\b(npm|brew|pip3?|pipx|apt(-get)?|gem|cargo)\s+(install|i|add)\b/i.test(_argvStr);
-    if (_isGoalMode || _installish) {
-      // Install of a named tool → build_agent (discovers the real package,
-      // verifies, registers the agent for later steps). Other goals → the
-      // generic run loop with the failure evidence attached.
-      const _svcM = _argvStr.match(/(?:npm|brew|pip3?|pipx|apt(?:-get)?|gem|cargo)\s+(?:install|i|add)\s+(?:-g\s+|--global\s+)?["']?(@?[\w./@-]+)/i)
-        || _goalText.match(/\b(?:install|set\s?up|setup|get|add)\s+(?:the\s+|a\s+|an\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
-      const _svc = _svcM?.[1]
-        ? (_svcM[1].startsWith('@') ? _svcM[1].split('/')[0].slice(1) : _svcM[1].split('@')[0]).replace(/-?cli$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '')
-        : '';
-      const _evidence = `Previous attempt failed: ${_argvStr || '(argv resolved from goal)'} → ${String(failedStep.error || 'failed').slice(0, 300)}`;
-      const _filler = new Set(['the', 'a', 'an', 'it', 'this', 'my', 'your', 'to', 'on', 'in', 'for', 'with']);
-      const _useBuild = _installish && _svc && !_filler.has(_svc) && _svc.length >= 2;
-      const patchedPlan = [...skillPlan];
-      patchedPlan[skillCursor] = {
-        ...patchedPlan[skillCursor],
-        skill: 'cli.agent',
-        args: _useBuild
-          ? { action: 'build_agent', service: _svc }
-          : { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}` },
-        description: failedStep.description || (_useBuild ? `Install & register ${_svc}` : `Retry agentically: ${(_goalText || _argvStr).slice(0, 60)}`),
-      };
-      logger.info(`[ExecuteCommand:ThinRecovery] AGENT_ESCALATE: shell.run step ${skillCursor + 1} failed (${(failedStep.error || '').slice(0, 80)}) — substituting cli.agent ${_useBuild ? `build_agent service=${_svc}` : 'generic run'}`);
-      return {
-        ...state,
-        recoveryAction: 'auto_patch',
-        skillPlan: patchedPlan,
-        recoveryNote: `The direct command failed — handing this step to the CLI agent so it can see the error and try a different approach.`,
-        patchHistory: [...patchHistory, { action: 'AGENT_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
-        stepRetryCount: stepRetryCount + 1,
-        failedStep: null,
-        commandExecuted: false,
-      };
-    }
   }
 
   // No LLM backend — surface to user
