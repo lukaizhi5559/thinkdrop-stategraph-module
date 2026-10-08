@@ -368,7 +368,10 @@ module.exports = async function answer(state) {
       const isImage = doc.isImage || doc.imageUrl;
       let lines = `[${i + 1}] ${doc.title || 'Untitled'}`;
       if (isImage && doc.imageUrl) {
-        lines += `\n    IMAGE URL (USE THIS): ${doc.imageUrl}`;
+        // Never hand the LLM the raw image URL — data: URIs flood the context
+        // with base64 it then echoes as ![]() markdown. Cards render from
+        // ITEMS; the model only needs the source page for attribution.
+        lines += `\n    IMAGE: rendered automatically as an image card — do NOT emit ![...](...) markdown for it`;
         lines += `\n    Source page: ${doc.url || doc.originalUrl || 'N/A'}`;
       } else {
         lines += `\n    URL: ${doc.url || 'N/A'}`;
@@ -378,7 +381,7 @@ module.exports = async function answer(state) {
       }
       return lines;
     }).join('\n\n');
-    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: For image results, use the IMAGE URL provided above. Do NOT invent or hallucinate image URLs. Synthesize the results into a SINGLE coherent answer — do NOT repeat the same fact or paragraph multiple times. Each piece of information should appear exactly once.\n\nLINKS: When the answer lists or recommends items that come from these results (businesses, shops, videos, products, articles, sites, tools), each item's name MUST be a markdown link — [Name](URL) — using the URL shown for that result above, or place the URL directly after the item. Use ONLY the URLs provided above; never invent, guess, or reconstruct a URL. If an item has no corresponding result URL, present it without a link rather than making one up.\n\nFORMATTING: Use markdown for readability — **bold** for key items, bullet lists for enumerations, and clear paragraph breaks. Do NOT use markdown headers (#) or code blocks unless the content is genuinely code. Keep the answer concise and well-structured.`;
+    systemInstructions += `\n\n=== WEB SEARCH RESULTS ===\n${formattedResults}\n=== END WEB SEARCH RESULTS ===\n\nCRITICAL: Image results render automatically as cards — NEVER emit ![..](..) image markdown for them. Do NOT invent or hallucinate image URLs. Synthesize the results into a SINGLE coherent answer — do NOT repeat the same fact or paragraph multiple times. Each piece of information should appear exactly once.\n\nLINKS: When the answer lists or recommends items that come from these results (businesses, shops, videos, products, articles, sites, tools), each item's name MUST be a markdown link — [Name](URL) — using the URL shown for that result above, or place the URL directly after the item. Use ONLY the URLs provided above; never invent, guess, or reconstruct a URL. If an item has no corresponding result URL, present it without a link rather than making one up.\n\nFORMATTING: Use markdown for readability — **bold** for key items, bullet lists for enumerations, and clear paragraph breaks. Do NOT use markdown headers (#) or code blocks unless the content is genuinely code. Keep the answer concise and well-structured.`;
   }
 
   // ── Inject conversation history for ambiguous follow-up interpretation ─────────
@@ -680,7 +683,32 @@ module.exports = async function answer(state) {
     let _thinking = '';
     const onReasoning = (r) => { if (r) _thinking += r; };
 
-    let finalAnswer = await backend.generateAnswer(
+    // ── AI Overview short-circuit ────────────────────────────────────────────
+    // When the SERP provider captured a real AI Overview, synthesizing our own
+    // answer from snippets is a wasted LLM call AND usually worse — stream the
+    // overview verbatim, then continue through the shared SOURCES/ITEMS path.
+    // Language-guarded: an English overview must not answer a non-English user.
+    // Original-language queries (state.originalPrompt via webSearch node) yield
+    // localized overviews — when the overview detects as the response language
+    // (e.g. zh query → zh overview) the short-circuit is the right answer.
+    const _overview = typeof state.aiOverview === 'string' && state.aiOverview.trim().length > 40
+      ? state.aiOverview.trim() : null;
+    const _overviewLang = _overview ? _detectTextLanguage(_overview) : null;
+    const _shortCircuit = _overview
+      && !needsInterpretation
+      && (!resolvedResponseLanguage || resolvedResponseLanguage === 'en' || _overviewLang === resolvedResponseLanguage);
+
+    let finalAnswer;
+    if (_shortCircuit) {
+      finalAnswer = _overview;
+      logger.info(`[Node:Answer] AI Overview short-circuit (${finalAnswer.length} chars, lang=${_overviewLang || 'unknown'}) — skipping generateAnswer`);
+      if (typeof streamCallback === 'function') streamCallback(finalAnswer);
+    } else {
+    if (_overview) {
+      logger.info(`[Node:Answer] aiOverview present but not short-circuiting (responseLang=${resolvedResponseLanguage || 'en'}, overviewLang=${_overviewLang || 'unknown'}) — LLM synthesis proceeds`);
+    }
+
+    finalAnswer = await backend.generateAnswer(
       finalQuery,
       payload,
       payload.options,
@@ -772,6 +800,7 @@ Please try asking: "help me track down the video links for each one of these wor
     if (!isStreaming && typeof streamCallback === 'function' && finalAnswer) {
       streamCallback(finalAnswer);
     }
+    } // end else (LLM-synthesis path — overview short-circuit already streamed)
 
     // ── Emit search sources so ResultsWindow can render the favicon pill ─────
     // Uses the \x00SOURCES\x00 sentinel (same channel as \x00REPLACE\x00).
@@ -849,11 +878,12 @@ Please try asking: "help me track down the video links for each one of these wor
       ...state,
       answer: displayAnswer,
       thinking: _thinking || state.thinking || null,
-      _answerStreamed: isStreaming,
+      _answerStreamed: isStreaming || _shortCircuit,
+      _aiOverviewUsed: !!_shortCircuit,
       ...(pendingQuestion ? { pendingQuestion } : {}),
       metadata: {
         ...state.metadata,
-        answerSource: backend.getInfo().type,
+        answerSource: _shortCircuit ? 'serp-overview' : backend.getInfo().type,
         llmBackend: backend.getInfo()
       }
     };

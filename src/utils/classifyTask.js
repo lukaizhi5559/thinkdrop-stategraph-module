@@ -164,6 +164,7 @@ Field rules:
     * A filename WITH an extension (e.g. "instruction.runner.cjs", "main.py", "README.md") → needsClarification:false (system can search the project tree)
     * An absolute or relative path that exists → needsClarification:false
   - NEVER ask about file format, content, or preferences — the system can infer those
+  - NEVER ask when taskType is query — standalone knowledge questions ("who's the president", "what is X") are never needsClarification; web search resolves referent ambiguity on its own
   - NEVER ask when taskType is local_system or browser — these are always clear enough
   - NEVER ask when isFollowUp is true and followUpTarget is resolved — EXCEPT for scheduling tasks where the notification/delivery method is missing (followUpTarget is the task content, not the delivery method)
 
@@ -379,7 +380,14 @@ function deriveResolution(tc, userMessage, hasAttachedCard) {
   }
 
   const unattachedCardAck = !!tc.isThoughtReply && (isAffirm || isDecline);
-  const hedgedVague = tc.needsClarification === true
+  // A well-formed standalone question never needs clarification — the SERP
+  // resolves referent ambiguity ("who's the president" → locale answer) better
+  // than a blocking clarify card that just echoes the question back.
+  const standaloneQuery = tc.taskType === 'query'
+    && !tc.isFollowUp && !tc.isThoughtReply
+    && (/^(?:who|what|when|where|which|whose|why|how|is|are|was|were|do|does|did|can|could|should|would)\b/i.test(word) || /\?\s*$/.test(word))
+    && word.split(/\s+/).length >= 3;
+  const hedgedVague = tc.needsClarification === true && !standaloneQuery
     && (tc.taskType === 'ambiguous' || tc.taskType === 'query');
   const orphanAck = isAffirm && !tc.isFollowUp;
 

@@ -70,44 +70,53 @@ module.exports = async function webSearch(state) {
     }
 
     // ── Media-listing hint (media-search guard in decomposePromptV2) ─────────
-    // Video-listing queries need Brave VIDEO Search (thumbnails → media cards),
-    // but the service's own intent classifier often scores generic queries as
-    // 'web' — so force the provider explicitly. Ensure the query carries a
-    // video keyword — follow-up queries resolved via followUpTarget may lack
-    // one — and ask for more results since the user wants a list, not an answer.
+    // Image/video intents ride the SERP auto-chain — google-serp extracts
+    // inline media cards (+tbm=isch hop for image intent). `intent` is sent as
+    // a hint so the service-side classifier (English-regex) still fires the
+    // image-grid hop for non-English queries its patterns can't match.
     const _mediaListing = state._mediaListing || (state._taskClassification || {}).mediaListing || 'none';
-    const _provider = _mediaListing === 'video' ? 'brave-video'
-      : _mediaListing === 'image' ? 'brave-image'
+    const _intentHint = _mediaListing === 'video' ? 'video'
+      : _mediaListing === 'image' ? 'image'
       : null;
     if (_mediaListing === 'video' && !/\b(videos?|tutorial|episode|sermon|clip)s?\b/i.test(query)) {
       query = `${query} videos`;
       logger.info(`[Node:WebSearch] mediaListing=video — appended video keyword: "${query}"`);
     }
 
-    logger.debug(`[Node:WebSearch] Query: "${query}"${_provider ? ` provider=${_provider}` : ''}`);
+    // ── Original-language search ────────────────────────────────────────────
+    // comms-graph translates prompts to English before the handoff; searching
+    // the translation returns English sources even for native speakers. When
+    // a non-English original exists, search IT — the SERP skews to native
+    // sources (Baidu/Temu-class domains) and the AI Overview arrives in the
+    // user's language (making the answer-node overview short-circuit usable).
+    const _searchLang = (state.detectedLanguage && state.detectedLanguage !== 'en')
+      ? state.detectedLanguage : null;
+    if (_searchLang && typeof state.originalPrompt === 'string' && state.originalPrompt.trim()) {
+      // Follow-ups resolved via followUpTarget are context-free in ANY language —
+      // prepend the resolved target so the query stays concrete.
+      const _isFollowUp = tc.isFollowUp === true
+        || (_mediaListing !== 'none' && tc.isScreenFollowUp !== true && /(images?|pictures?|photos?|videos?|clips?|tutorials?)/i.test(query));
+      const _isResolvedSub = state._workflowPlan?.execution?.strategy === 'workflow_sequence';
+      const _orig = (!tc.isScreenFollowUp && _isFollowUp && tc.followUpTarget && !_isResolvedSub)
+        ? `${tc.followUpTarget} ${state.originalPrompt.trim()}`
+        : state.originalPrompt.trim();
+      if (_orig) {
+        query = _orig;
+        logger.info(`[Node:WebSearch] original-language query (${_searchLang}): "${query.slice(0, 80)}"`);
+      }
+    }
+
+    logger.debug(`[Node:WebSearch] Query: "${query}"`);
 
     // Call web-search service. NOTE: the route reads `maxResults` (not `limit`).
-    // Forced-provider calls skip the service's fallback chain — on empty/failed
-    // results, retry once with auto provider before returning empty.
-    const _searchArgs = (provider) => ({
+    const _searchArgs = () => ({
       query,
       limit: _mediaListing === 'video' ? 8 : 3,
-      ...(provider ? { provider } : {}),
       ...(_mediaListing === 'video' ? { maxResults: 8 } : {}),
+      ...(_intentHint ? { intent: _intentHint } : {}),
+      ...(_searchLang ? { lang: _searchLang } : {}),
     });
-    let result = null;
-    try {
-      result = await mcpAdapter.callService('web-search', 'web.search', _searchArgs(_provider));
-    } catch (e) {
-      if (!_provider) throw e;
-      logger.warn(`[Node:WebSearch] ${_provider} call failed (${e.message}) — will retry with auto provider`);
-      result = null;
-    }
-    const _resultCount = (r) => ((r?.data || r)?.results || []).length;
-    if (_provider && _resultCount(result) === 0) {
-      logger.warn(`[Node:WebSearch] ${_provider} returned 0 results — retrying with auto provider`);
-      result = await mcpAdapter.callService('web-search', 'web.search', _searchArgs(null));
-    }
+    let result = await mcpAdapter.callService('web-search', 'web.search', _searchArgs());
 
     // MCP protocol wraps response in 'data' field
     const searchData = result.data || result;
@@ -119,16 +128,24 @@ module.exports = async function webSearch(state) {
     // video results. Video results carry thumbnails + duration + channel that
     // the answer node emits as media cards via the \x00ITEMS\x00 sentinel.
     const contextDocs = searchResults.map(r => {
-      const isImageResult = r.type === 'image-result';
-      const isVideoResult = r.type === 'video-result';
-      const imageUrl = isImageResult && r.metadata?.properties?.url ? r.metadata.properties.url : null;
-      const originalUrl = isImageResult && r.metadata?.properties?.originalUrl ? r.metadata.properties.originalUrl : null;
-      // Video results: thumbnail may be under metadata.thumbnail.src or r.thumbnail.src
+      // Legacy Brave shapes: 'image-result'/'video-result'. New SERP shapes:
+      // 'image'/'video'/'news' with flat thumbnail/duration fields.
+      const isImageResult = r.type === 'image-result' || r.type === 'image';
+      const isVideoResult = r.type === 'video-result' || r.type === 'video';
+      const imageUrl = isImageResult
+        ? (r.metadata?.properties?.url || r.thumbnail || r.imageUrl || null) : null;
+      const originalUrl = isImageResult
+        ? (r.metadata?.properties?.originalUrl || r.originalUrl || null) : null;
+      // Video results: thumbnail may be under metadata.thumbnail.src, r.thumbnail.src,
+      // or (SERP) flat r.thumbnail
       const videoThumb = isVideoResult
-        ? (r.metadata?.thumbnail?.src || r.thumbnail?.src || r.metadata?.properties?.thumbnail || null)
+        ? (r.metadata?.thumbnail?.src || r.thumbnail?.src || r.metadata?.properties?.thumbnail
+            || (typeof r.thumbnail === 'string' ? r.thumbnail : null))
         : null;
       // News/article results also carry thumbnails sometimes.
-      const articleThumb = (!isImageResult && !isVideoResult && r.metadata?.thumbnail?.src) ? r.metadata.thumbnail.src : null;
+      const articleThumb = (!isImageResult && !isVideoResult)
+        ? (r.metadata?.thumbnail?.src || (typeof r.thumbnail === 'string' ? r.thumbnail : null))
+        : null;
       const thumb = videoThumb || articleThumb;
 
       return {
@@ -154,10 +171,16 @@ module.exports = async function webSearch(state) {
       };
     });
 
+    // AI Overview (google-serp/bing-serp) — answer.js short-circuits on this.
+    const aiOverview = typeof searchData.aiOverview === 'string' && searchData.aiOverview.trim()
+      ? searchData.aiOverview.trim() : null;
+    if (aiOverview) logger.info(`[Node:WebSearch] aiOverview captured (${aiOverview.length} chars)`);
+
     return {
       ...state,
       searchResults,
-      contextDocs
+      contextDocs,
+      aiOverview
     };
   } catch (error) {
     logger.error('[Node:WebSearch] Error:', error.message);

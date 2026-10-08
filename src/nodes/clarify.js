@@ -112,6 +112,22 @@ module.exports = async function clarify(state) {
   if (tc.resolution !== 'needs_clarification') return state;
   if (state._clarified) return state;
 
+  // Backstop: a well-formed standalone knowledge question should never block
+  // on a clarify card — the SERP resolves referent ambiguity. deriveResolution
+  // already exempts these; this catches stragglers (e.g. taskType slipped to
+  // 'ambiguous' on a wh-question). Clearing resolution also keeps
+  // decomposePromptV2's needs_clarification→memory_retrieve guard off it.
+  const _q = String(state.message || '').trim();
+  const _standaloneQuery = !tc.isFollowUp && !tc.isThoughtReply
+    && (tc.taskType === 'query' || tc.taskType === 'ambiguous')
+    && (/^(?:who|what|when|where|which|whose|why|how|is|are|was|were|do|does|did|can|could|should|would)\b/i.test(_q) || /\?\s*$/.test(_q))
+    && _q.split(/\s+/).length >= 3;
+  if (_standaloneQuery) {
+    logger.info(`[Node:Clarify] needs_clarification on standalone query — bypassing ask, search will resolve: "${_q.slice(0, 60)}"`);
+    return { ...state, _clarified: true, _clarifyOutcome: 'standalone_query_bypass',
+      _taskClassification: { ...tc, resolution: 'resolved', needsClarification: false } };
+  }
+
   // Pipeline-control states never clarify — they carry their own flow.
   if (state._planFile || state._skillPlan || state.skillBuildRequest || state.intentPlan ||
       state._planCorrectionMode || state._resumeContext || state._gatherQuestionPending ||

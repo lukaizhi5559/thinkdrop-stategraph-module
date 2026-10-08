@@ -5651,6 +5651,16 @@ Please try again or search with different terms.`;
   // Special case: file.bridge poll uses pollTimeoutMs for the internal poll duration — the HTTP
   // timeout must be longer than that or the MCPClient kills the request before the poll completes.
   let stepTimeoutMs = resolvedArgs.timeoutMs || 60000;
+  // ── Deterministic fast-path: hard 10s wall-clock per step ─────────────────
+  // Catalog skills are all quick local ops (shell.run/fs.read/screen.capture/
+  // schedule*) — a step exceeding 10s indicates a hang, not legitimate work.
+  // Applied BEFORE the per-skill floors below: a skill that declares a floor
+  // (browser.act, web.crawl, agents, project_build…) keeps it — det plans can
+  // legitimately contain those skills and the cap was stomping them (observed:
+  // web.crawl killed at exactly 10000ms mid-extraction).
+  if (Array.isArray(state._deterministicPlan) && !state._deterministicExternal && !resolvedArgs.timeoutMs) {
+    if (stepTimeoutMs > 10000) stepTimeoutMs = 10000;
+  }
   if (skill === 'file.bridge' && resolvedArgs.action === 'poll' && resolvedArgs.pollTimeoutMs) {
     stepTimeoutMs = Math.max(stepTimeoutMs, resolvedArgs.pollTimeoutMs + 10000);
   }
@@ -5667,8 +5677,10 @@ Please try again or search with different terms.`;
     stepTimeoutMs = Math.max(stepTimeoutMs, 300000);
   }
   // web.crawl launches playwright-cli, navigates, waits for JS render — needs at least 45s.
+  // Multi-candidate retries + item-extraction scroll passes + warm retry can exceed
+  // 45s — 90s covers the worst case (observed: 3 candidates + warm ≈ 60-70s).
   if (skill === 'web.crawl') {
-    stepTimeoutMs = Math.max(stepTimeoutMs, 45000);
+    stepTimeoutMs = Math.max(stepTimeoutMs, 90000);
   }
   // app.agent run_app_flow: screen captures, OCR, web discovery, and monitoring
   // AI responses can take minutes. The HTTP timeout must be LONGER than the
@@ -5716,14 +5728,6 @@ Please try again or search with different terms.`;
     }
   }
 
-  // ── Deterministic fast-path: hard 10s wall-clock per step ─────────────────
-  // Catalog skills are all quick local ops (shell.run/fs.read/screen.capture/
-  // schedule*) — a step exceeding 10s indicates a hang, not legitimate work.
-  // Steps that genuinely need longer must explicitly opt out via args.timeoutMs
-  // (the plan's stated budget beats the cap).
-  if (Array.isArray(state._deterministicPlan) && !state._deterministicExternal && !resolvedArgs.timeoutMs) {
-    if (stepTimeoutMs > 10000) stepTimeoutMs = 10000;
-  }
   // ── project_build: route to project.builder MCP skill ──────────────────────
   if (skill === 'project_build') {
     if (progressCallback) progressCallback({
