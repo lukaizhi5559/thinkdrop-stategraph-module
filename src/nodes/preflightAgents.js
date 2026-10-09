@@ -164,6 +164,22 @@ function markAgentAuthFailed(agentId, reason) {
   });
 }
 
+// CLI-agent ledger consult — same newest-evidence-wins rule as the browser
+// path: authed:true is trusted until a failure stamped at/after it proves it
+// stale. Used only when the CLI probe is INCONCLUSIVE (verifyCmd absent or
+// 'unknown') — an inconclusive probe is no observation, not a broken one.
+function _cliLedgerAuth(agentId) {
+  const ledger = _getLedgerAuth(agentId);
+  if (!ledger) return { authed: false, failed: false };
+  const _tsOf = (t) => (typeof t === 'number' ? t : Date.parse(t)) || 0;
+  const failedAt = Math.max(ledger.lastAuthFailedAt || 0, ledger.authed === false ? _tsOf(ledger.ts) : 0);
+  const authedAt = ledger.authed === true ? _tsOf(ledger.ts) : 0;
+  return { authed: authedAt > failedAt, failed: failedAt > 0 && failedAt >= authedAt };
+}
+
+// Probe verdicts that mean "couldn't determine" — not proof of broken auth.
+const _CLI_AUTH_INCONCLUSIVE = new Set(['unknown', 'no_auth_check', 'configured_unverified', 'no_token_returned']);
+
 // Browser-profile existence check — NOT a staleness check. Existence is only
 // the migration signal (pre-ledger session); it cannot prove login.
 const BROWSER_PROFILES_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-profiles');
@@ -1192,6 +1208,7 @@ module.exports = async function preflightAgents(state) {
                     type: 'preflight:auth_required',
                     agentId: _agentId,
                     serviceName: c.service,
+                    cliTool: c.cli || null,
                     authType: 'cli_setup',
                     iconUrl,
                     message: `${c.service} needs configuration`,
@@ -1213,6 +1230,7 @@ module.exports = async function preflightAgents(state) {
                   type: 'preflight:auth_required',
                   agentId: _agentId,
                   serviceName: c.service,
+                  cliTool: c.cli || null,
                   authType: 'cli_setup',
                   iconUrl,
                   message: `${c.service} needs configuration`,
@@ -1222,8 +1240,18 @@ module.exports = async function preflightAgents(state) {
               } else {
                 const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : (c.authStatus === 'configured' ? ' — configured' : ''));
                 lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
-                const authed = !!c.authUser || c.authStatus === 'authenticated' || c.authStatus === 'configured';
                 const _agentId = c.agentId || `${c.service}.agent`;
+                let authed = !!c.authUser || c.authStatus === 'authenticated' || c.authStatus === 'configured';
+                // Two-way ledger — same trust model as browser agents:
+                // inconclusive probe + ledger-authed ⇒ pass (a blind probe is
+                // no observation of broken); definitive probe verdicts write
+                // the ledger so next run reflects what was just observed.
+                if (!authed && _CLI_AUTH_INCONCLUSIVE.has(c.authStatus) && _cliLedgerAuth(_agentId).authed) {
+                  authed = true;
+                  logger.info(`[Node:PreflightAgents] ${_agentId}: probe inconclusive (${c.authStatus}) but ledger is authed — proceeding`);
+                }
+                if (c.authStatus === 'authenticated' || c.authStatus === 'configured' || c.authUser) markAgentAuthed(_agentId);
+                else if (c.authStatus === 'not_authenticated' || c.authStatus === 'token_expired') markAgentAuthFailed(_agentId, `preflight probe: ${c.authStatus}`);
                 const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli, true);
                 agentReadiness.push({ type: 'cli', agentId: _agentId, ready: true, authed, iconUrl, service: c.service, setupInfo: _enrichedSetupInfo });
 
@@ -1234,6 +1262,7 @@ module.exports = async function preflightAgents(state) {
                     type: 'preflight:auth_required',
                     agentId: _agentId,
                     serviceName: c.service,
+                    cliTool: c.cli || null,
                     authType: 'cli_setup',
                     iconUrl,
                     message: `${c.service} agent`,
@@ -1430,6 +1459,7 @@ module.exports = async function preflightAgents(state) {
                 type: 'preflight:auth_required',
                 agentId: a.id,
                 serviceName: svcKey,
+                cliTool: a.cli_tool || a.cliTool || null,
                 authType: a.type,
                 iconUrl,
                 message: `${a.id} requires ${a.type} credentials before planning`,
@@ -1614,6 +1644,7 @@ module.exports = async function preflightAgents(state) {
               type: 'preflight:auth_required',
               agentId: 'vet',
               serviceName: 'vet',
+              cliTool: 'vet',
               authType: 'cli_install',
               iconUrl: null,
               message: 'vet CLI not installed — recommended for secure installations: brew tap vet-run/vet && brew install vet-run',
@@ -1726,6 +1757,7 @@ module.exports = async function preflightAgents(state) {
                 type: 'preflight:auth_required',
                 agentId,
                 serviceName: drifted.service,
+                cliTool: drifted.cli || null,
                 authType: 'cli_update_needed',
                 iconUrl,
                 message: `${drifted.cli} updated (${drifted.oldVersion} → ${drifted.newVersion}) — validation: ${val.verdict}`,
@@ -3082,6 +3114,7 @@ module.exports = async function preflightAgents(state) {
 module.exports.markAgentAuthed = markAgentAuthed;
 module.exports.markAgentAuthFailed = markAgentAuthFailed;
 module.exports._getLedgerAuth = _getLedgerAuth;
+module.exports._cliLedgerAuth = _cliLedgerAuth;
 module.exports.clearAuthCache = function clearAuthCache(agentId) {
   if (agentId) _authCache.delete(agentId.toLowerCase());
 };

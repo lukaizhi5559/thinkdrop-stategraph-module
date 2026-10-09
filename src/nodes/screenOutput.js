@@ -478,6 +478,48 @@ module.exports = async function screenOutput(state) {
       if (tc.screenOutputContent) payload.caption = tc.screenOutputContent;
       break;
     }
+    case 'doc': {
+      // Markdown artifact card (Claude-style editor) — content comes from the
+      // classifier's literal, a prior gather/generate step, or the last answer.
+      const content =
+        tc.screenOutputContent ||
+        _stepResultText(state) ||
+        _lastAssistantText(state.conversationHistory) ||
+        state.synthesisAnswer ||
+        state.answer;
+      if (!content) {
+        return {
+          ...state,
+          _directAnswer: '## Screen\n\nNothing on hand to write up — what should the doc say?',
+        };
+      }
+      // Strip a leading "## Screen" ack header — never carry it into the doc body.
+      payload.doc = payload.doc || { markdown: content.replace(/^## Screen\n+/i, ''), editable: true };
+      if (tc.screenOutputContent && !payload.title) payload.title = tc.screenOutputContent;
+      break;
+    }
+    case 'scene': {
+      // Generative escape hatch — animations/diagrams/custom visuals the
+      // presets can't express. An explicit scene payload (registered name or
+      // generated html/css/js) passes through; otherwise the scene model
+      // writes a three.js body. Failure is an honest error, never a wrong
+      // display — same contract as the 'three' generative fallback.
+      if (!payload.scene || (!payload.scene.name && !payload.scene.html && !payload.scene.js)) {
+        const gen = await _generateThreeScene(message, state, logger);
+        if (!gen) {
+          return {
+            ...state,
+            _directAnswer: "## Screen\n\nCouldn't generate that scene — the scene model timed out or returned unusable code. Try again, or ask for a chart/deck/doc instead.",
+          };
+        }
+        payload.scene = gen;
+      }
+      payload.id = payload.id || 'scene:active';
+      if (/\b(?:drag|click|play|interact|control|orbit|move|steer|fly|drive|game)\b/i.test(message)) {
+        payload.blocking = true;
+      }
+      break;
+    }
     case 'three': {
       // Preset 3D scenes — deterministic parse from the message; an explicit
       // payload.three from the classifier merges over the inferred defaults.

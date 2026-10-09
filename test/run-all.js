@@ -57,6 +57,8 @@ const TESTS = [
   'lint-synthesize-ordering.test.js',
   'reviewExecution.test.js',
   'reliability.test.js',
+  'sanitize-install-rewrite.test.js',
+  'preflight-cli-ledger.test.js',
   'unit.test.js',
 ];
 

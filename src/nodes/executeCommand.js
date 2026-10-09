@@ -988,7 +988,7 @@ function _generateContractSummary(stepResult) {
     case 'image.analyze':
       return `Image analysis of ${args.filePath || 'image'} ${status}`;
     case 'cli.agent':
-      return `CLI command '${args.command?.slice(0, 50)}...' ${status}`;
+      return `CLI command '${(args.command || args.task || args.service || args.action || '').slice(0, 50)}...' ${status}`;
     case 'edit.agent':
       return `Edit agent on ${args.filePath || args.path || 'file'} ${status}`;
     case 'app.agent':

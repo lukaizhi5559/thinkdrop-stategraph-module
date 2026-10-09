@@ -758,17 +758,22 @@ module.exports = async function resolveAgent(state) {
     // entirely and fall through to LLM selection (its path can create a real
     // agent via startUrl resolution instead of asserting existence).
     let _pinVerified = !mcpAdapter || !svcAgent; // no registry to check → pin
+    let _registered = [];
     if (mcpAdapter && svcAgent) {
       try {
         const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
-        const registered = (agRes?.data || agRes || []).filter(a => a && a.id);
-        _pinVerified = registered.some(a => String(a.id).toLowerCase() === String(svcAgent).toLowerCase());
+        _registered = (agRes?.data || agRes || []).filter(a => a && a.id);
+        _pinVerified = _registered.some(a => String(a.id).toLowerCase() === String(svcAgent).toLowerCase());
       } catch (_) { _pinVerified = true; /* registry unreachable — pin anyway */ }
     }
     if (_pinVerified) {
       logger.info(`[Node:ResolveAgent] Deterministic service plan — pinned agent ${svcAgent}`);
+      // Truthful type — a cli/api pin must not land in _resolverTypeMap as
+      // 'browser' or downstream auth routing picks the wrong lane.
+      const _pinRec = _registered
+        .find(a => String(a.id).toLowerCase() === String(svcAgent).toLowerCase());
       return { ...state, resolveAgentResult: {
-        agents: [{ agentId: svcAgent, role: resolvedMessage || message || '', exists: true, create: false, type: 'browser' }],
+        agents: [{ agentId: svcAgent, role: resolvedMessage || message || '', exists: true, create: false, type: _pinRec?.type || 'browser' }],
         reasoning: 'deterministic service template', question: null,
       } };
     }
@@ -820,15 +825,21 @@ module.exports = async function resolveAgent(state) {
   const _pinned = state._pinnedAgentId && String(state._pinnedAgentId).toLowerCase();
   if (_pinned && _pinned.endsWith('.agent')) {
     let _pinOk = true;
+    let _pinType = null;
     try {
       const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
       const registered = (agRes?.data || agRes || []).filter(a => a && a.id);
       _pinOk = registered.some(a => String(a.id).toLowerCase() === _pinned);
+      // Truthful registry type — a cli/api pin must not leave the planner
+      // thinking the lane is browser-shaped (browser appendix vocabulary →
+      // url.first/dom.act steps bound to an agent that can't run them).
+      _pinType = registered
+        .find(a => String(a.id).toLowerCase() === _pinned)?.type || null;
     } catch (_) { /* registry unreachable — honor the pin anyway */ }
     if (_pinOk) {
-      logger.info(`[Node:ResolveAgent] Pinned agent ${_pinned} — binding directly`);
+      logger.info(`[Node:ResolveAgent] Pinned agent ${_pinned} — binding directly${state._capabilityReason ? ` (selector: ${state._capabilityReason})` : ''}`);
       return { ...state, resolveAgentResult: {
-        agents: [{ agentId: _pinned, role: userMessage, exists: true, create: false }],
+        agents: [{ agentId: _pinned, role: userMessage, exists: true, create: false, type: _pinType }],
         reasoning: 'pinned by capability guard', question: null,
         _message: userMessage,
       } };

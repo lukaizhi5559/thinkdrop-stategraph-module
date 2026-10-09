@@ -19,6 +19,7 @@ const fs   = require('fs');
 const os   = require('os');
 
 const { parsePlan, buildStepDescription, serializeSkillPlanToMd, lintFileEditPlan, lintAtomicBrowserPlan, CONFIRM_ONLY_RE, FILE_EDIT_INTENT_RE, getAttachedFilePaths } = require('../utils/planHelpers');
+const { SCREEN_VISUAL_KIND_RE, SCREEN_DELIVERABLE_RE } = require('../utils/textPatterns.cjs');
 const { SITE_SEARCH_URLS } = require('../utils/localPlanTemplates');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
@@ -612,7 +613,15 @@ function _sanitizeSkillPlan(skillPlan, state) {
       // fallback, PTY for menus). Deterministic rewrite — the LLM directive
       // above is guidance; this catches the misses.
       const _goalText = `${step.args?.goal || ''} ${step.description || ''}`;
-      const _setupM = _goalText.match(/\b(install|set\s?up|setup|get|add|download)\s+(?:the\s+|a\s+|an\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
+      // Install-shaped verbs ONLY — `get`/`add` are fetch/edit verbs whose
+      // object is almost never a tool name ("get first 50KB" captured "first",
+      // "add a column" would capture "column"). The captured word must also
+      // appear near the START of the step text — a verb buried mid-pipeline
+      // ("extract the pdf, then install jq if missing") describes one clause
+      // of a larger step; rewriting the whole step to build_agent would drop
+      // the primary work.
+      const _setupM = _goalText.match(/\b(install|set\s?up|setup|download)\s+(?:the\s+|a\s+|an\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
+      const _setupEarly = (_setupM && _setupM.index <= 40) ? _setupM : null;
       const _authM  = _goalText.match(/\b(authenticat\w+|sign\s?in|log\s?in|connect|configure|authoriz\w+)\b/i);
       // Explicit-argv installs too — "npm install -g <pkg>" / "brew install <x>"
       // emitted as literal cmd/argv (the Nylas E404 was exactly this shape).
@@ -632,23 +641,52 @@ function _sanitizeSkillPlan(skillPlan, state) {
       // (the "@nylas/cli" E404 was a guessed name planned blind).
       const _provenPkgs = _provenInstallPkgs();
       const _argvIsProven = _pkgArgv && _provenPkgs.has(_pkgArgv);
-      if ((step.args?.goal && (_setupM || _authM)) || (_pkgArgv && !_argvIsProven)) {
+      if ((step.args?.goal && (_setupEarly || _authM)) || (_pkgArgv && !_argvIsProven)) {
         // Service name: argv package beats goal text — "@nylas/cli" → "nylas",
         // "nylas-cli" → "nylas", "pkg@1.2" → "pkg".
         const _pkgSvc = _pkgArgv
           ? (_pkgArgv.startsWith('@') ? _pkgArgv.split('/')[0].slice(1) : _pkgArgv.split('@')[0]).replace(/-?cli$/i, '')
           : '';
-        const _svcRaw = _pkgSvc || _setupM?.[2] || '';
+        const _svcRaw = _pkgSvc || _setupEarly?.[2] || '';
         const _svc = _svcRaw.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const _filler = new Set(['the', 'a', 'an', 'it', 'this', 'my', 'your', 'to', 'on', 'in', 'for', 'with']);
-        if (_authM && !_setupM) {
+        const _filler = new Set([
+          // articles / pronouns / connectives
+          'the', 'a', 'an', 'it', 'this', 'that', 'these', 'those', 'my', 'your', 'our', 'their', 'his', 'her', 'its',
+          'to', 'on', 'in', 'for', 'with', 'of', 'off', 'up', 'out', 'as', 'at', 'by', 'or', 'and', 'if', 'is', 'are',
+          'was', 'were', 'be', 'been', 'so', 'no', 'not', 'do', 'does', 'did', 'done', 'then', 'than', 'via', 'per', 'like',
+          'me', 'us', 'them', 'him', 'we', 'you', 'i',
+          // ordinals / quantifiers — "get FIRST 50KB", "download the LATEST release"
+          'first', 'second', 'third', 'fourth', 'fifth', 'last', 'next', 'previous', 'latest', 'newest', 'oldest',
+          'each', 'every', 'all', 'some', 'any', 'more', 'most', 'few', 'several', 'only', 'just', 'right', 'correct',
+          'proper', 'appropriate', 'same', 'other', 'another', 'new', 'old', 'current', 'entire', 'full', 'whole',
+          'rest', 'remaining', 'available', 'free', 'best', 'top', 'bottom',
+          // generic nouns that are never the tool's name
+          'file', 'files', 'folder', 'directory', 'path', 'output', 'content', 'contents', 'text', 'data', 'result',
+          'results', 'stdout', 'stderr', 'code', 'script', 'commands', 'command', 'binary', 'packages', 'package',
+          'tools', 'tool', 'cli', 'agents', 'agent', 'services', 'service', 'environment', 'env', 'var', 'variable',
+          'variables', 'config', 'configuration', 'settings', 'setting', 'profile', 'credential', 'credentials',
+          'account', 'version', 'releases', 'release', 'repos', 'repo', 'repository', 'dependencies', 'dependency',
+          'modules', 'module', 'libraries', 'library', 'sdk', 'runtime', 'driver', 'plugins', 'plugin', 'extensions',
+          'extension', 'updates', 'update', 'upgrades', 'upgrade', 'patch', 'reports', 'report', 'documents',
+          'document', 'images', 'image', 'videos', 'video', 'audios', 'audio', 'assets', 'asset', 'archives',
+          'archive', 'apps', 'app', 'application', 'applications', 'systems', 'system', 'machines', 'machine',
+          'devices', 'device', 'processes', 'process', 'sessions', 'session', 'terminals', 'terminal', 'shells',
+          'shell', 'key', 'keys', 'token', 'tokens', 'password', 'passwords', 'url', 'urls', 'link', 'links',
+          'name', 'names', 'user', 'users', 'kb', 'mb', 'gb',
+          // file extensions — "download the pdf" fetches a document, it does not install a tool named "pdf"
+          'pdf', 'doc', 'docx', 'txt', 'rtf', 'odt', 'csv', 'tsv', 'xls', 'xlsx', 'ppt', 'pptx', 'png', 'jpg', 'jpeg',
+          'gif', 'webp', 'svg', 'heic', 'mp4', 'mov', 'avi', 'mkv', 'mp3', 'wav', 'flac', 'aac', 'zip', 'tar', 'gz',
+          'bz2', '7z', 'rar', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'md', 'markdown', 'epub', 'pages',
+          'numbers', 'key', 'dmg', 'iso', 'exe', 'msi', 'deb', 'rpm',
+        ]);
+        if (_authM && !_setupEarly) {
           // auth/configure/connect — generic cli.agent run (drives PTY auth
           // menus itself); agentId left off so the generic loop handles it
           // whether or not a registered agent exists.
           step.skill = 'cli.agent';
           step.args = { action: 'run', task: (_goalText || step.description || '').trim() };
           _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: rewrote shell.run auth/setup step → cli.agent run "${step.args.task.slice(0, 80)}"`);
-        } else if (_svc && !_filler.has(_svc) && _svc.length >= 2) {
+        } else if (_svc && !_filler.has(_svc) && _svc.length >= 2 && !/^\d/.test(_svc)) {
           // install/setup of a named tool → build_agent discovers the real
           // package (no hallucinated names), installs, verifies, registers.
           step.skill = 'cli.agent';
@@ -1196,7 +1234,7 @@ function _buildSystemPrompt(userMessage, state) {
   // ── Determine which domain appendices are relevant ──────────────────────
   // The base prompt is always loaded; selected appendices are concatenated so
   // cross-domain tasks (e.g. browser extraction + file save) see the full toolset.
-  const _needsBrowser = (_tc?.requiresDOM === true) || (_hasExplicitUrl && !_browserIsOpen)
+  let _needsBrowser = (_tc?.requiresDOM === true) || (_hasExplicitUrl && !_browserIsOpen)
     // Interactive web tasks (send email, add to cart, create event) classify as
     // taskType:messaging/productivity — not 'browser' — but still need the
     // atomic browser skills vocabulary (url.first/dom.act/turn.loop).
@@ -1237,13 +1275,26 @@ function _buildSystemPrompt(userMessage, state) {
       _tc?.taskType?.includes(k) || _tc?.intent?.includes(k) || userMessage.toLowerCase().includes(k)
     ));
 
-  const _needsCli = _tc?.taskType === 'cli'
+  let _needsCli = _tc?.taskType === 'cli'
     || _tc?.targetService?.startsWith('cli:')
     || ['gh', 'aws', 'yt-dlp', 'ffmpeg', 'pandoc', 'imagemagick'].some(t =>
       userMessage.toLowerCase().includes(t)
     )
     || _registryKeywordMatch(userMessage)
     || _preflightImpliesCli(state);
+
+  // ── Pinned-agent lane constraint ──────────────────────────────────────────
+  // A pinned registered agent defines the lane: a cli/api pin on a task whose
+  // TEXT mentions a browser service ("search Gmail") must not load the
+  // browser vocabulary — the planner would emit url.first/dom.act steps bound
+  // to an agent that can't run them. Observed: nylas.agent-pinned task got
+  // browser steps because classification read "Gmail" off the prompt.
+  const _pinType = (state.resolveAgentResult?.agents || [])
+    .find(a => a && a.agentId && a.exists)?.type || null;
+  if (_pinType && _pinType !== 'browser') {
+    _needsCli = true;
+    _needsBrowser = false;
+  }
 
   // ── Image-analysis detection ────────────────────────────────────────────
   // Triggers when the LLM classifier detects an image-analysis task. Loads
@@ -1349,6 +1400,17 @@ function _buildSystemPrompt(userMessage, state) {
     || !!_tc?.activeDocTarget;
   if (_hasResolvedFile && !appendices.includes('plan-skills-file.md')) {
     appendices.push('plan-skills-file.md');
+  }
+
+  // Screen-deliverable appendix — the prompt names a GhostLayer artifact
+  // (chart/deck/doc/scene/three) but the task still routed through
+  // command_automate because it needs a gather step first. The plan must end
+  // with a screen.display step so the artifact lands on the layer.
+  const _isDeliverableTask = _tc?.isScreenOutput
+    || SCREEN_VISUAL_KIND_RE.test(userMessage || '')
+    || SCREEN_DELIVERABLE_RE.test(userMessage || '');
+  if (_isDeliverableTask && !appendices.includes('plan-skills-screen.md')) {
+    appendices.push('plan-skills-screen.md');
   }
 
   for (const filename of appendices) {
@@ -3857,6 +3919,43 @@ The user's request does NOT match any installed skill.
       logger.warn(`[Node:PlanSkillsV2] Rejecting nav-only plan for mutation task (interactiveActions=${(state._taskClassification?.interactiveActions || state.taskClassification?.interactiveActions || []).join(',')})`);
       return { ...state, planError: 'Planned steps only navigate to pages — none perform the requested on-page action. Please try rephrasing the request.', commandExecuted: false };
     }
+  }
+
+  // ── Agent-family guard: browser steps bound to a non-browser agent ────────
+  // Same rule planRunner applies to stored steps, applied to the LIVE plan —
+  // a cli-pinned task ("search Gmail via nylas") can still emit
+  // url.first/dom.act when the text classifier saw a browser service. Repair:
+  // replace the offending browser-family steps with one cli.agent run step
+  // bound to the pinned agent carrying the task text — deterministic, matches
+  // what a correct cli-first plan looks like (cli.agent + synthesize).
+  if (Array.isArray(skillPlan)) {
+    try {
+      const _planSteps = require('../../../shared/plan-steps.cjs');
+      const _svcMap = require('../../../shared/service-map.cjs');
+      const _mismatch = _planSteps.agentFamilyMismatch(skillPlan);
+      if (_mismatch) {
+        const _boundCli = skillPlan
+          .map(s => s && s.args && s.args.agentId)
+          .find(id => id && (_svcMap.describeAgent(String(id).replace(/\.agent$/, '')) || {}).type
+            && _svcMap.describeAgent(String(id).replace(/\.agent$/, '')).type !== 'browser');
+        const _taskText = String(state.resolvedMessage || state.message || '').slice(0, 500);
+        if (_boundCli && _taskText) {
+          skillPlan = skillPlan.filter(s => {
+            const aid = s && s.args && s.args.agentId;
+            return !(aid && _planSteps.AGENT_FAMILY_MISMATCH_SKILLS.has(s.skill)
+              && String(aid).toLowerCase() === String(_boundCli).toLowerCase());
+          });
+          skillPlan.unshift({
+            skill: 'cli.agent',
+            args: { action: 'run', agentId: _boundCli, task: _taskText },
+            description: `Run ${_boundCli} to complete: ${_taskText.slice(0, 120)}`,
+          });
+          logger.warn(`[Node:PlanSkillsV2] Agent-family mismatch (${_mismatch}) — replaced browser steps with cli.agent run for ${_boundCli}`);
+        } else {
+          logger.warn(`[Node:PlanSkillsV2] Agent-family mismatch (${_mismatch}) but no repair target — leaving plan`);
+        }
+      }
+    } catch (_) { /* shared helper unavailable — leave plan untouched */ }
   }
 
   // ── Malformed-step guard: shell.run without cmd/goal → ask_user ────────────

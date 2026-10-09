@@ -35,7 +35,7 @@
  */
 
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE } = require('./textPatterns.cjs');
+const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE, SCREEN_VISUAL_KIND_RE, SCREEN_DELIVERABLE_RE, VISUAL_INTO_APP_RE, SCREEN_CHART_RE, SCREEN_DECK_RE, SCREEN_DOC_RE, SCREEN_SCENE_RE, SCREEN_THREE_RE } = require('./textPatterns.cjs');
 const { _canonicalService } = require('./localPlanTemplates');
 
 // ── Deterministic screen-output detection ──────────────────────────────────
@@ -47,10 +47,33 @@ const _SCREEN_SHOW_RE = /\b(show|display|put|project|paint|present|pop|throw|bri
 const _SCREEN_CLEAR_RE = /\b(clear|dismiss|hide|close|wipe|remove|erase)\b[\w\s'!]*\bscreen\b/i;
 const _SCREEN_OFF_RE = /\btake\s+(?:that|it|this|them)\s+off\b[^.!?]*\bscreen\b/i;
 
+// ── Deliverable artifacts — "create a chart of Q3 sales", "put together a
+// slideshow", "draft an essay", "make a 3d model". These name a GhostLayer
+// kind WITHOUT the "on screen" qualifier — the GhostLayer IS the deliverable
+// surface (charts/docs/decks/scenes live there), so render there instead of
+// routing through file/python tooling. Guards (documented on
+// SCREEN_VISUAL_KIND_RE): artifact-into-app ("chart in Excel") stays with the
+// named app, and expectsFileOutput ("…save it to a file") keeps the file.
+function _deliverableKind(userMessage, result) {
+  const m = String(userMessage || '');
+  if (!SCREEN_VISUAL_KIND_RE.test(m) && !SCREEN_DELIVERABLE_RE.test(m)) return null;
+  if (result && result.targetService && VISUAL_INTO_APP_RE.test(m)) return null;
+  if (result && result.expectsFileOutput) return null;
+  if (SCREEN_CHART_RE.test(m)) return 'chart';
+  if (SCREEN_DECK_RE.test(m)) return 'deck';
+  if (SCREEN_DOC_RE.test(m)) return 'doc';
+  if (SCREEN_SCENE_RE.test(m)) return 'scene';
+  if (SCREEN_THREE_RE.test(m) || /3[\s-]?d\s+(?:model|scene|render|graphic)/i.test(m)) return 'three';
+  return 'text';
+}
+
 function detectScreenOutput(userMessage) {
   const m = String(userMessage || '');
   if (_SCREEN_CLEAR_RE.test(m) || _SCREEN_OFF_RE.test(m)) return 'clear';
   if (_SCREEN_SHOW_RE.test(m)) return 'show';
+  // Deliverable-only phrasing (no "on screen") — the kind check doubles as
+  // the show gate; artifact-into-app/file-output guard against it inside.
+  if (SCREEN_VISUAL_KIND_RE.test(m) || SCREEN_DELIVERABLE_RE.test(m)) return 'show';
   return null;
 }
 
@@ -58,9 +81,15 @@ function detectScreenOutput(userMessage) {
 function _applyScreenDetect(result, userMessage) {
   const action = detectScreenOutput(userMessage);
   if (!action) return result;
+  const dk = action === 'show' ? _deliverableKind(userMessage, result) : null;
+  // A guarded-out deliverable ("chart in Excel", "deck… save to file") keeps
+  // the LLM's own flags — only an unambiguous screen hit forces on.
+  if (action === 'show' && !_SCREEN_SHOW_RE.test(String(userMessage || '')) && !dk) return result;
   result.isScreenOutput = true;
   if (action === 'clear' || !result.screenOutputAction) result.screenOutputAction = action;
-  if (action === 'show' && !result.screenOutputKind) result.screenOutputKind = 'text';
+  if (action === 'show' && (!result.screenOutputKind || result.screenOutputKind === 'text')) {
+    result.screenOutputKind = dk || 'text';
+  }
   return result;
 }
 
@@ -673,7 +702,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       suggestedIntent:     _contradicts ? null : _rawSuggested,
       isScreenOutput:      !!parsed.isScreenOutput,
       screenOutputAction:  ['show', 'clear'].includes(parsed.screenOutputAction) ? parsed.screenOutputAction : null,
-      screenOutputKind:    ['text', 'emoji', 'image', 'chart', 'effect', 'alert', 'deck', 'scene'].includes(parsed.screenOutputKind) ? parsed.screenOutputKind : null,
+      screenOutputKind:    ['text', 'emoji', 'image', 'chart', 'effect', 'alert', 'deck', 'scene', 'doc', 'three'].includes(parsed.screenOutputKind) ? parsed.screenOutputKind : null,
       screenOutputContent: typeof parsed.screenOutputContent === 'string' && parsed.screenOutputContent ? parsed.screenOutputContent.slice(0, 20000) : null,
       screenOutputMood:    ['neutral', 'warm', 'happy', 'sad', 'alert', 'playful', 'calm'].includes(parsed.screenOutputMood) ? parsed.screenOutputMood : null,
       // Structured payload passthrough for chart/deck/alert data — bounded and

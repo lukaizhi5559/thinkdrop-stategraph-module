@@ -36,7 +36,14 @@ Then run it:
 - Generates a descriptor with `pre_steps` if needed
 - Stores the agent in the registry for reuse
 
-### Step 3: Fallback to the atomic browser lane if CLI unavailable
+### Step 3: Browser fallback — LAST RESORT ONLY
+Only when NO registered agent covers the service AND `build_agent` discovery
+has failed may you fall back to the atomic browser lane. When the TASK AGENTS
+line already names a registered cli/api/mcp agent, that agent IS the lane —
+never emit `url.first.agent`, `dom.act`, `turn.loop.agent`, or `browser.agent`
+steps for the task's own work; they cannot run on a non-browser agent and will
+be rejected at dispatch.
+
 ```json
 { "skill": "url.first.agent", "args": { "agentId": "<domain>.agent", "task": "open <domain> for <user goal>" } },
 { "skill": "dom.act", "args": { "agentId": "<domain>.agent", "task": "<user goal verbatim>" } }
