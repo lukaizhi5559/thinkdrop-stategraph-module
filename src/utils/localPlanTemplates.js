@@ -451,12 +451,22 @@ const TEMPLATES = [
       if (/\b(scroll|click|type|press|drag|select|submit|navigate|go\s+back|fill|add|delete|buy|check\s*out|zoom|expand|collapse|hover)\b/i.test(String(m || ''))) return 'action-goal, not a page read';
       return tc?.activeDocRef === 'url' ? null : 'no active url doc';
     },
-    build: (a, m) => [
-      // timeoutMs opts out of the 10s deterministic cap — focus wait + copy
-      // retries legitimately run to ~15s on a slow-loading page.
-      { skill: 'app.agent', args: { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 }, description: 'Read the open browser page' },
-      { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's question using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
-    ],
+    build: (a, m, tc) => {
+      // Resolved-URL target → read THAT url (http→browser→crawl ladder) rather
+      // than scanning whatever tab is frontmost. scan_page reads the focused
+      // tab — observed misfire: context said the doc was valleyforgebaptist.org
+      // but the focused tab was a Nylas login, and the summary came from the
+      // wrong page. read_url on the resolved target is the correct page every
+      // time; scan_page stays only for unresolved "this page" deixis.
+      const _target = String(tc?.activeDocTarget || '');
+      const _read = /^https?:\/\//i.test(_target)
+        ? { skill: 'app.agent', args: { action: 'read_url', url: _target, cleanup: 'deselect', httpFirst: true, crawlFallback: true }, description: `Read ${_target.slice(0, 70)}` }
+        : { skill: 'app.agent', args: { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 }, description: 'Read the open browser page' };
+      return [
+        _read,
+        { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's question using the fetched page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
+      ];
+    },
   },
   {
     n: 18, id: 'page_print', lowRisk: true,
@@ -820,7 +830,7 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
       logger?.info?.(`[localPlanTemplates] ${tmpl.id} validation failed: ${err} — LLM plan fallback`);
       return null;
     }
-    const skillPlan = tmpl.build(args, message).map((s, i) => ({ step: i + 1, ...s }));
+    const skillPlan = tmpl.build(args, message, taskClassification).map((s, i) => ({ step: i + 1, ...s }));
     for (const s of skillPlan) {
       const cmdStr = `${s.args?.cmd || ''} ${(s.args?.argv || []).join(' ')}`;
       if (DANGEROUS_CMD_RE.test(cmdStr)) {

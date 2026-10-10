@@ -195,15 +195,36 @@ const SCENE_FORBIDDEN_RE = /\b(?:import|require|fetch|XMLHttpRequest|WebSocket|E
 
 const SCENE_GEN_SYSTEM = [
   'You write three.js scenes for a sandboxed overlay. Output ONLY JavaScript — no markdown, no explanation.',
-  'The code you write is the BODY of `function build(THREE, ctx)`.',
-  'ctx = { scene, camera, renderer, width, height, canvas, onKey } — a renderer, camera (z=6), ambient + directional light already exist.',
+  'The code you write is the BODY of `function build(THREE, OrbitControls, ctx)`.',
+  'ctx = { scene, camera, renderer, controls, width, height, canvas, onKey } — a renderer, camera (z=6), ambient + directional light already exist.',
+  'ORBIT: a ready OrbitControls instance is at ctx.controls (damping on) — camera orbit/zoom/pan works out of the box, just use it. OrbitControls is also the second build() param if you need a second instance.',
   'Add meshes/lines/points to ctx.scene with THREE. For animation return `{ tick(t) }` — tick(t) runs every frame, t = elapsed seconds.',
   'Keep geometry under ~200k vertices. Use additive colors on transparent background. Camera starts at z=6; keep content within roughly x,y ∈ [-4,4].',
   'INTERACTION: ctx.onKey(fn) registers a key handler. Keys arrive as names: "up"|"down"|"prev"|"next" (arrow keys), "play" (spacebar), "zoom_in"|"zoom_out"|"zoom_reset" (+/−/0), "reset" (R), "key_w"|"key_a"|"key_s"|"key_d" (WASD).',
-  'Pointer input reaches the canvas while the scene is interactive — use canvas.addEventListener("pointerdown"|"pointermove"|"pointerup"|"wheel", fn) for drag-orbit, click, or scroll-zoom behaviour.',
-  'When the request implies control (drag, orbit, move, play, steer, fly), implement spherical camera orbit: keep { yaw, pitch, dist } state, apply camera.position.set(dist*Math.sin(yaw)*Math.cos(pitch), dist*Math.sin(pitch), dist*Math.cos(yaw)*Math.cos(pitch)); camera.lookAt(0,0,0) each frame — wire pointer drag to yaw/pitch and wheel to dist.',
+  'Pointer input reaches the canvas while the scene is interactive — ctx.controls already handles drag-orbit and wheel-zoom; use canvas.addEventListener("pointerdown"|"pointermove"|"pointerup"|"wheel", fn) only for custom interactions (click select, steer).',
   'NO imports, NO fetch/network calls, NO DOM access beyond ctx/canvas listeners, NO eval/Function. THREE only.',
 ].join('\n');
+
+/** Persist generated scene code so the artifact is exportable — "the code
+ *  can be exported" is a real user requirement; generated js otherwise lives
+ *  only inside the display payload and vanishes with it. Best-effort: a
+ *  failed write never blocks the display. Returns the saved path or null. */
+function _exportGeneratedScene(js, displayId, logger) {
+  try {
+    const fs = require('fs');
+    const path = require('path');
+    const os = require('os');
+    const dir = path.join(os.homedir(), '.thinkdrop', 'scene-exports');
+    fs.mkdirSync(dir, { recursive: true });
+    const safe = String(displayId || 'scene').replace(/[^\w-]/g, '_').slice(0, 40);
+    const file = path.join(dir, `${safe}-${Date.now()}.js`);
+    fs.writeFileSync(file, js, 'utf8');
+    return file;
+  } catch (e) {
+    logger.warn(`[Node:ScreenOutput] scene export failed: ${e.message}`);
+    return null;
+  }
+}
 
 /** LLM-generated three.js scene → { js, libs:['three'] } for kind:'scene'.
  *  Returns null on any failure — callers fall back to a preset. */
@@ -513,11 +534,14 @@ module.exports = async function screenOutput(state) {
           };
         }
         payload.scene = gen;
+        const _exportPath = _exportGeneratedScene(gen.js, 'scene', logger);
+        if (_exportPath) state._sceneExportPath = _exportPath;
       }
       payload.id = payload.id || 'scene:active';
-      if (/\b(?:drag|click|play|interact|control|orbit|move|steer|fly|drive|game)\b/i.test(message)) {
-        payload.blocking = true;
-      }
+      // Scenes are interactive by nature — the follow-up that triggered the
+      // display ("show this on my screen") often drops the original "orbit"
+      // phrasing, so interaction can't key off this message alone.
+      if (payload.blocking == null) payload.blocking = true;
       break;
     }
     case 'three': {
@@ -542,16 +566,15 @@ module.exports = async function screenOutput(state) {
           payload.kind = 'scene';
           payload.scene = gen;
           payload.title = payload.title || tc.screenOutputContent || null;
+          const _exportPath = _exportGeneratedScene(gen.js, 'scene', logger);
+          if (_exportPath) state._sceneExportPath = _exportPath;
           // Stable id — re-prompts ("make it faster", "now add rings") POST
           // a fresh scene under the same id so the stage swaps it in place
           // instead of stacking a second display. That swap IS the loop.
           payload.id = 'scene:active';
-          // Interactive phrasing ("let me drag/play with…") opts into
-          // click-through lifting; ambient scenes stay non-interactive
-          // (⌘⇧K still grabs controls live).
-          if (/\b(?:drag|click|play|interact|control|orbit|move|steer|fly|drive|game)\b/i.test(message)) {
-            payload.blocking = true;
-          }
+          // Generated scenes are interactive by default — same reason as the
+          // scene kind: the "orbit" phrasing usually lives in an earlier turn.
+          if (payload.blocking == null) payload.blocking = true;
         } else {
           // No silent starfield: a failed generation is an honest error, not
           // a wrong display. (Old behavior painted the starfield preset and
@@ -627,8 +650,17 @@ module.exports = async function screenOutput(state) {
   const subject = payload.title || payload.text || payload.image?.alt
     || (typeof payload.three?.scene === 'string' ? payload.three.scene : null)
     || payload.effect || payload.kind;
+  const exportNote = state._sceneExportPath
+    ? `\nScene code saved to \`${state._sceneExportPath}\`.`
+    : '';
   return {
     ...state,
-    _directAnswer: `## Screen\n\nDisplayed ${payload.kind}${subject && subject !== payload.kind ? ` "${String(subject).slice(0, 80)}"` : ''} on screen.`,
+    _directAnswer: `## Screen\n\nDisplayed ${payload.kind}${subject && subject !== payload.kind ? ` "${String(subject).slice(0, 80)}"` : ''} on screen.${exportNote}`,
   };
 };
+
+// Exposed for executeCommand's screen.display step filler — the same
+// text→rows/slides extraction the intent path uses, reused when a plan's
+// display step reaches dispatch with an empty payload (planner emits
+// `chart.data: []` placeholders the appendix example shows).
+module.exports._helpers = { _pairsToRows, _chartFromRows, _chartType, _extractChartFromText, _textToSlides };

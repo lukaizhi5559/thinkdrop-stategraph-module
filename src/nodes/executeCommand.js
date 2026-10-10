@@ -200,6 +200,74 @@ function _flagUnprovenMutation(res, skill, argsLike, raw, logger, stepNum) {
   } catch (_) {}
 }
 
+// ── screen.display payload fill — the planner emits display steps whose
+// payload field is an empty placeholder (`chart.data: []`, no `doc.markdown`)
+// because the data only exists after gather/synthesize steps run. Contract
+// validation (shared/screen-output.cjs) then hard-fails "chart kind requires
+// chart.data". Reuse screenOutput's extraction chain on prior step output:
+// deterministic label:value pairs first, LLM extraction as fallback — the
+// honest empty-data failure is preserved when nothing chartable exists.
+// Called from BOTH dispatch paths (serial + runGroup) since grouped plans
+// reach _dispatchGroupStep, not the serial dispatch site.
+async function _fillScreenDisplayArgs(callArgs, allResults, priorResults, state, logger) {
+  if (!callArgs || String(callArgs.action || 'display') !== 'display') return;
+  try {
+    const _so = require('./screenOutput.js')._helpers || {};
+    const _textOf = (r) => typeof r?.stdout === 'string' && r.stdout.trim() ? r.stdout
+      : typeof r?.result === 'string' && r.result.trim() ? r.result
+      : r?.result && typeof r.result === 'object' && typeof r.result.summary === 'string' ? r.result.summary
+      : null;
+    const _priorTexts = [...(allResults || []), ...(priorResults || [])]
+      .filter(r => r && r.ok !== false)
+      .map(_textOf)
+      .filter(Boolean);
+    const _userMsg = String(state.message || state.originalPrompt || '');
+    const _dispKind = String(callArgs.kind || '').toLowerCase();
+    logger.info(`[Node:ExecuteCommand] screen.display fill check — kind=${_dispKind} chartRows=${callArgs.chart?.data?.length ?? 'none'} priorTexts=${_priorTexts.length}`);
+    if (_dispKind === 'chart' && !(callArgs.chart && Array.isArray(callArgs.chart.data) && callArgs.chart.data.length)) {
+      let _chart = null;
+      for (const t of _priorTexts.slice().reverse()) {
+        const rows = _so._pairsToRows ? _so._pairsToRows(t) : [];
+        if (rows.length) { _chart = _so._chartFromRows(rows, _userMsg); break; }
+      }
+      if (!_chart && _so._extractChartFromText) {
+        for (const t of _priorTexts.slice().reverse()) {
+          const ext = await _so._extractChartFromText(t, _userMsg, state, logger);
+          if (ext) {
+            const type = (_so._chartType ? _so._chartType(_userMsg, null) : null) || ext.type || (ext.data.length === 1 ? 'stat' : 'bar');
+            _chart = type === 'stat'
+              ? { type, data: ext.data.slice(0, 1) }
+              : { type, data: ext.data, xKey: 'label', yKey: 'value' };
+            break;
+          }
+        }
+      }
+      if (_chart) {
+        callArgs.chart = _chart;
+        logger.info(`[Node:ExecuteCommand] screen.display chart filled from prior steps (${_chart.data.length} rows, type=${_chart.type})`);
+      }
+    } else if (_dispKind === 'deck' && !(callArgs.deck && Array.isArray(callArgs.deck.slides) && callArgs.deck.slides.length)) {
+      const _srcText = _priorTexts[_priorTexts.length - 1];
+      const _slides = _srcText && _so._textToSlides ? _so._textToSlides(_srcText) : [];
+      if (_slides.length) {
+        callArgs.deck = { transition: 'fade', slideMs: 5000, controls: true, ...(callArgs.deck || {}), slides: _slides };
+        logger.info(`[Node:ExecuteCommand] screen.display deck filled from prior steps (${_slides.length} slides)`);
+      }
+    } else if (_dispKind === 'doc' && !(callArgs.doc && callArgs.doc.markdown)) {
+      const _srcText = _priorTexts[_priorTexts.length - 1];
+      if (_srcText) {
+        callArgs.doc = { editable: true, ...(callArgs.doc || {}), markdown: _srcText };
+        logger.info('[Node:ExecuteCommand] screen.display doc filled from prior step output');
+      }
+    } else if ((_dispKind === 'text' || _dispKind === 'alert') && !callArgs.text && !callArgs.title) {
+      const _srcText = _priorTexts[_priorTexts.length - 1];
+      if (_srcText) callArgs.text = _srcText;
+    }
+  } catch (e) {
+    logger.warn(`[Node:ExecuteCommand] screen.display fill failed (display step proceeds as-is): ${e.message}`);
+  }
+}
+
 // Bucket runGroup steps into lanes keyed by agentId. Browser-family steps
 // with no explicit agentId (turn.loop verify steps commonly omit it) must
 // NOT spawn a parallel lane — they depend on the session/url state produced
@@ -4972,6 +5040,11 @@ Please try again or search with different terms.`;
     }
     if (webAgentBestUrl) {
       argsJson = argsJson.replace(/\{\{bestUrl\}\}/gi, webAgentBestUrl.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
+    } else if (webAgentFallbackUrls.length) {
+      // Producer step hasn't landed a bestUrl yet (failed/retrying) — the
+      // captured alternates are better than an unresolved-token plan error.
+      const alt = webAgentFallbackUrls[0].replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      argsJson = argsJson.replace(/\{\{bestUrl\}\}/gi, alt);
     }
     // {{fallbackUrls}} is an array token — replace the quoted form first so
     // "fallbackUrls": "{{fallbackUrls}}" becomes a real JSON array, then the
@@ -4989,6 +5062,14 @@ Please try again or search with different terms.`;
       && !(Array.isArray(resolvedArgs.fallbackUrls) && resolvedArgs.fallbackUrls.length)
       && webAgentFallbackUrls.length) {
     resolvedArgs = { ...resolvedArgs, fallbackUrls: webAgentFallbackUrls };
+  }
+
+  // Auto-fill a missing url on web.crawl steps — plans that chain "fetch the
+  // page the search found" emit crawl steps with no url at all; the prior
+  // web.agent step's best URL is the only sane target.
+  if (skill === 'web.crawl' && !resolvedArgs.url && webAgentBestUrl) {
+    logger.info(`[Node:ExecuteCommand] auto-filling web.crawl url from prior web.agent result: ${webAgentBestUrl}`);
+    resolvedArgs = { ...resolvedArgs, url: webAgentBestUrl };
   }
 
   // ── Listing-task safety nets for web.crawl ──────────────────────────────
@@ -5178,6 +5259,21 @@ Please try again or search with different terms.`;
     const _argsJson = JSON.stringify(resolvedArgs);
     const _allMatches = _argsJson.match(_UNRESOLVED_RE) || [];
     const _unresolved = [...new Set(_allMatches)].filter(t => !_SERVICE_CRED_TOKEN.test(t));
+    // {{bestUrl}} is a late-binding token — when its producer web.agent step
+    // hasn't landed a URL yet (failed/retrying), the plan isn't malformed,
+    // this step just can't run yet. Step-level failure lets thin recovery
+    // retry instead of terminal-erroring the whole task.
+    const _lateBound = _unresolved.filter(t => /^\{\{bestUrl\}\}$/i.test(t));
+    const _hardUnresolved = _unresolved.filter(t => !/^\{\{bestUrl\}\}$/i.test(t));
+    if (_lateBound.length && !_hardUnresolved.length) {
+      const _deferError = `{{bestUrl}} unresolved — the web.agent step that produces it has not completed yet.`;
+      logger.warn(`[Node:ExecuteCommand] Step ${skillCursor + 1} (${skill}) — ${_deferError}`);
+      return {
+        ...state,
+        failedStep: { step: skillCursor + 1, skill, description, error: _deferError, args: args || {} },
+        commandExecuted: false,
+      };
+    }
     if (_unresolved.length > 0) {
       const _placeholderError = `Unresolved placeholder(s) in step args: ${_unresolved.join(', ')}. No substitution rule matched — the plan is malformed. Please retry.`;
       logger.error(`[Node:ExecuteCommand] Step ${skillCursor + 1} (${skill}) — ${_placeholderError}`);
@@ -6125,6 +6221,12 @@ Please try again or search with different terms.`;
         : (gs.skill === 'shell.run' && _runProtectedPaths.length > 0 && !gsArgs.protectedPaths)
           ? { ...gsArgs, protectedPaths: _runProtectedPaths }
           : gsArgs;
+      // screen.display payload fill (group path) — empty chart.data/doc.markdown
+      // placeholders get filled from prior step output before the contract
+      // validation can hard-fail.
+      if (gs.skill === 'screen.display') {
+        await _fillScreenDisplayArgs(_callArgs, skillResults, priorResults, state, logger);
+      }
       // Extended timeout for parallel browser steps to handle YouTube searches + Tab-Flow
       const stepTimeoutMs = gs.skill === 'browser.agent' ? 420000 : 300000; // 7 min for browser, 5 min for CLI
 
@@ -6840,6 +6942,12 @@ Please try again or search with different terms.`;
           }
         }
       }
+    }
+
+    // ── screen.display payload fill (serial path — runGroup path fills in
+    // _dispatchGroupStep): see _fillScreenDisplayArgs.
+    if (skill === 'screen.display') {
+      await _fillScreenDisplayArgs(_callArgs, skillResults, [], state, logger);
     }
 
     _emitTerminalActivity(`step ${skillCursor + 1}/${skillPlan.length} — ${stepStartDescription || skill}`, 'step');

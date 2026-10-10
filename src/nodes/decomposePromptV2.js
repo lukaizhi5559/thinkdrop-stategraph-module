@@ -604,8 +604,13 @@ module.exports = async function decomposePromptV2(state) {
   if (_tc.isScreenOutput && _fileOpShape && !_screenOutputLex) {
     logger.info('[Node:DecomposePromptV2] isScreenOutput clamped — literal file path + file verb (classifier flake)');
   }
+  // Service gather+display compounds — "check my inbox … put a summary on my
+  // screen" — need the service lane first (targetService set + a read/write
+  // action). The screen_display is a DEPENDENT step of that plan, not the
+  // whole task; short-circuiting here skips agent resolution entirely.
+  const _serviceCompound = !!(_tc.targetService && Array.isArray(_tc.interactiveActions) && _tc.interactiveActions.length);
   const _screenOutFlag = (_tc.isScreenOutput && !_fileOpShape) || _screenOutputLex;
-  if (_screenOutFlag && !_isScreenCapture
+  if (_screenOutFlag && !_isScreenCapture && !_serviceCompound
       && (!_hasMultiGoalConjunction || _lookupThenDisplay)) {
     logger.info(`[Node:DecomposePromptV2] Screen-output guard: routing to screen_display (action=${_tc.screenOutputAction || 'show'} kind=${_tc.screenOutputKind || 'text'}) — skipping command_automate short-circuit`);
 

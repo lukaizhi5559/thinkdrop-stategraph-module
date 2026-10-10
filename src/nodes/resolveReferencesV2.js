@@ -774,10 +774,29 @@ module.exports = async function resolveReferencesV2(state) {
     }
   } else if (_taskClassification.activeDocRef === 'url') {
     const u = _priorScreenContext?.url || null;
-    if (u) {
-      _taskClassification.activeDocTarget = u;
-    } else {
-      _taskClassification.activeDocRef = 'screen';
+    // Host-mismatch veto — the message names a literal domain/host that isn't
+    // the visible page's host ("events on amazon.com" while HN is open). A
+    // named external site is a fetch target, not a screen referent (observed:
+    // "the Valley Forge Baptist Church website" classified url→page_scan read
+    // whatever tab was focused — a Nylas login page).
+    const _msgHost = (String(message || '').match(/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|edu|gov|us)\b/i) || [])[0];
+    if (u && _msgHost) {
+      try {
+        const _ctxHost = new URL(u).hostname.replace(/^www\./, '');
+        const _namedHost = _msgHost.toLowerCase().replace(/^www\./, '');
+        if (_namedHost !== _ctxHost && !_ctxHost.endsWith('.' + _namedHost) && !_namedHost.endsWith('.' + _ctxHost)) {
+          logger.info(`[Node:ResolveReferencesV2] host mismatch — message names ${_namedHost} but live page is ${_ctxHost} — dropping activeDocRef=url`);
+          _taskClassification.activeDocRef = null;
+          _taskClassification.activeDocTarget = null;
+        }
+      } catch (_) {}
+    }
+    if (_taskClassification.activeDocRef === 'url') {
+      if (u) {
+        _taskClassification.activeDocTarget = u;
+      } else {
+        _taskClassification.activeDocRef = 'screen';
+      }
     }
   } else if (_taskClassification.activeDocRef === 'screen') {
     // The classifier flakes between 'screen' and 'url' on identical page

@@ -103,7 +103,21 @@ module.exports = async function fastLanePlan(state) {
   // message; targetService biases the domain ranking ("biblehub look up…"
   // once returned a YouTube Short because preferDomain was null).
   const _tc2 = state._taskClassification || {};
-  const _searchQuery = String(_tc2.followUpTarget || message).trim() || message;
+  // Named-site prompts search better with an extracted entity + topic query —
+  // the raw prompt ("Give me a summary of the calendar events listed on the
+  // Valley Forge Baptist Church website…") dilutes the entity name and Google
+  // returns inconsistent mirrors (vfba.org academy, valleyforgechurch.com).
+  // Extract the longest capitalized run ("Valley Forge Baptist Church") and
+  // append the first recognized content noun ("calendar"/"events"/menu…).
+  const _entityQuery = (msg) => {
+    const runs = String(msg).match(/(?:[A-Z][\w&'.-]*\s*){2,}/g) || [];
+    const entity = runs.sort((a, b) => b.length - a.length)[0]?.trim();
+    if (!entity || entity.length < 5) return null;
+    const topic = (String(msg).toLowerCase().match(/\b(calendar|events?|menu|schedule|staff|service times?|hours|directions|sermons?|news|announcements?|ministries|programs?)\b/) || [])[0];
+    return `${entity}${topic ? ` ${topic}` : ''}`;
+  };
+  const _searchQuery = String(_tc2.followUpTarget || _entityQuery(message) || message).trim() || message;
+  // `follow` still gets the fuller message — its link picker uses intent words.
   // Named-service tasks go through nav_task's resolve-discovery ladder
   // (KNOWN_BROWSER_SERVICES → deep-link discovery → read_url) instead of a
   // bare search — search_and_navigate's preferDomain is only a scoring bias
@@ -133,7 +147,19 @@ module.exports = async function fastLanePlan(state) {
             args: { action: 'search_and_navigate', query: _searchQuery },
             description: `Search the web for: "${_searchQuery.slice(0, 80)}"`,
           },
-          fetchStep,
+          // web.crawl + follow: named-site lookups usually land on the site's
+          // homepage while the target content lives one click deep (calendar,
+          // events, menu, staff…). follow resolves that subpage link — observed
+          // miss: "calendar events on <church> site" summarized the homepage.
+          {
+            skill: 'web.crawl',
+            args: {
+              url: '{{bestUrl}}',
+              fallbackUrls: '{{fallbackUrls}}',
+              follow: _searchQuery,
+            },
+            description: 'Fetch the page (following the best subpage link)',
+          },
           synthStep,
         ];
 

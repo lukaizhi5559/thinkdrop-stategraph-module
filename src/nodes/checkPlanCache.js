@@ -35,6 +35,23 @@ const {
   _isStaleBrowserActPlan,
 } = require('../utils/planCacheHelpers');
 
+// Plans whose steps read "the open page / the screen" are only valid while the
+// current classification still resolves a live doc referent. A named-site
+// prompt can semantic-match a cached page_scan plan built under stale context
+// (observed: "calendar events on <church> website" replayed a scan_page plan
+// that read a Nylas login tab). Screen/document-reading steps include
+// scan_page, screen.capture, getPageText/get_recent_ocr, clipboard reads.
+const _DOC_DEPENDENT_RE = /^(scan_page|scan_url|capture|getPageText|getPageLinks|get_recent_ocr|read_clipboard)$/;
+function _planNeedsDocReferent(skillPlan) {
+  return (skillPlan || []).some(s =>
+    (s?.skill === 'app.agent' && _DOC_DEPENDENT_RE.test(String(s?.args?.action || ''))) ||
+    s?.skill === 'screen.capture');
+}
+function _docPlanStillValid(state) {
+  const tc = state._taskClassification || {};
+  return tc.activeDocRef === 'url' || tc.activeDocRef === 'file' || tc.activeDocRef === 'screen';
+}
+
 module.exports = async function checkPlanCache(state) {
   const logger = state.logger || console;
 
@@ -65,6 +82,8 @@ module.exports = async function checkPlanCache(state) {
   if (cached) {
     if (_isStaleBrowserActPlan(cached.skillPlan, userMessage)) {
       logger.info(`[Node:CheckPlanCache] Session cache invalidated — stale browser.act plan for named service`);
+    } else if (_planNeedsDocReferent(cached.skillPlan) && !_docPlanStillValid(state)) {
+      logger.info(`[Node:CheckPlanCache] Session cache invalidated — cached plan reads screen/page but no doc referent this turn`);
     } else {
       logger.info(`[Node:CheckPlanCache] Session cache hit (exact) — injecting _skillPlan instantly`);
       return {
@@ -81,6 +100,13 @@ module.exports = async function checkPlanCache(state) {
   const similarPlan = await findSimilarCompletePlan(userMessage, mcpAdapter, logger, sessionId);
 
   if (!similarPlan) return state;
+
+  // A screen/page-reading plan without a live doc referent isn't a valid
+  // suggestion either — reject outright rather than surfacing a modal.
+  if (_planNeedsDocReferent(similarPlan.skillPlan) && !_docPlanStillValid(state)) {
+    logger.info(`[Node:CheckPlanCache] Disk match rejected — plan reads screen/page but no doc referent this turn (${similarPlan.file})`);
+    return state;
+  }
 
   if (similarPlan.autoExecute) {
     logger.info(

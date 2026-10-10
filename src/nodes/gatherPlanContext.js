@@ -311,9 +311,12 @@ module.exports = async function gatherPlanContext(state) {
   // For reminder/scheduling tasks, ask the user how they want the alert delivered
   // (in-app alert vs. macOS notification vs. both) BEFORE the bypass gate, since
   // _shouldBypassGather returns true for scheduling tasks (needsClarification=false).
-  // Skip if the user already specified a channel in their message.
+  // Skip if the user already specified a channel in their message — or when the
+  // task targets a named service (google_calendar owns its own reminders; asking
+  // "how should ThinkDrop alert you" about a calendar event is off-topic).
   if (
     state._taskClassification?.taskType === 'scheduling' &&
+    !state._taskClassification?.targetService &&
     !state._deliveryChannelResolved &&
     state.intent?.type === 'command_automate'
   ) {
@@ -644,6 +647,8 @@ Rules:
 - Only defer a question to a later round if it TRULY cannot be asked without a prior answer (e.g., "Which specific album by [artist]?" when you don't know the artist yet). Even then, prefer asking "Which artist and album?" as one question.
 - NEVER ask about things the system can look up (timezone, credentials, installed apps, auth status — these are in PROBE RESULTS).
 - NEVER ask about things already answered in PRIOR CLARIFICATIONS. Every entry in PRIOR CLARIFICATIONS is a SETTLED answer — do NOT re-ask it, even with different wording.
+- PINNED CAPABILITY: if a PINNED CAPABILITY block is present, the execution tool is already selected — NEVER ask which service/app/channel/provider/tool to use. Only ask about task-specific gaps the tool can't supply (e.g. a recipient's phone number).
+- SERVICE CHOICE questions: if a question asks which service/tool/channel/provider/way to accomplish the task, mark it "serviceChoice": true and set "capabilityQuery" to the core action (e.g. "send a text message"). DO NOT invent options for these — the system populates real CLI/API/MCP candidates. Any other question type keeps normal options.
 - If a PRIOR CLARIFICATION answer starts with "yes —", it is a CONFIRMED answer — do NOT ask that question again.
 - If the ROUTE DECISION block is empty or all routes are marked [CONFIRMED], do NOT include a routeConfirmation. Confirmed routes are locked in.
 - If ALL failure-risk categories are clear and all routes are confirmed, return {"complete": true}.
@@ -693,7 +698,7 @@ async function _resolveTaskInputsFromMemory(requiredInputs, mcpAdapter, userId, 
 /**
  * Phase B2: Ask the LLM to generate a batch of questions (the frontier).
  */
-async function _askLLMBatch(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, routeDecision, memoryResults, logger, taskClassification) {
+async function _askLLMBatch(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, routeDecision, memoryResults, logger, taskClassification, pinnedAgent) {
   const priorBlock = priorQA.length > 0
     ? '\n\nPRIOR CLARIFICATIONS:\n' + priorQA.map(qa => {
         const displayAnswer = qa.confirmed ? `yes — ${qa.answer}` : qa.answer;
@@ -741,8 +746,15 @@ async function _askLLMBatch(llmBackend, userMsg, originalMsg, priorQA, conversat
     ? `\n\nUNAUTHENTICATED AGENTS:\n${unauthedAgents.join('\n')}`
     : '';
 
+  // Capability pin — when the selector already bound a tool/agent, the service
+  // choice is locked. The grill must not re-ask it (observed: a task pinned to
+  // messages.app.agent still got "which texting service?").
+  const pinBlock = pinnedAgent
+    ? `\n\nPINNED CAPABILITY: ${pinnedAgent.id}${pinnedAgent.reason ? ` — ${pinnedAgent.reason}` : ''} [LOCKED — the tool is already chosen]`
+    : '';
+
   const prompt = `REQUEST: "${originalMsg}"
-TASK: "${userMsg}"${priorBlock}${historyBlock}${routeBlock}${memoryBlock}${unauthedBlock}
+TASK: "${userMsg}"${pinBlock}${priorBlock}${historyBlock}${routeBlock}${memoryBlock}${unauthedBlock}
 
 Generate the frontier of questions for this task.`;
 
@@ -1005,12 +1017,18 @@ async function _runGrillLoop(state, logger) {
       return { ...state, resolvedMessage: enriched, planGatheringComplete: true, planGatheringRound: round, planGatheringAnswers: answers, grilledConstraints };
     }
 
+    // Capability pin — when the selector already bound an agent, the service
+    // choice is locked; the grill must not re-ask "which service/channel".
+    const _pinnedAgent = state._pinnedAgentId
+      ? { id: state._pinnedAgentId, reason: state._capabilityReason || null }
+      : null;
+
     // B2: Ask LLM for the frontier of questions
     const result = await _askLLMBatch(
       llmBackend, baseMsg, originalMsg, answers,
       state.conversationHistory || [], state.resolvedSelfContext || null,
       state.preflightResult || null, routeDecision, null,
-      logger, tc
+      logger, tc, _pinnedAgent
     );
 
     if (result.complete) {
@@ -1028,7 +1046,7 @@ async function _runGrillLoop(state, logger) {
         llmBackend, baseMsg, originalMsg, answers,
         state.conversationHistory || [], state.resolvedSelfContext || null,
         state.preflightResult || null, routeDecision, memoryResults,
-        logger, tc
+        logger, tc, _pinnedAgent
       );
       if (!resultWithMemory.complete) {
         Object.assign(result, resultWithMemory);
@@ -1037,6 +1055,51 @@ async function _runGrillLoop(state, logger) {
 
     const questions = result.questions || [];
     let routeConfirmation = result.routeConfirmation || null;
+
+    // ── Capability-sourced service choices ──────────────────────────────────
+    // Questions marked serviceChoice ask "which way/tool to accomplish X" —
+    // the LLM is told NOT to invent options (observed: a texting task offered
+    // a hallucinated "browser_sms" route). Populate options from a real
+    // capability search: verified CLI/API/MCP/local candidates, friction-sorted.
+    for (const q of questions) {
+      if (!q || q.serviceChoice !== true) continue;
+      if (_pinnedAgent) {
+        // Pin already locked the tool — a "which service" question is noise.
+        q._drop = true;
+        continue;
+      }
+      try {
+        const _cq = String(q.capabilityQuery || baseMsg).slice(0, 300);
+        const _res = await fetch('http://127.0.0.1:3007/capability.infer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: _cq }),
+          signal: AbortSignal.timeout(12000),
+        }).then(r => r.json()).catch(() => null);
+        const _cands = Array.isArray(_res?.candidates) ? _res.candidates : [];
+        if (_cands.length) {
+          q.options = _cands.slice(0, 5).map(c => ({
+            label: c.service || c.id,
+            value: c.id,
+            primary: false,
+            description: [
+              c.kind || c.type || '',
+              c.installed ? 'installed' : 'needs setup',
+              ...(Array.isArray(c.capabilities) ? c.capabilities.slice(0, 3) : []),
+            ].filter(Boolean).join(' · '),
+          }));
+          q.freeText = true;
+          logger.info(`[Node:GatherPlanContext:Grill] serviceChoice "${q.id}" — ${_cands.length} real candidates (${_cands.slice(0, 3).map(c => c.id).join(', ')})`);
+        } else {
+          // No verified candidates — free text so the user can still answer
+          q.freeText = true;
+          if (!Array.isArray(q.options) || !q.options.length) q.type = 'text';
+          logger.info(`[Node:GatherPlanContext:Grill] serviceChoice "${q.id}" — no candidates, falling back to free text`);
+        }
+      } catch (e) {
+        logger.warn(`[Node:GatherPlanContext:Grill] serviceChoice enrichment failed (${e.message}) — keeping question as-is`);
+      }
+    }
 
     // Fix B: Strip routeConfirmation if all routes are already confirmed.
     // The LLM may still emit a routeConfirmation even though the route is
@@ -1102,6 +1165,14 @@ async function _runGrillLoop(state, logger) {
         // Only the route confirmation is new — keep it, drop the duplicate questions
         logger.info(`[Node:GatherPlanContext:Grill] Dropping ${questions.length} duplicate question(s), keeping route confirmation`);
         questions.length = 0;
+      }
+    }
+
+    // Drop questions suppressed above (e.g. serviceChoice under a pin).
+    for (let i = questions.length - 1; i >= 0; i--) {
+      if (questions[i]?._drop) {
+        logger.info(`[Node:GatherPlanContext:Grill] Dropping pinned-service question "${questions[i].id}"`);
+        questions.splice(i, 1);
       }
     }
 
