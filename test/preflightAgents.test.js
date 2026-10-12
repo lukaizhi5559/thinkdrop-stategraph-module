@@ -744,6 +744,117 @@ async function runTests() {
     if (authEvents.length === 0) throw new Error('Expected preflight:auth_required event for unknown auth status CLI');
   });
 
+  await it('CLI agent with authStatus not_required proceeds — no auth wall (catt regression)', async () => {
+    // The original bug: catt's `status` verify probe fails with "No devices
+    // found" → authStatus 'unknown' → task parked on an auth flow that can
+    // never be completed (there is no catt login). The producer now emits
+    // 'not_required' for inconclusive probes on no-auth-surface CLIs.
+    const cliAgent = { id: 'catt.agent', type: 'cli', service: 'catt', cli_tool: 'catt', capabilities: ['cast_video'], status: 'healthy' };
+    const state = makeState({
+      agents: [cliAgent],
+      userMessage: 'cast a show to the tv',
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'catt.agent', create: false }] };
+    state.mcpAdapter.callService = async function(service, action, payload, opts) {
+      if (service === 'command' && action === 'agent.list') return { data: [cliAgent] };
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+        return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
+          { service: 'catt', cli: 'catt', installed: true, authStatus: 'not_required', authed: true, authUser: null, agentId: 'catt.agent', setupInfo: { verifyCmd: ['status'], instructions: 'No authentication required.' } },
+        ] } };
+      }
+      if (service === 'command' && action === 'ping') return { ok: true };
+      if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+      return null;
+    };
+    state.mcpAdapter.calls = [];
+
+    const result = await preflightAgents(state);
+    if (result.planError) throw new Error(`Unexpected planError for not_required CLI: ${result.planError}`);
+    if (result.preflightAuthRequired) throw new Error('Expected preflightAuthRequired false for not_required CLI');
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'catt.agent');
+    if (authEvents.length > 0) throw new Error('Did not expect preflight:auth_required for not_required CLI');
+    // Positive verdict stamps the ledger so the plan-time gate agrees.
+    if (_readLedger()['catt.agent']?.authed !== true) throw new Error('Expected ledger authed:true stamped for not_required CLI');
+  });
+
+  await it('CLI agent with localNetworkBlocked emits local_network event (not cli_setup)', async () => {
+    // macOS Local Network denial — the kernel refuses LAN sends for this
+    // app's identity. Must NOT route through a setup terminal (no login
+    // command exists); the Agents tab shows System Settings instructions.
+    const cliAgent = { id: 'catt.agent', type: 'cli', service: 'catt', cli_tool: 'catt', capabilities: ['cast_video'], status: 'healthy' };
+    const state = makeState({
+      agents: [cliAgent],
+      userMessage: 'cast a show to the tv',
+    });
+    state.resolveAgentResult = { agents: [{ agentId: 'catt.agent', create: false }] };
+    state.mcpAdapter.callService = async function(service, action, payload, opts) {
+      if (service === 'command' && action === 'agent.list') return { data: [cliAgent] };
+      if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+        return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
+          { service: 'catt', cli: 'catt', installed: true, authStatus: 'not_required', authed: true, authUser: null, agentId: 'catt.agent', localNetworkBlocked: true, setupInfo: { verifyCmd: ['status'] } },
+        ] } };
+      }
+      if (service === 'command' && action === 'ping') return { ok: true };
+      if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+      return null;
+    };
+    state.mcpAdapter.calls = [];
+
+    const result = await preflightAgents(state);
+    const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'catt.agent');
+    if (authEvents.length === 0) throw new Error('Expected preflight:auth_required for localNetworkBlocked CLI');
+    if (authEvents[0].authType !== 'local_network') throw new Error(`Expected authType local_network, got ${authEvents[0].authType}`);
+    if (!/Local Network/.test(authEvents[0].setupInfo?.instructions || '')) throw new Error('Expected Local Network instructions in setupInfo');
+    if (!/x-apple\.systempreferences/.test(authEvents[0].setupInfo?.setupUrl || '')) throw new Error('Expected System Settings deep-link in setupInfo');
+    // Selected agent is parked with an accurate reason — not "authentication".
+    if (!result.planError || !/Local Network/i.test(result.planError)) throw new Error(`Expected planError naming Local Network, got: ${result.planError}`);
+    if (result.preflightAuthRequired) throw new Error('preflightAuthRequired must stay false — this is a permission, not a login');
+  });
+
+  await it('CLI agent authenticated probe but declared secrets missing → auth_required', async () => {
+    // Declared-secrets override: a happy verify probe can't see missing env
+    // credentials. Point service-map at a temp dir declaring secrets, stub
+    // the resolver to report them missing.
+    const tmpAgents = fs.mkdtempSync(path.join(os.tmpdir(), 'td-agents-secretcli-'));
+    fs.writeFileSync(path.join(tmpAgents, 'secretcli.agent.md'),
+      '---\nid: secretcli.agent\ntype: cli\nservice: secretcli\ncli_tool: secretcli\nsecrets: [SECRETCLI_API_KEY]\n---\n');
+    const _prevAgentsDir = process.env.THINKDROP_AGENTS_DIR;
+    process.env.THINKDROP_AGENTS_DIR = tmpAgents;
+    const secretPath = require.resolve('../../shared/secret-resolve.cjs');
+    const _origSecret = require.cache[secretPath];
+    require.cache[secretPath] = { exports: { resolveAgentSecrets: async () => ({ found: {}, missing: ['SECRETCLI_API_KEY'] }) } };
+    try {
+      const cliAgent = { id: 'secretcli.agent', type: 'cli', service: 'secretcli', cli_tool: 'secretcli', capabilities: ['do_thing'], status: 'healthy' };
+      const state = makeState({
+        agents: [cliAgent],
+        userMessage: 'do a thing with secretcli',
+      });
+      state.resolveAgentResult = { agents: [{ agentId: 'secretcli.agent', create: false }] };
+      state.mcpAdapter.callService = async function(service, action, payload, opts) {
+        if (service === 'command' && action === 'agent.list') return { data: [cliAgent] };
+        if (service === 'command' && action === 'command.automate' && payload?.skill === 'cli.agent' && payload?.args?.action === 'preflight_check') {
+          return { data: { ok: true, brew: { installed: true }, curl: { installed: true }, detectedClis: [
+            { service: 'secretcli', cli: 'secretcli', installed: true, authStatus: 'authenticated', authed: true, authUser: 'me', agentId: 'secretcli.agent', setupInfo: null },
+          ] } };
+        }
+        if (service === 'command' && action === 'ping') return { ok: true };
+        if (service === 'user-memory' && action === 'skill.list') return { data: [] };
+        return null;
+      };
+      state.mcpAdapter.calls = [];
+
+      const result = await preflightAgents(state);
+      const authEvents = state._progressEvents.filter(e => e.type === 'preflight:auth_required' && e.agentId === 'secretcli.agent');
+      if (authEvents.length === 0) throw new Error('Expected auth_required when declared secrets are missing despite happy probe');
+      if (!result.planError) throw new Error('Expected planError — selected agent is unauthed');
+    } finally {
+      if (_prevAgentsDir === undefined) delete process.env.THINKDROP_AGENTS_DIR;
+      else process.env.THINKDROP_AGENTS_DIR = _prevAgentsDir;
+      if (_origSecret) require.cache[secretPath] = _origSecret;
+      else delete require.cache[secretPath];
+    }
+  });
+
   await it('noCli build failure soft-fails to shell.run fallback instead of planError', async () => {
     // Resolver hallucinated a CLI agent for a service that has no CLI tool.
     // cli.agent build_agent returns { ok: false, noCli: true, error: 'No CLI found...' }.

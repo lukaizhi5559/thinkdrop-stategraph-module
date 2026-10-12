@@ -1182,7 +1182,7 @@ module.exports = async function preflightAgents(state) {
                 })) }
               : {}),
           },
-        }, { timeoutMs: 5000 }).catch(() => null);
+        }, { timeoutMs: 20000 }).catch(() => null);
         const pf = pfRes?.data || pfRes;
         if (pf?.ok) {
           const lines = [];
@@ -1192,7 +1192,7 @@ module.exports = async function preflightAgents(state) {
           else lines.push('curl: installed ✓');
           if (Array.isArray(pf.detectedClis)) {
             for (const c of pf.detectedClis) {
-              _preflightCliMap[c.service.toLowerCase()] = { hasCli: !!c.cli };
+              _preflightCliMap[c.service.toLowerCase()] = { hasCli: !!c.cli, authStatus: c.authStatus || null, authed: null };
               const iconUrl = serviceToIconUrl(c.service);
 
               if (!c.cli) {
@@ -1238,10 +1238,62 @@ module.exports = async function preflightAgents(state) {
                   setupInfo: _enrichedSetupInfo,
                 });
               } else {
-                const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : (c.authStatus === 'configured' ? ' — configured' : ''));
-                lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
+                const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : (c.authStatus === 'configured' ? ' — configured' : (c.authStatus === 'not_required' ? ' — no auth required' : '')));
                 const _agentId = c.agentId || `${c.service}.agent`;
-                let authed = !!c.authUser || c.authStatus === 'authenticated' || c.authStatus === 'configured';
+
+                // macOS Local Network permission denial — surfaced by the
+                // command-service kernel probe. Not an auth problem and no
+                // setup-terminal lane exists for it — emit a local_network
+                // event so the Agents tab shows the System Settings
+                // instructions instead of a fake login flow.
+                if (c.localNetworkBlocked) {
+                  const _lanReason = 'macOS is blocking this app from local-network devices — grant Local Network permission, then re-check';
+                  const _lanSetupInfo = {
+                    ...(c.setupInfo || {}),
+                    instructions: 'macOS is blocking this app from reaching devices on your local network (e.g. Chromecast). Open System Settings → Privacy & Security → Local Network, enable this app, then click Re-check.',
+                    setupUrl: 'x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork',
+                  };
+                  lines.push(`${c.service}: ${c.cli} installed ✓ — LOCAL NETWORK ACCESS BLOCKED — enable this app in System Settings → Privacy & Security → Local Network`);
+                  agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: true, iconUrl, service: c.service, reason: _lanReason, setupInfo: _lanSetupInfo, localNetworkBlocked: true });
+                  _emitProgress({
+                    type: 'preflight:auth_required',
+                    agentId: _agentId,
+                    serviceName: c.service,
+                    cliTool: c.cli || null,
+                    authType: 'local_network',
+                    iconUrl,
+                    message: `${c.service} needs Local Network permission`,
+                    reason: _lanReason,
+                    setupInfo: _lanSetupInfo,
+                  });
+                  continue;
+                }
+
+                lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
+                let authed = !!c.authUser || c.authed === true || c.authStatus === 'authenticated' || c.authStatus === 'configured' || c.authStatus === 'not_required';
+                // Declared-secrets override — a CLI agent that declares env
+                // credentials is only authed when they're actually stored;
+                // a happy verify probe can't see missing env vars.
+                if (authed) {
+                  try {
+                    const _svcMap = require('../../../shared/service-map.cjs');
+                    const _desc = _svcMap.describeAgent(_agentId);
+                    if (_desc && Array.isArray(_desc.secrets) && _desc.secrets.length > 0) {
+                      const { resolveAgentSecrets } = require('../../../shared/secret-resolve.cjs');
+                      const _res = await resolveAgentSecrets(_agentId, _desc.secrets);
+                      if (_res && _res.missing && _res.missing.length > 0) {
+                        authed = false;
+                        logger.info(`[Node:PreflightAgents] ${_agentId}: declared secrets missing (${_res.missing.join(', ')}) → not authed`);
+                      }
+                    }
+                  } catch (_) {}
+                }
+                // CLI bypass — same "proceed without" escape hatch the
+                // browser lanes honor; a live bypass must not be ignored.
+                if (!authed && _isBypassedNow(_agentId)) {
+                  authed = true;
+                  logger.info(`[Node:PreflightAgents] ${_agentId}: auth bypassed by user — proceeding`);
+                }
                 // Two-way ledger — same trust model as browser agents:
                 // inconclusive probe + ledger-authed ⇒ pass (a blind probe is
                 // no observation of broken); definitive probe verdicts write
@@ -1250,10 +1302,12 @@ module.exports = async function preflightAgents(state) {
                   authed = true;
                   logger.info(`[Node:PreflightAgents] ${_agentId}: probe inconclusive (${c.authStatus}) but ledger is authed — proceeding`);
                 }
-                if (c.authStatus === 'authenticated' || c.authStatus === 'configured' || c.authUser) markAgentAuthed(_agentId);
+                if (c.authStatus === 'authenticated' || c.authStatus === 'configured' || c.authStatus === 'not_required' || c.authUser) markAgentAuthed(_agentId);
                 else if (c.authStatus === 'not_authenticated' || c.authStatus === 'token_expired') markAgentAuthFailed(_agentId, `preflight probe: ${c.authStatus}`);
                 const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli, true);
                 agentReadiness.push({ type: 'cli', agentId: _agentId, ready: true, authed, iconUrl, service: c.service, setupInfo: _enrichedSetupInfo });
+                const _cliMapEntry = _preflightCliMap[(c.service || '').toLowerCase()];
+                if (_cliMapEntry) _cliMapEntry.authed = authed;
 
                 if (!authed) {
                   const _reason = _buildReason(c.service, c.cli, c.authStatus, _enrichedSetupInfo);
@@ -1274,6 +1328,19 @@ module.exports = async function preflightAgents(state) {
             }
           }
           if (lines.length > 0) cliPreflightNote = `\n\nCLI PRE-FLIGHT:\n${lines.join('\n')}`;
+        }
+        // Probe unavailable — name the real cause instead of the misleading
+        // downstream "selected agent did not complete preflight" dead end.
+        if (!pf?.ok && _selectedCliAgents.length > 0) {
+          logger.warn(`[Node:PreflightAgents] preflight_check returned no data — marking ${_selectedCliAgents.length} selected CLI agent(s) unavailable`);
+          for (const a of _selectedCliAgents) {
+            if (agentReadiness.some(r => r.agentId === a.id)) continue;
+            agentReadiness.push({
+              type: 'cli', agentId: a.id, ready: false, authed: false,
+              iconUrl: serviceToIconUrl(a.service || a.id), service: a.service,
+              reason: 'preflight_check unavailable (timed out or failed) — retry the task',
+            });
+          }
         }
       } catch (_) {}
     })(),
@@ -1469,8 +1536,13 @@ module.exports = async function preflightAgents(state) {
               // Stale agent detection: registered CLI agent whose CLI is no longer installed
               const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
               const cliInfo = _preflightCliMap[svcKey];
-              const _cliAuthed = cliInfo ? (!!cliInfo.authUser || cliInfo.authStatus === 'authenticated') : false;
-              const _cliAuthTag = _cliAuthed ? '' : ' [NEEDS AUTH]';
+              // cliMap now carries the real probe verdict — authed (incl.
+              // not_required) → no tag; probed-and-blocked → [NEEDS AUTH];
+              // unprobed service → no tag either (nothing was checked, don't
+              // claim auth is needed).
+              const _cliAuthed = cliInfo ? cliInfo.authed === true : false;
+              const _cliProbedBlocked = cliInfo && cliInfo.authed === false && cliInfo.hasCli;
+              const _cliAuthTag = _cliAuthed ? '' : (_cliProbedBlocked ? ' [NEEDS AUTH]' : '');
               agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_cliAuthTag}`);
               if (cliInfo && !cliInfo.hasCli) {
                 const iconUrl = agentIdToIconUrl(a.id, a.start_url);
