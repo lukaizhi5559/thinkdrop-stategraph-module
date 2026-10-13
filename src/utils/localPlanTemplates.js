@@ -1,6 +1,7 @@
 'use strict';
 
 const { parseLlmJson } = require('./parseLlmJson');
+const { SCREEN_OBSERVATION_RE, LIVE_PAGE_REF_RE } = require('./textPatterns.cjs');
 
 /**
  * localPlanTemplates.js — force-classified fast-path plans for local automation.
@@ -452,14 +453,22 @@ const TEMPLATES = [
       return tc?.activeDocRef === 'url' ? null : 'no active url doc';
     },
     build: (a, m, tc) => {
-      // Resolved-URL target → read THAT url (http→browser→crawl ladder) rather
-      // than scanning whatever tab is frontmost. scan_page reads the focused
-      // tab — observed misfire: context said the doc was valleyforgebaptist.org
-      // but the focused tab was a Nylas login, and the summary came from the
-      // wrong page. read_url on the resolved target is the correct page every
-      // time; scan_page stays only for unresolved "this page" deixis.
+      // Two referent classes reach here:
+      //   · DEICTIC ("this page", "scan the screen", "on this page") — the
+      //     referent is the tab visibly in front of the user. scan_page reads
+      //     the focused tab's LIVE URL at exec time, so a stale monitor URL
+      //     can't redirect the read (observed: history said walmart.com while
+      //     the user viewed boscovs.com → read_url fetched the wrong page).
+      //   · RESOLVED (a named site/URL the classifier resolved from
+      //     conversation, e.g. "calendar events on the Valley Forge Baptist
+      //     Church website") — read_url on the resolved target is correct even
+      //     when another tab is focused (observed: context said valleyforge
+      //     but the focused tab was a Nylas login → scan_page read the wrong
+      //     page). Named-site messages carry no live deixis, so the check
+      //     below keeps the protection.
+      const _deictic = LIVE_PAGE_REF_RE.test(m) || SCREEN_OBSERVATION_RE.test(m);
       const _target = String(tc?.activeDocTarget || '');
-      const _read = /^https?:\/\//i.test(_target)
+      const _read = /^https?:\/\//i.test(_target) && !_deictic
         ? { skill: 'app.agent', args: { action: 'read_url', url: _target, cleanup: 'deselect', httpFirst: true, crawlFallback: true }, description: `Read ${_target.slice(0, 70)}` }
         : { skill: 'app.agent', args: { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 }, description: 'Read the open browser page' };
       return [
@@ -536,7 +545,7 @@ const TEMPLATES = [
   },
   {
     n: 21, id: 'screen_read', lowRisk: true,
-    describe: 'read or describe what is currently on the user\'s screen — real browser page scan when a browser is frontmost, OCR otherwise ("what\'s on my screen", "what am I looking at", "read my screen") — args: {}',
+    describe: 'read or describe what is currently on the user\'s screen — real browser page scan when a browser is frontmost, OCR otherwise ("what\'s on my screen", "what am I looking at", "read my screen", "scan the screen", "scan this page") — args: {}',
     validate: () => null,
     build: () => [{ skill: 'app.agent', args: { action: 'read_screen', timeoutMs: 30000 }, description: 'Read the screen' }],
   },

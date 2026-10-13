@@ -26,6 +26,8 @@
  * plan wins over the fixed fast-lane plan.
  */
 
+const { SCREEN_OBSERVATION_RE, LIVE_PAGE_REF_RE } = require('../utils/textPatterns.cjs');
+
 const ABS_URL_RE = /(https?:\/\/[^\s"'<>)\]]+)/i;
 const HOST_RE = /\b((?:[a-z0-9-]+\.)+(?:com|net|org|io|ai|dev|app|co|edu|gov|info|me|us|uk|de|fr|jp|au|ca))((?:\/|#|\?)[^\s"'<>)\]]*)?/i;
 
@@ -40,12 +42,23 @@ function _extractUrl(message) {
 // taskClassification-only eligibility — shared with decomposePromptV2, which
 // short-circuits its LLM call when this passes (the gate can't drift apart or
 // decompose would skip the call for prompts the lane then rejects).
-function isBrowseFastLaneTc(tc) {
+// The message param feeds the live-page veto: a prompt whose own vocabulary
+// points at the open page/screen ("this page", "scan the screen") is never a
+// public fetch — a flaked public_read classification must not hijack it into
+// a web.agent search of the literal text.
+function isBrowseFastLaneTc(tc, message) {
   if (!tc) return false;
   if (tc.isBrowseOnly !== true) return false;
   if (tc.requiresDOM === true) return false;
   if (tc.webAccessMode !== 'public_read') return false;
   if (tc.needsClarification === true) return false;
+  // A live-doc referent ("this page", "the file", the screen) contradicts the
+  // public-fetch lane by definition — the page_read/screen paths own it.
+  if (tc.activeDocRef) return false;
+  // Same veto from the message's own vocabulary when the classifier left
+  // activeDocRef null (observed: page questions typing public_read and
+  // getting a Brave search of the deictic text).
+  if (message && (SCREEN_OBSERVATION_RE.test(message) || LIVE_PAGE_REF_RE.test(message))) return false;
   // Resolved browse follow-ups ("yes, look up the Greek words" → followUpTarget
   // resolves to a concrete topic) are just as fixed-shape as fresh lookups —
   // the veto stays only for follow-ups whose referent never resolved.
@@ -68,7 +81,7 @@ function _eligible(state) {
   // A pre-built plan (cache hit, resume, approval round-trip) always wins.
   if (state._skillPlan?.length || state._planFile || state._forceNewPlan) return false;
   if (state.recoveryContext || state.isMultiIntent || state._planCorrectionMode) return false;
-  return isBrowseFastLaneTc(state._taskClassification);
+  return isBrowseFastLaneTc(state._taskClassification, state.resolvedMessage || state.message);
 }
 
 module.exports = async function fastLanePlan(state) {

@@ -333,3 +333,43 @@ describe('page_scan / page_print action-verb guard', () => {
     assert.equal(hit.template, 'page_print');
   });
 });
+
+// Deictic live-page reads must scan the FOCUSED tab — a stale activeDocTarget
+// (history/context said walmart.com while the user viewed boscovs.com) is not
+// the referent of "this page". Resolved named-site targets keep read_url —
+// the named site is the referent even when another tab is focused (observed:
+// valleyforge context + focused Nylas login → scan_page read the wrong page).
+describe('page_scan deictic vs resolved target', () => {
+  const _stale = { activeDocRef: 'url', activeDocTarget: 'https://www.walmart.com/' };
+
+  it('deictic message + stale activeDocTarget → scan_page (focused tab)', async () => {
+    const hit = await _hit('what the best page on this page', _json(17, {}), _stale);
+    assert.equal(hit.template, 'page_scan');
+    assert.equal(hit.skillPlan[0].args.action, 'scan_page');
+    assert.equal(hit.skillPlan[0].args.url, undefined);
+  });
+
+  it('scan-then-report deictic ignores the resolved target too', async () => {
+    const hit = await _hit('scan the page and tell me the best price', _json(17, {}), _stale);
+    assert.equal(hit.template, 'page_scan');
+    assert.equal(hit.skillPlan[0].args.action, 'scan_page');
+  });
+
+  it('"scan this tab" reads the focused tab, not the context URL', async () => {
+    const hit = await _hit('scan this tab and tell me the cheapest option', _json(17, {}), _stale);
+    assert.equal(hit.skillPlan[0].args.action, 'scan_page');
+  });
+
+  it('resolved named-site target (no live deixis) → read_url on that target', async () => {
+    const hit = await _hit('list the events on the valley forge baptist church website', _json(17, {}),
+      { activeDocRef: 'url', activeDocTarget: 'https://valleyforgebaptist.org/' });
+    assert.equal(hit.template, 'page_scan');
+    assert.equal(hit.skillPlan[0].args.action, 'read_url');
+    assert.equal(hit.skillPlan[0].args.url, 'https://valleyforgebaptist.org/');
+  });
+
+  it('no deixis and no target still → scan_page', async () => {
+    const hit = await _hit('what does this page say?', _json(17, {}), { activeDocRef: 'url' });
+    assert.equal(hit.skillPlan[0].args.action, 'scan_page');
+  });
+});

@@ -507,3 +507,93 @@ describe('decompose — device-state guard', () => {
     assertEq(r._decomposedIntent, 'command_automate');
   });
 });
+
+describe('decomposePromptV2 — scan-then-report compounds', () => {
+  // "scan the screen and tell me the best price" matched "and tell" in the
+  // multi-goal conjunction list → llmDecompose → two web_search steps on the
+  // literal text (observed Oct-12 run). The report clause reads from the
+  // scan's own capture — ONE observation goal, never a Brave query.
+  const _noCall = { generateAnswer: async () => { throw new Error('number/LLM call must not run'); } };
+
+  it('"scan the screen and tell me the best price" → single screen_intelligence step', async () => {
+    const r = await _decompose('scan the screen and tell me the best price', _noCall,
+      { taskType: 'query' });
+    assertEq(r._decomposedIntent, 'screen_intelligence');
+    assertEq(r._decomposedBy, 'screen-observation-guard');
+    assertEq(r.intentPlan.length, 1);
+    assertEq(r.intentPlan[0].estimatedIntent, 'screen_intelligence');
+  });
+
+  it('"scan the page and tell me the best price" → live-page read, not web_search', async () => {
+    const r = await _decompose('scan the page and tell me the best price', _noCall,
+      { taskType: 'query' });
+    assertEq(r._decomposedIntent, 'screen_intelligence');
+    assertEq(r._decomposedBy, 'screen-observation-guard');
+  });
+
+  it('"read this tab and tell me the cheapest option" → screen_intelligence', async () => {
+    const r = await _decompose('read this tab and tell me the cheapest option', _noCall,
+      { taskType: 'query' });
+    assertEq(r._decomposedIntent, 'screen_intelligence');
+    assertEq(r._decomposedBy, 'screen-observation-guard');
+  });
+
+  it('"check this page and tell me what it says" → screen_intelligence', async () => {
+    const r = await _decompose('check this page and tell me what it says', _noCall,
+      { taskType: 'query' });
+    assertEq(r._decomposedIntent, 'screen_intelligence');
+    assertEq(r._decomposedBy, 'screen-observation-guard');
+  });
+
+  it('flaked public_read/web_search classification cannot hijack a live-surface read', async () => {
+    // Observed misclassification: page questions typed webAccessMode:
+    // 'public_read' + suggestedIntent web_search → Brave search of the
+    // literal prompt. The message's own live-surface vocabulary vetoes it.
+    const r = await _decompose('scan the page and tell me the best price', _noCall,
+      { taskType: 'query', webAccessMode: 'public_read', suggestedIntent: 'web_search' });
+    assertEq(r._decomposedIntent, 'screen_intelligence');
+  });
+
+  it('url-ref compound → active-doc guard (page_scan lane), still not web_search', async () => {
+    // With a resolved url referent the active-doc guard claims it one hop
+    // earlier — the deterministic page_scan template then chooses scan_page
+    // for the deictic read (tested in local-plan-templates.test.js).
+    const r = await _decompose('scan the page and tell me the best price', _noCall,
+      { taskType: 'query', activeDocRef: 'url', activeDocTarget: 'https://www.walmart.com/' });
+    assertEq(r._decomposedIntent, 'command_automate');
+    assertEq(r._decomposedBy, 'active-doc-guard');
+    assertEq(r.intentPlan.length, 1);
+  });
+
+  it('display tail stays multi-goal — suppressor must not fire', async () => {
+    // "scan the page and then show it on my screen" is a genuine two-goal
+    // prompt (read + display). The screen-output guard / LLM decompose own it;
+    // it must NOT collapse into a single observation step.
+    const plan = [{ text: 'scan the page', estimatedIntent: 'screen_intelligence', order: 0, dependsOn: [], isLongRunning: false },
+                  { text: 'show it on my screen', estimatedIntent: 'screen_display', order: 1, dependsOn: [0], isLongRunning: false }];
+    const r = await _decompose('scan the page and then show it on my screen',
+      { generateAnswer: async () => JSON.stringify({ subPrompts: plan }) },
+      { taskType: 'query' });
+    assert(r._decomposedBy !== 'screen-observation-guard', 'display tail must not collapse to observation');
+    assertEq(r.intentPlan.length, 2);
+    assertEq(r.intentPlan[1].estimatedIntent, 'screen_display');
+  });
+
+  it('non-surface scan stays multi-goal ("scan the images…")', async () => {
+    const plan = [{ text: 'scan the images', estimatedIntent: 'command_automate', order: 0, dependsOn: [], isLongRunning: false },
+                  { text: 'tell me what they are', estimatedIntent: 'general_knowledge', order: 1, dependsOn: [0], isLongRunning: false }];
+    const r = await _decompose('scan the images and tell me what they are',
+      { generateAnswer: async () => JSON.stringify({ subPrompts: plan }) },
+      { taskType: 'local_file' });
+    assert(r._decomposedBy !== 'screen-observation-guard', 'non-surface noun must not hit the screen guard');
+  });
+
+  it('action compound stays multi-goal ("scan the page and email me…")', async () => {
+    const plan = [{ text: 'scan the page', estimatedIntent: 'command_automate', order: 0, dependsOn: [], isLongRunning: false },
+                  { text: 'email me the results', estimatedIntent: 'command_automate', order: 1, dependsOn: [0], isLongRunning: false }];
+    const r = await _decompose('scan the page and email me the results',
+      { generateAnswer: async () => JSON.stringify({ subPrompts: plan }) },
+      { taskType: 'query' });
+    assert(r._decomposedBy !== 'screen-observation-guard', 'email tail is a second goal');
+  });
+});

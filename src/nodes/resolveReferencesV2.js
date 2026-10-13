@@ -17,7 +17,7 @@
 const { classifyTask, deriveResolution } = require('../utils/classifyTask');
 const { forceClassifyLocalPlan, looksLikeLocalOp } = require('../utils/localPlanTemplates');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE } = require('../utils/textPatterns.cjs');
+const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE } = require('../utils/textPatterns.cjs');
 
 /**
  * Binary web-access confirmation — runs only when classifyTask returns
@@ -809,7 +809,7 @@ module.exports = async function resolveReferencesV2(state) {
       || /\b(?:chrome|safari|edge|brave|arc|firefox|opera|vivaldi|orion|helium|zen)\b/i.test(_liveApp);
     const _liveUrl = _priorScreenContext?.url || null;
     if ((_liveUrl || _liveIsBrowser)
-        && /\b(?:this|the|current|open)\s+(?:page|site|website|tab|article|listing)\b|\bon\s+this\s+(?:page|site|website|tab)\b/i.test(message || '')) {
+        && LIVE_PAGE_REF_RE.test(message || '')) {
       _taskClassification.activeDocRef = 'url';
       _taskClassification.activeDocTarget = _liveUrl;
       logger.info(`[Node:ResolveReferencesV2] screen→url upgrade: page-referring message + live browser (${_liveApp || 'unknown'}${(_liveUrl || '').slice(0, 60) ? ' ' + _liveUrl.slice(0, 60) : ''})`);
@@ -829,7 +829,7 @@ module.exports = async function resolveReferencesV2(state) {
     const _liveAppN = String(_priorScreenContext?.appName || '');
     const _liveBrowserN = _priorScreenContext?.url || _priorScreenContext?.category === 'browser'
       || /\b(?:chrome|safari|edge|brave|arc|firefox|opera|vivaldi|orion|helium|zen)\b/i.test(_liveAppN);
-    if (_liveBrowserN && /\b(?:this|the|current|open)\s+(?:page|site|website|tab|article|listing)\b|\bon\s+this\s+(?:page|site|website|tab)\b/i.test(message || '')) {
+    if (_liveBrowserN && LIVE_PAGE_REF_RE.test(message || '')) {
       _taskClassification.activeDocRef = 'url';
       _taskClassification.activeDocTarget = _priorScreenContext?.url || null;
       logger.info(`[Node:ResolveReferencesV2] deixis fallback: page-referring message + live browser (${_liveAppN || 'unknown'}) → activeDocRef=url`);
