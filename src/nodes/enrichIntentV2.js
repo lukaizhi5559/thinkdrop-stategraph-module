@@ -58,6 +58,14 @@ module.exports = async function enrichIntentV2(state) {
     return state;
   }
 
+  // ── Deterministic plan: the step list + agents are already fixed upstream
+  // (planRunner-authored steps or a decompose template) — domain.extract's
+  // tags only feed resolveUserContext/resolveAgent lanes that det plans skip.
+  if (Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+    logger.debug(`[Node:EnrichIntentV2] Deterministic plan (${state._deterministicTemplate || 'template'}) — skipping domain.extract`);
+    return state;
+  }
+
   if (!mcpAdapter) {
     logger.warn('[Node:EnrichIntentV2] No mcpAdapter — passthrough');
     return state;

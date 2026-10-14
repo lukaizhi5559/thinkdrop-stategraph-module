@@ -80,6 +80,11 @@ function _eligible(state) {
   if (state.intent?.type !== 'command_automate') return false;
   // A pre-built plan (cache hit, resume, approval round-trip) always wins.
   if (state._skillPlan?.length || state._planFile || state._forceNewPlan) return false;
+  // A planRunner-dispatched task carries authored steps (_deterministicPlan) —
+  // the generic browse plan must never replace them. This lane intentionally
+  // overrides decomposePromptV2's localPlanTemplate det plans (see below), so
+  // the guard keys on _planTask, not _deterministicPlan generally.
+  if (state._planTask) return false;
   if (state.recoveryContext || state.isMultiIntent || state._planCorrectionMode) return false;
   return isBrowseFastLaneTc(state._taskClassification, state.resolvedMessage || state.message);
 }

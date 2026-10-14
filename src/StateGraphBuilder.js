@@ -28,7 +28,6 @@ const synthesizeNode = require('./nodes/synthesize');
 const enrichIntentNode = require('./nodes/enrichIntentV2');
 const evaluateSkillsNode = require('./nodes/evaluateSkills');
 const reviewExecutionNode = require('./nodes/reviewExecution');
-const creatorPlanningNode = require('./nodes/creatorPlanning');
 const appControlNode = require('./nodes/appControl');
 const storeConstraintNode = require('./nodes/storeConstraint');
 const liftConstraintNode  = require('./nodes/liftConstraint');
@@ -227,8 +226,6 @@ class StateGraphBuilder {
       storeConstraint: (state) => storeConstraintNode({ ...state, logger, mcpAdapter }),
       liftConstraint:  (state) => liftConstraintNode({ ...state, logger, mcpAdapter }),
       webSearch: (state) => webSearchNode({ ...state, logger, mcpAdapter }),
-      gatherContext: (state) => gatherPlanContextNode({ ...state, logger, mcpAdapter, llmBackend }),
-      creatorPlanning: (state) => creatorPlanningNode({ ...state, logger, mcpAdapter }),
       resolveAgent: (state) => resolveAgentNode({ ...state, logger, mcpAdapter, llmBackend }),
       preflightAgents: (state) => preflightAgentsNode({ ...state, logger, mcpAdapter }),
       planSkills: (state) => planSkillsNode({ ...state, logger, mcpAdapter, llmBackend }),
@@ -262,7 +259,24 @@ class StateGraphBuilder {
       // go straight to planExecutor instead of re-running the full
       // classify/decompose/agent/plan chain (which burned ~15–30s per resume
       // on dead-endpoint enrich calls and repeat LLM passes).
-      start: (state) => state._planFile ? 'planExecutor' : 'resolveReferences',
+      //
+      // Plan-task lane: a planRunner dispatch arrives with authored steps
+      // (_deterministicPlan) and a forced command_automate intent — the
+      // classification spine has nothing to decide. resolveReferences still
+      // ran classifyTask's LLM pass whose fields planTasks then force-cleared,
+      // and enrichIntent ran a domain.extract lookup the det plan never reads;
+      // entering at resolveAgent skips ~10 no-op hops plus both wasted calls.
+      // resolveAgent/preflightAgents/gatherPlanContext/planSkills all carry
+      // det-plan handlers — internal templates skip straight through, and
+      // _deterministicExternal tasks still get the pin-verify + live auth
+      // preflight they need. A _planTask WITHOUT steps (planRunner's
+      // degenerate-step fallback, deterministicPlan:null) keeps the spine —
+      // live replanning legitimately needs _taskClassification.
+      start: (state) => state._planFile
+        ? 'planExecutor'
+        : (state._planTask && Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0
+          ? 'resolveAgent'
+          : 'resolveReferences'),
       // clarify is the pre-routing resolution gate: needs_clarification → ask
       // the user (grill batch) + re-classify once; resolved/declined_ack pass.
       resolveReferences: 'clarify',
@@ -353,10 +367,6 @@ class StateGraphBuilder {
         return 'planSkills';
       },
 
-      // gatherContext node (alias for gatherPlanContext — retained for compat)
-      gatherContext: () => 'planSkills',
-      creatorPlanning: () => 'planSkills',
-
       // planSkills → end (awaiting approval) or executeCommand (plan ready) or logConversation (plan error)
       planSkills: (state) => {
         if (state.awaitingPlanApproval) {
@@ -375,7 +385,7 @@ class StateGraphBuilder {
       // executeCommand cycle: next step, recover on failure, or done
       executeCommand: (state) => {
         // Thin recovery handler already ran inline in executeCommand and set recoveryAction.
-        // Route based on recoveryAction instead of going through recoverSkill node.
+        // Route based on recoveryAction (set by the inline thin recovery handler).
         // Guard: a stale 'auto_patch' (e.g. DET_RETRY's flag surviving a
         // terminal return) must not re-enter executeCommand once the plan has
         // no remaining steps — that loops until the cycle detector aborts and
@@ -449,7 +459,7 @@ class StateGraphBuilder {
 
       // evaluateSkills: PASS/ASK_USER → done, FIX → replan with stored context rule
       // Special case: failure-path PASS (no rule derived) still routes to planSkills
-      // because recoveryContext from recoverSkill is still set for the replan.
+      // because recoveryContext from thin recovery is still set for the replan.
       evaluateSkills: (state) => {
         const verdict = state.evaluationVerdict;
         if (verdict === 'FIX' && state.evaluationFix) {
@@ -457,7 +467,7 @@ class StateGraphBuilder {
           logger.info(`[StateGraph:Router] evaluateSkills FIX → prepareReplan (${state.recoveryAction === 'replan_step' ? 'single-step' : 'full'}, retry ${state.evaluationRetryCount})`);
           return 'prepareReplan';
         }
-        // recoverSkill set recoveryAction='replan' or 'replan_step' — evaluateSkills was inserted in that path.
+        // Thin recovery set recoveryAction='replan' or 'replan_step' — evaluateSkills was inserted in that path.
         // If no FIX rule was derived (PASS fallback), still continue to planSkills with recoveryContext.
         if (verdict === 'PASS' && (state.recoveryAction === 'replan' || state.recoveryAction === 'replan_step') && state.recoveryContext) {
           logger.debug(`[StateGraph:Router] evaluateSkills PASS (failure path) → prepareReplan (${state.recoveryAction === 'replan_step' ? 'single-step' : 'full'})`);
