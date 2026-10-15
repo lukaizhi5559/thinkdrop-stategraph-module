@@ -5007,9 +5007,24 @@ Please try again or search with different terms.`;
   //   {{prev_stdout}}         — stdout of the immediately preceding step (enables find→read→write chains)
   //   {{prev_watchId}}        — watchId from the last file.watch start step
   //   {{bestUrl}}             — bestUrl returned by the last web.agent search_and_navigate step
-  const synthesisAnswer = state.synthesisAnswer || '';
+  // Cross-task seed: plan tasks carry _priorResults (upstream task outputs).
+  // The stepgen writes {{synthesisAnswer}} into a downstream task meaning "the
+  // previous task's output" — without this seed the token dies at dispatch
+  // (synthesisAnswer is otherwise run-local until a synthesize step runs).
+  const _priorTail = (Array.isArray(state._priorResults) && state._priorResults.length)
+    ? String(state._priorResults[state._priorResults.length - 1].result || '')
+    : '';
+  const synthesisAnswer = state.synthesisAnswer || _priorTail;
   const synthesisAnswerFile = state.synthesisAnswerFile || '';
-  const prevStdout = skillResults.length > 0 ? (skillResults[skillResults.length - 1].stdout || '').trim() : '';
+  // Canonical output fallback — skill results may carry their data product in
+  // .result/.text when .stdout is absent (canonicalizer normalizes the wire
+  // shape; skillResults entries come from heterogeneous step pushes).
+  const prevStdout = skillResults.length > 0
+    ? String(skillResults[skillResults.length - 1].stdout
+        ?? skillResults[skillResults.length - 1].result
+        ?? skillResults[skillResults.length - 1].text
+        ?? '').trim()
+    : '';
   // Resolve prev_watchId: find the most recent file.watch step that returned a watchId
   const prevWatchId = (() => {
     for (let i = skillResults.length - 1; i >= 0; i--) {
@@ -6797,9 +6812,9 @@ Please try again or search with different terms.`;
   // ─────────────────────────────────────────────────────────────────────────────
 
   try {
-    // For cli.agent / browser.agent / app.agent: inject _progressCallbackUrl so the agent can POST
+    // For cli.agent / browser.agent / app.agent / task.agent: inject _progressCallbackUrl so the agent can POST
     // real-time turn updates back to the Electron overlay server → renderer (AutomationProgress).
-    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent' || skill === 'app.agent';
+    const _isAgentSkill = skill === 'cli.agent' || skill === 'browser.agent' || skill === 'app.agent' || skill === 'task.agent';
     // Guard: planSkills LLM sometimes emits browser.agent/cli.agent steps without an
     // explicit `action` field.  The agent's switch statement hits the default case and
     // returns { ok: false, error: "Unknown action: \"undefined\"" }, triggering an

@@ -2274,10 +2274,51 @@ async function planSkillsV2(state) {
   // approval gate is still honored (plan file + awaitingPlanApproval) so
   // planApprovalMode='always' users keep their review pass.
   if (!recoveryContext && Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0) {
+    // ── task.agent pilot (THINKDROP_TASK_AGENT=1) ────────────────────────
+    // Local-class plan tasks (shell / cli.agent / edit.agent / none — NOT a
+    // service or browser lane) collapse their authored steps into ONE
+    // task.agent step: the loop calls skills directly and keeps results in
+    // the LLM context — no {{PREV_OUTPUT}}/{{synthesisAnswer}} token seam.
+    // Service/browser tasks keep the authored deterministic plan unchanged.
+    let _taskAgentPlan = null;
+    if (state._planTask === true && process.env.THINKDROP_TASK_AGENT === '1') {
+      try {
+        const _svcMap = require('../../../shared/service-map.cjs');
+        const _pinned = state._deterministicServiceAgent || null;
+        const _pinnedType = _pinned
+          ? (_svcMap.describeAgent(String(_pinned).replace(/\.agent$/, '')) || {}).type
+          : null;
+        // Local-class pilot lane: no pinned agent, or a cli/local/mcp tool
+        // (cli.agent/edit.agent describe to null). Service lanes — browser,
+        // api, app — keep the authored deterministic plan.
+        const _isLocalLane = !_pinnedType || ['cli', 'local', 'mcp'].includes(_pinnedType);
+        if (_isLocalLane) {
+          // The authored steps stay useful as an approach hint — the loop may
+          // follow or deviate, but isn't starting blind.
+          const _hint = state._deterministicPlan
+            .map((s, i) => `  ${i + 1}. ${s.skill}${s.description ? ` — ${s.description}` : ''}`)
+            .join('\n');
+          const _taskText = String(state.resolvedMessage || state.message || '')
+            + (_hint ? `\n\nSUGGESTED APPROACH (from the approved plan — follow unless a step fails):\n${_hint}` : '');
+          _taskAgentPlan = [{
+            skill: 'task.agent',
+            args: {
+              task: _taskText,
+              ...(Array.isArray(state._priorResults) && state._priorResults.length
+                ? { priorResults: state._priorResults } : {}),
+            },
+            description: 'Execute task via task.agent loop',
+          }];
+          logger.info(`[Node:PlanSkillsV2] task.agent pilot — plan task collapsed to single task.agent step (pinned=${_pinned || 'none'}, type=${_pinnedType || 'none'})`);
+        } else {
+          logger.info(`[Node:PlanSkillsV2] task.agent pilot skipped — service lane ${_pinned} (type=${_pinnedType})`);
+        }
+      } catch (_) { /* service-map unavailable — stay on authored plan */ }
+    }
     // Preflight may have already resolved a deep-link for the pinned service
     // (e.g. gmail compose URL) — inject it into browser.agent run args.url so
     // browser.agent selects URL-first navigation instead of a blind start page.
-    const detPlan = _sanitizeSkillPlan(_lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
+    const detPlan = _taskAgentPlan || _sanitizeSkillPlan(_lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
       _stripRedundantVerifySteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger),
       userMessage), logger), logger), state);
     // Messaging follow-up body: the service_task template passes the raw
