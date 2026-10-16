@@ -155,6 +155,12 @@ module.exports = async function webSearch(state) {
         url: r.url || r.link,
         title: r.title || '',
         snippet: r.snippet || r.description || '',
+        // Real destination host from the SERP cite row — r.url is often a
+        // wrapped google.com/goto link whose hostname renders 'google.com'.
+        ...(r.displayDomain && { displayDomain: r.displayDomain }),
+        ...(r.rating !== undefined && { rating: r.rating, ratingMax: r.ratingMax }),
+        ...(r.reviewCount !== undefined && { reviewCount: r.reviewCount }),
+        ...(r.priceRange && { priceRange: r.priceRange }),
         // Include image URL for image search results so they can be displayed
         // imageUrl is the Brave thumbnail (reliable CDN), originalUrl is the source page
         ...(imageUrl && { imageUrl, isImage: true }),

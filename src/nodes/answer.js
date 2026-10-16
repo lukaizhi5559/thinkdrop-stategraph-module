@@ -806,14 +806,21 @@ Please try asking: "help me track down the video links for each one of these wor
     // Uses the \x00SOURCES\x00 sentinel (same channel as \x00REPLACE\x00).
     // Only fires when the answer was grounded in web search results.
     if (typeof streamCallback === 'function' && contextDocs.length > 0) {
+      const _seenHosts = new Set();
       const sources = contextDocs
         .filter(d => d.url && d.url.startsWith('http'))
-        .slice(0, 10)
         .map(d => {
           let hostname = '';
           try { hostname = new URL(d.url).hostname.replace(/^www\./, ''); } catch (_) {}
-          return { url: d.url, title: d.text?.split('\n')[0]?.trim() || hostname, hostname };
-        });
+          return {
+            url: d.url,
+            title: d.text?.split('\n')[0]?.trim() || d.displayDomain || hostname,
+            hostname: d.displayDomain || hostname,
+            snippet: d.snippet || '',
+          };
+        })
+        .filter(s => s.hostname && !_seenHosts.has(s.hostname) && _seenHosts.add(s.hostname))
+        .slice(0, 10);
       if (sources.length > 0) {
         streamCallback('\x00SOURCES\x00' + JSON.stringify(sources));
       }
@@ -835,7 +842,11 @@ Please try asking: "help me track down the video links for each one of these wor
             imageUrl: d.imageUrl,
             url: url || undefined,
             snippet: d.snippet || undefined,
-            hostname: hostname || undefined,
+            hostname: d.displayDomain || hostname || undefined,
+            rating: d.rating !== undefined ? d.rating : undefined,
+            ratingMax: d.ratingMax !== undefined ? d.ratingMax : undefined,
+            reviewCount: d.reviewCount !== undefined ? d.reviewCount : undefined,
+            priceRange: d.priceRange || undefined,
             mediaType: d.mediaType || undefined,
             duration: d.duration || undefined,
             channel: d.channel || undefined,

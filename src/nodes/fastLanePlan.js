@@ -32,9 +32,9 @@ const ABS_URL_RE = /(https?:\/\/[^\s"'<>)\]]+)/i;
 const HOST_RE = /\b((?:[a-z0-9-]+\.)+(?:com|net|org|io|ai|dev|app|co|edu|gov|info|me|us|uk|de|fr|jp|au|ca))((?:\/|#|\?)[^\s"'<>)\]]*)?/i;
 
 function _extractUrl(message) {
-  const m = message.match(ABS_URL_RE);
+  const m = String(message || '').match(ABS_URL_RE);
   if (m) return m[1];
-  const h = message.match(HOST_RE);
+  const h = String(message || '').match(HOST_RE);
   if (h) return `https://${h[1]}${h[2] || ''}`;
   return null;
 }
@@ -73,6 +73,12 @@ function isBrowseFastLaneTc(tc, message) {
   if (tc.expectsFileOutput === true) return false;
   if (tc.mediaListing && tc.mediaListing !== 'none') return false;
   if (Array.isArray(tc.interactiveActions) && tc.interactiveActions.length > 0) return false;
+  // Plain search-shaped lookups are SERP-answerable — the web_search intent
+  // (webSearch → answer) returns in seconds where this lane's search→crawl→
+  // synthesize plan takes 30s-2min. Only prompts naming a concrete page —
+  // a literal URL/host in the message or resolved follow-up target, or a
+  // resolved targetService — still qualify for the fetch path.
+  if (!tc.targetService && !_extractUrl(message) && !_extractUrl(tc.followUpTarget)) return false;
   return true;
 }
 

@@ -5,7 +5,9 @@
  * Regression tests for fastLanePlan plan emission:
  *   - named-service tasks (targetService) route through app.agent nav_task
  *     (the resolve-discovery lane), not bare web search;
- *   - service-less searches keep the web.agent → read_url → synthesize shape;
+ *   - plain service-less lookups are INELIGIBLE — they route to web_search
+ *     via the public-research guard (SERP answers, seconds not minutes);
+ *   - hostnames in the message count as page-targets and stay eligible;
  *   - literal URLs keep read_url → synthesize.
  *
  * Run from repo root with:
@@ -117,18 +119,34 @@ function browseState(tc, message = 'yes') {
     expect(r._skillPlan[0].args.service).toBe('biblegateway');
   });
 
-  // ── service-less search keeps the 3-step shape ─────────────────────────────
+  // ── plain lookups leave the crawl lane — they route to web_search ──────────
 
-  await it('no targetService → [search_and_navigate, read_url, synthesize]', async () => {
-    const r = await fastLanePlan(browseState({ targetService: null }, 'what is the capital of Norway'));
-    const plan = r._skillPlan;
-    expect(plan.length).toBe(3);
-    expect(plan[0].skill).toBe('web.agent');
-    expect(plan[0].args.action).toBe('search_and_navigate');
-    expect(plan[0].args.preferDomain).toBe(undefined);
-    expect(plan[1].skill).toBe('app.agent');
-    expect(plan[1].args.action).toBe('read_url');
-    expect(plan[2].skill).toBe('synthesize');
+  await it('plain lookup, no page-target → ineligible (web_search handles it)', async () => {
+    const tc = { targetService: null };
+    const state = browseState(tc, 'what is the capital of Norway');
+    expect(fastLanePlan.isBrowseFastLaneTc(state._taskClassification, state.message)).toBe(false);
+    const r = await fastLanePlan(state);
+    if (r._skillPlan) throw new Error('plain lookup must not emit a fetch plan');
+  });
+
+  await it('bare review query → ineligible (web_search handles it)', async () => {
+    const state = browseState({ targetService: null }, 'show me chipotle reviews for local restaurant');
+    expect(fastLanePlan.isBrowseFastLaneTc(state._taskClassification, state.message)).toBe(false);
+  });
+
+  await it('hostname in message → still eligible (page-targeted)', async () => {
+    const state = browseState({ targetService: null }, 'check the reviews on chipotle.com for me');
+    expect(fastLanePlan.isBrowseFastLaneTc(state._taskClassification, state.message)).toBe(true);
+  });
+
+  await it('URL in resolved followUpTarget → still eligible', async () => {
+    const state = browseState({
+      targetService: null,
+      isFollowUp: true,
+      followUpTarget: 'https://example.com/article',
+      resolution: 'resolved',
+    }, 'yes read it');
+    expect(fastLanePlan.isBrowseFastLaneTc(state._taskClassification, state.message)).toBe(true);
   });
 
   // ── literal URL keeps the 2-step shape ─────────────────────────────────────

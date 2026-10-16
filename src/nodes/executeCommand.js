@@ -169,6 +169,10 @@ Rules:
 // NOT block — they resolve to earlier successful steps, and a missing bestUrl
 // hits the existing unresolved-token skip guard downstream.
 const _READ_ONLY_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search', 'fs.read', 'image.analyze']);
+// Web-fetch subset of the read-only set — also excluded from the cli.agent
+// TERMINAL_DEBUG fallbacks: a shell loop cannot out-crawl the crawl skill,
+// so fetch failures go to auto-skip or LLM recovery instead.
+const _WEB_FETCH_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search']);
 
 // Atomic browser skills that share a session — used by the per-step arg
 // enrichment (serial + runGroup paths) and the session-tracking block.
@@ -469,6 +473,15 @@ async function _thinPostFailureHandler(state) {
     };
   }
 
+  // ── Read-only fetch auto-skip — BEFORE the universal terminal fallback ────
+  // A shell can't fix a dead web crawl: web.crawl/web.agent timeouts used to
+  // hit the TERMINAL_DEBUG block below first and burn ~20s in a cli.agent
+  // loop probing the filesystem for a browser problem. When remaining steps
+  // don't depend on the failed fetch's output, skip it and let the plan
+  // continue (synthesize answers from earlier steps' SERP results).
+  const _earlySkipped = _tryAutoSkipIndependentStep(state);
+  if (_earlySkipped) return _earlySkipped;
+
   // ── Universal terminal fallback — observe→adapt before replan/ask ─────────
   // ANY failed step that wasn't already handled above (not install-escalated,
   // not a delegation, not an ask-user pause, not already an agent loop) gets
@@ -476,8 +489,12 @@ async function _thinPostFailureHandler(state) {
   // user can watch — where it reads the real error, probes reality, and adapts.
   // Without this, non-install failures (ENOENT verify steps, browser.agent
   // failures, etc.) went straight to LLM replan and replayed the same argv.
+  // Web-fetch skills are excluded: even when a dependent step keeps them from
+  // auto-skipping above, a terminal loop cannot out-crawl the crawl skill —
+  // they fall through to LLM recovery/ask_user instead.
   if (failedStep
       && failedStep.skill !== 'cli.agent' && failedStep.skill !== 'terminal.agent'
+      && !_WEB_FETCH_SKILLS.has(failedStep.skill)
       && !failedStep.askUser && !failedStep.delegateTo
       && Array.isArray(skillPlan) && skillPlan[skillCursor]
       && !(patchHistory || []).some(p => (p.action === 'TERMINAL_DEBUG' || p.action === 'AGENT_ESCALATE' || p.action === 'DELEGATE_REROUTE') && p.cursor === skillCursor)
@@ -541,7 +558,10 @@ async function _thinPostFailureHandler(state) {
     // observe→adapt loop once per cursor: it reads the error, probes
     // registries/help, and tries a different approach — instead of presenting
     // the user a bare Retry that replays the dead command.
-    if (!(patchHistory || []).some(p => p.action === 'TERMINAL_DEBUG' && p.cursor === skillCursor)) {
+    // Web-fetch skills stay out — a terminal loop can't fix a dead crawl;
+    // they fall to the ask_user path below.
+    if (!_WEB_FETCH_SKILLS.has(failedStep.skill)
+        && !(patchHistory || []).some(p => p.action === 'TERMINAL_DEBUG' && p.cursor === skillCursor)) {
       const _dbgArgv = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
       const _dbgTask = `${failedStep.args?.goal || failedStep.description || _dbgArgv || 'complete the failed step'} — previous attempts failed: ${(_dbgArgv ? `\`${_dbgArgv}\` → ` : '')}${String(failedStep.error || 'failed').slice(0, 300)}`;
       const patchedPlan = [...skillPlan];
