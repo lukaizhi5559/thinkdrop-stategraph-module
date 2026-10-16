@@ -583,7 +583,19 @@ module.exports = async function resolveReferencesV2(state) {
   // followUpTarget; the live-doc resolution is a parallel channel that cannot
   // corrupt it, and an unused context block is harmless.
   let _taskClassification;
-  if (state._planFile) {
+  if (state._routeDecision && typeof state._routeDecision === 'object' && state._routeDecision.taskType) {
+    // RouteDecision envelope — comms-graph ran the canonical classifyTask at
+    // ingress and forwarded it via the handoff. Consuming it keeps one source
+    // of truth for "what is this prompt": the graph cannot re-derive a
+    // contradictory reading, and the second LLM call is saved. Delete the
+    // inbound key so a multi-intent queue re-entry can't reuse it for the
+    // NEXT message.
+    _taskClassification = { ...state._routeDecision };
+    delete state._routeDecision;
+    logger.info('[Node:ResolveReferencesV2] RouteDecision from comms-graph — skipping classifyTask', {
+      taskType: _taskClassification.taskType, suggestedIntent: _taskClassification.suggestedIntent || null,
+    });
+  } else if (state._planFile) {
     // Plan execution: skip the expensive LLM classification, but preserve the
     // original webAccessMode (public_read/download) so downstream nodes like
     // executeCommand can still make mode-aware decisions.
