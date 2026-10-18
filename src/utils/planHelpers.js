@@ -508,6 +508,30 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
   const steps = [...plan];
   const _hasResidue = (s) => hasMutationResidue(`${s?.args?.task || ''}\n${s?.description || ''}`);
 
+  // Extension connected → app.agent real-browser steps become session-bound
+  // browser-lane steps: navigate_url opens through the extension (tab binds,
+  // activates, and follow-ups can find it via /ext.sessions). app.agent's OS
+  // open leaves an unbound tab the next prompt can't address.
+  if (ctx.extConnected) {
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i];
+      if (s?.skill === 'app.agent' && s?.args?.action === 'navigate_url' && typeof s.args?.url === 'string' && s.args.url) {
+        steps[i] = {
+          ...s,
+          skill: 'url.first.agent',
+          args: {
+            url: s.args.url,
+            task: s.args.task || s.description || `Open ${s.args.url}`,
+            activate: s.args.activate !== false,
+            agentId: s.args.agentId,
+            sessionId: s.args.sessionId,
+          },
+        };
+        rewrites.push({ index: i, kind: 'app.agent-navigate_url→url.first', agentId: s.args?.agentId || null });
+      }
+    }
+  }
+
   for (let i = 0; i < steps.length; i++) {
     const uf = steps[i];
     if (uf?.skill !== 'url.first.agent') continue;
@@ -546,7 +570,10 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
     const _sameAgentElsewhere = steps.some((s, k) =>
       k !== i && _BROWSER_LANE_SKILLS.has(s?.skill) && agentKey && _stepAgentKey(s) === agentKey);
     const _url = typeof uf.args?.url === 'string' && uf.args.url && !/\{\{/.test(uf.args.url) ? uf.args.url : null;
-    if (_NAV_ONLY_TASK_RE.test(task) && _url && !_sameAgentElsewhere) {
+    // Extension connected → keep url.first even for display-only navs: ext
+    // navigation binds the tab into a session (follow-ups, /ext.sessions),
+    // which app.agent's fire-and-forget OS open never provides.
+    if (!ctx.extConnected && _NAV_ONLY_TASK_RE.test(task) && _url && !_sameAgentElsewhere) {
       steps[i] = {
         ...uf,
         skill: 'app.agent',

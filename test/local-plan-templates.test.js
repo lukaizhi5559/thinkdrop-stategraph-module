@@ -40,11 +40,23 @@ describe('template compilation', () => {
     assert.equal(hit.lowRisk, false);
   });
 
-  it('file_append compiles to an append (>> not >)', async () => {
+  it('file_append compiles to an edit.agent step (not raw shell append)', async () => {
     const msg = "append the line 'second entry' to /tmp/e2e/log.txt";
     const hit = await _hit(msg, _json(2, { path: '/tmp/e2e/log.txt', content: 'second entry' }));
     assert.equal(hit.template, 'file_append');
-    assert.match(hit.skillPlan[0].args.argv[1], />>\s*'\/tmp\/e2e\/log\.txt'/);
+    const step = hit.skillPlan[0];
+    assert.equal(step.skill, 'edit.agent');
+    assert.equal(step.args.filePath, '/tmp/e2e/log.txt');
+    assert.match(step.args.goal, /second entry/);
+    assert.match(step.args.goal, /append/i);
+  });
+
+  it('file_create emits a textutil pipeline for office extensions', async () => {
+    const msg = 'create a file at /tmp/e2e/notes.rtf containing the text hello world';
+    const hit = await _hit(msg, _json(1, { path: '/tmp/e2e/notes.rtf', content: 'hello world' }));
+    assert.equal(hit.template, 'file_create');
+    assert.match(hit.skillPlan[0].args.argv[1], /textutil -convert rtf/);
+    assert.match(hit.skillPlan[0].args.argv[1], /\/tmp\/e2e\/notes\.rtf/);
   });
 
   it('file_read compiles to fs.read', async () => {
@@ -68,6 +80,8 @@ describe('template compilation', () => {
     assert.match(mv.skillPlan[0].args.argv[1], /mv '\/tmp\/e2e\/a\.txt' '\/tmp\/e2e\/b\.txt'/);
     const cp = await _hit('copy /tmp/e2e/a.txt to /tmp/e2e/b.txt', _json(5, { src: '/tmp/e2e/a.txt', dst: '/tmp/e2e/b.txt', op: 'copy' }));
     assert.match(cp.skillPlan[0].args.argv[1], /cp -R/);
+    // The attached source IS the explicit target — seatbelt must not deny it.
+    assert.deepEqual(mv.skillPlan[0].args.protectedPaths, []);
   });
 
   it('sys_query compiles every known kind', async () => {

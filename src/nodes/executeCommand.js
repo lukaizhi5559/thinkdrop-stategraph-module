@@ -340,6 +340,49 @@ async function _thinPostFailureHandler(state) {
 
   if (!failedStep) return state;
 
+  // Attachment paths from the invoking message — injected into cli.agent
+  // patches below so the seatbelt follows the step across substitutions
+  // (cli.agent's PTY session enforces them at spawn).
+  const { getProtectedPaths: _getProtectedPaths } = require('../utils/planHelpers');
+  const _protectedPaths = state._protectedPaths || _getProtectedPaths(resolvedMessage || message || '');
+
+  // ── Sandboxed protected-path write → substitute edit.agent ────────────────
+  // Runs FIRST: a kernel-denied write to a user-attached file is the
+  // strongest signal that the step is a content edit in disguise — edit.agent
+  // is the sanctioned rail (draft/backup/diff, format-aware RTF/docx). Must
+  // precede the cli.agent fallbacks below, which would replay the same write
+  // in a terminal session. Only *content-write-shaped* commands qualify —
+  // mv/rm/cp denials are file ops, not edits (file_move/file_delete carry an
+  // explicit protectedPaths:[] opt-out for the targeted attachment).
+  if (failedStep._sandboxDeniedPath && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !patchHistory.some(p => p.action === 'SANDBOX_REROUTE')) {
+    const _deniedStr = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
+    const _isContentWrite = />\s*[^\s|&]|\btee\b|\bdd\b[^|;]*\bof=|\b(?:sed|perl|ed)\s+[^|;]*\s-i\b/.test(_deniedStr);
+    if (_isContentWrite) {
+      const _denied = failedStep._sandboxDeniedPath;
+      const _editGoal = failedStep.description || failedStep.args?.goal
+        || `Edit ${path.basename(_denied)}`;
+      const patchedPlan = [...skillPlan];
+      patchedPlan[skillCursor] = {
+        ...patchedPlan[skillCursor],
+        skill: 'edit.agent',
+        args: { goal: _editGoal, filePath: _denied },
+        description: failedStep.description || `Edit ${path.basename(_denied)}`,
+      };
+      logger.info(`[ExecuteCommand:ThinRecovery] SANDBOX_REROUTE: shell.run write to attached file ${_denied} denied — substituting edit.agent (goal="${_editGoal.slice(0, 80)}")`);
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        recoveryNote: `Direct writes to your attached file ${path.basename(_denied)} are blocked — routing through the safe editor instead.`,
+        patchHistory: [...patchHistory, { action: 'SANDBOX_REROUTE', cursor: skillCursor, note: `edit.agent for ${_denied}`, attempt: stepRetryCount + 1 }],
+        stepRetryCount: stepRetryCount + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
+  }
+
   // ── shell.run goal/install failure → escalate to cli.agent's loop ─────────
   // A one-shot argv can't observe its own stderr — "Retry" replays the same
   // failing command forever (observed: npm i -g @nylas/cli → E404 ×4). The
@@ -373,8 +416,8 @@ async function _thinPostFailureHandler(state) {
         ...patchedPlan[skillCursor],
         skill: 'cli.agent',
         args: _useBuild
-          ? { action: 'build_agent', service: _svc }
-          : { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}` },
+          ? { action: 'build_agent', service: _svc, protectedPaths: _protectedPaths }
+          : { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}`, protectedPaths: _protectedPaths },
         description: failedStep.description || (_useBuild ? `Install & register ${_svc}` : `Retry agentically: ${(_goalText || _argvStr).slice(0, 60)}`),
       };
       logger.info(`[ExecuteCommand:ThinRecovery] AGENT_ESCALATE: shell.run step ${skillCursor + 1} failed (${(failedStep.error || '').slice(0, 80)}) — substituting cli.agent ${_useBuild ? `build_agent service=${_svc}` : 'generic run'}`);
@@ -457,7 +500,7 @@ async function _thinPostFailureHandler(state) {
     const patchedPlan = [...skillPlan];
     patchedPlan[skillCursor] = {
       ...patchedPlan[skillCursor],
-      args: { action: 'run', task: `${failedStep.description || `Install and set up ${_svc} CLI`} — build_agent failed: ${String(failedStep.error || '').slice(0, 300)}. Diagnose the failure and complete the install a different way.`, timeoutMs: 300000 },
+      args: { action: 'run', task: `${failedStep.description || `Install and set up ${_svc} CLI`} — build_agent failed: ${String(failedStep.error || '').slice(0, 300)}. Diagnose the failure and complete the install a different way.`, timeoutMs: 300000, protectedPaths: _protectedPaths },
       description: failedStep.description || `Install & set up ${_svc}`,
     };
     logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: cli.agent build_agent step ${skillCursor + 1} failed — falling back to generic run loop`);
@@ -482,6 +525,56 @@ async function _thinPostFailureHandler(state) {
   const _earlySkipped = _tryAutoSkipIndependentStep(state);
   if (_earlySkipped) return _earlySkipped;
 
+  // ── Browser-lane escalation — BEFORE the universal terminal fallback ──────
+  // A failed dom.act/url.first/atomic step belongs to the page, not the shell:
+  // handing it to cli.agent (the TERMINAL_DEBUG catch-all) burns an agent loop
+  // probing the filesystem for a DOM problem (observed: gmail compose dom.act
+  // → cli.agent run loop → user cancel). Escalate browser→browser instead —
+  // turn.loop.agent retries as a multi-step observe→act loop on the SAME
+  // session (extension-bound tab preserved). turn.loop itself and second
+  // failures fall through to LLM recovery — never cli.agent.
+  const { ATOMIC_BROWSER_SKILLS: _BROWSER_LANE } = require('../utils/planHelpers');
+  // app.agent is dual-purpose (GUI apps + real-browser lane): a failed step
+  // whose ACTION is a browser action (scan_page/navigate_url/read_url/
+  // nav_task/print_page) belongs to the browser escalation, not the terminal
+  // one — regardless of whether the extension happens to be connected at this
+  // instant (a mid-run disconnect must not reroute a page step into cli.agent;
+  // observed: ext dropped → scan_page failed → cli.agent 'Page copy empty'
+  // spiral). GUI-app actions (focus_app etc.) stay terminal-eligible.
+  const _APP_BROWSER_ACTIONS = new Set(['scan_page', 'navigate_url', 'read_url', 'nav_task', 'print_page']);
+  const _browserish = (s) => _BROWSER_LANE.has(s)
+    || (s === 'app.agent' && _APP_BROWSER_ACTIONS.has(String(failedStep?.args?.action || '')));
+  if (failedStep
+      && _browserish(failedStep.skill)
+      && failedStep.skill !== 'turn.loop.agent'
+      && !failedStep.askUser && !failedStep.delegateTo
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => p.action === 'BROWSER_ESCALATE' && p.cursor === skillCursor)) {
+    const patchedPlan = [...skillPlan];
+    patchedPlan[skillCursor] = {
+      ...patchedPlan[skillCursor],
+      skill: 'turn.loop.agent',
+      args: {
+        task: failedStep.args?.task || failedStep.description || 'Complete the on-page task',
+        agentId: failedStep.args?.agentId,
+        sessionId: failedStep.args?.sessionId,
+        mode: 'act',
+      },
+      description: `${failedStep.description || 'On-page task'} — via turn.loop agent`,
+    };
+    logger.info(`[ExecuteCommand:ThinRecovery] BROWSER_ESCALATE: ${failedStep.skill} step ${skillCursor + 1} failed — retrying via turn.loop.agent on the same session`);
+    return {
+      ...state,
+      recoveryAction: 'auto_patch',
+      skillPlan: patchedPlan,
+      recoveryNote: 'The page action failed — retrying it as a multi-step observe→act loop on the same browser session.',
+      patchHistory: [...patchHistory, { action: 'BROWSER_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      stepRetryCount: stepRetryCount + 1,
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
   // ── Universal terminal fallback — observe→adapt before replan/ask ─────────
   // ANY failed step that wasn't already handled above (not install-escalated,
   // not a delegation, not an ask-user pause, not already an agent loop) gets
@@ -496,8 +589,9 @@ async function _thinPostFailureHandler(state) {
       && failedStep.skill !== 'cli.agent' && failedStep.skill !== 'terminal.agent'
       && !_WEB_FETCH_SKILLS.has(failedStep.skill)
       && !failedStep.askUser && !failedStep.delegateTo
+      && !_browserish(failedStep.skill)
       && Array.isArray(skillPlan) && skillPlan[skillCursor]
-      && !(patchHistory || []).some(p => (p.action === 'TERMINAL_DEBUG' || p.action === 'AGENT_ESCALATE' || p.action === 'DELEGATE_REROUTE') && p.cursor === skillCursor)
+      && !(patchHistory || []).some(p => (p.action === 'TERMINAL_DEBUG' || p.action === 'AGENT_ESCALATE' || p.action === 'DELEGATE_REROUTE' || p.action === 'BROWSER_ESCALATE') && p.cursor === skillCursor)
       // Timeout-shaped failures in deterministic plans still get the cheap
       // DET_RETRY with a longer timeout below — an agent loop for a mere
       // wall-clock timeout is wasted LLM work.
@@ -509,7 +603,7 @@ async function _thinPostFailureHandler(state) {
     patchedPlan[skillCursor] = {
       ...patchedPlan[skillCursor],
       skill: 'cli.agent',
-      args: { action: 'run', task: _dbgTask, timeoutMs: 300000 },
+      args: { action: 'run', task: _dbgTask, timeoutMs: 300000, protectedPaths: _protectedPaths },
       description: failedStep.description || 'Diagnose and complete via terminal agent',
     };
     logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: ${failedStep.skill} step ${skillCursor + 1} failed — handing to cli.agent run loop`);
@@ -568,7 +662,7 @@ async function _thinPostFailureHandler(state) {
       patchedPlan[skillCursor] = {
         ...patchedPlan[skillCursor],
         skill: 'cli.agent',
-        args: { action: 'run', task: _dbgTask, timeoutMs: 300000 },
+        args: { action: 'run', task: _dbgTask, timeoutMs: 300000, protectedPaths: _protectedPaths },
         description: failedStep.description || 'Diagnose and complete via terminal agent',
       };
       logger.info(`[ExecuteCommand:ThinRecovery] TERMINAL_DEBUG: ${failedStep.skill} step ${skillCursor + 1} exhausted retries — handing to cli.agent run loop`);
@@ -624,38 +718,6 @@ async function _thinPostFailureHandler(state) {
   if (failedStep.botBlocked) {
     const _botSkipped = _tryAutoSkipIndependentStep(state);
     if (_botSkipped) return _botSkipped;
-  }
-
-  // ── Sandboxed protected-path write → substitute edit.agent ────────────────
-  // shell.run ran under sandbox-exec and the kernel denied a write to a
-  // user-attached file (EPERM). Content edits to attachments must go through
-  // edit.agent's draft/backup/diff rails — substitute the step directly, no
-  // LLM decision needed. Once per cursor: a second denial falls through to
-  // normal recovery/ask_user (e.g. non-edit ops like mv that edit.agent
-  // can't perform).
-  if (failedStep._sandboxDeniedPath && Array.isArray(skillPlan) && skillPlan[skillCursor]
-      && !patchHistory.some(p => p.action === 'SANDBOX_REROUTE')) {
-    const _denied = failedStep._sandboxDeniedPath;
-    const _editGoal = failedStep.description || failedStep.args?.goal
-      || `Edit ${path.basename(_denied)}`;
-    const patchedPlan = [...skillPlan];
-    patchedPlan[skillCursor] = {
-      ...patchedPlan[skillCursor],
-      skill: 'edit.agent',
-      args: { goal: _editGoal, filePath: _denied },
-      description: failedStep.description || `Edit ${path.basename(_denied)}`,
-    };
-    logger.info(`[ExecuteCommand:ThinRecovery] SANDBOX_REROUTE: shell.run write to attached file ${_denied} denied — substituting edit.agent (goal="${_editGoal.slice(0, 80)}")`);
-    return {
-      ...state,
-      recoveryAction: 'auto_patch',
-      skillPlan: patchedPlan,
-      recoveryNote: `Direct writes to your attached file ${path.basename(_denied)} are blocked — routing through the safe editor instead.`,
-      patchHistory: [...patchHistory, { action: 'SANDBOX_REROUTE', note: `edit.agent for ${_denied}`, attempt: stepRetryCount + 1 }],
-      stepRetryCount: stepRetryCount + 1,
-      failedStep: null,
-      commandExecuted: false,
-    };
   }
 
   // No LLM backend — surface to user

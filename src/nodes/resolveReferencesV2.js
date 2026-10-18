@@ -17,7 +17,7 @@
 const { classifyTask, deriveResolution } = require('../utils/classifyTask');
 const { forceClassifyLocalPlan, looksLikeLocalOp } = require('../utils/localPlanTemplates');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE } = require('../utils/textPatterns.cjs');
+const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE, PAGE_ITEM_REF_RE, NAV_VERB_START_RE, NAMED_APP_RE } = require('../utils/textPatterns.cjs');
 
 /**
  * Binary web-access confirmation — runs only when classifyTask returns
@@ -568,6 +568,48 @@ module.exports = async function resolveReferencesV2(state) {
     }
   }
 
+  // ── Extension-bound tabs — the second live-page channel ─────────────────
+  // _activeAppContext.url only exists when a browser is FRONTMOST. When the
+  // user prompts from the ThinkDrop overlay, the page they mean by "here"/
+  // "this page"/"the open tab" is usually a tab the extension already bound —
+  // and without its URL the planner invents one ("goto exodus 4 here" →
+  // bible-api.com, blocked by the URL guard). Fetch /ext.sessions (cheap,
+  // cached gateway-side) and backfill the live page only when a live-page
+  // referent exists and the frontmost app supplied no URL.
+  let _extSessions = [];
+  try {
+    const _r = await fetch('http://127.0.0.1:3007/ext.sessions', { signal: AbortSignal.timeout(2000) });
+    const _d = await _r.json().catch(() => null);
+    if (_d?.connected && Array.isArray(_d.sessions)) {
+      _extSessions = _d.sessions.filter(s => s && s.url && !/^about:|^chrome/.test(s.url));
+    }
+  } catch (_) { /* gateway down — stay empty */ }
+  state._extSessions = _extSessions;
+  const _livePageRef = LIVE_PAGE_REF_RE.test(message || '')
+    || PAGE_ITEM_REF_RE.test(message || '')
+    || /\b(?:here|there|this\s+one)\b/i.test(message || '')
+    || (NAV_VERB_START_RE.test(message || '') && !/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|edu|gov|us)\b/i.test(message || '') && !NAMED_APP_RE.test(message || ''));
+  if (_livePageRef && !_priorScreenContext?.url && _extSessions.length) {
+    // Most recently touched bound tab is the page "here" refers to.
+    const _liveTab = _extSessions.slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
+    _priorScreenContext = {
+      ...(_priorScreenContext || {}),
+      url: _liveTab.url,
+      windowTitle: _priorScreenContext?.windowTitle || _liveTab.title || null,
+      timestamp: _priorScreenContext?.timestamp || new Date().toISOString(),
+      source: 'thinkdrop-extension',
+    };
+    _screenContextNote = `ACTIVE SCREEN (extension-bound tab): URL: ${_liveTab.url}${_liveTab.title ? `, Title: "${_liveTab.title}"` : ''}, Session: ${_liveTab.sessionId}`;
+    state._extSessionHint = { sessionId: _liveTab.sessionId, url: _liveTab.url, title: _liveTab.title || null };
+    // The classifier reads _activeAppContext for ACTIVE DOC CONTEXT — give
+    // it the same URL so activeDocRef:'url' can be emitted for "here".
+    if (!_activeAppContext) _activeAppContext = {};
+    _activeAppContext.url = _liveTab.url;
+    _activeAppContext.windowTitle = _activeAppContext.windowTitle || _liveTab.title || null;
+    _activeAppContext.source = 'thinkdrop-extension';
+    logger.info(`[Node:ResolveReferencesV2] live-page referent resolved via extension session ${_liveTab.sessionId} → ${_liveTab.url}`);
+  }
+
   // ── Classify task once — all downstream nodes read from _taskClassification ──────────
   // This replaces per-node NLU regex (BYPASS_PATTERNS, _LOCAL_ACTION_VERBS, etc.)
   // Skip for plan execution runs — the plan already has all steps, so the 15+ second
@@ -675,6 +717,26 @@ module.exports = async function resolveReferencesV2(state) {
     _taskClassification.activeDocTarget = null;
   }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
+
+  // ── Live-page intent demotion ────────────────────────────────────────────────
+  // A page/item-referring prompt with a resolved extension session is a page
+  // read or action on the BOUND TAB — not an OS screen capture and not a web
+  // search. The RouteDecision envelope / classifyTask often labels these
+  // screen_intelligence ("items on the page") or query/web_search; demote any
+  // passive intent to command_automate so routeIntent reaches planSkills,
+  // which emits browser.act getPageText / dom.act on the ext session
+  // (_extSessionHint carries the bound sessionId to the planner).
+  if (state._extSessionHint && _livePageRef && _taskClassification && typeof _taskClassification === 'object') {
+    const _PASSIVE_INTENTS = new Set(['screen_intelligence', 'web_search', 'question', 'general_knowledge', 'memory_retrieve']);
+    const _si = _taskClassification.suggestedIntent;
+    if (!state._planTask && _si && _PASSIVE_INTENTS.has(_si)) {
+      logger.info(`[Node:ResolveReferencesV2] live-page demotion: suggestedIntent "${_si}" → command_automate (bound ext session ${state._extSessionHint.sessionId})`);
+      _taskClassification.suggestedIntent = 'command_automate';
+      _taskClassification.taskType = 'command';
+      _taskClassification.activeDocRef = 'url';
+      _taskClassification.activeDocTarget = state._extSessionHint.url;
+    }
+  }
 
   // ── Ack floor: card attached + content-free ack + LLM no-resolution ────────
   // A bare "sure"/"yes"/"no thanks" carries zero topical signal — when the
@@ -821,7 +883,7 @@ module.exports = async function resolveReferencesV2(state) {
       || /\b(?:chrome|safari|edge|brave|arc|firefox|opera|vivaldi|orion|helium|zen)\b/i.test(_liveApp);
     const _liveUrl = _priorScreenContext?.url || null;
     if ((_liveUrl || _liveIsBrowser)
-        && LIVE_PAGE_REF_RE.test(message || '')) {
+        && (LIVE_PAGE_REF_RE.test(message || '') || PAGE_ITEM_REF_RE.test(message || ''))) {
       _taskClassification.activeDocRef = 'url';
       _taskClassification.activeDocTarget = _liveUrl;
       logger.info(`[Node:ResolveReferencesV2] screen→url upgrade: page-referring message + live browser (${_liveApp || 'unknown'}${(_liveUrl || '').slice(0, 60) ? ' ' + _liveUrl.slice(0, 60) : ''})`);
@@ -841,7 +903,7 @@ module.exports = async function resolveReferencesV2(state) {
     const _liveAppN = String(_priorScreenContext?.appName || '');
     const _liveBrowserN = _priorScreenContext?.url || _priorScreenContext?.category === 'browser'
       || /\b(?:chrome|safari|edge|brave|arc|firefox|opera|vivaldi|orion|helium|zen)\b/i.test(_liveAppN);
-    if (_liveBrowserN && LIVE_PAGE_REF_RE.test(message || '')) {
+    if (_liveBrowserN && (LIVE_PAGE_REF_RE.test(message || '') || PAGE_ITEM_REF_RE.test(message || ''))) {
       _taskClassification.activeDocRef = 'url';
       _taskClassification.activeDocTarget = _priorScreenContext?.url || null;
       logger.info(`[Node:ResolveReferencesV2] deixis fallback: page-referring message + live browser (${_liveAppN || 'unknown'}) → activeDocRef=url`);

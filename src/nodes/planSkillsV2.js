@@ -229,8 +229,8 @@ function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
 // The lint guarantees a url.first.agent is never a dead end: mutation residue
 // gets a dom.act step spliced in, and pure display-nav is downgraded to the
 // app.agent real-browser lane when nothing reuses the session.
-function _lintAtomicPlan(p, logger) {
-  return lintAtomicBrowserPlan(p, logger, {}).plan;
+function _lintAtomicPlan(p, logger, extConnected) {
+  return lintAtomicBrowserPlan(p, logger, { extConnected: !!extConnected }).plan;
 }
 
 // interactiveActions vocabulary values that imply on-page mutation — used to
@@ -1358,7 +1358,7 @@ function _buildSystemPrompt(userMessage, state) {
   if (!base) return null;
   state._promptTier = _promptTier;
 
-  let result = `## PRIMACY RULE\nThe CURRENT USER REQUEST below is the source of truth. Prior conversation and screen context are provided ONLY for pronoun resolution ("it", "that", "this"). If the current request names a specific task, service, or topic, plan for THAT task — do not continue prior tasks.\n\n` + base;
+  let result = `## PRIMACY RULE\nThe CURRENT USER REQUEST below is the source of truth. Prior conversation and screen context are provided ONLY for pronoun resolution ("it", "that", "this"). If the current request names a specific task, service, or topic, plan for THAT task — do not continue prior tasks. Step args that carry user content (text to type, email/message bodies, search terms, titles) MUST be copied verbatim from the CURRENT USER REQUEST — never substitute prior step results, assistant replies, or screen context into them (observed: a compose step typed leaked prior-result text instead of the requested body).\n\n` + base;
   const appendices = [];
 
   // Domain appendices are appended in skill-preference order: shell/CLI → image → app → browser.
@@ -1660,6 +1660,20 @@ function _buildSystemPrompt(userMessage, state) {
     && !state._taskClassification?.activeDocRef;
   if (_screenNote && !_screenIsStale && !_isNonFollowUpAutomate && typeof _screenNote === 'string' && _screenNote.length > 0) {
     result += `\n\n## ACTIVE SCREEN CONTEXT (live — use this app as the target for screen-related tasks)\n\n${_screenNote}`;
+  }
+
+  // ── Extension-bound browser tabs — the real pages the user means ─────────
+  // When the ThinkDrop Chrome extension has bound tabs, their URLs are GROUND
+  // TRUTH for live-page referents ("here", "this page", "the open tab") —
+  // prefer them over inventing URLs, and prefer the browser lane (url.first/
+  // dom.act/turn.loop on the matching service agent) over app.agent GUI ops:
+  // work lands on the user's real signed-in page and the session stays bound
+  // for follow-ups.
+  const _extSessions = Array.isArray(state._extSessions) ? state._extSessions : [];
+  if (_extSessions.length) {
+    const _tabLines = _extSessions.slice(0, 5).map(s =>
+      `- ${s.sessionId} → ${s.url}${s.title ? ` — "${String(s.title).slice(0, 80)}"` : ''}`).join('\n');
+    result += `\n\n## EXTENSION-BOUND TABS (real Chrome — live session)\n\n${_tabLines}\n\nThe ThinkDrop extension is CONNECTED. For navigation/reads/UI work on these pages or named web services, use the browser lane (url.first.agent + dom.act/turn.loop.agent) — it drives the user's real signed-in Chrome via the extension. Do NOT emit app.agent navigate_url/scan_page for work these tabs can serve — app.agent is the fallback only when the extension is disconnected. Multi-field forms (compose, checkout, signup) → emit turn.loop.agent, not a single dom.act step. NEVER use shell.run/curl to fetch or read a bound page — drive the extension session instead. Follow-ups that refer to items on a bound page ("the first three items", "click on it", "open the second result") are page actions on that session, not web searches and not shell commands.`;
   }
 
   // ── Install scoring policy ──────────────────────────────────────────────
@@ -1972,7 +1986,7 @@ async function planSkillsV2(state) {
         // since resolved in live context.
         const _resolvedPlan = _resolveCtxUrlTokens(decoded, state._priorScreenContext?.url, state._gatheredVars, logger);
         // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
-        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger), logger);
+        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger), logger, state._extSessions?.length > 0);
         const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
@@ -1987,7 +2001,7 @@ async function planSkillsV2(state) {
   if (state._loginResumeSkillPlan && !recoveryContext) {
     logger.info('[Node:PlanSkillsV2] Login resume: returning existing plan as-is');
     const _resumePlan = Array.isArray(state._loginResumeSkillPlan)
-      ? _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger), logger)
+      ? _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger), logger, state._extSessions?.length > 0)
       : state._loginResumeSkillPlan;
     return { ...state, skillPlan: _resumePlan, skillCursor: 0, planError: null };
   }
@@ -2256,7 +2270,7 @@ async function planSkillsV2(state) {
     try {
       const cached = await findSimilarCompletePlan(userMessage, PLANS_DIR, logger);
       if (cached && Array.isArray(cached.plan) && cached.plan.length > 0) {
-        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(cached.plan, userMessage), logger), logger);
+        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(cached.plan, userMessage), logger), logger, state._extSessions?.length > 0);
         if (_guardedPlan.length > cached.plan.length) {
           logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}" — appended synthesize step`);
         } else {
@@ -2320,7 +2334,7 @@ async function planSkillsV2(state) {
     // browser.agent selects URL-first navigation instead of a blind start page.
     const detPlan = _taskAgentPlan || _sanitizeSkillPlan(_lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
       _stripRedundantVerifySteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger),
-      userMessage), logger), logger), state);
+      userMessage), logger), logger, state._extSessions?.length > 0), state);
     // Messaging follow-up body: the service_task template passes the raw
     // message as task ("send this info to X"), so the browser agent never sees
     // the actual content and invents a placeholder body. Attach the resolved
@@ -3950,7 +3964,7 @@ The user's request does NOT match any installed skill.
   // ── Atomic browser agents: rewrite browser.agent run steps → atomic skills ──
   if (Array.isArray(skillPlan)) {
     skillPlan = _rewriteBrowserStepsToAtomicAgents(skillPlan, logger);
-    const _atomicLint = lintAtomicBrowserPlan(skillPlan, logger, {});
+    const _atomicLint = lintAtomicBrowserPlan(skillPlan, logger, { extConnected: (state._extSessions || []).length > 0 });
     skillPlan = _atomicLint.plan;
     // A mutation-classified task whose plan is STILL nav-only end-to-end was
     // not repairable by the lint (every destination was described as pure

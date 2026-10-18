@@ -206,16 +206,33 @@ const TEMPLATES = [
     n: 1, id: 'file_create', lowRisk: false,
     describe: 'create a new file with given content — args: {path, content}',
     validate: (a, m, t) => _pathArgOk(a.path, m, t) ? (typeof a.content === 'string' ? null : 'arg.content missing') : 'arg.path not verbatim/resolved',
-    build: (a) => [{ skill: 'shell.run', args: {
-      cmd: 'bash', argv: ['-c', `mkdir -p ${_q(_dirname(a.path))} && printf '%s' ${_q(_b64(a.content))} | base64 -d > ${_q(a.path)}`],
-    }, description: `Create ${a.path}` }],
+    build: (a) => {
+      // printf writes raw bytes — fine for text, but an office extension gets
+      // a text file in a document costume (invalid RTF/docx). Route those
+      // through textutil so the result is a real document.
+      const ext = String(a.path).split('.').pop().toLowerCase();
+      if (['rtf', 'doc', 'docx'].includes(ext)) {
+        const tmp = `/tmp/thinkdrop_create_${Date.now()}.txt`;
+        return [{ skill: 'shell.run', args: {
+          cmd: 'bash', argv: ['-c', `mkdir -p ${_q(_dirname(a.path))} && printf '%s' ${_q(_b64(a.content))} | base64 -d > ${_q(tmp)} && textutil -convert ${ext === 'docx' ? 'docx' : ext === 'doc' ? 'doc' : 'rtf'} ${_q(tmp)} -output ${_q(a.path)} && rm ${_q(tmp)}`],
+        }, description: `Create ${a.path}` }];
+      }
+      return [{ skill: 'shell.run', args: {
+        cmd: 'bash', argv: ['-c', `mkdir -p ${_q(_dirname(a.path))} && printf '%s' ${_q(_b64(a.content))} | base64 -d > ${_q(a.path)}`],
+      }, description: `Create ${a.path}` }];
+    },
   },
   {
     n: 2, id: 'file_append', lowRisk: false,
     describe: 'append given text/content to an existing file — args: {path, content}',
     validate: (a, m, t) => _pathArgOk(a.path, m, t) ? (typeof a.content === 'string' ? null : 'arg.content missing') : 'arg.path not verbatim/resolved',
-    build: (a) => [{ skill: 'shell.run', args: {
-      cmd: 'bash', argv: ['-c', `printf '%s' ${_q(_b64(a.content))} | base64 -d >> ${_q(a.path)}`],
+    // Content edits belong on edit.agent's rails — a raw `>>` append pastes
+    // bytes after an RTF's closing `}` (invisible text), trips the
+    // protected-paths seatbelt on attached files, and has no draft/backup/diff
+    // safety. edit.agent handles every text/office format correctly.
+    build: (a) => [{ skill: 'edit.agent', args: {
+      goal: `Append this text verbatim to the end of the file: ${a.content}`,
+      filePath: a.path,
     }, description: `Append to ${a.path}` }],
   },
   {
@@ -238,6 +255,10 @@ const TEMPLATES = [
       const op = /copy/i.test(a.op || '') ? 'cp -R' : 'mv';
       return [{ skill: 'shell.run', args: {
         cmd: 'bash', argv: ['-c', `mkdir -p ${_q(_dirname(a.dst))} && ${op} ${_q(a.src)} ${_q(a.dst)}`],
+        // Same opt-out as file_delete — the attached file IS the user's
+        // explicit move/copy source, so the attachment sandbox would deny the
+        // requested op. Path is still verbatim-validated above.
+        protectedPaths: [],
       }, description: `${op === 'mv' ? 'Move' : 'Copy'} ${a.src} → ${a.dst}` }];
     },
   },
