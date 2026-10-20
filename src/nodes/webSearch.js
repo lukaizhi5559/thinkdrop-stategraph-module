@@ -146,6 +146,7 @@ module.exports = async function webSearch(state) {
           searchResults: [],
           contextDocs: [],
           aiOverview: passage,
+          searchProvider: 'bible-api',
         };
       }
       logger.warn(`[Node:WebSearch] bible-api miss for "${scriptureRef[0]}" — normal SERP`);
@@ -229,7 +230,10 @@ module.exports = async function webSearch(state) {
       ...state,
       searchResults,
       contextDocs,
-      aiOverview
+      aiOverview,
+      // Serving engine — surfaced on the queue card's engine chip so the
+      // user can see which provider answered (google/bing/copilot/brave…).
+      searchProvider: typeof searchData.provider === 'string' ? searchData.provider : null,
     };
   } catch (error) {
     logger.error('[Node:WebSearch] Error:', error.message);

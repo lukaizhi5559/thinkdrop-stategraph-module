@@ -958,8 +958,14 @@ module.exports = async function resolveAgent(state) {
   // "which website is the form on?" is wrong — the page is already known.
   // Return an empty selection like the local-file skip; the browser lane
   // (dom.act / form.fill.agent) is driven by taskType, not by picked agents.
+  // taskType is a flaky label for these reads — observed: "sum up the good
+  // comments on this page" classified 'query' + activeDocRef:'url' (deixis
+  // fallback) → the gate missed and a full LLM agent-selection round ran for
+  // a plain page read. An activeDocRef/ext-hint means the bound tab IS the
+  // subject regardless of the label.
   const _livePageSubject = !!_tc && state._extConnected === true && (
-    (_tc.taskType === 'browser' || _tc.taskType === 'command_automate')
+    (_tc.taskType === 'browser' || _tc.taskType === 'command_automate'
+      || _tc.taskType === 'query' || _tc.taskType === 'screen_intelligence')
     && (_tc.activeDocRef === 'url' || state.activeDocRef === 'url' || state._extSessionHint)
   );
   if (_livePageSubject && !_tc.targetService && !_messageMentionsServiceOrAgent(userMessage, registeredAgents)) {

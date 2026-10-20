@@ -39,6 +39,55 @@ const GRILL_MAX_ROUNDS = 5;
 // missing-info UX. Set THINKDROP_GRILL_MODE=0 to opt out (tests, fallback).
 const GRILL_MODE = process.env.THINKDROP_GRILL_MODE !== '0';
 
+// ── Resolved live-surface block ──────────────────────────────────────────────
+// ResolveReferencesV2 already resolves deictic referents ("this page", "on my
+// screen", "here") into activeDocRef/activeDocTarget, a bound extension tab
+// (_extSessionHint/_extSessions), the promoted browser session
+// (activeBrowserUrl), or the frontmost app's screen capture
+// (_priorScreenContext). The grill never saw any of it — observed: "sum up
+// the comments on this page" → "Which page are we summarizing comments from?"
+// even though the YouTube tab's URL was already resolved. Feed the resolved
+// surface into every readiness/question prompt so page/file/screen identity
+// is KNOWN, and let the caller hard-drop page-identity questions the LLM
+// emits anyway.
+function _liveSurface(state) {
+  const tc = state?._taskClassification || {};
+  const docRef = tc.activeDocRef || state?.activeDocRef || null;
+  const docTarget = tc.activeDocTarget || null;
+  const hint = state?._extSessionHint || null;
+  const extTab = (Array.isArray(state?._extSessions) ? state._extSessions : [])
+    .filter(s => s && s.url && !/^about:|^chrome/.test(s.url))
+    .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0] || null;
+  const screen = state?._priorScreenContext || null;
+  const browserUrl = state?.activeBrowserUrl || null;
+
+  const lines = [];
+  const pageUrl = docTarget || hint?.url || extTab?.url || browserUrl || screen?.url || null;
+  const pageTitle = hint?.title || extTab?.title || screen?.windowTitle || null;
+  if (docRef === 'url' || hint || extTab || pageUrl) {
+    lines.push(`- Active page: ${pageTitle ? `"${pageTitle}" — ` : ''}${pageUrl || '(current browser tab)'} [browser tab — 'this page' / 'the page' / 'this tab' / 'on this page' refer to it]`);
+  }
+  if (docRef === 'file' && docTarget) {
+    lines.push(`- Active file: ${docTarget} ['this file' / 'this doc' refer to it]`);
+  }
+  if (screen?.appName) {
+    lines.push(`- Frontmost app: ${screen.appName}${screen.windowTitle ? ` — "${screen.windowTitle}"` : ''} ['on screen' / 'what I'm looking at' refer to it — screen_intelligence/OCR reads it]`);
+  }
+  const resolved = !!(docRef === 'url' || docRef === 'file' || hint || extTab || pageUrl);
+  return {
+    resolved,
+    docRef,
+    block: lines.length
+      ? `\n\nACTIVE SURFACE (already resolved — deictic referents like "this page", "on this screen", "here" point at it; NEVER ask which page/site/tab/URL/file):\n${lines.join('\n')}`
+      : '',
+  };
+}
+
+// Page/site/tab/URL/file-identity questions — a live-resolved surface makes
+// these unanswerable-by-design (the referent IS the active surface). Used to
+// _drop them from grill batches even when the LLM ignores the prompt rule.
+const _PAGE_IDENTITY_Q_RE = /\b(?:which|what)\b[^?]{0,50}\b(?:page|site|website|web ?page|url|link|tab|article|screen|document|file|form)\b|\b(?:url|link|page name|file name|file path)\b[^?]{0,30}\b(?:of|for|to|from|should)\b|\bprovide\b[^?]{0,20}\b(?:url|link|path)\b/i;
+
 // ── Deterministic bypass gate ────────────────────────────────────────────────
 // Returns true when the task is fully specified and clarification cannot add
 // value. Used to skip both the legacy loop and the Grill loop without spending
@@ -113,7 +162,7 @@ Rules:
 // Returns 0 (complete), 1 (need-question), or 2 (need-auth).
 // Only on 1/2 does the caller run the full JSON generation to get question/authAgentId.
 // Safe default on parse failure/timeout: 0 (complete) — matches existing fail-open.
-async function _askLLMDecision(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null) {
+async function _askLLMDecision(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null, state = null) {
   const priorBlock = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
@@ -183,10 +232,12 @@ Rules:
   "notify me via osascript" → 0
 - NEVER ask about: timezone, credentials, optional preferences, or things the system can look up
 - If a required service is NOT listed under UNAUTHENTICATED AGENTS, return 0 — do NOT ask about auth
-- When in doubt about a slot value → 0. But an under-specified start/create/plan/build request is NEVER a doubt case → 1`;
+- When in doubt about a slot value → 0. But an under-specified start/create/plan/build request is NEVER a doubt case → 1
+- Deictic referents — "this page", "the page", "this tab", "on this page", "on my screen", "here", "this file" — resolve to the ACTIVE SURFACE below when one is present. Page/site/tab/URL/file identity is NEVER a missing input in that case → return 0.`;
 
+  const _surfaceBlock = state ? _liveSurface(state).block : '';
   const userPrompt = `REQUEST: "${originalMsg}"
-TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}${tcBlock}
+TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}${tcBlock}${_surfaceBlock}
 
 Ready? (0, 1, or 2)`;
 
@@ -202,7 +253,7 @@ Ready? (0, 1, or 2)`;
   }
 }
 
-async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null) {
+async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null, state = null) {
   const priorBlock = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
@@ -241,10 +292,11 @@ async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHi
     ? `\n\n(Context from prior turn: ${followUpTarget})`
     : '';
 
+  const _surfaceBlock = state ? _liveSurface(state).block : '';
   const prompt = `REQUEST: "${originalMsg}"
-TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}
+TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${unauthedBlock}${_surfaceBlock}
 
-Is this task ready to execute, or is one critical piece missing?`;
+Is this task ready to execute, or is one critical piece missing? If an ACTIVE SURFACE is listed above, "this page"/"the page"/"this tab"/"this file" already refer to it — never ask which page/site/tab/URL/file.`;
 
   try {
     const raw = await llmBackend.generateAnswer(prompt, { query: prompt, context: { systemInstructions: SYSTEM_PROMPT } }, { maxTokens: 80, temperature: 0, taskType: 'classification' });
@@ -467,14 +519,14 @@ module.exports = async function gatherPlanContext(state) {
     // If COMPLETE (0), return immediately — skip the 80-token JSON generation.
     // If NEED_QUESTION (1) or NEED_AUTH (2), run the full JSON generation to get
     // the question text and/or authAgentId.
-    const _fastDecision = await _askLLMDecision(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null);
+    const _fastDecision = await _askLLMDecision(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null, state);
     let result;
     if (_fastDecision === 0) {
       logger.info('[Node:GatherPlanContext] Fast decision: COMPLETE — skipping full JSON generation');
       result = { complete: true };
     } else {
       logger.info(`[Node:GatherPlanContext] Fast decision: ${_fastDecision === 1 ? 'NEED_QUESTION' : 'NEED_AUTH'} — running full JSON generation`);
-      result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null);
+      result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null, state);
     }
 
     // Defensive override: if the LLM returned an auth question for an agent that
@@ -662,6 +714,7 @@ Rules:
 - Questions about the same topic (e.g., playlist name, genre, artists, songs) MUST be in the same batch — never ask them one at a time.
 - Only defer a question to a later round if it TRULY cannot be asked without a prior answer (e.g., "Which specific album by [artist]?" when you don't know the artist yet). Even then, prefer asking "Which artist and album?" as one question.
 - NEVER ask about things the system can look up (timezone, credentials, installed apps, auth status — these are in PROBE RESULTS).
+- NEVER ask which page/site/tab/URL/document/file the task refers to when an ACTIVE SURFACE block is present — the deictic referent ("this page", "on my screen", "here", "this file") is ALREADY RESOLVED to that surface. The browser lane reads the active page directly; screen_intelligence reads the frontmost app.
 - NEVER ask about things already answered in PRIOR CLARIFICATIONS. Every entry in PRIOR CLARIFICATIONS is a SETTLED answer — do NOT re-ask it, even with different wording.
 - PINNED CAPABILITY: if a PINNED CAPABILITY block is present, the execution tool is already selected — NEVER ask which service/app/channel/provider/tool to use. Only ask about task-specific gaps the tool can't supply (e.g. a recipient's phone number).
 - SERVICE CHOICE questions: if a question asks which service/tool/channel/provider/way to accomplish the task, mark it "serviceChoice": true and set "capabilityQuery" to the core action (e.g. "send a text message"). DO NOT invent options for these — the system populates real CLI/API/MCP candidates. Any other question type keeps normal options.
@@ -714,7 +767,7 @@ async function _resolveTaskInputsFromMemory(requiredInputs, mcpAdapter, userId, 
 /**
  * Phase B2: Ask the LLM to generate a batch of questions (the frontier).
  */
-async function _askLLMBatch(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, routeDecision, memoryResults, logger, taskClassification, pinnedAgent) {
+async function _askLLMBatch(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, routeDecision, memoryResults, logger, taskClassification, pinnedAgent, state = null) {
   const priorBlock = priorQA.length > 0
     ? '\n\nPRIOR CLARIFICATIONS:\n' + priorQA.map(qa => {
         const displayAnswer = qa.confirmed ? `yes — ${qa.answer}` : qa.answer;
@@ -769,8 +822,9 @@ async function _askLLMBatch(llmBackend, userMsg, originalMsg, priorQA, conversat
     ? `\n\nPINNED CAPABILITY: ${pinnedAgent.id}${pinnedAgent.reason ? ` — ${pinnedAgent.reason}` : ''} [LOCKED — the tool is already chosen]`
     : '';
 
+  const _surfaceBlock = state ? _liveSurface(state).block : '';
   const prompt = `REQUEST: "${originalMsg}"
-TASK: "${userMsg}"${pinBlock}${priorBlock}${historyBlock}${routeBlock}${memoryBlock}${unauthedBlock}
+TASK: "${userMsg}"${pinBlock}${priorBlock}${historyBlock}${routeBlock}${memoryBlock}${unauthedBlock}${_surfaceBlock}
 
 Generate the frontier of questions for this task.`;
 
@@ -1017,7 +1071,7 @@ async function _runGrillLoop(state, logger) {
     const _fastDecision = await _askLLMDecision(
       llmBackend, baseMsg, originalMsg, answers,
       state.conversationHistory || [], state.resolvedSelfContext || null,
-      state.preflightResult || null, logger, tc
+      state.preflightResult || null, logger, tc, state
     );
     if (_fastDecision === 0) {
       logger.info('[Node:GatherPlanContext:Grill] Fast decision: COMPLETE — skipping batch prompt');
@@ -1117,7 +1171,7 @@ async function _runGrillLoop(state, logger) {
       llmBackend, baseMsg, originalMsg, answers,
       state.conversationHistory || [], state.resolvedSelfContext || null,
       state.preflightResult || null, routeDecision, null,
-      logger, tc, _pinnedAgent
+      logger, tc, _pinnedAgent, state
     );
 
     if (result.complete) {
@@ -1135,7 +1189,7 @@ async function _runGrillLoop(state, logger) {
         llmBackend, baseMsg, originalMsg, answers,
         state.conversationHistory || [], state.resolvedSelfContext || null,
         state.preflightResult || null, routeDecision, memoryResults,
-        logger, tc, _pinnedAgent
+        logger, tc, _pinnedAgent, state
       );
       if (!resultWithMemory.complete) {
         Object.assign(result, resultWithMemory);
@@ -1254,6 +1308,22 @@ async function _runGrillLoop(state, logger) {
         // Only the route confirmation is new — keep it, drop the duplicate questions
         logger.info(`[Node:GatherPlanContext:Grill] Dropping ${questions.length} duplicate question(s), keeping route confirmation`);
         questions.length = 0;
+      }
+    }
+
+    // Page/site/tab/URL/file-identity questions are unanswerable-by-design
+    // when a live surface is resolved — the deictic referent IS the active
+    // page/tab/file (observed: "sum up the comments on this page" → "Which
+    // page are we summarizing comments from?" while the YouTube URL sat in
+    // activeDocTarget). Mark them _drop even if the LLM ignored the rule.
+    const _surfaceNow = _liveSurface(state);
+    if (_surfaceNow.resolved) {
+      for (const q of questions) {
+        if (!q || q._drop) continue;
+        if (_PAGE_IDENTITY_Q_RE.test(q.text || '')) {
+          q._drop = true;
+          logger.info(`[Node:GatherPlanContext:Grill] Dropping page-identity question "${q.id}" — surface already resolved ("${String(q.text || '').slice(0, 60)}")`);
+        }
       }
     }
 
@@ -1429,3 +1499,7 @@ async function _runGrillLoop(state, logger) {
     routeDecision,
   };
 }
+
+// Exported for tests — resolved-surface helpers used by the grill.
+module.exports._liveSurface = _liveSurface;
+module.exports._PAGE_IDENTITY_Q_RE = _PAGE_IDENTITY_Q_RE;
