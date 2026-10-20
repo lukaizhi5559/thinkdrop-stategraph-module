@@ -577,14 +577,20 @@ module.exports = async function resolveReferencesV2(state) {
   // cached gateway-side) and backfill the live page only when a live-page
   // referent exists and the frontmost app supplied no URL.
   let _extSessions = [];
+  let _extConnected = false;
   try {
     const _r = await fetch('http://127.0.0.1:3007/ext.sessions', { signal: AbortSignal.timeout(2000) });
     const _d = await _r.json().catch(() => null);
     if (_d?.connected && Array.isArray(_d.sessions)) {
       _extSessions = _d.sessions.filter(s => s && s.url && !/^about:|^chrome/.test(s.url));
+      _extConnected = true;
     }
   } catch (_) { /* gateway down — stay empty */ }
   state._extSessions = _extSessions;
+  // Extension reachability itself — _extSessions is empty when nothing is
+  // bound yet, so lane decisions (e.g. named video-platform searches) can't
+  // rely on session count alone.
+  state._extConnected = _extConnected;
   const _livePageRef = LIVE_PAGE_REF_RE.test(message || '')
     || PAGE_ITEM_REF_RE.test(message || '')
     || /\b(?:here|there|this\s+one)\b/i.test(message || '')
@@ -608,6 +614,20 @@ module.exports = async function resolveReferencesV2(state) {
     _activeAppContext.windowTitle = _activeAppContext.windowTitle || _liveTab.title || null;
     _activeAppContext.source = 'thinkdrop-extension';
     logger.info(`[Node:ResolveReferencesV2] live-page referent resolved via extension session ${_liveTab.sessionId} → ${_liveTab.url}`);
+  } else if (_livePageRef && !_extSessions.length && !_priorScreenContext?.url) {
+    // Page/item referent but NO bound sessions (extension reload wiped the
+    // registry) — don't let the planner mint a named session that resolves
+    // to a blank tab (observed: 'click the first item' post-reload →
+    // ext:default_agent → fresh about:blank while the eBay tab sat focused).
+    // Prefer the prior browser turn's session (host-matched adopt finds the
+    // right tab); else ext:default = whatever tab is active right now.
+    const _priorSid = state.priorBrowserContext?.sessionId || null;
+    const _pseudoSid = _priorSid
+      ? (_priorSid.startsWith('ext:') ? _priorSid : `ext:${_priorSid}`)
+      : 'ext:default';
+    state._extSessions = [{ sessionId: _pseudoSid, url: state.priorBrowserContext?.url || null, title: null, pseudo: true }];
+    state._extSessionHint = { sessionId: _pseudoSid, url: state.priorBrowserContext?.url || null, title: null };
+    logger.info(`[Node:ResolveReferencesV2] live-page referent with empty registry → pseudo-session ${_pseudoSid} (prior=${_priorSid || 'none'})`);
   }
 
   // ── Classify task once — all downstream nodes read from _taskClassification ──────────
@@ -729,12 +749,27 @@ module.exports = async function resolveReferencesV2(state) {
   if (state._extSessionHint && _livePageRef && _taskClassification && typeof _taskClassification === 'object') {
     const _PASSIVE_INTENTS = new Set(['screen_intelligence', 'web_search', 'question', 'general_knowledge', 'memory_retrieve']);
     const _si = _taskClassification.suggestedIntent;
-    if (!state._planTask && _si && _PASSIVE_INTENTS.has(_si)) {
-      logger.info(`[Node:ResolveReferencesV2] live-page demotion: suggestedIntent "${_si}" → command_automate (bound ext session ${state._extSessionHint.sessionId})`);
+    // Page-interaction verbs aimed at the live tab — "fill out this form",
+    // "click the link on this page". A bound ext session means the browser
+    // lane can act on the page directly; a local_system/app_automation
+    // classification for these is the pre-extension app.agent assumption.
+    const _PAGE_ACTION_RE = /\b(fill|complete|click|type|enter|select|choose|check|tick|press|scroll|submit|sign\s*up|apply|paste|write|answer)\b/i;
+    const _isPageInteraction = _PAGE_ACTION_RE.test(message || '');
+    if (!state._planTask && _si && (_PASSIVE_INTENTS.has(_si)
+        || (_isPageInteraction && ['local_system', 'app_automation', 'ambiguous'].includes(_taskClassification.taskType)))) {
+      logger.info(`[Node:ResolveReferencesV2] live-page demotion: "${_si}"/${_taskClassification.taskType} → command_automate/browser (bound ext session ${state._extSessionHint.sessionId})`);
       _taskClassification.suggestedIntent = 'command_automate';
-      _taskClassification.taskType = 'command';
+      _taskClassification.taskType = _isPageInteraction ? 'browser' : 'command';
+      if (_isPageInteraction) _taskClassification.requiresDOM = true;
       _taskClassification.activeDocRef = 'url';
       _taskClassification.activeDocTarget = state._extSessionHint.url;
+      // Planner lane: the bound session becomes the active session so
+      // planSkills emits dom.act/form.fill.agent on it instead of a fresh
+      // url.first navigation or an app.agent step.
+      if (!state.activeBrowserSessionId) {
+        state.activeBrowserSessionId = state._extSessionHint.sessionId;
+        state.activeBrowserUrl = state._extSessionHint.url || null;
+      }
     }
   }
 

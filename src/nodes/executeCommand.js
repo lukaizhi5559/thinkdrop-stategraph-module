@@ -176,7 +176,7 @@ const _WEB_FETCH_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search']);
 
 // Atomic browser skills that share a session — used by the per-step arg
 // enrichment (serial + runGroup paths) and the session-tracking block.
-const _SESSION_BROWSER_SKILLS = new Set(['url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
+const _SESSION_BROWSER_SKILLS = new Set(['url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'form.fill.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
 
 // Mutation-evidence flag — shared by the serial stepResult builder and the
 // runGroup path. A browser step whose task asserts on-page work but whose
@@ -542,7 +542,7 @@ async function _thinPostFailureHandler(state) {
   // observed: ext dropped → scan_page failed → cli.agent 'Page copy empty'
   // spiral). GUI-app actions (focus_app etc.) stay terminal-eligible.
   const _APP_BROWSER_ACTIONS = new Set(['scan_page', 'navigate_url', 'read_url', 'nav_task', 'print_page']);
-  const _browserish = (s) => _BROWSER_LANE.has(s)
+  const _browserish = (s) => _BROWSER_LANE.has(s) || s === 'form.fill.agent'
     || (s === 'app.agent' && _APP_BROWSER_ACTIONS.has(String(failedStep?.args?.action || '')));
   if (failedStep
       && _browserish(failedStep.skill)
@@ -2391,10 +2391,18 @@ module.exports = async function executeCommand(state) {
   if (skillCursor > 0) {
     const _prevUserAgent = [...skillResults].reverse().find(r => r.skill === 'user.agent' && r.ok);
     if (_prevUserAgent) {
-      const _uaResolved = _prevUserAgent?.result?.resolved || _prevUserAgent?.resolved || {};
+      // Result envelope varies by dispatch path (serial keeps raw; runGroup
+      // shaped `result`) — try every layer so {{user.agent.resolved.*}} sees
+      // the real map.
+      const _uaResolved = _prevUserAgent?.result?.resolved || _prevUserAgent?.resolved || _prevUserAgent?.raw?.resolved || {};
       logger.info(`[Node:ExecuteCommand] user.agent resolved keys: ${JSON.stringify(Object.keys(_uaResolved))} | result keys: ${JSON.stringify(Object.keys(_prevUserAgent?.result || {}))}`);
       const _uaFlat = {};
-      if (_uaResolved.self) Object.entries(_uaResolved.self).forEach(([k, v]) => { _uaFlat[k] = String(v); });
+      for (const [k, v] of Object.entries(_uaResolved)) {
+        if (v != null && typeof v !== 'object') _uaFlat[k] = String(v);
+      }
+      if (_uaResolved.self && typeof _uaResolved.self === 'object') {
+        Object.entries(_uaResolved.self).forEach(([k, v]) => { if (v != null) _uaFlat[k] = String(v); });
+      }
       if (_uaResolved.email) _uaFlat.email = String(_uaResolved.email);
       if (_uaResolved.name) _uaFlat.name = String(_uaResolved.name);
       // Fallback 1: extract email from summary text
@@ -5774,6 +5782,28 @@ Please try again or search with different terms.`;
         out = { ...out, priorFilledFields: _dedupFilled };
       }
     }
+
+    // ── form.fill.agent enrichment ──────────────────────────────────────────
+    // The gather-phase probe (state._formFillProbe / state._formFillAnswers)
+    // resolved values before the plan ran — inject them so the skill starts
+    // from the same truth, and hand it the gather callback so a mid-run
+    // missing-value ask renders the same batched QuestionCard.
+    if (skillName === 'form.fill.agent') {
+      out = {
+        ...out,
+        resolvedFields: out.resolvedFields || state._formFillProbe?.resolved || undefined,
+        gatheredAnswers: out.gatheredAnswers || state._formFillAnswers || undefined,
+        _gatherAnswerCallback: out._gatherAnswerCallback || state.gatherAnswerCallback || null,
+      };
+      if (state._extSessionHint?.sessionId && !out.sessionId) {
+        out = { ...out, sessionId: state._extSessionHint.sessionId };
+      }
+      // Live-page fallback: extension connected but no session was pinned —
+      // fill the user's currently active web tab, not a fresh engine page.
+      if (!out.sessionId && state._extConnected) {
+        out = { ...out, sessionId: 'ext:default' };
+      }
+    }
     return out;
   }
 
@@ -5900,6 +5930,11 @@ Please try again or search with different terms.`;
   // 7 min allows Tab-Flow (up to 210s) + turn-loop recovery + Tab-Flow re-entry.
   if (skill === 'browser.agent' || skill === 'cli.agent') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 420000); // 7 min
+  }
+  // form.fill.agent can block on a batched QuestionCard awaiting the user's
+  // missing-field answers (10-min gather timeout) — the step must outlive it.
+  if (skill === 'form.fill.agent') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 640000);
   }
   // app.agent long-running monitors run their own internal loop for up to maxDurationMs.
   // The MCP HTTP timeout must exceed that or the call is killed while the monitor is still running.
@@ -6242,7 +6277,7 @@ Please try again or search with different terms.`;
   // have local handlers in executeCommand and no command-service counterpart.
   // If a meta-skill somehow has a runGroup (e.g. old plan file), skip the
   // runGroup block and fall through to the per-skill handlers below.
-  const _META_SKILLS = new Set(['api_suggest', 'needs_skill', 'ask_user', 'synthesize', 'schedule', 'profile.store_secret', 'smartFill']);
+  const _META_SKILLS = new Set(['api_suggest', 'needs_skill', 'ask_user', 'synthesize', 'schedule', 'profile.store_secret', 'smartFill', 'user.agent', 'form.fill.agent']);
   if (step.runGroup && !_META_SKILLS.has(skill)) {
     const groupId = step.runGroup;
     // Collect all consecutive steps in this group starting from skillCursor
@@ -6401,7 +6436,7 @@ Please try again or search with different terms.`;
             args: _callArgs,
             description: gs.description || null,
             ok: raw?.ok === true,
-            result: raw?.result ?? raw?.stdout ?? null,
+            result: raw?.result ?? (raw?.resolved || raw?.missingFields ? raw : null) ?? raw?.stdout ?? null,
             stdout: raw?.stdout ?? null,
             draftPath: raw?.draftPath ?? null,
             filePath: raw?.filePath ?? null,
@@ -6611,7 +6646,7 @@ Please try again or search with different terms.`;
         try {
           const res = await mcpAdapter.callService('command', 'command.automate', { skill: gs.skill, args: _callArgs }, { timeoutMs: 300000, signal: state.abortSignal });
           const raw = res?.data || res;
-          return { idx: r.idx, step: gs, skill: gs.skill, args: _callArgs, ok: raw?.ok !== false, result: raw?.result ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, url: raw?.url ?? null, sessionId: raw?.sessionId ?? null, content: raw?.content || null, output: raw?.output || null, raw };
+          return { idx: r.idx, step: gs, skill: gs.skill, args: _callArgs, ok: raw?.ok !== false, result: raw?.result ?? (raw?.resolved || raw?.missingFields ? raw : null) ?? raw?.stdout ?? null, stdout: raw?.stdout ?? null, url: raw?.url ?? null, sessionId: raw?.sessionId ?? null, content: raw?.content || null, output: raw?.output || null, raw };
         } catch (err) {
           return { idx: r.idx, step: gs, skill: gs.skill, args: _callArgs, ok: false, error: err.message, result: null, stdout: null, raw: null };
         }

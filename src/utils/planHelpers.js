@@ -513,8 +513,74 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
   // activates, and follow-ups can find it via /ext.sessions). app.agent's OS
   // open leaves an unbound tab the next prompt can't address.
   if (ctx.extConnected) {
+    // Bound hosts + referent detector for the foreign-read rewrite below.
+    const _boundHosts = (Array.isArray(ctx.extSessions) ? ctx.extSessions : [])
+      .map(s => { try { return new URL(s.url || '').hostname.replace(/^www\./, '').toLowerCase(); } catch { return ''; } })
+      .filter(Boolean);
+    const _PAGE_ITEM_RE = /\b(this|that|the|these|those|first|second|third|\d+(?:st|nd|rd|th)|next|previous|current|open)\s+(item|items|result|results|listing|listings|product|products|page|tab|email|message|event|option|one|ones)\b|\bthis\s+item\b|\bthe\s+page\b|\bhere\b|\bit\b/i;
+    const _recentBound = (Array.isArray(ctx.extSessions) ? ctx.extSessions : [])
+      .slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
+
+    // Pure "go back to my X tab" prompts get LLM-rephrased into steps that no
+    // longer contain the words "go back" (observed: "go back to my ebay tab" →
+    // step "Confirm the current product page is displayed" → url.first
+    // web-searched for an ebay URL → minted a blank tab). Detect the pure form
+    // from the original prompt — no other action verbs — and rewrite the first
+    // browser-lane step once.
+    const _promptGoBack = (() => {
+      const p = String(ctx.prompt || '');
+      if (!/\b(go\s+back|return|switch|focus|bring\s+me\s+back|take\s+me)\s+to\b.{0,40}\b(tab|page|site)\b/i.test(p)) return false;
+      const stripped = p.replace(/\b(go\s+back|return|switch|focus|bring\s+me\s+back|take\s+me)\s+to\b.{0,40}\b(tab|page|site)\b/gi, '');
+      return !/\b(click|type|fill|search|read|get|find|create|send|open|select|buy|add|scroll|press|check|tell)\b/i.test(stripped);
+    })();
+    let _goBackRewritten = false;
+
     for (let i = 0; i < steps.length; i++) {
       const s = steps[i];
+      // "go back / return / switch to my <svc> tab" → tab-select on the bound
+      // session, not url.first + turn.loop `back` presses (observed: 8 turns
+      // of back/screenshot against a freshly created tab → ask_user).
+      {
+        const _goBack = !_goBackRewritten && (_promptGoBack || /\b(go\s+back|return|switch|focus|bring\s+me\s+back|take\s+me)\s+to\b.{0,40}\b(tab|page|site)\b/i.test(`${s?.args?.task || ''} ${s?.args?.goal || ''} ${s?.description || ''}`));
+        if (_goBack && ['url.first.agent', 'turn.loop.agent', 'dom.act', 'app.agent', 'browser.act'].includes(s?.skill)) {
+          const _agentBase = String(_stepAgentKey(s) || s?.args?.agentId || '').replace(/\.agent$|_agent$/i, '').toLowerCase();
+          const _bound = (ctx.extSessions || []).find(x =>
+            x.sessionId === `ext:${_agentBase}_agent` ||
+            (_agentBase && (x.url || '').toLowerCase().includes(_agentBase))) ||
+            (ctx.extSessions || [])[0];
+          if (_bound) {
+            steps[i] = {
+              ...s,
+              skill: 'browser.act',
+              args: { action: 'tab-select', sessionId: _bound.sessionId, timeoutMs: 10000 },
+              description: (s.description || 'Switch to the bound tab') + ` (${_bound.sessionId})`,
+            };
+            rewrites.push({ index: i, kind: 'go-back→tab-select', agentId: s.args?.agentId || null });
+            _goBackRewritten = true;
+            continue;
+          }
+        }
+      }
+      // Referent reads must hit the bound tab, not a foreign research URL.
+      // Observed: "shipping cost for this item" → read_url google.com —
+      // the planner invented a Google fetch for a question whose answer
+      // lived in the bound ebay tab.
+      if (s?.skill === 'app.agent' && ['read_url', 'scan_page'].includes(s?.args?.action) && typeof s.args?.url === 'string' && s.args.url && _recentBound) {
+        let _host = '';
+        try { _host = new URL(s.args.url).hostname.replace(/^www\./, '').toLowerCase(); } catch {}
+        const _boundMatch = _boundHosts.some(h => h === _host || h.endsWith('.' + _host) || _host.endsWith('.' + h));
+        const _isReferent = _PAGE_ITEM_RE.test(`${s.args?.task || ''}\n${s.description || ''}`);
+        if (_host && !_boundMatch && _isReferent) {
+          steps[i] = {
+            ...s,
+            skill: 'browser.act',
+            args: { action: 'getPageText', sessionId: _recentBound.sessionId, timeoutMs: 15000 },
+            description: (s.description || 'Read the bound tab') + ' (bound tab)',
+          };
+          rewrites.push({ index: i, kind: 'app.agent-read_url→bound-tab-read', agentId: s.args?.agentId || null });
+          continue;
+        }
+      }
       if (s?.skill === 'app.agent' && s?.args?.action === 'navigate_url' && typeof s.args?.url === 'string' && s.args.url) {
         steps[i] = {
           ...s,
@@ -548,9 +614,31 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
       if (agentKey && fk && fk !== agentKey) break;
       followers.push(s);
     }
-    if (followers.some(_isActionCapableBrowserStep)) continue;
-
+    // A follower whose goal restates the SAME navigate+search the url.first
+    // step just performed is redundant — the nav already landed on the results
+    // page. Demote it to a results read instead of letting a turn-loop burn
+    // turns re-navigating a second tab (observed: url.first →
+    // youtube.com/results?search_query=lo-fi beats, then a dom.act step
+    // "Navigate to YouTube and search for lo-fi beats" re-navigated → 8 turns
+    // on a stolen/blank tab → ~2min + reported failure).
     const task = String(uf.args?.task || '');
+    if (/\bsearch\b|\bfind\b|\blook\s+for\b/i.test(task)) {
+      for (const f of followers) {
+        const _ft = `${f.args?.task || ''} ${f.args?.goal || ''} ${f.description || ''}`;
+        if (/\b(navigate|go|head|open|visit|load)\b[^.\n]*\b(search|find|look)\b/i.test(_ft)) {
+          const _fi = steps.indexOf(f);
+          steps[_fi] = {
+            ...f,
+            skill: 'browser.act',
+            args: { action: 'getPageText', sessionId: f.args?.sessionId || uf.args?.sessionId, agentId: f.args?.agentId || uf.args?.agentId, timeoutMs: 15000 },
+            description: 'Read the search results on the page',
+          };
+          rewrites.push({ index: _fi, kind: 'dup-nav-search→results-read', agentId: _stepAgentKey(f) || agentKey || null });
+        }
+      }
+    }
+
+    if (followers.some(_isActionCapableBrowserStep)) continue;
     if (_hasResidue(uf)) {
       const actStep = {
         skill: 'dom.act',

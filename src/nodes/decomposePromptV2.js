@@ -841,17 +841,21 @@ module.exports = async function decomposePromptV2(state) {
   // Image requests on a NAMED site ("pics of baby clothes on amazon") stay
   // command_automate → site_search → web.crawl → extractItems (structured
   // product cards). Generic image queries route to web_search.
-  // Video requests route to web_search even when a video platform is named —
-  // Brave Video Search handles site-scoped queries and youtube SERP crawls
-  // are bot-walled. Non-video sites stay command_automate.
+  // Video requests route to web_search ONLY when no service is named, or when
+  // a video platform is named but the extension lane is down — youtube SERP
+  // crawls are bot-walled on the managed-engine path. With the ThinkDrop
+  // extension connected, "search youtube for X" drives the user's real Chrome
+  // (url-first → youtube.com/results?search_query=…) — never a Brave link list.
+  // Non-video sites stay command_automate.
   const _VIDEO_PLATFORMS = new Set(['youtube', 'yt', 'vimeo', 'tiktok', 'twitch', 'netflix', 'rumble', 'bitchute', 'dailymotion']);
   const _targetSvcLower = String(_tc.targetService || '').toLowerCase();
+  const _extLaneUp = state._extConnected === true || (state._extSessions || []).length > 0;
   const _routeMediaToWebSearch =
     !_hasMultiGoalConjunction &&
     _tc.webAccessMode !== 'interactive' &&
     (
       (_mediaListing === 'image' && !_tc.targetService) ||
-      (_mediaListing === 'video' && (!_tc.targetService || _VIDEO_PLATFORMS.has(_targetSvcLower)))
+      (_mediaListing === 'video' && (!_tc.targetService || (_VIDEO_PLATFORMS.has(_targetSvcLower) && !_extLaneUp)))
     );
   if (_routeMediaToWebSearch) {
     logger.info(`[Node:DecomposePromptV2] Media-search guard: routing to web_search (mediaListing=${_mediaListing} taskType=${_tc.taskType} targetService=${_tc.targetService || 'none'}) — skipping command_automate short-circuit`);
@@ -930,6 +934,19 @@ module.exports = async function decomposePromptV2(state) {
   // refs were already caught by the active-doc guard above; a 'screen' ref
   // belongs to the screen-observation guard (OCR answer), never a literal
   // Brave query on "what's on my screen".
+  // "search <named web service> for X" is automation on that service's page —
+  // never public research, whatever the classifier typed (observed: "search
+  // youtube for lo-fi beats" → webSearch node answered with Google links
+  // instead of driving YouTube). Deterministic short-circuit: emit
+  // command_automate before any web-research routing sees it.
+  const _SERVICE_SEARCH_RE = /\b(search|find|look\s+for|browse)\s+(youtube|spotify|netflix|amazon|ebay|etsy|reddit|github|tiktok|twitch|hulu|pinterest|wikipedia|imdb|soundcloud|bandcamp|apple\s+music|google\s+(?:maps|flights|shopping|scholar|news|images))\s+(for|to\s+find)\b/i;
+  if (_SERVICE_SEARCH_RE.test(message) && !_hasMultiGoalConjunction) {
+    logger.info(`[Node:DecomposePromptV2] Service-search short-circuit: "${message.slice(0, 60)}" → command_automate`);
+    const subPrompts = [{ text: message, estimatedIntent: 'command_automate', confidence: 0.9, order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null }];
+    writeDecomposeLog({ ts: new Date().toISOString(), message, carriedHint: _carriedHint, parser: 'service-search-guard', intent: 'command_automate', subPromptCount: 1, durationMs: Date.now() - t0, subPrompts });
+    _emitIntentDecided(state, 'command_automate', 0.9);
+    return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'service-search-guard', intentPlan: subPrompts };
+  }
   if (_tc.webAccessMode === 'public_read' && !_tc.targetService && !_hasMultiGoalConjunction
       && _carriedHint !== 'command_automate' && !FILE_PATH_RE.test(message)
       && !LOCAL_FS_PROBE_RE.test(message)

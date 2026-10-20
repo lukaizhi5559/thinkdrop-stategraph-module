@@ -952,6 +952,30 @@ module.exports = async function resolveAgent(state) {
     logger.info(`[Node:ResolveAgent] local-file subject but service mentioned (targetService=${_tc.targetService || 'null'}, mentionsService=${_mentionsService}, isFollowUp=${!!_tc.isFollowUp}) — proceeding to LLM selection`);
   }
 
+  // ── Skip: live-page browser task, extension connected, no service named ────
+  // "fill out this form on my screen" resolves to the active extension tab
+  // (activeDocRef='url' via the deixis fallback + _extConnected). Asking
+  // "which website is the form on?" is wrong — the page is already known.
+  // Return an empty selection like the local-file skip; the browser lane
+  // (dom.act / form.fill.agent) is driven by taskType, not by picked agents.
+  const _livePageSubject = !!_tc && state._extConnected === true && (
+    (_tc.taskType === 'browser' || _tc.taskType === 'command_automate')
+    && (_tc.activeDocRef === 'url' || state.activeDocRef === 'url' || state._extSessionHint)
+  );
+  if (_livePageSubject && !_tc.targetService && !_messageMentionsServiceOrAgent(userMessage, registeredAgents)) {
+    logger.info(`[Node:ResolveAgent] live-page browser task on bound extension tab — skipping agent selection: "${userMessage.slice(0, 80)}"`);
+    return {
+      ...state,
+      resolveAgentResult: {
+        agents: [],
+        reasoning: 'Live-page browser task — active extension tab is the target',
+        question: null,
+        _message: userMessage,
+      },
+      resolveAgentAnswers: Array.isArray(state.resolveAgentAnswers) ? [...state.resolveAgentAnswers] : [],
+    };
+  }
+
   // ── Inline Q&A loop (max MAX_ROUNDS) ───────────────────────────────────────
   for (let round = 0; round < MAX_ROUNDS; round++) {
     if (progressCallback) progressCallback({ type: 'planning', message: 'Selecting the right agent…' });

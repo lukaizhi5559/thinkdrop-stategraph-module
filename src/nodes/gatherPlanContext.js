@@ -313,10 +313,13 @@ module.exports = async function gatherPlanContext(state) {
   // _shouldBypassGather returns true for scheduling tasks (needsClarification=false).
   // Skip if the user already specified a channel in their message — or when the
   // task targets a named service (google_calendar owns its own reminders; asking
-  // "how should ThinkDrop alert you" about a calendar event is off-topic).
+  // "how should ThinkDrop alert you" about a calendar event is off-topic). A
+  // pinned service agent (e.g. google_calendar.agent) implies a named service
+  // even when taskClassification didn't carry targetService.
   if (
     state._taskClassification?.taskType === 'scheduling' &&
     !state._taskClassification?.targetService &&
+    !state._pinnedAgentId &&
     !state._deliveryChannelResolved &&
     state.intent?.type === 'command_automate'
   ) {
@@ -340,8 +343,21 @@ module.exports = async function gatherPlanContext(state) {
       const _gatherAnswerCallback = state.gatherAnswerCallback || null;
       if (_gatherAnswerCallback) {
         try {
-          const _channelAnswer = await _gatherAnswerCallback(_deliveryQuestion);
-          const _channel = String(_channelAnswer || '').toLowerCase();
+          // Don't block the task indefinitely on a delivery-channel choice —
+          // if the user doesn't answer promptly, proceed with the primary
+          // option rather than stalling the whole task.
+          const _primary = _deliveryOptions.find(o => o.primary)?.value || _deliveryOptions[0]?.value || 'in-app';
+          const _rawAnswer = await Promise.race([
+            _gatherAnswerCallback(_deliveryQuestion),
+            new Promise((res) => setTimeout(() => res(`__timeout__:${_primary}`), 45 * 1000)),
+          ]);
+          const _timedOut = typeof _rawAnswer === 'string' && _rawAnswer.startsWith('__timeout__:');
+          if (_timedOut) {
+            logger.info(`[Node:GatherPlanContext] Delivery channel unanswered after 45s — defaulting to "${_primary}"`);
+            if (progressCallback) progressCallback({ type: 'gather_answer_received' });
+          }
+          const _channelAnswer = _timedOut ? _rawAnswer.slice('__timeout__:'.length) : _rawAnswer;
+          const _channel = String(_channelAnswer || _primary).toLowerCase();
           logger.info(`[Node:GatherPlanContext] Delivery channel chosen: "${_channel}"`);
           // Inject the chosen channel into resolvedMessage so planSkillsV2 builds the right synthesize step
           let _channelSuffix = '';
@@ -909,6 +925,79 @@ async function _runGrillLoop(state, logger) {
     }
     if (!_matched) {
       logger.warn(`[Node:GatherPlanContext:Grill] Could not auto-confirm single-route mandate for ${svc} — no matching routeDecision key (keys: ${Object.keys(routeDecision).join(',')})`);
+    }
+  }
+
+  // ── Form-fill probe short-circuit ────────────────────────────────────────
+  // "Fill out this form on my screen" — the generic grill asked blind
+  // questions ("which fields?", "what email?") because nobody had scanned the
+  // DOM. Probe the bound extension tab instead: form.fill.agent's read-only
+  // 'probe' action enumerates the live form's fields and resolves each label
+  // against user profile + memory. Three outcomes:
+  //   1. probe fails / no fields → fall through to the normal grill loop.
+  //   2. all fields resolved  → skip questions entirely (nothing to ask).
+  //   3. missing requireds    → ONE deterministic batch card, one input per
+  //      missing field — answers land in _formFillAnswers for the fill step
+  //      and persist to memory via the existing Phase B5 path.
+  const _FILL_FORM_GOAL_RE = /\b(?:fill|complete|enter|type)[^.]{0,40}\b(?:form|application|registration|signup|fields?)\b|\b(?:form|application|registration)\b[^.]{0,40}\b(?:fill|complete)\b/i;
+  if (mcpAdapter && state._extConnected && _FILL_FORM_GOAL_RE.test(baseMsg)) {
+    try {
+      const _probeSession = state._extSessionHint?.sessionId || state.activeBrowserSessionId || 'ext:default';
+      if (progressCallback) progressCallback({ type: 'gathering', message: 'Scanning the form on screen…' });
+      const _pRes = await mcpAdapter.callService('command', 'command.automate', {
+        skill: 'form.fill.agent',
+        args: { action: 'probe', sessionId: _probeSession },
+      }, { timeoutMs: 15000 }).catch(() => null);
+      const _probe = _pRes?.data?.result || _pRes?.data || _pRes?.result || _pRes;
+      if (_probe?.ok && Array.isArray(_probe.fields) && _probe.fields.length >= 2) {
+        logger.info(`[Node:GatherPlanContext:Grill] form probe: ${_probe.fields.length} field(s), ${Object.keys(_probe.resolved || {}).length} resolved, ${(_probe.missing || []).length} missing (url=${String(_probe.url || '').slice(0, 80)})`);
+        state._formFillProbe = _probe;
+        state._formFillAnswers = {};
+
+        // Only REQUIRED missing fields block — optional fields just go unfilled.
+        const _missingRequired = (_probe.missing || []).filter(m => m.required !== false);
+        if (_missingRequired.length === 0) {
+          logger.info('[Node:GatherPlanContext:Grill] form probe: all required values resolved from memory — skipping questions');
+          const _enriched = `${baseMsg}\n(Form on the live page was pre-scanned: ${Object.keys(_probe.resolved || {}).length} field value(s) already resolved from your profile/memory. Fill it — do NOT submit.)`;
+          return { ...state, resolvedMessage: _enriched, planGatheringComplete: true, planGatheringRound: 0, planGatheringAnswers: answers, _formFillProbe: _probe, _formFillAnswers: {} };
+        }
+
+        if (gatherAnswerCallback) {
+          const questions = _missingRequired.slice(0, 8).map((m) => ({
+            id: `q_ff_${m.key}`,
+            text: `The form asks for "${m.label}" — what should I use?`,
+            type: 'text',
+            freeText: true,
+            memoryResolved: false,
+            memoryText: `The user's ${String(m.key).replace(/^self:/, '').replace(/_/g, ' ')} is {answer}`,
+            memoryTextTemplate: `The user's ${String(m.key).replace(/^self:/, '').replace(/_/g, ' ')} is {answer}`,
+          }));
+          const batchId = `grill_formfill_${Date.now()}`;
+          logger.info(`[Node:GatherPlanContext:Grill] form probe: asking ${questions.length} missing field value(s) (batch ${batchId})`);
+          const batchAnswers = await gatherAnswerCallback({ batch: true, batchId, questions });
+          if (batchAnswers && Object.keys(batchAnswers).length > 0) {
+            for (const q of questions) {
+              const ans = batchAnswers[q.id];
+              const key = q.id.replace(/^q_ff_/, '');
+              if (ans && String(ans).trim()) {
+                answers.push({ question: q.text, answer: ans, confirmed: true });
+                state._formFillAnswers[key] = String(ans).trim();
+              }
+            }
+            // Persist to memory (fire-and-forget Phase B5 semantics)
+            _recordGatherAnswersToMemory(questions, batchAnswers, mcpAdapter, userId, logger).catch(() => {});
+          } else {
+            logger.warn('[Node:GatherPlanContext:Grill] form-fill batch returned empty — proceeding with resolved values only');
+          }
+        }
+        const _enriched = answers.length
+          ? `${baseMsg}\n[Additional context: ${answers.map(qa => `${qa.question}: ${qa.answer}`).join('; ')}]`
+          : baseMsg;
+        return { ...state, resolvedMessage: _enriched, planGatheringComplete: true, planGatheringRound: 0, planGatheringAnswers: answers, _formFillProbe: _probe, _formFillAnswers: state._formFillAnswers };
+      }
+      logger.info(`[Node:GatherPlanContext:Grill] form probe: ${_probe?.ok ? 'no form detected' : `failed (${_probe?.error || 'unavailable'})`} — continuing normal grill`);
+    } catch (e) {
+      logger.warn(`[Node:GatherPlanContext:Grill] form probe threw (${e.message}) — continuing normal grill`);
     }
   }
 

@@ -10,7 +10,7 @@ Interactive browser tasks decompose into **one step per tier** — the plan is t
    ```json
    { "skill": "url.first.agent", "args": { "agentId": "<service>.agent", "task": "go to <service> <section>" }, "description": "Navigate to <service>" }
    ```
-   **Display-only requests** ("open gmail", "go to calendar", "show me amazon" — the user just wants to SEE the page) don't need an automation session at all: emit `app.agent { "action": "navigate_url", "url": "<site url>" }` to open it in the user's real browser instead.
+   **Display-only requests** ("open gmail", "go to calendar", "show me amazon" — the user just wants to SEE the page) don't need an automation session at all: emit `app.agent { "action": "navigate_url", "url": "<site url>" }` to open it in the user's real browser instead. Same for **navigate + read/copy/show content** tasks ("go to X and show me Y", "open the page and copy the chapter"): prefer `app.agent navigate_url` + `read_url`/`scan_page` (the user's real browser — no Playwright window) over `url.first.agent` + turn-loop. Reserve `url.first.agent` for goals that truly need DOM interaction (click/fill/submit) or a logged-in automation session.
 2. **`dom.act`** — ONE on-page action per step (click, type, fill, submit, select, drag, scroll, keypress). A deterministic router picks the executor (just.type/meta.find/shortcut.keys/tab.map/gesture/arrow.grid/turn.loop) from live DOM state — you do NOT need to pick it.
    ```json
    { "skill": "dom.act", "args": { "task": "fill the To field with <recipient>", "agentId": "<service>.agent" }, "description": "Fill recipient" }
@@ -24,6 +24,26 @@ Interactive browser tasks decompose into **one step per tier** — the plan is t
 4. **`synthesize`** — summarize for the user.
 
 Consecutive steps reuse the same browser session automatically — no `sessionId` needed, no `synthesize` between browser steps.
+
+### `form.fill.agent` — multi-field form fill from memory
+
+When the task is **"fill out this/the form"** (on the current page OR a page a prior `url.first.agent` step opened), emit ONE `form.fill.agent` step instead of several `dom.act` fill steps. It scans the live form, resolves each field's value from the user's profile/memory, asks the user (batched card) only for values that are genuinely missing, fills deterministically, and verifies — far faster and more accurate than typing field-by-field.
+
+```json
+{ "skill": "form.fill.agent", "args": { "task": "fill out the sponsorship form", "agentId": "<service>.agent" }, "description": "Fill the sponsorship form" }
+```
+
+- **Values do NOT go in the args.** The agent resolves them itself — do NOT emit a `user.agent` step first unless the task needs user context for a different reason, and do NOT invent per-field `dom.act` steps around it.
+- **No-submit:** when the task says "fill but don't submit", "without submitting", "leave it ready", etc., just emit `form.fill.agent` as normal — it structurally cannot submit (DOM guard + no submit-class clicks + no Enter). NEVER emit a separate "click Submit/Save/Send/Continue" step unless the user explicitly asked to submit, and never put submit intent inside the fill step's task text.
+- **Explicit submit:** if the task DOES say "fill and submit/send", emit `form.fill.agent` for the fill and a separate `dom.act` step for the submit click — submission is always its own step.
+- Fields already containing values are skipped; set `args.overwrite: true` only when the task asks to replace existing values.
+- **Correction loop:** the fill run reports per-field state (`filled`, `validationIssues` with the form's own messages like "Not a valid email address", `missing`). When a follow-up prompt supplies a corrected value ("the email is kai@x.com", "use 555-555-0134"), emit `form.fill.agent` again with `args.fields` (the corrected values), `args.only` (just the affected field keys/labels), and `args.overwrite: true` — do NOT re-fill the whole form or add a `user.agent` step:
+
+```json
+{ "skill": "form.fill.agent", "args": { "task": "correct the email field", "fields": { "email": "kai@example.com" }, "only": ["email"], "overwrite": true }, "description": "Fix email field" }
+```
+
+- The fill step's `synthesize` should report which fields filled, which the form rejected (quote the validation message), and which still need values — the user supplies corrections on the next turn.
 
 **Live-session continuation:** when a `## ACTIVE BROWSER SESSION` note is present, that session's page is already open. Follow-up goals on it ("scroll down", "click that one", "add the next item to my cart", "what does this page say") are `dom.act`/`turn.loop.agent` (or `browser.act getPageText` for reads) — do NOT emit `url.first.agent` to go back to the same site.
 
@@ -48,6 +68,15 @@ Consecutive steps reuse the same browser session automatically — no `sessionId
   { "skill": "synthesize", "args": { "prompt": "Confirm the <query> item was added to the cart" }, "description": "Confirm" }
 ]
 ```
+
+**Fill a form on the visible page without submitting:**
+```json
+[
+  { "skill": "form.fill.agent", "args": { "task": "fill out the form on this page but do not submit it" }, "description": "Fill the form (no submit)" },
+  { "skill": "synthesize", "args": { "prompt": "Report which fields were filled and which were skipped." }, "description": "Report fill results" }
+]
+```
+No `url.first.agent` — the page is already on screen (the ACTIVE BROWSER SESSION hint carries the bound tab). No `dom.act` submit step — the task forbids it.
 
 **Create a calendar event (shortcut-driven app):**
 ```json
