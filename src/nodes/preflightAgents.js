@@ -2991,7 +2991,11 @@ module.exports = async function preflightAgents(state) {
           // (e.g. "email me X" must not become a Gmail #search/ URL).
           taskClassification: _tc,
         },
-      }, { timeoutMs: 30000 }).catch(() => null);
+        // 75s (was 30s): the resolution chain (template → session eval →
+        // web.agent → crawl → suggest) can legitimately run ~60s; a mid-chain
+        // timeout abandons the work and url.first.agent re-runs the identical
+        // chain at execution — the observed duplicate-resolution latency.
+      }, { timeoutMs: 75000 }).catch(() => null);
       const result = res?.data || res;
       if (result?.ok && result?.deepLinkUrl) {
         _deepLinkCache.set(_cacheKey, { url: result.deepLinkUrl, source: result.deepLinkSource || null, ts: Date.now() });

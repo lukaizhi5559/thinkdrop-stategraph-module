@@ -72,7 +72,7 @@ function _extractNavQuery(message) {
 // Lexical pre-gate: only fire the classify call when the message could
 // plausibly be a local op. This is a TRIGGER, not a decision — a miss just
 // means no prefire (the decompose site still calls the classifier directly).
-const _PRE_GATE_RE = /(?:^|[\s"'`(\[])(?:~?\/[^\s"'`)]+|\.\.?\/[^\s"'`)]+)|\b(?:battery|disk|uptime|volume|mute|unmute|screenshot|screen\s?shot|screen|terminal|shell|open|launch|quit|remind\w*|alarm|cancel|schedule|process|wifi|bluetooth|hostname|memory|cpu|copy|move|rename|append|write|create|read|list|file|delete|trash|remove|goto|go\s+to|visit|navigate|browse|page)\b/i;
+const _PRE_GATE_RE = /(?:^|[\s"'`(\[])(?:~?\/[^\s"'`)]+|\.\.?\/[^\s"'`)]+)|\b(?:battery|disk|uptime|volume|mute|unmute|screenshot|screen\s?shot|screen|terminal|shell|open|launch|quit|close|tab|remind\w*|alarm|cancel|schedule|process|wifi|bluetooth|hostname|memory|cpu|copy|move|rename|append|write|create|read|list|file|delete|trash|remove|goto|go\s+to|visit|navigate|browse|page)\b/i;
 function looksLikeLocalOp(message) {
   return _PRE_GATE_RE.test(String(message || ''));
 }
@@ -619,6 +619,16 @@ const TEMPLATES = [
       ];
     },
   },
+  {
+    // Deterministic browser/app tab close — execute_shortcut pulls Cmd+W from
+    // the shortcut tables so the keystroke can never be a hallucinated raw
+    // osascript key code (observed: LLM emitted key code 17 = Cmd+T and opened
+    // a NEW tab; Cmd+W is key code 13).
+    n: 23, id: 'tab_close', lowRisk: true,
+    describe: 'close the current browser tab or app tab ("close this tab", "close the tab", "close current tab") — args: {}. NOT for closing/quitting a whole window or app ("close chrome", "quit slack" → app_control).',
+    validate: (a, m) => /\bclose\s+(?:this\s+|the\s+|current\s+|that\s+)?(?:browser\s+)?tabs?\b/i.test(String(m || '')) ? null : 'no close-tab phrase',
+    build: () => [{ skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'browser', shortcutOverride: 'Cmd+W' }, description: 'Close the current tab' }],
+  },
 ];
 
 /** bible_verse — bible-api.com (free, no key). Prints "Reference" then the
@@ -776,17 +786,18 @@ RULES:
 EXAMPLES:
 "read /tmp/a.txt and tell me what it says" → {"n": 3, "args": {"path": "/tmp/a.txt"}}
 "[File: /tmp/notes.txt] what's this about" → {"n": 3, "args": {"path": "/tmp/notes.txt"}}
-"append 'milk' to ~/todo.txt" → {"n": 2, "args": {"path": "~/todo.txt", "content": "milk"}}
+"append 'X' to ~/todo.txt" → {"n": 2, "args": {"path": "~/todo.txt", "content": "X"}}
 "what's my battery percentage" → {"n": 6, "args": {"kind": "battery"}}
 "open https://a.com" → {"n": 10, "args": {"url": "https://a.com"}}
-"post hello to twitter" → {"n": 14, "args": {"service": "twitter"}}
-"send a slack message to #eng" → {"n": 14, "args": {"service": "slack"}}
-"send an email to bob about the meeting" → {"n": 14, "args": {"service": "gmail"}}
+"post hello to X" → {"n": 14, "args": {"service": "X"}}
+"send a X message to #eng" → {"n": 14, "args": {"service": "X"}}
+"send an email to bob about the meeting" → {"n": 14, "args": {"service": "X"}}
 "delete the file /tmp/old.txt" → {"n": 20, "args": {"path": "/tmp/old.txt"}}
 "what's on my screen" → {"n": 21, "args": {}}
-"check the weather" → {"n": 0, "args": {}}
+"check the X" → {"n": 0, "args": {}}
 "what's the cheapest item on this page" → {"n": 17, "args": {}} (when a page is open)
-"goto amazon and search for baby clothes" → {"n": 19, "args": {"site": "amazon", "query": "baby clothes"}}
+"goto X and search for Y" → {"n": 19, "args": {"site": "X", "query": "Y"}}
+"close this tab" → {"n": 23, "args": {}}
 ${resolvedTarget ? `RESOLVED TARGET (the file/app the user's referent points at): ${resolvedTarget}` : ''}
 ${priorTask ? `PRIOR TASK CONTEXT: this message is a follow-up continuing a prior turn — the resolved referent is "${priorTask}". Bare continuations ("try again", "continue", "do that", "check again") mean re-run/continue THAT task — classify the template the referent implies (e.g. referent "check my gmail for unread emails" → n=22 service_browse).` : ''}
 ${activePage ? `ACTIVE PAGE: the user has a browser page open right now (${activePage}) — "this page"/"the page" refers to it, prefer template 17/18` : ''}

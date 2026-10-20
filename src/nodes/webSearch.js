@@ -7,6 +7,31 @@
  * - Without MCP: Returns empty results
  */
 
+const https = require('https');
+const { SCRIPTURE_REF_RE } = require('../utils/textPatterns.cjs');
+
+// Scripture lookup fast path — bible-api.com (free, no key). Google's AI
+// Overview only returns verse fragments for full-chapter asks; the API
+// returns the complete passage deterministically. Null → normal SERP.
+function _fetchBiblePassage(ref, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    const url = `https://bible-api.com/${encodeURIComponent(String(ref).trim().slice(0, 40))}`;
+    const req = https.get(url, { timeout: timeoutMs }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(data);
+          if (j.error || !j.text) return resolve(null);
+          resolve(`${(j.reference || ref).trim()}\n\n${j.text.trim()}`);
+        } catch (_) { resolve(null); }
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+  });
+}
+
 module.exports = async function webSearch(state) {
   const { mcpAdapter, message } = state;
   const logger = state.logger || console;
@@ -107,6 +132,24 @@ module.exports = async function webSearch(state) {
     }
 
     logger.debug(`[Node:WebSearch] Query: "${query}"`);
+
+    // Scripture lookup → bible-api.com fast path. Covers follow-ups the
+    // express lane abstains on ("show full chapter") — the Overview only
+    // returns verse fragments; the API returns the complete passage.
+    const scriptureRef = query.match(SCRIPTURE_REF_RE);
+    if (scriptureRef) {
+      const passage = await _fetchBiblePassage(scriptureRef[0]);
+      if (passage) {
+        logger.info(`[Node:WebSearch] scripture → bible-api "${scriptureRef[0]}" (${passage.length} chars)`);
+        return {
+          ...state,
+          searchResults: [],
+          contextDocs: [],
+          aiOverview: passage,
+        };
+      }
+      logger.warn(`[Node:WebSearch] bible-api miss for "${scriptureRef[0]}" — normal SERP`);
+    }
 
     // Call web-search service. NOTE: the route reads `maxResults` (not `limit`).
     const _searchArgs = () => ({

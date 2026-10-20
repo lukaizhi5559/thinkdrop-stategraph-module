@@ -8,7 +8,8 @@ The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or mo
 
 - For "the file that's open" with no explicit app name → use `App` and `File` from ACTIVE SCREEN CONTEXT as `appName` / `filePath`.
 - For "close/minimize/hide/quit this app" → use `shell.run` osascript (see plan-skills-shell.md). `app.agent` is NOT for window management.
-- `app.agent` is for **in-app interactions** only: undo/redo/cut/copy/paste, find/replace, tab navigation, toggle sidebar/dark mode, scroll/read content, app AI assistant (run_agent / run_app_flow).
+- **Exception:** "close this tab" / "close the tab" is an in-app action, NOT window management → use `app.agent execute_shortcut` with `appName: "browser"` and `shortcutOverride: "Cmd+W"`. NEVER emit `osascript key code N` or `keystroke "x" using command down` for known app/browser shortcuts — raw key codes are easy to get wrong (key code 17 is Cmd+T, not Cmd+W); `execute_shortcut` resolves the correct keystroke from the shortcut tables.
+- `app.agent` is for **in-app interactions** only: undo/redo/cut/copy/paste, find/replace, tab navigation (new tab, close tab, switch tab), toggle sidebar/dark mode, scroll/read content, app AI assistant (run_agent / run_app_flow).
 
 ## Three-Tier Priority
 

@@ -39,6 +39,39 @@ function _extractUrl(message) {
   return null;
 }
 
+// Infer a registered service name from free text ("Bible Gateway link for
+// John 1" → 'biblegateway') — separator-insensitive word match against the
+// agent registry's service names + keywords. Lets the nav_task lane engage
+// when the classifier left targetService null but the message names a site.
+function _inferServiceFromText(text) {
+  const t = String(text || '').toLowerCase();
+  const tokens = t.split(/[^a-z0-9]+/).filter(Boolean);
+  if (!tokens.length) return null;
+  // Sliding window of 1–3 consecutive tokens, collapsed — "Bible Gateway"
+  // matches the registered 'biblegateway' service while 'email' never
+  // matches a 'mail' service (whole-token compare, not substring).
+  const windowSet = new Set();
+  for (let i = 0; i < tokens.length; i++) {
+    let w = '';
+    for (let len = 1; len <= 3 && i + len <= tokens.length; len++) {
+      w += tokens[i + len - 1];
+      windowSet.add(w);
+    }
+  }
+  try {
+    const { listAgentNames } = require('../../../shared/service-map.cjs');
+    for (const a of listAgentNames()) {
+      const names = [a.service, ...(a.keywords || [])]
+        .map(n => String(n || '').replace(/\.agent$/, '').toLowerCase().replace(/[^a-z0-9]/g, ''))
+        .filter(n => n.length >= 4);
+      for (const n of names) {
+        if (windowSet.has(n)) return String(a.service || n).replace(/\.agent$/, '');
+      }
+    }
+  } catch (_) { /* registry unavailable */ }
+  return null;
+}
+
 // taskClassification-only eligibility — shared with decomposePromptV2, which
 // short-circuits its LLM call when this passes (the gate can't drift apart or
 // decompose would skip the call for prompts the lane then rejects).
@@ -50,7 +83,12 @@ function isBrowseFastLaneTc(tc, message) {
   if (!tc) return false;
   if (tc.isBrowseOnly !== true) return false;
   if (tc.requiresDOM === true) return false;
-  if (tc.webAccessMode !== 'public_read') return false;
+  // public_read admits freely; 'interactive' admits only when no interactive
+  // action was extracted — a browse-only task with an empty action list is a
+  // read (observed: "go to one" classified interactive with zero actions and
+  // missed this lane, paying for a full engine run).
+  const _noActions = !Array.isArray(tc.interactiveActions) || tc.interactiveActions.length === 0;
+  if (tc.webAccessMode !== 'public_read' && !(tc.webAccessMode === 'interactive' && _noActions)) return false;
   if (tc.needsClarification === true) return false;
   // A live-doc referent ("this page", "the file", the screen) contradicts the
   // public-fetch lane by definition — the page_read/screen paths own it.
@@ -78,7 +116,8 @@ function isBrowseFastLaneTc(tc, message) {
   // synthesize plan takes 30s-2min. Only prompts naming a concrete page —
   // a literal URL/host in the message or resolved follow-up target, or a
   // resolved targetService — still qualify for the fetch path.
-  if (!tc.targetService && !_extractUrl(message) && !_extractUrl(tc.followUpTarget)) return false;
+  if (!tc.targetService && !_extractUrl(message) && !_extractUrl(tc.followUpTarget)
+      && !_inferServiceFromText(tc.followUpTarget || message)) return false;
   return true;
 }
 
@@ -147,21 +186,27 @@ module.exports = async function fastLanePlan(state) {
   // bare search — search_and_navigate's preferDomain is only a scoring bias
   // and picked a dcbridges.org mirror for a "biblegateway" task. browseFallback
   // keeps the search+read floor when the service isn't registered.
+  // When the classifier left targetService null, recover the named service
+  // from the resolved target / message text (e.g. "Bible Gateway link for
+  // John 1" → biblegateway) so nav_task still engages.
+  const _svc = _tc2.targetService
+    || _inferServiceFromText(_tc2.followUpTarget)
+    || _inferServiceFromText(message);
   const plan = url
     ? [fetchStep, synthStep]
-    : _tc2.targetService
+    : _svc
       ? [
           {
             skill: 'app.agent',
             args: {
               action: 'nav_task',
-              service: _tc2.targetService,
+              service: _svc,
               task: _searchQuery,
               escalate: false,
               browseFallback: true,
               timeoutMs: 120000,
             },
-            description: `${_tc2.targetService}: ${_searchQuery.slice(0, 80)}`,
+            description: `${_svc}: ${_searchQuery.slice(0, 80)}`,
           },
           synthStep,
         ]
@@ -187,7 +232,7 @@ module.exports = async function fastLanePlan(state) {
           synthStep,
         ];
 
-  logger.info(`[Node:FastLanePlan] Browse fast-lane → ${plan.length}-step injected plan (url=${url ? 'literal' : _tc2.targetService ? `service:${_tc2.targetService}` : 'search'}) for: "${message.slice(0, 70)}"`);
+  logger.info(`[Node:FastLanePlan] Browse fast-lane → ${plan.length}-step injected plan (url=${url ? 'literal' : _svc ? `service:${_svc}` : 'search'}) for: "${message.slice(0, 70)}"`);
   if (typeof state.progressCallback === 'function') {
     try {
       state.progressCallback({ type: 'node', node: 'fastLanePlan', label: 'Fast lane — direct web lookup', icon: 'bolt' });
