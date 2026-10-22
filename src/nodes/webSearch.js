@@ -7,8 +7,59 @@
  * - Without MCP: Returns empty results
  */
 
+const http = require('http');
 const https = require('https');
 const { SCRIPTURE_REF_RE } = require('../utils/textPatterns.cjs');
+
+const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
+const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
+
+// SSE call to /web.search stream:true — progress events ({type:'engine'}
+// chain transitions, {type:'items'} partial results) go to onEvent; resolves
+// with the {type:'done'} payload ({results, aiOverview, provider, …}), which
+// is the same shape mcpAdapter.callService returns under .data. Null on
+// failure — the caller falls back to the adapter's plain-JSON path.
+function _postSearchSse(payload, timeoutMs, onEvent) {
+  return new Promise((resolve) => {
+    if (!WS_API_KEY) return resolve(null);
+    const body = JSON.stringify({
+      version: 'mcp.v1', service: 'web-search', action: 'web.search',
+      payload, requestId: 'sg_ws_' + Date.now(), context: { userId: 'local_user' },
+    });
+    const req = http.request({
+      hostname: '127.0.0.1', port: WEB_SEARCH_PORT, path: '/web.search', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+        Authorization: `Bearer ${WS_API_KEY}`,
+      },
+      timeout: timeoutMs,
+    }, (res) => {
+      let buf = '';
+      res.on('data', (c) => {
+        buf += c;
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          for (const line of block.split('\n')) {
+            if (!line.startsWith('data:')) continue;
+            try {
+              const ev = JSON.parse(line.slice(5));
+              if (ev.type === 'done') { req.destroy(); resolve(ev.data); return; }
+              if (onEvent) onEvent(ev);
+            } catch (_) {}
+          }
+        }
+      });
+      res.on('end', () => resolve(null));
+    });
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+    req.on('error', () => resolve(null));
+    req.write(body);
+    req.end();
+  });
+}
 
 // Scripture lookup fast path — bible-api.com (free, no key). Google's AI
 // Overview only returns verse fragments for full-chapter asks; the API
@@ -152,15 +203,59 @@ module.exports = async function webSearch(state) {
       logger.warn(`[Node:WebSearch] bible-api miss for "${scriptureRef[0]}" — normal SERP`);
     }
 
+    // Signal the overlay that a SERP fetch is in flight — the renderer shows
+    // a loading engine chip until the real \x00ENGINE\x00 sentinel arrives.
+    if (typeof state.streamCallback === 'function') {
+      try { state.streamCallback('\x00SEARCHING\x00google-serp'); } catch (_) {}
+    }
+
     // Call web-search service. NOTE: the route reads `maxResults` (not `limit`).
+    // stream:true via SSE first — engine transitions + partial items ride
+    // streamCallback as sentinels so favicon chips/cards appear mid-fetch.
+    // Falls back to the adapter's plain-JSON call when SSE can't connect.
     const _searchArgs = () => ({
       query,
       limit: _mediaListing === 'video' ? 8 : 3,
       ...(_mediaListing === 'video' ? { maxResults: 8 } : {}),
       ...(_intentHint ? { intent: _intentHint } : {}),
       ...(_searchLang ? { lang: _searchLang } : {}),
+      stream: true,
     });
-    let result = await mcpAdapter.callService('web-search', 'web.search', _searchArgs());
+    const _streamHost = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch (_) { return ''; } };
+    const _onSerpEvent = (ev) => {
+      if (typeof state.streamCallback !== 'function') return;
+      try {
+        if (ev.type === 'engine' && ev.engine) {
+          state.streamCallback('\x00SEARCHING\x00' + ev.engine);
+        } else if (ev.type === 'items') {
+          if (Array.isArray(ev.items) && ev.items.length) {
+            const items = ev.items.map(r => ({
+              title: r.title || undefined,
+              url: (r.url || r.link || '').startsWith('http') ? (r.url || r.link) : undefined,
+              thumbnail: (typeof r.thumbnail === 'string' ? r.thumbnail : r.thumbnail?.src) || undefined,
+              imageUrl: r.imageUrl || undefined,
+              snippet: r.snippet || r.description || undefined,
+              hostname: r.displayDomain || _streamHost(r.url || r.link || '') || undefined,
+              mediaType: r.type === 'video' ? 'video' : undefined,
+              duration: r.duration || undefined,
+              channel: r.channel || undefined,
+            })).filter(i => i.url || i.imageUrl);
+            if (items.length) state.streamCallback('\x00ITEMS\x00' + JSON.stringify(items));
+          }
+          const srcs = (Array.isArray(ev.sources) && ev.sources.length ? ev.sources
+            : (Array.isArray(ev.items) ? ev.items : [])
+              .filter(r => (r.url || r.link || '').startsWith('http'))
+              .map(r => ({ url: r.url || r.link, hostname: r.displayDomain || _streamHost(r.url || r.link), title: r.title || '' })));
+          if (srcs.length) state.streamCallback('\x00SOURCES\x00' + JSON.stringify(srcs));
+        }
+      } catch (_) {}
+    };
+    let result = await _postSearchSse(_searchArgs(), 20000, _onSerpEvent);
+    if (!result) {
+      const args = _searchArgs();
+      delete args.stream;
+      result = await mcpAdapter.callService('web-search', 'web.search', args);
+    }
 
     // MCP protocol wraps response in 'data' field
     const searchData = result.data || result;
@@ -222,8 +317,14 @@ module.exports = async function webSearch(state) {
     });
 
     // AI Overview (google-serp/bing-serp) — answer.js short-circuits on this.
-    const aiOverview = typeof searchData.aiOverview === 'string' && searchData.aiOverview.trim()
+    // When every free provider is down, the service returns searchUnavailable
+    // + a connect-an-API guidance message — route it through the same
+    // short-circuit so the user sees it verbatim instead of an LLM guess.
+    let aiOverview = typeof searchData.aiOverview === 'string' && searchData.aiOverview.trim()
       ? searchData.aiOverview.trim() : null;
+    if (!aiOverview && searchData.searchUnavailable && typeof searchData.userMessage === 'string' && searchData.userMessage.trim()) {
+      aiOverview = searchData.userMessage.trim();
+    }
     if (aiOverview) logger.info(`[Node:WebSearch] aiOverview captured (${aiOverview.length} chars)`);
 
     return {

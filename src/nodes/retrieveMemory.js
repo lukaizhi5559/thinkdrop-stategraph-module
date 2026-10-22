@@ -665,7 +665,9 @@ async function retrieveMemory(state) {
           endDate: episodicDateRange.endDate,
           filters: {
             type: 'screen_capture',
-            excludeOverlay: true,
+            // excludeOverlay was removed: the overlay's rect is masked before
+            // OCR now, and the old loose signature had tainted nearly every
+            // historic capture — excluding them emptied all date-range results.
             ...(episodicAppName ? { appName: episodicAppName } : {})
           },
           dedup: true,

@@ -119,6 +119,7 @@ Output ONLY valid JSON with exactly these fields:
   "interactiveActions": ["login", "add_to_cart", ...] | [],
   "expectsFileOutput": true | false,
   "activeDocRef": "file" | "url" | "screen" | null,
+  "newDestination": true | false,
   "mediaListing": "none" | "image" | "video",
   "isScreenOutput": true | false,
   "screenOutputAction": "show" | "clear" | null,
@@ -174,6 +175,8 @@ Field rules:
   - NAMED-SITE RULE: a message that names a specific external site, org, or domain ("the Valley Forge Baptist Church website", "events on amazon.com", "what's on Hacker News") is a PUBLIC FETCH target, NOT an active-doc referent — even when a browser happens to be open. activeDocRef=url is ONLY for the page verifiably visible right now: deictic/vague references ("this site", "the page open", "the current tab", "what's this page about") or an explicit reference to the exact URL shown in the context block. When in doubt, set activeDocRef=null — the web-scrape path handles named sites.
   - LIVE-ARTIFACT NOUN OVERRIDE: explicit nouns that can only exist on screen — "this site", "this webpage", "this website", "this tab", "the browser page", "the browser tab", "the page in the browser", "the page I'm on", "the site I'm on" — resolve to activeDocRef even when CONVERSATION HISTORY supplies a competing referent (e.g. "print this site" after discussing a saved file → activeDocRef="url", followUpTarget may still carry the file). A site/webpage/tab/browser-page referent is never a conversation artifact. Bare "this"/"it" and conversation-artifact nouns ("this file", "the document") still defer to a competing conversation referent.
   - When activeDocRef is "file" or "url", also set isScreenFollowUp:false and needsFreshScreen:false (the target is known — no screen OCR needed). When activeDocRef is "screen", set isScreenFollowUp:true.
+
+- newDestination: true when the user asks to GO SOMEWHERE — open/go to/visit/navigate/pull up/bring up/switch to a site, page, tab, app, or service — including departure phrasings without a literal nav verb ("hop over to", "swing by", "take me to", "bring me to"). Also true when the message names a DIFFERENT service/site than the one the context shows open. false when the request acts on the page or app already open in front of the user (write/reply/fill/click on the visible page), or when no destination is named or implied. DEFAULT false — most action requests act on the current surface.
 
 - isScreenOutput: true when the user wants content PAINTED ONTO THE SCREEN itself — the GhostLayer visual output surface (a transparent always-on-top layer over the whole desktop). This is WRITING to the screen, the opposite of reading it. Signals: "show it on the screen", "display that on my screen", "put this on screen", "show on screen", "make it rain (on my screen)", "fireworks on the screen", "show a big emoji", "put up a chart on screen", "clear the screen", "take that off the screen".
   - action "show": render/display/paint/put something onto the screen — "show it on the screen", "display John 3:16 on screen", "make it rain", "put up fireworks"
@@ -699,6 +702,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       expectsFileOutput:   !!parsed.expectsFileOutput,
       activeDocRef,
       activeDocTarget:     null, // resolved by caller from live context
+      newDestination:      !!parsed.newDestination,
       mediaListing:        _VALID_MEDIA_LISTINGS.has(parsed.mediaListing) ? parsed.mediaListing : 'none',
       suggestedIntent:     _contradicts ? null : _rawSuggested,
       isScreenOutput:      !!parsed.isScreenOutput,

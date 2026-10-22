@@ -77,6 +77,103 @@ r = lintAtomicBrowserPlan([
 ], logger, {});
 check('no url → kept as url.first.agent and flagged', r.plan[0].skill === 'url.first.agent' && r.navOnlyPlan === true, skills(r.plan));
 
+console.log('\n--- same-host url.first under no departure → bound-tab select ---');
+// The LinkedIn incident: the Sharmila messaging thread was bound, the prompt
+// never said "this page", and a linkedin url.first moved the real tab to /feed.
+const _liCtx = {
+  prompt: "in write a message come with a response to Sharmila but don't submit",
+  extConnected: true,
+  extSessions: [{ sessionId: 'ext:linkedin_agent', url: 'https://www.linkedin.com/messaging/thread/sharmila', title: 'LinkedIn Messaging', lastSeen: 1 }],
+  boundSession: 'ext:linkedin_agent',
+  boundUrl: 'https://www.linkedin.com/messaging/thread/sharmila',
+};
+r = lintAtomicBrowserPlan([
+  { skill: 'url.first.agent', args: { agentId: 'linkedin.agent', task: 'open linkedin messages' }, description: 'nav to linkedin' },
+  { skill: 'dom.act', args: { agentId: 'linkedin.agent', task: 'type the reply into the Write a message field' }, description: 'type reply' },
+  { skill: 'synthesize', args: {} },
+], logger, _liCtx);
+check('same-host url.first → browser.act:tab-select', skills(r.plan).startsWith('browser.act:tab-select'), skills(r.plan));
+check('tab-select carries the bound session', r.plan[0].args.sessionId === 'ext:linkedin_agent');
+check('dom.act follower stamped with bound session', r.plan[1].args.sessionId === 'ext:linkedin_agent');
+
+console.log('\n--- departure keeps url.first ---');
+r = lintAtomicBrowserPlan([
+  { skill: 'url.first.agent', args: { agentId: 'linkedin.agent', task: 'open linkedin' }, description: 'go to linkedin' },
+  { skill: 'synthesize', args: {} },
+], logger, { ..._liCtx, prompt: 'go to linkedin' });
+check('"go to" prompt keeps url.first', r.plan[0].skill === 'url.first.agent', skills(r.plan));
+
+console.log('\n--- different-service url.first untouched ---');
+r = lintAtomicBrowserPlan([
+  { skill: 'url.first.agent', args: { agentId: 'gmail.agent', task: 'open gmail' }, description: 'open gmail' },
+  { skill: 'synthesize', args: {} },
+], logger, _liCtx);
+check('foreign-service url.first not rewritten to tab-select', r.plan[0].skill !== 'browser.act', skills(r.plan));
+
+console.log('\n--- no-submit prompt drops pure-submit steps ---');
+r = lintAtomicBrowserPlan([
+  { skill: 'form.fill.agent', args: { task: 'write the reply into the message box' }, description: 'fill message' },
+  { skill: 'dom.act', args: { task: 'click the Send button' }, description: 'send it' },
+  { skill: 'synthesize', args: {} },
+], logger, { ..._liCtx, prompt: "write a reply to Sharmila but don't submit" });
+check('pure "click Send" step dropped under don\'t-submit', !r.plan.some(s => /send button/i.test(s.args?.task || '')), skills(r.plan));
+check('the fill step is kept', r.plan.some(s => s.skill === 'form.fill.agent'));
+
+r = lintAtomicBrowserPlan([
+  { skill: 'dom.act', args: { task: 'type the reply then click send' }, description: 'type and send' },
+], logger, { prompt: "write a reply but don't send", extConnected: false });
+check('mixed type+send step kept (skill-layer guard owns the send)', r.plan.length === 1 && r.plan[0].skill === 'dom.act');
+
+console.log('\n--- web step on the bound host → bound-tab read ---');
+r = lintAtomicBrowserPlan([
+  { skill: 'web.crawl', args: { url: 'https://www.linkedin.com/messaging/thread/sharmila' }, description: 'crawl thread' },
+  { skill: 'synthesize', args: {} },
+], logger, _liCtx);
+check('web.crawl same-host → browser.act:getPageText', skills(r.plan).startsWith('browser.act:getPageText'), skills(r.plan));
+check('the read carries the bound session', r.plan[0].args.sessionId === 'ext:linkedin_agent');
+
+console.log('\n--- bare history nav collapses to browser.act:back (the Amazon bug) ---');
+// "go back for me on this page" used to match the named-destination go-back
+// rule via step text like "go back to the previous page" → tab-select on a
+// dead session → resolveTab minted a fresh Amazon tab. Bare history must be
+// history.back() on the on-screen tab, never a tab select.
+const _amznCtx = {
+  prompt: 'go back for me on this page',
+  extConnected: true,
+  extSessions: [{ sessionId: 'ext:amazon_agent', url: 'https://www.amazon.com/dp/B0XXXX', title: 'Amazon product', lastSeen: 1 }],
+  boundSession: 'ext:amazon_agent',
+  boundUrl: 'https://www.amazon.com/dp/B0XXXX',
+};
+r = lintAtomicBrowserPlan([
+  { skill: 'url.first.agent', args: { agentId: 'amazon.agent', task: 'go back to the previous page' }, description: 'navigate back' },
+  { skill: 'turn.loop.agent', args: { agentId: 'amazon.agent', goal: 'previous page is displayed', mode: 'act' } },
+  { skill: 'synthesize', args: {} },
+], logger, _amznCtx);
+check('bare "go back" collapses to a single browser.act:back', skills(r.plan) === 'browser.act:back', skills(r.plan));
+check('…on the bound session (no minting)', r.plan[0].args.sessionId === 'ext:amazon_agent');
+check('history rewrite logged', r.rewrites.some(w => /history-nav/.test(w.kind)));
+
+r = lintAtomicBrowserPlan([
+  { skill: 'url.first.agent', args: { agentId: 'amazon.agent', task: 'go back to the previous page' }, description: 'back' },
+], logger, { ..._amznCtx, prompt: 'go back to the previous page' });
+check('"go back to the previous page" is history, not a destination', skills(r.plan) === 'browser.act:back', skills(r.plan));
+
+r = lintAtomicBrowserPlan([
+  { skill: 'browser.act', args: { action: 'navigate', url: 'https://x.com' }, description: 'nav' },
+], logger, { ..._amznCtx, prompt: 'reload this page' });
+check('"reload this page" → browser.act:reload', skills(r.plan) === 'browser.act:reload', skills(r.plan));
+
+console.log('\n--- named-destination "go back to my X tab" still tab-selects ---');
+r = lintAtomicBrowserPlan([
+  { skill: 'url.first.agent', args: { agentId: 'ebay.agent', task: 'open ebay' }, description: 'nav ebay' },
+], logger, {
+  prompt: 'go back to my ebay tab',
+  extConnected: true,
+  extSessions: [{ sessionId: 'ext:ebay_agent', url: 'https://www.ebay.com/myb', title: 'eBay', lastSeen: 1 }],
+});
+check('"go back to my ebay tab" → tab-select', skills(r.plan) === 'browser.act:tab-select', skills(r.plan));
+check('…bound ebay session', r.plan[0].args.sessionId === 'ext:ebay_agent');
+
 console.log('\n--- parseNumberDecision: the "115" bug ---');
 check('decision "1" + "July 15th" prose → 1 (was 115)', parseNumberDecision('1\n\nThe calendar event on July 15th is missing a time.') === 1);
 check('bare "2" → 2', parseNumberDecision('2') === 2);

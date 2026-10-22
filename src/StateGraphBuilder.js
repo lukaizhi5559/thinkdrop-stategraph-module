@@ -361,8 +361,14 @@ class StateGraphBuilder {
         return 'gatherPlanContext';
       },
 
-      // gatherPlanContext: now auth-aware — proceeds to planSkills
-      gatherPlanContext: () => {
+      // gatherPlanContext: now auth-aware — proceeds to planSkills, unless the
+      // node decided the task needs a real plan (needs_plan escalation) — then
+      // exit cleanly so handoffRunner reports the escalation to comms-graph.
+      gatherPlanContext: (state) => {
+        if (state._needsPlan) {
+          logger.info(`[StateGraph:Router] gatherPlanContext: _needsPlan (${state._needsPlan.reason}) — exiting to logConversation for planning escalation`);
+          return 'logConversation';
+        }
         logger.debug('[StateGraph:Router] gatherPlanContext → planSkills');
         return 'planSkills';
       },
@@ -384,6 +390,12 @@ class StateGraphBuilder {
 
       // executeCommand cycle: next step, recover on failure, or done
       executeCommand: (state) => {
+        // task.agent pushed a mid-run plan revision — exit cleanly so
+        // handoffRunner reports 'plan_update' and comms revises + resumes.
+        if (state._planUpdate) {
+          logger.info(`[StateGraph:Router] executeCommand: _planUpdate → logConversation (${String(state._planUpdate.reason || '').slice(0, 60)})`);
+          return 'logConversation';
+        }
         // Thin recovery handler already ran inline in executeCommand and set recoveryAction.
         // Route based on recoveryAction (set by the inline thin recovery handler).
         // Guard: a stale 'auto_patch' (e.g. DET_RETRY's flag surviving a

@@ -387,3 +387,33 @@ describe('page_scan deictic vs resolved target', () => {
     assert.equal(hit.skillPlan[0].args.action, 'scan_page');
   });
 });
+
+describe('browser_history — bare in-page nav', () => {
+  it('"go back for me on this page" → browser.act back on ext:default', async () => {
+    const hit = await _hit('go back for me on this page', _json(24, { op: 'back' }));
+    assert.equal(hit.template, 'browser_history');
+    assert.equal(hit.skillPlan[0].skill, 'browser.act');
+    assert.equal(hit.skillPlan[0].args.action, 'back');
+    assert.equal(hit.skillPlan[0].args.sessionId, 'ext:default');
+  });
+
+  it('"reload this page" → reload', async () => {
+    const hit = await _hit('reload this page', _json(24, { op: 'reload' }));
+    assert.equal(hit.skillPlan[0].args.action, 'reload');
+  });
+
+  it('"go back to the previous page" is history, not tab-select', async () => {
+    const hit = await _hit('go back to the previous page', _json(24, { op: 'back' }));
+    assert.equal(hit.template, 'browser_history');
+  });
+
+  it('rejects named destinations ("go back to my ebay tab")', async () => {
+    const hit = await _hit('go back to my ebay tab', _json(24, { op: 'back' }));
+    assert.equal(hit, null);
+  });
+
+  it('rejects op mismatches (LLM said forward, prompt said back)', async () => {
+    const hit = await _hit('go back for me on this page', _json(24, { op: 'forward' }));
+    assert.equal(hit, null);
+  });
+});

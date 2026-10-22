@@ -357,7 +357,7 @@ async function _thinPostFailureHandler(state) {
   if (failedStep._sandboxDeniedPath && Array.isArray(skillPlan) && skillPlan[skillCursor]
       && !patchHistory.some(p => p.action === 'SANDBOX_REROUTE')) {
     const _deniedStr = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
-    const _isContentWrite = />\s*[^\s|&]|\btee\b|\bdd\b[^|;]*\bof=|\b(?:sed|perl|ed)\s+[^|;]*\s-i\b/.test(_deniedStr);
+    const _isContentWrite = />\s*[^\s|&]|\btee\b|\bdd\b[^|;]*\bof=|\b(?:sed|perl|ed)\s+[^|;]*\s-i\b|\bopen\s*\([^)]*['"][wa]r?\+?['"]|\.write_text\s*\(|\bfs\.(?:write|append)File\w*\s*\(/.test(_deniedStr);
     if (_isContentWrite) {
       const _denied = failedStep._sandboxDeniedPath;
       const _editGoal = failedStep.description || failedStep.args?.goal
@@ -381,6 +381,56 @@ async function _thinPostFailureHandler(state) {
         commandExecuted: false,
       };
     }
+  }
+
+  // ── edit.agent unexpressible → escalate to app.agent in-app editing ───────
+  // edit.agent is the sanctioned file editor — when it reports the goal can't
+  // be expressed as structured ops (reason:'unexpressible', delegateTo:
+  // 'app.agent'), the right next step is the file's owning app, NOT a cli.agent
+  // PTY loop: the universal TERMINAL_DEBUG catch-all below used to rewrite
+  // these to `cli.agent run`, which burned ~12 PTY turns probing a format it
+  // can't edit and then died (observed: RTF edit → pty exitCode=-1 → EBADF).
+  // Once per cursor — a second failure falls through to LLM recovery/ask_user.
+  if (failedStep.skill === 'edit.agent'
+      && !failedStep.askUser
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && (failedStep.delegateTo === 'app.agent'
+          || failedStep.reason === 'unexpressible'
+          || /could not be expressed|no applicable|not present|not found in/i.test(String(failedStep.error || '')))
+      && !(patchHistory || []).some(p => p.action === 'EDIT_ESCALATE' && p.cursor === skillCursor)) {
+    const _editPath = failedStep.args?.filePath || failedStep.filePath || null;
+    const _ext = (_editPath && path.extname(_editPath).toLowerCase()) || '';
+    // Default macOS editor per file family — all are built-in apps.
+    const _appForExt = { '.rtf': 'TextEdit', '.rtfd': 'TextEdit', '.txt': 'TextEdit', '.md': 'TextEdit',
+      '.doc': 'TextEdit', '.docx': 'TextEdit', '.odt': 'TextEdit',
+      '.xlsx': 'Numbers', '.xls': 'Numbers', '.csv': 'Numbers',
+      '.pptx': 'Keynote', '.ppt': 'Keynote', '.pages': 'Pages', '.numbers': 'Numbers', '.key': 'Keynote',
+      '.pdf': 'Preview', '.png': 'Preview', '.jpg': 'Preview', '.jpeg': 'Preview' }[_ext] || 'TextEdit';
+    const _editGoal = failedStep.args?.goal || failedStep.description || `Edit ${path.basename(_editPath || 'the file')}`;
+    const patchedPlan = [...skillPlan];
+    patchedPlan[skillCursor] = {
+      ...patchedPlan[skillCursor],
+      skill: 'app.agent',
+      args: {
+        action: 'run_app_flow',
+        appName: _appForExt,
+        goal: `${_editGoal} — the structured file editor could not express this edit; perform it inside ${_appForExt} on the open document${_editPath ? ` (${_editPath})` : ''}.`,
+        resolvedFilePath: _editPath,
+        timeoutMs: 300000,
+      },
+      description: failedStep.description || `Edit ${path.basename(_editPath || 'file')} in ${_appForExt}`,
+    };
+    logger.info(`[ExecuteCommand:ThinRecovery] EDIT_ESCALATE: edit.agent step ${skillCursor + 1} unexpressible (${String(failedStep.error || '').slice(0, 80)}) — escalating to app.agent/${_appForExt}`);
+    return {
+      ...state,
+      recoveryAction: 'auto_patch',
+      skillPlan: patchedPlan,
+      recoveryNote: `The file editor couldn't apply that change directly — opening ${_appForExt} to make the edit in the app.`,
+      patchHistory: [...patchHistory, { action: 'EDIT_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      stepRetryCount: stepRetryCount + 1,
+      failedStep: null,
+      commandExecuted: false,
+    };
   }
 
   // ── shell.run goal/install failure → escalate to cli.agent's loop ─────────
@@ -525,6 +575,39 @@ async function _thinPostFailureHandler(state) {
   const _earlySkipped = _tryAutoSkipIndependentStep(state);
   if (_earlySkipped) return _earlySkipped;
 
+  // ── Bound-page restore — BEFORE browser-lane escalation ───────────────────
+  // dom.act reports 'bound-page-missing' when the session has no live page to
+  // act on (dead binding, blank tab). Escalating to turn.loop can't help — it
+  // would hit the same empty page. The deterministic repair is to re-open the
+  // page the step expects (prior nav or the known context URL) on the SAME
+  // session, then let the original step retry. Once per cursor.
+  if (failedStep
+      && /bound-page-missing|no live (bound )?tab/i.test(String(failedStep.error || failedStep.detail || ''))
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => p.action === 'PAGE_RESTORE' && p.cursor === skillCursor)) {
+    const _restoreSession = failedStep.args?.sessionId || failedStep.sessionId || state.activeBrowserSessionId || null;
+    const _restoreUrl = failedStep.args?.priorNavUrl || state.lastBrowserNav?.url || state.activeBrowserUrl || null;
+    if (_restoreSession && _restoreUrl) {
+      const patchedPlan = [...skillPlan];
+      patchedPlan.splice(skillCursor, 0, {
+        skill: 'browser.act',
+        args: { action: 'navigate', sessionId: _restoreSession, url: _restoreUrl, activate: true },
+        description: `Re-open the page this step needs (${_restoreUrl})`,
+      });
+      logger.info(`[ExecuteCommand:ThinRecovery] PAGE_RESTORE: ${failedStep.skill} step ${skillCursor + 1} found no bound page — navigating ${_restoreSession} back to ${_restoreUrl}`);
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        recoveryNote: 'The page this step needs is gone — re-opening it, then retrying.',
+        patchHistory: [...patchHistory, { action: 'PAGE_RESTORE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        stepRetryCount: stepRetryCount + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
+  }
+
   // ── Browser-lane escalation — BEFORE the universal terminal fallback ──────
   // A failed dom.act/url.first/atomic step belongs to the page, not the shell:
   // handing it to cli.agent (the TERMINAL_DEBUG catch-all) burns an agent loop
@@ -587,6 +670,7 @@ async function _thinPostFailureHandler(state) {
   // they fall through to LLM recovery/ask_user instead.
   if (failedStep
       && failedStep.skill !== 'cli.agent' && failedStep.skill !== 'terminal.agent'
+      && failedStep.skill !== 'edit.agent'
       && !_WEB_FETCH_SKILLS.has(failedStep.skill)
       && !failedStep.askUser && !failedStep.delegateTo
       && !_browserish(failedStep.skill)
@@ -653,8 +737,10 @@ async function _thinPostFailureHandler(state) {
     // registries/help, and tries a different approach — instead of presenting
     // the user a bare Retry that replays the dead command.
     // Web-fetch skills stay out — a terminal loop can't fix a dead crawl;
-    // they fall to the ask_user path below.
+    // they fall to the ask_user path below. edit.agent too — a PTY session
+    // cannot out-edit the structured editor (see EDIT_ESCALATE above).
     if (!_WEB_FETCH_SKILLS.has(failedStep.skill)
+        && failedStep.skill !== 'edit.agent'
         && !(patchHistory || []).some(p => p.action === 'TERMINAL_DEBUG' && p.cursor === skillCursor)) {
       const _dbgArgv = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
       const _dbgTask = `${failedStep.args?.goal || failedStep.description || _dbgArgv || 'complete the failed step'} — previous attempts failed: ${(_dbgArgv ? `\`${_dbgArgv}\` → ` : '')}${String(failedStep.error || 'failed').slice(0, 300)}`;
@@ -2769,14 +2855,21 @@ module.exports = async function executeCommand(state) {
 
     if (typeof gatherCredentialCallback === 'function') {
       try {
-        // Emit gather_credential to show the masked input card in the Queue tab UI
-        // (same pattern as planSkills.js credential gate)
+        // Context-var / non-sensitive asks ({{_ctx_*}} tokens, plain questions)
+        // are NOT credentials — render a QuestionCard, never write the answer
+        // into the keychain (the old card literally stored e.g. the target URL
+        // under `credential:_ctx_url_0`). Only sensitive:true asks are secrets.
+        const _purpose = sensitive ? 'credential' : 'context';
+        // Emit gather_credential to show the input card in the Queue tab UI
+        // (same pattern as planSkills.js credential gate); `purpose` picks the
+        // renderer (QuestionCard for context, keychain card for credentials).
         if (progressCallback) progressCallback({
           type: 'gather_credential',
           credentialKey: varName || inputHint,
           question: askQuestion,
           hint: inputHint,
           sensitive,
+          purpose: _purpose,
           optional: args.optional || false,
           stepIndex: skillCursor,
           totalSteps: skillPlan.length,
@@ -2787,11 +2880,12 @@ module.exports = async function executeCommand(state) {
           question: askQuestion,
           hint: inputHint,
           sensitive,
+          noStore: !sensitive,
         });
         gathered = result?.value ?? null;
         if (gathered !== null) {
-          logger.info(`[Node:ExecuteCommand] ask_user: credential received for "${varName}"`);
-          if (progressCallback) progressCallback({ type: 'gather_credential_stored', credentialKey: varName || inputHint });
+          logger.info(`[Node:ExecuteCommand] ask_user: ${_purpose} received for "${varName}"`);
+          if (progressCallback && result?.stored) progressCallback({ type: 'gather_credential_stored', credentialKey: varName || inputHint });
         }
       } catch (cbErr) {
         logger.warn(`[Node:ExecuteCommand] ask_user: gatherCredentialCallback threw: ${cbErr.message}`);
@@ -5699,8 +5793,8 @@ Please try again or search with different terms.`;
         // step's agentId names the same service ("amazon.agent" ↔ "amazon_agent")
         // or the step is service-less. A leftover amazon session must not stamp
         // onto a later gmail step's args.
-        const _sessSvc = String(state.activeBrowserSessionId).replace(/_agent$/, '').toLowerCase();
-        const _stepSvc = String(out.agentId || '').replace(/\.agent$/, '').toLowerCase();
+        const _sessSvc = String(state.activeBrowserSessionId).replace(/^(?:(?:ext|open|bg):)+/i, '').replace(/\.agent$|_agent$/i, '').toLowerCase();
+        const _stepSvc = String(out.agentId || '').replace(/^(?:(?:ext|open|bg):)+/i, '').replace(/\.agent$|_agent$/i, '').toLowerCase();
         if (!_stepSvc || _stepSvc === _sessSvc) {
           inheritedSession = state.activeBrowserSessionId;
         } else {
@@ -7395,6 +7489,32 @@ Please try again or search with different terms.`;
       };
     }
 
+    // ── Plan-update loop-back ────────────────────────────────────────────────
+    // task.agent discovered the plan itself is wrong/incomplete mid-run — a
+    // missing task, a bad assumption, a newly-found input. Not a step failure:
+    // terminate the run with _planUpdate so handoffRunner reports 'plan_update'
+    // to comms-graph, which revises the plan .md and auto-resumes it.
+    if (raw.needsPlanUpdate === true) {
+      logger.info(`[Node:ExecuteCommand] task.agent plan_update: "${String(raw.reason || '').slice(0, 120)}"`);
+      return {
+        ...state,
+        skillResults: [...skillResults, {
+          step: skillCursor + 1, skill, args: resolvedArgs, description,
+          ok: false, needsPlanUpdate: true,
+          error: raw.reason || 'plan revision requested',
+        }],
+        failedStep: null,
+        _planUpdate: {
+          reason: String(raw.reason || '').slice(0, 2000),
+          proposal: String(raw.proposal || '').slice(0, 4000),
+          addRefs: Array.isArray(raw.addRefs) ? raw.addRefs : [],
+          planId: raw.planId || state._planId || null,
+          taskNum: state._planTaskNum || null,
+        },
+        commandExecuted: false,
+      };
+    }
+
     // ── Agent ask_user short-circuit ──────────────────────────────────────────
     // When cli.agent (or browser.agent api_key path) returns askUser: true, surface
     // the agent's exact question directly without routing through recoverSkill.
@@ -8560,17 +8680,30 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         ? (stepResult.sessionId || resolvedArgs.sessionId
            || (args.agentId ? `${args.agentId.replace('.agent', '')}_agent` : null)
            || state.activeBrowserSessionId)
+      : (skill === 'app.agent' && stepResult.ok && raw.via === 'ext' && raw.sessionId)
+        // Ext-lane app navs bind a real session — record it or follow-ups
+        // can't find the tab they just opened.
+        ? raw.sessionId
         : state.activeBrowserSessionId || null;
+    // app.agent presentation navs (navigate_url/nav_task via:'ext') leave the
+    // user's real tab on a real URL — activeBrowserUrl must track it or
+    // follow-up referents read a stale page (observed: the ext-lane amazon
+    // nav left activeBrowserUrl on google.com).
+    const _appNavUrl = skill === 'app.agent' && stepResult.ok && raw.via === 'ext'
+      && (resolvedArgs.action === 'navigate_url' || resolvedArgs.action === 'nav_task')
+      ? (raw.url || null) : null;
     const activeBrowserUrl = (skill === 'browser.act' || _ATOMIC_SESSION_SKILLS.has(skill)) && stepResult.ok && raw.url
       ? raw.url
-      : state.activeBrowserUrl || null;
+      : _appNavUrl || state.activeBrowserUrl || null;
     // Persist the last url.first navigation (url + deepLinkType) so replans and
     // ask_user resumes — which start with an empty skillResults — still know a
     // compose/creation deep link opened a dialog (→ expectOverlay) and where
     // the browser session was left. Overwritten by each new url.first nav.
     const lastBrowserNav = (skill === 'url.first.agent' && stepResult.ok && (raw.url || stepResult.url))
       ? { url: raw.url || stepResult.url, deepLinkType: raw.deepLinkType || stepResult.deepLinkType || 'none', sessionId: activeBrowserSessionId, at: Date.now() }
-      : state.lastBrowserNav || null;
+      : _appNavUrl
+        ? { url: _appNavUrl, deepLinkType: raw.deepLinkType || 'none', sessionId: raw.sessionId || activeBrowserSessionId, at: Date.now() }
+        : state.lastBrowserNav || null;
     // Cumulative filled-field ledger: survives replans/ask_user resumes (empty
     // skillResults) the same way lastBrowserNav does. Each entry carries the
     // page url it was filled on so cross-page seeding can't poison a new page.

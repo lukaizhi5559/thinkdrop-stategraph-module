@@ -514,10 +514,24 @@ const TEMPLATES = [
     // scan the loaded page. One template covers the whole lane-A corpus shape.
     n: 19, id: 'page_nav_scan', lowRisk: true,
     describe: `open a page in the browser and read/answer from it — args: {site, query} for named sites (site: one of ${Object.keys(SITE_SEARCH_URLS).join('|')}, query: verbatim search text) OR {url} only when the message contains a literal URL/host. "goto amazon and search X" → {site:"amazon",query:"X"}, never {url:"amazon"}.`,
-    validate: (a, m) => {
+    validate: (a, m, t, tc) => {
       const raw = String(a.url || '').trim();
-      const siteKey = SITE_SEARCH_URLS[raw.toLowerCase()] ? raw.toLowerCase()
+      let siteKey = SITE_SEARCH_URLS[raw.toLowerCase()] ? raw.toLowerCase()
         : (SITE_SEARCH_URLS[String(a.site || '').trim().toLowerCase()] ? String(a.site).trim().toLowerCase() : null);
+      // Follow-up coercion — a continuation naming no site inherits the
+      // task's resolved service, not the classifier's google default
+      // (observed: "I want to see baby clothes on my screen" picked
+      // site:'google' and a page_nav_scan step hijacked ext:amazon_agent's
+      // amazon tab to google.com). Only fires when the picked site is a bare
+      // whitelist name (never a literal URL) and the message doesn't name
+      // that site explicitly — the user's stated site always wins.
+      const _svc = String(tc?.targetService || '').trim().toLowerCase();
+      const _rawIsLiteralUrl = raw && !SITE_SEARCH_URLS[raw.toLowerCase()];
+      if (!_rawIsLiteralUrl && tc?.isFollowUp === true && _svc && SITE_SEARCH_URLS[_svc]
+          && siteKey && siteKey !== _svc
+          && !new RegExp(`\\b${siteKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(m)) {
+        a.site = _svc; a.url = ''; siteKey = _svc;
+      }
       if (siteKey) {
         // Query: model-supplied (must be verbatim) or deterministically
         // extracted (message-derived by construction — can't invent content).
@@ -628,6 +642,39 @@ const TEMPLATES = [
     describe: 'close the current browser tab or app tab ("close this tab", "close the tab", "close current tab") — args: {}. NOT for closing/quitting a whole window or app ("close chrome", "quit slack" → app_control).',
     validate: (a, m) => /\bclose\s+(?:this\s+|the\s+|current\s+|that\s+)?(?:browser\s+)?tabs?\b/i.test(String(m || '')) ? null : 'no close-tab phrase',
     build: () => [{ skill: 'app.agent', args: { action: 'execute_shortcut', appName: 'browser', shortcutOverride: 'Cmd+W' }, description: 'Close the current tab' }],
+  },
+  {
+    // Bare history nav is a single deterministic action on the tab the user
+    // is looking at — never a plan ("go back for me on this page" once
+    // planned into tab-select and minted a fresh Amazon tab). Named
+    // destinations ("go back to my ebay tab") are tab-select, not this.
+    n: 24, id: 'browser_history', lowRisk: true,
+    describe: 'navigate the current page\'s history or reload it ("go back", "go back on this page", "go back to the previous page", "go forward", "reload this page", "refresh") — args: {op: "back"|"forward"|"reload"}. NOT for named destinations ("go back to my ebay tab") or any read/search goal.',
+    validate: (a, m) => {
+      const op = String(a.op || '').toLowerCase();
+      if (!/^(back|forward|reload)$/.test(op)) return 'bad op';
+      const msg = String(m || '');
+      const mv = msg.match(/\b(go\s+back|navigate\s+back|go\s+forward|reload|refresh)(?:\s+(?:for\s+me\s+)?(?:a|one)\s+page)?(?:\s+to\s+([^.\n]{0,60}))?/i);
+      if (!mv) return 'no history phrase';
+      const dest = String(mv[2] || '');
+      if (dest && !/^\s*(?:the\s+|a\s+|one\s+)?(?:previous|last|prior|same|this|that|current|original)?\s*(?:page|tab|site|one)?\s*$/i.test(dest)) return 'named destination';
+      const stripped = msg.replace(mv[0], '');
+      if (/\b(click|type|fill|search|read|get|find|create|send|open|select|buy|add|scroll|press|check|tell|watch|play)\b/i.test(stripped)) return 'extra action verb';
+      if (op === 'back' && /forward|reload|refresh/i.test(mv[1])) return 'op mismatch';
+      if (op === 'forward' && !/forward/i.test(mv[1])) return 'op mismatch';
+      if (op === 'reload' && !/reload|refresh/i.test(mv[1])) return 'op mismatch';
+      return null;
+    },
+    build: (a) => {
+      const op = String(a.op || 'back').toLowerCase();
+      const desc = op === 'back' ? 'Navigate back in history (current tab)'
+        : op === 'forward' ? 'Navigate forward in history (current tab)'
+        : 'Reload the current tab';
+      // ext:default resolves the active tab (bound-session-first lives in the
+      // extension); engine sessions goBack on their own page. The extension
+      // refuses to mint a tab for these actions.
+      return [{ skill: 'browser.act', args: { action: op, sessionId: 'ext:default', timeoutMs: 10000 }, description: desc }];
+    },
   },
 ];
 

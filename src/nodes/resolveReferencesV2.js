@@ -15,9 +15,9 @@
  */
 
 const { classifyTask, deriveResolution } = require('../utils/classifyTask');
-const { forceClassifyLocalPlan, looksLikeLocalOp } = require('../utils/localPlanTemplates');
+const { forceClassifyLocalPlan, looksLikeLocalOp, SERVICE_ALIASES } = require('../utils/localPlanTemplates');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE, PAGE_ITEM_REF_RE, NAV_VERB_START_RE, NAMED_APP_RE } = require('../utils/textPatterns.cjs');
+const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE, PAGE_ITEM_REF_RE, NAV_VERB_START_RE, NAMED_APP_RE, LEAD_AWAY_VERB_RE } = require('../utils/textPatterns.cjs');
 
 /**
  * Binary web-access confirmation — runs only when classifyTask returns
@@ -738,6 +738,133 @@ module.exports = async function resolveReferencesV2(state) {
   }
   logger.debug(`[Node:ResolveReferencesV2] taskClassification: ${JSON.stringify(_taskClassification)}`);
 
+  // ── On-screen referent inference (implicit "the page in front of me") ────
+  // Prompts that act on the visible page rarely say "this page" — "write a
+  // reply to Sharmila but don't submit" while the LinkedIn thread is bound.
+  // A named service whose host matches a bound/live page — or a page-action
+  // verb + artifact noun with a live page in front — IS the on-screen
+  // referent. Departure is a three-layer veto: a named destination the live
+  // page isn't (structural), a lead-away verb (lexical), the classifier's
+  // newDestination flag (semantic).
+  const _onScreenRef = (() => {
+    if (state._planTask || state._planFile || !_taskClassification || typeof _taskClassification !== 'object') return null;
+    const _msg = String(message || '');
+    const _PAGE_VERB_RE = /\b(fill|complete|click|type|enter|select|choose|tick|press|scroll|submit|sign|apply|paste|write|answer|reply|compose|post|comment|send|message|dm|check|read|view|open|close|delete|remove|add|book|buy|order|follow|like|share|upload|attach|accept|decline|invite|rsvp|join|confirm|verify|mark|archive|star|mute|play|pause|refresh|reload|download|sort|filter|draft)\b/i;
+    const _PASSIVE_SI = new Set(['screen_intelligence', 'web_search', 'question', 'general_knowledge', 'memory_retrieve', 'query']);
+    const _si = String(_taskClassification.suggestedIntent || '');
+    const _browserish = _taskClassification.webAccessMode === 'interactive'
+      || _taskClassification.requiresDOM === true
+      || _taskClassification.taskType === 'browser'
+      || _taskClassification.taskType === 'messaging'
+      || _si === 'command_automate'
+      || (Array.isArray(_taskClassification.interactiveActions) && _taskClassification.interactiveActions.length > 0)
+      || (_PASSIVE_SI.has(_si) && _PAGE_VERB_RE.test(_msg));
+    if (!_browserish) return null;
+
+    // Live page candidates — bound extension tabs + the frontmost browser URL.
+    const _live = [
+      ...(_extSessions || []).map(s => ({ url: s.url, title: s.title || null, sessionId: s.sessionId, bound: true, lastSeen: s.lastSeen || 0 })),
+      ...(_priorScreenContext?.url ? [{ url: _priorScreenContext.url, title: _priorScreenContext.windowTitle || null, sessionId: null, bound: false, lastSeen: 0 }] : []),
+    ].filter(c => c.url && /^https?:/i.test(c.url));
+    if (!_live.length) return null;
+
+    // Host → service matching: registry frontmatter first, substring fallback.
+    let _serviceForUrl = null;
+    try { _serviceForUrl = require('../../../shared/service-map.cjs').serviceForUrl; } catch (_) {}
+    const _hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } };
+    const _normSvc = (s) => String(s || '').toLowerCase().replace(/\.agent$|_agent$/i, '').replace(/[\s_-]+/g, '');
+    const _svcMatch = (pageUrl, svc) => {
+      const name = _normSvc(svc);
+      if (!name || name.length < 3) return false;
+      try {
+        const hit = _serviceForUrl && _serviceForUrl(pageUrl);
+        const hs = _normSvc(String(hit?.service || hit?.agentId || ''));
+        if (hs && (hs === name || hs.startsWith(name) || name.startsWith(hs))) return true;
+      } catch (_) {}
+      const host = _hostOf(pageUrl);
+      return !!host && (host === `${name}.com` || host.endsWith(`.${name}.com`) || host.includes(`${name}.`) || host.split('.')[0] === name);
+    };
+
+    // Named services — classifier + alias/token scan over message & resolved
+    // target (the prior-turn annotation "LinkedIn message to Sharmila" carries it).
+    const _named = new Set();
+    const _pushSvc = (s) => { s = String(s || '').toLowerCase().replace(/\.agent$|_agent$/i, '').replace(/\s+/g, '_'); if (s) _named.add(s); };
+    _pushSvc(_taskClassification.targetService);
+    const _scanText = `${_msg} ${_taskClassification.followUpTarget || ''}`;
+    for (const [canon, aliases] of Object.entries(SERVICE_ALIASES || {})) {
+      for (const al of [canon, ...(aliases || [])]) {
+        if (new RegExp(`\\b${String(al).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(_scanText)) { _named.add(canon); break; }
+      }
+    }
+    const _NAMED_SVC_TOKENS = /\b(linkedin|gmail|youtube|amazon|twitter|reddit|github|notion|slack|spotify|netflix|whatsapp|telegram|discord|facebook|instagram|tiktok|perplexity|chatgpt|claude|outlook|ebay|etsy|walmart|pinterest|twitch|substack|medium|paypal|stripe|wikipedia|figma|canva|dropbox|trello|asana|linear|jira|confluence|vercel|netlify|zoom|grok)\b/ig;
+    for (const m of _scanText.matchAll(_NAMED_SVC_TOKENS)) _pushSvc(m[1]);
+    // A literal host in the message is itself a named destination.
+    const _msgHost = ((_msg.match(/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|edu|gov|us)\b/i) || [])[0] || '').toLowerCase().replace(/^www\./, '');
+    if (_msgHost) {
+      const _mh = _live.find(c => { const h = _hostOf(c.url); return h === _msgHost || h.endsWith('.' + _msgHost) || _msgHost.endsWith('.' + h); });
+      if (_mh) return { sessionId: _extConnected ? (_mh.bound ? _mh.sessionId : 'ext:default') : null, url: _mh.url, title: _mh.title, service: null, via: 'url-on-screen', boundSession: !!_mh.bound };
+      // Host named that the live page ISN'T → destination elsewhere; skip binding.
+      return null;
+    }
+
+    // Veto layer 2 — lexical: an unqualified departure verb, or a qualified
+    // verb (open/go to/switch to/load) whose object is a destination (a
+    // service, a domain, a site-noun) rather than an on-page element.
+    const _UNQUALIFIED_DEPART_RE = /\b(?:navigate(?:\s+to)?|head\s+(?:to|over\s+to|back\s+to)|take\s+me\s+to|visit|pull\s+up|bring\s+up|launch|fire\s+up|log\s*in(?:to)?|sign\s*in(?:to)?|browse|leave\s+(?:this|the|these|for|to))\b/i;
+    const _isDestObject = (after) => {
+      let obj = String(after || '').toLowerCase().replace(/^(?:up|over\s+to|back\s+to|down|in|into|on)\s+/, '').replace(/^(?:my|the|a|an|that|this)\s+/, '').slice(0, 60);
+      if (!obj) return false;
+      if (/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co)\b/.test(obj)) return true;
+      if (/^(?:site|website|webpage|app|url|home\s?page)\b/.test(obj)) return true;
+      const norm = obj.replace(/[\s_-]+/g, '');
+      _NAMED_SVC_TOKENS.lastIndex = 0;
+      if (_NAMED_SVC_TOKENS.test(obj)) return true;
+      return [..._named].some(s => { const n = s.replace(/_/g, ''); return n.length >= 3 && (norm.includes(n) || n.includes(norm)); });
+    };
+    const _QUALIFIED_VERB_RE = /\b(open|go\s+to|goto|switch\s+to|load)\s+/gi;
+    let _leadAway = _UNQUALIFIED_DEPART_RE.test(_msg);
+    for (const m of _msg.matchAll(_QUALIFIED_VERB_RE)) {
+      if (_isDestObject(_msg.slice(m.index + m[0].length))) { _leadAway = true; break; }
+    }
+    // Veto layer 3 — semantic: the classifier saw a destination change.
+    if (_leadAway || _taskClassification.newDestination === true) return null;
+
+    // Tier 1 — service-on-screen: a named service IS the live page.
+    const _namedMatch = [..._named]
+      .map(s => ({ svc: s, cand: _live.find(c => _svcMatch(c.url, s)) }))
+      .filter(x => x.cand)
+      .sort((a, b) => (b.cand.lastSeen || 0) - (a.cand.lastSeen || 0));
+    if (_namedMatch.length) {
+      const { svc, cand } = _namedMatch[0];
+      const sid = _extConnected ? (cand.bound ? cand.sessionId : `ext:open:${svc}_agent`) : null;
+      return { sessionId: sid, url: cand.url, title: cand.title, service: svc, via: 'service-on-screen', boundSession: !!cand.bound };
+    }
+    // Tier 2 — page-artifact: nothing named, but the action needs a page and
+    // one is live in front. Only reachable when no service/host was named
+    // (a named destination the live page isn't → destination elsewhere).
+    if (!_named.size && _extConnected && _PAGE_VERB_RE.test(_msg)
+        && /\b(message|reply|replies|comment|comments|thread|threads|conversation|conversations|dm|post|posts|field|fields|form|forms|box|boxes|button|buttons|link|links|input|inputs|draft|drafts|compose|composer|listing|listings|item|items|cart|checkout|search\s*box|text\s*area)\b/i.test(_msg)) {
+      const _front = _live.find(c => !c.bound) || _live.slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
+      if (_front) return { sessionId: 'ext:default', url: _front.url, title: _front.title, service: null, via: 'page-artifact', boundSession: false };
+    }
+    return null;
+  })();
+  if (_onScreenRef) {
+    if (_onScreenRef.sessionId && !state._extSessionHint) {
+      state._extSessionHint = { sessionId: _onScreenRef.sessionId, url: _onScreenRef.url, title: _onScreenRef.title || null };
+    }
+    if (_taskClassification.activeDocRef !== 'file') {
+      _taskClassification.activeDocRef = 'url';
+      _taskClassification.activeDocTarget = _onScreenRef.url;
+    }
+    if (_onScreenRef.sessionId && !state.activeBrowserSessionId) {
+      state.activeBrowserSessionId = _onScreenRef.sessionId;
+      state.activeBrowserUrl = _onScreenRef.url || null;
+    }
+    state._onScreenRef = _onScreenRef;
+    logger.info(`[Node:ResolveReferencesV2] on-screen referent bound (${_onScreenRef.via}${_onScreenRef.service ? ':' + _onScreenRef.service : ''}): ${_onScreenRef.sessionId || 'no-session'} → ${String(_onScreenRef.url || '').slice(0, 80)}`);
+  }
+
   // ── Live-page intent demotion ────────────────────────────────────────────────
   // A page/item-referring prompt with a resolved extension session is a page
   // read or action on the BOUND TAB — not an OS screen capture and not a web
@@ -746,7 +873,7 @@ module.exports = async function resolveReferencesV2(state) {
   // passive intent to command_automate so routeIntent reaches planSkills,
   // which emits browser.act getPageText / dom.act on the ext session
   // (_extSessionHint carries the bound sessionId to the planner).
-  if (state._extSessionHint && _livePageRef && _taskClassification && typeof _taskClassification === 'object') {
+  if (state._extSessionHint && (_livePageRef || state._onScreenRef) && _taskClassification && typeof _taskClassification === 'object') {
     const _PASSIVE_INTENTS = new Set(['screen_intelligence', 'web_search', 'question', 'general_knowledge', 'memory_retrieve']);
     const _si = _taskClassification.suggestedIntent;
     // Page-interaction verbs aimed at the live tab — "fill out this form",

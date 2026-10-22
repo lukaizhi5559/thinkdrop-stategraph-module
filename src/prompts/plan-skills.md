@@ -30,7 +30,7 @@ provider.discovery|args:{action:string,provider?:string,modelId?:string,taskType
 
 If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `browser.act` or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.
 
-- Single browser agent available → atomic browser skills with agentId `'<agentId>'`: `url.first.agent` to navigate, then `dom.act` / `turn.loop.agent` steps for the on-page work
+- Single browser agent available → atomic browser skills with agentId `'<agentId>'`: `url.first.agent` to navigate, then `dom.act` / `turn.loop.agent` steps for the on-page work — UNLESS a bound tab/active session already shows that service (the visible page is the default referent; on-page work skips `url.first.agent`). `url.first.agent` is only for NEW destinations — a different site/service than the live page, or explicit "go to / leave / switch to" language.
 - Single CLI/API agent available → `cli.agent { action: 'run', agentId: '<agentId>', task: '...' }`
 - Single app agent available → `app.agent { action: 'run_agent', appName: '<service>', task: '...' }`
 

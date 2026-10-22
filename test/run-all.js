@@ -54,6 +54,7 @@ const TESTS = [
   'screen-output.test.js',
   'phase3-longrunning.test.js',
   'tab-flow-tab-map.test.js',
+  'live-page-binding.test.js',
   'lint-synthesize-ordering.test.js',
   'reviewExecution.test.js',
   'reliability.test.js',

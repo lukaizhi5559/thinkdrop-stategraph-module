@@ -37,7 +37,7 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 
 If a service has only one authenticated route available (e.g., only `notion.agent` is authed and ready), you MUST use that route directly. You MUST NOT output `browser.act` or any alternative route for that service. The route choice has already been resolved by preflight; your job is to execute, not to offer alternatives.
 
-- Single browser agent available → `url.first.agent { agentId: '<agentId>', task: 'navigate to <service>' }` then `dom.act { agentId, task: '<action>' }` steps
+- Single browser agent available → `url.first.agent { agentId: '<agentId>', task: 'navigate to <service>' }` then `dom.act { agentId, task: '<action>' }` steps — UNLESS a bound tab/active session already shows that service (see the ACTIVE BROWSER SESSION / EXTENSION-BOUND TABS notes: the visible page is the default referent; on-page work skips `url.first.agent` entirely). `url.first.agent` is only for NEW destinations — a different site/service than the live page, or explicit "go to / leave / switch to" language in the prompt.
 - Single CLI/API agent available → `cli.agent { action: 'run', agentId: '<agentId>', task: '...' }`
 - Single app agent available → `app.agent { action: 'run_agent', appName: '<service>', task: '...' }`
 
@@ -70,6 +70,7 @@ If no authenticated route exists for a service, preflight will surface auth requ
 - Public web research / read a public page → `web.agent` (`research_domain` | `site_search` | `search_and_navigate`) or `web.crawl { url }` → `synthesize` (NEVER browser.agent)
 - Named-site listing/search ("search <site> for X") → `web.agent { action: 'site_search', domain, query }` → `web.crawl { url: '{{bestUrl}}', extractItems: true }` → `synthesize`
 - Local file ops / scripts / git → `shell.run`
+- Multi-entity local sweeps ("find all repos under <path> and <verb> each", "commit the changes in every project") → keep the loop INSIDE one step's goal — `task.agent`/`shell.run { goal }` iterates entities with judgment. NEVER emit literal `git commit -m "<placeholder>"` commands: commit messages are composed at run time from each repo's `git log --oneline -5` convention + `git diff`; a placeholder message silently drops the user's actual requirement.
 - Desktop app interaction (shortcuts, scroll, OCR) → `app.agent`
 - App's built-in AI assistant → `app.agent { action: 'run_agent', appName, filePath, prompt }`
 - Watch/transcribe a specific video → `video.agent` (always wins over ytdlp.agent)

@@ -229,9 +229,18 @@ function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
 // The lint guarantees a url.first.agent is never a dead end: mutation residue
 // gets a dom.act step spliced in, and pure display-nav is downgraded to the
 // app.agent real-browser lane when nothing reuses the session.
-function _lintAtomicPlan(p, logger, extConnectedOrSessions, prompt) {
+function _lintAtomicPlan(p, logger, extConnectedOrSessions, prompt, state) {
   const extSessions = Array.isArray(extConnectedOrSessions) ? extConnectedOrSessions : null;
-  return lintAtomicBrowserPlan(p, logger, { extConnected: extSessions ? extSessions.length > 0 : !!extConnectedOrSessions, extSessions, prompt }).plan;
+  return lintAtomicBrowserPlan(p, logger, {
+    extConnected: extSessions ? extSessions.length > 0 : !!extConnectedOrSessions,
+    extSessions,
+    prompt,
+    boundSession: state?.activeBrowserSessionId || null,
+    boundUrl: state?.activeBrowserUrl || null,
+    priorScreenUrl: state?._priorScreenContext?.url || null,
+    taskClassification: state?._taskClassification || null,
+    onScreenRef: state?._onScreenRef || null,
+  }).plan;
 }
 
 // interactiveActions vocabulary values that imply on-page mutation — used to
@@ -512,6 +521,14 @@ function _sanitizeSkillPlan(skillPlan, state) {
   // invention. Fix by substitution when a context URL exists, else ask_user.
   const _msgForUrls = state?.resolvedMessage || state?.message || '';
   const _allowedUrls = new Set((_msgForUrls.match(/https?:\/\/[^\s"'<>)\]]+/gi) || []));
+  // Bare hosts/domains typed verbatim ("go to amazon.com") are user intent —
+  // sanction the scheme-prefixed forms the planner legitimately builds
+  // (url_open emits `open https://<host>`). Without this, the invented-URL
+  // guard blocks the user's own site whenever no browser URL is in context.
+  for (const m of (_msgForUrls.match(/\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*\.[a-z]{2,}(?:\/[^\s"'<>)\]]*)?/gi) || [])) {
+    _allowedUrls.add(`https://${m.toLowerCase()}`);
+    _allowedUrls.add(`http://${m.toLowerCase()}`);
+  }
   if (_urlHint) _allowedUrls.add(_urlHint);
   // Preflight-resolved deep links are injected into steps before sanitize runs
   // (see _injectPreflightDeepLinks) — trusted, not invented.
@@ -535,27 +552,38 @@ function _sanitizeSkillPlan(skillPlan, state) {
       }
     }
     if (!bad.length) return;
-    // Nav-step URLs are destinations, not data — different repair than
+    // URLs that are destinations the user named — different repair than
     // substitute/ask_user. Deterministic search-template hosts (google.com/
     // search?q=…, youtube.com/results?…, etc.) are sanctioned planner output —
     // keep them. When the user literally named the site (e.g. "goto cathay
-    // pacific" → cathaypacific.com), only the deep path was invented — strip to
-    // the origin so the step lands on the real homepage instead of a 404.
-    if (_isNavStep(step)) {
+    // pacific" → cathaypacific.com, "go to amazon.com"), only the deep path
+    // was invented — strip to the origin so the step lands on the real
+    // homepage instead of a 404. Applies to every step shape that carries a
+    // URL — nav steps (app.agent/browser.act navigate), `shell.run` (`open`,
+    // `curl`), and `web.crawl` — not just _isNavStep.
+    {
       const _hostLabel = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').split('.')[0].toLowerCase(); } catch (_) { return ''; } };
       const _msgNorm = _msgForUrls.toLowerCase().replace(/[^a-z0-9]/g, '');
       const _named = [];
       bad = bad.filter((u) => {
         const label = _hostLabel(u);
-        if (label && SITE_SEARCH_URLS[label]) return false; // sanctioned search template
+        // Sanctioned search templates are nav destinations only — a google.com
+        // literal inside shell.run argv is still an invention.
+        if (_isNavStep(step) && label && SITE_SEARCH_URLS[label]) return false;
         const norm = label.replace(/[^a-z0-9]/g, '');
         if (norm.length >= 3 && _msgNorm.includes(norm)) { _named.push(u); return false; }
         return true;
       });
       for (const u of _named) {
         const origin = (() => { try { const p = new URL(u); return `${p.protocol}//${p.host}`; } catch (_) { return u; } })();
-        if (typeof step.args.url === 'string') step.args.url = step.args.url.split(u).join(origin);
-        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: nav step URL had invented path — stripped ${u} → ${origin}`);
+        if (step.skill === 'shell.run') {
+          if (typeof step.args?.cmd === 'string') step.args.cmd = step.args.cmd.split(u).join(origin);
+          if (typeof step.args?.goal === 'string') step.args.goal = step.args.goal.split(u).join(origin);
+          if (Array.isArray(step.args?.argv)) step.args.argv = step.args.argv.map(a => typeof a === 'string' ? a.split(u).join(origin) : a);
+        } else if (typeof step.args?.url === 'string') {
+          step.args.url = step.args.url.split(u).join(origin);
+        }
+        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: user-named host — stripped invented path ${u} → ${origin}`);
       }
       if (!bad.length) return;
     }
@@ -1481,7 +1509,7 @@ function _buildSystemPrompt(userMessage, state) {
   const _isPublicWebMode = ['download', 'public_read'].includes(_tc?.webAccessMode);
   if (!_isPublicWebMode) {
     if (state.activeBrowserSessionId) {
-      result += `\n\n## ACTIVE BROWSER SESSION\n\nA browser automation session is already open${state.activeBrowserUrl ? ` at ${state.activeBrowserUrl}` : ''} (sessionId: "${state.activeBrowserSessionId}"). If this request continues work on that page — scrolling, clicking, typing, adding another item, reading it — emit ONLY \`dom.act\`/\`turn.loop.agent\` steps with args.sessionId "${state.activeBrowserSessionId}". Do NOT emit \`url.first.agent\` unless the user asks for a NEW site/destination — re-navigating disrupts the live session.\n\nFor page READS on that open page, emit \`browser.act\` { action: "getPageText", sessionId: "${state.activeBrowserSessionId}" } — NOT \`app.agent\` scan_page (OS-level clipboard copy cannot read the automation window).`;
+      result += `\n\n## ACTIVE BROWSER SESSION\n\nA browser automation session is already open${state.activeBrowserUrl ? ` at ${state.activeBrowserUrl}` : ''} (sessionId: "${state.activeBrowserSessionId}"). THE VISIBLE PAGE IS THE DEFAULT REFERENT — if this request acts on that page or its service (fill, write, click, reply, read, scroll — even when the prompt does not say "this page"), emit ONLY \`dom.act\`/\`form.fill.agent\`/\`turn.loop.agent\` steps with args.sessionId "${state.activeBrowserSessionId}". \`url.first.agent\` is for NEW destinations only — re-navigating moves the user's real tab away from the page they mean. Emit it only when the prompt asks to go somewhere else (a different site/service, or explicit "go to/leave/switch to" language).\n\nFor page READS on that open page, emit \`browser.act\` { action: "getPageText", sessionId: "${state.activeBrowserSessionId}" } — NOT \`app.agent\` scan_page (OS-level clipboard copy cannot read the automation window).`;
     }
   result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects/scrolls on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit", "scroll to the bottom"). Optional \`agentHint\` (emit when intent is clear): \`"tab.map.agent"\` (multi-field forms and dialogs/overlays — fill several fields then submit; navigate-and-extract goals like "search the page for X" or "read the results"), \`"just.type.agent"\` (single-field typing into a focused or autofocused input — AI chat prompts, search bars — and single keypress/scroll goals like "press Enter" or "scroll to the bottom"), \`"meta.find.agent"\` (locate/click specific named text on the page — e.g. a named conversation in a chat-history list), \`"shortcut.keys.agent"\` (open/create/compose/new actions on apps with documented hotkeys — Google Calendar 'c' opens the event dialog, Gmail 'c' composes, '/' searches. Prefer this over scanning the landing page when a create/open intent maps to a known app hotkey; it self-falls-back to tab.map when the site has no shortcut table. NOT for content searches or multi-field entry), \`"turn.loop.agent"\` (dense commerce grids, multi-step action sequences, or typing when no input is focused), \`"gesture.agent"\` (drag/slider/swipe), \`"arrow.grid.agent"\` (spreadsheet cells). Emit \`args.pageCategory\` on dom.act steps when the site class is known (\`ai_chat\`, \`email_compose\`, \`shopping\`, \`spreadsheet\`, \`search_engine\`, \`social_feed\`, \`messaging\` — else omit).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction. Emit ONLY for silent-failure mutations whose outcome isn't provable from step results (add-to-cart, checkout, purchase, submit, send, post, delete). Do NOT emit for create/navigate/read flows — url.first's landed URL and dom.act's result already prove the outcome; synthesize confirms from step results.\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nCRITICAL: EVERY browser step for a service must carry that service's \`args.agentId\` — including \`turn.loop.agent\` verify steps. Steps without agentId run in a parallel lane with no browser session.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "agentId": "amazon.agent", "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n\nCalendar/compose example — shortcut opens the dialog, tab.map fills it:\n[\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "google_calendar.agent", "task": "Open Google Calendar" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "google_calendar.agent", "agentHint": "shortcut.keys.agent", "task": "Open the create-event dialog" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "google_calendar.agent", "agentHint": "tab.map.agent", "task": "Fill title 'Dentist appointment', date next Tuesday, time 2pm, then Save" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the dentist appointment was created" } }\n]\n`;
 
@@ -1683,7 +1711,7 @@ function _buildSystemPrompt(userMessage, state) {
   if (_extSessions.length) {
     const _tabLines = _extSessions.slice(0, 5).map(s =>
       `- ${s.sessionId} → ${s.url}${s.title ? ` — "${String(s.title).slice(0, 80)}"` : ''}`).join('\n');
-    result += `\n\n## EXTENSION-BOUND TABS (real Chrome — live session)\n\n${_tabLines}\n\nThe ThinkDrop extension is CONNECTED. For navigation/reads/UI work on these pages or named web services, use the browser lane (url.first.agent + dom.act/turn.loop.agent) — it drives the user's real signed-in Chrome via the extension. Do NOT emit app.agent navigate_url/scan_page for work these tabs can serve — app.agent is the fallback only when the extension is disconnected. Multi-field forms (compose, checkout, signup) → emit turn.loop.agent, not a single dom.act step. NEVER use shell.run/curl to fetch or read a bound page — drive the extension session instead. Follow-ups that refer to items on a bound page ("the first three items", "click on it", "open the second result") are page actions on that session, not web searches and not shell commands. Questions about the bound page's content ("what is the shipping for this item", "price of the second listing", "subject of the latest email") MUST be answered from that tab — emit browser.act getPageText (sessionId from the list above) or dom.act on the matching agent; never substitute a Google/research URL — the answer is already on the page.`;
+    result += `\n\n## EXTENSION-BOUND TABS (real Chrome — live session)\n\n${_tabLines}\n\nThe ThinkDrop extension is CONNECTED. For navigation/reads/UI work on these pages or named web services, use the browser lane (dom.act/turn.loop.agent, with url.first.agent only for NEW destinations) — it drives the user's real signed-in Chrome via the extension. When the request acts on a bound page or its service — fill/write/reply/click/read on the visible site — the bound session IS the referent: emit dom.act/form.fill.agent/turn.loop.agent on that sessionId and NO url.first.agent (re-navigating moves the user's real tab to a start URL and abandons the page they mean). Reserve url.first.agent for a different site/service or explicit "go to/leave/switch to" language. Do NOT emit app.agent navigate_url/scan_page for work these tabs can serve — app.agent is the fallback only when the extension is disconnected. Multi-field forms (compose, checkout, signup) → emit turn.loop.agent, not a single dom.act step. NEVER use shell.run/curl to fetch or read a bound page — drive the extension session instead. Follow-ups that refer to items on a bound page ("the first three items", "click on it", "open the second result") are page actions on that session, not web searches and not shell commands. Questions about the bound page's content ("what is the shipping for this item", "price of the second listing", "subject of the latest email") MUST be answered from that tab — emit browser.act getPageText (sessionId from the list above) or dom.act on the matching agent; never substitute a Google/research URL — the answer is already on the page.`;
   }
 
   // ── Install scoring policy ──────────────────────────────────────────────
@@ -1996,7 +2024,7 @@ async function planSkillsV2(state) {
         // since resolved in live context.
         const _resolvedPlan = _resolveCtxUrlTokens(decoded, state._priorScreenContext?.url, state._gatheredVars, logger);
         // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
-        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger), logger, state._extSessions, userMessage);
+        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger), logger, state._extSessions, userMessage, state);
         const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
@@ -2011,7 +2039,7 @@ async function planSkillsV2(state) {
   if (state._loginResumeSkillPlan && !recoveryContext) {
     logger.info('[Node:PlanSkillsV2] Login resume: returning existing plan as-is');
     const _resumePlan = Array.isArray(state._loginResumeSkillPlan)
-      ? _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger), logger, state._extSessions, userMessage)
+      ? _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger), logger, state._extSessions, userMessage, state)
       : state._loginResumeSkillPlan;
     return { ...state, skillPlan: _resumePlan, skillCursor: 0, planError: null };
   }
@@ -2280,7 +2308,7 @@ async function planSkillsV2(state) {
     try {
       const cached = await findSimilarCompletePlan(userMessage, PLANS_DIR, logger);
       if (cached && Array.isArray(cached.plan) && cached.plan.length > 0) {
-        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(cached.plan, userMessage), logger), logger, state._extSessions, userMessage);
+        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(cached.plan, userMessage), logger), logger, state._extSessions, userMessage, state);
         if (_guardedPlan.length > cached.plan.length) {
           logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}" — appended synthesize step`);
         } else {
@@ -2330,6 +2358,12 @@ async function planSkillsV2(state) {
               task: _taskText,
               ...(Array.isArray(state._priorResults) && state._priorResults.length
                 ? { priorResults: state._priorResults } : {}),
+              // Context refs — plan file (type:'plan') first so the loop can
+              // re-read its Task-N section + sibling statuses on resume.
+              ...(Array.isArray(state._refs) && state._refs.length
+                ? { refs: state._refs } : {}),
+              ...(state._planTaskNum ? { taskNum: state._planTaskNum } : {}),
+              ...(state._planId ? { planId: state._planId } : {}),
             },
             description: 'Execute task via task.agent loop',
           }];
@@ -3733,7 +3767,7 @@ The user's request does NOT match any installed skill.
   //   · app.agent scan_page reads of the session's page → browser.act
   //     getPageText (OS-level Cmd+A/C can't focus the automation window).
   if (effectiveSessionId && Array.isArray(skillPlan)) {
-    const _sessService = String(effectiveSessionId).replace(/_agent$/, '').toLowerCase();
+    const _sessService = String(effectiveSessionId).replace(/^(?:(?:ext|open|bg):)+/i, '').replace(/\.agent$|_agent$/i, '').toLowerCase();
     const _hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } };
     const _sessHost = _hostOf(state.activeBrowserUrl);
     // New-destination signal: explicit URL to a different host, or the message
@@ -3974,7 +4008,16 @@ The user's request does NOT match any installed skill.
   // ── Atomic browser agents: rewrite browser.agent run steps → atomic skills ──
   if (Array.isArray(skillPlan)) {
     skillPlan = _rewriteBrowserStepsToAtomicAgents(skillPlan, logger);
-    const _atomicLint = lintAtomicBrowserPlan(skillPlan, logger, { extConnected: (state._extSessions || []).length > 0, extSessions: state._extSessions });
+    const _atomicLint = lintAtomicBrowserPlan(skillPlan, logger, {
+      extConnected: (state._extSessions || []).length > 0,
+      extSessions: state._extSessions,
+      prompt: userMessage,
+      boundSession: state.activeBrowserSessionId || null,
+      boundUrl: state.activeBrowserUrl || null,
+      priorScreenUrl: state._priorScreenContext?.url || null,
+      taskClassification: state._taskClassification || null,
+      onScreenRef: state._onScreenRef || null,
+    });
     skillPlan = _atomicLint.plan;
     // A mutation-classified task whose plan is STILL nav-only end-to-end was
     // not repairable by the lint (every destination was described as pure

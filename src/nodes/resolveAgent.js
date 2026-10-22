@@ -794,6 +794,20 @@ module.exports = async function resolveAgent(state) {
     return { ...state, resolveAgentResult: { agents: [], reasoning: 'deterministic plan', question: null } };
   }
 
+  // ── Local git-ops guard — never select a hosted-service agent ─────────────
+  // "commit all the changes" / "commit each repo" is LOCAL filesystem work;
+  // github.agent is the hosted-service lane and burns a navigation round
+  // resolving github.com before failing the task anyway (observed: a commit
+  // prompt burned 12s deep-linking an unrelated github repo). Only an
+  // explicit hosting-service mention may route to a service agent.
+  const _preMsg = (resolvedMessage || message || '');
+  if (/\b(commit|stage|stash|merge|rebase|checkout|diff|push|pull)\w*\b/i.test(_preMsg)
+      && /\b(repo|repositories|changes?|work|files?|branch|git)\b/i.test(_preMsg)
+      && !/\b(github|gitlab|bitbucket)\b/i.test(_preMsg)) {
+    logger.info('[Node:ResolveAgent] Local git-ops task — suppressing service-agent selection');
+    return { ...state, resolveAgentResult: { agents: [], reasoning: 'local git ops — no service agent', question: null, _message: _preMsg.trim() } };
+  }
+
   // ── Skip: already resolved for this exact message ──────────────────────────
   const userMessage = (resolvedMessage || message || '').trim();
   const cachedResult = state.resolveAgentResult;

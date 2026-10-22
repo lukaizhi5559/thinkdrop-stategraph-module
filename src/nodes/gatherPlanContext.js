@@ -29,6 +29,7 @@
 const { markAgentAuthed } = require('./preflightAgents');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { isLocalMultiEntityTask, extractContextRefs } = require('../utils/contextRefs.cjs');
 
 const MAX_ROUNDS = 3;
 const MAX_AUTH_ROUNDS = 10; // auth sign-ins don't count against Q&A budget
@@ -451,6 +452,27 @@ module.exports = async function gatherPlanContext(state) {
     }
     logger.info(`[Node:GatherPlanContext] File already resolved by preflight: ${_fileRes.path} (${_fileRes.status}) — bypassing`);
     return { ...state, resolvedMessage: _enrichedMsg, planGatheringComplete: true, planGatheringSkipped: true };
+  }
+
+  // ── needs_plan escalation — local multi-entity sweep ───────────────────────
+  // An anchored iterate-and-act task ("scan this folder and commit each repo")
+  // needs a plan, not clarifying questions — grilling asks "which repos?" when
+  // enumeration IS the task. Escalate to comms-graph planning with the prompt
+  // + extracted refs as the seed; the router exits to logConversation and
+  // handoffRunner reports status 'needs_plan'.
+  const _gatherMsg = resolvedMessage || message || '';
+  if (isLocalMultiEntityTask(_gatherMsg) || isLocalMultiEntityTask(state.originalMessage || '')) {
+    logger.info(`[Node:GatherPlanContext] Local multi-entity shape → needs_plan escalation (no grill): "${_gatherMsg.slice(0, 80)}"`);
+    return {
+      ...state,
+      planGatheringComplete: true,
+      _needsPlan: {
+        reason: 'local_multi_entity',
+        seedPrompt: _gatherMsg,
+        refs: extractContextRefs(_gatherMsg),
+        gatheredContext: (state.planGatheringAnswers || []),
+      },
+    };
   }
 
   // ── Grill-Me Phase B: batched questioning path ──────────────────────────────
@@ -1063,6 +1085,26 @@ async function _runGrillLoop(state, logger) {
   while (round < GRILL_MAX_ROUNDS) {
     if (progressCallback) progressCallback({ type: 'gathering', message: 'Checking task details…' });
     logger.info(`[Node:GatherPlanContext:Grill] Round ${round + 1}/${GRILL_MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
+
+    // ── needs_plan escalation — grill is not converging on a plan-shaped task ──
+    // Past round 2 on an anchored iterate-and-act prompt, another question
+    // batch is noise: enumeration IS the task. Hand the gathered context back
+    // to comms-graph planning instead of asking again.
+    if (round >= 2 && isLocalMultiEntityTask(baseMsg)) {
+      logger.info(`[Node:GatherPlanContext:Grill] Round ${round + 1} on local multi-entity task — escalating to planning with ${answers.length} gathered answer(s)`);
+      return {
+        ...state,
+        planGatheringComplete: true,
+        planGatheringRound: round,
+        planGatheringAnswers: answers,
+        _needsPlan: {
+          reason: 'grill_round_overflow',
+          seedPrompt: `${baseMsg}${answers.length ? `\n[Already answered: ${answers.map(qa => `${qa.question}: ${qa.answer}`).join('; ')}]` : ''}`,
+          refs: extractContextRefs(baseMsg),
+          gatheredContext: answers,
+        },
+      };
+    }
 
     // ── Fast number-based decision before the expensive batch prompt ────────
     // Ask the light model "return ONLY a single number" (0=COMPLETE, 1=NEED_QUESTION,

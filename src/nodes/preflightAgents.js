@@ -616,6 +616,29 @@ module.exports = async function preflightAgents(state) {
   const recoveryContext = state.recoveryContext || null;
   const confirmInstallCallback = state.confirmInstallCallback || null;
 
+  // ── Pure in-page navigation — skip file-probe and deep-link resolution ─────
+  // "go back for me on this page" / "reload this page" operate on the tab the
+  // user is already looking at. There is no file to probe and no destination
+  // to deep-link — but the activeDocTarget injection ("Amazon.com product
+  // page") used to trip the file-candidate gate (extracted "Amazon.com" →
+  // resolved amazon_product_reviews.txt) and the deep-link loop web-searched a
+  // homepage URL that later minted a fresh tab. Detect pure in-page nav and
+  // skip both probes. Named-destination variants ("go back to my ebay tab")
+  // still aren't in-page actions, but they need no file/deep-link either —
+  // they read as tab-select and are left to the lint; only skip when the
+  // prompt has no destination at all.
+  const _isInPageNav = (() => {
+    const p = String(userMessage || '').split('\n')[0]; // literal prompt only — not injected context
+    if (!/\b(go\s+back|navigate\s+back|go\s+back\s+(?:a|one)\s+page|previous\s+page|go\s+forward|reload|refresh)\b/i.test(p)) return false;
+    // Any "to <something>" phrasing names a destination — not pure history.
+    if (/\b(go\s+back|return|switch|focus|bring\s+me\s+back|take\s+me|navigate|go)\s+to\b/i.test(p)) return false;
+    // An explicit URL/host is a real target — resolve it normally.
+    if (/https?:\/\/|\b[a-z0-9][\w-]*\.(?:com|org|net|io|dev|ai|app|co|gov|edu)\b/i.test(p)) return false;
+    // Other action verbs → the nav is a fragment of a larger goal, not pure.
+    const stripped = p.replace(/\b(go\s+back|navigate\s+back|go\s+forward|reload|refresh|previous\s+page|for\s+me|on\s+this\s+page|this\s+page|please)\b/gi, '');
+    return !/\b(click|type|fill|search|read|get|find|create|send|open|select|buy|add|scroll|press|check|tell|watch|play|log\s*in|sign\s*in|download|upload)\b/i.test(stripped);
+  })();
+
   // ── Auth bypass (one-run, user-chosen "proceed without") ──────────────────
   // Agent IDs the user explicitly chose to run unauthenticated. NOT persisted —
   // nothing is written to the auth cache or authed_at, so the next task that
@@ -678,7 +701,10 @@ module.exports = async function preflightAgents(state) {
   // The gate also fires on activeDocRef:'file'/activeDocTarget — misclassified
   // follow-ups like "update the file" (taskType:ambiguous) still refer to a
   // live local document and must resolve it before any agent planning.
-  if (_tc.taskType === 'app_automation' || _tc.taskType === 'local_file' || _tc.activeDocRef === 'file' || _tc.activeDocTarget) {
+  // Pure in-page nav ("go back on this page") never has a file to resolve —
+  // the injected activeDocTarget ("Amazon.com product page") is a URL context,
+  // not a document reference.
+  if (!_isInPageNav && (_tc.taskType === 'app_automation' || _tc.taskType === 'local_file' || _tc.activeDocRef === 'file' || _tc.activeDocTarget)) {
     let candidate = _extractFileCandidate(userMessage);
     // "the file" has no literal name to extract — fall back to the resolved
     // live-document target.
@@ -3010,7 +3036,9 @@ module.exports = async function preflightAgents(state) {
   // Deep-links resolve to a SINGLE page (e.g. one watch?v= URL) — wrong for
   // public_read listing/search tasks that need a SERP, and the resolution
   // chain itself burns web-search + crawl calls the task doesn't need.
-  for (const a of _isPublicWebTask ? [] : agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
+  // In-page nav ("go back on this page") has no destination at all — resolving
+  // one minted a fresh tab for a history request.
+  for (const a of (_isPublicWebTask || _isInPageNav) ? [] : agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
     const deepLink = await _resolveDeepLinkForAgent(a, userMessage);
     if (deepLink) {
       a.deepLinkUrl = deepLink.url || deepLink;

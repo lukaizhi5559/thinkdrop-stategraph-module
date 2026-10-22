@@ -45,7 +45,9 @@ When the task is **"fill out this/the form"** (on the current page OR a page a p
 
 - The fill step's `synthesize` should report which fields filled, which the form rejected (quote the validation message), and which still need values — the user supplies corrections on the next turn.
 
-**Live-session continuation:** when a `## ACTIVE BROWSER SESSION` note is present, that session's page is already open. Follow-up goals on it ("scroll down", "click that one", "add the next item to my cart", "what does this page say") are `dom.act`/`turn.loop.agent` (or `browser.act getPageText` for reads) — do NOT emit `url.first.agent` to go back to the same site.
+**Live-session continuation:** when a `## ACTIVE BROWSER SESSION` or `## EXTENSION-BOUND TABS` note is present, that session's page is already open. Follow-up goals on it ("scroll down", "click that one", "add the next item to my cart", "what does this page say") are `dom.act`/`form.fill.agent`/`turn.loop.agent` (or `browser.act getPageText` for reads) — do NOT emit `url.first.agent` to go back to the same site.
+
+**The visible page is the DEFAULT referent.** When a bound tab or active session exists and the prompt acts on that page or its service — "write a message", "fill the form", "reply to this thread" — the work lands on the live page EVEN WHEN the prompt never says "this page"/"on screen". Emit only on-page steps (`form.fill.agent`/`dom.act`/`turn.loop.agent`, `browser.act getPageText` for reads) with the bound sessionId. `url.first.agent` is for NEW destinations only — a different site/service than the live page, or explicit departure language ("go to X", "open Y", "leave", "take me to", "switch to"). Re-navigating a bound tab resolves the service's start URL and ABANDONS the page the user means (e.g., a linkedin url.first sends an open message thread to /feed). Never let a service name alone trigger navigation — "message on linkedin" while LinkedIn is bound means THE BOUND PAGE, not a fresh linkedin.com visit.
 
 ### Canonical examples
 

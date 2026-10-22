@@ -508,6 +508,76 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
   const steps = [...plan];
   const _hasResidue = (s) => hasMutationResidue(`${s?.args?.task || ''}\n${s?.description || ''}`);
 
+  // ── Bound-session referent context (on-screen page is the default) ───────
+  // When the prompt acts on the live page/service, a url.first for that same
+  // host moves the user's real tab to a start URL and abandons the page they
+  // mean (observed: "write a message to Sharmila" → linkedin.com/feed while
+  // her thread was bound). Rewrite same-host navs to a bound-tab select and
+  // stamp followers with the bound session.
+  const _hostOf = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); } catch { return ''; } };
+  const _stripSess = (sid) => String(sid || '').replace(/^(?:(?:ext|open|bg):)+/i, '').replace(/\.agent$|_agent$/i, '').toLowerCase();
+  let _serviceForUrl = null;
+  try { _serviceForUrl = require('../../../shared/service-map.cjs').serviceForUrl; } catch (_) {}
+  const _boundHost = _hostOf(ctx.boundUrl || ctx.onScreenRef?.url || ctx.priorScreenUrl || '');
+  const _boundHosts = new Set(
+    [_boundHost, ...(Array.isArray(ctx.extSessions) ? ctx.extSessions : []).map(s => _hostOf(s.url))]
+      .filter(Boolean));
+  const _boundSvc = _stripSess(ctx.boundSession || ctx.onScreenRef?.sessionId || '');
+  const _recentBoundSess = (ctx.extSessions || []).slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
+  const _boundSessionId = ctx.boundSession || ctx.onScreenRef?.sessionId || _recentBoundSess?.sessionId || null;
+  const _boundForSvc = (svc) => (ctx.extSessions || []).find(x =>
+    x.sessionId === `ext:${svc}_agent` || x.sessionId === `ext:open:${svc}_agent` ||
+    (svc && (x.url || '').toLowerCase().includes(svc)))?.sessionId || null;
+  const _svcOfHost = (host) => {
+    if (!host) return '';
+    try {
+      const hit = _serviceForUrl && _serviceForUrl(`https://${host}`);
+      const s = _stripSess(String(hit?.service || hit?.agentId || ''));
+      if (s) return s;
+    } catch (_) {}
+    return '';
+  };
+  const _stepSvcOf = (s) => _stripSess(String(s?.args?.agentId || s?.args?.sessionId || ''));
+  // Same-host: the url.first's service/url resolves to a bound/live page.
+  const _isBoundHostStep = (s) => {
+    const stepUrl = typeof s?.args?.url === 'string' ? s.args.url : '';
+    const stepHost = _hostOf(stepUrl);
+    if (stepHost) return _boundHosts.has(stepHost) || [..._boundHosts].some(h => h.endsWith('.' + stepHost) || stepHost.endsWith('.' + h));
+    const stepSvc = _stepSvcOf(s);
+    if (!stepSvc || stepSvc === 'browser' || stepSvc === 'default') return false;
+    if (_boundSvc && stepSvc === _boundSvc) return true;
+    return [..._boundHosts].some(h => _svcOfHost(h) === stepSvc || h.includes(stepSvc));
+  };
+  // Departure signal for the prompt — a url.first is legitimate when the user
+  // asked to leave. Mirrors resolveReferencesV2's lexical veto (kept
+  // conservative: any unqualified departure verb counts).
+  let _LEAD_AWAY_VERB_RE = null;
+  try { _LEAD_AWAY_VERB_RE = require('../../../shared/text-patterns.cjs').LEAD_AWAY_VERB_RE; } catch (_) {}
+  const _promptLeadsAway = (() => {
+    const p = String(ctx.prompt || '');
+    if (ctx.taskClassification?.newDestination === true) return true;
+    if (!p) return false;
+    if (_LEAD_AWAY_VERB_RE && _LEAD_AWAY_VERB_RE.test(p)) return true;
+    // 'open <svc-or-site>' is a departure even without the shared verb set.
+    const m = p.match(/\bopen\s+(?:up\s+)?(?:my\s+|the\s+|a\s+)?([a-z0-9][\w.-]{0,30})/i);
+    if (m && (/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co)\b/i.test(m[1]) || /^(?:site|website|app|url)\b/i.test(m[1]) || _boundHosts.size && ![..._boundHosts].some(h => h.includes(m[1].toLowerCase())))) return true;
+    return false;
+  })();
+  // Foreign-host detector — a nav step whose url leaves the bound/live host
+  // family is legitimate only when the prompt names that destination.
+  const _promptLc = String(ctx.prompt || '').toLowerCase();
+  const _nameRe = (s) => new RegExp(`\\b${String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+  const _promptNamesHost = (host, svc) => {
+    if (!_promptLc) return false;
+    const dom = String(host || '').replace(/^www\./, '').split('.')[0];
+    return (dom.length >= 3 && _nameRe(dom).test(_promptLc)) || (svc && _nameRe(svc).test(_promptLc));
+  };
+
+  // "don't submit" — a step whose only work is submitting/sending must go.
+  const _NO_SUBMIT_PROMPT = /\b(?:don'?t|do\s+not|never|without)\b[^.\n]{0,40}\b(?:submit|send|post)\b|\bno\s+(?:submit|send(?:ing)?|post(?:ing)?)\b/i;
+  const _SUBMIT_ACTION_RE = /\b(?:submit|send|post|press\s+(?:the\s+)?(?:send|submit)|click\s+(?:the\s+)?(?:send|submit)|hit\s+(?:the\s+)?(?:send|submit))\b/i;
+  const _NEG_IN_STEP_RE = /\b(?:don'?t|do\s+not|never|without|except|before|until|instead|draft)\b/i;
+
   // Extension connected → app.agent real-browser steps become session-bound
   // browser-lane steps: navigate_url opens through the extension (tab binds,
   // activates, and follow-ups can find it via /ext.sessions). app.agent's OS
@@ -527,13 +597,48 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
     // web-searched for an ebay URL → minted a blank tab). Detect the pure form
     // from the original prompt — no other action verbs — and rewrite the first
     // browser-lane step once.
+    // Bare history nav ("go back", "go back for me on this page", "go back to
+    // the previous page") is history.back() on the page the user is looking
+    // at — NOT a tab select. Routing it through tab-select minted a fresh
+    // Amazon tab when the named session had no live binding (resolveTab →
+    // createBoundTab → service-home nav). Returns 'back'|'forward'|'reload'
+    // or null when the prompt names a destination or isn't pure nav.
+    const _HISTORY_DEST_RE = /^\s*(?:the\s+|a\s+|one\s+)?(?:previous|last|prior|same|this|that|current|original)?\s*(?:page|tab|site|one)?\s*$/i;
+    const _promptHistoryNav = (() => {
+      const p = String(ctx.prompt || '');
+      const m = p.match(/\b(go\s+back|navigate\s+back|go\s+forward|reload|refresh)(?:\s+(?:for\s+me\s+)?(?:a|one)\s+page)?(?:\s+to\s+([^.\n]{0,60}))?/i);
+      if (!m) return null;
+      const dest = String(m[2] || '');
+      if (dest && !_HISTORY_DEST_RE.test(dest)) return null;
+      const stripped = p.replace(m[0], '');
+      if (/\b(click|type|fill|search|read|get|find|create|send|open|select|buy|add|scroll|press|check|tell|watch|play)\b/i.test(stripped)) return null;
+      if (/reload|refresh/i.test(m[1])) return 'reload';
+      if (/forward/i.test(m[1])) return 'forward';
+      return 'back';
+    })();
     const _promptGoBack = (() => {
+      if (_promptHistoryNav) return false; // bare history — not a named destination
       const p = String(ctx.prompt || '');
       if (!/\b(go\s+back|return|switch|focus|bring\s+me\s+back|take\s+me)\s+to\b.{0,40}\b(tab|page|site)\b/i.test(p)) return false;
       const stripped = p.replace(/\b(go\s+back|return|switch|focus|bring\s+me\s+back|take\s+me)\s+to\b.{0,40}\b(tab|page|site)\b/gi, '');
       return !/\b(click|type|fill|search|read|get|find|create|send|open|select|buy|add|scroll|press|check|tell)\b/i.test(stripped);
     })();
     let _goBackRewritten = false;
+
+    // Pure history nav collapses to a single browser.act on the bound/active
+    // tab. ext:default resolves the active tab; a live bound session resolves
+    // its tab. The extension never mints a tab for these actions.
+    if (_promptHistoryNav) {
+      const action = _promptHistoryNav;
+      const desc = action === 'back' ? 'Navigate back in history (current tab)'
+        : action === 'forward' ? 'Navigate forward in history (current tab)'
+        : 'Reload the current tab';
+      return {
+        plan: [{ skill: 'browser.act', args: { action, sessionId: _boundSessionId || 'ext:default', timeoutMs: 10000 }, description: desc }],
+        rewrites: [{ index: 0, kind: `history-nav→browser.act:${action}` }],
+        navOnlyLeftover: [],
+      };
+    }
 
     for (let i = 0; i < steps.length; i++) {
       const s = steps[i];
@@ -598,10 +703,103 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
     }
   }
 
+  // ── Pre-pass: no-submit drops, bound-host web vetoes, session stamps ─────
+  // These run before the url.first residue scan so a dropped submit step is
+  // correctly treated as "no action-capable follower".
+  const _ATOMIC_ACTION_SKILLS = new Set(['dom.act', 'form.fill.agent', 'turn.loop.agent', 'tab.map.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'gesture.agent', 'arrow.grid.agent', 'browser.act']);
+  const _dropNoSubmit = _NO_SUBMIT_PROMPT.test(String(ctx.prompt || ''));
+  for (let i = 0; i < steps.length; i++) {
+    const s = steps[i];
+    if (!s) continue;
+    // A planner-emitted step whose ONLY action is submit/send/post under a
+    // "don't submit" prompt → drop it (mixed steps like "type X and send" are
+    // kept — the skill-layer NO_SUBMIT_GUARD prevents the send at exec).
+    if (_dropNoSubmit && _ATOMIC_ACTION_SKILLS.has(s.skill)) {
+      const t = `${s.args?.task || ''} ${s.args?.goal || ''} ${s.description || ''}`;
+      const verbs = (t.toLowerCase().match(/\b(?:click|press|hit|tap|submit|send|post|type|write|fill|enter|select|choose|scroll|read|search|open|navigate|check|get|add|upload|attach|drag|compose|reply|draft)\b/g) || []);
+      const _pureSubmit = _SUBMIT_ACTION_RE.test(t) && !_NEG_IN_STEP_RE.test(t)
+        && verbs.length > 0 && verbs.every(v => ['submit', 'send', 'post', 'click', 'press', 'hit', 'tap'].includes(v));
+      if (_pureSubmit) {
+        steps.splice(i, 1);
+        rewrites.push({ index: i, kind: 'no-submit-prompt→drop-submit-step', agentId: _stepAgentKey(s) || null });
+        i--;
+        continue;
+      }
+    }
+    // Public-web steps pointed at a bound/on-screen host → read the bound tab
+    // instead (the answer lives on the user's real page, not a public fetch).
+    if ((s.skill === 'web.agent' || s.skill === 'web.crawl') && _boundHosts.size) {
+      const stepHost = _hostOf(s.args?.url || s.args?.target || '');
+      const _boundHit = stepHost && (_boundHosts.has(stepHost) || [..._boundHosts].some(h => h.endsWith('.' + stepHost) || stepHost.endsWith('.' + h)));
+      if (_boundHit && _boundSessionId) {
+        steps[i] = {
+          ...s,
+          skill: 'browser.act',
+          args: { action: 'getPageText', sessionId: _boundForSvc(_svcOfHost(stepHost)) || _boundSessionId, timeoutMs: 15000 },
+          description: (s.description || 'Read the bound tab') + ' (bound tab — same host)',
+        };
+        rewrites.push({ index: i, kind: 'web-step→bound-tab-read', agentId: _stepAgentKey(s) || null });
+        continue;
+      }
+    }
+    // Stamp the bound session onto atomic-lane steps missing it when the step
+    // serves the bound service (or carries no service) and nothing leads away.
+    if (_boundSessionId && !_promptLeadsAway && _ATOMIC_ACTION_SKILLS.has(s.skill) && s.args && !s.args.sessionId) {
+      const stepSvc = _stepSvcOf(s);
+      if (!stepSvc || stepSvc === 'browser' || stepSvc === _boundSvc || _boundForSvc(stepSvc)) {
+        steps[i] = { ...s, args: { ...s.args, sessionId: _boundForSvc(stepSvc) || _boundSessionId } };
+        rewrites.push({ index: i, kind: 'bound-session-stamp', agentId: stepSvc || null });
+      }
+    }
+  }
+
   for (let i = 0; i < steps.length; i++) {
     const uf = steps[i];
     if (uf?.skill !== 'url.first.agent') continue;
     const agentKey = _stepAgentKey(uf);
+
+    // Foreign-host nav under a bound session — a nav step whose url resolves
+    // outside the bound/live host family, for a different service than the
+    // step's own, that the prompt never named, is planner contamination (not
+    // intent). Observed: a follow-up "see baby clothes on my screen" emitted
+    // google.com/search with no agentId under a bound ext:amazon_agent —
+    // _isBoundHostStep bails on empty service so the foreign nav sailed
+    // through and hijacked the amazon tab to google. Collapse it to a bound
+    // tab-select: the live page is the referent. A prompt that names the
+    // destination ("go to google", "search bing") always keeps its nav.
+    if (_boundSessionId && typeof uf.args?.url === 'string' && uf.args.url && !/\{\{/.test(uf.args.url)) {
+      const _ufHost = _hostOf(uf.args.url);
+      const _ufBound = _ufHost && (_boundHosts.has(_ufHost) || [..._boundHosts].some(h => h.endsWith('.' + _ufHost) || _ufHost.endsWith('.' + h)));
+      const _ufUrlSvc = _svcOfHost(_ufHost);
+      const _ufStepSvc = _stepSvcOf(uf);
+      const _ufForeign = _ufBound === false && _ufHost
+        && !['browser', 'default'].includes(_ufStepSvc)
+        && (!_ufStepSvc || !_ufUrlSvc || _ufUrlSvc !== _ufStepSvc)
+        && !_promptNamesHost(_ufHost, _ufUrlSvc);
+      if (_ufForeign) {
+        steps[i] = {
+          ...uf,
+          skill: 'browser.act',
+          args: { action: 'tab-select', sessionId: _boundForSvc(_ufStepSvc) || _boundSessionId, timeoutMs: 10000 },
+          description: (uf.description || 'Focus the bound tab') + ` (bound tab — foreign url ${_ufHost} dropped)`,
+        };
+        rewrites.push({ index: i, kind: 'url.first foreign-host→bound-tab-select', agentId: agentKey || null });
+        continue;
+      }
+    }
+
+    // Same-host nav under no departure → select the bound tab instead of
+    // re-navigating the user's real page to a service start URL.
+    if (!_promptLeadsAway && _boundSessionId && _isBoundHostStep(uf)) {
+      steps[i] = {
+        ...uf,
+        skill: 'browser.act',
+        args: { action: 'tab-select', sessionId: _boundForSvc(_stepSvcOf(uf)) || _boundSessionId, timeoutMs: 10000 },
+        description: (uf.description || 'Focus the bound tab') + ' (bound tab — no navigation needed)',
+      };
+      rewrites.push({ index: i, kind: 'url.first→bound-tab-select', agentId: agentKey || null });
+      continue;
+    }
 
     // Scan the lane: same/absent agentId browser steps until the next
     // url.first.agent, a synthesize, or a non-browser step.
