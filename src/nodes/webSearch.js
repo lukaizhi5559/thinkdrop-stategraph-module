@@ -23,6 +23,7 @@ catch (_) {
     const imageUrl = r.imageUrl || (typeof r.thumbnail === 'string' ? r.thumbnail : r.thumbnail?.src) || undefined;
     if (!url && !imageUrl) return null;
     const isVideo = r.type === 'video' || r.type === 'video-result';
+    const isImage = r.type === 'image' || r.type === 'image-result';
     const cleanHost = host && host !== 'google.com' ? host : undefined;
     const rawTitle = r.title && r.title !== 'Image' && !/^[\w-]+(\.[\w-]+)+$/.test(r.title.trim())
       ? r.title : undefined;
@@ -32,7 +33,7 @@ catch (_) {
       thumbnail: (typeof r.thumbnail === 'string' ? r.thumbnail : r.thumbnail?.src) || undefined,
       snippet: r.snippet || r.description || undefined,
       hostname: cleanHost,
-      mediaType: isVideo ? 'video' : undefined,
+      mediaType: isVideo ? 'video' : (isImage ? 'image' : undefined),
       duration: isVideo ? (r.duration || undefined) : undefined,
       channel: isVideo ? (r.channel || undefined) : undefined,
     };
@@ -326,7 +327,7 @@ module.exports = async function webSearch(state) {
         ...(r.priceRange && { priceRange: r.priceRange }),
         // Include image URL for image search results so they can be displayed
         // imageUrl is the Brave thumbnail (reliable CDN), originalUrl is the source page
-        ...(imageUrl && { imageUrl, isImage: true }),
+        ...(imageUrl && { imageUrl, isImage: true, mediaType: 'image' }),
         ...(originalUrl && { originalUrl }),
         // Video metadata — surfaced as media cards by the answer node.
         ...(isVideoResult && {
