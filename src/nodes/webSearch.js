@@ -10,6 +10,34 @@
 const http = require('http');
 const https = require('https');
 const { SCRIPTURE_REF_RE } = require('../utils/textPatterns.cjs');
+// Shared card mapper — lives at repo-root shared/serp-item.cjs in the dev
+// layout, but the packaged copy (node_modules/@thinkdrop/stategraph) can't
+// reach it, so an equivalent inline mapper is the fallback.
+let _serpToItem;
+try { ({ toItem: _serpToItem } = require('../../../shared/serp-item.cjs')); }
+catch (_) {
+  const _h = (u) => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch (__) { return ''; } };
+  _serpToItem = (r) => {
+    const url = (r.url || r.link || '').startsWith('http') ? (r.url || r.link) : undefined;
+    const host = r.displayDomain || _h(r.url || r.link || '');
+    const imageUrl = r.imageUrl || (typeof r.thumbnail === 'string' ? r.thumbnail : r.thumbnail?.src) || undefined;
+    if (!url && !imageUrl) return null;
+    const isVideo = r.type === 'video' || r.type === 'video-result';
+    const cleanHost = host && host !== 'google.com' ? host : undefined;
+    const rawTitle = r.title && r.title !== 'Image' && !/^[\w-]+(\.[\w-]+)+$/.test(r.title.trim())
+      ? r.title : undefined;
+    return {
+      title: rawTitle || cleanHost || undefined,
+      url, imageUrl,
+      thumbnail: (typeof r.thumbnail === 'string' ? r.thumbnail : r.thumbnail?.src) || undefined,
+      snippet: r.snippet || r.description || undefined,
+      hostname: cleanHost,
+      mediaType: isVideo ? 'video' : undefined,
+      duration: isVideo ? (r.duration || undefined) : undefined,
+      channel: isVideo ? (r.channel || undefined) : undefined,
+    };
+  };
+}
 
 const WEB_SEARCH_PORT = parseInt(process.env.WEB_SEARCH_PORT || '3002', 10);
 const WS_API_KEY = process.env.MCP_WEB_SEARCH_API_KEY || process.env.MCP_WEBSEARCH_API_KEY || process.env.MCP_API_KEY || '';
@@ -227,19 +255,15 @@ module.exports = async function webSearch(state) {
       try {
         if (ev.type === 'engine' && ev.engine) {
           state.streamCallback('\x00SEARCHING\x00' + ev.engine);
+          // Upgrade the pending chip to the settled engine chip — the express
+          // lane already emits this; without it the renderer only learns the
+          // engine at done-time.
+          state.streamCallback('\x00ENGINE\x00' + ev.engine);
         } else if (ev.type === 'items') {
           if (Array.isArray(ev.items) && ev.items.length) {
-            const items = ev.items.map(r => ({
-              title: r.title || undefined,
-              url: (r.url || r.link || '').startsWith('http') ? (r.url || r.link) : undefined,
-              thumbnail: (typeof r.thumbnail === 'string' ? r.thumbnail : r.thumbnail?.src) || undefined,
-              imageUrl: r.imageUrl || undefined,
-              snippet: r.snippet || r.description || undefined,
-              hostname: r.displayDomain || _streamHost(r.url || r.link || '') || undefined,
-              mediaType: r.type === 'video' ? 'video' : undefined,
-              duration: r.duration || undefined,
-              channel: r.channel || undefined,
-            })).filter(i => i.url || i.imageUrl);
+            // Shared card mapper — same google.com-host guard + video fields
+            // as the express lane (shared/serp-item.cjs).
+            const items = ev.items.map(_serpToItem).filter(Boolean);
             if (items.length) state.streamCallback('\x00ITEMS\x00' + JSON.stringify(items));
           }
           const srcs = (Array.isArray(ev.sources) && ev.sources.length ? ev.sources
