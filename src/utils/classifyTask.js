@@ -542,8 +542,15 @@ async function _classifyViaDecision(askDecision, promptState, logger, userMessag
     { id: 'suggestedIntent', type: 'choice', options: _DC_INTENTS.map(([v, h]) => `${v} — ${h}`),
       question: 'Which single-step intent best serves this message?' },
   ];
-  const r = await askDecision(questions, { state: promptState });
-  const a = r?.answers;
+  // Chunk the batch — ~23 questions in one call overshot the old timeout and
+  // serialize model time; parallel chunks of ≤12 halve wall-clock on multi-
+  // core boxes and keep per-request latency under the (scaled) timeout.
+  const _CHUNK = 12;
+  const _chunks = [];
+  for (let i = 0; i < questions.length; i += _CHUNK) _chunks.push(questions.slice(i, i + _CHUNK));
+  const _rs = await Promise.all(_chunks.map(c => askDecision(c, { state: promptState })));
+  const r = _rs.find(Boolean) || null;
+  const a = _rs.reduce((acc, rr) => (rr?.answers ? Object.assign(acc, rr.answers) : acc), null);
   if (!a?.taskType) return null;
   const pick = (ans, table) => {
     const i = ans?.index;

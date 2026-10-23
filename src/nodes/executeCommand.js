@@ -602,6 +602,34 @@ async function _thinPostFailureHandler(state) {
       && !(patchHistory || []).some(p => p.action === 'PAGE_RESTORE' && p.cursor === skillCursor)) {
     const _restoreSession = failedStep.args?.sessionId || failedStep.sessionId || state.activeBrowserSessionId || null;
     const _restoreUrl = failedStep.args?.priorNavUrl || state.lastBrowserNav?.url || state.activeBrowserUrl || null;
+    if (_restoreSession && !_restoreUrl && /^(?:ext:)?(?:open:)?[a-z0-9_-]+_agent$/i.test(String(_restoreSession))) {
+      // No known URL, but the session names a service — a tab-select resolve
+      // re-adopts any live tab matching the session's host hints (the gmail
+      // tab the user still has open) and restores the binding; worst case it
+      // mints a service-home tab. Either beats handing the step to turn.loop
+      // on an engine session that spawns a fresh browser (observed: "click
+      // first email" → bound-page-missing → turn.loop → playwright engine
+      // window + full reload).
+      const patchedPlan = [...skillPlan];
+      const _extSess = String(_restoreSession).startsWith('ext:')
+        ? _restoreSession : `ext:${_restoreSession}`;
+      patchedPlan.splice(skillCursor, 0, {
+        skill: 'browser.act',
+        args: { action: 'tab-select', sessionId: _extSess, timeoutMs: 10000 },
+        description: `Re-bind the ${_restoreSession} tab (adopt the matching open page)`,
+      });
+      logger.info(`[ExecuteCommand:ThinRecovery] PAGE_REBIND: ${failedStep.skill} step ${skillCursor + 1} lost its bound page — re-adopting by session hints for ${_restoreSession}`);
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        recoveryNote: 'Re-binding the tab for this session, then retrying.',
+        patchHistory: [...patchHistory, { action: 'PAGE_REBIND', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        stepRetryCount: stepRetryCount + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
     if (_restoreSession && _restoreUrl) {
       const patchedPlan = [...skillPlan];
       patchedPlan.splice(skillCursor, 0, {

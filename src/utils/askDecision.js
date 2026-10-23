@@ -18,11 +18,20 @@ function makeAskDecision(mcpAdapter) {
   if (!mcpAdapter || process.env.DECISION_LOCAL === '0') return null;
   return async (questions, opts = {}) => {
     try {
+      // Timeout scales with batch size — a 23-question classifyTask batch
+      // can't fit in the old flat 2500ms on tev1:0.8b (~60-120ms/question).
+      // noCircuit: a slow local model is not a dead phi4 — the fail-open
+      // design already falls back; don't let it trip the shared breaker.
+      const _n = Array.isArray(questions) ? questions.length : 1;
       const r = await mcpAdapter.callService('phi4', 'decision.answer', {
         state: opts.state || '',
         questions,
         ...(opts.image ? { image: opts.image } : {}),
-      }, { timeoutMs: opts.timeoutMs || 2500 });
+      }, {
+        timeoutMs: opts.timeoutMs
+          || (process.env.DECISION_TIMEOUT_MS ? Number(process.env.DECISION_TIMEOUT_MS) : Math.min(1500 + 300 * _n, 12000)),
+        noCircuit: true,
+      });
       const data = r?.data || r;
       if (r?.status === 'error' || !data || typeof data.answers !== 'object') return null;
       return { answers: data.answers, model: data.model, elapsedMs: data.elapsedMs };

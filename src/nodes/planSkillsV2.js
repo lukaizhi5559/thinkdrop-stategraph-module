@@ -3719,6 +3719,21 @@ The user's request does NOT match any installed skill.
   }
 
   // ── Active browser session enforcement ────────────────────────────────────
+  // Nav-URL → owning service session. A plan that navigates to a different
+  // destination must be stamped with that destination's session — never the
+  // old bound session (observed: gmail plan under bound ext:chatgpt_agent got
+  // every browser.act step stamped chatgpt → lint rewrote the mail.google.com
+  // nav into a tab-select on the YouTube tab).
+  const _sessForHostUrl = (u) => {
+    try {
+      const host = new URL(u).hostname.replace(/^www\./, '').toLowerCase();
+      const bare = host.replace(/\.(ai|com|io|org|net|co|app|dev|me|us|uk)(\.[a-z]{2})?$/, '');
+      const agentId = _registeredAgentServiceMap[bare] || _registeredAgentServiceMap[host] || null;
+      if (!agentId) return null;
+      const svc = String(agentId).replace(/\.agent$/, '').replace(/\./g, '_');
+      return `ext:${svc}_agent`;
+    } catch (_) { return null; }
+  };
   const effectiveSessionId = state.activeBrowserSessionId || activeBrowserSessionId;
   if (effectiveSessionId && Array.isArray(skillPlan)) {
     const browserSteps = skillPlan.filter(s => s.skill === 'browser.act');
@@ -3750,8 +3765,12 @@ The user's request does NOT match any installed skill.
           const withoutNav = skillPlan.filter(s => !(s.skill === 'browser.act' && s.args?.action === 'navigate'));
           if (withoutNav.length > 0) { skillPlan = withoutNav; logger.debug(`[Node:PlanSkillsV2] Reused active session "${effectiveSessionId}" — stripped navigate (same domain)`); }
         } else {
-          skillPlan = skillPlan.map(s => s.skill !== 'browser.act' ? s : { ...s, args: { ...s.args, sessionId: effectiveSessionId } });
-          logger.debug(`[Node:PlanSkillsV2] Enforced active session "${effectiveSessionId}"`);
+          // Different domain — the plan's destination session owns the work,
+          // not the old bound session. Explicit step sessionIds are preserved.
+          const _destSess = navStep?.args?.url ? _sessForHostUrl(navStep.args.url) : null;
+          const _stampSess = _destSess || 'browser';
+          skillPlan = skillPlan.map(s => s.skill !== 'browser.act' || s.args?.sessionId ? s : { ...s, args: { ...s.args, sessionId: _stampSess } });
+          logger.debug(`[Node:PlanSkillsV2] New-destination plan — stamped "${_stampSess}" (bound "${effectiveSessionId}" not enforced)`);
         }
       }
     }
@@ -3799,9 +3818,22 @@ The user's request does NOT match any installed skill.
       });
     }
 
+    // Destination session for this plan — the url.first.agent's service or
+    // the nav URL's owning service. Atomic steps in a new-destination plan
+    // bind to THAT session, not the stale bound one.
+    const _destSessAtomic = (() => {
+      if (!_newDestination) return effectiveSessionId;
+      const ufAgent = skillPlan.find(s => s.skill === 'url.first.agent' && s.args?.agentId)?.args?.agentId;
+      if (ufAgent) {
+        const svc = String(ufAgent).replace(/\.agent$/, '').replace(/\./g, '_');
+        return `ext:${svc}_agent`;
+      }
+      const navUrl = skillPlan.find(s => s.skill === 'browser.act' && s.args?.action === 'navigate' && s.args?.url)?.args?.url;
+      return _sessForHostUrl(navUrl) || effectiveSessionId;
+    })();
     const _ATOMIC_SESS = new Set(['dom.act', 'turn.loop.agent', 'tab.map.agent', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'gesture.agent', 'arrow.grid.agent']);
     skillPlan = skillPlan.map(s => (_ATOMIC_SESS.has(s.skill) && s.args && !s.args.sessionId)
-      ? { ...s, args: { ...s.args, sessionId: effectiveSessionId } } : s);
+      ? { ...s, args: { ...s.args, sessionId: _destSessAtomic } } : s);
 
     // Page read on the session's page → in-process getPageText, not OS copy.
     const _liveHost = _hostOf(state._priorScreenContext?.url);
@@ -3842,6 +3874,7 @@ The user's request does NOT match any installed skill.
           if (new URL(state.activeBrowserUrl).hostname === new URL(navStep.args.url).hostname) derived = state.activeBrowserSessionId;
         } catch (_) {}
       }
+      if (!derived && navStep?.args?.url) derived = _sessForHostUrl(navStep.args.url);
       if (!derived) derived = 'browser';
       skillPlan = skillPlan.map(s => s.skill !== 'browser.act' || s.args?.sessionId ? s : { ...s, args: { ...s.args, sessionId: derived } });
       logger.info(`[Node:PlanSkillsV2] Stamped missing sessionIds with "${derived}"`);
@@ -3856,7 +3889,16 @@ The user's request does NOT match any installed skill.
       if (sessionIds.size === 1) {
         const [onlySession] = [...sessionIds];
         if (onlySession && onlySession !== 'browser') {
-          const isRegisteredAgent = !!_registeredAgentServiceMap[onlySession.toLowerCase()];
+          // Strip ext:/open: routing prefixes and agent suffixes before the
+          // registry lookup — 'ext:chatgpt_agent' IS registered as 'chatgpt';
+          // the prefixed lookup missed it and rewrote a real service session
+          // to 'browser', minting the generic ext:browser session that then
+          // stole service-tab ownership (bound-page-missing cascade).
+          const _sessKey = onlySession.toLowerCase()
+            .replace(/^(?:(?:ext|open|bg):)+/i, '')
+            .replace(/\.agent$|_agent$/i, '');
+          const isRegisteredAgent = !!_registeredAgentServiceMap[_sessKey]
+            || !!_registeredAgentServiceMap[onlySession.toLowerCase()];
           const BROWSER_PROFILES_DIR = path.join(os.homedir(), '.thinkdrop', 'browser-profiles');
           const profileDir = onlySession.endsWith('_agent') ? onlySession : `${onlySession}_agent`;
           const hasProfile = fs.existsSync(path.join(BROWSER_PROFILES_DIR, profileDir));

@@ -835,12 +835,30 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
       const _ufForeign = _ufBound === false && _ufHost
         && !['browser', 'default'].includes(_ufStepSvc)
         && (!_ufStepSvc || !_ufUrlSvc || _ufUrlSvc !== _ufStepSvc)
-        && !_promptNamesHost(_ufHost, _ufUrlSvc);
-      if (_ufForeign) {
+        && !_promptNamesHost(_ufHost, _ufUrlSvc)
+        // The STEP's own service is named by the prompt too — "check my
+        // gmail" names 'gmail' even when url-svc resolution or a stamped
+        // session made _ufUrlSvc≠_ufStepSvc (observed: mail.google.com nav
+        // rewritten to tab-select on ext:chatgpt_agent → YouTube).
+        && !_promptNamesHost(_ufHost, _ufStepSvc);
+      // Named-destination hard veto — a prompt the classifier marked as a new
+      // destination, or whose targetService differs from the bound session's
+      // service, must keep its nav step; a bound tab can never be the referent.
+      const _ufNamedDest = ctx.taskClassification?.newDestination === true
+        || (_ufStepSvc && ctx.taskClassification?.targetService
+            && ctx.taskClassification.targetService !== _boundSvc
+            && _promptNamesHost(_ufHost, ctx.taskClassification.targetService));
+      if (_ufForeign && !_ufNamedDest) {
         steps[i] = {
           ...uf,
           skill: 'browser.act',
-          args: { action: 'tab-select', sessionId: _boundForSvc(_ufStepSvc) || _boundSessionId, timeoutMs: 10000 },
+          args: { action: 'tab-select',
+            // Cross-service fallback forbidden: when the step names a service
+            // we have no bound session for, don't pin it to _boundSessionId
+            // (a different service's page) — use ext:default's active-tab
+            // semantics instead.
+            sessionId: _boundForSvc(_ufStepSvc) || (!_ufStepSvc || _ufStepSvc === _boundSvc ? _boundSessionId : 'ext:default'),
+            timeoutMs: 10000 },
           description: (uf.description || 'Focus the bound tab') + ` (bound tab — foreign url ${_ufHost} dropped)`,
         };
         rewrites.push({ index: i, kind: 'url.first foreign-host→bound-tab-select', agentId: agentKey || null });
@@ -851,10 +869,11 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
     // Same-host nav under no departure → select the bound tab instead of
     // re-navigating the user's real page to a service start URL.
     if (!_promptLeadsAway && _boundSessionId && _isBoundHostStep(uf)) {
+      const _uhStepSvc = _stepSvcOf(uf);
       steps[i] = {
         ...uf,
         skill: 'browser.act',
-        args: { action: 'tab-select', sessionId: _boundForSvc(_stepSvcOf(uf)) || _boundSessionId, timeoutMs: 10000 },
+        args: { action: 'tab-select', sessionId: _boundForSvc(_uhStepSvc) || (!_uhStepSvc || _uhStepSvc === _boundSvc ? _boundSessionId : 'ext:default'), timeoutMs: 10000 },
         description: (uf.description || 'Focus the bound tab') + ' (bound tab — no navigation needed)',
       };
       rewrites.push({ index: i, kind: 'url.first→bound-tab-select', agentId: agentKey || null });
