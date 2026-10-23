@@ -46,6 +46,7 @@ const os   = require('os');
 const { probeDesktopApp } = require('../utils/probeDesktopApp');
 const { probeTCC } = require('../utils/probeTCC');
 const { resolveRoute } = require('../utils/resolveRoute');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 
 // ── Preflight state file (monthly validation persistence) ────────────────────
 const PREFLIGHT_STATE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-state.json');
@@ -440,10 +441,20 @@ async function _llmExtractFileCandidate(llmBackend, userMessage, logger) {
 // Quick LLM classification: does this prompt require the user to be logged in
 // or signed in to accomplish the goal? Returns 0 (no login needed) or 1 (login
 // required). Defaults to 1 on any error so we never silently skip auth.
-async function _llmNeedsLoginCheck(llmBackend, userMessage, logger) {
-  if (!llmBackend) return 1;
-  try {
-    const prompt = `You are a task classifier. Determine whether the following user request requires the user to be logged in or signed into an account to accomplish the goal. Return ONLY a single digit: 0 if the task can be completed without logging in, 1 if a login/sign-in is required.
+async function _llmNeedsLoginCheck(llmBackend, userMessage, logger, askDecision) {
+  if (!llmBackend && typeof askDecision !== 'function') return 1;
+  return boundedDecision({
+    site: 'preflightAgents.needsLogin',
+    askDecision,
+    questions: [{
+      id: 'needsLogin', type: 'noul',
+      question: 'Does this request fundamentally need the user logged into an account? false for anonymous/public tasks (browse, search, view listings, read prices, add to a guest cart, read public pages/videos/maps). true only for tasks needing an account: send/read email or DMs, post content, account pages, order history, saved playlists, checkout/payment, or anything asking for "my" account data.',
+    }],
+    state: `User request: "${userMessage}"`,
+    local: (a) => a.needsLogin?.bool == null ? null : (a.needsLogin.bool ? 1 : 0),
+    remote: async () => {
+      try {
+        const prompt = `You are a task classifier. Determine whether the following user request requires the user to be logged in or signed into an account to accomplish the goal. Return ONLY a single digit: 0 if the task can be completed without logging in, 1 if a login/sign-in is required.
 
 Return 0 (no login needed) for tasks that work anonymously on public sites:
 - Browsing, searching, viewing products/listings, reading prices or reviews
@@ -457,16 +468,19 @@ Return 1 (login required) only for tasks that fundamentally need an account:
 - Anything explicitly asking for "my" account data (orders, messages, playlists)
 
 User request: "${userMessage}"`;
-    const raw = await llmBackend.generateAnswer(prompt, { query: prompt }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
-    const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
-    if (text.startsWith('0')) { logger.info(`[Node:PreflightAgents] LLM login-need check answered "0" (no login) for: "${userMessage.slice(0, 80)}"`); return 0; }
-    if (text.startsWith('1')) { logger.info(`[Node:PreflightAgents] LLM login-need check answered "1" (login required) for: "${userMessage.slice(0, 80)}"`); return 1; }
-    logger.warn(`[Node:PreflightAgents] LLM login-need check returned unexpected value: "${text}" — defaulting to 1`);
-    return 1;
-  } catch (e) {
-    logger.warn(`[Node:PreflightAgents] LLM login-need check failed: ${e.message}`);
-    return 1;
-  }
+        const raw = await llmBackend.generateAnswer(prompt, { query: prompt }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
+        const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
+        if (text.startsWith('0')) { logger.info(`[Node:PreflightAgents] LLM login-need check answered "0" (no login) for: "${userMessage.slice(0, 80)}"`); return 0; }
+        if (text.startsWith('1')) { logger.info(`[Node:PreflightAgents] LLM login-need check answered "1" (login required) for: "${userMessage.slice(0, 80)}"`); return 1; }
+        logger.warn(`[Node:PreflightAgents] LLM login-need check returned unexpected value: "${text}" — defaulting to 1`);
+        return 1;
+      } catch (e) {
+        logger.warn(`[Node:PreflightAgents] LLM login-need check failed: ${e.message}`);
+        return 1;
+      }
+    },
+    logger,
+  });
 }
 
 async function _probeFilesystem(mcpAdapter, candidate, logger) {
@@ -687,7 +701,7 @@ module.exports = async function preflightAgents(state) {
   const _firstContactLoginNeed = () => {
     if (_firstContactLoginNeedPromise === null) {
       _firstContactLoginNeedPromise = state.llmBackend
-        ? _llmNeedsLoginCheck(state.llmBackend, userMessage, logger).catch(() => 1)
+        ? _llmNeedsLoginCheck(state.llmBackend, userMessage, logger, makeAskDecision(mcpAdapter)).catch(() => 1)
         : Promise.resolve(1);
     }
     return _firstContactLoginNeedPromise;

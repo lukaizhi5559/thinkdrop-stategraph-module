@@ -10,6 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 const MAX_EVAL_RETRIES = 4;
 
 // ThinkDrop environment map — where state, logs, and services live. Injected
@@ -379,7 +380,7 @@ module.exports = async function evaluateSkills(state) {
   const _fastVerdict = await _evalDecision(
     backend, userMessage, stepLogs, filteredLog, answer,
     evaluationRetryCount, isFailurePath, recoveryContext,
-    state.conversationHistory, context, logger
+    state.conversationHistory, context, logger, makeAskDecision(state.mcpAdapter)
   );
   if (_fastVerdict === 0) {
     logger.info(`[Node:EvaluateSkills] Fast verdict: PASS — skipping full JSON generation`);
@@ -603,7 +604,7 @@ Output ONLY valid JSON.`;
 // Only when FIX (1) is returned does the caller run the full JSON generation
 // to extract the fix rule, contextKey, etc.
 // Safe default on parse failure/timeout: 0 (PASS) — matches existing fail-open.
-async function _evalDecision(backend, userMessage, stepLogs, filteredLog, answer, evaluationRetryCount, isFailurePath, recoveryContext, conversationHistory, context, logger) {
+async function _evalDecision(backend, userMessage, stepLogs, filteredLog, answer, evaluationRetryCount, isFailurePath, recoveryContext, conversationHistory, context, logger, askDecision) {
   const failureSection = isFailurePath && recoveryContext ? `
 FAILURE ANALYSIS:
   failedSkill: ${recoveryContext.failedSkill}
@@ -649,21 +650,35 @@ Verdict? (0, 1, or 2)`;
     }
   };
 
-  try {
-    const raw = await backend.generateAnswer(userPrompt, evalPayload, {
-      maxTokens: 5,
-      temperature: 0.1,
-      fastMode: true,
-      taskType: 'classification'
-    });
-    const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
-    const result = [0, 1, 2].includes(num) ? num : 0;
-    logger.info(`[Node:EvaluateSkills] _evalDecision: verdict=${result} (raw="${(raw || '').trim()}")`);
-    return result;
-  } catch (e) {
-    logger.warn(`[Node:EvaluateSkills] _evalDecision failed: ${e.message} — defaulting to 0 (PASS)`);
-    return 0;
-  }
+  return boundedDecision({
+    site: 'evaluateSkills.evalDecision',
+    askDecision,
+    questions: [{
+      id: 'verdict', type: 'choice',
+      question: `Did the run satisfy the user's request? PASS when the final answer addresses it (correct count, list, confirmation, sent email). FIX when the answer is empty/hollow/contradicts step results and a correction rule should be saved. ASK_USER when the failure needs human guidance (auth, ambiguity, missing info).${isFailurePath ? ' On the failure path, lean toward FIX — derive a permanent rule.' : ''} When in doubt, PASS.`,
+      options: ['PASS — result satisfies the request', 'FIX — wrong/incomplete, save a correction rule', 'ASK_USER — needs human input'],
+    }],
+    state: userPrompt,
+    local: (a) => a.verdict?.index ?? null,
+    remote: async () => {
+      try {
+        const raw = await backend.generateAnswer(userPrompt, evalPayload, {
+          maxTokens: 5,
+          temperature: 0.1,
+          fastMode: true,
+          taskType: 'classification'
+        });
+        const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
+        const result = [0, 1, 2].includes(num) ? num : 0;
+        logger.info(`[Node:EvaluateSkills] _evalDecision: verdict=${result} (raw="${(raw || '').trim()}")`);
+        return result;
+      } catch (e) {
+        logger.warn(`[Node:EvaluateSkills] _evalDecision failed: ${e.message} — defaulting to 0 (PASS)`);
+        return 0;
+      }
+    },
+    logger,
+  });
 }
 
 // Export helper functions for testing

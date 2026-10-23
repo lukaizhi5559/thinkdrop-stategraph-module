@@ -9,6 +9,7 @@
 
 const { parseDateRange, hasRelativeTimePhrase } = require('../utils/parseDateRange');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 const { searchTaskJournal } = require('../utils/taskJournalSearch.cjs');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const {
@@ -191,7 +192,7 @@ function buildEpisodicSearchQuery(query) {
  * Only called on short messages containing "my" or "your" to avoid LLM calls on every message.
  * Returns the normalized attribute name (e.g. 'name', 'email', 'phone') or null.
  */
-async function _llmDetectPersonalAttribute(message, llmBackend, logger) {
+async function _llmDetectPersonalAttribute(message, llmBackend, logger, askDecision) {
   const q = (message || '').trim();
 
   // Quick pre-filter: only run LLM on short messages with possessive pronouns
@@ -199,33 +200,51 @@ async function _llmDetectPersonalAttribute(message, llmBackend, logger) {
     return null;
   }
 
-  if (!llmBackend || !llmBackend.generateAnswer) return null;
-
-  // Single-number pattern: LLM returns index 0–11 or -1 for no attribute.
   const ATTRIBUTES = ['name', 'email', 'phone', 'birthday', 'location', 'timezone', 'company', 'occupation', 'github', 'username', 'address', 'language'];
-  const numberedList = ATTRIBUTES.map((a, i) => `${i}: ${a}`).join('\n');
-  const systemPrompt = `You extract personal attributes from short messages. Return ONLY a single number — nothing else:
+  if ((!llmBackend || !llmBackend.generateAnswer) && typeof askDecision !== 'function') return null;
+
+  return boundedDecision({
+    site: 'retrieveMemory.personalAttribute',
+    askDecision,
+    questions: [{
+      id: 'attribute', type: 'choice',
+      question: 'Which personal attribute does this short message ask about? Pick "none" if no personal attribute is mentioned.',
+      options: [...ATTRIBUTES, 'none'],
+    }],
+    state: `Message: "${q}"`,
+    local: (a) => {
+      const i = a.attribute?.index;
+      return (i != null && i < ATTRIBUTES.length) ? ATTRIBUTES[i] : null;
+    },
+    remote: async () => {
+      if (!llmBackend || !llmBackend.generateAnswer) return null;
+      // Single-number pattern: LLM returns index 0–11 or -1 for no attribute.
+      const numberedList = ATTRIBUTES.map((a, i) => `${i}: ${a}`).join('\n');
+      const systemPrompt = `You extract personal attributes from short messages. Return ONLY a single number — nothing else:
   -1 = no personal attribute mentioned
   0..11 = the index of the attribute from this list:
 ${numberedList}`;
-  const prompt = `Message: "${q}"\n\nAttribute index (0–11 or -1):`;
-  try {
-    const raw = await llmBackend.generateAnswer(prompt, {
-      query: prompt,
-      context: { systemInstructions: systemPrompt },
-    }, { maxTokens: 5, temperature: 0, fastMode: true, taskType: 'classification' });
-    if (!raw) return null;
-    const numMatch = (raw || '').trim().match(/-?\d+/);
-    const idx = numMatch ? parseInt(numMatch[0], 10) : -1;
-    if (idx >= 0 && idx < ATTRIBUTES.length) {
-      logger.debug(`[Node:RetrieveMemory] LLM detected personal attribute: ${ATTRIBUTES[idx]} (index ${idx})`);
-      return ATTRIBUTES[idx];
-    }
-    return null;
-  } catch (e) {
-    logger.debug(`[Node:RetrieveMemory] LLM personal attribute detection failed: ${e.message}`);
-    return null;
-  }
+      const prompt = `Message: "${q}"\n\nAttribute index (0–11 or -1):`;
+      try {
+        const raw = await llmBackend.generateAnswer(prompt, {
+          query: prompt,
+          context: { systemInstructions: systemPrompt },
+        }, { maxTokens: 5, temperature: 0, fastMode: true, taskType: 'classification' });
+        if (!raw) return null;
+        const numMatch = (raw || '').trim().match(/-?\d+/);
+        const idx = numMatch ? parseInt(numMatch[0], 10) : -1;
+        if (idx >= 0 && idx < ATTRIBUTES.length) {
+          logger.debug(`[Node:RetrieveMemory] LLM detected personal attribute: ${ATTRIBUTES[idx]} (index ${idx})`);
+          return ATTRIBUTES[idx];
+        }
+        return null;
+      } catch (e) {
+        logger.debug(`[Node:RetrieveMemory] LLM personal attribute detection failed: ${e.message}`);
+        return null;
+      }
+    },
+    logger,
+  });
 }
 
 /**
@@ -477,7 +496,7 @@ async function retrieveMemory(state) {
     // Before running noisy semantic search across thousands of screen captures,
     // check the structured user_profile KV store for known personal attributes.
     let profileFallback = null;
-    const personalAttribute = await _llmDetectPersonalAttribute(resolvedMessage || message, state.llmBackend, logger);
+    const personalAttribute = await _llmDetectPersonalAttribute(resolvedMessage || message, state.llmBackend, logger, makeAskDecision(state.mcpAdapter));
     if (personalAttribute && !dateRange) {
       const profileKeys = _profileKeysForAttribute(personalAttribute);
       for (const key of profileKeys) {

@@ -97,6 +97,7 @@ const _isDeepItemUrl  = (u) => _siteSearch ? _siteSearch.isDeepItemUrl(u) : fals
 // Skill thinking helper for generating human-readable thinking messages
 const { generateSkillThinking } = require('../utils/skillThinking');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 // Runtime param builder + token substitution for {{BODY}}, {{EMAIL}}, {{PHONE}},
 // {{URL}}, {{AMOUNT}}, {{ZIP}}, {{FILENAME}}, {{TO}}, {{TIME_MIN/MAX}}, etc.
 const { buildRuntimeParams, substituteTokens } = require('../utils/planSkillsHelpers');
@@ -125,7 +126,7 @@ Output ONLY valid JSON. No explanation, no markdown fences.`;
 // Only on 3 (AUTO_PATCH) does the caller run the full JSON generation to get
 // patchedArgs. REPLAN/REPLAN_STEP/ASK_USER can proceed immediately with defaults.
 // Safe default on parse failure/timeout: 2 (ASK_USER) — matches existing fallback.
-async function _thinRecoveryDecision(llmBackend, userMsg, logger) {
+async function _thinRecoveryDecision(llmBackend, userMsg, logger, askDecision) {
   const systemPrompt = `You are an automation recovery agent. A skill step failed.
 Decide the recovery action. Return ONLY a single number — nothing else:
   0 = REPLAN (rebuild the entire plan — use when the plan is fundamentally broken)
@@ -140,16 +141,30 @@ Rules:
 - If the error is a small fixable arg issue (wrong URL, missing flag) → 3 (AUTO_PATCH)
 - When in doubt → 2 (ASK_USER)`;
 
-  try {
-    const raw = await llmBackend.generateAnswer(systemPrompt, userMsg, { temperature: 0.1, maxTokens: 5, taskType: 'classification' });
-    const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
-    const result = [0, 1, 2, 3].includes(num) ? num : 2;
-    logger.info(`[ExecuteCommand:ThinRecovery] _thinRecoveryDecision: ${['REPLAN', 'REPLAN_STEP', 'ASK_USER', 'AUTO_PATCH'][result]} (raw="${(raw || '').trim()}")`);
-    return result;
-  } catch (e) {
-    logger.warn(`[ExecuteCommand:ThinRecovery] _thinRecoveryDecision failed: ${e.message} — defaulting to 2 (ASK_USER)`);
-    return 2;
-  }
+  return boundedDecision({
+    site: 'executeCommand.thinRecovery',
+    askDecision,
+    questions: [{
+      id: 'recovery', type: 'choice',
+      question: 'A skill step failed. Which recovery action fits? Prefer ASK_USER over guessing; REPLAN_STEP over REPLAN when prior steps succeeded; ASK_USER for auth/credential errors; AUTO_PATCH only for small fixable arg issues (wrong URL, missing flag).',
+      options: ['REPLAN — rebuild the entire plan', 'REPLAN_STEP — regenerate just this step', 'ASK_USER — need human input', 'AUTO_PATCH — fix args inline'],
+    }],
+    state: userMsg,
+    local: (a) => a.recovery?.index ?? null,
+    remote: async () => {
+      try {
+        const raw = await llmBackend.generateAnswer(systemPrompt, userMsg, { temperature: 0.1, maxTokens: 5, taskType: 'classification' });
+        const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
+        const result = [0, 1, 2, 3].includes(num) ? num : 2;
+        logger.info(`[ExecuteCommand:ThinRecovery] _thinRecoveryDecision: ${['REPLAN', 'REPLAN_STEP', 'ASK_USER', 'AUTO_PATCH'][result]} (raw="${(raw || '').trim()}")`);
+        return result;
+      } catch (e) {
+        logger.warn(`[ExecuteCommand:ThinRecovery] _thinRecoveryDecision failed: ${e.message} — defaulting to 2 (ASK_USER)`);
+        return 2;
+      }
+    },
+    logger,
+  });
 }
 
 // ── Auto-skip: failed read-only step with independent remaining steps ────────
@@ -335,7 +350,7 @@ function _tryAutoSkipIndependentStep(state) {
 const _AGENT_SKILLS_FOR_RECOVERY = new Set(['browser.agent', 'cli.agent', 'playwright.agent', 'url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
 
 async function _thinPostFailureHandler(state) {
-  const { failedStep, skillPlan, skillCursor, skillResults = [], llmBackend, message, resolvedMessage, stepRetryCount = 0, replanCount = 0, patchHistory = [] } = state;
+  const { failedStep, skillPlan, skillCursor, skillResults = [], llmBackend, message, resolvedMessage, stepRetryCount = 0, replanCount = 0, patchHistory = [], mcpAdapter } = state;
   const logger = state.logger || console;
 
   if (!failedStep) return state;
@@ -826,7 +841,7 @@ async function _thinPostFailureHandler(state) {
   // If REPLAN (0), REPLAN_STEP (1), or ASK_USER (2), proceed immediately with defaults
   // — skip the 300-token JSON generation. Only on AUTO_PATCH (3) do we run the full
   // JSON generation to get patchedArgs.
-  const _fastDecision = await _thinRecoveryDecision(llmBackend, userMsg, logger);
+  const _fastDecision = await _thinRecoveryDecision(llmBackend, userMsg, logger, makeAskDecision(mcpAdapter));
 
   if (_fastDecision === 0) {
     // REPLAN — immediate, no generation needed
@@ -7996,24 +8011,38 @@ Return ONLY a single number — nothing else:
 Conservative threshold: only flag as APP_ERROR when the failure is clear and unambiguous. When in doubt → 0.`;
             const _pcDecisionPrompt = `API call context: ${_pcContext}\n\nJSON payload:\n${_payloadStr.slice(0, 4000)}\n\nVerdict? (0, 1, or 2)`;
 
-            let _pcFastVerdict = 0;
-            try {
-              const _pcDecRaw = await _pcLlm.generateAnswer(_pcDecisionPrompt, {
-                query: _pcDecisionPrompt,
-                context: {
-                  conversationHistory: [],
-                  systemInstructions: _pcDecisionSystem,
-                  intent: 'command_automate',
-                },
-                options: { maxTokens: 5, temperature: 0, fastMode: true },
-              }, { maxTokens: 5, temperature: 0, fastMode: true, taskType: 'classification' }, null);
-              const _pcNum = require('../utils/parseLlmJson').parseNumberDecision(_pcDecRaw);
-              _pcFastVerdict = [0, 1, 2].includes(_pcNum) ? _pcNum : 0;
-              logger.debug(`[Node:ExecuteCommand] payload.check decision: ${['SUCCESS', 'APP_ERROR', 'PARTIAL_SUCCESS'][_pcFastVerdict]} (raw="${(_pcDecRaw || '').trim()}")`);
-            } catch (_pcDecErr) {
-              logger.warn(`[Node:ExecuteCommand] payload.check decision failed (non-blocking): ${_pcDecErr.message}`);
-              _pcFastVerdict = 0; // fail open
-            }
+            let _pcFastVerdict = await boundedDecision({
+              site: 'executeCommand.payloadCheck',
+              askDecision: makeAskDecision(typeof mcpAdapter !== 'undefined' ? mcpAdapter : null),
+              questions: [{
+                id: 'verdict', type: 'choice',
+                question: 'Examine this JSON payload from an API call. Did the operation succeed at the application level? Only flag APP_ERROR when the failure is clear and unambiguous; when in doubt pick SUCCESS.',
+                options: ['SUCCESS — no application-level errors', 'APP_ERROR — clear application-level failure', 'PARTIAL_SUCCESS — batch with mixed results'],
+              }],
+              state: `API call context: ${_pcContext}\n\nJSON payload:\n${_payloadStr.slice(0, 4000)}`,
+              local: (a) => a.verdict?.index ?? null,
+              remote: async () => {
+                try {
+                  const _pcDecRaw = await _pcLlm.generateAnswer(_pcDecisionPrompt, {
+                    query: _pcDecisionPrompt,
+                    context: {
+                      conversationHistory: [],
+                      systemInstructions: _pcDecisionSystem,
+                      intent: 'command_automate',
+                    },
+                    options: { maxTokens: 5, temperature: 0, fastMode: true },
+                  }, { maxTokens: 5, temperature: 0, fastMode: true, taskType: 'classification' }, null);
+                  const _pcNum = require('../utils/parseLlmJson').parseNumberDecision(_pcDecRaw);
+                  const _v = [0, 1, 2].includes(_pcNum) ? _pcNum : 0;
+                  logger.debug(`[Node:ExecuteCommand] payload.check decision: ${['SUCCESS', 'APP_ERROR', 'PARTIAL_SUCCESS'][_v]} (raw="${(_pcDecRaw || '').trim()}")`);
+                  return _v;
+                } catch (_pcDecErr) {
+                  logger.warn(`[Node:ExecuteCommand] payload.check decision failed (non-blocking): ${_pcDecErr.message}`);
+                  return 0; // fail open
+                }
+              },
+              logger,
+            });
 
             if (_pcFastVerdict === 1 || _pcFastVerdict === 2) {
               // Run full JSON generation to get error details

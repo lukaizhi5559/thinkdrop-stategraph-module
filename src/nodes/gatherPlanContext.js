@@ -29,6 +29,7 @@
 const { markAgentAuthed } = require('./preflightAgents');
 const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 const { isLocalMultiEntityTask, extractContextRefs } = require('../utils/contextRefs.cjs');
 
 const MAX_ROUNDS = 3;
@@ -163,7 +164,7 @@ Rules:
 // Returns 0 (complete), 1 (need-question), or 2 (need-auth).
 // Only on 1/2 does the caller run the full JSON generation to get question/authAgentId.
 // Safe default on parse failure/timeout: 0 (complete) — matches existing fail-open.
-async function _askLLMDecision(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null, state = null) {
+async function _askLLMDecision(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null, state = null, askDecision = null) {
   const priorBlock = priorQA.length > 0
     ? '\n\nPrior clarifications:\n' + priorQA.map(qa => `Q: ${qa.question}\nA: ${qa.answer}`).join('\n')
     : '';
@@ -242,16 +243,30 @@ TASK: "${userMsg}"${followUpBlock}${priorBlock}${historyBlock}${knownBlock}${una
 
 Ready? (0, 1, or 2)`;
 
-  try {
-    const raw = await llmBackend.generateAnswer(userPrompt, { query: userPrompt, context: { systemInstructions: systemPrompt } }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
-    const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
-    const result = (num === 0 || num === 1 || num === 2) ? num : 0;
-    logger.info(`[Node:GatherPlanContext] _askLLMDecision: ${['COMPLETE', 'NEED_QUESTION', 'NEED_AUTH'][result]} (raw="${(raw || '').trim()}")`);
-    return result;
-  } catch (err) {
-    logger.warn(`[Node:GatherPlanContext] _askLLMDecision failed (${err.message}) — defaulting to 0 (COMPLETE)`);
-    return 0;
-  }
+  return boundedDecision({
+    site: 'gatherPlanContext.askDecision',
+    askDecision,
+    questions: [{
+      id: 'verdict', type: 'choice',
+      question: 'Is this task ready to execute? COMPLETE = proceed as-is. NEED_QUESTION = exactly one critical piece is missing (messaging with no recipient; scheduling with no time/frequency or no notification method; bare-basename file with no extension/path; a start/create/build request with no clear goal or deliverable — well-specified requests are COMPLETE). NEED_AUTH = a required service appears in UNAUTHENTICATED AGENTS. Never ask about timezone, credentials, optional preferences, or deictic referents resolvable to an ACTIVE SURFACE. When in doubt, COMPLETE.',
+      options: ['COMPLETE — proceed as-is', 'NEED_QUESTION — one critical input is missing', 'NEED_AUTH — required service is unauthenticated'],
+    }],
+    state: userPrompt,
+    local: (a) => a.verdict?.index ?? null,
+    remote: async () => {
+      try {
+        const raw = await llmBackend.generateAnswer(userPrompt, { query: userPrompt, context: { systemInstructions: systemPrompt } }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
+        const num = require('../utils/parseLlmJson').parseNumberDecision(raw);
+        const result = (num === 0 || num === 1 || num === 2) ? num : 0;
+        logger.info(`[Node:GatherPlanContext] _askLLMDecision: ${['COMPLETE', 'NEED_QUESTION', 'NEED_AUTH'][result]} (raw="${(raw || '').trim()}")`);
+        return result;
+      } catch (err) {
+        logger.warn(`[Node:GatherPlanContext] _askLLMDecision failed (${err.message}) — defaulting to 0 (COMPLETE)`);
+        return 0;
+      }
+    },
+    logger,
+  });
 }
 
 async function _askLLM(llmBackend, userMsg, originalMsg, priorQA, conversationHistory, resolvedSelfContext, preflightResult, logger, taskClassification = null, state = null) {
@@ -545,14 +560,14 @@ module.exports = async function gatherPlanContext(state) {
     // If COMPLETE (0), return immediately — skip the 80-token JSON generation.
     // If NEED_QUESTION (1) or NEED_AUTH (2), run the full JSON generation to get
     // the question text and/or authAgentId.
-    const _fastDecision = await _askLLMDecision(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null, state);
+    const _fastDecision = await _askLLMDecision(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null, state, makeAskDecision(state.mcpAdapter));
     let result;
     if (_fastDecision === 0) {
       logger.info('[Node:GatherPlanContext] Fast decision: COMPLETE — skipping full JSON generation');
       result = { complete: true };
     } else {
       logger.info(`[Node:GatherPlanContext] Fast decision: ${_fastDecision === 1 ? 'NEED_QUESTION' : 'NEED_AUTH'} — running full JSON generation`);
-      result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null, state);
+      result = await _askLLM(llmBackend, baseMsg, originalMsg, answers, state.conversationHistory || [], state.resolvedSelfContext || null, state.preflightResult || null, logger, state._taskClassification || null, state, makeAskDecision(state.mcpAdapter));
     }
 
     // Defensive override: if the LLM returned an auth question for an agent that
@@ -1122,7 +1137,7 @@ async function _runGrillLoop(state, logger) {
     const _fastDecision = await _askLLMDecision(
       llmBackend, baseMsg, originalMsg, answers,
       state.conversationHistory || [], state.resolvedSelfContext || null,
-      state.preflightResult || null, logger, tc, state
+      state.preflightResult || null, logger, tc, state, makeAskDecision(state.mcpAdapter)
     );
     if (_fastDecision === 0) {
       logger.info('[Node:GatherPlanContext:Grill] Fast decision: COMPLETE — skipping batch prompt');

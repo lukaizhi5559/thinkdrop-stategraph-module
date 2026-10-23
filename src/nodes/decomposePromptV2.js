@@ -3,6 +3,7 @@
 const fs   = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 const { suggestIntent } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
@@ -242,7 +243,7 @@ function _decisionRoleLabel(m) {
     : 'Assistant (proactive card)';
 }
 
-async function _decomposeDecision(message, llmBackend, conversationHistory, logger, carriedHint = null, taskClassification = null) {
+async function _decomposeDecision(message, llmBackend, conversationHistory, logger, carriedHint = null, taskClassification = null, askDecision = null) {
   const recentCtx = (conversationHistory || []).slice(-4)
     .map(m => `${_decisionRoleLabel(m)}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
@@ -327,38 +328,56 @@ EXAMPLES:
     return null;
   };
 
-  let lastErr = null;
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const raw = await llmBackend.generateAnswer(userPrompt, {
-        query: userPrompt,
-        context: { systemInstructions: systemPrompt },
-      }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
-      const parsed = _parseDecision(raw);
-      if (parsed) {
-        // Hint veto over bare 0: command_automate is the residual bucket —
-        // "0" means "no better match", and the five-token call flakes on
-        // ambiguous verbs while seeing the hint in its prompt. A confident
-        // deterministic hint for a NON-automation intent beats the residual
-        // (same rule as the comms keyword veto). Only 0 is vetoed — a
-        // specific non-zero choice is the model affirmatively disagreeing.
-        if (parsed.num === 0 && hintIdx > 0 && _SINGLE_STEP_INTENTS[hintIdx] !== 'command_automate') {
-          logger.info(`[Node:DecomposePromptV2] _decomposeDecision: LLM returned residual 0 but hint=${carriedHint} claims ${_SINGLE_STEP_INTENTS[hintIdx]} — hint veto (raw="${(raw || '').trim()}"${attempt > 1 ? ` attempt=${attempt}` : ''})`);
-          return hintIdx;
+  const _num = await boundedDecision({
+    site: 'decomposePromptV2.intent',
+    askDecision,
+    questions: [{
+      id: 'intent', type: 'choice',
+      question: "Which intent best fits this message? command_automate = run a tool/app/browser action (also questions needing a shell probe of the user's machine). screen_intelligence = observe what is on screen. web_search = look things up online with NO site interaction. memory_store / memory_retrieve = save / recall facts or past activity. general_knowledge = answer from knowledge. greeting = chitchat. multi_step only for MULTIPLE INDEPENDENT goals.",
+      options: [..._SINGLE_STEP_INTENTS, 'multi_step — multiple independent goals'],
+    }],
+    state: userPrompt,
+    local: (a) => {
+      const i = a.intent?.index;
+      if (i == null) return null;
+      return i < _SINGLE_STEP_INTENTS.length ? i : 7;
+    },
+    remote: async () => {
+      let lastErr = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const raw = await llmBackend.generateAnswer(userPrompt, {
+            query: userPrompt,
+            context: { systemInstructions: systemPrompt },
+          }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
+          const parsed = _parseDecision(raw);
+          if (parsed) {
+            logger.info(`[Node:DecomposePromptV2] _decomposeDecision: intent=${parsed.num} (${_SINGLE_STEP_INTENTS[parsed.num] || 'MULTI_STEP'}) (raw="${(raw || '').trim()}" hint=${carriedHint || 'none'}${attempt > 1 ? ` attempt=${attempt}` : ''}${parsed.extracted ? ' extracted' : ''})`);
+            return parsed.num;
+          }
+          lastErr = new Error(`unparseable: "${(raw || '').trim().slice(0, 80)}"`);
+          logger.warn(`[Node:DecomposePromptV2] _decomposeDecision unparseable (attempt ${attempt}): "${(raw || '').trim().slice(0, 80)}"`);
+        } catch (e) {
+          lastErr = e;
+          logger.warn(`[Node:DecomposePromptV2] _decomposeDecision attempt ${attempt} failed: ${e.message}`);
         }
-        logger.info(`[Node:DecomposePromptV2] _decomposeDecision: intent=${parsed.num} (${_SINGLE_STEP_INTENTS[parsed.num] || 'MULTI_STEP'}) (raw="${(raw || '').trim()}" hint=${carriedHint || 'none'}${attempt > 1 ? ` attempt=${attempt}` : ''}${parsed.extracted ? ' extracted' : ''})`);
-        return parsed.num;
       }
-      lastErr = new Error(`unparseable: "${(raw || '').trim().slice(0, 80)}"`);
-      logger.warn(`[Node:DecomposePromptV2] _decomposeDecision unparseable (attempt ${attempt}): "${(raw || '').trim().slice(0, 80)}"`);
-    } catch (e) {
-      lastErr = e;
-      logger.warn(`[Node:DecomposePromptV2] _decomposeDecision attempt ${attempt} failed: ${e.message}`);
-    }
+      const fb = hintIdx >= 0 ? hintIdx : 0;
+      logger.warn(`[Node:DecomposePromptV2] _decomposeDecision exhausted retries (${lastErr?.message}) — defaulting to ${fb} (${_SINGLE_STEP_INTENTS[fb]})`);
+      return fb;
+    },
+    logger,
+  });
+
+  // Hint veto over bare 0: command_automate is the residual bucket — a
+  // confident deterministic hint for a NON-automation intent beats the
+  // residual (same rule as the comms keyword veto). Only 0 is vetoed — a
+  // specific non-zero choice is the model affirmatively disagreeing.
+  if (_num === 0 && hintIdx > 0 && _SINGLE_STEP_INTENTS[hintIdx] !== 'command_automate') {
+    logger.info(`[Node:DecomposePromptV2] _decomposeDecision: residual 0 but hint=${carriedHint} claims ${_SINGLE_STEP_INTENTS[hintIdx]} — hint veto`);
+    return hintIdx;
   }
-  const fallback = hintIdx >= 0 ? hintIdx : 0;
-  logger.warn(`[Node:DecomposePromptV2] _decomposeDecision exhausted retries (${lastErr?.message}) — defaulting to ${fallback} (${_SINGLE_STEP_INTENTS[fallback]})`);
-  return fallback;
+  return _num;
 }
 
 async function llmDecompose(message, llmBackend, conversationHistory, logger, onParsed = null) {
@@ -1459,7 +1478,7 @@ module.exports = async function decomposePromptV2(state) {
     logger.info(`[Node:DecomposePromptV2] classifyTask suggestedIntent=${_suggestedIntent} (hint=${_carriedHint || 'none'} — concur/abstain) — skipping number call`);
     _fastDecision = _suggestedIdx;
   } else {
-    _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint, _tc);
+    _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint, _tc, makeAskDecision(state.mcpAdapter));
   }
 
   // Contradiction check: command_automate is the heaviest route (plan +

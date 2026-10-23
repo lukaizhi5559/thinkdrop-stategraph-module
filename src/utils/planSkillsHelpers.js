@@ -262,13 +262,37 @@ function substituteTokens(code, params, logger) {
  * PII (phone, email, message body) is NOT sent to the LLM.
  * Returns { index, substitutions: [], params: {} } or null on failure.
  */
-async function selectCommandTemplate(commands, userMessage, backend) {
+async function selectCommandTemplate(commands, userMessage, backend, askDecision) {
   const _scrubbedMsg = userMessage
     .replace(/\+?1?[\s.-]?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g, '[PHONE]')
     .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[EMAIL]')
     .replace(/https?:\/\/\S+/g, '[URL]');
 
   const commandList = commands.map((c, i) => `--- Template ${i}: ${c.heading} ---`).join('\n');
+
+  // ── Local decision fast path — bounded index pick over templates ────────
+  if (typeof askDecision === 'function' && commands.length <= 26) {
+    try {
+      const { boundedDecision } = require('./askDecision');
+      const _local = await boundedDecision({
+        site: 'planSkillsHelpers.selectCommandTemplate',
+        askDecision,
+        questions: [{
+          id: 'tpl', type: 'choice',
+          question: 'Which command template best matches the user request?',
+          options: commands.map(c => c.heading || 'command'),
+        }],
+        state: `User request: "${_scrubbedMsg}"`,
+        local: (a) => {
+          const i = a.tpl?.index;
+          return (i != null && i < commands.length) ? { index: i, substitutions: [], params: {} } : null;
+        },
+        remote: async () => null,
+        logger: null,
+      });
+      if (_local) return _local;
+    } catch (_) { /* fall through to numbered LLM call */ }
+  }
 
   const query = `User request: "${_scrubbedMsg}"
 

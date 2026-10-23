@@ -32,4 +32,71 @@ function makeAskDecision(mcpAdapter) {
   };
 }
 
-module.exports = { makeAskDecision };
+/**
+ * boundedDecision — P2 shared helper for migrating bounded classification
+ * call sites. Centralizes DECISION_LOCAL / DECISION_SHADOW so each migrated
+ * site is a one-line swap.
+ *
+ * @param {object}   cfg
+ *   askDecision    fn | null      — from makeAskDecision(mcpAdapter) or
+ *                                   options.askDecision; null → remote path
+ *   site           string         — shadow-log label, e.g. 'executeCommand.thinRecovery'
+ *   questions      array          — systemone questions [{id,type,question,options?}]
+ *   state          string|object  — decision context (prompt-state text or JSON)
+ *   local          fn(answers)→any — build the site value from answers; return
+ *                                   undefined/null to force remote fallback
+ *   remote         fn()→any       — existing production path (async ok)
+ *   logger         object         — optional; gets info/debug lines
+ *   minConfidence  number         — optional floor on answer.confidence
+ *                                   (choice/score only); below → remote
+ * @returns remote value in shadow/disabled/fail modes; local value otherwise
+ */
+async function boundedDecision(cfg) {
+  const { site, questions, state, local, remote, logger, minConfidence } = cfg;
+  const askDecision = cfg.askDecision;
+  const enabled = typeof askDecision === 'function' && process.env.DECISION_LOCAL !== '0';
+  const shadow = enabled && process.env.DECISION_SHADOW === '1';
+
+  if (!enabled) return remote();
+
+  const runLocal = async () => {
+    const r = await askDecision(questions, { state });
+    if (!r?.answers) return { value: null, ms: null };
+    // Confidence floor — low-confidence choice/score answers abstain to remote
+    if (minConfidence != null) {
+      for (const q of questions) {
+        const a = r.answers[q.id];
+        if (a && typeof a.confidence === 'number' && a.confidence < minConfidence) {
+          return { value: null, ms: r.elapsedMs, lowConf: true };
+        }
+      }
+    }
+    const v = local(r.answers);
+    return { value: v == null ? null : v, ms: r.elapsedMs, model: r.model };
+  };
+
+  if (shadow) {
+    const remoteP = Promise.resolve().then(remote);
+    let lv = null, lms = null, lerr = '';
+    try { const l = await runLocal(); lv = l.value; lms = l.ms; }
+    catch (e) { lerr = e.message; }
+    const rv = await remoteP;
+    const agree = lv != null && rv != null && JSON.stringify(lv) === JSON.stringify(rv);
+    (logger || console).info?.(`[DecisionShadow] site=${site} agree=${agree} local=${JSON.stringify(lv)?.slice(0, 120)} remote=${JSON.stringify(rv)?.slice(0, 120)} localMs=${lms}${lerr ? ` err=${lerr}` : ''}`);
+    return rv;
+  }
+
+  try {
+    const l = await runLocal();
+    if (l.value != null) {
+      (logger || console).info?.(`[Decision] site=${site} local ${l.ms}ms model=${l.model || '?'}`);
+      return l.value;
+    }
+    if (l.lowConf) (logger || console).debug?.(`[Decision] site=${site} low-confidence — remote fallback`);
+  } catch (e) {
+    (logger || console).debug?.(`[Decision] site=${site} failed: ${e.message} — remote fallback`);
+  }
+  return remote();
+}
+
+module.exports = { makeAskDecision, boundedDecision };

@@ -42,6 +42,7 @@ const path = require('path');
 const { parseLlmJson, parseNumberDecision } = require('../utils/parseLlmJson');
 const { ATOMIC_BROWSER_SKILLS, hasBrowserMutationEvidence } = require('../utils/planHelpers');
 const { demotePlanFile } = require('../utils/planCacheHelpers');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 
 function loadReviewPrompt() {
   try {
@@ -113,7 +114,7 @@ function buildPartialSummary(userMessage, skillResults, suspiciousDetails) {
  * Only on 1 (contradiction) does it run the full JSON generation to extract correctedAnswer.
  * Safe default on failure: null (caller falls through to replan, same as existing fail-open).
  */
-async function assessAnswerContradiction(userMessage, synthesizeOutput, pageText, llmBackend, context, logger) {
+async function assessAnswerContradiction(userMessage, synthesizeOutput, pageText, llmBackend, context, logger, askDecision) {
   if (!pageText || pageText.length < 50) return null;
   if (!synthesizeOutput || synthesizeOutput.length < 5) return null;
 
@@ -140,23 +141,37 @@ ${synthesizeOutput.slice(0, 2000)}
 
 Contradiction? (0 or 1)`;
 
-  let hasContradiction = false;
-  try {
-    const raw = await llmBackend.generateAnswer(decisionUserPrompt, {
-      query: decisionUserPrompt,
-      context: {
-        systemInstructions: decisionSystemPrompt,
-        sessionId: context?.sessionId,
-        userId: context?.userId || 'local_user',
-      },
-    }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
-    const num = parseNumberDecision(raw);
-    hasContradiction = num === 1;
-    logger.info(`[Node:ReviewExecution] assessAnswerContradiction decision: ${hasContradiction ? 'CONTRADICTION' : 'NO_CONTRADICTION'} (raw="${(raw || '').trim()}")`);
-  } catch (err) {
-    logger.warn(`[Node:ReviewExecution] assessAnswerContradiction decision failed: ${err.message}`);
-    return null;
-  }
+  const hasContradiction = await boundedDecision({
+    site: 'reviewExecution.contradiction',
+    askDecision,
+    questions: [{
+      id: 'contradiction', type: 'noul',
+      question: 'Does the CURRENT PAGE TEXT contain the real answer while the SYNTHESIZE OUTPUT disagrees, is wrong, or is hollow/vague? Answer true only on a clear contradiction — when in doubt, false.',
+    }],
+    state: decisionUserPrompt,
+    local: (a) => a.contradiction?.bool ?? null,
+    remote: async () => {
+      try {
+        const raw = await llmBackend.generateAnswer(decisionUserPrompt, {
+          query: decisionUserPrompt,
+          context: {
+            systemInstructions: decisionSystemPrompt,
+            sessionId: context?.sessionId,
+            userId: context?.userId || 'local_user',
+          },
+        }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
+        const num = parseNumberDecision(raw);
+        const v = num === 1;
+        logger.info(`[Node:ReviewExecution] assessAnswerContradiction decision: ${v ? 'CONTRADICTION' : 'NO_CONTRADICTION'} (raw="${(raw || '').trim()}")`);
+        return v;
+      } catch (err) {
+        logger.warn(`[Node:ReviewExecution] assessAnswerContradiction decision failed: ${err.message}`);
+        return null;
+      }
+    },
+    logger,
+  });
+  if (hasContradiction == null) return null;
 
   if (!hasContradiction) {
     return { corrected: false, reason: 'no contradiction detected' };
@@ -206,7 +221,7 @@ Output ONLY valid JSON:
  * Uses the single-number pattern: LLM returns 0 (FULFILLED) or 1 (NOT_FULFILLED).
  * Safe default on failure: null (caller falls back to regex hollow check).
  */
-async function assessBrowserFulfillment(userMessage, synthesizeOutput, snapshot, llmBackend, context, logger) {
+async function assessBrowserFulfillment(userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, askDecision) {
   const snapshotExcerpt = snapshot ? snapshot.slice(0, 3000) : '(no page content available)';
   const synthExcerpt = synthesizeOutput ? synthesizeOutput.slice(0, 2000) : '(none)';
 
@@ -232,27 +247,41 @@ ${synthExcerpt}
 
 Fulfilled? (0 or 1)`;
 
-  try {
-    const raw = await llmBackend.generateAnswer(userPrompt, {
-      query: userPrompt,
-      context: {
-        systemInstructions: systemPrompt,
-        sessionId: context?.sessionId,
-        userId: context?.userId || 'local_user',
-      },
-    }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
+  return boundedDecision({
+    site: 'reviewExecution.fulfillment',
+    askDecision,
+    questions: [{
+      id: 'fulfilled', type: 'noul',
+      question: 'Was the user goal achieved? true when the page shows the right content and the synthesize output is a real answer; false on sign-in/auth wall, wrong page, or hollow/vague output.',
+    }],
+    state: userPrompt,
+    local: (a) => a.fulfilled?.bool == null ? null
+      : { fulfilled: a.fulfilled.bool, reason: a.fulfilled.bool ? 'goal achieved' : 'not fulfilled' },
+    remote: async () => {
+      try {
+        const raw = await llmBackend.generateAnswer(userPrompt, {
+          query: userPrompt,
+          context: {
+            systemInstructions: systemPrompt,
+            sessionId: context?.sessionId,
+            userId: context?.userId || 'local_user',
+          },
+        }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
 
-    const num = parseNumberDecision(raw);
-    if (isNaN(num) || (num !== 0 && num !== 1)) {
-      throw new Error(`invalid response: "${(raw || '').trim()}"`);
-    }
-    const fulfilled = num === 0;
-    logger.info(`[Node:ReviewExecution] assessBrowserFulfillment: fulfilled=${fulfilled} (raw="${(raw || '').trim()}")`);
-    return { fulfilled, reason: fulfilled ? 'goal achieved' : 'not fulfilled' };
-  } catch (err) {
-    logger.warn(`[Node:ReviewExecution] assessBrowserFulfillment failed: ${err.message} — falling back to regex`);
-    return null;
-  }
+        const num = parseNumberDecision(raw);
+        if (isNaN(num) || (num !== 0 && num !== 1)) {
+          throw new Error(`invalid response: "${(raw || '').trim()}"`);
+        }
+        const fulfilled = num === 0;
+        logger.info(`[Node:ReviewExecution] assessBrowserFulfillment: fulfilled=${fulfilled} (raw="${(raw || '').trim()}")`);
+        return { fulfilled, reason: fulfilled ? 'goal achieved' : 'not fulfilled' };
+      } catch (err) {
+        logger.warn(`[Node:ReviewExecution] assessBrowserFulfillment failed: ${err.message} — falling back to regex`);
+        return null;
+      }
+    },
+    logger,
+  });
 }
 
 /**
@@ -263,7 +292,7 @@ Fulfilled? (0 or 1)`;
  * generation to extract suspiciousSteps.
  * Safe default on parse failure/timeout: 0 (PASS) — matches existing fail-open.
  */
-async function _reviewDecision(llmBackend, userMessage, stepLog, context, state, logger) {
+async function _reviewDecision(llmBackend, userMessage, stepLog, context, state, logger, askDecision) {
   const systemPrompt = `You are an automation step reviewer. Did all steps produce output that proves their actions were performed correctly?
 Return ONLY a single number — nothing else:
   0 = PASS (all steps verified — outputs match intended actions, no suspicious results)
@@ -282,24 +311,37 @@ ${stepLog}
 
 Verdict? (0 or 1)`;
 
-  try {
-    const raw = await llmBackend.generateAnswer(userPrompt, {
-      query: userPrompt,
-      context: {
-        systemInstructions: systemPrompt,
-        sessionId: context?.sessionId,
-        userId: context?.userId || 'local_user',
-        intent: state.intent?.type || 'command_automate',
+  return boundedDecision({
+    site: 'reviewExecution.reviewDecision',
+    askDecision,
+    questions: [{
+      id: 'pass', type: 'noul',
+      question: 'Did all steps produce output proving their actions were performed correctly? true = PASS (outputs consistent with intent); false = VERIFY_NEEDED (hollow/missing/contradictory output). When in doubt, true.',
+    }],
+    state: userPrompt,
+    local: (a) => a.pass?.bool == null ? null : (a.pass.bool ? 0 : 1),
+    remote: async () => {
+      try {
+        const raw = await llmBackend.generateAnswer(userPrompt, {
+          query: userPrompt,
+          context: {
+            systemInstructions: systemPrompt,
+            sessionId: context?.sessionId,
+            userId: context?.userId || 'local_user',
+            intent: state.intent?.type || 'command_automate',
+          }
+        }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
+        const num = parseNumberDecision(raw);
+        const result = (num === 0 || num === 1) ? num : 0;
+        logger.info(`[Node:ReviewExecution] _reviewDecision: verdict=${result === 0 ? 'PASS' : 'VERIFY_NEEDED'} (raw="${(raw || '').trim()}")`);
+        return result;
+      } catch (e) {
+        logger.warn(`[Node:ReviewExecution] _reviewDecision failed: ${e.message} — defaulting to 0 (PASS)`);
+        return 0;
       }
-    }, { maxTokens: 5, temperature: 0.1, fastMode: true, taskType: 'classification' });
-    const num = parseNumberDecision(raw);
-    const result = (num === 0 || num === 1) ? num : 0;
-    logger.info(`[Node:ReviewExecution] _reviewDecision: verdict=${result === 0 ? 'PASS' : 'VERIFY_NEEDED'} (raw="${(raw || '').trim()}")`);
-    return result;
-  } catch (e) {
-    logger.warn(`[Node:ReviewExecution] _reviewDecision failed: ${e.message} — defaulting to 0 (PASS)`);
-    return 0;
-  }
+    },
+    logger,
+  });
 }
 
 module.exports = async function reviewExecution(state) {
@@ -619,7 +661,7 @@ module.exports = async function reviewExecution(state) {
 
       // Ask LLM: was the goal fulfilled given prompt + synthesize + current page snapshot?
       const judgment = await assessBrowserFulfillment(
-        userMessage, synthesizeOutput, snapshot, llmBackend, context, logger
+        userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, makeAskDecision(mcpAdapter)
       );
 
       if (judgment !== null) {
@@ -644,7 +686,7 @@ module.exports = async function reviewExecution(state) {
       // the answer directly from page text — no replan needed.
       if (snapshot && llmBackend && synthesizeOutput) {
         let contradiction = await assessAnswerContradiction(
-          userMessage, synthesizeOutput, snapshot, llmBackend, context, logger
+          userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, makeAskDecision(mcpAdapter)
         );
         if (contradiction?.corrected) {
           logger.info(`[Node:ReviewExecution] Answer-only contradiction detected — correcting synthesis from page text: ${contradiction.reason}`);
@@ -671,7 +713,7 @@ module.exports = async function reviewExecution(state) {
               if (reSnapshot && reSnapshot.length > (snapshot || '').length) {
                 logger.info(`[Node:ReviewExecution] Re-captured page text: ${reSnapshot.length} chars (was ${(snapshot || '').length} chars) — re-running contradiction check`);
                 const reContradiction = await assessAnswerContradiction(
-                  userMessage, synthesizeOutput, reSnapshot, llmBackend, context, logger
+                  userMessage, synthesizeOutput, reSnapshot, llmBackend, context, logger, makeAskDecision(mcpAdapter)
                 );
                 if (reContradiction?.corrected && !TRUNCATION_INDICATORS.test(reContradiction.answer)) {
                   logger.info(`[Node:ReviewExecution] Re-capture recovery succeeded — full response obtained`);
@@ -838,7 +880,7 @@ module.exports = async function reviewExecution(state) {
   // If PASS (0), return immediately — skip the expensive 300-token JSON generation.
   // If VERIFY_NEEDED (1), fall through to the full JSON generation to get
   // the suspiciousSteps array with verification commands.
-  const _fastVerdict = await _reviewDecision(llmBackend, userMessage, stepLog, context, state, logger);
+  const _fastVerdict = await _reviewDecision(llmBackend, userMessage, stepLog, context, state, logger, makeAskDecision(state.mcpAdapter));
   if (_fastVerdict === 0) {
     logger.info('[Node:ReviewExecution] Fast verdict: PASS — skipping full JSON generation → UNVERIFIABLE (pass-through)');
     return { ...state, reviewVerdict: 'UNVERIFIABLE' };

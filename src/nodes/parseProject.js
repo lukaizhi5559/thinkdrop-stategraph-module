@@ -28,6 +28,7 @@
  */
 
 const fs   = require('fs');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 const os   = require('os');
 const path = require('path');
 
@@ -76,7 +77,7 @@ function fastMatch(msgLower, projects) {
 /**
  * LLM fallback — only runs when fast match fails and projects exist.
  */
-async function llmMatch(classifyMessage, projects, conversationHistory, llmBackend, logger) {
+async function llmMatch(classifyMessage, projects, conversationHistory, llmBackend, logger, askDecision) {
   const recentContext = conversationHistory.length > 0
     ? conversationHistory.slice(-4).map(m => {
         const role = m.role === 'assistant' ? 'AI' : 'User';
@@ -108,6 +109,34 @@ Output JSON only:
   "confidence": 0.0-1.0,
   "reason": "<1 sentence explanation>"
 }`;
+
+  // ── Local decision fast path — intent + project are both bounded picks ──
+  if (typeof askDecision === 'function' && projects.length <= 25) {
+    const _local = await boundedDecision({
+      site: 'parseProject.match',
+      askDecision,
+      questions: [
+        { id: 'intent', type: 'choice',
+          question: 'What does the user want? launch = open/start/run a project; stop = close/stop/kill it; edit = modify/fix/update it (note: "make X show/visible" is EDIT, "show me the game" is LAUNCH); none = not project-related.',
+          options: ['launch', 'stop', 'edit', 'none'] },
+        { id: 'project', type: 'choice',
+          question: 'Which built project is the message about?',
+          options: [...projects, 'none'] },
+      ],
+      state: `Built projects: ${projects.join(', ')}\nCurrent user message: "${classifyMessage}"`,
+      local: (a) => {
+        const ii = a.intent?.index, pi = a.project?.index;
+        if (ii == null || pi == null || ii === 3 || pi >= projects.length) return null;
+        return { project: projects[pi], action: ['launch', 'stop', 'edit'][ii] };
+      },
+      remote: async () => null,
+      logger,
+    });
+    if (_local) {
+      logger.info(`[Node:ParseProject] Local decision match: ${_local.action}("${_local.project}")`);
+      return _local;
+    }
+  }
 
   try {
     const response = await llmBackend.generateAnswer(prompt, {
@@ -152,7 +181,7 @@ module.exports = async function parseProject(state) {
   } else if (llmBackend) {
     // Stage 2: LLM fallback — only runs for app_control_start messages with existing projects
     logger.debug('[Node:ParseProject] No fast name match — trying LLM fallback...');
-    match = await llmMatch(classifyMessage, projects, conversationHistory || [], llmBackend, logger);
+    match = await llmMatch(classifyMessage, projects, conversationHistory || [], llmBackend, logger, makeAskDecision(state.mcpAdapter));
   }
 
   if (!match) {

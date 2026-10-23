@@ -6,6 +6,7 @@ const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 const { fuzzyMatch } = require('../utils/fuzzyMatch');
 const { _canonicalService } = require('../utils/localPlanTemplates');
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 
 /**
  * resolveAgent.js — StateGraph node
@@ -508,7 +509,7 @@ function _parseSelectionJson(text, logger) {
   return null;
 }
 
-async function _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorQA, logger, attempt = 1, taskClassification = null, conversationHistory = null) {
+async function _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorQA, logger, attempt = 1, taskClassification = null, conversationHistory = null, askDecision = null) {
   const agentBlock = registeredAgents.length > 0
     ? `\n\nREGISTERED AGENTS:\n${registeredAgents.map(a => {
       const caps = Array.isArray(a.capabilities) ? a.capabilities.join(', ') : '';
@@ -547,6 +548,32 @@ async function _callSelectionLLM(llmBackend, userMessage, registeredAgents, prio
   const prompt = `USER TASK: "${userMessage}"${agentBlock}${priorBlock}${conversationBlock}${followUpBlock}${strictInstruction}
 
 Select the right agent(s) for this task, or ask the user if ambiguous.`;
+
+  // ── Local decision fast path ─────────────────────────────────────────────
+  // Agent selection is a bounded pick over registered agent ids. The decision
+  // model picks one; 'none'/'ask_user' sentinels or low confidence → remote
+  // path (which can generate a clarifying question). Skipped when >24 agents
+  // (systemone caps options at 26) or on strict-mode retries.
+  if (attempt === 1 && typeof askDecision === 'function' && registeredAgents.length > 0 && registeredAgents.length <= 24) {
+    const localPick = await boundedDecision({
+      site: 'resolveAgent.selection',
+      askDecision,
+      questions: [{
+        id: 'agent', type: 'choice',
+        question: `Select the right agent for this task. Pick 'none' if no registered agent fits and 'ask_user' only when genuinely ambiguous.${followUpBlock ? ' A follow-up is in progress — prefer the same service/agent as the prior turn.' : ''}`,
+        options: [...registeredAgents.map(a => `${a.id} — ${a.service || a.type || 'agent'}${a.start_url || a.startUrl ? ` (${a.start_url || a.startUrl})` : ''}`), 'none — no registered agent fits', 'ask_user — ambiguous, ask the user'],
+      }],
+      state: prompt,
+      local: (a) => {
+        const i = a.agent?.index;
+        if (i == null || i >= registeredAgents.length) return null; // sentinel → remote
+        return { agents: [{ agentId: registeredAgents[i].id, role: `use ${registeredAgents[i].id}` }], reasoning: 'local decision pick', question: null };
+      },
+      remote: async () => null, // remote path runs below on null
+      logger,
+    });
+    if (localPick?.agents?.length) return localPick;
+  }
 
   try {
     const raw = await llmBackend.generateAnswer(prompt, {
@@ -1001,7 +1028,7 @@ module.exports = async function resolveAgent(state) {
     if (progressCallback) progressCallback({ type: 'planning', message: 'Selecting the right agent…' });
     logger.info(`[Node:ResolveAgent] Round ${round + 1}/${MAX_ROUNDS} — selecting agents for: "${userMessage.slice(0, 80)}"`);
 
-    const result = await _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorAnswers, logger, 1, state._taskClassification, state.conversationHistory);
+    const result = await _callSelectionLLM(llmBackend, userMessage, registeredAgents, priorAnswers, logger, 1, state._taskClassification, state.conversationHistory, makeAskDecision(mcpAdapter));
 
     // Provider outage — every LLM backend failed. Exit the graph with a clean
     // user-facing explanation instead of an agent-selection question.

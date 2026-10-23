@@ -59,6 +59,7 @@ const ONE_SHOT_EVENT_MARKERS = ['calendar', '.event', 'booking', 'meeting', 'web
 // (message + installed skills) pair. Cache the raw LLM response for 5 minutes
 // to avoid redundant LLM calls when the user re-sends or slightly edits a
 // similar request within a short window.
+const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
 const SEMANTIC_CACHE = new Map(); // key: semanticPrompt → { value: string, expiresAt: number }
 const SEMANTIC_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -500,6 +501,33 @@ module.exports = async function parseSkill(state) {
   if (state.progressCallback) {
     try { state.progressCallback({ type: 'planning', message: 'Matching skills…' }); }
     catch (_) { /* progress callback must never block execution */ }
+  }
+
+  // ── Local decision fast path — bounded pick over the skill menu ──────────
+  // Same pick the numbered prompt makes, but one local forward pass. Only
+  // when the menu fits systemone's 26-option cap (+ 'none' sentinel).
+  if (skillsWithDesc.length <= 25) {
+    const _localSkill = await boundedDecision({
+      site: 'parseSkill.semantic',
+      askDecision: makeAskDecision(mcpAdapter),
+      questions: [{
+        id: 'skill', type: 'choice',
+        question: 'Which installed skill matches the user request? Pick "none" if no skill matches.',
+        options: [...skillsWithDesc.map(s => `${s.name} — ${(s.description || s.summary || '').slice(0, 120)}`), 'none'],
+      }],
+      state: `User request: "${classifyMessage}"`,
+      local: (a) => {
+        const i = a.skill?.index;
+        return (i != null && i < skillsWithDesc.length) ? i : null;
+      },
+      remote: async () => null, // numbered LLM call runs below on null
+      logger,
+    });
+    if (_localSkill != null) {
+      const _ls = skillsWithDesc[_localSkill];
+      logger.info(`[Node:ParseSkill] Local decision semantic match: "${classifyMessage.substring(0, 60)}" → skill "${_ls.name}" (index ${_localSkill})${userWantsToCreate ? ' (userWantsToCreate)' : ''}`);
+      return _matchedState(state, _ls.name, userWantsToCreate, _ls.sourceDomain || null, _ls.sourceAction || null);
+    }
   }
 
   try {

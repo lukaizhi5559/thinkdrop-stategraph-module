@@ -15,7 +15,7 @@
  */
 
 const { classifyTask, deriveResolution } = require('../utils/classifyTask');
-const { makeAskDecision: _makeAskDecision } = require('../utils/askDecision');
+const { makeAskDecision: _makeAskDecision, boundedDecision: _boundedDecision } = require('../utils/askDecision');
 const { forceClassifyLocalPlan, looksLikeLocalOp, SERVICE_ALIASES } = require('../utils/localPlanTemplates');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE, PAGE_ITEM_REF_RE, NAV_VERB_START_RE, NAMED_APP_RE, LEAD_AWAY_VERB_RE } = require('../utils/textPatterns.cjs');
@@ -29,26 +29,39 @@ const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATIO
  *
  * Uses maxTokens:1 + temperature:0 for the most stable possible LLM output.
  */
-async function _confirmWebAccessMode(userMessage, llmBackend, logger) {
-  if (!llmBackend || !userMessage) return 1;
-  try {
-    const prompt = `Does this prompt require the user's real browser session — login/account access, form submission — OR did the user explicitly ask to open/navigate a website or see the result in a browser or on screen? Or can it be completed with public web search/crawl alone?
+async function _confirmWebAccessMode(userMessage, llmBackend, logger, askDecision) {
+  if ((!llmBackend && typeof askDecision !== 'function') || !userMessage) return 1;
+  return _boundedDecision({
+    site: 'resolveReferencesV2.webAccessMode',
+    askDecision,
+    questions: [{
+      id: 'interactive', type: 'noul',
+      question: "Does this prompt require the user's real browser session — login/account access, form submission — OR did the user explicitly ask to open/navigate a website or see the result in a browser or on screen? false = public_read (search, browse, read, download, no browser surface); true = interactive (login, account data, form, cart, post, send, play, or explicit 'open/goto <site>' / 'in the browser' / 'on my screen' request).",
+    }],
+    state: `Prompt: "${userMessage}"`,
+    local: (a) => a.interactive?.bool == null ? null : (a.interactive.bool ? 1 : 0),
+    remote: async () => {
+      try {
+        const prompt = `Does this prompt require the user's real browser session — login/account access, form submission — OR did the user explicitly ask to open/navigate a website or see the result in a browser or on screen? Or can it be completed with public web search/crawl alone?
 
 Prompt: "${userMessage}"
 
 Answer ONLY "0" (public_read — search, browse, read, download, no browser surface requested) or "1" (interactive — login, account data, form, cart, post, send, play, or an explicit "open/goto <site>" / "in the browser" / "on my screen" request).`;
-    const raw = await llmBackend.generateAnswer(prompt, {
-      query: prompt,
-      context: { systemInstructions: 'Answer with a single digit: 0 or 1.' },
-    }, { maxTokens: 1, temperature: 0, fastMode: true, taskType: 'classification' });
-    const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
-    const answer = text.trim();
-    logger.info(`[Node:ResolveReferencesV2] binary confirmation raw="${answer}"`);
-    return answer === '0' ? 0 : 1;
-  } catch (e) {
-    logger.warn(`[Node:ResolveReferencesV2] binary confirmation failed: ${e.message} — keeping interactive`);
-    return 1;
-  }
+        const raw = await llmBackend.generateAnswer(prompt, {
+          query: prompt,
+          context: { systemInstructions: 'Answer with a single digit: 0 or 1.' },
+        }, { maxTokens: 1, temperature: 0, fastMode: true, taskType: 'classification' });
+        const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
+        const answer = text.trim();
+        logger.info(`[Node:ResolveReferencesV2] binary confirmation raw="${answer}"`);
+        return answer === '0' ? 0 : 1;
+      } catch (e) {
+        logger.warn(`[Node:ResolveReferencesV2] binary confirmation failed: ${e.message} — keeping interactive`);
+        return 1;
+      }
+    },
+    logger,
+  });
 }
 
 function stripHtml(text) {
@@ -1178,7 +1191,7 @@ module.exports = async function resolveReferencesV2(state) {
       Array.isArray(_taskClassification.interactiveActions) &&
       _taskClassification.interactiveActions.length === 0) {
     logger.info('[Node:ResolveReferencesV2] interactive mode with no listed actions — running binary confirmation');
-    const _confirm = await _confirmWebAccessMode(message, state.llmBackend || null, logger);
+    const _confirm = await _confirmWebAccessMode(message, state.llmBackend || null, logger, _makeAskDecision(state.mcpAdapter));
     if (_confirm === 0) {
       _taskClassification.webAccessMode = 'public_read';
       _taskClassification.requiresDOM = false;
@@ -1199,7 +1212,7 @@ module.exports = async function resolveReferencesV2(state) {
   if ((_taskClassification.webAccessMode === 'public_read' || _taskClassification.webAccessMode === 'download') &&
       _taskClassification.targetService) {
     logger.info(`[Node:ResolveReferencesV2] ${_taskClassification.webAccessMode} + targetService="${_taskClassification.targetService}" — running binary confirmation`);
-    const _confirm = await _confirmWebAccessMode(message, state.llmBackend || null, logger);
+    const _confirm = await _confirmWebAccessMode(message, state.llmBackend || null, logger, _makeAskDecision(state.mcpAdapter));
     if (_confirm === 1) {
       _taskClassification.webAccessMode = 'interactive';
       _taskClassification.isBrowseOnly = false;

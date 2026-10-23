@@ -2753,7 +2753,7 @@ async function planSkillsV2(state) {
         const runtimeParams = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, _priorForParams);
         const sel = parsed.commands.length === 1
           ? { index: 0, substitutions: [], params: {} }
-          : await selectCommandTemplate(parsed.commands, userMessage, backend);
+          : await selectCommandTemplate(parsed.commands, userMessage, backend, require('../utils/askDecision').makeAskDecision(mcpAdapter));
 
         if (sel !== null) {
           const selectedCmd = parsed.commands[sel.index];
