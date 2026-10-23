@@ -533,6 +533,10 @@ module.exports = async function gatherPlanContext(state) {
 
   // ── Inline Q&A loop (max MAX_ROUNDS) ─────────────────────────────────────────
   while (round < MAX_ROUNDS) {
+    if (state.abortSignal?.aborted) {
+      logger.info('[Node:GatherPlanContext] Aborted — exiting gather loop without asking further questions');
+      return state;
+    }
     if (progressCallback) progressCallback({ type: 'thinking', message: 'Checking task details…' });
     logger.info(`[Node:GatherPlanContext] Round ${round + 1}/${MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
 
@@ -910,8 +914,9 @@ Generate the frontier of questions for this task.`;
  * Phase B5: Record gather answers to user-memory as clean factual statements.
  * Fire-and-forget — doesn't block planning.
  */
-async function _recordGatherAnswersToMemory(questions, answers, mcpAdapter, userId, logger) {
+async function _recordGatherAnswersToMemory(questions, answers, mcpAdapter, userId, logger, abortSignal = null) {
   if (!questions || !answers || !mcpAdapter) return;
+  if (abortSignal?.aborted) return; // run was cancelled — don't persist stale answers
   for (const q of questions) {
     let answer = answers[q.id];
     if (answer == null) continue;
@@ -1061,7 +1066,7 @@ async function _runGrillLoop(state, logger) {
               }
             }
             // Persist to memory (fire-and-forget Phase B5 semantics)
-            _recordGatherAnswersToMemory(questions, batchAnswers, mcpAdapter, userId, logger).catch(() => {});
+            _recordGatherAnswersToMemory(questions, batchAnswers, mcpAdapter, userId, logger, state.abortSignal).catch(() => {});
           } else {
             logger.warn('[Node:GatherPlanContext:Grill] form-fill batch returned empty — proceeding with resolved values only');
           }
@@ -1083,6 +1088,10 @@ async function _runGrillLoop(state, logger) {
   let _lastRouteConfirmKey = null; // tracks repeated route confirmations for loop guard
 
   while (round < GRILL_MAX_ROUNDS) {
+    if (state.abortSignal?.aborted) {
+      logger.info('[Node:GatherPlanContext:Grill] Aborted — exiting grill loop without asking further questions');
+      return state;
+    }
     if (progressCallback) progressCallback({ type: 'gathering', message: 'Checking task details…' });
     logger.info(`[Node:GatherPlanContext:Grill] Round ${round + 1}/${GRILL_MAX_ROUNDS} — checking clarity for: "${baseMsg.slice(0, 80)}"`);
 
@@ -1502,7 +1511,7 @@ async function _runGrillLoop(state, logger) {
 
       // B5: Record answers to memory (fire-and-forget)
       if (mcpAdapter) {
-        _recordGatherAnswersToMemory(questions, batchAnswers, mcpAdapter, userId, logger).catch(e => {
+        _recordGatherAnswersToMemory(questions, batchAnswers, mcpAdapter, userId, logger, state.abortSignal).catch(e => {
           logger.warn(`[Node:GatherPlanContext:Grill] _recordGatherAnswersToMemory failed: ${e.message}`);
         });
       }

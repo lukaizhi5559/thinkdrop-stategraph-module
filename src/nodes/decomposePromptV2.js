@@ -794,7 +794,7 @@ module.exports = async function decomposePromptV2(state) {
   // still auth-checks the pinned agent.
   if (!_hasMultiGoalConjunction
       && (_tc._detPrefirePromise || looksLikeLocalOp(message))) {
-    const _fastTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    const _fastTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null);
     if (_fastTmpl) {
       logger.info(`[Node:DecomposePromptV2] Deterministic fast lane → command_automate (${_fastTmpl.template}, ${_fastTmpl.skillPlan.length} steps)`);
       const subPrompts = [{
@@ -909,7 +909,7 @@ module.exports = async function decomposePromptV2(state) {
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
     _emitIntentDecided(state, 'command_automate', 0.9);
-    const _docTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    const _docTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'active-doc-guard', intentPlan: subPrompts,
       ..._detState(_docTmpl) };
   }
@@ -1079,7 +1079,7 @@ module.exports = async function decomposePromptV2(state) {
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
     _emitIntentDecided(state, 'command_automate', 0.9);
-    const _devTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    const _devTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'device-state-guard', intentPlan: subPrompts,
       ..._detState(_devTmpl) };
   }
@@ -1102,7 +1102,7 @@ module.exports = async function decomposePromptV2(state) {
       subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
     });
     _emitIntentDecided(state, 'command_automate', 0.9);
-    const _fsTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    const _fsTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'local-probe-guard', intentPlan: subPrompts,
       ..._detState(_fsTmpl) };
   }
@@ -1130,7 +1130,7 @@ module.exports = async function decomposePromptV2(state) {
     // Adopt a force-classified plan when it hits — "open youtube.com" is a
     // plain url_open, not a service-agent task, and shouldn't pay for agent
     // selection + the full planning prompt.
-    const _siteTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    const _siteTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'site-service-guard', intentPlan: subPrompts,
       ..._detState(_siteTmpl) };
   }
@@ -1184,7 +1184,7 @@ module.exports = async function decomposePromptV2(state) {
     _emitIntentDecided(state, 'command_automate', 0.85);
     // Force-classified fast-path: one small call compiles the skillPlan for
     // unambiguous local ops — skips preflight/grill/the 84k plan prompt.
-    const _localTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger);
+    const _localTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null);
     return {
       ...state,
       _decomposedIntent: 'command_automate',
@@ -1645,7 +1645,7 @@ module.exports = async function decomposePromptV2(state) {
     // force-classified plan when the prefire/call hits (classifyTask flakes
     // around the local guards must not strand a valid compiled plan).
     const _llmTmpl = sp.estimatedIntent === 'command_automate'
-      ? await _classifyDeterministic(message, _tc, state.llmBackend, logger)
+      ? await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null)
       : null;
     return {
       ...state,
@@ -1678,7 +1678,7 @@ module.exports = async function decomposePromptV2(state) {
   _emitIntentDecided(state, collapsed[0]?.estimatedIntent, collapsed[0]?.confidence || 0.85);
   // Same adoption for collapsed single-step command_automate outcomes.
   const _collapsedTmpl = (collapsed.length === 1 && collapsed[0]?.estimatedIntent === 'command_automate')
-    ? await _classifyDeterministic(message, _tc, state.llmBackend, logger)
+    ? await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null)
     : null;
   return {
     ...state,

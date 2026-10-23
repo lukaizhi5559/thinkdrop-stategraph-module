@@ -28,6 +28,7 @@
  */
 
 const { classifyTask, deriveResolution } = require('../utils/classifyTask');
+const { makeAskDecision: _makeAskDecision } = require('../utils/askDecision');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 
 const CLARIFY_SYSTEM_PROMPT = `You are a clarification engine for a desktop assistant.
@@ -183,7 +184,7 @@ module.exports = async function clarify(state) {
 
   let newTc = tc;
   try {
-    newTc = await classifyTask(enriched, state.conversationHistory || [], state.llmBackend, logger);
+    newTc = await classifyTask(enriched, state.conversationHistory || [], state.llmBackend, logger, null, null, { askDecision: _makeAskDecision(state.mcpAdapter) });
     // deriveResolution's ack-word test must see the user's literal text, not
     // the enriched message — "yes" stays an ack even once clarified.
     newTc.resolution = deriveResolution(newTc, state.message, !!state._thoughtAttachment);

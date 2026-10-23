@@ -15,6 +15,7 @@
  */
 
 const { classifyTask, deriveResolution } = require('../utils/classifyTask');
+const { makeAskDecision: _makeAskDecision } = require('../utils/askDecision');
 const { forceClassifyLocalPlan, looksLikeLocalOp, SERVICE_ALIASES } = require('../utils/localPlanTemplates');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE, PAGE_ITEM_REF_RE, NAV_VERB_START_RE, NAMED_APP_RE, LEAD_AWAY_VERB_RE } = require('../utils/textPatterns.cjs');
@@ -713,6 +714,7 @@ module.exports = async function resolveReferencesV2(state) {
         logger,
         priorScreenSummary,
         _activeAppContext,
+        { askDecision: _makeAskDecision(state.mcpAdapter) },
       );
       if (_detPrefire && _taskClassification && typeof _taskClassification === 'object') {
         _taskClassification._detPrefirePromise = _detPrefire;

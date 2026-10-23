@@ -453,6 +453,108 @@ function _stripAttachmentTags(text) {
   return t.trim();
 }
 
+// ── Local decision-model decomposition ─────────────────────────────────────
+// The remote classifier answers a 25-field JSON schema in one shot. The local
+// decision model answers the same schema as one batched question set — every
+// bounded field becomes choice/noul and the two free-text fields become cloze.
+// Returned shape mimics the model's raw JSON so the identical sanitize/guard
+// code below runs on either source. Fields the decision path doesn't ask
+// (screenOutput content/kind/mood/payload, interactiveActions detail) stay
+// null — the lexical _applyScreenDetect guard re-derives the output side.
+const _DC_TASK_TYPES = [
+  ['local_file', 'create/open/rename/move/copy/delete/convert/find a local file or folder'],
+  ['local_system', 'query or control the OS — shell command, disk/battery/network stats, native app UI (menus, dialogs), screenshot/annotate screen. NOT content inside a web page'],
+  ['app_automation', 'use a named desktop app\'s built-in AI assistant to do work inside that app'],
+  ['browser', 'navigate/search/open a website or interact with a web page — including typing/clicking/filling elements on the CURRENTLY VISIBLE or open browser tab'],
+  ['messaging', 'send email/text/SMS/Slack/Discord/notify someone'],
+  ['scheduling', 'calendar events, reminders, recurring/scheduled tasks'],
+  ['query', 'answer a question — knowledge, or PASSIVE observation of what is currently on screen/page'],
+  ['ambiguous', 'none of the above fits'],
+];
+const _DC_BOOL_FIELDS = [
+  ['isFollowUp', 'continues or refers to something from the conversation instead of being a standalone request'],
+  ['needsClarification', 'is too ambiguous to act on and requires asking the user a question first'],
+  ['isRecurring', 'asks to repeat/schedule something on an ongoing basis'],
+  ['isBrowseOnly', 'is a browser task with NO send/message/notify intent — read/look/search only'],
+  ['requiresDOM', 'requires precise web-page DOM interaction a keyboard shortcut cannot do (fill a form, click a specific element, add to cart, filter UI)'],
+  ['isScreenFollowUp', 'refers back to content previously shown on screen'],
+  ['needsFreshScreen', 'requires a NEW screen capture to answer (content may have changed)'],
+  ['isAppUiInspection', 'asks to locate/find/show a UI element inside a named DESKTOP app'],
+  ['isSpatialAnalysis', 'asks about positions/arrangement of things on screen'],
+  ['isImageAnalysis', 'asks to analyze an attached or on-screen image'],
+  ['isConversationRecall', 'asks about this chat transcript itself ("what did I just ask")'],
+  ['isActivityQuery', 'asks about past activity/what the user was doing (episodic memory)'],
+  ['isThoughtReply', 'replies to or references a proactive assistant card/notification'],
+  ['expectsFileOutput', 'expects a file to be produced or saved'],
+  ['newDestination', 'navigates to a new destination rather than acting on the current page'],
+  ['isScreenOutput', 'asks to literally display/clear content ON the screen (overlay effect, not a file)'],
+];
+const _DC_WEB_MODES = [
+  ['none', 'no web access needed'],
+  ['download', 'download/fetch a file from the web'],
+  ['public_read', 'read public web content (search results, articles) — no login, no page mutation'],
+  ['interactive', 'drive a real browser session — click, type, fill, cart, logged-in actions'],
+];
+const _DC_DOC_REFS = [['none', 'no live-document referent'], ['file', 'a local file'], ['url', 'a web page/URL'], ['screen', 'content on screen']];
+const _DC_MEDIA = [['none', 'none'], ['image', 'image(s)'], ['video', 'video(s)']];
+const _DC_INTENTS = [
+  ['none', 'no single-step intent fits'], ['command_automate', 'run a tool/app/browser action'],
+  ['screen_intelligence', 'analyze what is on screen'], ['web_search', 'search the web'],
+  ['memory_store', 'store a fact/note'], ['memory_retrieve', 'recall a stored fact/history'],
+  ['general_knowledge', 'answer from knowledge'], ['greeting', 'greeting/chitchat'],
+  ['screen_display', 'display something on screen'], ['multi_step', 'needs full multi-step planning'],
+];
+
+async function _classifyViaDecision(askDecision, promptState, logger) {
+  const questions = [
+    { id: 'taskType', type: 'choice', options: _DC_TASK_TYPES.map(([v, h]) => `${v} — ${h}`),
+      question: 'Which task type best fits the CURRENT USER MESSAGE?' },
+    ..._DC_BOOL_FIELDS.map(([f, hint]) => ({
+      id: f, type: 'noul', question: `Does the current message ${hint}?`,
+    })),
+    { id: 'webAccessMode', type: 'choice', options: _DC_WEB_MODES.map(([v, h]) => `${v} — ${h}`),
+      question: 'What web-access mode does this task need?' },
+    { id: 'activeDocRef', type: 'choice', options: _DC_DOC_REFS.map(([v, h]) => `${v} — ${h}`),
+      question: 'What kind of live-document referent ("this file/page/screen") does the message point at, if any?' },
+    { id: 'mediaListing', type: 'choice', options: _DC_MEDIA.map(([v, h]) => `${v} — ${h}`),
+      question: 'Does the task want a listing of media, and which kind?' },
+    { id: 'suggestedIntent', type: 'choice', options: _DC_INTENTS.map(([v, h]) => `${v} — ${h}`),
+      question: 'Which single-step intent best serves this message?' },
+    { id: 'targetService', type: 'cloze',
+      question: 'What web/desktop service is named or clearly implied (e.g. gmail, amazon, notion)? Answer the bare service name, or "none".' },
+    { id: 'followUpTarget', type: 'cloze',
+      question: 'If this is a follow-up, what is the concrete resolved subject the pronouns refer to (self-contained phrase)? If standalone, answer "none".' },
+  ];
+  const r = await askDecision(questions, { state: promptState });
+  const a = r?.answers;
+  if (!a?.taskType) return null;
+  const pick = (ans, table) => {
+    const i = ans?.index;
+    return (i != null && table[i]) ? table[i][0] : null;
+  };
+  const parsed = { taskType: pick(a.taskType, _DC_TASK_TYPES) };
+  if (!parsed.taskType) return null;
+  for (const [f] of _DC_BOOL_FIELDS) parsed[f] = !!a[f]?.bool;
+  parsed.webAccessMode = pick(a.webAccessMode, _DC_WEB_MODES) || 'none';
+  parsed.activeDocRef = pick(a.activeDocRef, _DC_DOC_REFS);
+  if (parsed.activeDocRef === 'none') parsed.activeDocRef = null;
+  parsed.mediaListing = pick(a.mediaListing, _DC_MEDIA) || 'none';
+  parsed.suggestedIntent = pick(a.suggestedIntent, _DC_INTENTS);
+  if (parsed.suggestedIntent === 'none') parsed.suggestedIntent = null;
+  const txt = (id) => {
+    const s = String(a[id]?.text || '').trim();
+    return s && !/^(none|null|n\/a|no)$/i.test(s) ? s : null;
+  };
+  parsed.targetService = txt('targetService');
+  parsed.followUpTarget = txt('followUpTarget');
+  // requiresDOM implies interactive-mode work — give the downstream
+  // mutation-action guard a marker action instead of leaving [] (which would
+  // let the first-result demotion strip a real DOM task to public_read).
+  parsed.interactiveActions = parsed.requiresDOM ? ['dom_interaction'] : [];
+  logger.info(`[classifyTask] Local decision result taskType=${parsed.taskType} suggestedIntent=${parsed.suggestedIntent || 'null'} model=${r.model} ${r.elapsedMs}ms`);
+  return parsed;
+}
+
 async function classifyTask(userMessage, conversationHistory, llmBackend, logger, priorScreenSummary, activeAppContext, options = {}) {
   const _default = {
     taskType: 'ambiguous',
@@ -559,19 +661,50 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     }
     const prompt = `RECENT CONVERSATION:\n${recentCtx || '(none)'}${semanticCtx ? `\n\nRELEVANT EARLIER MESSAGES (older sessions — use only if they resolve the current message's referent):\n${semanticCtx}` : ''}${screenBlock}${activeAppBlock}\n\nCURRENT USER MESSAGE: "${classifiedMessage}"`;
 
-    const raw = await llmBackend.generateAnswer(prompt, {
-      query: prompt,
-      context: { systemInstructions: options.systemPrompt || CLASSIFY_SYSTEM_PROMPT },
-    }, { maxTokens: 120, temperature: 0, fastMode: true, taskType: 'classification' });
+    // ── Local decision-model path (P1-9) ─────────────────────────────────────
+    // options.askDecision (phi4 decision.answer client) decomposes the schema
+    // into a batched typed-question call — one local forward pass instead of
+    // a remote JSON-generation call. DECISION_LOCAL=0 disables entirely;
+    // DECISION_SHADOW=1 runs local alongside remote, logs taskType agreement,
+    // and keeps REMOTE authoritative. Malformed/unavailable → remote path.
+    let parsed = null;
+    let _decShadowP = null;
+    const _askDec = typeof options.askDecision === 'function' ? options.askDecision : null;
+    const _decOn = !!_askDec && process.env.DECISION_LOCAL !== '0';
+    const _decShadow = _decOn && process.env.DECISION_SHADOW === '1';
+    if (_decShadow) {
+      _decShadowP = _classifyViaDecision(_askDec, prompt, logger).catch(() => null);
+    } else if (_decOn) {
+      try {
+        parsed = await _classifyViaDecision(_askDec, prompt, logger);
+      } catch (e) {
+        logger.debug(`[classifyTask] Local decision failed: ${e.message} — remote fallback`);
+        parsed = null;
+      }
+    }
 
-    const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
-
-    // Use the shared parseLlmJson utility — handles markdown fences, missing
-    // boolean values, dangling commas, unterminated strings, and jsonrepair fallback.
-    const parsed = parseLlmJson(text, logger, 'classifyTask');
     if (!parsed) {
-      logger.debug('[classifyTask] No JSON in response — using default');
-      return _withResolution(_default);
+      const raw = await llmBackend.generateAnswer(prompt, {
+        query: prompt,
+        context: { systemInstructions: options.systemPrompt || CLASSIFY_SYSTEM_PROMPT },
+      }, { maxTokens: 120, temperature: 0, fastMode: true, taskType: 'classification' });
+
+      const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
+
+      // Use the shared parseLlmJson utility — handles markdown fences, missing
+      // boolean values, dangling commas, unterminated strings, and jsonrepair fallback.
+      parsed = parseLlmJson(text, logger, 'classifyTask');
+      if (_decShadowP) {
+        _decShadowP.then(sh => logger.info(
+          `[DecisionShadow] site=classifyTask agree=${!!sh && sh.taskType === parsed?.taskType} local=${sh?.taskType || 'null'} remote=${parsed?.taskType || 'null'}`
+        ));
+      }
+      if (!parsed) {
+        logger.debug('[classifyTask] No JSON in response — using default');
+        return _withResolution(_default);
+      }
+    } else if (_decOn && !_decShadow) {
+      logger.info('[classifyTask] Local decision answered — skipping remote call');
     }
 
     // Sanitize webAccessMode — only the four known values; requiresDOM forces

@@ -105,26 +105,9 @@ module.exports = async function summarizeMultiIntent(state) {
     }
   }
 
-  // ── Path 2: MCP phi4 fallback ─────────────────────────────────────────────
-  if (!combinedAnswer && mcpAdapter) {
-    try {
-      const response = await mcpAdapter.callService('phi4', 'general.answer', {
-        query: userPrompt,
-        context: { systemInstructions },
-        options: { maxTokens: 500, temperature: 0.1 },
-      });
-      const text = response?.data?.answer || response?.answer || null;
-      if (text) {
-        combinedAnswer = text;
-        combinedBy = 'mcp';
-        logger.info('[Node:SummarizeMultiIntent] Combined via MCP phi4 fallback');
-      }
-    } catch (e) {
-      logger.warn(`[Node:SummarizeMultiIntent] MCP phi4 fallback failed: ${e.message}`);
-    }
-  }
-
-  // ── Path 3: plain-text concatenation ──────────────────────────────────────
+  // ── Path 2: plain-text concatenation ──────────────────────────────────────
+  // (The old phi4 general.answer fallback was removed with the route — phi4's
+  // Ollama generation was dormant anyway and returned the offline-mode text.)
   if (!combinedAnswer) {
     combinedAnswer = intentResults
       .map((r) => `**${r.intent}**: ${r.result || '(no result)'}`)

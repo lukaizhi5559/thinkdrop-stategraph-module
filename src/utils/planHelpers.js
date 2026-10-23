@@ -578,6 +578,66 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
   const _SUBMIT_ACTION_RE = /\b(?:submit|send|post|press\s+(?:the\s+)?(?:send|submit)|click\s+(?:the\s+)?(?:send|submit)|hit\s+(?:the\s+)?(?:send|submit))\b/i;
   const _NEG_IN_STEP_RE = /\b(?:don'?t|do\s+not|never|without|except|before|until|instead|draft)\b/i;
 
+  // ── GUI-typing-on-page guard ─────────────────────────────────────────────
+  // The planner sometimes emits app.agent GUI steps for page-field typing:
+  // "Focus the address bar" (execute_shortcut Cmd+L) + "type_text" — which
+  // types into the omnibox and navigates/searches instead of filling the page
+  // field (observed: "type in the ask anything field" → text went to the
+  // address bar). Page-element typing is dom.act's lane — it can resolve the
+  // target element and verify the mutation; blind OS-level typing can't.
+  // Detect app.agent steps on a browser app whose action is GUI-level
+  // (shortcut/press/type) while the step or prompt names an in-page target,
+  // and rewrite the cluster to one dom.act step carrying the same goal.
+  const _BROWSER_APP_RE = /\b(?:chrome|safari|edge|arc|firefox|brave|orion|dia|comet|browser)\b/i;
+  const _GUI_ACTION_RE  = /^(?:execute_shortcut|shortcut|press(?:_key)?|keypress|type_text|type|focus(?:_ai)?|click)$/i;
+  const _ADDRESS_BAR_RE = /\baddress\s*bar\b|\bomnibox\b|\bcmd\s*\+\s*l\b/i;
+  const _PAGE_TARGET_RE = /\b(?:into|in|on)\s+(?:the|this|a|an|my)\s+[\w .-]{0,24}?\b(?:field|box|input|text\s*area|placeholder|search\s*(?:bar|box|field)|comment|compose|editor|form|page)\b|\b(?:field|box|input|placeholder)\s+(?:on|in)\s+(?:the|this|a)\s+page\b|\bon\s+(?:this|the)\s+page\b/i;
+  const _URL_ENTRY_RE   = /\b(?:url|website|site|link|navigate|open|go\s*to|visit|address\s*bar)\b/i;
+  const _stepText = (s) => `${s?.args?.task || ''} ${s?.args?.goal || ''} ${s?.args?.text || ''} ${s?.description || ''}`;
+  const _isGuiOnBrowser = (s) => s?.skill === 'app.agent'
+    && (_BROWSER_APP_RE.test(String(s?.args?.appName || '')) || _BROWSER_APP_RE.test(String(ctx.boundSession || ctx.boundUrl || '')))
+    && (_GUI_ACTION_RE.test(String(s?.args?.action || '')) || _ADDRESS_BAR_RE.test(_stepText(s)));
+  // Page-typing intent comes from the step text OR the prompt — the planner's
+  // step descriptions often say "the active field"/"the ask anything field".
+  const _wantsPageType = _PAGE_TARGET_RE.test(_promptLc)
+    || _PAGE_TARGET_RE.test(steps.map(_stepText).join(' '));
+  const _isPageTypeStep = (s) => _isGuiOnBrowser(s)
+    && (_PAGE_TARGET_RE.test(_stepText(s)) || _wantsPageType)
+    && !_URL_ENTRY_RE.test(_stepText(s));
+  const _isAddrFocusStep = (s) => _isGuiOnBrowser(s) && _ADDRESS_BAR_RE.test(_stepText(s));
+
+  if (_isPageTypeStep || _isAddrFocusStep) {
+    // any() probe first — only rewrite when a page-type step exists; a bare
+    // address-bar step alone is legitimate URL entry.
+    const _hasPageType = steps.some(_isPageTypeStep);
+    if (_hasPageType) {
+      let _domGoal = '';
+      const _kept = [];
+      for (let i = 0; i < steps.length; i++) {
+        const s = steps[i];
+        if (_isPageTypeStep(s)) {
+          _domGoal = (_stepText(s) || '').replace(/\s+/g, ' ').trim().slice(0, 300) || 'Type the requested text into the target field on the page';
+          rewrites.push({ index: i, kind: 'gui-type→dom.act' });
+          continue;
+        }
+        if (_isAddrFocusStep(s)) {
+          rewrites.push({ index: i, kind: 'address-bar-focus→dropped' });
+          continue;
+        }
+        _kept.push(s);
+      }
+      steps.length = 0;
+      steps.push(..._kept);
+      // Insert the dom.act step where the first rewritten step was.
+      const _insAt = Math.min(...rewrites.filter(r => r.kind === 'gui-type→dom.act').map(r => r.index), steps.length);
+      steps.splice(_insAt, 0, {
+        skill: 'dom.act',
+        args: { goal: _domGoal || String(ctx.prompt || '').slice(0, 300), ...(ctx.boundSession ? { sessionId: ctx.boundSession } : {}) },
+        description: `Type into the page field (dom.act): ${_domGoal.slice(0, 80)}`,
+      });
+    }
+  }
+
   // Extension connected → app.agent real-browser steps become session-bound
   // browser-lane steps: navigate_url opens through the extension (tab binds,
   // activates, and follow-ups can find it via /ext.sessions). app.agent's OS

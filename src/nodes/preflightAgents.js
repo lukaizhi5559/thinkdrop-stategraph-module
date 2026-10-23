@@ -884,8 +884,14 @@ module.exports = async function preflightAgents(state) {
   // return early. This removes ~5s of MCP calls and prevents spurious
   // "Sign in to X" banners on tasks that never needed an agent.
   const _isPublicWebTask = _tc.webAccessMode === 'download' || _tc.webAccessMode === 'public_read';
+  // Pure query tasks (research/Q&A, no named service) take the same exit —
+  // tool.discover + generic CLI preflight burned ~17s on prompts that only
+  // ever needed web.agent/llm skills. A query naming a service
+  // (targetService set) keeps full preflight — it may legitimately need
+  // service discovery or an agent.
+  const _isPureQuery = _tc.taskType === 'query' && !_tc.targetService;
   if (selectedAgentIds.size === 0 && createAgentSpecs.length === 0 && !recoveryContext &&
-      (_tc.taskType === 'local_file' || _tc.taskType === 'local_system' || _isPublicWebTask || _tc.activeDocRef === 'file')) {
+      (_tc.taskType === 'local_file' || _tc.taskType === 'local_system' || _isPublicWebTask || _tc.activeDocRef === 'file' || _isPureQuery)) {
     logger.info(`[Node:PreflightAgents] Fast path — no agents selected, taskType=${_tc.taskType} webAccessMode=${_tc.webAccessMode || 'n/a'} → skipping heavy preflight`);
     // Single cheap call: installed skills list (planSkillsV2 reads this)
     let _installedSkillsList = [];
@@ -930,6 +936,13 @@ module.exports = async function preflightAgents(state) {
   if (_shouldRunCliPreflight && _tc.taskType === 'app_automation') {
     _shouldRunCliPreflight = false;
     logger.info('[Node:PreflightAgents] CLI preflight skipped — taskType is app_automation (desktop/browser automation, no service CLI needed)');
+  }
+  // Pure query (research/Q&A) never needs a CLI capability scan — the generic
+  // preflight_check costs ~20s answering a question that only uses web/llm
+  // skills. A named service keeps the check — it may be a CLI-backed tool.
+  if (_shouldRunCliPreflight && _tc.taskType === 'query' && !_tc.targetService) {
+    _shouldRunCliPreflight = false;
+    logger.info('[Node:PreflightAgents] CLI preflight skipped — taskType is query with no named service');
   }
   let _selectedCliAgents = []; // descriptors of selected CLI agents to pass explicitly
   let _isGenericPreflight = false; // true when running discovery scan without typed CLI agents
@@ -1967,6 +1980,13 @@ module.exports = async function preflightAgents(state) {
     (async () => {
       if (recoveryContext) return;
       if (!userMessage || userMessage.length < 10) return;
+      // Pure query tasks don't need tool discovery — a research/Q&A prompt is
+      // answered by web.agent/llm skills; searching for external AI tools is
+      // wasted latency (and occasionally invents irrelevant tools).
+      if (_tc?.taskType === 'query' && !_canonSvc(_tc.targetService)) {
+        logger.info('[Node:PreflightAgents] Tool discovery skipped — taskType is query with no named service');
+        return;
+      }
       if (selectedAgentIds.size > 0) {
         logger.info('[Node:PreflightAgents] resolveAgent selected agents — skipping tool discovery');
         return;

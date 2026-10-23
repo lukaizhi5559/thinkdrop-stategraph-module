@@ -81,7 +81,7 @@ function looksLikeLocalOp(message) {
 // when resolveReferencesV2 already launched the classify call in parallel
 // with classifyTask (saves the serial ~2–4s). A resolved followUpTarget means
 // the prefire ran with incomplete context → reclassify with the target.
-async function _classifyDeterministic(message, tc, llmBackend, logger) {
+async function _classifyDeterministic(message, tc, llmBackend, logger, pinnedAgentId = null) {
   // The resolveReferencesV2 prefire classifies with a tc-lite (no
   // webAccessMode) — a service_task hit there survives validate, so veto
   // external (service-pinned) templates against the REAL classification at
@@ -93,6 +93,20 @@ async function _classifyDeterministic(message, tc, llmBackend, logger) {
         && tc && (tc.webAccessMode === 'public_read' || tc.isBrowseOnly === true)) {
       logger?.info?.(`[localPlanTemplates] ${hit.template} pinned a service agent but tc is public-read/browse — vetoing; not a service task`);
       return null;
+    }
+    // Capability-pin veto — comms-graph pinned a registered agent for this
+    // task (state._pinnedAgentId → resolveAgent). A deterministic plan that
+    // doesn't route through that agent bypasses the pin entirely (observed:
+    // page_nav_scan hijacked a chatgpt.agent-pinned task into a Google
+    // search). The only exception: an external template whose own
+    // serviceAgent IS the pinned agent — same lane, deterministic is fine.
+    if (hit && hit !== '__error' && pinnedAgentId) {
+      const _pin = String(pinnedAgentId).toLowerCase().replace(/\.agent$/, '');
+      const _hitAgent = String(hit.serviceAgent || '').toLowerCase().replace(/\.agent$/, '');
+      if (!hit.external || _hitAgent !== _pin) {
+        logger?.info?.(`[localPlanTemplates] ${hit.template} bypasses pinned agent ${pinnedAgentId} — vetoing; pin wins`);
+        return null;
+      }
     }
     return hit;
   };
@@ -531,6 +545,20 @@ const TEMPLATES = [
           && siteKey && siteKey !== _svc
           && !new RegExp(`\\b${siteKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(m)) {
         a.site = _svc; a.url = ''; siteKey = _svc;
+      }
+      // Named-service veto — when classifyTask resolved a targetService the nav
+      // whitelist can't serve (chatgpt, gmail, notion…) and it isn't the picked
+      // site, page_nav_scan silently redirects to a search engine (observed:
+      // "go to chat GPT and look up vegan food" → google.com/search). Defer to
+      // the service-agent path instead. When the named service IS in the
+      // whitelist but wasn't picked, coerce to the user's stated site.
+      const _svcCanon = _svc ? _canonicalService(_svc) : null;
+      const _normTok = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const _svcNamed = _svcCanon && (SERVICE_ALIASES[_svcCanon] || [_svcCanon])
+        .some(al => _normTok(al) && _normTok(m).includes(_normTok(al)));
+      if (!_rawIsLiteralUrl && _svcNamed && siteKey !== _svcCanon) {
+        if (SITE_SEARCH_URLS[_svcCanon]) { a.site = _svcCanon; a.url = ''; siteKey = _svcCanon; }
+        else return `named service "${_svc}" has no deterministic nav URL — defer to agent path`;
       }
       if (siteKey) {
         // Query: model-supplied (must be verbatim) or deterministically
