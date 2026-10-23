@@ -72,7 +72,7 @@ function _extractNavQuery(message) {
 // Lexical pre-gate: only fire the classify call when the message could
 // plausibly be a local op. This is a TRIGGER, not a decision — a miss just
 // means no prefire (the decompose site still calls the classifier directly).
-const _PRE_GATE_RE = /(?:^|[\s"'`(\[])(?:~?\/[^\s"'`)]+|\.\.?\/[^\s"'`)]+)|\b(?:battery|disk|uptime|volume|mute|unmute|screenshot|screen\s?shot|screen|terminal|shell|open|launch|quit|close|tab|remind\w*|alarm|cancel|schedule|process|wifi|bluetooth|hostname|memory|cpu|copy|move|rename|append|write|create|read|list|file|delete|trash|remove|goto|go\s+to|visit|navigate|browse|page)\b/i;
+const _PRE_GATE_RE = /(?:^|[\s"'`(\[])(?:~?\/[^\s"'`)]+|\.\.?\/[^\s"'`)]+)|\b(?:battery|disk|uptime|volume|mute|unmute|screenshot|screen\s?shot|screen|terminal|shell|open|launch|quit|close|tab|remind\w*|alarm|cancel|schedule|process|wifi|bluetooth|hostname|memory|cpu|copy|move|rename|append|write|create|read|list|file|delete|trash|remove|goto|go\s+to|visit|navigate|browse|page|type)\b/i;
 function looksLikeLocalOp(message) {
   return _PRE_GATE_RE.test(String(message || ''));
 }
@@ -674,6 +674,43 @@ const TEMPLATES = [
       // extension); engine sessions goBack on their own page. The extension
       // refuses to mint a tab for these actions.
       return [{ skill: 'browser.act', args: { action: op, sessionId: 'ext:default', timeoutMs: 10000 }, description: desc }];
+    },
+  },
+  {
+    // "type X in the <app> app / chat window" — deterministic focus →
+    // shortcut → type. Bypasses run_app_flow's LLM tier chain (which took 46s
+    // and pressed Enter twice on a "don't submit" goal). type_text types the
+    // text verbatim; {ENTER} only when the message has explicit submit intent.
+    n: 25, id: 'app_type', lowRisk: false,
+    describe: 'type/write text into a NAMED installed desktop app\'s input field (chat box, AI assistant prompt, message input, editor) — args: {app (app name verbatim from message), text (verbatim text to type)}. "type hello in the Devin app chat window", "write X in Slack but don\'t send", "type X in VS Code". NOT for typing into a browser page or a named website (service_task), and NOT for open/launch an app (app_control).',
+    validate: (a, m) => {
+      const app = String(a.app || '').trim();
+      const text = String(a.text || '').trim();
+      if (!app || !/^[\w .&'+-]{1,40}$/i.test(app)) return 'bad app name';
+      if (!String(m || '').toLowerCase().includes(app.toLowerCase())) return 'app not message-verbatim';
+      if (!text) return 'text missing';
+      if (text.length > 2000) return 'text too long';
+      if (!_resolveInstalledApp(app).installed) return `app not installed: ${app}`;
+      return null;
+    },
+    build: (a, m) => {
+      const appName = _resolveInstalledApp(a.app).appName || String(a.app).trim();
+      const msg = String(m || '');
+      const _noSubmit = /don'?t\s+(?:submit|send|save|post)|do\s+not\s+(?:submit|send|save|post)|without\s+(?:submitt?ing|sending|saving|posting|submit|send|save|post)|never\s+(?:submit|send)|leave\s+(?:it|the\s+form)\s+(?:ready|open|unsent|unsubmitted)/i.test(msg);
+      const _submit = !_noSubmit && /\b(?:send|submit|post)\s*(?:it|the message|this)?\b/i.test(msg) && /\b(?:send|submit|post)\b/i.test(msg);
+      // Focus shortcut — chat/AI mentions → focus_ai (Devin/Cursor Cmd+L),
+      // chat-input mentions → focus_input. Neither → type_text still focuses
+      // the app via verifyAppFocused.
+      const focusAction = /\b(?:ai|assistant|agent|copilot|ai chat|chat window)\b/i.test(msg) ? 'focus_ai'
+        : /\b(?:chat|message|dm|compose)\b/i.test(msg) ? 'focus_input'
+        : null;
+      const steps = [];
+      if (focusAction) {
+        steps.push({ skill: 'app.agent', args: { action: 'execute_shortcut', appName, shortcutAction: focusAction }, description: `Focus ${appName} ${focusAction === 'focus_ai' ? 'AI input' : 'input'}` });
+      }
+      steps.push({ skill: 'app.agent', args: { action: 'type_text', appName, text: String(a.text) + (_submit ? '{ENTER}' : '') }, description: `Type "${String(a.text).slice(0, 40)}" in ${appName}` });
+      steps.push({ skill: 'synthesize', args: { prompt: `Report that "${String(a.text).slice(0, 80)}" was typed into ${appName}${_submit ? ' and sent' : ' and left unsubmitted'} — report only what happened, never claim inability.` }, description: 'Report' });
+      return steps;
     },
   },
 ];

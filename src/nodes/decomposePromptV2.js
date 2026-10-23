@@ -1340,7 +1340,31 @@ module.exports = async function decomposePromptV2(state) {
     && (_tc.suggestedIntent === 'command_automate'
         || _tc.targetService
         || (_tc.interactiveActions && _tc.interactiveActions.length > 0));
-  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification' || _ambientMisref) && !_hasMultiGoalConjunction && !_screenReferent && !_actionableMessage && !_hasHighlightContext) {
+  // Entity-correction resolution — "Devon app not death app", "I meant Slack",
+  // "the Devin app" — corrects a misheard/misresolved entity from the previous
+  // task. When the message names a token that resolves to an installed app it
+  // IS actionable; memory_retrieve would answer from history and never re-run
+  // the corrected task (observed: correction → memory_retrieve → dead end).
+  const _correctionResolves = (() => {
+    try {
+      if (!/\b(?:i meant|i mean|not\s+\S|rather|actually|correction)\b/i.test(message)
+          && !/\b\w+\s+app\b/i.test(message)) return false;
+      const { _deriveAppNames, _scanApplicationsForApp } = require('../utils/probeDesktopApp.js');
+      const STOP = new Set(['app', 'the', 'not', 'and', 'for', 'meant', 'mean', 'rather', 'actually', 'this', 'that', 'please', 'want', 'type', 'hello', 'chat', 'window', 'into', 'in', 'on', 'a', 'an', 'to', 'do', 'it']);
+      const tokens = String(message).toLowerCase().match(/[a-z][a-z0-9]{2,}/g) || [];
+      for (const tok of tokens) {
+        if (STOP.has(tok)) continue;
+        const names = _deriveAppNames(tok);
+        if (names.length && _scanApplicationsForApp(names).installed) return tok;
+      }
+      return false;
+    } catch (_) { return false; }
+  })();
+  if (_correctionResolves && _tc.isFollowUp && !_tc.followUpTarget) {
+    logger.info(`[Node:DecomposePromptV2] unresolved-follow-up guard skipped — correction resolves to installed app "${_correctionResolves}"`);
+  }
+  const _isActionable = _actionableMessage || !!_correctionResolves;
+  if (((_tc.isFollowUp && !_tc.followUpTarget) || _tc.resolution === 'needs_clarification' || _ambientMisref) && !_hasMultiGoalConjunction && !_screenReferent && !_isActionable && !_hasHighlightContext) {
     logger.info(`[Node:DecomposePromptV2] Unresolved-follow-up guard: ${_ambientMisref ? 'bare deictic misresolved to ambient ' + _tc.activeDocRef : (_tc.resolution === 'needs_clarification' ? 'resolution=needs_clarification' : 'isFollowUp with null followUpTarget')} — routing to memory_retrieve (answer from history), skipping web_search on literal text`);
     const subPrompts = [{
       text: message,

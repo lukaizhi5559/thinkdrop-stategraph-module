@@ -148,6 +148,7 @@ const SERVICE_APP_NAME_ALIASES = {
   windsurf: ['Windsurf'],
   cursor: ['Cursor'],
   devin: ['Devin'],
+  devon: ['Devin'], // common speech-transcription mishearing of "Devin"
   zed: ['Zed'],
   slack: ['Slack'],
   discord: ['Discord'],
@@ -238,6 +239,36 @@ function _scanApplicationsForApp(candidateNames) {
         }
       }
     }
+  }
+
+  // Fuzzy pass (macOS) — speech transcription mishears app names ("Devon" →
+  // Devin). Per-token fuzzyMatch against installed app basenames; the tiered
+  // threshold keeps genuinely different names ("debit editor") unmatched.
+  if (process.platform === 'darwin') {
+    try {
+      const { fuzzyMatch } = require('./fuzzyMatch');
+      const appDirs = ['/Applications', path.join(os.homedir(), 'Applications')];
+      for (const dir of appDirs) {
+        let entries;
+        try { entries = fs.readdirSync(dir); } catch (_) { continue; }
+        for (const entry of entries) {
+          const baseName = entry.toLowerCase().replace(/\.app$/i, '');
+          for (const candidate of candidateNames) {
+            const cand = candidate.toLowerCase();
+            const hit = fuzzyMatch(cand, baseName)
+              || baseName.split(/\s+/).some(w => fuzzyMatch(cand, w))
+              || cand.split(/\s+/).some(w => w.length >= 4 && fuzzyMatch(w, baseName));
+            if (hit) {
+              return {
+                installed: true,
+                evidence: `fuzzy match in ${dir}: ${entry} (candidate "${candidate}")`,
+                appName: entry.replace(/\.app$/i, ''),
+              };
+            }
+          }
+        }
+      }
+    } catch (_) { /* fuzzy module missing — exact matching already ran */ }
   }
 
   // Windows: Program Files + LOCALAPPDATA (for Electron apps like VS Code, Cursor)

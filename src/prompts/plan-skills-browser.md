@@ -7,6 +7,7 @@ Domain-specific guidance for the atomic browser agents and `web.agent`. General 
 Interactive browser tasks decompose into **one step per tier** — the plan is the orchestrator, not the agent:
 
 1. **`url.first.agent`** — the ONLY step that navigates the automation session. Resolves the best URL for the task (deep-link), opens the shared session, detects auth walls. **It performs NO on-page interaction** — it never types, clicks, fills, or saves. One step per destination, and every destination may be followed by **0–N** action steps depending on the remaining work. A `url.first.agent` step alone NEVER completes a create/fill/send/add/verify goal — if the task text requests anything beyond "open/show me", emit the action steps too.
+   **Open/click/select goals are ACTIONS, not navigation.** "open the first message", "click the third result", "open that thread", "select the second option" all REQUIRE a `dom.act` (or `turn.loop.agent`) step after navigation — a `url.first.agent` + `browser.act getPageText` + `synthesize` plan can only ever DESCRIBE the item, never open it. Never substitute a read step for the open/click step; the page showing the item's sender/subject text is NOT the item being open.
    ```json
    { "skill": "url.first.agent", "args": { "agentId": "<service>.agent", "task": "go to <service> <section>" }, "description": "Navigate to <service>" }
    ```
@@ -90,6 +91,15 @@ No `url.first.agent` — the page is already on screen (the ACTIVE BROWSER SESSI
   { "skill": "synthesize", "args": { "prompt": "Confirm the calendar event was created" }, "description": "Confirm" }
 ]
 ```
+
+**Open the first message in Gmail (bound session already on screen):**
+```json
+[
+  { "skill": "dom.act", "args": { "agentId": "gmail.agent", "task": "open the first message in the inbox list" }, "description": "Open first message" },
+  { "skill": "synthesize", "args": { "prompt": "Report the opened message's sender, subject, and first lines." }, "description": "Report message" }
+]
+```
+No `url.first.agent` — the inbox is the bound page. The `dom.act` step is mandatory: "open" is a click action, and a read/synthesize step alone cannot perform it. If the session were NOT already bound, prepend `{ "skill": "url.first.agent", "args": { "agentId": "gmail.agent", "task": "open Gmail inbox" } }`.
 
 ### `browser.agent` is for MANAGEMENT actions only
 
