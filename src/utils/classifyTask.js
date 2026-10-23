@@ -36,7 +36,7 @@
 
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE, SCREEN_VISUAL_KIND_RE, SCREEN_DELIVERABLE_RE, VISUAL_INTO_APP_RE, SCREEN_CHART_RE, SCREEN_DECK_RE, SCREEN_DOC_RE, SCREEN_SCENE_RE, SCREEN_THREE_RE } = require('./textPatterns.cjs');
-const { _canonicalService } = require('./localPlanTemplates');
+const { _canonicalService, SERVICE_ALIASES } = require('./localPlanTemplates');
 
 // ── Deterministic screen-output detection ──────────────────────────────────
 // The LLM's isScreenOutput flag is advisory — phrasing is unambiguous enough
@@ -456,7 +456,12 @@ function _stripAttachmentTags(text) {
 // ── Local decision-model decomposition ─────────────────────────────────────
 // The remote classifier answers a 25-field JSON schema in one shot. The local
 // decision model answers the same schema as one batched question set — every
-// bounded field becomes choice/noul and the two free-text fields become cloze.
+// bounded field becomes choice/noul. System One models cannot generate text,
+// so the two free-text fields are handled differently:
+//   targetService   → lexical scan over SERVICE_ALIASES (below)
+//   followUpTarget  → if local says isFollowUp, we return null so the caller
+//                     runs the full remote path (referent resolution needs
+//                     generation — a minority of prompts).
 // Returned shape mimics the model's raw JSON so the identical sanitize/guard
 // code below runs on either source. Fields the decision path doesn't ask
 // (screenOutput content/kind/mood/payload, interactiveActions detail) stay
@@ -505,7 +510,23 @@ const _DC_INTENTS = [
   ['screen_display', 'display something on screen'], ['multi_step', 'needs full multi-step planning'],
 ];
 
-async function _classifyViaDecision(askDecision, promptState, logger) {
+// Lexical service extraction — replaces the free-text targetService field the
+// decision model can't emit. Word-boundary scan over SERVICE_ALIASES needles;
+// returns the canonical key. The downstream _serviceMentioned drop-guard still
+// applies for non-interactive tasks.
+function _lexicalTargetService(msg) {
+  if (!msg) return null;
+  const m = ` ${String(msg).toLowerCase()} `;
+  for (const [canon, aliases] of Object.entries(SERVICE_ALIASES)) {
+    for (const al of aliases) {
+      const esc = al.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      if (new RegExp(`\\b${esc}\\b`).test(m)) return canon;
+    }
+  }
+  return null;
+}
+
+async function _classifyViaDecision(askDecision, promptState, logger, userMessage) {
   const questions = [
     { id: 'taskType', type: 'choice', options: _DC_TASK_TYPES.map(([v, h]) => `${v} — ${h}`),
       question: 'Which task type best fits the CURRENT USER MESSAGE?' },
@@ -520,10 +541,6 @@ async function _classifyViaDecision(askDecision, promptState, logger) {
       question: 'Does the task want a listing of media, and which kind?' },
     { id: 'suggestedIntent', type: 'choice', options: _DC_INTENTS.map(([v, h]) => `${v} — ${h}`),
       question: 'Which single-step intent best serves this message?' },
-    { id: 'targetService', type: 'cloze',
-      question: 'What web/desktop service is named or clearly implied (e.g. gmail, amazon, notion)? Answer the bare service name, or "none".' },
-    { id: 'followUpTarget', type: 'cloze',
-      question: 'If this is a follow-up, what is the concrete resolved subject the pronouns refer to (self-contained phrase)? If standalone, answer "none".' },
   ];
   const r = await askDecision(questions, { state: promptState });
   const a = r?.answers;
@@ -535,18 +552,21 @@ async function _classifyViaDecision(askDecision, promptState, logger) {
   const parsed = { taskType: pick(a.taskType, _DC_TASK_TYPES) };
   if (!parsed.taskType) return null;
   for (const [f] of _DC_BOOL_FIELDS) parsed[f] = !!a[f]?.bool;
+  // Follow-ups need referent resolution (followUpTarget) — free text the
+  // decision model can't produce. Return null so the caller runs the full
+  // remote path; standalone messages (the common case) stay local.
+  if (parsed.isFollowUp) {
+    logger.debug('[classifyTask] Local decision says follow-up — remote path needed for referent resolution');
+    return null;
+  }
   parsed.webAccessMode = pick(a.webAccessMode, _DC_WEB_MODES) || 'none';
   parsed.activeDocRef = pick(a.activeDocRef, _DC_DOC_REFS);
   if (parsed.activeDocRef === 'none') parsed.activeDocRef = null;
   parsed.mediaListing = pick(a.mediaListing, _DC_MEDIA) || 'none';
   parsed.suggestedIntent = pick(a.suggestedIntent, _DC_INTENTS);
   if (parsed.suggestedIntent === 'none') parsed.suggestedIntent = null;
-  const txt = (id) => {
-    const s = String(a[id]?.text || '').trim();
-    return s && !/^(none|null|n\/a|no)$/i.test(s) ? s : null;
-  };
-  parsed.targetService = txt('targetService');
-  parsed.followUpTarget = txt('followUpTarget');
+  parsed.targetService = _lexicalTargetService(userMessage);
+  parsed.followUpTarget = null;
   // requiresDOM implies interactive-mode work — give the downstream
   // mutation-action guard a marker action instead of leaving [] (which would
   // let the first-result demotion strip a real DOM task to public_read).
@@ -673,10 +693,10 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const _decOn = !!_askDec && process.env.DECISION_LOCAL !== '0';
     const _decShadow = _decOn && process.env.DECISION_SHADOW === '1';
     if (_decShadow) {
-      _decShadowP = _classifyViaDecision(_askDec, prompt, logger).catch(() => null);
+      _decShadowP = _classifyViaDecision(_askDec, prompt, logger, classifiedMessage).catch(() => null);
     } else if (_decOn) {
       try {
-        parsed = await _classifyViaDecision(_askDec, prompt, logger);
+        parsed = await _classifyViaDecision(_askDec, prompt, logger, classifiedMessage);
       } catch (e) {
         logger.debug(`[classifyTask] Local decision failed: ${e.message} — remote fallback`);
         parsed = null;
