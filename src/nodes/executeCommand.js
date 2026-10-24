@@ -411,6 +411,73 @@ async function _thinPostFailureHandler(state) {
   const _pageUnchanged = !!(_pageSig && _lastPageSig && !_pageSig.probeError
     && JSON.stringify(_pageSig) === JSON.stringify(_lastPageSig));
 
+  // ── Missing-information gate ─────────────────────────────────────────────
+  // A skill reporting reason:'missing-information' discovered mid-run that a
+  // required input can't be resolved from any source (goal args, gathered
+  // answers, profile memory). No deterministic patch can conjure the value —
+  // the fix is back in planning: replan_step hands missingInputs to
+  // planSkillsV2 (bake args.fields, pick a skill that parses the goal, or
+  // the gather grill asks the user when the value exists nowhere). If a
+  // replan already ran for this signature, escalate to ask_user — the spec
+  // can't self-heal twice.
+  if (failedStep.reason === 'missing-information' && !failedStep.askUser) {
+    const _missing = Array.isArray(failedStep.missingInputs) ? failedStep.missingInputs : [];
+    const _qList = _missing.map(m => m.question || `What value should go in "${m.label || m.field}"?`);
+    // Plan-sourced task → plan_update loop-back: the missing input goes back
+    // to comms-graph's planning lane (the lane that authored the plan and
+    // owns the <choices> question surface). It revises the step with values
+    // baked in — or asks the user — and auto-resumes the run. The existing
+    // _planUpdate → 'plan_update' → planning-lane-revise pipeline carries it.
+    if (state._planId) {
+      logger.info(`[ExecuteCommand:ThinRecovery] missing-information on plan task — plan_update loop-back (${_missing.map(m => m.field).join(', ') || 'unspecified'})`);
+      return {
+        ...state,
+        recoveryAction: null,
+        _planUpdate: {
+          reason: `missing-information: step "${failedStep.skill}" could not resolve ${_missing.map(m => m.label || m.field).join(', ') || 'required values'}`,
+          proposal: `Re-emit the step with the values as args (args.fields/resolvedFields), or pick a skill whose contract accepts goal-carried values. If the value exists nowhere, ask the user: ${_qList.join(' ') || 'what is missing?'}`,
+          missingInputs: _missing,
+          planId: state._planId,
+          taskNum: state._planTaskNum || null,
+        },
+        patchHistory: [...patchHistory, { action: 'MISSING_INFO_PLAN', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
+    if ((patchHistory || []).some(p => p.action === 'MISSING_INFO' && p.sig === _failSig)) {
+      logger.warn(`[ExecuteCommand:ThinRecovery] missing-information survived a replan — asking user: ${_missing.map(m => m.field).join(', ')}`);
+      return {
+        ...state,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: _qList.length === 1
+            ? _qList[0]
+            : `Missing values: ${_missing.map(m => m.label || m.field).join(', ')} — ${_qList[0] || 'what should they be?'}`,
+          options: [],
+          _missingInputs: _missing,
+        },
+        patchHistory: [...patchHistory, { action: 'MISSING_INFO_ASK', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        commandExecuted: false,
+      };
+    }
+    logger.info(`[ExecuteCommand:ThinRecovery] missing-information on ${failedStep.skill} (${_missing.map(m => m.field).join(', ') || 'unspecified'}) — replan_step with missingInputs`);
+    return {
+      ...state,
+      recoveryAction: 'replan_step',
+      recoveryContext: {
+        failedSkill: failedStep.skill,
+        failedStep,
+        failureReason: `missing-information: could not resolve ${_missing.map(m => m.label || m.field).join(', ') || 'required values'} — re-emit the step with the values as args (args.fields/resolvedFields) or pick a skill whose contract accepts goal-carried values`,
+        missingInputs: _missing,
+      },
+      replanCount: replanCount + 1,
+      patchHistory: [...patchHistory, { action: 'MISSING_INFO', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
   // Stall guard — same failure signature survived ≥2 patches AND the live
   // page never moved: deterministic repair is provably not working. Escalate
   // to replan_step (or ask_user once replans also stop helping) instead of
@@ -6963,6 +7030,7 @@ Please try again or search with different terms.`;
         goalVerified: r.goalVerified === true ? true : (r.goalVerified === false ? false : null),
         postconditionVerified: r.postconditionVerified === true ? true : null,
         reason: r.reason || null,
+        missingInputs: r.missingInputs || null,
         suggestion: r.suggestion || null,
         partialProgress: r.partialProgress || null,
         content: r.content || null,
@@ -7949,6 +8017,7 @@ Please try again or search with different terms.`;
       isOAuth:    raw.isOAuth === true,
       instruction: raw.instruction || null,
       reason: raw.reason || null,
+      missingInputs: raw.missingInputs || null,
       verified: raw.verified !== undefined ? raw.verified : null,
       goalVerified: raw.goalVerified === true ? true : (raw.goalVerified === false ? false : null),
       postconditionVerified: raw.postconditionVerified === true ? true : null,

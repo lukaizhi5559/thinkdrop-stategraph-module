@@ -948,9 +948,17 @@ function stepCandidates(step, ctx = {}) {
     || tc.webAccessMode === 'interactive' || tc.requiresDOM === true
     || (Array.isArray(tc.interactiveActions) && tc.interactiveActions.length > 0);
   if (sessionish) {
-    if (_STEP_ACTION_RE.test(desc)) return _BOUND_ACTION_PICKS;
+    // Email-compose/send goals are never legal for form.fill.agent — its
+    // contract resolves profile fields and never submits; a compose+send is
+    // an app workflow (dom.act's email-compose path or tab.map).
+    const _isEmailWork = /\b(?:e-?mail|compose|inbox)\b/i.test(desc)
+      && /\b(?:send|reply|forward|compose|draft|write|fill)\b/i.test(desc);
+    const _actionPicks = _isEmailWork
+      ? _BOUND_ACTION_PICKS.filter(s => s !== 'form.fill.agent')
+      : _BOUND_ACTION_PICKS;
+    if (_STEP_ACTION_RE.test(desc)) return _actionPicks;
     if (_STEP_READ_RE.test(desc)) return _BOUND_READ_PICKS;
-    return [..._BOUND_ACTION_PICKS.slice(0, 4), 'browser.act'];
+    return [..._actionPicks.slice(0, 4), 'browser.act'];
   }
 
   if (ctx.publicWeb) return _PUBLIC_WEB_PICKS;
