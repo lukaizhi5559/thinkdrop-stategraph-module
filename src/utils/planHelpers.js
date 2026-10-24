@@ -190,6 +190,15 @@ function _validateStepSchema(steps, logger) {
         step._malformed = true;
       }
     }
+    // Atomic on-page skills: the step description IS the goal — an emitted
+    // step with no args.goal/args.task fails at runtime ("dom.act: no
+    // task/goal"). Default it instead of dropping the step.
+    if (_GOAL_ARG_SKILLS.has(step?.skill) && step.args
+        && !step.args.goal && !step.args.task
+        && typeof step.description === 'string' && step.description.trim()) {
+      step.args = { ...step.args, goal: step.description.trim() };
+      if (logger) logger.warn(`[planHelpers:parsePlan] ${step.skill} missing goal — defaulted from step description`);
+    }
   }
   return steps;
 }
@@ -212,6 +221,14 @@ function _validateStepSchema(steps, logger) {
  * Returns { plan, rewrites } — rewrites is a log-friendly list of what changed.
  */
 const _CONFIRM_ONLY_RE = /^\s*(?:please\s+)?(?:confirm(?:ed|ing)?|verify|verifying|verified|check(?:ed)?|double-check)\b[\s\S]{0,200}?\b(?:saved|written|created|applied|corrected|updated|exists|duplicated|done|completed?)\b/i;
+
+// On-page atomic skills whose args carry the goal text — a step emitted
+// without one is defaulted from its description rather than dropped.
+const _GOAL_ARG_SKILLS = new Set([
+  'dom.act', 'tab.map.agent', 'just.type.agent', 'meta.find.agent',
+  'turn.loop.agent', 'gesture.agent', 'arrow.grid.agent', 'shortcut.keys.agent',
+  'browser.act', 'form.fill.agent',
+]);
 
 function _expandHomeDir(p) {
   return p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p;
@@ -702,30 +719,6 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
 
     for (let i = 0; i < steps.length; i++) {
       const s = steps[i];
-      // "go back / return / switch to my <svc> tab" → tab-select on the bound
-      // session, not url.first + turn.loop `back` presses (observed: 8 turns
-      // of back/screenshot against a freshly created tab → ask_user).
-      {
-        const _goBack = !_goBackRewritten && (_promptGoBack || /\b(go\s+back|return|switch|focus|bring\s+me\s+back|take\s+me)\s+to\b.{0,40}\b(tab|page|site)\b/i.test(`${s?.args?.task || ''} ${s?.args?.goal || ''} ${s?.description || ''}`));
-        if (_goBack && ['url.first.agent', 'turn.loop.agent', 'dom.act', 'app.agent', 'browser.act'].includes(s?.skill)) {
-          const _agentBase = String(_stepAgentKey(s) || s?.args?.agentId || '').replace(/\.agent$|_agent$/i, '').toLowerCase();
-          const _bound = (ctx.extSessions || []).find(x =>
-            x.sessionId === `ext:${_agentBase}_agent` ||
-            (_agentBase && (x.url || '').toLowerCase().includes(_agentBase))) ||
-            (ctx.extSessions || [])[0];
-          if (_bound) {
-            steps[i] = {
-              ...s,
-              skill: 'browser.act',
-              args: { action: 'tab-select', sessionId: _bound.sessionId, timeoutMs: 10000 },
-              description: (s.description || 'Switch to the bound tab') + ` (${_bound.sessionId})`,
-            };
-            rewrites.push({ index: i, kind: 'go-back→tab-select', agentId: s.args?.agentId || null });
-            _goBackRewritten = true;
-            continue;
-          }
-        }
-      }
       // Referent reads must hit the bound tab, not a foreign research URL.
       // Observed: "shipping cost for this item" → read_url google.com —
       // the planner invented a Google fetch for a question whose answer
@@ -746,20 +739,8 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
           continue;
         }
       }
-      if (s?.skill === 'app.agent' && s?.args?.action === 'navigate_url' && typeof s.args?.url === 'string' && s.args.url) {
-        steps[i] = {
-          ...s,
-          skill: 'url.first.agent',
-          args: {
-            url: s.args.url,
-            task: s.args.task || s.description || `Open ${s.args.url}`,
-            activate: s.args.activate !== false,
-            agentId: s.args.agentId,
-            sessionId: s.args.sessionId,
-          },
-        };
-        rewrites.push({ index: i, kind: 'app.agent-navigate_url→url.first', agentId: s.args?.agentId || null });
-      }
+      // F13: app.agent navigate_url stays app.agent — the planner's lane choice
+      // stands; the lint no longer swaps it into the url.first lane.
     }
   }
 
@@ -818,68 +799,6 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
     if (uf?.skill !== 'url.first.agent') continue;
     const agentKey = _stepAgentKey(uf);
 
-    // Foreign-host nav under a bound session — a nav step whose url resolves
-    // outside the bound/live host family, for a different service than the
-    // step's own, that the prompt never named, is planner contamination (not
-    // intent). Observed: a follow-up "see baby clothes on my screen" emitted
-    // google.com/search with no agentId under a bound ext:amazon_agent —
-    // _isBoundHostStep bails on empty service so the foreign nav sailed
-    // through and hijacked the amazon tab to google. Collapse it to a bound
-    // tab-select: the live page is the referent. A prompt that names the
-    // destination ("go to google", "search bing") always keeps its nav.
-    if (_boundSessionId && typeof uf.args?.url === 'string' && uf.args.url && !/\{\{/.test(uf.args.url)) {
-      const _ufHost = _hostOf(uf.args.url);
-      const _ufBound = _ufHost && (_boundHosts.has(_ufHost) || [..._boundHosts].some(h => h.endsWith('.' + _ufHost) || _ufHost.endsWith('.' + h)));
-      const _ufUrlSvc = _svcOfHost(_ufHost);
-      const _ufStepSvc = _stepSvcOf(uf);
-      const _ufForeign = _ufBound === false && _ufHost
-        && !['browser', 'default'].includes(_ufStepSvc)
-        && (!_ufStepSvc || !_ufUrlSvc || _ufUrlSvc !== _ufStepSvc)
-        && !_promptNamesHost(_ufHost, _ufUrlSvc)
-        // The STEP's own service is named by the prompt too — "check my
-        // gmail" names 'gmail' even when url-svc resolution or a stamped
-        // session made _ufUrlSvc≠_ufStepSvc (observed: mail.google.com nav
-        // rewritten to tab-select on ext:chatgpt_agent → YouTube).
-        && !_promptNamesHost(_ufHost, _ufStepSvc);
-      // Named-destination hard veto — a prompt the classifier marked as a new
-      // destination, or whose targetService differs from the bound session's
-      // service, must keep its nav step; a bound tab can never be the referent.
-      const _ufNamedDest = ctx.taskClassification?.newDestination === true
-        || (_ufStepSvc && ctx.taskClassification?.targetService
-            && ctx.taskClassification.targetService !== _boundSvc
-            && _promptNamesHost(_ufHost, ctx.taskClassification.targetService));
-      if (_ufForeign && !_ufNamedDest) {
-        steps[i] = {
-          ...uf,
-          skill: 'browser.act',
-          args: { action: 'tab-select',
-            // Cross-service fallback forbidden: when the step names a service
-            // we have no bound session for, don't pin it to _boundSessionId
-            // (a different service's page) — use ext:default's active-tab
-            // semantics instead.
-            sessionId: _boundForSvc(_ufStepSvc) || (!_ufStepSvc || _ufStepSvc === _boundSvc ? _boundSessionId : 'ext:default'),
-            timeoutMs: 10000 },
-          description: (uf.description || 'Focus the bound tab') + ` (bound tab — foreign url ${_ufHost} dropped)`,
-        };
-        rewrites.push({ index: i, kind: 'url.first foreign-host→bound-tab-select', agentId: agentKey || null });
-        continue;
-      }
-    }
-
-    // Same-host nav under no departure → select the bound tab instead of
-    // re-navigating the user's real page to a service start URL.
-    if (!_promptLeadsAway && _boundSessionId && _isBoundHostStep(uf)) {
-      const _uhStepSvc = _stepSvcOf(uf);
-      steps[i] = {
-        ...uf,
-        skill: 'browser.act',
-        args: { action: 'tab-select', sessionId: _boundForSvc(_uhStepSvc) || (!_uhStepSvc || _uhStepSvc === _boundSvc ? _boundSessionId : 'ext:default'), timeoutMs: 10000 },
-        description: (uf.description || 'Focus the bound tab') + ' (bound tab — no navigation needed)',
-      };
-      rewrites.push({ index: i, kind: 'url.first→bound-tab-select', agentId: agentKey || null });
-      continue;
-    }
-
     // Scan the lane: same/absent agentId browser steps until the next
     // url.first.agent, a synthesize, or a non-browser step.
     const followers = [];
@@ -930,25 +849,9 @@ function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
       continue;
     }
 
-    // No residue — display-only nav candidate. Downgrade to the real-browser
-    // lane only when nothing else in the plan reuses this agent's session.
-    const _sameAgentElsewhere = steps.some((s, k) =>
-      k !== i && _BROWSER_LANE_SKILLS.has(s?.skill) && agentKey && _stepAgentKey(s) === agentKey);
-    const _url = typeof uf.args?.url === 'string' && uf.args.url && !/\{\{/.test(uf.args.url) ? uf.args.url : null;
-    // Extension connected → keep url.first even for display-only navs: ext
-    // navigation binds the tab into a session (follow-ups, /ext.sessions),
-    // which app.agent's fire-and-forget OS open never provides.
-    if (!ctx.extConnected && _NAV_ONLY_TASK_RE.test(task) && _url && !_sameAgentElsewhere) {
-      steps[i] = {
-        ...uf,
-        skill: 'app.agent',
-        args: { action: 'navigate_url', url: _url, timeoutMs: 15000 },
-        description: uf.description || `Open ${_url}`,
-      };
-      rewrites.push({ index: i, kind: 'url.first→app.agent-navigate_url', agentId: agentKey || null });
-      continue;
-    }
-
+    // No residue — display-only nav. F13: the planner's url.first lane stands
+    // (no downgrade to app.agent's fire-and-forget OS open, which navigated
+    // real Chrome outside any session — observed: amazon → prime upsell page).
     navOnlyLeftover.push({ index: i, agentId: agentKey || null, task: task.slice(0, 120) });
   }
 
@@ -989,4 +892,69 @@ function hasBrowserMutationEvidence(results) {
   });
 }
 
-module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths, getAttachedFilePaths, FILE_EDIT_INTENT_RE, CONFIRM_ONLY_RE: _CONFIRM_ONLY_RE, lintAtomicBrowserPlan, hasMutationResidue, hasBrowserMutationEvidence, _isActionCapableBrowserStep, ATOMIC_BROWSER_SKILLS: _BROWSER_LANE_SKILLS };
+// ── F23: deterministic legal-skill candidates per plan step ─────────────────
+// The policy layer. Given the task facts + step text, returns the ORDERED list
+// of skills legal for that step. The filter only narrows the option space —
+// it never picks for an ambiguous step: [] means "no policy opinion, keep the
+// planner's pick". planSkillsV2 repairs a pick that lands OUTSIDE the set
+// (single candidate → forced; N candidates → plan.skillPick typed decision).
+//
+// Buckets, first match wins:
+//   nav step            → [url.first.agent]              (single → forced)
+//   sessionish + action → [dom.act, turn.loop, meta.find, form.fill, just.type, tab.map, browser.act]
+//   sessionish + read   → [browser.act, turn.loop, dom.act, meta.find]
+//   sessionish + other  → broad browser lane (web.* still excluded)
+//   public web, no session → [web.agent, web.crawl]
+// Anything else (synthesize, edit.agent, fs.*, shell.run, cli.agent…) → [].
+
+const _GOVERNED_STEP_SKILLS = new Set([
+  ..._BROWSER_LANE_SKILLS, 'form.fill.agent', 'web.agent', 'web.crawl', 'app.agent',
+]);
+
+// "go to / open / navigate to <dest>" — but "open the first result" is an
+// on-page ACTION, not navigation; the item-noun guard separates them.
+const _STEP_NAV_VERB_RE = /\b(?:go\s+to|navigate\s+to|open|visit|take\s+(?:me\s+)?to|head\s+to|load|pull\s+up|bring\s+up|launch)\b/i;
+const _STEP_ITEM_RE = /\b(?:first|second|third|fourth|fifth|last|top|latest|newest|oldest|next|previous|that|this|the)\b[^.]{0,60}?\b(?:result|item|message|email|thread|post|link|product|listing|option|card|article|video|row|one|story|hit|match|comment|notification|tab|window|dialog|form|menu|panel|compose|sidebar|modal|box|field)\b/i;
+const _STEP_ACTION_RE = /\b(?:click|press|tap|type|fill|enter|input|submit|select|choose|check|uncheck|scroll|drag|drop|add\s+to|remove|buy|purchase|order|checkout|send|reply|forward|post|publish|compose|write|comment|delete|archive|star|mute|unmute|join|leave|accept|decline|follow|unfollow|like|save|bookmark|dismiss|expand|collapse|hover|toggle|enable|disable|apply|upload|attach|invite|schedule|book|rsvp|sign\s*in|log\s*in|log\s*out|refresh|reload|go\s+back|close|play|pause|first|second|third|\d+(?:st|nd|rd|th))\b/i;
+const _STEP_READ_RE = /\b(?:read|tell\s+me|what\s+(?:does|is|are|says|happened)|list|show\s+me|summari[sz]e|extract|get\s+(?:the\s+)?(?:text|content|info|data|page)|how\s+many|count|price|cost|title|headline|confirm|verify|check\s+(?:if|whether|that)|copy)\b/i;
+
+const _BOUND_ACTION_PICKS = ['dom.act', 'turn.loop.agent', 'meta.find.agent', 'form.fill.agent', 'just.type.agent', 'tab.map.agent', 'browser.act'];
+const _BOUND_READ_PICKS = ['browser.act', 'turn.loop.agent', 'dom.act', 'meta.find.agent'];
+const _PUBLIC_WEB_PICKS = ['web.agent', 'web.crawl'];
+const _NAV_PICKS = ['url.first.agent'];
+
+function stepCandidates(step, ctx = {}) {
+  const skill = step?.skill;
+  if (!skill || !_GOVERNED_STEP_SKILLS.has(skill)) return [];
+  const tc = ctx.tc || {};
+  const desc = String(step.description || step.args?.task || step.args?.goal || step.args?.query || '');
+
+  // A service/URL token makes "open X" a navigation; an item-noun makes it
+  // an on-page action ("open the first result" → click, not nav).
+  const mentionsDest = (ctx.targetService && new RegExp(`\\b${ctx.targetService.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(desc))
+    || /https?:\/\//i.test(desc) || /\b\w+\.(?:com|org|net|io|dev|ai|co|app)\b/i.test(desc)
+    // Task-level departure: when classifyTask flagged newDestination, a
+    // nav-verb step IS the nav even if the service token is absent from the
+    // step text ("Open ChatGPT in the browser" with targetService unset).
+    || tc.newDestination === true;
+  if (_STEP_NAV_VERB_RE.test(desc) && mentionsDest && !_STEP_ITEM_RE.test(desc)) {
+    return _NAV_PICKS;
+  }
+
+  // Sessionish = the step plausibly acts on a live/automation page: a session
+  // was promoted for this task, an earlier step in this plan navigated, or the
+  // task itself needs DOM interaction. web.* is never legal for those steps.
+  const sessionish = !!ctx.boundSessionId || !!ctx.planHasNav
+    || tc.webAccessMode === 'interactive' || tc.requiresDOM === true
+    || (Array.isArray(tc.interactiveActions) && tc.interactiveActions.length > 0);
+  if (sessionish) {
+    if (_STEP_ACTION_RE.test(desc)) return _BOUND_ACTION_PICKS;
+    if (_STEP_READ_RE.test(desc)) return _BOUND_READ_PICKS;
+    return [..._BOUND_ACTION_PICKS.slice(0, 4), 'browser.act'];
+  }
+
+  if (ctx.publicWeb) return _PUBLIC_WEB_PICKS;
+  return [];
+}
+
+module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths, getAttachedFilePaths, FILE_EDIT_INTENT_RE, CONFIRM_ONLY_RE: _CONFIRM_ONLY_RE, lintAtomicBrowserPlan, hasMutationResidue, hasBrowserMutationEvidence, _isActionCapableBrowserStep, ATOMIC_BROWSER_SKILLS: _BROWSER_LANE_SKILLS, stepCandidates };

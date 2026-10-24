@@ -97,6 +97,20 @@ function _collapseBlankRuns(text) {
   return typeof text === 'string' ? text.replace(/(\n\s*){3,}/g, '\n\n').trimEnd() : text;
 }
 
+// Strip raw tool-call markup local models sometimes emit verbatim into
+// user-facing answers (observed: <function_calls>…</function_calls> blocks
+// and orphaned tags rendered in the overlay).
+function _stripToolMarkup(text) {
+  if (typeof text !== 'string') return text;
+  return text
+    .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
+    .replace(/<\/?function_calls>/g, '')
+    .replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '')
+    .replace(/<\/?tool_call>/g, '')
+    .replace(/(\n\s*){3,}/g, '\n\n')
+    .trimEnd();
+}
+
 // Build the RECENT CONVERSATION HISTORY block injected into answer prompts.
 // Recall queries ("list my last 8 prompts", "what did I ask 3 ago") get the
 // full loaded window plus a dedicated user-prompts list — interleaved
@@ -741,6 +755,11 @@ module.exports = async function answer(state) {
       }
     } else {
       finalAnswer = _collapseBlankRuns(finalAnswer);
+    }
+    const _preStrip = finalAnswer;
+    finalAnswer = _stripToolMarkup(finalAnswer);
+    if (finalAnswer !== _preStrip && isStreaming && typeof streamCallback === 'function') {
+      streamCallback('\x00REPLACE\x00' + finalAnswer);
     }
 
     logger.debug(`[Node:Answer] Answer generated (${finalAnswer.length} chars) via ${backend.getInfo().name}`);

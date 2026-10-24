@@ -5822,8 +5822,21 @@ Please try again or search with different terms.`;
     let out = args;
     const _allResults = extraResults.length ? [...skillResults, ...extraResults] : skillResults;
 
-    if ((skillName === 'browser.act' || _SESSION_BROWSER_SKILLS.has(skillName)) && !out.sessionId && out.action !== 'navigate') {
+    if ((skillName === 'browser.act' || _SESSION_BROWSER_SKILLS.has(skillName)) && out.action !== 'navigate') {
       const lastNavigate = [..._allResults].reverse().find(r => (r.skill === 'browser.act' && r.args?.action === 'navigate' && r.ok) || (_SESSION_BROWSER_SKILLS.has(r.skill) && r.ok && (r.sessionId || r.args?.sessionId)));
+      // Stale planner-stamp correction: the planner sometimes writes a
+      // sessionId for a DIFFERENT bound tab (observed: gmail step stamped
+      // ext:youtube_agent from the previous task's context). When this task
+      // itself navigated somewhere newer, that nav session is the
+      // authoritative context — correct the stamp.
+      if (out.sessionId && lastNavigate) {
+        const _navSession = lastNavigate.args?.sessionId || lastNavigate.sessionId || null;
+        if (_navSession && _navSession !== out.sessionId) {
+          logger.warn(`[Node:ExecuteCommand] Session stamp corrected: planner's "${out.sessionId}" → this-task nav "${_navSession}" for ${skillName}`);
+          out = { ...out, sessionId: _navSession };
+        }
+      }
+      if (!out.sessionId) {
       let inheritedSession = lastNavigate?.args?.sessionId || lastNavigate?.sessionId || null;
       if (!inheritedSession && lastNavigate?.url) {
         // Derive hostname-based session the same way the command service does
@@ -5849,6 +5862,7 @@ Please try again or search with different terms.`;
         logger.info(`[Node:ExecuteCommand] Session inherit: "${inheritedSession}" → ${out.action || skillName} (lastNavigate.url=${lastNavigate?.url})`);
       } else {
         logger.info(`[Node:ExecuteCommand] Session inherit: no session found for ${out.action || skillName} (lastNavigate=${JSON.stringify(lastNavigate?.url)}, active=${state.activeBrowserSessionId})`);
+      }
       }
     }
 
@@ -6582,7 +6596,7 @@ Please try again or search with different terms.`;
             changed: raw?.changed ?? null,
             openIn: raw?.openIn ?? null,
             diff: raw?.diff ?? null,
-            error: raw?.error ?? null,
+            error: raw?.error ?? raw?.question ?? raw?.message ?? raw?.reason ?? null,
             stderr: raw?.stderr ?? null,
             exitCode: raw?.exitCode ?? null,
             askUser: raw?.askUser === true,
@@ -7820,7 +7834,10 @@ Please try again or search with different terms.`;
       links: raw.links ?? null,
       pageContext: raw.pageContext ?? null,
       stateChanged: raw.stateChanged ?? null,
-      error: raw.error || null,
+      error: raw.error || raw.question || raw.message || raw.reason || null,
+      askUser: raw.askUser === true,
+      question: raw.question ?? null,
+      options: raw.options ?? [],
       executionTime: raw.executionTime || null,
       needsManualStep: raw.needsManualStep || false,
       delegateTo: raw.delegateTo || null,

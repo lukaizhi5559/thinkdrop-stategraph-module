@@ -29,16 +29,22 @@ const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATIO
  *
  * Uses maxTokens:1 + temperature:0 for the most stable possible LLM output.
  */
-async function _confirmWebAccessMode(userMessage, llmBackend, logger, askDecision) {
+async function _confirmWebAccessMode(userMessage, llmBackend, logger, askDecision, extSessions) {
   if ((!llmBackend && typeof askDecision !== 'function') || !userMessage) return 1;
+  const _boundHosts = (extSessions || [])
+    .map(s => { try { return new URL(s.url).hostname.replace(/^www\./, ''); } catch (_) { return null; } })
+    .filter(Boolean);
+  const _boundCtx = _boundHosts.length
+    ? ` The user's browser currently has these live pages bound to automation: ${_boundHosts.join(', ')} — if the prompt acts on or continues from one of those open pages, it IS interactive.`
+    : '';
   return _boundedDecision({
     site: 'resolveReferencesV2.webAccessMode',
     askDecision,
     questions: [{
       id: 'interactive', type: 'noul',
-      question: "Does this prompt require the user's real browser session — login/account access, form submission — OR did the user explicitly ask to open/navigate a website or see the result in a browser or on screen? false = public_read (search, browse, read, download, no browser surface); true = interactive (login, account data, form, cart, post, send, play, or explicit 'open/goto <site>' / 'in the browser' / 'on my screen' request).",
+      question: "Does this prompt require the user's real browser session — login/account access, form submission — OR did the user explicitly ask to open/navigate a website or see the result in a browser or on screen, OR does it act on a page already open in the user's browser? false = public_read (search, browse, read, download, no browser surface); true = interactive (login, account data, form, cart, post, send, play, explicit 'open/goto <site>' / 'in the browser' request, OR acting on an already-open bound page)." + _boundCtx,
     }],
-    state: `Prompt: "${userMessage}"`,
+    state: `Prompt: "${userMessage}"${_boundCtx}`,
     local: (a) => a.interactive?.bool == null ? null : (a.interactive.bool ? 1 : 0),
     remote: async () => {
       try {
@@ -727,7 +733,7 @@ module.exports = async function resolveReferencesV2(state) {
         logger,
         priorScreenSummary,
         _activeAppContext,
-        { askDecision: _makeAskDecision(state.mcpAdapter) },
+        { askDecision: _makeAskDecision(state.mcpAdapter), extSessions: _extSessions },
       );
       if (_detPrefire && _taskClassification && typeof _taskClassification === 'object') {
         _taskClassification._detPrefirePromise = _detPrefire;
@@ -765,6 +771,10 @@ module.exports = async function resolveReferencesV2(state) {
     if (state._planTask || state._planFile || !_taskClassification || typeof _taskClassification !== 'object') return null;
     const _msg = String(message || '');
     const _PAGE_VERB_RE = /\b(fill|complete|click|type|enter|select|choose|tick|press|scroll|submit|sign|apply|paste|write|answer|reply|compose|post|comment|send|message|dm|check|read|view|open|close|delete|remove|add|book|buy|order|follow|like|share|upload|attach|accept|decline|invite|rsvp|join|confirm|verify|mark|archive|star|mute|play|pause|refresh|reload|download|sort|filter|draft)\b/i;
+    // Bare "search/find/look for X" — a page action when a searchable site is
+    // bound in front (Amazon search box), a web search otherwise.
+    const _BARE_SEARCH_RE = /^\s*(?:please\s+)?(?:now\s+)?(?:then\s+)?(?:search|find|look)\s+(?:for|up)\b/i;
+    const _SEARCHABLE_HOST_RE = /(amazon|ebay|etsy|walmart|target|bestbuy|aliexpress|youtube|reddit|pinterest|imdb|yelp|airbnb|booking|zillow|indeed|spotify|netflix|tiktok|wikipedia|stackoverflow|github|gitlab|npmjs|pypi|quora|medium|substack|goodreads|wayfair|homedepot|lowes|newegg|chewy|instacart|doordash|ubereats|grubhub|depop|poshmark|mercari|craigslist|realtor|redfin|kayak|expedia|hotels|trivago|nordstrom|macys|kohls|sephora|ulta|shein|temu|discogs|bandcamp|soundcloud|vimeo|dailymotion|twitch|flickr|unsplash|pexels|archive\.org|genius|allrecipes|foodnetwork|bbcgoodfood|seriouseats)\./i;
     const _PASSIVE_SI = new Set(['screen_intelligence', 'web_search', 'question', 'general_knowledge', 'memory_retrieve', 'query']);
     const _si = String(_taskClassification.suggestedIntent || '');
     const _browserish = _taskClassification.webAccessMode === 'interactive'
@@ -773,7 +783,8 @@ module.exports = async function resolveReferencesV2(state) {
       || _taskClassification.taskType === 'messaging'
       || _si === 'command_automate'
       || (Array.isArray(_taskClassification.interactiveActions) && _taskClassification.interactiveActions.length > 0)
-      || (_PASSIVE_SI.has(_si) && _PAGE_VERB_RE.test(_msg));
+      || (_PASSIVE_SI.has(_si) && _PAGE_VERB_RE.test(_msg))
+      || (_PASSIVE_SI.has(_si) && _BARE_SEARCH_RE.test(_msg));
     if (!_browserish) return null;
 
     // Live page candidates — bound extension tabs + the frontmost browser URL.
@@ -841,6 +852,24 @@ module.exports = async function resolveReferencesV2(state) {
     for (const m of _msg.matchAll(_QUALIFIED_VERB_RE)) {
       if (_isDestObject(_msg.slice(m.index + m[0].length))) { _leadAway = true; break; }
     }
+    // Tier 0.5 — bound-search: a bare "search/find/look for X" with no named
+    // destination binds to the live tab on a searchable host — the site's own
+    // search box does the work, not a public web search. Runs BEFORE the
+    // destination veto: a bare search cannot declare a destination, so
+    // newDestination/leadAway are meaningless for this shape (observed:
+    // "search for baby mittens" with ext:amazon_agent bound arrived with
+    // newDestination:true hallucinated by the classifier). Most recently
+    // active bound tab wins; non-searchable live pages fall through.
+    if (!_named.size && _BARE_SEARCH_RE.test(_msg)) {
+      const _searchable = _live
+        .filter(c => _SEARCHABLE_HOST_RE.test(_hostOf(c.url)))
+        .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
+      const _cand = _searchable.find(c => c.bound) || _searchable[0];
+      if (_cand && _extConnected) {
+        return { sessionId: _cand.bound ? _cand.sessionId : 'ext:default', url: _cand.url, title: _cand.title, service: null, via: 'bound-search', boundSession: !!_cand.bound };
+      }
+    }
+
     // Veto layer 3 — semantic: the classifier saw a destination change.
     if (_leadAway || _taskClassification.newDestination === true) return null;
 
@@ -1189,9 +1218,10 @@ module.exports = async function resolveReferencesV2(state) {
   if (_taskClassification.webAccessMode === 'interactive' &&
       _taskClassification.taskType === 'browser' &&
       Array.isArray(_taskClassification.interactiveActions) &&
-      _taskClassification.interactiveActions.length === 0) {
+      _taskClassification.interactiveActions.length === 0 &&
+      !state._onScreenRef) {
     logger.info('[Node:ResolveReferencesV2] interactive mode with no listed actions — running binary confirmation');
-    const _confirm = await _confirmWebAccessMode(message, state.llmBackend || null, logger, _makeAskDecision(state.mcpAdapter));
+    const _confirm = await _confirmWebAccessMode(message, state.llmBackend || null, logger, _makeAskDecision(state.mcpAdapter), _extSessions);
     if (_confirm === 0) {
       _taskClassification.webAccessMode = 'public_read';
       _taskClassification.requiresDOM = false;

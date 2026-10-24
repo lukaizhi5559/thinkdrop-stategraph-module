@@ -1442,7 +1442,18 @@ module.exports = async function preflightAgents(state) {
               const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
               const profileDir = `${svcKey}_agent`;
               const profilePath = path.join(BROWSER_PROFILES_DIR, profileDir);
-              const hasSession = fs.existsSync(profilePath);
+              // F14: under extension-first, the user's real Chrome IS the
+              // session — an engine profile dir proves nothing about their
+              // login state. A bound ext tab for this service is hard evidence
+              // of a live session; the login wall itself is detected in-page.
+              const _extSvcBound = !!state._extConnected && (state._extSessions || []).some(s => {
+                try {
+                  const host = new URL(s.url || '').hostname.replace(/^www\./, '');
+                  const svcHost = (a.start_url ? new URL(a.start_url).hostname.replace(/^www\./, '') : '') || `${svcKey}.`;
+                  return host === svcHost || host.endsWith('.' + svcHost) || svcHost.endsWith('.' + host) || host.split('.')[0] === svcKey;
+                } catch (_) { return false; }
+              });
+              const hasSession = fs.existsSync(profilePath) || state._extConnected === true;
               const profileCookies = _browserProfileHasCookies(a.id);
 
               const _cachedAuth = _getCachedAuth(a.id);
@@ -1474,7 +1485,7 @@ module.exports = async function preflightAgents(state) {
               } else if (_isPublicWebTask) {
                 authed = true; _authedReason = 'public-web';
                 _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
-              } else if (_ledgerFailed) {
+              } else if (_ledgerFailed && !state._extConnected) {
                 _forceAuthRequired = true;
               } else if (_ledgerAuthed || _provisionalAuthedAt) {
                 authed = true; _authedReason = 'ledger';
@@ -1482,6 +1493,13 @@ module.exports = async function preflightAgents(state) {
               } else if (_ledgerNeedsAuth === 0) {
                 authed = true; _authedReason = 'needsAuth0';
                 _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
+              } else if (_extSvcBound) {
+                // F14 bound-session short-circuit: the user's real Chrome has
+                // a live tab on this service — that IS the session. The login
+                // wall (if any) surfaces on first in-page load and triggers the
+                // NEED_AUTH pause/banner/resume flow truthfully.
+                authed = true; _authedReason = 'ext-bound';
+                _authTag = ' [AUTHENTICATED — live bound session in real Chrome]';
               } else if (profileCookies) {
                 // Pre-ledger session migration — can't prove login from a Cookies
                 // file, but the profile was likely authenticated before tracking
@@ -1497,7 +1515,14 @@ module.exports = async function preflightAgents(state) {
                 }
                 _writeLedgerAuth(a.id, { needsAuth: _need });
                 if (_need === 1) {
-                  _forceAuthRequired = true;
+                  if (state._extConnected) {
+                    // F14: don't pre-gate on an engine-era answer — drive the
+                    // user's real Chrome; an actual login wall pauses in-page.
+                    authed = true; _authedReason = 'ext-first-optimistic';
+                    _authTag = ' [SESSION VIA USER CHROME — login wall detected in-page]';
+                  } else {
+                    _forceAuthRequired = true;
+                  }
                 } else {
                   authed = true; _authedReason = 'first-contact-public';
                   _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
@@ -2980,7 +3005,13 @@ module.exports = async function preflightAgents(state) {
   // contradict that constraint (and produced youtube.agent for "find videos
   // from X" listing prompts).
   const singleRouteMandate = {};
-  if (_isPublicWebTask) {
+  // A pinned/selected service agent is a concrete "use this service" signal —
+  // under ext-first a named-service nav always rides the browser lane, so the
+  // public_read label must not suppress the mandate (observed: "go to youtube"
+  // → mandate skipped → grill asked "Open YouTube in your browser?" on a
+  // route that was already predetermined).
+  const _pinnedSvc = state._pinnedAgentId ? String(state._pinnedAgentId).replace(/\.agent$/i, '').toLowerCase() : null;
+  if (_isPublicWebTask && !_pinnedSvc) {
     logger.info(`[Node:PreflightAgents] Skipping single-route mandate — webAccessMode=${_tc.webAccessMode} (public web task, no service agent)`);
   } else {
     const _readyByService = new Map();
@@ -3072,7 +3103,12 @@ module.exports = async function preflightAgents(state) {
   // chain itself burns web-search + crawl calls the task doesn't need.
   // In-page nav ("go back on this page") has no destination at all — resolving
   // one minted a fresh tab for a history request.
-  for (const a of (_isPublicWebTask || _isInPageNav) ? [] : agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
+  // F15: bare nav to a named service (newDestination, no interactive actions)
+  // goes to the canonical startUrl — a cached deep-link overrides it with a
+  // stale page ("go to youtube" → a random watch?v= video; "go to amazon" →
+  // the prime upsell redirect). Deep-links belong to content-targeted tasks.
+  const _bareNav = _tc?.newDestination === true && !(_tc?.interactiveActions || []).length;
+  for (const a of (_isPublicWebTask || _isInPageNav || _bareNav) ? [] : agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
     const deepLink = await _resolveDeepLinkForAgent(a, userMessage);
     if (deepLink) {
       a.deepLinkUrl = deepLink.url || deepLink;

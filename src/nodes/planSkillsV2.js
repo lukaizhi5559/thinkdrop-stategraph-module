@@ -507,6 +507,103 @@ function _provenInstallPkgs() {
   return pkgs;
 }
 
+// ── F23: legal-skill adjudication ──────────────────────────────────────────
+// stepCandidates() (deterministic policy) returns each governed step's legal
+// skill set. A pick already inside the set stands — the LLM's skill choice IS
+// the adjudication when it's legal. A pick OUTSIDE the set gets repaired:
+// one candidate → forced; N candidates → one plan.skillPick typed-decision
+// call (~300-600ms local) chooses among the legal options. On decision failure
+// the LLM pick is kept (fail-open to prior behavior — never blocks a plan).
+// Deliberately NOT run through boundedDecision/shadow: remote here would be
+// the very pick being repaired.
+
+function _argsForRepairedSkill(skill, step, ctx) {
+  const prev = step.args || {};
+  const desc = String(step.description || prev.task || prev.goal || prev.query || '').trim();
+  switch (skill) {
+    case 'dom.act':
+    case 'just.type.agent':
+    case 'meta.find.agent':
+    case 'tab.map.agent':   return { task: desc || prev.task };
+    case 'form.fill.agent': return { task: desc || prev.task };
+    case 'turn.loop.agent': return { goal: desc || prev.goal, mode: prev.mode || 'act' };
+    case 'browser.act':     return { action: 'getPageText' };
+    case 'url.first.agent': return {
+      url: prev.url || ctx.homeUrl || undefined,
+      task: desc || prev.task,
+      agentId: prev.agentId || (ctx.targetService ? `${ctx.targetService}.agent` : undefined),
+    };
+    case 'web.agent':       return { action: 'site_search', query: desc || prev.query, domain: ctx.targetService || prev.domain };
+    case 'web.crawl':       return { url: prev.url || ctx.urlHint };
+    default:                return prev;
+  }
+}
+
+async function _adjudicateSkillPicks(skillPlan, state, logger, mcpAdapter, userMessage) {
+  if (!Array.isArray(skillPlan) || !skillPlan.length) return skillPlan;
+  const { stepCandidates } = require('../utils/planHelpers');
+  const _tc = state._taskClassification || {};
+  const ctx = {
+    tc: _tc,
+    targetService: _tc.targetService || null,
+    boundSessionId: state.activeBrowserSessionId || null,
+    publicWeb: ['download', 'public_read'].includes(_tc.webAccessMode),
+    urlHint: state.activeBrowserUrl || state._priorScreenContext?.url || null,
+    homeUrl: null,
+  };
+  if (ctx.targetService) {
+    try {
+      const { _serviceHomeUrl } = require('../utils/localPlanTemplates');
+      ctx.homeUrl = _serviceHomeUrl(ctx.targetService);
+    } catch (_) {}
+  }
+  let _askDec = null;
+  try { _askDec = require('../utils/askDecision').makeAskDecision(mcpAdapter); } catch (_) {}
+
+  let planHasNav = false;
+  const out = [];
+  for (const step of skillPlan) {
+    let next = step;
+    const cands = stepCandidates(step, { ...ctx, planHasNav });
+    if (cands.length && !cands.includes(step.skill)) {
+      const _desc = String(step.description || step.args?.task || step.args?.goal || step.args?.query || '').slice(0, 120);
+      let picked = null;
+      if (cands.length === 1) {
+        picked = cands[0];
+        logger.info(`[Node:PlanSkillsV2] plan.skillPick "${_desc}": ${step.skill}→${picked} (single legal candidate)`);
+      } else if (_askDec) {
+        const q = [{
+          id: 'skill', type: 'choice', options: cands,
+          question: `A browser task step says: "${_desc}". Which skill should execute it?`
+            + (ctx.boundSessionId ? ` A live browser session "${ctx.boundSessionId}" is already bound — the step acts on that open page.` : ''),
+        }];
+        try {
+          const r = await _askDec(q, { state: `task: ${String(userMessage || '').slice(0, 300)}\nservice: ${ctx.targetService || 'none'}\nstep: ${_desc}` });
+          const a = r?.answers?.skill;
+          const v = a?.index != null ? cands[a.index] : (cands.includes(a?.answer) ? a.answer : null);
+          // Confidence floor: a sub-0.5 pick is a guess (observed conf=0.27 →
+          // dom.act "fetch and extract" hang). Fall back to candidates[0] —
+          // the lists are policy-ordered, so index 0 IS the safe default —
+          // never back to the planner's out-of-set pick.
+          if (v && (a?.confidence == null || a.confidence >= 0.5)) {
+            picked = v;
+            logger.info(`[Node:PlanSkillsV2] plan.skillPick "${_desc}": ${step.skill}→${v} (decision, ${r.elapsedMs}ms${typeof a?.confidence === 'number' ? ` conf=${a.confidence}` : ''})`);
+          }
+        } catch (e) {
+          logger.debug(`[Node:PlanSkillsV2] plan.skillPick decision failed: ${e.message}`);
+        }
+      }
+      if (!picked) picked = cands[0]; // ordered-default — always legal
+      if (picked !== step.skill) {
+        next = { ...step, skill: picked, args: _argsForRepairedSkill(picked, step, ctx) };
+      }
+    }
+    if (next.skill === 'url.first.agent' || (next.skill === 'browser.agent' && ['navigate', 'run'].includes(next.args?.action))) planHasNav = true;
+    out.push(next);
+  }
+  return out;
+}
+
 function _sanitizeSkillPlan(skillPlan, state) {
   if (!Array.isArray(skillPlan)) return skillPlan;
   const _log = state?.logger || console;
@@ -1284,8 +1381,14 @@ function _buildSystemPrompt(userMessage, state) {
   // webfetch appendix — web.agent + web.crawl + curl patterns, no browser.agent.
   // Also load it when the referent is the open web page — crawl/curl patterns
   // are the deterministic path for reading/saving/printing it.
-  const _needsWebFetch = ['download', 'public_read'].includes(_tc?.webAccessMode)
-    || _tc?.activeDocRef === 'url';
+  // VETO (F19): a promoted bound session means the prompt refers to that live
+  // page — web-fetch guidance is the wrong vocabulary for click/read/action
+  // steps on it. Only applies when the task isn't departing to a new site.
+  const _boundSessionHoldsReferent = !!state.activeBrowserSessionId
+    && _tc?.newDestination !== true;
+  const _needsWebFetch = (['download', 'public_read'].includes(_tc?.webAccessMode)
+    || _tc?.activeDocRef === 'url')
+    && !_boundSessionHoldsReferent;
 
   const _isNativeDesktopTask = _tc?.taskType !== 'browser'
     && !(_tc?.taskType === 'query' && !_tc?.targetService && !_tc?.isAppUiInspection); // exclude pure abstract knowledge Q (but not named-app UI inspection)
@@ -1756,7 +1859,11 @@ A step whose goal is to install, set up, configure, authenticate, sign in to, or
   // Some base prompts and agent-selection paths leak browser.agent examples.
   // For public_read/download tasks, forbid any browser/agent step and force the
   // web.agent + web.crawl path. This is a final guard, not a suggestion.
-  const _publicWebGuard = ['download', 'public_read'].includes(_tc?.webAccessMode);
+  // VETO (F19): same bound-session rule as _needsWebFetch above — a promoted
+  // session means this prompt acts on the live page, so the web-only lane
+  // ("click the first result" → web.crawl) must not forbid browser skills.
+  const _publicWebGuard = ['download', 'public_read'].includes(_tc?.webAccessMode)
+    && !_boundSessionHoldsReferent;
   if (_publicWebGuard) {
     result += `\n\n## CRITICAL: PUBLIC WEB MODE — BROWSER SKILLS FORBIDDEN
 
@@ -3538,6 +3645,12 @@ The user's request does NOT match any installed skill.
       skillPlan = _linted.plan;
     }
   }
+
+  // ── F23: legal-skill adjudication per step ────────────────────────────────
+  // Deterministic candidate sets (policy) + plan.skillPick repair (judgment).
+  // Runs before session stamping/deep-link injection so those passes see the
+  // final skills. No-ops on template plans (already-legal picks stand).
+  skillPlan = await _adjudicateSkillPicks(skillPlan, state, logger, mcpAdapter, userMessage);
 
   // ── Inject direct deep-link URLs from preflight ───────────────────────────
   // Shared with the deterministic-template path (which adopts plans before the

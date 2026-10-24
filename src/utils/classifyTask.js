@@ -476,24 +476,31 @@ const _DC_TASK_TYPES = [
   ['query', 'answer a question — knowledge, or PASSIVE observation of what is currently on screen/page'],
   ['ambiguous', 'none of the above fits'],
 ];
-const _DC_BOOL_FIELDS = [
+// Core flags — asked on EVERY task (single ≤12-question call). Routing-critical.
+const _DC_CORE_BOOLS = [
   ['isFollowUp', 'continues or refers to something from the conversation instead of being a standalone request'],
   ['needsClarification', 'is too ambiguous to act on and requires asking the user a question first'],
   ['isRecurring', 'asks to repeat/schedule something on an ongoing basis'],
   ['isBrowseOnly', 'is a browser task with NO send/message/notify intent — read/look/search only'],
   ['requiresDOM', 'requires precise web-page DOM interaction a keyboard shortcut cannot do (fill a form, click a specific element, add to cart, filter UI)'],
+  ['isConversationRecall', 'asks about this chat transcript itself ("what did I just ask")'],
+  ['isActivityQuery', 'asks about past activity/what the user was doing (episodic memory)'],
+  ['expectsFileOutput', 'expects a file to be produced or saved'],
+  ['newDestination', 'navigates to a new destination rather than acting on the current page'],
+];
+// Lazy flags — screen/doc/media family. Only asked when the core pass or the
+// context indicates screen/doc relevance (second batched call); they classify
+// better WITH that context anyway. Missing answers default to false/none.
+const _DC_LAZY_BOOLS = [
   ['isScreenFollowUp', 'refers back to content previously shown on screen'],
   ['needsFreshScreen', 'requires a NEW screen capture to answer (content may have changed)'],
   ['isAppUiInspection', 'asks to locate/find/show a UI element inside a named DESKTOP app'],
   ['isSpatialAnalysis', 'asks about positions/arrangement of things on screen'],
   ['isImageAnalysis', 'asks to analyze an attached or on-screen image'],
-  ['isConversationRecall', 'asks about this chat transcript itself ("what did I just ask")'],
-  ['isActivityQuery', 'asks about past activity/what the user was doing (episodic memory)'],
   ['isThoughtReply', 'replies to or references a proactive assistant card/notification'],
-  ['expectsFileOutput', 'expects a file to be produced or saved'],
-  ['newDestination', 'navigates to a new destination rather than acting on the current page'],
   ['isScreenOutput', 'asks to literally display/clear content ON the screen (overlay effect, not a file)'],
 ];
+const _DC_BOOL_FIELDS = [..._DC_CORE_BOOLS, ..._DC_LAZY_BOOLS];
 const _DC_WEB_MODES = [
   ['none', 'no web access needed'],
   ['download', 'download/fetch a file from the web'],
@@ -514,6 +521,27 @@ const _DC_INTENTS = [
 // decision model can't emit. Word-boundary scan over SERVICE_ALIASES needles;
 // returns the canonical key. The downstream _serviceMentioned drop-guard still
 // applies for non-interactive tasks.
+// Live registry scan — SERVICE_ALIASES is a curated list (~17 services) but
+// ~/.thinkdrop/agents/*.agent.md knows every provisioned service (chatgpt,
+// etsy, grok, claude…). Cached 60s; a directory read is ~1ms.
+let _AGENT_NAMES_CACHE = null, _AGENT_NAMES_TS = 0;
+function _registeredServiceNames() {
+  const now = Date.now();
+  if (_AGENT_NAMES_CACHE && now - _AGENT_NAMES_TS < 60000) return _AGENT_NAMES_CACHE;
+  try {
+    const dir = require('path').join(require('os').homedir(), '.thinkdrop', 'agents');
+    const names = new Set();
+    for (const f of require('fs').readdirSync(dir)) {
+      if (f.endsWith('.agent.md')) names.add(f.slice(0, -'.agent.md'.length));
+    }
+    _AGENT_NAMES_CACHE = names;
+    _AGENT_NAMES_TS = now;
+    return names;
+  } catch (_) {
+    return _AGENT_NAMES_CACHE || new Set();
+  }
+}
+
 function _lexicalTargetService(msg) {
   if (!msg) return null;
   const m = ` ${String(msg).toLowerCase()} `;
@@ -523,34 +551,32 @@ function _lexicalTargetService(msg) {
       if (new RegExp(`\\b${esc}\\b`).test(m)) return canon;
     }
   }
+  // Registry fallback — a bare service name token that matches a registered
+  // agent ("open chatgpt") resolves even without a curated alias.
+  const regs = _registeredServiceNames();
+  for (const w of m.split(/[^a-z0-9_]+/)) {
+    if (w && regs.has(w)) return w;
+  }
   return null;
 }
 
+const _noulQ = ([f, hint]) => ({ id: f, type: 'noul', question: `Does the current message ${hint}?` });
+
 async function _classifyViaDecision(askDecision, promptState, logger, userMessage) {
-  const questions = [
+  // Core batch — exactly 12 questions → ONE call (~1.5–2.5s vs two sequential
+  // chunk calls for the old 21-question batch). The screen/doc/media family
+  // moves to a lazy second call that only fires when relevant.
+  const _coreQs = [
     { id: 'taskType', type: 'choice', options: _DC_TASK_TYPES.map(([v, h]) => `${v} — ${h}`),
       question: 'Which task type best fits the CURRENT USER MESSAGE?' },
-    ..._DC_BOOL_FIELDS.map(([f, hint]) => ({
-      id: f, type: 'noul', question: `Does the current message ${hint}?`,
-    })),
-    { id: 'webAccessMode', type: 'choice', options: _DC_WEB_MODES.map(([v, h]) => `${v} — ${h}`),
-      question: 'What web-access mode does this task need?' },
-    { id: 'activeDocRef', type: 'choice', options: _DC_DOC_REFS.map(([v, h]) => `${v} — ${h}`),
-      question: 'What kind of live-document referent ("this file/page/screen") does the message point at, if any?' },
-    { id: 'mediaListing', type: 'choice', options: _DC_MEDIA.map(([v, h]) => `${v} — ${h}`),
-      question: 'Does the task want a listing of media, and which kind?' },
     { id: 'suggestedIntent', type: 'choice', options: _DC_INTENTS.map(([v, h]) => `${v} — ${h}`),
       question: 'Which single-step intent best serves this message?' },
+    { id: 'webAccessMode', type: 'choice', options: _DC_WEB_MODES.map(([v, h]) => `${v} — ${h}`),
+      question: 'What web-access mode does this task need?' },
+    ..._DC_CORE_BOOLS.map(_noulQ),
   ];
-  // Chunk the batch — ~23 questions in one call overshot the old timeout and
-  // serialize model time; parallel chunks of ≤12 halve wall-clock on multi-
-  // core boxes and keep per-request latency under the (scaled) timeout.
-  const _CHUNK = 12;
-  const _chunks = [];
-  for (let i = 0; i < questions.length; i += _CHUNK) _chunks.push(questions.slice(i, i + _CHUNK));
-  const _rs = await Promise.all(_chunks.map(c => askDecision(c, { state: promptState })));
-  const r = _rs.find(Boolean) || null;
-  const a = _rs.reduce((acc, rr) => (rr?.answers ? Object.assign(acc, rr.answers) : acc), null);
+  const r = await askDecision(_coreQs, { state: promptState });
+  const a = r?.answers ? { ...r.answers } : null;
   if (!a?.taskType) return null;
   const pick = (ans, table) => {
     const i = ans?.index;
@@ -558,7 +584,39 @@ async function _classifyViaDecision(askDecision, promptState, logger, userMessag
   };
   const parsed = { taskType: pick(a.taskType, _DC_TASK_TYPES) };
   if (!parsed.taskType) return null;
-  for (const [f] of _DC_BOOL_FIELDS) parsed[f] = !!a[f]?.bool;
+  for (const [f] of _DC_CORE_BOOLS) parsed[f] = !!a[f]?.bool;
+  for (const [f] of _DC_LAZY_BOOLS) parsed[f] = false;
+  parsed.activeDocRef = null;
+  parsed.mediaListing = 'none';
+  parsed.suggestedIntent = pick(a.suggestedIntent, _DC_INTENTS);
+  if (parsed.suggestedIntent === 'none') parsed.suggestedIntent = null;
+
+  // Lazy second batch — only when the task plausibly involves screen/doc
+  // content (screen verbs, live-context capture present, or a desktop-app
+  // task). ~8 questions; missing answers keep their false/none defaults.
+  const _screenish = parsed.taskType === 'local_system'
+    || /\b(screen|on\s*screen|screenshot|display|show\s+me|overlay|on\s*this\s*page|this\s*(file|document|image|photo)|arrange|layout|position)\b/i.test(String(userMessage || ''))
+    || /\b(screen|screenshot|capture)\b/i.test(String(promptState || '').slice(0, 500));
+  if (_screenish) {
+    const _lazyQs = [
+      { id: 'activeDocRef', type: 'choice', options: _DC_DOC_REFS.map(([v, h]) => `${v} — ${h}`),
+        question: 'What kind of live-document referent ("this file/page/screen") does the message point at, if any?' },
+      { id: 'mediaListing', type: 'choice', options: _DC_MEDIA.map(([v, h]) => `${v} — ${h}`),
+        question: 'Does the task want a listing of media, and which kind?' },
+      ..._DC_LAZY_BOOLS.map(_noulQ),
+    ];
+    try {
+      const r2 = await askDecision(_lazyQs, { state: promptState });
+      const a2 = r2?.answers;
+      if (a2) {
+        for (const [f] of _DC_LAZY_BOOLS) parsed[f] = !!a2[f]?.bool;
+        parsed.activeDocRef = pick(a2.activeDocRef, _DC_DOC_REFS);
+        if (parsed.activeDocRef === 'none') parsed.activeDocRef = null;
+        parsed.mediaListing = pick(a2.mediaListing, _DC_MEDIA) || 'none';
+      }
+    } catch (_) { /* lazy batch failed — screen/doc flags stay at safe defaults */ }
+  }
+
   // Follow-ups need referent resolution (followUpTarget) — free text the
   // decision model can't produce. Return null so the caller runs the full
   // remote path; standalone messages (the common case) stay local.
@@ -567,18 +625,13 @@ async function _classifyViaDecision(askDecision, promptState, logger, userMessag
     return null;
   }
   parsed.webAccessMode = pick(a.webAccessMode, _DC_WEB_MODES) || 'none';
-  parsed.activeDocRef = pick(a.activeDocRef, _DC_DOC_REFS);
-  if (parsed.activeDocRef === 'none') parsed.activeDocRef = null;
-  parsed.mediaListing = pick(a.mediaListing, _DC_MEDIA) || 'none';
-  parsed.suggestedIntent = pick(a.suggestedIntent, _DC_INTENTS);
-  if (parsed.suggestedIntent === 'none') parsed.suggestedIntent = null;
   parsed.targetService = _lexicalTargetService(userMessage);
   parsed.followUpTarget = null;
   // requiresDOM implies interactive-mode work — give the downstream
   // mutation-action guard a marker action instead of leaving [] (which would
   // let the first-result demotion strip a real DOM task to public_read).
   parsed.interactiveActions = parsed.requiresDOM ? ['dom_interaction'] : [];
-  logger.info(`[classifyTask] Local decision result taskType=${parsed.taskType} suggestedIntent=${parsed.suggestedIntent || 'null'} model=${r.model} ${r.elapsedMs}ms`);
+  logger.info(`[classifyTask] Local decision result taskType=${parsed.taskType} suggestedIntent=${parsed.suggestedIntent || 'null'} model=${r.model} ${r.elapsedMs}ms${_screenish ? ' (+lazy)' : ''}`);
   return parsed;
 }
 
@@ -698,7 +751,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     let _decShadowP = null;
     const _askDec = typeof options.askDecision === 'function' ? options.askDecision : null;
     const _decOn = !!_askDec && process.env.DECISION_LOCAL !== '0';
-    const _decShadow = _decOn && process.env.DECISION_SHADOW === '1';
+    const { shadowSite: _shadowSite } = require('./askDecision');
+    const _decShadow = _decOn && _shadowSite('classifyTask');
     if (_decShadow) {
       _decShadowP = _classifyViaDecision(_askDec, prompt, logger, classifiedMessage).catch(() => null);
     } else if (_decOn) {
@@ -748,7 +802,32 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const _mutationActions = new Set(['add_to_cart', 'checkout', 'place_order', 'filter_ui', 'sort_ui', 'fill_form', 'submit_form', 'book_reservation', 'upload', 'publish', 'delete', 'edit', 'create', 'update', 'send_message', 'send_email', 'post', 'comment', 'like', 'share', 'follow', 'subscribe', 'retweet', 'react', 'vote', 'play_media', 'pause_media', 'skip_media', 'shuffle', 'repeat']);
     const _hasMutationAction = _interactiveActions.some(a => _mutationActions.has(a));
     const _isFirstResultExtract = _firstResultPattern.test(userMessage) && !_hasMutationAction;
-    if (_isFirstResultExtract && (webAccessMode === 'interactive' || requiresDOM)) {
+    // Bound-session veto: a live extension tab IS the result surface — "click
+    // the first result" on a bound Amazon/SERP page must stay interactive so
+    // the click lands on the real page, not a public-read extraction.
+    const _boundSessions = Array.isArray(options.extSessions) ? options.extSessions.filter(s => s && s.url && /^https?:/i.test(s.url)) : [];
+    if (_isFirstResultExtract && _boundSessions.length && (webAccessMode === 'interactive' || requiresDOM)) {
+      logger.info(`[classifyTask] first-result pattern but ${_boundSessions.length} bound session(s) live — keeping interactive: "${userMessage.slice(0, 80)}"`);
+      parsed.interactiveActions = _interactiveActions.length ? _interactiveActions : ['view_page'];
+      if (!requiresDOM) requiresDOM = true;
+      webAccessMode = 'interactive';
+    }
+    // Bound-context rule — a page-deictic action ("click the first result",
+    // "scroll down", "select that one", "search for X") while a real tab is
+    // bound is on-page automation, never a chat answer or public read. The
+    // model often classifies these context-free as query/web_search; a live
+    // bound session overrides that.
+    const _PAGE_DEICTIC_RE = /\b(?:click|open|follow|select|tap|press|scroll|type|fill|check|read|close|expand|play|pause|next|back|dismiss|choose)\b[\s\S]{0,40}\b(?:first|second|third|top|next|last|it|that|this|the|those|these|result|item|link|listing|page|one|down|up|box|button|email|message|video)\b/i;
+    const _BARE_SEARCH_MSG_RE = /^\s*(?:please\s+)?(?:now\s+)?(?:then\s+)?(?:search|find|look)\s+(?:for|up)\b/i;
+    if (_boundSessions.length && !parsed.newDestination
+        && (_PAGE_DEICTIC_RE.test(userMessage) || _BARE_SEARCH_MSG_RE.test(userMessage))
+        && (webAccessMode !== 'interactive' || !requiresDOM)) {
+      logger.info(`[classifyTask] page-deictic/bare-search with ${_boundSessions.length} bound session(s) — forcing interactive: "${userMessage.slice(0, 80)}"`);
+      webAccessMode = 'interactive';
+      requiresDOM = true;
+      if (!_interactiveActions.length) parsed.interactiveActions = ['view_page'];
+    }
+    if (_isFirstResultExtract && !_boundSessions.length && (webAccessMode === 'interactive' || requiresDOM)) {
       logger.info(`[classifyTask] Search-to-extract first-result pattern detected — forcing public_read: "${userMessage.slice(0, 80)}"`);
       webAccessMode = 'public_read';
       requiresDOM = false;
@@ -791,6 +870,17 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
         !_serviceMentioned(parsedTargetService, _mentionCorpus)) {
       logger.info(`[classifyTask] Phantom targetService "${parsedTargetService}" not mentioned in message — dropping (webAccessMode=${webAccessMode})`);
       parsedTargetService = null;
+    }
+    // Deterministic recovery — a bare token that names a registered service
+    // ("open chatgpt") is ground truth even when the remote classifier emits
+    // null. Same _lexicalTargetService the local-decision path uses; scans the
+    // same mention corpus the phantom check used.
+    if (!parsedTargetService) {
+      const _lexical = _lexicalTargetService(_mentionCorpus);
+      if (_lexical) {
+        logger.info(`[classifyTask] targetService recovered lexically: "${_lexical}" (LLM emitted null)`);
+        parsedTargetService = _lexical;
+      }
     }
 
     // activeDocRef — kind of live-document referent, if any. The concrete

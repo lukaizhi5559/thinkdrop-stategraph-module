@@ -1002,4 +1002,4 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
   }
 }
 
-module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS, _canonicalService, SERVICE_ALIASES, _CLASSIFY_PROMPT };
+module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS, _canonicalService, SERVICE_ALIASES, _CLASSIFY_PROMPT, _serviceHomeUrl };

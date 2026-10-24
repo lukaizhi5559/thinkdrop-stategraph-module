@@ -14,6 +14,18 @@
  *   DECISION_SHADOW=1  — caller runs remote too and logs agreement
  */
 
+// DECISION_SHADOW_SITES — comma list ("prefix*" wildcard): when set, only the
+// listed sites run shadow; all other sites go authoritative-local (fail-open
+// remote on error/low-confidence). Unset → DECISION_SHADOW=1 shadows all.
+function shadowSite(site) {
+  if (process.env.DECISION_SHADOW !== '1') return false;
+  const list = (process.env.DECISION_SHADOW_SITES || '').split(',').map(s => s.trim()).filter(Boolean);
+  if (!list.length) return true;
+  return list.some(pat => pat.endsWith('*')
+    ? String(site || '').startsWith(pat.slice(0, -1))
+    : String(site || '') === pat);
+}
+
 function makeAskDecision(mcpAdapter) {
   if (!mcpAdapter || process.env.DECISION_LOCAL === '0') return null;
   return async (questions, opts = {}) => {
@@ -29,7 +41,7 @@ function makeAskDecision(mcpAdapter) {
         ...(opts.image ? { image: opts.image } : {}),
       }, {
         timeoutMs: opts.timeoutMs
-          || (process.env.DECISION_TIMEOUT_MS ? Number(process.env.DECISION_TIMEOUT_MS) : Math.min(1500 + 300 * _n, 12000)),
+          || (process.env.DECISION_TIMEOUT_MS ? Number(process.env.DECISION_TIMEOUT_MS) : Math.min(6000 + 400 * _n, 15000)),
         noCircuit: true,
       });
       const data = r?.data || r;
@@ -64,7 +76,7 @@ async function boundedDecision(cfg) {
   const { site, questions, state, local, remote, logger, minConfidence } = cfg;
   const askDecision = cfg.askDecision;
   const enabled = typeof askDecision === 'function' && process.env.DECISION_LOCAL !== '0';
-  const shadow = enabled && process.env.DECISION_SHADOW === '1';
+  const shadow = enabled && shadowSite(site);
 
   if (!enabled) return remote();
 
@@ -108,4 +120,4 @@ async function boundedDecision(cfg) {
   return remote();
 }
 
-module.exports = { makeAskDecision, boundedDecision };
+module.exports = { makeAskDecision, boundedDecision, shadowSite };

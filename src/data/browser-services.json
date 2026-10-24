@@ -42,6 +42,7 @@
     "philipshue", "ecobee", "honeywell", "switchbot", "govee", "lifx", "shelly", "meross", "nanoleaf", "wemo", "lutron",
     "tesla", "smartcar", "ford", "bmw", "rivian", "onstar",
     "dji", "dronedeploy", "skydio", "autel", "airmap", "dronelogbook",
-    "spotify"
+    "spotify",
+    "amazon", "ebay", "etsy", "walmart", "target", "aliexpress", "bestbuy", "costco"
   ]
 }

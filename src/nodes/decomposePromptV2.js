@@ -966,6 +966,19 @@ module.exports = async function decomposePromptV2(state) {
     _emitIntentDecided(state, 'command_automate', 0.9);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'service-search-guard', intentPlan: subPrompts };
   }
+  // F10: an in-page follow-up on a bound service tab is NEVER public research —
+  // "search for baby mittens" on the live Amazon tab means the site's search
+  // box, not a Brave query. Veto the guard when the task is a follow-up with
+  // a referent AND a real service session is bound in the extension.
+  const _boundSvcSession = (Array.isArray(state._extSessions) ? state._extSessions : [])
+    .some(s => s && /^ext:/.test(String(s.sessionId || ''))
+      && s.alive !== false && s.url && !/^about:|^chrome:/.test(s.url))
+    || /^ext:/.test(String(state._extSessionHint?.sessionId || ''))
+    || /^https?:/.test(String(state.activeBrowserUrl || ''));
+  const _inPageFollowUp = _tc.isFollowUp === true && !!_tc.followUpTarget && _boundSvcSession;
+  if (_inPageFollowUp && _tc.webAccessMode === 'public_read') {
+    logger.info(`[Node:DecomposePromptV2] Public-research guard vetoed — in-page follow-up on bound service session (target="${_tc.followUpTarget}")`);
+  }
   if (_tc.webAccessMode === 'public_read' && !_tc.targetService && !_hasMultiGoalConjunction
       && _carriedHint !== 'command_automate' && !FILE_PATH_RE.test(message)
       && !LOCAL_FS_PROBE_RE.test(message)
@@ -973,6 +986,7 @@ module.exports = async function decomposePromptV2(state) {
       // webAccessMode — "scan the page" is never a Brave query, whatever the
       // classifier typed.
       && !SCREEN_OBSERVATION_RE.test(message)
+      && !_inPageFollowUp
       && !_tc.activeDocRef) {
     logger.info(`[Node:DecomposePromptV2] Public-research guard: routing to web_search (taskType=${_tc.taskType}) — skipping command_automate short-circuit`);
     const subPrompts = [{
@@ -1150,8 +1164,30 @@ module.exports = async function decomposePromptV2(state) {
     // plain url_open, not a service-agent task, and shouldn't pay for agent
     // selection + the full planning prompt.
     const _siteTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null);
+    // F15 — bare nav to a named service: emit the canonical plan directly.
+    // The pinned agent vetoes the url_open template (pin wins over generic
+    // templates), then the LLM replans the identical 2 steps for ~8s. A
+    // newDestination task with no interactive actions IS a nav: [url.first →
+    // canonical startUrl, synthesize] under the service session. Session
+    // stamping happens downstream (newDestination → ext:<svc>_agent).
+    let _navDet = null;
+    if (!_siteTmpl && _tc.newDestination === true && _tc.targetService
+        && !(_tc.interactiveActions || []).length) {
+      const { _serviceHomeUrl } = require('../utils/localPlanTemplates.js');
+      const _home = _serviceHomeUrl(_tc.targetService);
+      if (_home) {
+        _navDet = {
+          template: 'service_nav', lowRisk: true,
+          skillPlan: [
+            { skill: 'url.first.agent', args: { url: _home, agentId: `${_tc.targetService}.agent` }, description: `Navigate to ${_tc.targetService}` },
+            { skill: 'synthesize', args: {}, description: `Tell the user ${_tc.targetService} is now open` },
+          ],
+        };
+        logger.info(`[Node:DecomposePromptV2] service_nav template → ${_home} (skipping LLM plan)`);
+      }
+    }
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'site-service-guard', intentPlan: subPrompts,
-      ..._detState(_siteTmpl) };
+      ..._detState(_siteTmpl || _navDet) };
   }
 
   // Fetch+save composition ("search the web for X and save it to /path") —

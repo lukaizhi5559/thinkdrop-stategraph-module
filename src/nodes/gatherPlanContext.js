@@ -90,6 +90,12 @@ function _liveSurface(state) {
 // _drop them from grill batches even when the LLM ignores the prompt rule.
 const _PAGE_IDENTITY_Q_RE = /\b(?:which|what)\b[^?]{0,50}\b(?:page|site|website|web ?page|url|link|tab|article|screen|document|file|form)\b|\b(?:url|link|page name|file name|file path)\b[^?]{0,30}\b(?:of|for|to|from|should)\b|\bprovide\b[^?]{0,20}\b(?:url|link|path)\b/i;
 
+// Tab-placement questions ("open it in the current tab or a new tab?") are
+// always droppable — session binding answers deterministically: a bound/live
+// session owns the tab; otherwise the automation session opens its own. The
+// user can never supply information the system doesn't already have.
+const _TAB_CHOICE_Q_RE = /\b(?:current|existing|same)\s+(?:browser\s+)?tab\b|\bnew\s+tab\b|\bnew\s+(?:browser\s+)?window\b|\bwhich\s+tab\b|\bseparate\s+(?:tab|window)\b|\bsame\s+window\b/i;
+
 // ── Deterministic bypass gate ────────────────────────────────────────────────
 // Returns true when the task is fully specified and clarification cannot add
 // value. Used to skip both the legacy loop and the Grill loop without spending
@@ -499,6 +505,17 @@ module.exports = async function gatherPlanContext(state) {
   // Falls back to legacy if the grill loop fails for any reason.
   // Deterministic fast-path skips the grill entirely — a force-classified
   // plan has verbatim validated args; there is nothing to question.
+  // ── Nav/browse skip ──────────────────────────────────────────────────────
+  // Fully-specified named-service tasks ("open chatgpt", "check my gmail",
+  // "go to youtube") have nothing to clarify — the grill's NEED_AUTH route-
+  // confirmation just stalls them (10min wait, queue-serialized). Landing on
+  // the site — even a login page — IS the correct outcome for nav work.
+  const _tcNav = state._taskClassification || {};
+  if (GRILL_MODE && (_tcNav.isBrowseOnly === true
+      || (_tcNav.newDestination === true && !!_tcNav.targetService && _tcNav.needsClarification !== true))) {
+    logger.info(`[Node:GatherPlanContext] Grill skipped — fully-specified nav/browse task (service=${_tcNav.targetService || '-'})`);
+    return { ...state, planGatheringComplete: true, planGatheringSkipped: true };
+  }
   if (GRILL_MODE && !(Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0)) {
     try {
       logger.info('[Node:GatherPlanContext] Grill-Me mode enabled — running batched Q&A loop');
@@ -1383,13 +1400,25 @@ async function _runGrillLoop(state, logger) {
     // page are we summarizing comments from?" while the YouTube URL sat in
     // activeDocTarget). Mark them _drop even if the LLM ignored the rule.
     const _surfaceNow = _liveSurface(state);
-    if (_surfaceNow.resolved) {
-      for (const q of questions) {
-        if (!q || q._drop) continue;
-        if (_PAGE_IDENTITY_Q_RE.test(q.text || '')) {
-          q._drop = true;
-          logger.info(`[Node:GatherPlanContext:Grill] Dropping page-identity question "${q.id}" — surface already resolved ("${String(q.text || '').slice(0, 60)}")`);
-        }
+    // A named service with a canonical start URL also makes page-identity
+    // questions unanswerable-by-design — "which ChatGPT domain?" is settled by
+    // the service registry (chatgpt → chatgpt.com), not by asking the user.
+    let _svcHasHome = false;
+    try {
+      const { _serviceHomeUrl } = require('../utils/localPlanTemplates');
+      _svcHasHome = !!(state._taskClassification?.targetService
+        && _serviceHomeUrl(state._taskClassification.targetService));
+    } catch (_) {}
+    const _identityResolved = _surfaceNow.resolved || _svcHasHome;
+    for (const q of questions) {
+      if (!q || q._drop) continue;
+      if (_identityResolved && _PAGE_IDENTITY_Q_RE.test(q.text || '')) {
+        q._drop = true;
+        logger.info(`[Node:GatherPlanContext:Grill] Dropping page-identity question "${q.id}" — surface already resolved ("${String(q.text || '').slice(0, 60)}")`);
+      }
+      if (!q._drop && _TAB_CHOICE_Q_RE.test(q.text || '')) {
+        q._drop = true;
+        logger.info(`[Node:GatherPlanContext:Grill] Dropping tab-choice question "${q.id}" — session binding decides deterministically ("${String(q.text || '').slice(0, 60)}")`);
       }
     }
 
