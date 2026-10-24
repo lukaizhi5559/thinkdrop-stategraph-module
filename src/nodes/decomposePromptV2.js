@@ -243,7 +243,7 @@ function _decisionRoleLabel(m) {
     : 'Assistant (proactive card)';
 }
 
-async function _decomposeDecision(message, llmBackend, conversationHistory, logger, carriedHint = null, taskClassification = null, askDecision = null) {
+async function _decomposeDecision(message, llmBackend, conversationHistory, logger, carriedHint = null, taskClassification = null, askDecision = null, boundContext = null) {
   const recentCtx = (conversationHistory || []).slice(-4)
     .map(m => `${_decisionRoleLabel(m)}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
@@ -309,7 +309,14 @@ EXAMPLES:
   const tcLine = tc.taskType
     ? `\nSemantic classifier verdict: taskType=${tc.taskType}${tc.targetService ? `, targetService=${tc.targetService}` : ''} — local_file/local_system/app_automation/browser mean the request requires a real action on the user's machine; query/ambiguous mean no tool is needed.`
     : '';
-  const userPrompt = `Message: "${message}"${contextBlock}${hintLine}${tcLine}\nIntent? (0–7)`;
+  // A resolved bound tab is ground truth the regex hint can't see — a bare
+  // "search for X" on an open Amazon tab is that site's own search box, not
+  // a public web search. Without this line the number-call votes blind
+  // (observed: bound amazon, decided web_search → Node:WebSearch).
+  const boundLine = boundContext
+    ? `\nLive bound page fact: ${boundContext} — prompts acting on or continuing from that page are command_automate, NOT web_search.`
+    : '';
+  const userPrompt = `Message: "${message}"${contextBlock}${hintLine}${tcLine}${boundLine}\nIntent? (0–7)`;
 
   // Parse contract: a bare digit is trusted; a single distinct digit embedded
   // in short text is extracted. Multiple distinct digits (enumerated echoes —
@@ -373,7 +380,9 @@ EXAMPLES:
   // confident deterministic hint for a NON-automation intent beats the
   // residual (same rule as the comms keyword veto). Only 0 is vetoed — a
   // specific non-zero choice is the model affirmatively disagreeing.
-  if (_num === 0 && hintIdx > 0 && _SINGLE_STEP_INTENTS[hintIdx] !== 'command_automate') {
+  // Bound-referent guard: when a live tab owns the context, the comms regex
+  // hint is provably wrong (it never saw the page) — the veto must not fire.
+  if (_num === 0 && hintIdx > 0 && _SINGLE_STEP_INTENTS[hintIdx] !== 'command_automate' && !boundContext) {
     logger.info(`[Node:DecomposePromptV2] _decomposeDecision: residual 0 but hint=${carriedHint} claims ${_SINGLE_STEP_INTENTS[hintIdx]} — hint veto`);
     return hintIdx;
   }
@@ -1505,16 +1514,40 @@ module.exports = async function decomposePromptV2(state) {
   // question to the number call as tiebreaker — its internal hint-veto still
   // applies there. 'multi_step' skips straight to full decomposition.
   let _fastDecision;
+  // Bound-referent fact — resolveReferences bound a live tab for this prompt.
+  // Passed into the number-call so the model sees the open page, used to veto
+  // passive picks, and demotes a passive comms hint to abstain (the regex
+  // never saw the page — observed: bound amazon + hint=web_search → decided
+  // web_search → Node:WebSearch ran over the live tab).
+  const _boundHost = (() => {
+    const u = state._onScreenRef?.url || state._extSessionHint?.url || state.activeBrowserUrl || '';
+    try { return u ? new URL(u).hostname.replace(/^www\./, '') : null; } catch (_) { return null; }
+  })();
+  const _boundRef = !!state._onScreenRef || /^ext:/.test(String(state._extSessionHint?.sessionId || ''));
+  const _PASSIVE_HINTS = new Set(['web_search', 'general_knowledge', 'screen_intelligence', 'memory_retrieve', 'memory_store', 'question', 'greeting']);
+  const _carriedHintEff = (_boundRef && _PASSIVE_HINTS.has(_carriedHint)) ? null : _carriedHint;
+  const _boundCtx = _boundRef
+    ? `the user currently has ${_boundHost || 'a page'} open in their browser and bound to automation (session ${state._onScreenRef?.sessionId || state._extSessionHint?.sessionId || 'ext:default'})`
+    : null;
   const _suggestedIntent = typeof _tc.suggestedIntent === 'string' ? _tc.suggestedIntent : null;
   const _suggestedIdx = _suggestedIntent ? _SINGLE_STEP_INTENTS.indexOf(_suggestedIntent) : -1;
   if (_suggestedIntent === 'multi_step') {
     logger.info('[Node:DecomposePromptV2] classifyTask suggestedIntent=multi_step — skipping number call, running full decomposition');
     _fastDecision = 7;
-  } else if (_suggestedIdx >= 0 && (!_carriedHint || _carriedHint === _suggestedIntent)) {
-    logger.info(`[Node:DecomposePromptV2] classifyTask suggestedIntent=${_suggestedIntent} (hint=${_carriedHint || 'none'} — concur/abstain) — skipping number call`);
+  } else if (_suggestedIdx >= 0 && (!_carriedHintEff || _carriedHintEff === _suggestedIntent)) {
+    logger.info(`[Node:DecomposePromptV2] classifyTask suggestedIntent=${_suggestedIntent} (hint=${_carriedHint || 'none'}${_boundRef && _carriedHint !== _carriedHintEff ? ' — passive hint demoted by bound referent' : ''} — concur/abstain) — skipping number call`);
     _fastDecision = _suggestedIdx;
   } else {
-    _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHint, _tc, makeAskDecision(state.mcpAdapter));
+    _fastDecision = await _decomposeDecision(message, llmBackend, conversationHistory, logger, _carriedHintEff, _tc, makeAskDecision(state.mcpAdapter), _boundCtx);
+  }
+
+  // Bound-referent veto — a resolved live tab IS an on-page action; a passive
+  // pick (web_search etc.) contradicting it is wrong by definition, not a
+  // disagreement to debate. Deterministic, after every model vote.
+  if (_boundRef && _fastDecision >= 0 && _fastDecision <= 6
+      && _PASSIVE_HINTS.has(_SINGLE_STEP_INTENTS[_fastDecision])) {
+    logger.info(`[Node:DecomposePromptV2] bound-referent veto: ${_SINGLE_STEP_INTENTS[_fastDecision]} → command_automate (bound ${_boundHost || state._onScreenRef?.sessionId || 'tab'})`);
+    _fastDecision = 0;
   }
 
   // Contradiction check: command_automate is the heaviest route (plan +
