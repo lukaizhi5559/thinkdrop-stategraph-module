@@ -541,6 +541,15 @@ const TEMPLATES = [
       // that site explicitly — the user's stated site always wins.
       const _svc = String(tc?.targetService || '').trim().toLowerCase();
       const _rawIsLiteralUrl = raw && !SITE_SEARCH_URLS[raw.toLowerCase()];
+      // Bound-search coercion — a resolved bound-search referent only exists
+      // when the message named NO site, so the bound host IS the destination:
+      // "search for baby mittens" with ext:amazon_agent bound must drive
+      // amazon.com/s?k=... on the bound tab, not a google.com nav (observed:
+      // classifier picked site:'google', app.agent opened a new SERP tab).
+      const _boundHost = String(tc?._boundSearchHost || '').trim().toLowerCase();
+      if (!_rawIsLiteralUrl && _boundHost && SITE_SEARCH_URLS[_boundHost] && siteKey !== _boundHost) {
+        a.site = _boundHost; a.url = ''; siteKey = _boundHost;
+      }
       if (!_rawIsLiteralUrl && tc?.isFollowUp === true && _svc && SITE_SEARCH_URLS[_svc]
           && siteKey && siteKey !== _svc
           && !new RegExp(`\\b${siteKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(m)) {
@@ -575,16 +584,23 @@ const TEMPLATES = [
       }
       return 'site not in search-url whitelist';
     },
-    build: (a, m) => {
+    build: (a, m, tc) => {
       const raw = String(a.url || '').trim();
       const siteKey = SITE_SEARCH_URLS[raw.toLowerCase()] ? raw.toLowerCase()
         : String(a.site || '').trim().toLowerCase();
       const url = raw && !SITE_SEARCH_URLS[raw.toLowerCase()]
         ? (/^https?:\/\//i.test(raw) ? raw : `https://${raw}`)
         : SITE_SEARCH_URLS[siteKey](String(a.query || '').trim() || _extractNavQuery(m));
+      // Bound-search coercion stamped a session → navigate THE BOUND TAB to its
+      // own search results (not a fresh tab) so follow-ups like "click the
+      // first result" act on the same SERP the user just watched appear.
+      const _bSid = String(tc?._boundSearchSessionId || '').trim() || undefined;
+      const _navArgs = { action: 'navigate_url', url, timeoutMs: 15000 };
+      const _scanArgs = { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 };
+      if (_bSid) { _navArgs.sessionId = _bSid; _scanArgs.sessionId = _bSid; }
       return [
-        { skill: 'app.agent', args: { action: 'navigate_url', url, timeoutMs: 15000 }, description: `Open ${url.slice(0, 70)}` },
-        { skill: 'app.agent', args: { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 }, description: 'Read the loaded page' },
+        { skill: 'app.agent', args: _navArgs, description: `Open ${url.slice(0, 70)}` },
+        { skill: 'app.agent', args: _scanArgs, description: 'Read the loaded page' },
         { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's request using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
       ];
     },

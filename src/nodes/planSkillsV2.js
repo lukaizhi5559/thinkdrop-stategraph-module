@@ -3929,6 +3929,26 @@ The user's request does NOT match any installed skill.
         }
         return true;
       });
+      // Activation steps the LLM emits to fill the gap after a stripped nav
+      // ("Activate ChatGPT session and bring to foreground — via turn.loop")
+      // are deterministic work: activate the bound tab+window via tab-select.
+      // A generative executor wastes turns and can wander (observed: turn.loop
+      // activation step failed empty → ask_user; dom.act routed a focus goal
+      // to tab.map which clicked through the user's chat sidebar).
+      const _ACTIVATE_STEP_RE = /\b(activate|activating|bring(?:ing)?\s+(?:it\s+)?to\s+(?:the\s+)?(?:forefront|foreground|front)|bring\s+(?:the\s+)?(?:session|tab|window|page)\s+(?:to|into)\s+(?:focus|view|front)|ensure|ensuring|make\s+sure|confirm(?:ing)?|verify(?:ing)?|focus(?:ing)?)\b[^.]{0,80}\b(session|tab|window|foreground|focus|ready|open|loaded|active|visible|usable|interaction|prepared)\b/i;
+      skillPlan = skillPlan.map(s => {
+        if (s.skill !== 'turn.loop.agent' && s.skill !== 'dom.act' && s.skill !== 'tab.map.agent') return s;
+        const _txt = `${s.description || ''} ${s.args?.goal || s.args?.task || ''}`;
+        if (!_ACTIVATE_STEP_RE.test(_txt)) return s;
+        logger.info(`[Node:PlanSkillsV2] Deterministic activation — replaced ${s.skill} step with browser.act tab-select on "${effectiveSessionId}" ("${_txt.slice(0, 60)}")`);
+        return {
+          ...s,
+          skill: 'browser.act',
+          args: { action: 'tab-select', sessionId: effectiveSessionId },
+          description: `Bring bound session ${effectiveSessionId} to the foreground`,
+          deterministic: true,
+        };
+      });
     }
 
     // Destination session for this plan — the url.first.agent's service or

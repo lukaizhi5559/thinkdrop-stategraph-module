@@ -868,6 +868,7 @@ module.exports = async function resolveReferencesV2(state) {
       // in front" — lastSeen reflects extension heartbeats, not task order
       // (observed: fresh nav to amazon, bind still picked a stale youtube).
       const _cand = _searchable.find(c => c.sessionId && c.sessionId === state.activeBrowserSessionId)
+        || _searchable.find(c => c.sessionId && c.sessionId === state.priorBrowserContext?.sessionId)
         || _searchable.find(c => c.bound)
         || _searchable[0];
       if (_cand && _extConnected) {
@@ -921,6 +922,15 @@ module.exports = async function resolveReferencesV2(state) {
       _taskClassification.requiresDOM = true;
       _taskClassification.webAccessMode = 'interactive';
       if (!_taskClassification.interactiveActions?.length) _taskClassification.interactiveActions = ['view_page'];
+      // The bound host/session IS the search destination — page_nav_scan and
+      // other deterministic templates coerce their site arg from this so a
+      // bare "search for X" drives the bound tab's own search URL, never a
+      // generic google.com nav in a new tab.
+      try {
+        const _h = new URL(_onScreenRef.url).hostname.replace(/^www\./, '').split('.')[0];
+        if (_h) _taskClassification._boundSearchHost = _h;
+      } catch (_) {}
+      if (_onScreenRef.sessionId) _taskClassification._boundSearchSessionId = _onScreenRef.sessionId;
     }
     logger.info(`[Node:ResolveReferencesV2] on-screen referent bound (${_onScreenRef.via}${_onScreenRef.service ? ':' + _onScreenRef.service : ''}): ${_onScreenRef.sessionId || 'no-session'} → ${String(_onScreenRef.url || '').slice(0, 80)}`);
   }

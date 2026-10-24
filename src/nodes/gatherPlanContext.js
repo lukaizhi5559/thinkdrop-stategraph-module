@@ -57,8 +57,9 @@ function _liveSurface(state) {
   const docRef = tc.activeDocRef || state?.activeDocRef || null;
   const docTarget = tc.activeDocTarget || null;
   const hint = state?._extSessionHint || null;
-  const extTab = (Array.isArray(state?._extSessions) ? state._extSessions : [])
-    .filter(s => s && s.url && !/^about:|^chrome/.test(s.url))
+  const _allBound = (Array.isArray(state?._extSessions) ? state._extSessions : [])
+    .filter(s => s && s.url && !/^about:|^chrome/.test(s.url));
+  const extTab = _allBound.slice()
     .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0] || null;
   const screen = state?._priorScreenContext || null;
   const browserUrl = state?.activeBrowserUrl || null;
@@ -74,6 +75,15 @@ function _liveSurface(state) {
   }
   if (screen?.appName) {
     lines.push(`- Frontmost app: ${screen.appName}${screen.windowTitle ? ` — "${screen.windowTitle}"` : ''} ['on screen' / 'what I'm looking at' refer to it — screen_intelligence/OCR reads it]`);
+  }
+  // All bound sessions — "is X already open in another tab?" is answerable
+  // from this list (yes: reuse the bound session; no: the automation opens
+  // its own). Never a user question — deterministic session binding decides.
+  if (_allBound.length) {
+    const _tabs = _allBound.slice(0, 6)
+      .map(s => { try { return `${new URL(s.url).hostname.replace(/^www\./, '')}${s.sessionId ? ` (${s.sessionId})` : ''}`; } catch (_) { return null; } })
+      .filter(Boolean).join(', ');
+    if (_tabs) lines.push(`- Bound tabs already open: ${_tabs} ['already open' / 'in another tab' — reuse the matching bound session; NEVER ask navigate-or-already-open]`);
   }
   const resolved = !!(docRef === 'url' || docRef === 'file' || hint || extTab || pageUrl);
   return {
@@ -94,7 +104,7 @@ const _PAGE_IDENTITY_Q_RE = /\b(?:which|what)\b[^?]{0,50}\b(?:page|site|website|
 // always droppable — session binding answers deterministically: a bound/live
 // session owns the tab; otherwise the automation session opens its own. The
 // user can never supply information the system doesn't already have.
-const _TAB_CHOICE_Q_RE = /\b(?:current|existing|same)\s+(?:browser\s+)?tab\b|\bnew\s+tab\b|\bnew\s+(?:browser\s+)?window\b|\bwhich\s+tab\b|\bseparate\s+(?:tab|window)\b|\bsame\s+window\b/i;
+const _TAB_CHOICE_Q_RE = /\b(?:current|existing|same|another|other)\s+(?:browser\s+)?tab\b|\bnew\s+tab\b|\bnew\s+(?:browser\s+)?window\b|\bwhich\s+tab\b|\bseparate\s+(?:tab|window)\b|\bsame\s+window\b|\balready\s+open\b|\bopen\s+(?:it\s+)?in\s+(?:a\s+)?(?:new|another|different)\s+(?:tab|window)\b|\bnavigate\s+to\b[^?]{0,60}\bor\s+is\s+it\b/i;
 
 // ── Deterministic bypass gate ────────────────────────────────────────────────
 // Returns true when the task is fully specified and clarification cannot add
