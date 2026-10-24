@@ -864,7 +864,12 @@ module.exports = async function resolveReferencesV2(state) {
       const _searchable = _live
         .filter(c => _SEARCHABLE_HOST_RE.test(_hostOf(c.url)))
         .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
-      const _cand = _searchable.find(c => c.bound) || _searchable[0];
+      // The session THIS conversation most recently drove is the real "site
+      // in front" — lastSeen reflects extension heartbeats, not task order
+      // (observed: fresh nav to amazon, bind still picked a stale youtube).
+      const _cand = _searchable.find(c => c.sessionId && c.sessionId === state.activeBrowserSessionId)
+        || _searchable.find(c => c.bound)
+        || _searchable[0];
       if (_cand && _extConnected) {
         return { sessionId: _cand.bound ? _cand.sessionId : 'ext:default', url: _cand.url, title: _cand.title, service: null, via: 'bound-search', boundSession: !!_cand.bound };
       }
@@ -906,6 +911,17 @@ module.exports = async function resolveReferencesV2(state) {
       state.activeBrowserUrl = _onScreenRef.url || null;
     }
     state._onScreenRef = _onScreenRef;
+    // A bound-search referent is unambiguous: the user wants that site's own
+    // search driven. Force command_automate so a null/passive suggestedIntent
+    // can't still drift into Node:WebSearch downstream (observed: bound tab
+    // resolved, intent decided web_search anyway).
+    if (_onScreenRef.via === 'bound-search') {
+      _taskClassification.suggestedIntent = 'command_automate';
+      _taskClassification.taskType = 'browser';
+      _taskClassification.requiresDOM = true;
+      _taskClassification.webAccessMode = 'interactive';
+      if (!_taskClassification.interactiveActions?.length) _taskClassification.interactiveActions = ['view_page'];
+    }
     logger.info(`[Node:ResolveReferencesV2] on-screen referent bound (${_onScreenRef.via}${_onScreenRef.service ? ':' + _onScreenRef.service : ''}): ${_onScreenRef.sessionId || 'no-session'} → ${String(_onScreenRef.url || '').slice(0, 80)}`);
   }
 
@@ -926,7 +942,7 @@ module.exports = async function resolveReferencesV2(state) {
     // classification for these is the pre-extension app.agent assumption.
     const _PAGE_ACTION_RE = /\b(fill|complete|click|type|enter|select|choose|check|tick|press|scroll|submit|sign\s*up|apply|paste|write|answer)\b/i;
     const _isPageInteraction = _PAGE_ACTION_RE.test(message || '');
-    if (!state._planTask && _si && (_PASSIVE_INTENTS.has(_si)
+    if (!state._planTask && (!_si || _PASSIVE_INTENTS.has(_si)
         || (_isPageInteraction && ['local_system', 'app_automation', 'ambiguous'].includes(_taskClassification.taskType)))) {
       logger.info(`[Node:ResolveReferencesV2] live-page demotion: "${_si}"/${_taskClassification.taskType} → command_automate/browser (bound ext session ${state._extSessionHint.sessionId})`);
       _taskClassification.suggestedIntent = 'command_automate';
