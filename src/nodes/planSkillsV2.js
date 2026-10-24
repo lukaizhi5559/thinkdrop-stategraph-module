@@ -3881,7 +3881,21 @@ The user's request does NOT match any installed skill.
           // Different domain — the plan's destination session owns the work,
           // not the old bound session. Explicit step sessionIds are preserved.
           const _destSess = navStep?.args?.url ? _sessForHostUrl(navStep.args.url) : null;
-          const _stampSess = _destSess || 'browser';
+          // 'browser' is a dead stamp: the extension refuses to bind generic
+          // sessions, so every later in-page step on 'ext:browser' fails with
+          // 'no live tab'. Post-nav steps belong to the session that actually
+          // owns the destination tab — the nav step's own session, or the
+          // last nav's session when the plan returns to that same page
+          // (observed: replanned docs title steps stamped 'browser' while the
+          // doc tab lived on ext:google_agent → bound-page-missing loop).
+          const _hostOfPlan = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').toLowerCase(); } catch (_) { return ''; } };
+          const _destHost = navStep?.args?.url ? _hostOfPlan(navStep.args.url) : '';
+          const _navSess = state.lastBrowserNav?.sessionId || null;
+          const _navHost = _hostOfPlan(state.lastBrowserNav?.url);
+          const _navOwnsDest = !!(_navSess && (!_destHost
+            || (_navHost === _destHost || _destHost.endsWith('.' + _navHost))));
+          const _stampSess = _destSess || navStep?.args?.sessionId
+            || (_navOwnsDest ? _navSess : null) || 'browser';
           skillPlan = skillPlan.map(s => s.skill !== 'browser.act' || s.args?.sessionId ? s : { ...s, args: { ...s.args, sessionId: _stampSess } });
           logger.debug(`[Node:PlanSkillsV2] New-destination plan — stamped "${_stampSess}" (bound "${effectiveSessionId}" not enforced)`);
         }

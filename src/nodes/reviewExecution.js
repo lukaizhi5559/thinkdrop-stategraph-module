@@ -221,9 +221,16 @@ Output ONLY valid JSON:
  * Uses the single-number pattern: LLM returns 0 (FULFILLED) or 1 (NOT_FULFILLED).
  * Safe default on failure: null (caller falls back to regex hollow check).
  */
-async function assessBrowserFulfillment(userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, askDecision) {
+async function assessBrowserFulfillment(userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, askDecision, pageMeta) {
   const snapshotExcerpt = snapshot ? snapshot.slice(0, 3000) : '(no page content available)';
   const synthExcerpt = synthesizeOutput ? synthesizeOutput.slice(0, 2000) : '(none)';
+
+  // Canvas-rendered apps (Docs/Sheets/Figma) expose almost no innerText — the
+  // judge must reason from document.title + URL instead of treating thin text
+  // as failure.
+  const metaBlock = pageMeta && typeof pageMeta === 'object'
+    ? `\nPAGE META (document.title/URL — authoritative on canvas-rendered apps like Google Docs where page text is empty):\n${JSON.stringify(pageMeta)}\n`
+    : '';
 
   const systemPrompt = `You are a task fulfillment judge. Evaluate whether the user's goal was achieved based on the current page state and the system's summary.
 Return ONLY a single number — nothing else:
@@ -235,13 +242,14 @@ Decision rules:
 - If the page and synthesize output clearly contain the specific data the user asked for → 0
 - If the synthesize output is vague/hollow ("no information available", "could not retrieve", etc.) → 1
 - If the page text doesn't match what was asked (e.g. user asked for channel videos but page shows search results) → 1
-- If the synthesize output is a plausible answer AND the page confirms the right content is showing → 0`;
+- If the synthesize output is a plausible answer AND the page confirms the right content is showing → 0
+- Canvas apps (Google Docs, Sheets, Figma, canvas=true) render content off-DOM — empty PAGE TEXT means nothing. When PAGE META shows the goal's artifact open (e.g. a create/open-document goal and title or URL shows the document) → 0`;
 
   const userPrompt = `USER GOAL: "${userMessage}"
 
 CURRENT PAGE TEXT CONTENT:
 ${snapshotExcerpt}
-
+${metaBlock}
 SYNTHESIZE OUTPUT (what the system reported back):
 ${synthExcerpt}
 
@@ -252,7 +260,7 @@ Fulfilled? (0 or 1)`;
     askDecision,
     questions: [{
       id: 'fulfilled', type: 'noul',
-      question: 'Was the user goal achieved? true when the page shows the right content and the synthesize output is a real answer; false on sign-in/auth wall, wrong page, or hollow/vague output.',
+      question: 'Was the user goal achieved? true when the page shows the right content and the synthesize output is a real answer; false on sign-in/auth wall, wrong page, or hollow/vague output. Canvas apps (canvas=true, e.g. Google Docs) have empty page text — judge from PAGE META title/URL there.',
     }],
     state: userPrompt,
     local: (a) => a.fulfilled?.bool == null ? null
@@ -639,6 +647,7 @@ module.exports = async function reviewExecution(state) {
       // Capture current page text for fulfillment judgment.
       // getPageText returns visible page content (vs. ARIA tree from scanCurrentPage which
       // is often only a few hundred chars and too sparse for the LLM to judge correctly).
+      let pageMeta = null;
       if (browserSessionId) {
         try {
           const snapRes = await mcpAdapter.callService('command', 'command.automate', {
@@ -657,11 +666,37 @@ module.exports = async function reviewExecution(state) {
         } catch (snapErr) {
           logger.warn(`[Node:ReviewExecution] Page text capture failed: ${snapErr.message}`);
         }
+
+        // Canvas-app evidence — Google Docs/Sheets/Figma render on <canvas> so
+        // innerText is ~empty and the judge starves on "(no page content)" →
+        // false NOT_FULFILLED → hollow replan (observed: a created+titled doc
+        // replanned 3x because getPageText saw ~0 chars). document.title +
+        // URL are the real signal there — capture them whenever text is thin.
+        if (!snapshot) {
+          try {
+            const metaRes = await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'browser.act',
+              args: {
+                action: 'evaluate',
+                sessionId: browserSessionId,
+                text: `JSON.stringify({url:location.href,title:document.title||'',readyState:document.readyState,canvas:!!document.querySelector('canvas'),editables:document.querySelectorAll('input,textarea,[contenteditable]').length,textLen:((document.body&&document.body.innerText)||'').length})`,
+              },
+            }, { timeoutMs: 8000 });
+            const metaData = metaRes?.data || metaRes;
+            const metaRaw = metaData?.result ?? metaData?.stdout;
+            if (metaData?.ok && metaRaw) {
+              pageMeta = typeof metaRaw === 'string' ? JSON.parse(metaRaw.replace(/^"|"$/g, '')) : metaRaw;
+              logger.info(`[Node:ReviewExecution] Page meta captured (canvas/thin-text): title="${String(pageMeta.title || '').slice(0, 80)}" url=${String(pageMeta.url || '').slice(0, 100)}`);
+            }
+          } catch (metaErr) {
+            logger.debug(`[Node:ReviewExecution] page-meta capture failed: ${metaErr.message}`);
+          }
+        }
       }
 
       // Ask LLM: was the goal fulfilled given prompt + synthesize + current page snapshot?
       const judgment = await assessBrowserFulfillment(
-        userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, makeAskDecision(mcpAdapter)
+        userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, makeAskDecision(mcpAdapter), pageMeta
       );
 
       if (judgment !== null) {

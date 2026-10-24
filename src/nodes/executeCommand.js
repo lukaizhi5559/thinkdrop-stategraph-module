@@ -167,6 +167,34 @@ Rules:
   });
 }
 
+// ── Page-state signature probe — the recovery watchdog's evidence ────────────
+// One ~100ms evaluate on the failed step's session: {u}rl, {t}itle, ready
+// state, focused element, fillable/clickable counts, text length. A dead
+// binding returns 'no live tab' — which IS the signal, so errors are kept
+// rather than swallowed. Compared across patch records, an unchanged
+// signature means "the last patch moved nothing" — the stall detector the
+// wall-clock watchdog can't be (restore loops emit progress constantly).
+async function _probePageSignature(mcpAdapter, sessionId, logger) {
+  try {
+    const r = await mcpAdapter.callService('command', 'command.automate', {
+      skill: 'browser.act',
+      args: {
+        action: 'evaluate',
+        sessionId,
+        text: `JSON.stringify({u:location.href.slice(0,180),t:(document.title||'').slice(0,100),rs:document.readyState,ae:(document.activeElement&&document.activeElement.tagName)||'',fl:document.querySelectorAll('input,textarea,[contenteditable]').length,cl:document.querySelectorAll('a,button,[role="button"]').length,tx:((document.body&&document.body.innerText)||'').length})`,
+      },
+    }, { timeoutMs: 6000 });
+    const data = r?.data || r;
+    if (!data?.ok) return { probeError: String(data?.error || 'probe failed').slice(0, 100) };
+    const raw = data.result ?? data.stdout;
+    const parsed = typeof raw === 'string' ? JSON.parse(raw.replace(/^"|"$/g, '')) : raw;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (e) {
+    logger?.debug?.(`[ExecuteCommand:ThinRecovery] page-signature probe failed: ${e.message}`);
+    return null;
+  }
+}
+
 // ── Auto-skip: failed read-only step with independent remaining steps ────────
 // A failed read-only retrieval step (web.crawl, web.agent, web.search, fs.read,
 // image.analyze) shouldn't halt the whole plan when later steps can still
@@ -355,6 +383,61 @@ async function _thinPostFailureHandler(state) {
 
   if (!failedStep) return state;
 
+  // ── Recovery accounting: failure signature + live page-state signature ──
+  // Cursor-based dedup (`p.cursor === skillCursor`) is defeated by splice
+  // insertions — a patch that SPLICES a step before skillCursor shifts the
+  // failing step to a new index, so the dedup never matches the next time
+  // the same logical step fails (observed: PAGE_RESTORE inserting 10+
+  // navigate steps on one docs task). The durable identity is the failure
+  // signature: "this skill failing this way", independent of position.
+  const _errClass = String(failedStep.error || failedStep.detail || 'unknown')
+    .replace(/\s+/g, ' ').slice(0, 90);
+  const _failSig = `${failedStep.skill}::${_errClass}`;
+  const _sigCount = (patchHistory || []).filter(p => p.sig === _failSig).length;
+  const _restoreCount = (patchHistory || []).filter(p => p.action === 'PAGE_RESTORE' || p.action === 'PAGE_REBIND').length;
+  const _lastPageSig = [...(patchHistory || [])].reverse().find(p => p.pageSig)?.pageSig || null;
+
+  // Live page-state signature for browser-lane failures — one evaluate on the
+  // session's tab (~100ms). Attached to patch records so the stall detector
+  // can tell "patch applied but the page never moved" from a working repair.
+  const _BROWSER_STEP_RE = /^(url\.first\.agent|dom\.act|just\.type\.agent|meta\.find\.agent|shortcut\.keys\.agent|tab\.map\.agent|form\.fill\.agent|gesture\.agent|arrow\.grid\.agent|turn\.loop\.agent|browser\.act|browser\.agent|playwright\.agent)$/;
+  const _browserStep = _BROWSER_STEP_RE.test(String(failedStep.skill))
+    || /bound-page-missing|no live (bound )?tab/i.test(_errClass);
+  const _probeSess = failedStep.args?.sessionId || failedStep.sessionId
+    || state.activeBrowserSessionId || null;
+  const _pageSig = (_browserStep && _probeSess && mcpAdapter)
+    ? await _probePageSignature(mcpAdapter, _probeSess, logger)
+    : null;
+  const _pageUnchanged = !!(_pageSig && _lastPageSig && !_pageSig.probeError
+    && JSON.stringify(_pageSig) === JSON.stringify(_lastPageSig));
+
+  // Stall guard — same failure signature survived ≥2 patches AND the live
+  // page never moved: deterministic repair is provably not working. Escalate
+  // to replan_step (or ask_user once replans also stop helping) instead of
+  // letting another same-shaped patch run. This is the progress watchdog —
+  // the stall timer only sees silence; this sees *no forward motion*.
+  if (_sigCount >= 2 && (_pageUnchanged || _restoreCount >= 2)) {
+    logger.warn(`[ExecuteCommand:ThinRecovery] STALL-GUARD: "${_failSig}" survived ${_sigCount} patch(es)${_pageUnchanged ? ' with the page unchanged' : ` (${_restoreCount} restores)`} — forcing escalation`);
+    if ((state.replanCount || replanCount) >= 2) {
+      return {
+        ...state,
+        recoveryAction: 'ask_user',
+        pendingQuestion: { question: `Step "${failedStep.skill}" keeps failing the same way (${_errClass}) after several repair attempts — how should I proceed?`, options: [] },
+        patchHistory: [...patchHistory, { action: 'STALL_GUARD', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        commandExecuted: false,
+      };
+    }
+    return {
+      ...state,
+      recoveryAction: 'replan_step',
+      recoveryContext: { failedSkill: failedStep.skill, failedStep, failureReason: `${_errClass} (same failure ${_sigCount + 1}x, page ${_pageUnchanged ? 'unchanged' : `${_restoreCount} restores`} — prior patches ineffective)` },
+      replanCount: replanCount + 1,
+      patchHistory: [...patchHistory, { action: 'STALL_GUARD', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
   // Attachment paths from the invoking message — injected into cli.agent
   // patches below so the seatbelt follows the step across substitutions
   // (cli.agent's PTY session enforces them at spawn).
@@ -441,7 +524,7 @@ async function _thinPostFailureHandler(state) {
       recoveryAction: 'auto_patch',
       skillPlan: patchedPlan,
       recoveryNote: `The file editor couldn't apply that change directly — opening ${_appForExt} to make the edit in the app.`,
-      patchHistory: [...patchHistory, { action: 'EDIT_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      patchHistory: [...patchHistory, { action: 'EDIT_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
       stepRetryCount: stepRetryCount + 1,
       failedStep: null,
       commandExecuted: false,
@@ -491,7 +574,7 @@ async function _thinPostFailureHandler(state) {
         recoveryAction: 'auto_patch',
         skillPlan: patchedPlan,
         recoveryNote: `The direct command failed — handing this step to the CLI agent so it can see the error and try a different approach.`,
-        patchHistory: [...patchHistory, { action: 'AGENT_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        patchHistory: [...patchHistory, { action: 'AGENT_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
         stepRetryCount: stepRetryCount + 1,
         failedStep: null,
         commandExecuted: false,
@@ -546,7 +629,7 @@ async function _thinPostFailureHandler(state) {
       recoveryAction: 'auto_patch',
       skillPlan: patchedPlan,
       recoveryNote: `${_svc} needs OAuth setup in their developer console — handing to the browser agent to walk through it.`,
-      patchHistory: [...patchHistory, { action: 'DELEGATE_REROUTE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      patchHistory: [...patchHistory, { action: 'DELEGATE_REROUTE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
       stepRetryCount: stepRetryCount + 1,
       failedStep: null,
       commandExecuted: false,
@@ -574,7 +657,7 @@ async function _thinPostFailureHandler(state) {
       recoveryAction: 'auto_patch',
       skillPlan: patchedPlan,
       recoveryNote: 'The structured installer failed — handing to the CLI agent loop so it can adapt.',
-      patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
       stepRetryCount: stepRetryCount + 1,
       failedStep: null,
       commandExecuted: false,
@@ -596,12 +679,27 @@ async function _thinPostFailureHandler(state) {
   // would hit the same empty page. The deterministic repair is to re-open the
   // page the step expects (prior nav or the known context URL) on the SAME
   // session, then let the original step retry. Once per cursor.
+  // Generic sessions ('browser', 'ext:browser') can never own a tab — the
+  // extension refuses to bind them (generic reads resolve fresh each call),
+  // so restoring ONTO them loops forever. When the failed step's session is
+  // generic, restore on the session that actually owns the page instead.
+  const _GENERIC_SESS_RE = /^(?:(?:ext|open|bg):)*(?:browser|default)$/i;
+  const _stepSess = failedStep?.args?.sessionId || failedStep?.sessionId || null;
+  const _restoreSessionPre = (_stepSess && !_GENERIC_SESS_RE.test(String(_stepSess)))
+    ? _stepSess
+    : (state.lastBrowserNav?.sessionId || state.activeBrowserSessionId || _stepSess);
+  const _restoreUrlPre = failedStep?.args?.priorNavUrl || state.lastBrowserNav?.url || state.activeBrowserUrl || null;
+  const _restoreTargetPre = `${_restoreSessionPre}|${_restoreUrlPre || 'rebind'}`;
   if (failedStep
       && /bound-page-missing|no live (bound )?tab/i.test(String(failedStep.error || failedStep.detail || ''))
       && Array.isArray(skillPlan) && skillPlan[skillCursor]
-      && !(patchHistory || []).some(p => p.action === 'PAGE_RESTORE' && p.cursor === skillCursor)) {
-    const _restoreSession = failedStep.args?.sessionId || failedStep.sessionId || state.activeBrowserSessionId || null;
-    const _restoreUrl = failedStep.args?.priorNavUrl || state.lastBrowserNav?.url || state.activeBrowserUrl || null;
+      // Dedup by restore TARGET, not cursor — splice insertions shift
+      // skillCursor so `p.cursor === skillCursor` never matches a repeat.
+      && !(patchHistory || []).some(p => (p.action === 'PAGE_RESTORE' || p.action === 'PAGE_REBIND') && p.target === _restoreTargetPre)
+      && _restoreCount < 2
+      && _sigCount === 0) {
+    const _restoreSession = _restoreSessionPre;
+    const _restoreUrl = _restoreUrlPre;
     if (_restoreSession && !_restoreUrl && /^(?:ext:)?(?:open:)?[a-z0-9_-]+_agent$/i.test(String(_restoreSession))) {
       // No known URL, but the session names a service — a tab-select resolve
       // re-adopts any live tab matching the session's host hints (the gmail
@@ -624,7 +722,7 @@ async function _thinPostFailureHandler(state) {
         recoveryAction: 'auto_patch',
         skillPlan: patchedPlan,
         recoveryNote: 'Re-binding the tab for this session, then retrying.',
-        patchHistory: [...patchHistory, { action: 'PAGE_REBIND', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        patchHistory: [...patchHistory, { action: 'PAGE_REBIND', cursor: skillCursor, target: _restoreTargetPre, sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
         stepRetryCount: stepRetryCount + 1,
         failedStep: null,
         commandExecuted: false,
@@ -643,7 +741,7 @@ async function _thinPostFailureHandler(state) {
         recoveryAction: 'auto_patch',
         skillPlan: patchedPlan,
         recoveryNote: 'The page this step needs is gone — re-opening it, then retrying.',
-        patchHistory: [...patchHistory, { action: 'PAGE_RESTORE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        patchHistory: [...patchHistory, { action: 'PAGE_RESTORE', cursor: skillCursor, target: _restoreTargetPre, sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
         stepRetryCount: stepRetryCount + 1,
         failedStep: null,
         commandExecuted: false,
@@ -694,7 +792,7 @@ async function _thinPostFailureHandler(state) {
       recoveryAction: 'auto_patch',
       skillPlan: patchedPlan,
       recoveryNote: 'The page action failed — retrying it as a multi-step observe→act loop on the same browser session.',
-      patchHistory: [...patchHistory, { action: 'BROWSER_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      patchHistory: [...patchHistory, { action: 'BROWSER_ESCALATE', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
       stepRetryCount: stepRetryCount + 1,
       failedStep: null,
       commandExecuted: false,
@@ -739,7 +837,7 @@ async function _thinPostFailureHandler(state) {
       recoveryAction: 'auto_patch',
       skillPlan: patchedPlan,
       recoveryNote: 'The step failed — handing it to the terminal agent so it can inspect the error and adapt.',
-      patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
       stepRetryCount: stepRetryCount + 1,
       failedStep: null,
       commandExecuted: false,
@@ -768,7 +866,7 @@ async function _thinPostFailureHandler(state) {
         recoveryAction: 'auto_patch',
         skillPlan: patchedPlan,
         recoveryNote: '',
-        patchHistory: [...patchHistory, { action: 'DET_RETRY', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        patchHistory: [...patchHistory, { action: 'DET_RETRY', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
         stepRetryCount: stepRetryCount + 1,
         failedStep: null,
         commandExecuted: false,
@@ -800,7 +898,7 @@ async function _thinPostFailureHandler(state) {
         recoveryAction: 'auto_patch',
         skillPlan: patchedPlan,
         recoveryNote: 'Direct retries failed — handing this step to the CLI agent so it can diagnose the error and adapt.',
-        patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
         stepRetryCount: stepRetryCount + 1,
         failedStep: null,
         commandExecuted: false,
@@ -811,7 +909,7 @@ async function _thinPostFailureHandler(state) {
       ...state,
       recoveryAction: 'ask_user',
       pendingQuestion: { question: `Step "${failedStep.skill}" failed: ${failedStep.error}. Retry or cancel?`, options: ['Retry', 'Cancel'] },
-      patchHistory: [...patchHistory, { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      patchHistory: [...patchHistory, { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
       commandExecuted: false,
     };
   }
@@ -862,7 +960,13 @@ async function _thinPostFailureHandler(state) {
   // Quick LLM assessment
   const priorSteps = (skillResults || []).filter(r => r.ok).map(r => `✓ ${r.skill}: ${r.stdout?.slice(0, 100) || 'ok'}`).join('\n');
   const failedInfo = `Skill: ${failedStep.skill}\nError: ${failedStep.error}\nArgs: ${JSON.stringify(failedStep.args || {}).slice(0, 500)}`;
-  const userMsg = `## User Request\n${resolvedMessage || message}\n\n## Completed Steps\n${priorSteps || '(none)'}\n\n## Failed Step (cursor=${skillCursor})\n${failedInfo}\n\n## Previous Recovery Attempts\n${patchHistory.length > 0 ? patchHistory.map((p, i) => `${i + 1}. ${p.action}: ${p.note || p.suggestion || ''}`).join('\n') : '(none)'}\n\n## Retry Count: ${stepRetryCount}, Replan Count: ${replanCount}\n\n## Next Action\nReturn a single number (0=REPLAN, 1=REPLAN_STEP, 2=ASK_USER, 3=AUTO_PATCH).`;
+  const _sigLedger = _sigCount > 0
+    ? `\n\n## Failure Signature\nThis exact failure (${_failSig}) has already been seen ${_sigCount} time(s) this task — repeated identical failures mean prior repairs did not work. Prefer REPLAN_STEP or ASK_USER over more patching.`
+    : '';
+  const _pageStateBlock = _browserStep
+    ? `\n\n## Live Page State (probed now)\n${_pageSig ? JSON.stringify(_pageSig) : 'probe unavailable'}${_pageUnchanged ? '\nNOTE: the page signature is IDENTICAL to before the last repair — the last patch changed nothing.' : ''}`
+    : '';
+  const userMsg = `## User Request\n${resolvedMessage || message}\n\n## Completed Steps\n${priorSteps || '(none)'}\n\n## Failed Step (cursor=${skillCursor})\n${failedInfo}\n\n## Previous Recovery Attempts\n${patchHistory.length > 0 ? patchHistory.map((p, i) => `${i + 1}. ${p.action}: ${p.note || p.suggestion || ''}`).join('\n') : '(none)'}${_sigLedger}${_pageStateBlock}\n\n## Retry Count: ${stepRetryCount}, Replan Count: ${replanCount}\n\n## Next Action\nReturn a single number (0=REPLAN, 1=REPLAN_STEP, 2=ASK_USER, 3=AUTO_PATCH).`;
 
   // ── Fast number-based decision (REPLAN/REPLAN_STEP/ASK_USER/AUTO_PATCH) ───
   // Call the light model with "return ONLY a single number" to get a fast verdict.
@@ -914,7 +1018,7 @@ async function _thinPostFailureHandler(state) {
     }
     logger.info('[ExecuteCommand:ThinRecovery] Fast decision: ASK_USER — proceeding to default ask_user handler');
     // Record the ask so a repeat on this cursor escalates instead of looping.
-    state = { ...state, patchHistory: [...patchHistory, { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }] };
+    state = { ...state, patchHistory: [...patchHistory, { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }] };
   } else {
     // AUTO_PATCH (3) — run the full JSON generation to get patchedArgs
     logger.info('[ExecuteCommand:ThinRecovery] Fast decision: AUTO_PATCH — running full JSON generation for patchedArgs');
@@ -1028,7 +1132,7 @@ async function _thinPostFailureHandler(state) {
     ...state,
     recoveryAction: 'ask_user',
     pendingQuestion: { question: `Step "${failedStep.skill}" failed: ${failedStep.error}. Would you like to retry, skip, or cancel?`, options: ['Retry', 'Skip this step', 'Cancel'] },
-    patchHistory: [...(_ph || []), { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1 }],
+    patchHistory: [...(_ph || []), { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
     commandExecuted: false,
   };
 }
