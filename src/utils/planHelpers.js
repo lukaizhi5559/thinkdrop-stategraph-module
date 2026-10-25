@@ -923,6 +923,33 @@ const _BOUND_READ_PICKS = ['browser.act', 'turn.loop.agent', 'dom.act', 'meta.fi
 const _PUBLIC_WEB_PICKS = ['web.agent', 'web.crawl'];
 const _NAV_PICKS = ['url.first.agent'];
 
+// Surface nouns — a dialog/modal/menu is an on-page element, never a
+// destination. "Open create event dialog using shortcut" matched "open" +
+// newDestination and got force-routed to url.first.agent as "single legal
+// candidate" — the item-noun regex missed it because "create event dialog"
+// has no determiner before "dialog". Surface nouns block the nav bucket
+// deterministically.
+const _STEP_SURFACE_RE = /\b(?:dialog|modal|popup|popover|popin|compose|menu|panel|drawer|sheet|shortcut(?:\s*key)?|keystroke|text\s*field|input\s*field|checkbox|button|icon|link|tab)\b/i;
+
+// Surfaces that ARE URLs on their service — "open the create-event dialog"
+// is a navigation to /r/eventedit, not a keyboard shortcut. Exiling these
+// to action picks produced the 'c'-press circle: shortcut fires on the
+// month view, dialog never confirms, eyes fail, replan emits the same step.
+const _DEEP_LINKABLE_SURFACES = [
+  [/\b(google|calendar)\b/i, /\b(event|meeting|appointment|calendar|schedule)\b/i],
+  [/\b(gmail|outlook|mail)\b/i, /\b(compose|e-?mail|draft|inbox|message)\b/i],
+  [/\bnotion\b/i, /\b(page|doc|note)\b/i],
+  [/\b(docs?|sheets?|slides?)\b/i, /\b(doc|document|sheet|spreadsheet|slide|presentation)\b/i],
+  [/\b(calendly|eventbrite|zoom|meet|teams)\b/i, /\b(event|meeting|invite|schedule)\b/i],
+];
+function _deepLinkableSurface(desc, targetService) {
+  if (!targetService) return false;
+  for (const [svcRe, surfRe] of _DEEP_LINKABLE_SURFACES) {
+    if (svcRe.test(String(targetService)) && surfRe.test(desc)) return true;
+  }
+  return false;
+}
+
 function stepCandidates(step, ctx = {}) {
   const skill = step?.skill;
   if (!skill || !_GOVERNED_STEP_SKILLS.has(skill)) return [];
@@ -937,7 +964,8 @@ function stepCandidates(step, ctx = {}) {
     // nav-verb step IS the nav even if the service token is absent from the
     // step text ("Open ChatGPT in the browser" with targetService unset).
     || tc.newDestination === true;
-  if (_STEP_NAV_VERB_RE.test(desc) && mentionsDest && !_STEP_ITEM_RE.test(desc)) {
+  const _surfaceBlocked = _STEP_SURFACE_RE.test(desc) && !_deepLinkableSurface(desc, ctx.targetService);
+  if (_STEP_NAV_VERB_RE.test(desc) && mentionsDest && !_STEP_ITEM_RE.test(desc) && !_surfaceBlocked) {
     return _NAV_PICKS;
   }
 
@@ -953,9 +981,16 @@ function stepCandidates(step, ctx = {}) {
     // an app workflow (dom.act's email-compose path or tab.map).
     const _isEmailWork = /\b(?:e-?mail|compose|inbox)\b/i.test(desc)
       && /\b(?:send|reply|forward|compose|draft|write|fill)\b/i.test(desc);
+    // Form-fill lane: a fill-shaped step on a form surface is a deterministic
+    // fill+verify job — form.fill first, not the LLM loop. submit:true when
+    // the step also carries the save verb so the guard path engages.
+    const _isFormWork = /\b(fill|enter|type|set)\b[^.]{0,40}\b(form|field|title|date|time|detail|name|description|event|event details)\b/i.test(desc)
+      || /\bfill in\b/i.test(desc);
     const _actionPicks = _isEmailWork
       ? _BOUND_ACTION_PICKS.filter(s => s !== 'form.fill.agent')
-      : _BOUND_ACTION_PICKS;
+      : _isFormWork
+        ? ['form.fill.agent', ..._BOUND_ACTION_PICKS.filter(s => s !== 'form.fill.agent')]
+        : _BOUND_ACTION_PICKS;
     if (_STEP_ACTION_RE.test(desc)) return _actionPicks;
     if (_STEP_READ_RE.test(desc)) return _BOUND_READ_PICKS;
     return [..._actionPicks.slice(0, 4), 'browser.act'];

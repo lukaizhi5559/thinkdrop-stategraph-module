@@ -1544,7 +1544,11 @@ function _buildSystemPrompt(userMessage, state) {
   // _hasLocalSignals true and skips the domain appendix block above. But the
   // scheduling guidance is required to avoid `shell.run sleep` and to map the
   // chosen method (thinkdrop_alert, macOS, email, etc.) to the correct skill.
-  if (_tc?.taskType === 'scheduling' && !appendices.includes('plan-skills-scheduling.md')) {
+  if (_tc?.taskType === 'scheduling' && !appendices.includes('plan-skills-scheduling.md')
+      // External-service scheduling is browser automation, not a reminder —
+      // "set a google event" must not emit reminder-shaped steps (observed:
+      // a local reminder fired while the run claimed a Google event was made).
+      && !(_tc?.targetService || /\b(google|gmail|calendly|outlook|eventbrite|zoom|meet|teams)\b/i.test(userMessage || ''))) {
     appendices.push('plan-skills-scheduling.md');
   }
 

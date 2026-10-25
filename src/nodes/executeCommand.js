@@ -181,7 +181,7 @@ async function _probePageSignature(mcpAdapter, sessionId, logger) {
       args: {
         action: 'evaluate',
         sessionId,
-        text: `JSON.stringify({u:location.href.slice(0,180),t:(document.title||'').slice(0,100),rs:document.readyState,ae:(document.activeElement&&document.activeElement.tagName)||'',fl:document.querySelectorAll('input,textarea,[contenteditable]').length,cl:document.querySelectorAll('a,button,[role="button"]').length,tx:((document.body&&document.body.innerText)||'').length})`,
+        text: `JSON.stringify((()=>{const _v=(e)=>!!e&&e.isConnected&&(e.offsetParent!==null||getComputedStyle(e).position==='fixed')&&(e.getBoundingClientRect().width>40&&e.getBoundingClientRect().height>40);const dg=[...document.querySelectorAll('[role="dialog"],[role="alertdialog"],[aria-modal="true"],[class*="popin" i],[class*="popover" i],[class*="modal" i],[class*="dialog" i],[data-popin]')].some(_v);return{u:location.href.slice(0,180),t:(document.title||'').slice(0,100),rs:document.readyState,ae:(document.activeElement&&document.activeElement.tagName)||'',fl:document.querySelectorAll('input,textarea,[contenteditable]').length,cl:document.querySelectorAll('a,button,[role="button"]').length,tx:((document.body&&document.body.innerText)||'').length,dg}})())`,
       },
     }, { timeoutMs: 6000 });
     const data = r?.data || r;
@@ -193,6 +193,78 @@ async function _probePageSignature(mcpAdapter, sessionId, logger) {
     logger?.debug?.(`[ExecuteCommand:ThinRecovery] page-signature probe failed: ${e.message}`);
     return null;
   }
+}
+
+// ── Step-boundary "eyes" — tev1 sees the live state and judges whether the
+// step actually accomplished its intent. Deterministic checks run first
+// (dialog expected ↔ probe.dg); the decision model only fires when the
+// postcondition is semantic ("opened the compose view", "item selected").
+// A NO verdict downgrades a nominal ok:true step to failed so ThinRecovery
+// replans instead of the next step scanning the wrong state — the exact
+// failure that killed the 'c' calendar flow.
+const _EYES_BROWSER_RE = /^(url\.first\.agent|dom\.act|just\.type\.agent|meta\.find\.agent|shortcut\.keys\.agent|tab\.map\.agent|form\.fill\.agent|gesture\.agent|arrow\.grid\.agent|turn\.loop\.agent|browser\.act|browser\.agent|playwright\.agent)$/;
+const _EYES_ACTION_GOAL_RE = /\b(open|click|press|create|add|save|submit|send|select|choose|fill|type|navigate|goto|go to|start|begin|apply|confirm|post|upload|download|delete|remove|edit|rename|share|invite|sign|log)\b/i;
+const _EYES_DIALOG_GOAL_RE = /\b(dialog|modal|popup|popover|compose|create.?event|new event|new doc|quick.?add)\b/i;
+// Terminal actions END by closing the surface — after a successful Save the
+// form is gone and the page returns to baseline. "Nothing on screen" is the
+// success signature, not a contradiction. Misreading it caused the calendar
+// duplicate: eyes failed a saved event → recovery re-ran → second event.
+const _EYES_TERMINAL_RE = /\b(save|submit|send|post|publish|checkout|pay|book|order|delete|remove|apply|invite|share)\b/i;
+
+async function _eyesStepCheck({ mcpAdapter, askDecision, llmBackend, logger, step, sessionId, resultText }) {
+  const sig = await _probePageSignature(mcpAdapter, sessionId, logger).catch(() => null);
+  if (!sig || sig.probeError) return { verdict: 'pass', pageState: sig }; // blind → don't gate
+  const goal = String(step.goal || step.description || step.args?.goal || step.args?.task || '');
+  const _terminal = _EYES_TERMINAL_RE.test(goal);
+  // Deterministic postconditions first — a dialog-expected step with no
+  // dialog on screen is a fact, not a judgment. Except terminal goals: for a
+  // save/submit the dialog closing IS the expected end-state.
+  if (!_terminal && _EYES_DIALOG_GOAL_RE.test(goal) && sig.dg === false) {
+    return { verdict: 'fail', reason: 'expected dialog/overlay is not open (probe.dg=false)', pageState: sig };
+  }
+  // Terminal step + form closed + clickables present → the surface did close
+  // on a live page — deterministic pass, no model needed.
+  if (_terminal && sig.dg === false) {
+    return { verdict: 'pass', pageState: sig };
+  }
+  if (!_EYES_ACTION_GOAL_RE.test(goal)) return { verdict: 'pass', pageState: sig };
+  // Semantic check — tev1 judges whether the state evidences the intent.
+  const _q = _terminal
+    ? 'A browser step claimed it saved/submitted/sent something. For these actions the form CLOSING is success. Answer NO only if the form is still open with unsaved data or an error message is visible.'
+    : 'A browser step claimed success. Does the live page state show the step accomplished its intent? Answer NO only when the state clearly contradicts it (wrong page, dialog missing, nothing changed).';
+  const _state = `Step goal: "${goal.slice(0, 160)}"\nReported result: ${String(resultText || '').slice(0, 120)}\nLive state: url=${sig.u} title="${sig.t}" dialogOpen=${sig.dg} activeEl=${sig.ae} fillables=${sig.fl} clickables=${sig.cl}`;
+  try {
+    const v = await boundedDecision({
+      site: 'executeCommand.stepEyes',
+      askDecision,
+      questions: [{
+        id: 'eyes', type: 'choice',
+        question: _q,
+        options: ['YES — state is consistent with the goal', 'NO — state contradicts the goal'],
+      }],
+      state: _state,
+      local: (a) => a.eyes?.index ?? null,
+      remote: async () => {
+        try {
+          const raw = await llmBackend.generateAnswer(
+            'You verify automation step outcomes. Answer with ONLY 0 or 1 — 0=state consistent, 1=state contradicts.',
+            `${_q}\n${_state}\nVerdict:`,
+            { temperature: 0.1, maxTokens: 5, taskType: 'classification' });
+          const num = parseInt(String(raw || '').trim(), 10);
+          return num === 1 ? 1 : 0;
+        } catch (_) { return 0; }
+      },
+      logger,
+    });
+    if (v === 1) {
+      // Mutation guard — a semantic "contradicts" on a terminal step must not
+      // trigger a blind re-execution (that's how the duplicate event happened).
+      // Only deterministic evidence can hard-fail a terminal step.
+      if (_terminal) return { verdict: 'uncertain', reason: 'eyes: unverified — confirm the effect landed before retrying', pageState: sig };
+      return { verdict: 'fail', reason: 'eyes: live state contradicts the step goal', pageState: sig };
+    }
+  } catch (_) { /* fail-open */ }
+  return { verdict: 'pass', pageState: sig };
 }
 
 // ── Auto-skip: failed read-only step with independent remaining steps ────────
@@ -2797,6 +2869,24 @@ module.exports = async function executeCommand(state) {
   // then returns immediately. No blocking setTimeout countdown.
   if (skill === 'schedule') {
     const { time, delayMs: rawDelayMs, label: _rawLabel } = args;
+    // External-service guard — a "schedule" step whose description/label
+    // names a web service ("set a google event", "schedule a Calendly
+    // meeting") is a browser-automation task mis-planned as a local reminder.
+    // Registering the reminder then claiming the event was created is the
+    // exact failure observed — refuse loudly instead.
+    const _schedText = `${description || ''} ${_rawLabel || ''} ${args.goal || ''}`;
+    const _origMsg = (state.message || state.resolvedMessage || '');
+    const _svcNamed = /\b(google|gmail|calendar\.google|calendly|outlook|eventbrite|zoom|meet|teams)\b/i.test(`${_schedText} ${_origMsg}`)
+      || /\b(google|gmail|calendly|outlook|eventbrite|zoom|meet|teams)\b/i.test(String(state._taskClassification?.targetService || ''));
+    const _eventy = /\b(event|meeting|appointment|calendar)\b/i.test(`${_schedText} ${_origMsg}`);
+    if (_svcNamed && _eventy) {
+      const _svcFail = { step: skillCursor + 1, skill: 'schedule', args, description, ok: false,
+        error: 'external-service scheduling task — belongs in the browser lane, not a local reminder' };
+      const _svcContract = generateStepContract(_svcFail, skillCursor);
+      logger.warn(`[Node:ExecuteCommand] schedule: refused external-service step — "${_schedText.slice(0, 80)}"`);
+      _emitTerminalActivity(`schedule: refused — "${_schedText.slice(0, 60)}" names a web service`, 'fail');
+      return { ...state, skillResults: [...skillResults, _svcFail], stepContracts: [...stepContracts, _svcContract], skillCursor: skillCursor + 1, commandExecuted: false };
+    }
     // Recurring schedules: planner may emit recur/cron/every/frequency.
     // "daily report" → recur 'daily' (fires every day via node-cron).
     const _recur = args.recur || args.cron || args.every || args.frequency || null;
@@ -2830,24 +2920,33 @@ module.exports = async function executeCommand(state) {
       waitMs = _correctedDelayMs;
     } else if (time && typeof time === 'string') {
       const now = new Date();
-      const ts = time.trim().toUpperCase();
-      const m12 = ts.match(/^(\d{1,2})(?::(\d{2}))?\s*(AM|PM)$/);
-      const m24 = ts.match(/^(\d{1,2}):(\d{2})$/);
+      // Strip relative-day words first — "5 PM tomorrow" doesn't match the
+      // anchored time regex, which used to fall through to waitMs<=0 and
+      // mis-report "time already passed" for a future event.
+      let ts = time.trim().toUpperCase();
+      let dayOffset = 0;
+      if (/\bTOMORROW\b/.test(ts)) { dayOffset = 1; ts = ts.replace(/\bTOMORROW\b/g, '').trim(); }
+      else if (/\bTODAY|TONIGHT\b/.test(ts)) { ts = ts.replace(/\bTODAY|TONIGHT\b/g, '').trim(); }
+      // Drop filler words ("at 5 PM", "for 5 PM") so the anchored match can hit.
+      ts = ts.replace(/\b(?:AT|FOR|ON|BY)\b/g, '').trim();
+      const m12 = ts.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)/);
+      const m24 = !m12 ? ts.match(/\b(\d{1,2}):(\d{2})\b/) : null;
       let td = null;
       if (m12) {
         let h = parseInt(m12[1], 10); const mn = parseInt(m12[2] || '0', 10);
         if (m12[3] === 'PM' && h < 12) h += 12;
         if (m12[3] === 'AM' && h === 12) h = 0;
-        td = new Date(now); td.setHours(h, mn, 0, 0);
+        td = new Date(now); td.setDate(td.getDate() + dayOffset); td.setHours(h, mn, 0, 0);
       } else if (m24) {
-        td = new Date(now); td.setHours(parseInt(m24[1], 10), parseInt(m24[2], 10), 0, 0);
+        td = new Date(now); td.setDate(td.getDate() + dayOffset); td.setHours(parseInt(m24[1], 10), parseInt(m24[2], 10), 0, 0);
       }
       if (td) { if (td <= now) td.setDate(td.getDate() + 1); waitMs = td.getTime() - now.getTime(); }
+      if (!td && time) logger.info(`[Node:ExecuteCommand] schedule: could not parse time "${time}"`);
     }
     if (waitMs <= 0 && !recur) {
       logger.info('[Node:ExecuteCommand] schedule: no valid future time — skipping');
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'schedule', description: 'Schedule: skipped', stdout: 'Skipped' });
-      const skipResult = { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: 'Skipped — time already passed' };
+      const skipResult = { step: skillCursor + 1, skill: 'schedule', args, description, ok: true, stdout: 'Skipped — could not resolve a future time' };
       const skipContract = generateStepContract(skipResult, skillCursor);
       return { ...state, skillResults: [...skillResults, skipResult], stepContracts: [...stepContracts, skipContract], skillCursor: skillCursor + 1, commandExecuted: false };
     }
@@ -6087,6 +6186,37 @@ Please try again or search with different terms.`;
           priorNavType: out.priorNavType || _lastNav.deepLinkType || 'none',
         };
       }
+      // Structured dialog-expectation signal: a prior step (shortcut 'c', a
+      // click that opens a modal) reported openedDialog — the follow-on step
+      // must INHERIT that expectation so tab.map's focus reset doesn't
+      // Escape+click the live dialog away. expectOverlay only traveled via
+      // nav classification before; a shortcut-opened dialog never set it
+      // (observed: 'c' opened the event popin, next step's tab-map reset
+      // killed it and scanned the month view).
+      const _dialogOpener = [..._allResults].reverse().find(r => r && r.ok && r.openedDialog);
+      if (_dialogOpener) {
+        out = { ...out, expectOverlay: true };
+      }
+      // Page-shape propagation: a prior tab.map/form.fill result carries the
+      // scanned shape — hand it to the next step so just.type/shortcut.keys/
+      // gesture/meta.find/turn.loop act on mapped elements instead of
+      // re-deriving page structure. Refs are only valid while the scanned
+      // DOM is mounted; consumers check shape.url vs currentUrl.
+      if (!out.pageMap) {
+        const _shapeSrc = [..._allResults].reverse().find(r => r && r.ok && r.pageShape);
+        if (_shapeSrc) {
+          out = { ...out, pageMap: _shapeSrc.pageShape, pageMapUrl: _shapeSrc.url || _shapeSrc.pageShape.url || null };
+        }
+      }
+      // Raw element map propagation — gesture (drag endpoints by numbered
+      // ref), meta.find (named target), turn.loop (context) consume the live
+      // tabMap; refs stay valid while the scanned DOM is mounted.
+      if (!out.tabMap) {
+        const _mapSrc = [..._allResults].reverse().find(r => r && r.ok && Array.isArray(r.tabMap) && r.tabMap.length);
+        if (_mapSrc) {
+          out = { ...out, tabMap: _mapSrc.tabMap, tabMapUrl: _mapSrc.tabMapUrl || _mapSrc.url || null };
+        }
+      }
 
       // Structured fill memory: fields filled by earlier browser steps
       // (results + persisted state.domFilled) → priorFilledFields.
@@ -7426,7 +7556,35 @@ Please try again or search with different terms.`;
 
     let raw = result.data || result;
 
-    const _stepOk = raw && (raw.ok ?? raw.success);
+    // ── Step-boundary eyes — tev1 sees the live state and judges whether the
+    // step actually accomplished its intent (not just that the call returned
+    // ok). Browser-ish skills only; ~100ms probe + local decision. A NO
+    // verdict downgrades to failed so recovery replans on evidence.
+    let _stepOk = raw && (raw.ok ?? raw.success);
+    if (_stepOk && mcpAdapter && _EYES_BROWSER_RE.test(String(skill))) {
+      const _eyesSess = resolvedArgs?.sessionId || _callArgs?.sessionId || step.args?.sessionId || state.activeBrowserSessionId || null;
+      if (_eyesSess) {
+        const _eyes = await _eyesStepCheck({
+          mcpAdapter, askDecision: makeAskDecision(mcpAdapter), llmBackend: state.llmBackend, logger, step, sessionId: _eyesSess,
+          resultText: String(raw.stdout || raw.output || raw.message || '').slice(0, 200),
+        }).catch(() => ({ verdict: 'pass' }));
+        if (_eyes?.pageState) raw.pageState = _eyes.pageState;
+        if (_eyes?.verdict === 'fail') {
+          _stepOk = false;
+          raw.ok = false;
+          raw.error = _eyes.reason || 'eyes: state contradicts step goal';
+          logger.warn(`[Node:ExecuteCommand] eyes: step ${skillCursor + 1} (${skill}) ok→fail — ${_eyes.reason}`);
+          _emitTerminalActivity(`eyes: step ${skillCursor + 1} state contradicts goal — ${_eyes.reason.slice(0, 80)}`, 'fail');
+        } else if (_eyes?.verdict === 'uncertain') {
+          // Terminal step with ambiguous post-state — keep ok:true (the save
+          // probably landed) but annotate so synthesis/recovery knows the
+          // effect was never confirmed. Never auto-retry on this.
+          raw.verificationNote = _eyes.reason;
+          logger.info(`[Node:ExecuteCommand] eyes: step ${skillCursor + 1} (${skill}) uncertain — ${_eyes.reason}`);
+        }
+      }
+    }
+
     _emitTerminalActivity(
       _stepOk
         ? `step ${skillCursor + 1}/${skillPlan.length} done`

@@ -699,17 +699,18 @@ module.exports = async function reviewExecution(state) {
         userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, makeAskDecision(mcpAdapter), pageMeta
       );
 
-      if (judgment !== null) {
+      // Zero-evidence mutation steps are a hard hollow signal the judge cannot
+      // veto — a weak/over-confident judge must not suppress deterministic
+      // evidence (observed: dom.act filled [] on an email-compose step, local
+      // verdict still said "fulfilled" → false "sent" claim reached the user).
+      const hardUnproven = _unprovenMutations.length > 0 && !hasBrowserMutationEvidence(skillResults);
+      if (hardUnproven) {
+        isHollow = true;
+        hollowReason = `Step(s) reported success but produced zero mutation evidence: ${_unprovenMutations.map(r => r.skill).join(', ')}`;
+      } else if (judgment !== null) {
         // LLM judgment overrides regex
         isHollow = !judgment.fulfilled;
         hollowReason = judgment.reason || hollowReason;
-      } else if (_unprovenMutations.length > 0 && !hasBrowserMutationEvidence(skillResults)) {
-        // No judge available — zero-evidence mutation steps are the
-        // deterministic hollow signal, but only when no browser step anywhere
-        // produced real mutation evidence (a residue url.first is informational
-        // once its sibling action step did the work).
-        isHollow = true;
-        hollowReason = `Step(s) reported success but produced zero mutation evidence: ${_unprovenMutations.map(r => r.skill).join(', ')}`;
       }
       // If judgment is null (LLM error), regexHollow from above remains the fallback
     }

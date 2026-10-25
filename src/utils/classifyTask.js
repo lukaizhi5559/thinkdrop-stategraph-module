@@ -137,7 +137,7 @@ Field rules:
   - "app_automation": the user wants to use a named desktop application's built-in AI assistant or agent to do work inside that app. The phrase "in [app] use the AI" or "use the AI in [app]" or "ask [app] AI to ..." are strong signals. Examples: "In Devin use the AI to add tests to this file", "Ask Claude in Slack to summarize the thread", "Use Cursor's AI to refactor the file". These are handled by app.agent run_agent, which opens the file and uses the app's AI assistant. Use "app_automation" whenever the user explicitly asks to invoke an app's AI assistant, even if the task also mentions a file path.
   - "browser": navigate, search, open a website, go to a URL, look something up online, or interact with a web page via precise DOM access — ONLY for web browser tasks that go beyond the currently visible page. NOT for tasks that inspect, use, or interact with a native desktop app's UI (e.g. Slack, Figma, Zoom, Discord) — those are "local_system" or "app_automation" or "query" even if a service name is mentioned. ALWAYS "browser" for interacting with elements on the CURRENTLY VISIBLE or open browser page — "fill out this form on my screen", "fill this form but don't submit", "click the link on this page", "type into the field on my tab" — the extension controls the bound tab directly; no navigation is required for "browser". "local_system" is ONLY for native macOS/desktop UI (app menus, dialogs, windows, keyboard-driven OS actions), never web-page content. IMPORTANT: "Open [known web service]" (e.g. "Open Spotify and play my playlist", "Open YouTube and search for X", "Open Notion and create a page") is ALWAYS "browser" — the word "open" here means "launch the web service", not "click a visible element on the current page". Known web services include: Spotify, YouTube, Notion, Slack, Discord, Gmail, GitHub, Twitter/X, LinkedIn, Reddit, TikTok, Instagram, Facebook, Perplexity, ChatGPT, Claude, and any other service with a web player or web app. The local_system "click, open, or select a visible text element" rule does NOT apply when "open" is followed by a named web service. NOT "browser" when the user only wants to read, describe, or summarize the CURRENTLY VISIBLE page ("what does this page say", "read this article on screen", "sum up what's showing") — that is passive observation → "query" (handled by screen_intelligence; no navigation needed).
   - "messaging": send email, text, SMS, Slack, Discord, notify someone
-  - "scheduling": set a reminder, schedule something, recurring alarm, cron task
+  - "scheduling": set a LOCAL reminder/alarm, defer a task for later, recurring/cron job — remind-me semantics only. NEVER for creating or modifying events inside a named external service (Google Calendar, Outlook, Calendly, Eventbrite, Notion calendar) — "set a google event", "add to my calendar", "create a meeting on Zoom" are "browser" (the event is created by automating the service's web app, not by registering a local reminder).
   - "query": question, lookup, retrieve memory, general knowledge — includes asking about or locating UI elements in a desktop app ("show me where X is in Slack", "where is the toolbar in Figma"). Use for tasks that ask to find, describe, or explain something without sending or modifying anything. ALSO "query" for PASSIVE SCREEN OBSERVATION — reading, describing, summarizing, or answering about content currently visible on screen or the open page ("what's on my screen", "describe this page", "explain what's showing", "tell me what this says"). This INCLUDES scan/read/check-verb phrasing aimed at the live surface — "scan the screen and tell me the best price", "scan this page for the cheapest option", "check this page and tell me what it says", "read this tab" — the report clause is answered from the live capture; it is NOT a web_search. These route to screen_intelligence (capture + answer), not automation. NOT "query" when the task is an imperative action ON the screen (highlight, scroll, capture, monitor, annotate) — those are "local_system"; imperative actions on PAGE CONTENT inside a browser (click, type, fill, select) are "browser". NOT "query" when the task explicitly asks to use an app's AI assistant — those are "app_automation".
   - "ambiguous": genuinely unclear even with history
 
@@ -472,7 +472,7 @@ const _DC_TASK_TYPES = [
   ['app_automation', 'use a named desktop app\'s built-in AI assistant to do work inside that app'],
   ['browser', 'navigate/search/open a website or interact with a web page — including typing/clicking/filling elements on the CURRENTLY VISIBLE or open browser tab'],
   ['messaging', 'send email/text/SMS/Slack/Discord/notify someone'],
-  ['scheduling', 'calendar events, reminders, recurring/scheduled tasks'],
+  ['scheduling', 'local reminders/alarms, recurring/cron/deferred tasks — NOT creating events in a named web service (that is browser)'],
   ['query', 'answer a question — knowledge, or PASSIVE observation of what is currently on screen/page'],
   ['ambiguous', 'none of the above fits'],
 ];
@@ -915,6 +915,18 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
         && (!parsed.taskType || parsed.taskType === 'query' || parsed.taskType === 'ambiguous')) {
       logger.info(`[classifyTask] Literal path in message but taskType='${parsed.taskType}' — coercing to local_file`);
       parsed.taskType = 'local_file';
+    }
+
+    // External-service scheduling → browser. 'scheduling' means LOCAL
+    // reminders/deferred tasks; "set a google event" names a service — the
+    // event is created by automating the web app, not by a reminder. Without
+    // this guard the plan emits `schedule` steps that register a local
+    // reminder and the run claims a Google event was created (observed).
+    const _EXT_SVC_RE = /\b(google|gmail|calendar\.google|calendly|outlook|eventbrite|notion|spotify|zoom|meet|teams|slack|discord|github|linkedin|twitter)\b/i;
+    if (parsed.taskType === 'scheduling'
+        && (parsedTargetService || _EXT_SVC_RE.test(classifiedMessage))) {
+      logger.info(`[classifyTask] taskType='scheduling' but external service named (targetService=${parsedTargetService || 'none'}) — coercing to browser`);
+      parsed.taskType = 'browser';
     }
 
     const _rawSuggested = _VALID_SUGGESTED_INTENTS.has(parsed.suggestedIntent) ? parsed.suggestedIntent : null;
