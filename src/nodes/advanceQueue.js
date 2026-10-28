@@ -274,7 +274,6 @@ module.exports = async function advanceQueue(state) {
       recoveryAction:    null,
       carriedIntent:     null,
       enrichmentNeeded:  [],
-      matchedSkillName:  null,
       // Referent + pause/verdict state from the previous step must not bleed
       // into the next one — a queued step is a fresh sub-intent, not a reply
       // to the same card/question.

@@ -51,7 +51,14 @@ function _finalizePlanFile(state, logger) {
     return acc;
   }, []);
   const allOk = deduped.every(r => r && r.ok !== false);
-  const newStatus = allOk ? 'complete' : 'failed';
+  // Save-gate: a step whose ok:true is an LLM claim with no machine evidence
+  // (executeCommand marks it _llmClaimed) must not make the plan reusable —
+  // claimed results flip world-state verdicts (observed: a stale git status
+  // reported a successful commit) and wildcard steps aren't safely replayable.
+  // 'unverified' is honest third state: ran ok, but not provably — never
+  // enters the plan cache, swept like pending/failed after 30d.
+  const hasClaimed = deduped.some(r => r && r._llmClaimed === true);
+  const newStatus = !allOk ? 'failed' : (hasClaimed ? 'unverified' : 'complete');
   try {
     const md = fs.readFileSync(planFile, 'utf8');
     const updated = md.replace(/^(status:\s*)(pending|failed|running)(\s*)$/m, `$1${newStatus}$3`);
@@ -386,7 +393,12 @@ module.exports = async function logConversation(state) {
       const _isRecoveryTurn = !!(state.recoveryAction || state.recoveryQuestion ||
                                  state._isAgentAskUser || state.askUser);
       const _isMemoryStore = intent?.type === 'memory_store';
-      if (!_isRecoveryTurn && !_isMemoryStore) {
+      // Screen-observation turns carry OCR dumps — the extractor used to
+      // store page chrome as "personal facts" (observed: contact:footer:name,
+      // contact:branding:name, screen_content_comparison — ~21 profile writes
+      // of junk per describe).
+      const _isScreenTurn = ['screen_analysis', 'screen_intelligence', 'screen_display'].includes(intent?.type);
+      if (!_isRecoveryTurn && !_isMemoryStore && !_isScreenTurn) {
         _extractAndStoreFacts(mcpAdapter, llmBackend, message, answer, context, logger).catch(err => {
           logger.warn(`[Node:LogConversation] Auto-extraction failed: ${err.message}`);
         });

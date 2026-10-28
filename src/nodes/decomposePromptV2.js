@@ -397,7 +397,15 @@ async function llmDecompose(message, llmBackend, conversationHistory, logger, on
     .map(m => `${_decisionRoleLabel(m)}: ${String(m.content || '').slice(0, 150)}`)
     .join('\n');
   const contextBlock = recentCtx ? `\nRecent conversation (for context/grounding only - DO NOT include in decomposition):\n${recentCtx}\n` : '';
-  const userPrompt = `CURRENT DATE AND TIME: ${currentDate} ${currentTime}\n\nDecompose ONLY the NEW user message below into ordered single-intent sub-prompts.${contextBlock}\nNEW MESSAGE TO DECOMPOSE:\n"${message}"`;
+  // Attachment blobs ([Highlighted: <page dump>]) are context, not tasks —
+  // the decomposer split mid-blob into phantom sub-prompts and ran duplicate
+  // work (observed: one screen-describe → two 10s browser scans). Bound the
+  // blob to an excerpt; the full text stays in state.selectedText for the
+  // answering nodes.
+  const _decompMsg = String(message || '').replace(
+    /\[(Thought|File|Folder|Context|Highlighted):([\s\S]*?)\]/g,
+    (m, kind, body) => `[${kind}: ${String(body).replace(/\s+/g, ' ').trim().slice(0, 220)}${body.length > 220 ? ' …' : ''}]`);
+  const userPrompt = `CURRENT DATE AND TIME: ${currentDate} ${currentTime}\n\nDecompose ONLY the NEW user message below into ordered single-intent sub-prompts.${contextBlock}\nNEW MESSAGE TO DECOMPOSE:\n"${_decompMsg}"`;
 
   let raw;
   try {
@@ -678,7 +686,7 @@ module.exports = async function decomposePromptV2(state) {
     // must still fetch. (Deck case handled by _imageDeckNeedsFetch below.)
     const _content = _scriptureRef ? null : (_tc.screenOutputContent || _inferred.content || null);
     const _action = _tc.screenOutputAction || 'show';
-    const _REFERENTIAL_RE = /\b(it|that|this|them|those|the\s+(result|answer|chapter|verse|response|reply|output|list|chart|graph|data|one)|whole\s+\w+|above|previous|again)\b/i;
+    const _REFERENTIAL_RE = /\b(it|that|this|them|those|him|his|her|he|she|the\s+(result|answer|chapter|verse|response|reply|output|list|chart|graph|data|one)|whole\s+\w+|above|previous|again)\b/i;
     // Image needs a fetch when the message carries no URL/path — the subject
     // ("pic of sonic") is the search query, not the content.
     const _imageNeedsFetch = _kind === 'image'

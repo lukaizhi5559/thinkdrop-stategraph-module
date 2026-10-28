@@ -26,6 +26,15 @@ function serializeSkillPlanToMd(skillPlan, originalPrompt, planId, sessionId) {
   const safePrompt = (originalPrompt || '').replace(/"/g, '\\"').slice(0, 300);
   const shortTitle = (originalPrompt || '').split(/\s+/).slice(0, 6).join(' ');
   const skillPlanB64 = Buffer.from(JSON.stringify(skillPlan)).toString('base64');
+  // Slot manifest — typed bindable values across step args (paths/urls/emails/
+  // quoted strings/numbers). Written at save so replay can rebind targets
+  // instead of re-running literal args (rebindPlanSlots).
+  let slotsB64 = null;
+  try {
+    const { mergePlanSlots } = require('./planCacheHelpers');
+    const _slots = mergePlanSlots(skillPlan);
+    if (Object.keys(_slots).length) slotsB64 = Buffer.from(JSON.stringify(_slots)).toString('base64');
+  } catch (_) {}
 
   const lines = [
     '---',
@@ -36,6 +45,7 @@ function serializeSkillPlanToMd(skillPlan, originalPrompt, planId, sessionId) {
     `session_id: ${sessionId || 'unknown'}`,
     `skill_plan: true`,
     `skill_plan_json: '${skillPlanB64}'`,
+    ...(slotsB64 ? [`slots_json: '${slotsB64}'`] : []),
     '---',
     '',
     `# Plan: ${shortTitle}`,
@@ -91,8 +101,6 @@ function buildStepDescription(step) {
   if (skill === 'playwright.agent') {
     return args.goal ? `playwright.agent — ${args.goal.slice(0, 50)}…` : 'playwright.agent';
   }
-  if (skill === 'external.skill') return `external.skill — ${args.name || ''}`;
-
   return skill;
 }
 
@@ -394,9 +402,17 @@ function _lintFileEditPlan(plan, logger, ctx = {}) {
   });
 
   const last = steps[steps.length - 1];
+  // Only drop a confirm-only terminal synthesize when a real artifact step
+  // (edit/write/shell) produced the deliverable — on service/browser plans
+  // the synthesize IS the answer surface, and dropping it leaves a verify
+  // step terminal (observed: calendar task ended on a blind turn.loop verify
+  // → "partial completion" while the event sat saved).
+  const _hasArtifactStep = steps.slice(0, -1).some(s =>
+    ['edit.agent', 'fs.write', 'fs.writeFile', 'shell.run'].includes(s?.skill));
   if (steps.length > 1 && last?.skill === 'synthesize' && !last.args?.saveToFile
       && String(last.args?.prompt || '').length < 400
-      && _CONFIRM_ONLY_RE.test(String(last.args.prompt))) {
+      && _CONFIRM_ONLY_RE.test(String(last.args.prompt))
+      && _hasArtifactStep) {
     rewrites.push({ index: steps.length - 1, kind: 'drop-confirm-step' });
     steps = steps.slice(0, -1);
   }

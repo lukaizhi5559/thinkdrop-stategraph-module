@@ -400,14 +400,23 @@ module.exports = async function gatherPlanContext(state) {
   // "how should ThinkDrop alert you" about a calendar event is off-topic). A
   // pinned service agent (e.g. google_calendar.agent) implies a named service
   // even when taskClassification didn't carry targetService.
+  // Delivery-channel question applies ONLY to reminder/alarm CREATION — a
+  // delete/cancel/reschedule of an existing event or reminder has nothing to
+  // notify about (observed: "delete that event I just set" misclassified as
+  // scheduling stalled 45s on "how would you like to be alerted").
+  const _schedMsg = String(state.message || state.resolvedMessage || '');
+  const _isReminderCreate =
+    /\b(remind|reminder|reminders|alarm|alarms|timer|timers|alert\s+me|wake\s+me|notify\s+me)\b/i.test(_schedMsg)
+    && !/\b(cancel|delete|delte|remove|erase|clear|reschedul\w*|postpone|turn\s+off|disable|move|change|edit|update)\b/i.test(_schedMsg);
   if (
     state._taskClassification?.taskType === 'scheduling' &&
     !state._taskClassification?.targetService &&
     !state._pinnedAgentId &&
     !state._deliveryChannelResolved &&
-    state.intent?.type === 'command_automate'
+    state.intent?.type === 'command_automate' &&
+    _isReminderCreate
   ) {
-    const _userMsg = String(state.message || state.resolvedMessage || '').toLowerCase();
+    const _userMsg = _schedMsg.toLowerCase();
     const _hasChannelKeyword = /\b(in[\s-]?app|notification|desktop\s+alert|macos\s+alert|sound|push)\b/i.test(_userMsg);
     if (!_hasChannelKeyword) {
       const _deliveryQuestion = 'How would you like to be alerted when the reminder fires?';
@@ -499,6 +508,36 @@ module.exports = async function gatherPlanContext(state) {
       planGatheringComplete: true,
       _needsPlan: {
         reason: 'local_multi_entity',
+        seedPrompt: _gatherMsg,
+        refs: extractContextRefs(_gatherMsg),
+        gatheredContext: (state.planGatheringAnswers || []),
+      },
+    };
+  }
+
+  // ── needs_plan escalation — no deterministic coverage ──────────────────────
+  // Coverage check: nothing deterministic claims this task — no compiled
+  // template plan, no cached/reused plan, no pinned tool. Rather than letting
+  // the LLM planner silently improvise (and grill for it), escalate to
+  // comms-graph planning mode, which AUTHORS a named reusable plan — the
+  // user-skill surface. Escape: a re-handoff carrying _allowPlannerFallback
+  // (user declined the planning lane / "just run it") skips this gate.
+  if (state.intent?.type === 'command_automate'
+      && !state._allowPlannerFallback
+      && !(Array.isArray(state._deterministicPlan) && state._deterministicPlan.length > 0)
+      && !(Array.isArray(state._skillPlan) && state._skillPlan.length > 0)
+      && !state._pinnedAgent
+      && !state._planTask
+      && !state.recoveryContext
+      && !state.isMultiIntent
+      && !(state.planGatheringAnswers || []).length
+      && !state._taskClassification?.isBrowseOnly) {
+    logger.info(`[Node:GatherPlanContext] No deterministic coverage → needs_plan escalation (no grill): "${_gatherMsg.slice(0, 80)}"`);
+    return {
+      ...state,
+      planGatheringComplete: true,
+      _needsPlan: {
+        reason: 'no_skill_coverage',
         seedPrompt: _gatherMsg,
         refs: extractContextRefs(_gatherMsg),
         gatheredContext: (state.planGatheringAnswers || []),

@@ -97,7 +97,12 @@ module.exports = async function checkPlanCache(state) {
 
   // ── 2. Disk search: exact match → auto-execute; semantic → suggestion only ──
   const mcpAdapter = state.mcpAdapter || null;
-  const similarPlan = await findSimilarCompletePlan(userMessage, mcpAdapter, logger, sessionId);
+  // Attached folder/file refs are first-class slot sources — "commit my-api"
+  // with a folder ref binds the resolved path, not a regex guess.
+  const _refsPaths = ((state.refs || state.context?.refs || []))
+    .filter(r => r && (r.type === 'folder' || r.type === 'file') && typeof r.path === 'string')
+    .map(r => r.path);
+  const similarPlan = await findSimilarCompletePlan(userMessage, mcpAdapter, logger, sessionId, { refsPaths: _refsPaths });
 
   if (!similarPlan) return state;
 

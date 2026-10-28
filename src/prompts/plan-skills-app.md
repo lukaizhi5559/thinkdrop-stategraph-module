@@ -173,7 +173,7 @@ For browser category, when the user wants to click, open, or select a text-based
 - The app's AI assistant performs the actual edit. The final save is triggered by the app's own save shortcut via `run_agent`.
 - Do NOT use `shell.run` to write to the file from outside the app.
 - Do NOT emit separate `execute_shortcut` + `typeText` steps for this pattern unless `run_agent` is unavailable. The per-app skill descriptor provides the correct shortcuts.
-- **NEVER use `cli.agent`, `external.skill`, or any other CLI/package tool for this desktop app task — the native app itself is the correct execution route.**
+- **NEVER use `cli.agent` or any other CLI/package tool for this desktop app task — the native app itself is the correct execution route.**
 
 ## App-Flow (New — replaces run_agent for complex app tasks)
 
@@ -198,7 +198,7 @@ When the user asks to perform a multi-step task in a desktop app that requires m
 - Use `run_app_flow` for complex multi-step tasks that need iterative navigation, slash commands, monitoring, or fallback strategies
 - For examine/retrieve tasks (read, summarize, explain, tell me about), follow `run_app_flow` with a `synthesize` step to present the answer to the user
 - For edit/mutation tasks (add, modify, refactor, write), use a single `run_agent` step with NO `synthesize` — the app owns the save
-- **NEVER use `shell.run`, `cli.agent`, `external.skill`, or any other CLI/package tool for a named desktop app task. The native desktop app itself is the correct execution route — do not install or call a similarly-named package from PyPI, npm, etc.**
+- **NEVER use `shell.run`, `cli.agent`, or any other CLI/package tool for a named desktop app task. The native desktop app itself is the correct execution route — do not install or call a similarly-named package from PyPI, npm, etc.**
 
 **Example: "Examine the <file> using <AppName> LLM and tell me what it's about"**
 ```json

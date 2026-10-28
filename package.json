@@ -8,7 +8,6 @@
     "test": "node test/run-all.js",
     "test:unit": "node test/unit.test.js",
     "test:parse-intent": "node test/parse-intent.test.js",
-    "test:parse-skill": "node test/parse-skill.test.js",
     "test:full": "node test/full-stategraph.test.js",
     "bench": "node test/intent-bench.js",
     "bench:offline": "node test/intent-bench.js --offline",

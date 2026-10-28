@@ -10,7 +10,8 @@
  *   3. Override low-confidence command_automate → answer for screen queries
  *   4. Lazy screen grab handoff (needsFreshScreen)
  *   5. Unresolved enrichment gaps → logConversation (ask user)
- *   6. skill_creation follow-up → createSkillFromHistory
+ *   6. (skill_creation follow-up → createSkillFromHistory — RETIRED; skill
+ *      asks now flow through the normal automate path → needs_plan → planning)
  *   7. Resume fast-paths → planSkills
  *   8. command_automate → resolveUserContext (with installed-skill check)
  *   9. intent → destination map
@@ -105,17 +106,6 @@ module.exports = async function routeIntent(state) {
     return patch;
   }
 
-  // ── Skill creation from conversation history ───────────────────────────────
-  // classifyTask detected skill_creation intent — user wants to turn code/script
-  // from previous conversation into a reusable skill. Route to createSkillFromHistory.
-  // CRITICAL: Only route to skill creation if it's a follow-up referring to previous code
-  if (state._taskClassification?.taskType === 'skill_creation' &&
-      state._taskClassification?.isFollowUp === true) {
-    logger.info('[Node:RouteIntent] skill_creation + isFollowUp detected — routing to createSkillFromHistory');
-    patch._advanceRoute = 'createSkillFromHistory';
-    return patch;
-  }
-
   // ── _skillPlan resume fast-path ────────────────────────────────────────────
   // Plan is pre-built (e.g. ask_user resume) — skip resolveUserContext,
   // resolveAgent, preflightAgents, gatherPlanContext and go straight to planSkills.
@@ -137,41 +127,6 @@ module.exports = async function routeIntent(state) {
   }
 
   if (intentType === 'command_automate') {
-    // Skill already installed (parseSkill matched) — skip creatorPlanning,
-    // go straight to resolveUserContext → gatherPlanContext → planSkills.
-    // BUT: if the skill is a stub (no index.cjs on disk), we must go through gatherContext
-    // first so credentials/service info are collected before the skill build kicks off.
-    if (state.matchedSkillName) {
-      const _fs = require('fs');
-      const _os = require('os');
-      const _path = require('path');
-      const _dotName = state.matchedSkillName;
-      const _underscoreName = _dotName.replace(/\./g, '_');
-      // Check both dot-notation and underscore directories
-      const _candidates = [_dotName, _underscoreName].filter((v, i, a) => a.indexOf(v) === i);
-      let _found = false;
-      for (const _dirName of _candidates) {
-        const _skillDir = _path.join(_os.homedir(), '.thinkdrop', 'skills', _dirName);
-        const _skillExec = _path.join(_skillDir, 'index.cjs');
-        const _skillMd   = _path.join(_skillDir, 'skill.md');
-        const _apiJson   = _path.join(_skillDir, 'api.json');
-        const _cliJson   = _path.join(_skillDir, 'cli.json');
-        if (_fs.existsSync(_skillExec) || _fs.existsSync(_skillMd) || _fs.existsSync(_apiJson) || _fs.existsSync(_cliJson)) {
-          logger.debug(`[Node:RouteIntent] matchedSkillName="${_dotName}" is installed (dir=${_dirName}) — skipping to resolveUserContext`);
-          _found = true;
-          break;
-        }
-      }
-      if (_found) {
-        patch._advanceRoute = 'resolveUserContext';
-        return patch;
-      }
-      // Stub-only: no index.cjs on disk — fall through to resolveUserContext which handles it
-      logger.debug(`[Node:RouteIntent] matchedSkillName="${_dotName}" is stub — routing to resolveUserContext`);
-      patch.matchedSkillName = null;
-      // fall through below
-    }
-    // gatherContext + creatorPlanning both bypassed — route to resolveUserContext → planSkills
     logger.debug('[Node:RouteIntent] command_automate — resolveUserContext');
     patch._advanceRoute = 'resolveUserContext';
     return patch;

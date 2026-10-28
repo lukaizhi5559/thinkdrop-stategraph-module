@@ -21,7 +21,6 @@ const planSkillsNode = require('./nodes/planSkillsV2');
 const screenIntelligenceNode = require('./nodes/screenIntelligence');
 const logConversationNode = require('./nodes/logConversation');
 const resolveReferencesNode = require('./nodes/resolveReferencesV2');
-const parseSkillNode = require('./nodes/parseSkill');
 const checkPlanCacheNode = require('./nodes/checkPlanCache');
 const fastLanePlanNode = require('./nodes/fastLanePlan');
 const synthesizeNode = require('./nodes/synthesize');
@@ -46,7 +45,6 @@ const routeIntentNode = require('./nodes/routeIntent');
 const extractStepResult = require('./utils/extractStepResult');
 const executeIntrospectNode = require('./nodes/executeIntrospect');
 const executeSettingsNode = require('./nodes/executeSettings');
-const createSkillFromHistoryNode = require('./nodes/createSkillFromHistory');
 const planExecutorNode = require('./nodes/planExecutor');
 const preflightAgentsNode = require('./nodes/preflightAgents');
 const resolveAgentNode = require('./nodes/resolveAgent');
@@ -214,7 +212,6 @@ class StateGraphBuilder {
       decomposePrompt: (state) => decomposePromptNode({ ...state, logger, llmBackend }),
       resolveReferences: (state) => resolveReferencesNode({ ...state, logger, mcpAdapter, llmBackend }),
       clarify: (state) => clarifyNode({ ...state, logger, mcpAdapter, llmBackend }),
-      parseSkill: (state) => parseSkillNode({ ...state, logger, mcpAdapter, llmBackend }),
       parseIntent: (state) => parseIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       checkPlanCache: (state) => checkPlanCacheNode({ ...state, logger }),
       fastLanePlan: (state) => fastLanePlanNode({ ...state, logger }),
@@ -241,7 +238,6 @@ class StateGraphBuilder {
       summarizeMultiIntent: (state) => summarizeMultiIntentNode({ ...state, logger, mcpAdapter, llmBackend }),
       executeIntrospect: (state) => executeIntrospectNode({ ...state, logger, mcpAdapter }),
       executeSettings: (state) => executeSettingsNode({ ...state, logger }),
-      createSkillFromHistory: (state) => createSkillFromHistoryNode({ ...state, logger, mcpAdapter, llmBackend }),
       planExecutor: (state) => planExecutorNode({ ...state, logger, mcpAdapter, llmBackend }),
       advanceQueue: (state) => advanceQueueNode({ ...state, logger, mcpAdapter, llmBackend }),
       preparePostScreen: (state) => preparePostScreenNode({ ...state, logger, mcpAdapter }),
@@ -296,18 +292,10 @@ class StateGraphBuilder {
       // a fixed browse plan when taskClassification proves a simple public-web
       // lookup. Either way, _skillPlan downstream cascades to planSkills.
       checkPlanCache: 'fastLanePlan',
-      fastLanePlan: 'parseSkill',
-      parseSkill: (state) => {
-        // parseIntent has already run upstream — always proceed to enrichIntent.
-        // parseSkill may have set matchedSkillName via strategies 1/2 (exact/phrase match)
-        // or strategy 2.5/2.7/3 (gated on command_automate). Intent is preserved either way.
-        if (state.matchedSkillName) {
-          logger.debug(`[StateGraph:Router] parseSkill matched "${state.matchedSkillName}" — routing to enrichIntent`);
-        } else {
-          logger.debug(`[StateGraph:Router] parseSkill no match — routing to enrichIntent (intent: ${state.intent?.type})`);
-        }
-        return 'enrichIntent';
-      },
+      // parseSkill (installed-skill match) retired — fastLanePlan goes straight
+      // to enrichIntent. Reusable procedures are named saved plans; the
+      // checkPlanCache path already handles their match/replay.
+      fastLanePlan: 'enrichIntent',
 
       // enrichIntent → routeIntent: all post-enrichment routing decisions
       // (screen follow-up injection, lazy grab, resume fast-paths, intent map)
@@ -332,9 +320,6 @@ class StateGraphBuilder {
       storeConstraint: 'logConversation',
       // Constraint lift path: liftConstraint → logConversation → end
       liftConstraint: 'logConversation',
-
-      // Skill creation from history → logConversation → end
-      createSkillFromHistory: 'logConversation',
 
       // resolveUserContext → resolveAgent → preflightAgents → gatherPlanContext → planSkills
       // resolveAgent picks the agents; preflightAgents checks their auth status

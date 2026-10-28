@@ -16,7 +16,7 @@
  * the skill.
  *
  * The injected _skillPlan rides the existing pre-built-plan machinery:
- * parseSkill/enrichIntent pass through, routeIntent skips resolveUserContext /
+ * enrichIntent passes through; routeIntent skips resolveUserContext /
  * resolveAgent / preflightAgents / gatherPlanContext straight to planSkills,
  * and planSkillsV2's `_skillPlan` fast-path adopts it without an LLM call and
  * without an approval modal (read-only public fetches are low-risk, same as

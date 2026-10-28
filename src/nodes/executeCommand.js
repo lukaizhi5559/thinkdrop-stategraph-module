@@ -67,6 +67,40 @@ try {
     _dir = path.dirname(_dir);
   }
 } catch (_) {}
+
+// Guardian/trigger rules — same walk-up; the canonical matcher lives in
+// command-service skill-helpers so every service shares one rules file.
+let _rulesMod = null;
+try {
+  let _dir = __dirname;
+  for (let i = 0; i < 8; i++) {
+    const _candidate = path.join(_dir, 'mcp-services', 'command-service', 'src', 'skill-helpers', 'rules.cjs');
+    if (fs.existsSync(_candidate)) {
+      _rulesMod = require(_candidate);
+      break;
+    }
+    _dir = path.dirname(_dir);
+  }
+} catch (_) {}
+
+// Fire-and-forget task enqueue — trigger rules' `enqueue_task` action
+// dispatches through comms-graph's normal proactive lane (lock check →
+// journal → stategraph run), so triggered work gets its own taskFacts.
+function _enqueueTriggeredTask(prompt, ruleId, logger) {
+  try {
+    const port = parseInt(process.env.THINKDROP_COMMS_PORT || '3015', 10);
+    const body = JSON.stringify({ prompt, source: 'trigger', ruleId });
+    const req = http.request({
+      hostname: '127.0.0.1', port, path: '/comms.proactive', method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+      timeout: 5000,
+    }, (res) => { res.resume(); });
+    req.on('error', (e) => { try { logger?.warn?.(`[Node:ExecuteCommand] trigger enqueue failed: ${e.message}`); } catch (_) {} });
+    req.on('timeout', () => req.destroy());
+    req.end(body);
+    return true;
+  } catch (_) { return false; }
+}
 if (!_classifyDeepLinkType) {
   // Fallback: simple regex-based classifier (less accurate but prevents crashes)
   _classifyDeepLinkType = (url) => {
@@ -205,13 +239,32 @@ async function _probePageSignature(mcpAdapter, sessionId, logger) {
 const _EYES_BROWSER_RE = /^(url\.first\.agent|dom\.act|just\.type\.agent|meta\.find\.agent|shortcut\.keys\.agent|tab\.map\.agent|form\.fill\.agent|gesture\.agent|arrow\.grid\.agent|turn\.loop\.agent|browser\.act|browser\.agent|playwright\.agent)$/;
 const _EYES_ACTION_GOAL_RE = /\b(open|click|press|create|add|save|submit|send|select|choose|fill|type|navigate|goto|go to|start|begin|apply|confirm|post|upload|download|delete|remove|edit|rename|share|invite|sign|log)\b/i;
 const _EYES_DIALOG_GOAL_RE = /\b(dialog|modal|popup|popover|compose|create.?event|new event|new doc|quick.?add)\b/i;
+// Full-page creation surfaces render inline, not as dialogs — a creation-URL
+// already satisfies an "open the dialog" goal even when sig.dg is false
+// (observed: eyes failed "Open create-event dialog" on /r/eventedit where no
+// dialog exists by design). Same vocabulary as stateEyes._CREATION_URL_RE.
+const _EYES_CREATION_URL_RE = /eventedit|action=TEMPLATE|compose|\/new\b|\/create|\/draft|\/editor|deeplink/i;
 // Terminal actions END by closing the surface — after a successful Save the
 // form is gone and the page returns to baseline. "Nothing on screen" is the
 // success signature, not a contradiction. Misreading it caused the calendar
 // duplicate: eyes failed a saved event → recovery re-ran → second event.
 const _EYES_TERMINAL_RE = /\b(save|submit|send|post|publish|checkout|pay|book|order|delete|remove|apply|invite|share)\b/i;
 
-async function _eyesStepCheck({ mcpAdapter, askDecision, llmBackend, logger, step, sessionId, resultText }) {
+// taskFacts surface-match: the live URL is ON the resolved destination
+// surface → the creation surface is open (full-page forms like eventedit
+// have no dialog flag). Facts beat regex — taskFacts.destination was
+// resolved once upstream and is authoritative for "what surface did we
+// aim at".
+function _taskFactsSurfaceMatch(taskFacts, currentUrl) {
+  const dest = taskFacts?.destination?.url;
+  if (!dest || !currentUrl) return false;
+  try {
+    const d = new URL(dest), c = new URL(currentUrl);
+    return d.hostname === c.hostname && c.pathname.startsWith(d.pathname);
+  } catch (_) { return false; }
+}
+
+async function _eyesStepCheck({ mcpAdapter, askDecision, llmBackend, logger, step, sessionId, resultText, taskFacts }) {
   const sig = await _probePageSignature(mcpAdapter, sessionId, logger).catch(() => null);
   if (!sig || sig.probeError) return { verdict: 'pass', pageState: sig }; // blind → don't gate
   const goal = String(step.goal || step.description || step.args?.goal || step.args?.task || '');
@@ -219,12 +272,24 @@ async function _eyesStepCheck({ mcpAdapter, askDecision, llmBackend, logger, ste
   // Deterministic postconditions first — a dialog-expected step with no
   // dialog on screen is a fact, not a judgment. Except terminal goals: for a
   // save/submit the dialog closing IS the expected end-state.
-  if (!_terminal && _EYES_DIALOG_GOAL_RE.test(goal) && sig.dg === false) {
+  if (!_terminal && _EYES_DIALOG_GOAL_RE.test(goal) && sig.dg === false
+      && !_EYES_CREATION_URL_RE.test(sig.u || '')
+      && !_taskFactsSurfaceMatch(taskFacts, sig.u || '')) {
     return { verdict: 'fail', reason: 'expected dialog/overlay is not open (probe.dg=false)', pageState: sig };
   }
   // Terminal step + form closed + clickables present → the surface did close
   // on a live page — deterministic pass, no model needed.
   if (_terminal && sig.dg === false) {
+    return { verdict: 'pass', pageState: sig };
+  }
+  // Destination auto-satisfy — the live URL IS the resolved taskFacts
+  // destination, so a reach/open/verify-the-surface goal is satisfied by
+  // observation. tev1 doesn't get to contradict a fact (observed: "Open
+  // create-event dialog" fail on the eventedit page — dg=false was read as
+  // "dialog missing" though eventedit renders a full page by design).
+  if (_taskFactsSurfaceMatch(taskFacts, sig.u || '')
+      && /\b(open|launch|pull\s+up|bring\s+up|show|start|begin|create|new|add|go\s+to|navigate|visit|reach)\b[^.]{0,50}\b(dialog|modal|popup|popover|form|window|compose|page|event|surface|screen|site|tab)\b/i.test(goal)) {
+    logger?.info?.(`[Node:ExecuteCommand] eyes: step goal satisfied — live URL is the resolved destination (${String(sig.u).slice(0, 80)})`);
     return { verdict: 'pass', pageState: sig };
   }
   if (!_EYES_ACTION_GOAL_RE.test(goal)) return { verdict: 'pass', pageState: sig };
@@ -698,13 +763,27 @@ async function _thinPostFailureHandler(state) {
       const _evidence = `Previous attempt failed: ${_argvStr || '(argv resolved from goal)'} → ${String(failedStep.error || 'failed').slice(0, 300)}`;
       const _filler = new Set(['the', 'a', 'an', 'it', 'this', 'my', 'your', 'to', 'on', 'in', 'for', 'with']);
       const _useBuild = _installish && _svc && !_filler.has(_svc) && _svc.length >= 2;
+      // Carry the original request + prior step discoveries into the
+      // substituted agent run — without them the generic loop re-derives the
+      // world from a bare goal (observed: an escalated "find uncommitted
+      // changes" step re-globbed ~ for .git dirs for 12 PTY turns).
+      const _priorCtx = (skillResults || [])
+        .filter(r => r && r.ok !== false && r.stdout)
+        .slice(-2)
+        .map(r => `[${r.skill}] ${String(r.stdout).slice(0, 400)}`)
+        .join('\n');
+      const _origReq = (resolvedMessage || message || '').slice(0, 300);
+      const _ctxBlock = [
+        _origReq ? `Original request: ${_origReq}` : '',
+        _priorCtx ? `Earlier step results:\n${_priorCtx}` : '',
+      ].filter(Boolean).join('\n');
       const patchedPlan = [...skillPlan];
       patchedPlan[skillCursor] = {
         ...patchedPlan[skillCursor],
         skill: 'cli.agent',
         args: _useBuild
           ? { action: 'build_agent', service: _svc, protectedPaths: _protectedPaths }
-          : { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}`, protectedPaths: _protectedPaths },
+          : { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}${_ctxBlock ? `\n${_ctxBlock}` : ''}`, cwd: failedStep.args?.cwd || undefined, protectedPaths: _protectedPaths },
         description: failedStep.description || (_useBuild ? `Install & register ${_svc}` : `Retry agentically: ${(_goalText || _argvStr).slice(0, 60)}`),
       };
       logger.info(`[ExecuteCommand:ThinRecovery] AGENT_ESCALATE: shell.run step ${skillCursor + 1} failed (${(failedStep.error || '').slice(0, 80)}) — substituting cli.agent ${_useBuild ? `build_agent service=${_svc}` : 'generic run'}`);
@@ -797,6 +876,47 @@ async function _thinPostFailureHandler(state) {
       skillPlan: patchedPlan,
       recoveryNote: 'The structured installer failed — handing to the CLI agent loop so it can adapt.',
       patchHistory: [...patchHistory, { action: 'TERMINAL_DEBUG', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
+      stepRetryCount: stepRetryCount + 1,
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
+  // ── cli.agent run on a missing agent → splice build_agent before it ───────
+  // needsBuild means the referenced agentId isn't in the registry — typically
+  // a fabricated "<svc>.agent" minted for a merely-detected CLI. cli.agent's
+  // run self-heals when the binary is already on PATH; a needsBuild reaching
+  // recovery means the binary is missing too (or the auto-build declined) —
+  // schedule the explicit build step, then let the run retry against the real
+  // agent. Mirrors the browser.agent needsBuild → REPLAN contract. Once per
+  // cursor — a second failure falls through to normal recovery.
+  const _nbAgentId = failedStep.skill === 'cli.agent' && failedStep.needsBuild
+    ? String(failedStep.args?.agentId || '') : '';
+  const _nbSvcKey = _nbAgentId.replace(/\.agent$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (_nbSvcKey.length >= 2
+      && failedStep.args?.action === 'run'
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => p.action === 'AGENT_BUILD' && p.cursor === skillCursor)) {
+    const patchedPlan = [...skillPlan];
+    patchedPlan.splice(skillCursor, 0, {
+      skill: 'cli.agent',
+      args: { action: 'build_agent', service: _nbSvcKey, protectedPaths: _protectedPaths },
+      description: `Build the ${_nbSvcKey} agent (register CLI descriptor)`,
+    });
+    // Normalize the deferred run step's agentId to match what build_agent
+    // creates — a fabricated "my-svc.agent" would re-miss even after
+    // "mysvc.agent" registers.
+    const _runStep = patchedPlan[skillCursor + 1];
+    if (_runStep?.args?.agentId) {
+      _runStep.args = { ..._runStep.args, agentId: `${_nbSvcKey}.agent` };
+    }
+    logger.info(`[ExecuteCommand:ThinRecovery] AGENT_BUILD: cli.agent step ${skillCursor + 1} references unregistered ${_nbSvcKey}.agent — inserting build_agent before retry`);
+    return {
+      ...state,
+      recoveryAction: 'auto_patch',
+      skillPlan: patchedPlan,
+      recoveryNote: `The ${_nbSvcKey} agent isn't set up yet — building it first, then retrying.`,
+      patchHistory: [...patchHistory, { action: 'AGENT_BUILD', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
       stepRetryCount: stepRetryCount + 1,
       failedStep: null,
       commandExecuted: false,
@@ -1216,7 +1336,7 @@ async function _thinPostFailureHandler(state) {
       ...state,
       recoveryAction: 'ask_user',
       pendingQuestion: {
-        question: `Step "${_failedSkill}" failed: ${failedStep.error}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
+        question: `Step "${_failedSkill}" failed: ${failedStep.error || 'the step did not complete (no error detail)'}\n\nWhat would you like to do? You can also type what went wrong and I'll retry with your correction.`,
         options: [
           { label: 'Try again', value: 'try_again' },
           { label: 'Correct and retry (tell me what was missed)', value: 'correct_and_retry' },
@@ -2620,6 +2740,25 @@ module.exports = async function executeCommand(state) {
   const step = skillPlan[skillCursor];
   const { skill, optional = false, description } = step;
 
+  // ── Skipped/superseded steps — plan-locked semantics ──────────────────────
+  // A step marked by plan-time dedup ("surface already open") or a replan
+  // ("superseded by step N") stays in the list and renders skipped — it is
+  // never silently removed nor re-run. Emitted as step_skipped so the UI marks
+  // it and the synthesizer sees the gap honestly.
+  if (step.skipped || step.superseded) {
+    const _skipReason = step.skipReason || (step.superseded ? 'superseded by replan' : 'skipped');
+    logger.info(`[Node:ExecuteCommand] Step ${skillCursor + 1}/${skillPlan.length} skipped — ${_skipReason} (${String(description || skill).slice(0, 60)})`);
+    if (progressCallback) progressCallback({
+      type: 'step_skipped', stepIndex: skillCursor, skill,
+      description, reason: _skipReason,
+    });
+    const _skipRes = { step: skillCursor + 1, skill, args: step.args || {}, description,
+      ok: true, skipped: true, skipReason: _skipReason, result: null };
+    const _skipContract = generateStepContract(_skipRes, skillCursor);
+    return { ...state, skillResults: [...skillResults, _skipRes],
+      stepContracts: [...stepContracts, _skipContract], skillCursor: skillCursor + 1 };
+  }
+
   // ── Auto-inject from prior step contracts ────────────────────────────────
   // Before template resolution, scan prior contracts to fill missing args
   let args = step.args || {};
@@ -2867,6 +3006,44 @@ module.exports = async function executeCommand(state) {
   // ── schedule pseudo-skill (NON-BLOCKING) ─────────────────────────────────
   // Registers a one-shot reminder with command-service /reminder.register,
   // then returns immediately. No blocking setTimeout countdown.
+  // ── Postcondition verify — deterministic, ext-session safe ────────────────
+  // turn.loop verify steps are blind on extension sessions ("no engine page
+  // for session=ext:…" → exhausted → null). When taskFacts carries a
+  // urlTransition postcondition the answer is already a fact: the creation
+  // surface's URL closing IS the save. Probe it directly — no model, no
+  // turn-loop — and report the transition truthfully.
+  const _postcond = state.taskFacts?.postcondition;
+  if (skill === 'turn.loop.agent'
+      && _postcond && _postcond.kind === 'urlTransition' && _postcond.from
+      && (String(args.mode || '') === 'verify'
+          || /\b(verify|confirm|ensure|check|validate)\b/i.test(String(description || '') + ' ' + String(args.goal || args.task || '')))) {
+    const _vSid = args.sessionId || state.activeBrowserSessionId || null;
+    const _sig = await _probePageSignature(mcpAdapter, _vSid, logger).catch(() => null);
+    if (_sig && !_sig.probeError && _sig.u) {
+      const _left = (() => {
+        try {
+          const f = new URL(_postcond.from), c = new URL(_sig.u);
+          return !(f.hostname === c.hostname && c.pathname.startsWith(f.pathname));
+        } catch (_) { return false; }
+      })();
+      const _vRes = {
+        step: skillCursor + 1, skill, args, description,
+        ok: _left,
+        result: _left
+          ? `verified: page transitioned off ${_postcond.from.slice(0, 80)} → ${_sig.u.slice(0, 80)}`
+          : `postcondition unmet — still on ${_sig.u.slice(0, 80)}`,
+        error: _left ? null : 'postcondition: still on creation surface',
+      };
+      const _vContract = generateStepContract(_vRes, skillCursor);
+      logger.info(`[Node:ExecuteCommand] postcondition verify (urlTransition): ${_left ? 'PASS' : 'FAIL'} — ${_sig.u.slice(0, 80)}`);
+      _emitTerminalActivity(`postcondition verify: ${_left ? 'transitioned — done' : 'still on origin surface'}`, _left ? 'done' : 'fail');
+      return { ...state, skillResults: [...skillResults, _vRes],
+        stepContracts: [...stepContracts, _vContract], skillCursor: skillCursor + 1 };
+    }
+    // Probe blind → fall through to the normal turn.loop path.
+    logger.info('[Node:ExecuteCommand] postcondition probe blind — falling through to turn.loop');
+  }
+
   if (skill === 'schedule') {
     const { time, delayMs: rawDelayMs, label: _rawLabel } = args;
     // External-service guard — a "schedule" step whose description/label
@@ -4024,9 +4201,6 @@ module.exports = async function executeCommand(state) {
         (r.skill === 'cli.agent' && r.ok &&
           ((typeof r.result === 'string' && r.result.trim().length > 0) ||
            (typeof r.stdout === 'string' && r.stdout.trim().length > 0))) ||
-        (r.skill === 'external.skill' && r.ok &&
-          ((typeof r.result === 'string' && r.result.trim().length > 0) ||
-           (typeof r.stdout === 'string' && r.stdout.trim().length > 0))) ||
         (r.skill === 'web.agent' && r.ok &&
           ((typeof r.result === 'string' && r.result.trim().length > 0) ||
            (typeof r.stdout === 'string' && r.stdout.trim().length > 0))) ||
@@ -4084,8 +4258,6 @@ module.exports = async function executeCommand(state) {
           ? ('video.agent:' + (r.pageTitle || r.result?.pageTitle || r.args?.videoUrl || r.args?.url || 'video'))
           : r.skill === 'cli.agent'
           ? ('cli.agent:' + (r.args?.agentId || r.args?.command || 'cli'))
-          : r.skill === 'external.skill'
-          ? ('external.skill:' + (r.args?.name || 'skill'))
           : r.skill === 'web.agent'
           ? ('web.agent:' + (r.args?.action || r.args?.query || 'web'))
           : (r.args?.sessionId || r.args?.agentId || (r.skill === 'app.agent' ? 'app.agent' : 'browser.agent'));
@@ -4459,24 +4631,6 @@ module.exports = async function executeCommand(state) {
       .filter(r => r.skill === 'system.introspect' && r.ok && r.result)
       .map(r => `=== System Information (${r.args?.query || 'introspect'}) ===\n${JSON.stringify(r.result, null, 2)}`);
 
-    // Include external.skill results — external skill execution output
-    const externalSkillResults = skillResults
-      .filter(r => r.skill === 'external.skill' && r.ok && (r.output || r.stdout))
-      .map(r => {
-        const label = r.skillName || r.args?.name || 'external';
-        const parts = [`=== External Skill (${label}) ===`];
-        const mainOutput = r.output || r.stdout || '';
-        if (mainOutput) parts.push(mainOutput);
-        // Include additional structured fields beyond just the `output` string
-        // so synthesize/downstream LLMs see the full data (images[], counts, file paths, etc.)
-        const SKIP_FIELDS = new Set(['ok','skill','skillName','execType','step','description','args','stdout','output','_contract','requiresReauth']);
-        const extras = Object.entries(r)
-          .filter(([k, v]) => !SKIP_FIELDS.has(k) && v !== null && v !== undefined && typeof v !== 'function')
-          .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
-        if (extras.length > 0) parts.push(extras.join('\n'));
-        return parts.join('\n');
-      });
-
     // ── Generic catch-all collector ──────────────────────────────────────────
     // Any successful step whose result carries substantial text that no dedicated
     // collector claimed — covers the atomic browser agents (url.first, dom.act→
@@ -4485,7 +4639,7 @@ module.exports = async function executeCommand(state) {
     // never sees (observed: Gmail results on screen, synthesize reported
     // "0 results" and hallucinated a no-access refusal).
     const _COLLECTED_SKILLS = new Set([
-      'browser.act', 'app.agent', 'browser.agent', 'cli.agent', 'external.skill',
+      'browser.act', 'app.agent', 'browser.agent', 'cli.agent',
       'web.agent', 'video.agent', 'playwright.agent', 'shell.run', 'web.crawl',
       'file.bridge', 'fs.read', 'image.analyze', 'user.agent', 'screen.capture',
       'file.watch', 'system.introspect', 'synthesize', 'ask_user', 'schedule',
@@ -4532,7 +4686,6 @@ module.exports = async function executeCommand(state) {
       ...screenCaptureResults,
       ...fileWatchResults,
       ...systemIntrospectResults,
-      ...externalSkillResults,
       ...genericResults,
     ];
 
@@ -4630,44 +4783,6 @@ module.exports = async function executeCommand(state) {
         crossTurnContext = recentOutputMsg.content;
         logger.debug(`[Node:ExecuteCommand] synthesize: using cross-turn context from conversation history (${crossTurnContext.length} chars)`);
       }
-    }
-
-    // ── External-skill-only fast path ─────────────────────────────────────────
-    // When the only context is from external.skill result(s) — no page text, no
-    // shell output, no web crawl — skip the LLM and return the skill output directly.
-    // This preserves the exact structured output instead of letting the LLM paraphrase
-    // (and potentially lose) data like images[], file paths, and counts.
-    const _onlyExternalSkill = externalSkillResults.length > 0 &&
-      pageTextResults.length === 0 && processedShellResults.length === 0 &&
-      webCrawlResults.length === 0 && fileBridgeResults.length === 0 &&
-      fsReadResults.length === 0 && imageAnalyzeResults.length === 0 &&
-      cliAgentResults.length === 0 && playwrightAgentResults.length === 0 &&
-      webAgentResults.length === 0 && appAgentResults.length === 0 &&
-      videoAgentResults.length === 0 &&
-      screenCaptureResults.length === 0 && systemIntrospectResults.length === 0;
-
-    if (_onlyExternalSkill) {
-      const _directAnswer = externalSkillResults.join('\n\n');
-      logger.info(`[Node:ExecuteCommand] synthesize: external-skill-only — returning output directly (${_directAnswer.length} chars)`);
-      if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill: 'synthesize', description: description || 'Skill result', stdout: _directAnswer, isSynthesisResult: true });
-      if (typeof streamCallback === 'function') streamCallback(_directAnswer);
-
-      // Emit all_done if synthesize is the last step — otherwise the UI spinner never dismisses
-      const _isExtOnlyLast = skillCursor + 1 >= skillPlan.length;
-      if (_isExtOnlyLast && progressCallback) {
-        const _extUpdatedResults = [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: _directAnswer, stdout: _directAnswer }];
-        progressCallback({ type: 'all_done', completedCount: skillCursor + 1, totalCount: skillPlan.length, skillResults: _extUpdatedResults, savedFilePaths: state.savedFilePaths || [], planFile: state._skillPlanFile || null });
-      }
-
-      return {
-        ...state,
-        skillResults: [...skillResults, { step: skillCursor + 1, skill: 'synthesize', args, description, ok: true, result: _directAnswer, stdout: _directAnswer }],
-        skillCursor: skillCursor + 1,
-        failedStep: null,
-        answer: _directAnswer,
-        synthesisAnswer: _directAnswer,
-        commandExecuted: true,
-      };
     }
 
     const _rawSynthesisContext = allContextParts.length > 0
@@ -5536,6 +5651,11 @@ Please try again or search with different terms.`;
   // bestUrl turns out to be an error page or thin content.
   const webAgentFallbackUrls = Array.isArray(state.webAgentFallbackUrls) ? state.webAgentFallbackUrls : [];
   let resolvedArgs = args;
+  // Canonical task-facts object — resolved once in preflightAgents, carried to
+  // skills verbatim. Gate/fill logic reads facts instead of re-deriving them.
+  if (state.taskFacts && typeof resolvedArgs === 'object' && resolvedArgs !== null) {
+    resolvedArgs = { ...resolvedArgs, taskFacts: state.taskFacts };
+  }
   if (synthesisAnswer || synthesisAnswerFile || prevStdout || prevWatchId || webAgentBestUrl || JSON.stringify(args).includes('{{fallbackUrls}}')) {
     let argsJson = JSON.stringify(args);
     if (synthesisAnswer) {
@@ -6261,7 +6381,6 @@ Please try again or search with different terms.`;
 
   resolvedArgs = _enrichBrowserStepArgs(skill, resolvedArgs);
 
-  const externalSkillName = skill === 'external.skill' && resolvedArgs.name ? resolvedArgs.name : null;
   // Build a human-readable label: "browser.act — navigate (perplexity)", "shell.run — bash", etc.
   function buildRichDescription(sk, args) {
     if (description) return description;
@@ -6285,7 +6404,6 @@ Please try again or search with different terms.`;
       const u = (args.url || '').replace(/^https?:\/\//, '').slice(0, 50);
       return u ? `Crawling ${u}…` : 'web.crawl';
     }
-    if (externalSkillName) return `external.skill — ${externalSkillName}`;
     return sk;
   }
   const stepStartDescription = buildRichDescription(skill, resolvedArgs);
@@ -6682,6 +6800,11 @@ Please try again or search with different terms.`;
   //   step.args.skipIfEmpty = true    → same (canonical location)
   //   step.skipIfPrevEmpty = varName  → skip if state._gatheredVars[varName] is empty
   //   step.args.skipIfPrevEmpty = v   → same
+  //
+  //   step.runIf = {var, op, value}   → plan-level conditional (Trigger):
+  //   step.args.runIf = same          → skip unless _gatheredVars[var]
+  //       satisfies op (exists|contains|eq|ne|match). Deterministic — the
+  //       predicate is a regex/eq over a captured var, never a model call.
   {
     const gatheredVars = state._gatheredVars || {};
     const skipIfEmpty = step.skipIfEmpty || args.skipIfEmpty;
@@ -6695,8 +6818,27 @@ Please try again or search with different terms.`;
     const shouldSkipByPrev = skipIfPrevEmpty &&
       (!gatheredVars[skipIfPrevEmpty] || String(gatheredVars[skipIfPrevEmpty]).trim() === '');
 
-    if (shouldSkipByEmpty || shouldSkipByPrev) {
-      const whySkipped = shouldSkipByEmpty ? 'value is empty' : `"${skipIfPrevEmpty}" not collected`;
+    const runIf = step.runIf || args.runIf || null;
+    let shouldSkipByRunIf = false;
+    let runIfReason = null;
+    if (runIf && typeof runIf === 'object' && runIf.var) {
+      const actual = gatheredVars[runIf.var];
+      const actualStr = actual === undefined || actual === null ? '' : String(actual);
+      const want = runIf.value !== undefined ? String(runIf.value) : '';
+      const op = String(runIf.op || 'exists').toLowerCase();
+      shouldSkipByRunIf = !(
+        op === 'exists' ? actualStr.trim() !== ''
+        : op === 'contains' ? actualStr.toLowerCase().includes(want.toLowerCase())
+        : op === 'eq' ? actualStr.trim().toLowerCase() === want.trim().toLowerCase()
+        : op === 'ne' ? actualStr.trim().toLowerCase() !== want.trim().toLowerCase()
+        : op === 'match' ? (() => { try { return new RegExp(want, 'i').test(actualStr); } catch (_) { return false; } })()
+        : (runIfReason = `runIf: unknown op "${op}" — failing closed`, true)
+      );
+      if (!runIfReason) runIfReason = `runIf ${runIf.var} ${op} ${JSON.stringify(want)} → actual=${JSON.stringify(actualStr.slice(0, 60))}`;
+    }
+
+    if (shouldSkipByEmpty || shouldSkipByPrev || shouldSkipByRunIf) {
+      const whySkipped = shouldSkipByEmpty ? 'value is empty' : shouldSkipByPrev ? `"${skipIfPrevEmpty}" not collected` : runIfReason || 'runIf not satisfied';
       logger.info(`[Node:ExecuteCommand] Skipping optional step ${skillCursor + 1} (${skill}): ${whySkipped}`);
       if (progressCallback) progressCallback({
         type: 'step_skipped', stepIndex: skillCursor, totalSteps: skillPlan.length,
@@ -7567,6 +7709,7 @@ Please try again or search with different terms.`;
         const _eyes = await _eyesStepCheck({
           mcpAdapter, askDecision: makeAskDecision(mcpAdapter), llmBackend: state.llmBackend, logger, step, sessionId: _eyesSess,
           resultText: String(raw.stdout || raw.output || raw.message || '').slice(0, 200),
+          taskFacts: state.taskFacts || null,
         }).catch(() => ({ verdict: 'pass' }));
         if (_eyes?.pageState) raw.pageState = _eyes.pageState;
         if (_eyes?.verdict === 'fail') {
@@ -8036,12 +8179,12 @@ Please try again or search with different terms.`;
     }
 
     // ── OAuth gate ────────────────────────────────────────────────────────────
-    // external.skill returns needsOAuth when a declared provider has no stored token.
+    // Skills return needsOAuth when a declared provider has no stored token.
     // Pause execution, show the OAuth connect modal, and retry the same step once
     // the user has connected. Mirrors the gather:credential pattern.
     if (raw.needsOAuth && raw.needsOAuth.provider) {
       const { provider, providers, tokenKey, scopes } = raw.needsOAuth;
-      const skillLabel = skill === 'external.skill' ? (resolvedArgs.name || '') : skill;
+      const skillLabel = skill;
       logger.warn(`[Node:ExecuteCommand] OAuth required for skill "${skillLabel}" — provider: ${provider}`);
       if (progressCallback) progressCallback({
         type:       'gather_oauth',
@@ -8179,6 +8322,18 @@ Please try again or search with different terms.`;
       verified: raw.verified !== undefined ? raw.verified : null,
       goalVerified: raw.goalVerified === true ? true : (raw.goalVerified === false ? false : null),
       postconditionVerified: raw.postconditionVerified === true ? true : null,
+      // _llmClaimed — an agentic skill reported ok:true with no machine
+      // evidence (no exitCode 0, no verified flag): the ok came from an LLM
+      // `done` claim. Plans containing claimed steps can't flip to
+      // 'complete' in logConversation's finalizer — wildcard steps aren't
+      // safely replayable and stale claims used to poison the cache.
+      _llmClaimed: (() => {
+        const _ok = skill === 'ui.screen.verify' ? verifyOk : (raw.ok ?? raw.success ?? false);
+        if (!_ok) return false;
+        if (typeof raw.exitCode === 'number' && raw.exitCode === 0) return false;
+        if (raw.verified === true || raw.goalVerified === true || raw.postconditionVerified === true) return false;
+        return /(^|\.)agent$/.test(skill);
+      })(),
       routingDecision: raw.routingDecision || null,
       reasoning: raw.reasoning || null,
       suggestion: raw.suggestion || null,
@@ -8498,13 +8653,22 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       };
     }
 
-    // Normalise external.skill result: copy `output` → `stdout` so review/synthesize nodes
-    // can treat it the same as shell.run output without special-casing.
-    const _normalizedResult = (skill === 'external.skill' && enrichedStepResult.ok && enrichedStepResult.output && !enrichedStepResult.stdout)
-      ? { ...enrichedStepResult, stdout: enrichedStepResult.output }
-      : enrichedStepResult;
+    const updatedResults = [...skillResults, enrichedStepResult];
 
-    const updatedResults = [...skillResults, _normalizedResult];
+    // ── captureAs — Trigger primitive: persist a step's output into
+    // _gatheredVars so a later step's runIf predicate can branch on a captured
+    // value ("IF the next event is 'Bedtime', THEN turn off the lights" →
+    // capture next_event in a read step, runIf on the mutation step). Only a
+    // successful step captures — a failed read must not feed the predicate.
+    const _captureAs = step.captureAs || args.captureAs || resolvedArgs.captureAs || null;
+    if (_captureAs && _normalizedResult.ok) {
+      const _cap = _normalizedResult.output ?? _normalizedResult.stdout ?? _normalizedResult.result ?? _normalizedResult.message ?? null;
+      if (_cap !== null && _cap !== undefined) {
+        const _capStr = typeof _cap === 'string' ? _cap : JSON.stringify(_cap);
+        state._gatheredVars = { ...(state._gatheredVars || {}), [String(_captureAs)]: _capStr };
+        logger.info(`[Node:ExecuteCommand] captureAs: "${_captureAs}" ← ${_capStr.length} chars from ${skill}`);
+      }
+    }
 
     // ── Generate step output contract ────────────────────────────────────────
     const stepContract = generateStepContract(_normalizedResult, skillCursor);
@@ -8575,297 +8739,8 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       };
     }
 
-    // ── CLI / API Scout execution ────────────────────────────────────────────
-    // If this step is external.skill AND the skill dir has cli.json or api.json
-    // (written by creatorPlanning Scout fast-path), route to the universal runners
-    // instead of doing code-gen or failing. Only fires when the MCP call FAILED
-    // (external.skill.cjs now handles api.json/cli.json routing internally).
-    if (skill === 'external.skill' && !stepResult.ok) {
-      const SKILLS_DIR = require('path').join(require('os').homedir(), '.thinkdrop', 'skills');
-      const stepSkillName = resolvedArgs.name || args.name;
-      if (stepSkillName) {
-        const skillDir    = require('path').join(SKILLS_DIR, stepSkillName);
-        const cliJsonPath = require('path').join(skillDir, 'cli.json');
-        const apiJsonPath = require('path').join(skillDir, 'api.json');
-        const hasCli = require('fs').existsSync(cliJsonPath);
-        const hasApi = !hasCli && require('fs').existsSync(apiJsonPath);
-
-        if (hasCli || hasApi) {
-          const runnerType = hasCli ? 'CLI' : 'API';
-          const logger = state.logger || console;
-          logger.info(`[Node:ExecuteCommand] ${runnerType} Scout skill detected — routing to runner`, { skillName: stepSkillName });
-
-          if (progressCallback) progressCallback({
-            type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length,
-            skill: hasCli ? 'skill-cli-runner' : 'skill-api-runner',
-            description: `Running "${stepSkillName}" via ${runnerType} runner…`,
-          });
-
-          try {
-            // Resolve runner path — walk up from __dirname to find command-service/src.
-            // Works from both stategraph-module/src/nodes/ and node_modules/@thinkdrop/stategraph/src/nodes/
-            function findCommandServiceSrc() {
-              const _path = require('path');
-              const _fs   = require('fs');
-              let dir = __dirname;
-              for (let i = 0; i < 8; i++) {
-                const candidate = _path.join(dir, 'mcp-services', 'command-service', 'src');
-                if (_fs.existsSync(candidate)) return candidate;
-                dir = _path.dirname(dir);
-              }
-              return null;
-            }
-            const cmdSvcSrc = findCommandServiceSrc();
-            const runnerFile = hasCli ? 'skill-cli-runner.cjs' : 'skill-api-runner.cjs';
-            const runnerPath = cmdSvcSrc
-              ? require('path').join(cmdSvcSrc, runnerFile)
-              : require('path').join(__dirname, '../../../../mcp-services/command-service/src', runnerFile);
-
-            const runner = require(runnerPath);
-            const runArgs = { ...(resolvedArgs || {}), ...(args || {}) };
-            delete runArgs.name; delete runArgs.secretKeys;
-
-            let runResult = await runner.run(stepSkillName, runArgs, {
-              dryRun: runArgs.dryRun === true,
-            });
-
-            // ── CLI→API runtime fallback ─────────────────────────────────────
-            // If the CLI runner reports the binary is unavailable after install,
-            // check if an api.json exists for the same skill and retry via the
-            // API runner — no user interaction needed.
-            let effectiveRunnerType = runnerType;
-            if (!runResult.ok && runResult.cliNotAvailable && hasCli) {
-              const _logger = state.logger || console;
-              const apiFallbackPath = require('path').join(skillDir, 'api.json');
-              if (require('fs').existsSync(apiFallbackPath)) {
-                _logger.info(`[Node:ExecuteCommand] CLI→API fallback: "${runResult.error}" — retrying via API runner`, { skillName: stepSkillName });
-                if (progressCallback) progressCallback({
-                  type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length,
-                  skill: 'skill-api-runner',
-                  description: `CLI unavailable — retrying "${stepSkillName}" via API runner…`,
-                });
-                const apiRunnerPath = cmdSvcSrc
-                  ? require('path').join(cmdSvcSrc, 'skill-api-runner.cjs')
-                  : require('path').join(__dirname, '../../../../mcp-services/command-service/src/skill-api-runner.cjs');
-                try {
-                  const apiRunner = require(apiRunnerPath);
-                  runResult = await apiRunner.run(stepSkillName, runArgs, { dryRun: runArgs.dryRun === true });
-                  effectiveRunnerType = 'API';
-                } catch (apiFallbackErr) {
-                  _logger.warn(`[Node:ExecuteCommand] API fallback runner threw: ${apiFallbackErr.message}`);
-                }
-              }
-            }
-
-            const scoutStepResult = {
-              skill,
-              args: resolvedArgs,
-              ok: runResult.ok,
-              result: runResult.result || runResult.output || null,
-              error: runResult.error || null,
-              runnerType: effectiveRunnerType,
-            };
-
-            if (progressCallback) progressCallback({
-              type: runResult.ok ? 'step_done' : 'step_error',
-              stepIndex: skillCursor,
-              totalSteps: skillPlan.length,
-              skill: `skill-${effectiveRunnerType.toLowerCase()}-runner`,
-              result: scoutStepResult,
-            });
-
-            const scoutResults = [...skillResults, scoutStepResult];
-            const scoutContract = generateStepContract(scoutStepResult, skillCursor);
-            const scoutStepContracts = [...stepContracts, scoutContract];
-
-            if (!runResult.ok && !optional) {
-              return {
-                ...state,
-                skillResults: scoutResults,
-                stepContracts: scoutStepContracts,
-                failedStep: { step: skillCursor, skill, args: resolvedArgs, error: runResult.error, runnerType: effectiveRunnerType },
-                skillCursor,
-                skillPlan,
-              };
-            }
-
-            if (skillCursor + 1 >= skillPlan.length) {
-              return {
-                ...state,
-                skillResults: scoutResults,
-                stepContracts: scoutStepContracts,
-                skillCursor: skillCursor + 1,
-                commandExecuted: true,
-                answer: runResult.result || `${runnerType} skill "${stepSkillName}" completed.`,
-              };
-            }
-            return { ...state, skillResults: scoutResults, stepContracts: scoutStepContracts, skillCursor: skillCursor + 1, skillPlan };
-
-          } catch (runnerErr) {
-            const logger = state.logger || console;
-            logger.warn(`[Node:ExecuteCommand] ${runnerType} runner threw — falling through to code-gen`, { error: runnerErr.message });
-            // Fall through to normal missing-skill handling below
-          }
-        }
-      }
-    }
 
     if (!stepResult.ok && !optional) {
-      // ── Missing external skill — trigger build pipeline ─────────────────────
-      // When external.skill fails because the skill file doesn't exist, don't
-      // send to recoverSkill (which has no way to build code). Instead, kick off
-      // the skill build pipeline so buildSkill → validateSkill → installSkill runs.
-      const isMissingSkill = skill === 'external.skill' &&
-        typeof enrichedStepResult.error === 'string' &&
-        (enrichedStepResult.error.includes('Skill file not found') ||
-         enrichedStepResult.error.includes('No installed skill named'));
-
-      // Clear session cache when skill is missing to prevent stale plan reuse
-      if (isMissingSkill) {
-        try {
-          const { _clearSessionCache } = require('../utils/planCacheHelpers');
-          _clearSessionCache();
-          logger.info('[Node:ExecuteCommand] Session plan cache cleared due to missing skill');
-        } catch (cacheErr) {
-          logger.debug('[Node:ExecuteCommand] Failed to clear session cache:', cacheErr.message);
-        }
-      }
-
-      if (isMissingSkill && !!state.creatorProjectId && !state.skillCreatorRegenAttempted && !state.skillCreatorBuildAttempted && mcpAdapter) {
-        // Creator skill missing — re-run skillCreator silently before failing (once only)
-        const missingSkillName = resolvedArgs.name || args.name;
-        logger.info(`[Node:ExecuteCommand] Creator skill "${missingSkillName}" missing — re-running skillCreator silently`);
-        if (progressCallback) progressCallback({
-          type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length,
-          skill: 'skillCreator', description: `Re-generating skill "${missingSkillName}"…`,
-        });
-        try {
-          const regenRes = await mcpAdapter.callService('command', 'command.automate', {
-            skill: 'skillCreator.skill',
-            args: { action: 'generate_skill', projectId: state.creatorProjectId },
-          }, { timeoutMs: 300000 }).catch(e => ({ ok: false, error: e.message }));
-          const regen = regenRes?.data || regenRes;
-          if (regen?.ok && regen?.skillPath) {
-            logger.info(`[Node:ExecuteCommand] skillCreator re-gen succeeded: ${regen.skillPath}`);
-            return {
-              ...state,
-              creatorSkillName: regen.skillName || missingSkillName,
-              creatorSkillPath: regen.skillPath,
-              skillCreatorRegenAttempted: true,
-              skillPlan,
-              skillCursor,
-              skillResults: updatedResults.slice(0, -1),
-            };
-          }
-          logger.warn(`[Node:ExecuteCommand] skillCreator re-gen failed: ${regen?.error}`);
-        } catch (regenErr) {
-          logger.warn(`[Node:ExecuteCommand] skillCreator re-gen threw: ${regenErr.message}`);
-        }
-      }
-
-      // ── No creatorProjectId — skill was installed as a stub but never built ──
-      // Kick off creator.agent create_project → skillCreator generate_skill to
-      // actually build the index.cjs file, install deps, and register the skill.
-      // After a successful build, retry the external.skill step (once only).
-      //
-      // GUARD: Do NOT build on-demand if the skill name looks like a capability
-      // that gatherContext+creatorPlanning owns (sms, email, payment, etc.).
-      // Those need provider-specific context the gatherContext pipeline collects.
-      // Building here would produce generic/wrong code (e.g. hardcoded Twilio).
-      const _missingName = (resolvedArgs.name || args.name || '').toLowerCase();
-      const _capabilityPrefixes = ['sms', 'email', 'send', 'message', 'text', 'payment', 'storage', 'notify', 'call', 'voice', 'mail', 'push'];
-      const _nameSegments = _missingName.split('.');
-      const _isCapabilitySkill = _capabilityPrefixes.some(p =>
-        _nameSegments.includes(p) || _missingName.startsWith(p + '.') || _missingName === p || _missingName.startsWith(p + '_')
-      );
-      // Also block creator.agent when user explicitly asked to install/create a skill — bootstrap flow should handle it
-      const _userMsg = (state.message || state.resolvedMessage || '').toLowerCase();
-      const _isInstallRequest = /\b(install|create|add|build|need|want)\b.*\bskill\b/i.test(_userMsg);
-      if (isMissingSkill && (_isCapabilitySkill || _isInstallRequest)) {
-        logger.warn(`[Node:ExecuteCommand] Blocking on-demand build for "${_missingName}" — ${_isInstallRequest ? 'install request → bootstrap flow' : 'capability skill → gatherContext pipeline'}`);
-        // Fall through to recoverSkill with a clear error
-      }
-      if (isMissingSkill && !_isCapabilitySkill && !_isInstallRequest && !state.creatorProjectId && !state.skillCreatorBuildAttempted && mcpAdapter) {
-        const missingSkillName = resolvedArgs.name || args.name;
-        // Build a focused skill description from the step args — NOT the full user task message.
-        // The full message (e.g. "research photosynthesis and text me") describes the overall task,
-        // not what the missing skill should do. Use the step args to describe the skill's purpose.
-        const stepArgsDesc = Object.entries(resolvedArgs.args || resolvedArgs || {})
-          .filter(([k]) => k !== 'name')
-          .map(([k, v]) => `${k}: ${typeof v === 'string' ? v.slice(0, 120) : JSON.stringify(v).slice(0, 120)}`)
-          .join(', ');
-        const skillPrompt = `Create a ThinkDrop skill named "${missingSkillName}" that: ${stepArgsDesc || `implements the ${missingSkillName} capability`}. The skill should be a standalone Node.js CommonJS module that accepts runtime args and uses REST APIs or npm packages to accomplish its task. It must NOT use any relative require() paths or command-service internal files.`;
-        logger.info(`[Node:ExecuteCommand] Skill "${missingSkillName}" has no index.cjs — kicking off creator.agent + skillCreator build pipeline`);
-        logger.debug(`[Node:ExecuteCommand] creator.agent prompt: ${skillPrompt.slice(0, 200)}`);
-
-        if (progressCallback) progressCallback({
-          type: 'skill_build_phase',
-          phase: 'planning',
-          skillName: missingSkillName,
-          round: 1,
-        });
-
-        try {
-          // Step 1: creator.agent create_project — BDD, plan.md, agents.md
-          logger.info(`[Node:ExecuteCommand] creator.agent create_project for "${missingSkillName}"`);
-          if (progressCallback) progressCallback({
-            type: 'step_start', stepIndex: skillCursor, totalSteps: skillPlan.length,
-            skill: 'creator.agent', description: `Planning skill "${missingSkillName}"…`,
-          });
-
-          const createRes = await mcpAdapter.callService('command', 'command.automate', {
-            skill: 'creator.agent',
-            args: { action: 'create_project', prompt: skillPrompt, name: missingSkillName },
-          }, { timeoutMs: 360000 }).catch(e => ({ ok: false, error: e.message }));
-          const created = createRes?.data || createRes;
-
-          if (!created?.ok || !created?.id) {
-            logger.warn(`[Node:ExecuteCommand] creator.agent create_project failed: ${created?.error}`);
-            // Fall through to recoverSkill
-          } else {
-            // Step 2: skillCreator generate_skill — generates index.cjs, installs deps
-            logger.info(`[Node:ExecuteCommand] skillCreator generate_skill for project "${created.id}"`);
-            if (progressCallback) progressCallback({
-              type: 'skill_build_phase',
-              phase: 'generating',
-              skillName: missingSkillName,
-              round: 1,
-            });
-
-            const genRes = await mcpAdapter.callService('command', 'command.automate', {
-              skill: 'skillCreator.skill',
-              args: { action: 'generate_skill', projectId: created.id, projectDir: created.dir },
-            }, { timeoutMs: 360000 }).catch(e => ({ ok: false, error: e.message }));
-            const generated = genRes?.data || genRes;
-
-            if (generated?.ok && generated?.skillPath) {
-              logger.info(`[Node:ExecuteCommand] Skill "${missingSkillName}" built at ${generated.skillPath} — retrying external.skill step`);
-              if (progressCallback) progressCallback({
-                type: 'skill_build_phase',
-                phase: 'complete',
-                skillName: generated.skillName || missingSkillName,
-                round: 1,
-              });
-              // Retry the failed external.skill step (cursor stays, remove failed result)
-              return {
-                ...state,
-                creatorProjectId: created.id,
-                creatorSkillName: generated.skillName || missingSkillName,
-                creatorSkillPath: generated.skillPath,
-                skillCreatorBuildAttempted: true,
-                skillPlan,
-                skillCursor,
-                skillResults: updatedResults.slice(0, -1), // remove the failed step so it retries
-                failedStep: null,
-              };
-            }
-            logger.warn(`[Node:ExecuteCommand] skillCreator generate_skill failed: ${generated?.error}`);
-          }
-        } catch (buildErr) {
-          logger.warn(`[Node:ExecuteCommand] creator.agent/skillCreator build threw: ${buildErr.message}`);
-        }
-        // Build failed — fall through to recoverSkill
-      }
 
       // ── Pre-recoverSkill: open <file> with wrong extension → glob for real file ──
       // When `open <path>` or `open -a <App> <path>` fails with exit code 1, the most
@@ -9006,10 +8881,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         stepResult.stdout = `web.agent: no URL found. Query: ${fallbackText}`;
         logger.info(`[Node:ExecuteCommand] web.agent search_and_navigate: no bestUrl — stdout set to fallback`);
       }
-      const resolvedSkillName = skill === 'external.skill'
-        ? (stepResult.skillName || resolvedArgs.name || 'external.skill')
-        : null;
-      const stepDoneDescription = description || (resolvedSkillName ? `external.skill — ${resolvedSkillName}` : skill);
+      const stepDoneDescription = description || skill;
       if (progressCallback) progressCallback({ type: 'step_done', stepIndex: skillCursor, totalSteps: skillPlan.length, skill, description: stepDoneDescription, stdout: stepResult.stdout || stepResult.output, exitCode: stepResult.exitCode, draftPath: stepResult.draftPath || null, filePath: stepResult.filePath || null, openIn: stepResult.openIn || null, diff: stepResult.diff || null, narration: stepResult.narration || null });
 
       // ── Auth wall detected by waitForStableText or navigate ─────────────────
@@ -9343,6 +9215,38 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
     // skillCursor >= skillPlan.length block at the top is never reached).
     let lastStepAnswer;
     if (isLastStep) {
+      // ── Task-completion triggers — guardian/trigger rules evaluated once
+      // per plan, at the tail, against taskFacts + gathered vars. Deterministic
+      // match; `enqueue_task` fires through comms-graph's proactive lane so the
+      // triggered task runs its own full pipeline (and its own taskFacts).
+      if (_rulesMod && _normalizedResult.ok) {
+        try {
+          const _tf = state.taskFacts || {};
+          const _hits = _rulesMod.evaluate({
+            prompt: String(state.resolvedMessage || state.message || ''),
+            service: _tf.service,
+            host: (() => { try { return new URL(_tf.destination?.url || '').hostname; } catch (_) { return ''; } })(),
+            url: _tf.destination?.url || '',
+            entities: _tf.entities || {},
+            vars: state._gatheredVars || {},
+            intent: _tf.intent,
+          }, 'completion');
+          for (const _rule of _hits) {
+            const _then = _rule.then || {};
+            if (_then.action === 'enqueue_task' && _then.prompt) {
+              const _dispatched = _enqueueTriggeredTask(_then.prompt, _rule.id, logger);
+              logger.info(`[Node:ExecuteCommand] trigger ${_rule.id} → enqueue_task ${JSON.stringify(_then.prompt.slice(0, 80))} (${_dispatched ? 'dispatched' : 'dispatch failed'})`);
+              state.triggeredTasks = [...(state.triggeredTasks || []), { ruleId: _rule.id, prompt: _then.prompt, dispatched: _dispatched }];
+            } else if (_then.action === 'notify' || _then.action === 'show_card') {
+              _emitTerminalActivity(`trigger ${_rule.id}: ${String(_then.body || _then.msg || 'matched').slice(0, 100)}`, 'step');
+              logger.info(`[Node:ExecuteCommand] trigger ${_rule.id} → ${_then.action}`);
+            }
+          }
+        } catch (e) {
+          logger.warn(`[Node:ExecuteCommand] trigger evaluation failed: ${e.message}`);
+        }
+      }
+
       const finalSavedPaths = [...(state.savedFilePaths || [])];
       const finalHomeDir = require('os').homedir();
       updatedResults.forEach((r) => {
@@ -9364,9 +9268,6 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         ? [...updatedResults].reverse().find(r => r.skill === 'browser.act' && r.ok)
         : null;
       const imageAnalyzeResult = [...updatedResults].reverse().find(r => r.skill === 'image.analyze' && r.ok && r.stdout);
-      // external.skill result — the Node.js skill returned a string in the `output` field.
-      // Must be checked before the shell.run fallback — external.skill produces rich markdown reports.
-      const lastExternalSkillResult = [...updatedResults].reverse().find(r => r.skill === 'external.skill' && r.ok && r.output?.trim());
       // Last getPageText result — the actual page content the user asked for.
       // Prefer getPageText (explicit canonical read); fall back to waitForStableText
       // only for older plans that lack an explicit getPageText step.
@@ -9392,10 +9293,6 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
         logger.info(`[Node:ExecuteCommand] isLastStep: using synthesize result as answer (${lastStepAnswer.length} chars)`);
       } else if (imageAnalyzeResult) {
         lastStepAnswer = imageAnalyzeResult.stdout;
-      } else if (lastExternalSkillResult) {
-        // Node.js skill returned a string report — stream it directly.
-        lastStepAnswer = lastExternalSkillResult.output;
-        logger.debug(`[Node:ExecuteCommand] synthesize: external.skill answer (${lastStepAnswer.length} chars) from "${lastExternalSkillResult.skillName || lastExternalSkillResult.args?.name || 'unknown'}"`);
       } else if (pageTextContent) {
         // Raw innerText may have literal "\n" escape sequences (from JSON serialization) — convert to real newlines.
         // Also collapse runs of 3+ blank lines into 2 so the output isn't excessively spaced.

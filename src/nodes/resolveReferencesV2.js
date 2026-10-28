@@ -18,7 +18,7 @@ const { classifyTask, deriveResolution } = require('../utils/classifyTask');
 const { makeAskDecision: _makeAskDecision, boundedDecision: _boundedDecision } = require('../utils/askDecision');
 const { forceClassifyLocalPlan, looksLikeLocalOp, SERVICE_ALIASES } = require('../utils/localPlanTemplates');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE, PAGE_ITEM_REF_RE, NAV_VERB_START_RE, NAMED_APP_RE, LEAD_AWAY_VERB_RE } = require('../utils/textPatterns.cjs');
+const { REFERENTIAL_RE, FILE_WRITE_VERB_RE, DEICTIC_CONTINUATION_RE, CONVERSATION_RECALL_RE, EPISODIC_RE, SCREEN_OBSERVATION_RE, AMBIENT_ARTIFACT_RE, ACTION_VERB_RE, LIVE_PAGE_REF_RE, PAGE_ITEM_REF_RE, NAV_VERB_START_RE, NAMED_APP_RE, LEAD_AWAY_VERB_RE, PERSON_PRONOUN_RE, substituteReferent } = require('../utils/textPatterns.cjs');
 
 /**
  * Binary web-access confirmation — runs only when classifyTask returns
@@ -710,7 +710,7 @@ module.exports = async function resolveReferencesV2(state) {
     // follow-up: ≥4 words, no deictic markers ("it", "again", "same", …),
     // and no prior screen summary in play. Follow-up-shaped prompts never
     // get stored, so a cached result can't wrongly suppress resolution.
-    const _FOLLOWUP_HINT_RE = /\b(again|retry|re-?do|same (?:thing|one|as before)|that (?:file|page|doc|email|one|site|tab)|this (?:file|page|doc|email|one|site|tab)|it\b|them\b|those\b|these\b|continue|go on|keep going|previous|last one|the one)\b/i;
+    const _FOLLOWUP_HINT_RE = /\b(again|retry|re-?do|same (?:thing|one|as before)|that (?:file|page|doc|email|one|site|tab)|this (?:file|page|doc|email|one|site|tab)|it\b|them\b|those\b|these\b|him\b|his\b|her\b|he\b|she\b|continue|go on|keep going|previous|last one|the one)\b/i;
     const _memoKey = (!priorScreenSummary &&
         String(message || '').trim().split(/\s+/).filter(Boolean).length >= 4 &&
         !_FOLLOWUP_HINT_RE.test(message))
@@ -1297,12 +1297,82 @@ module.exports = async function resolveReferencesV2(state) {
     logger.info(`[Node:ResolveReferencesV2] resolution=${_taskClassification.resolution}: "${String(message).slice(0, 60)}"`);
   }
 
+  // ── Referent resolution → resolvedMessage ────────────────────────────────
+  // The LLM is the resolver of record (it sees the same history); these layers
+  // exist because its verdict used to die in a field nobody consumed — and
+  // because it can miss a signal its spec doesn't enumerate.
+  let _resolvedMessage = message;
+  let _coreferenceMethod = 'none';
+  let _coreferenceReplacements = [];
+
+  // Layer A (deterministic fallback): message carries a person pronoun but the
+  // classifier didn't flag a follow-up — scan recent turns for the unique
+  // capitalized name it must mean ("look up his videos" → the one person under
+  // discussion). Precision-first: only an unambiguous candidate resolves.
+  if (!state._planTask && _taskClassification && !_taskClassification.isFollowUp
+      && PERSON_PRONOUN_RE.test(message || '')
+      && Array.isArray(conversationHistory) && conversationHistory.length) {
+    const _NAME_RE = /(?<![.!?\n]\s*|^)([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)\b/g;
+    const _msgLower = String(message).toLowerCase();
+    const _extract = (turns) => {
+      const cands = new Set();
+      for (const turn of turns.slice(0, 6)) {
+        const content = String(turn?.content || '');
+        let m;
+        while ((m = _NAME_RE.exec(content)) !== null) {
+          const cand = m[1];
+          if (NAMED_APP_RE.test(cand)) continue;
+          if (_msgLower.includes(cand.toLowerCase())) continue;
+          cands.add(cand);
+        }
+        if (cands.size >= 2) break;
+      }
+      return cands;
+    };
+    // User turns first — the referent is almost always a person the USER
+    // named; assistant results are littered with capitalized names (channel
+    // titles, credits) that would poison an unqualified scan.
+    const _userTurns = conversationHistory.slice().reverse().filter(m => m && m.role === 'user');
+    let _cands = _extract(_userTurns);
+    if (_cands.size === 0) {
+      _cands = _extract(conversationHistory.slice().reverse().filter(m => m && m.role !== 'user'));
+    }
+    if (_cands.size === 1) {
+      const cand = [..._cands][0];
+      _taskClassification.isFollowUp = true;
+      _taskClassification.followUpTarget = cand;
+      _coreferenceMethod = 'unique-name';
+      logger.info(`[Node:ResolveReferencesV2] unique-name fallback: person pronoun → "${cand}"`);
+    } else if (_cands.size > 1) {
+      logger.warn(`[Node:ResolveReferencesV2] unresolved person pronoun — ${_cands.size} candidates (${[..._cands].join(', ')}), task may run on literal text`);
+    } else {
+      logger.warn(`[Node:ResolveReferencesV2] unresolved person pronoun — no history candidate, task may run on literal text`);
+    }
+  }
+
+  // Layer B (propagation): a resolved followUpTarget is worthless if it dies in
+  // the classification envelope — deterministically substitute it into the
+  // effective task text so every downstream consumer (decompose, planSkillsV2
+  // _taskText, service_task args.task, deep-link query extraction) sees the
+  // concrete referent instead of the pronoun.
+  if (_taskClassification && _taskClassification.isFollowUp
+      && typeof _taskClassification.followUpTarget === 'string'
+      && _taskClassification.followUpTarget.trim()) {
+    const _sub = substituteReferent(message, _taskClassification.followUpTarget.trim());
+    if (_sub.replaced.length && _sub.text !== message) {
+      _resolvedMessage = _sub.text;
+      _coreferenceMethod = _coreferenceMethod === 'unique-name' ? 'unique-name' : 'followUpTarget-substitution';
+      _coreferenceReplacements = _sub.replaced.map(r => ({ original: r, resolved: _taskClassification.followUpTarget.trim() }));
+      logger.info(`[Node:ResolveReferencesV2] resolvedMessage via ${_coreferenceMethod}: "${String(message).slice(0, 70)}" → "${String(_resolvedMessage).slice(0, 90)}"`);
+    }
+  }
+
   return {
     ...state,
     // Card replies: `message` is the reply-only text everywhere downstream —
     // the tag stays available via _thoughtAttachment.tag.
     message:                message,
-    resolvedMessage:        message,
+    resolvedMessage:        _resolvedMessage,
     originalMessage:        message,
     conversationHistory,
     semanticHistory,
@@ -1310,8 +1380,8 @@ module.exports = async function resolveReferencesV2(state) {
     _thoughtAttachment:     _thoughtCtx || null,
     _priorScreenContext:    _priorScreenContext || null,
     _screenContextNote:     _screenContextNote || null,
-    coreferenceMethod:      'none',
-    coreferenceReplacements: [],
+    coreferenceMethod:      _coreferenceMethod,
+    coreferenceReplacements: _coreferenceReplacements,
   };
 };
 

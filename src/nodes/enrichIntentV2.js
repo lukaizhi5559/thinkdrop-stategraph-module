@@ -95,7 +95,7 @@ module.exports = async function enrichIntentV2(state) {
   const isBrowseOnly = tc.isBrowseOnly === true || (tc.taskType === 'browser' && tc.taskType !== 'messaging');
 
   // ── Extract domain tags ────────────────────────────────────────────────────
-  let domainTags = (state.matchedSkillName || isBrowseOnly)
+  let domainTags = isBrowseOnly
     ? null
     : await extractDomainTags(userMessage, mcpAdapter, logger);
 

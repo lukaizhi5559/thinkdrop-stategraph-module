@@ -443,6 +443,60 @@ const _SIDE_EFFECT_ACTIONS = new Set([
   'add_to_cart', 'checkout', 'place_order', 'send_message', 'send_email',
   'post', 'comment', 'submit_form', 'delete', 'publish', 'book_reservation',
 ]);
+// agentId → deepLinkType from preflight resolution + taskFacts (canonical —
+// preflightAgents recorded destination+type once; dedup reads facts, not a
+// re-derivation that could disagree).
+function _agentDeepLinkTypes(state) {
+  const map = {};
+  for (const _pa of (state?.preflightResult?.agents || [])) {
+    if (_pa?.agentId && _pa?.deepLinkUrl) map[_pa.agentId] = _classifyDeepLinkType(_pa.deepLinkUrl);
+  }
+  const _tf = state?.taskFacts;
+  if (_tf?.agentId && _tf?.destination?.url) {
+    map[_tf.agentId] = _tf.destination.deepLinkType && _tf.destination.deepLinkType !== 'none'
+      ? _tf.destination.deepLinkType
+      : _classifyDeepLinkType(_tf.destination.url);
+  }
+  return map;
+}
+
+const _OPEN_SURFACE_RE = /\b(open|launch|pull\s+up|bring\s+up|show|start|begin|create|new|add)\b[^.]{0,50}\b(dialog|modal|popup|popover|form|window|compose|create.?event|new\s+event|page)\b/i;
+
+// MARK (not drop) open-surface steps whose surface a compose/creation deep
+// link already opened — the step stays in the plan and renders "skipped —
+// surface already open" so the presented list is stable (a completed/satisfied
+// step switches to skipped rather than silently vanishing). Runs on BOTH the
+// LLM-planned and deterministic-plan paths.
+function _markSatisfiedOpenSteps(plan, state, logger) {
+  if (!Array.isArray(plan)) return plan;
+  const _dlTypes = _agentDeepLinkTypes(state);
+  const _normDesc = (s) => String(s?.description || s?.args?.task || s?.args?.goal || s?.args?.query || '')
+    .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  // Order-independent seeding: an agent whose plan contains ANY url.first nav
+  // to a compose/creation link has its surface opened — covers replans that
+  // promote the open-dialog step ahead of the nav step.
+  const _surfOpened = new Set();
+  for (const _s of plan) {
+    const _aid = String(_s?.args?.agentId || _s?.agentId || '');
+    if (/^url\.first\.agent$/.test(String(_s?.skill || ''))
+        && ['compose', 'creation'].includes(_dlTypes[_aid])) {
+      _surfOpened.add(_aid);
+    }
+  }
+  if (!_surfOpened.size) return plan;
+  return plan.map((s) => {
+    const _aid = String(s?.args?.agentId || s?.agentId || '');
+    if (_aid && _surfOpened.has(_aid)
+        && !/^url\.first\.agent$/.test(String(s?.skill || ''))
+        && !s.skipped && !s.superseded
+        && _OPEN_SURFACE_RE.test(_normDesc(s))) {
+      logger?.info?.(`[Node:PlanSkillsV2] plan.dedupe: marking open-surface step "${_normDesc(s).slice(0, 60)}" skipped — ${_aid} deep-link already opened it (${_dlTypes[_aid]})`);
+      return { ...s, skipped: true, skipReason: 'surface already open' };
+    }
+    return s;
+  });
+}
+
 function _stripRedundantVerifySteps(skillPlan, state, logger) {
   if (!Array.isArray(skillPlan)) return skillPlan;
   // Plan-dispatched tasks (_planTask) carry canon-generated steps — their
@@ -567,6 +621,7 @@ async function _adjudicateSkillPicks(skillPlan, state, logger, mcpAdapter, userM
   for (let i = 0; i < skillPlan.length; i++) {
     const step = skillPlan[i];
     let next = step;
+    if (step?.skipped || step?.superseded) { out.push(step); continue; }
     // Consecutive-duplicate dedupe — planner artifacts like
     // "1) go to amazon click first item  2) click first item" emit the same
     // step twice; the second is a no-op replay, not a real step. Cheaper to
@@ -1209,14 +1264,9 @@ Example: [{"skill": "web.agent", "args": {"action": "...", "query": "..."}, "run
   }
 }
 const {
-  parseContractCommands,
   resolveDateRange,
   buildRuntimeParams,
   substituteTokens,
-  selectCommandTemplate,
-  applyContractParams,
-  detectSaveSkillIntent,
-  deriveSkillName,
 } = require('../utils/planSkillsHelpers');
 const { buildBridgeReminderPlan } = require('../utils/buildBridgeReminderPlan');
 const { findSimilarCompletePlan, findMostRecentPlanInSession, domainsMatch, isCorrectionSignal }  = require('../utils/planCacheHelpers');
@@ -1369,10 +1419,7 @@ function _buildSystemPrompt(userMessage, state) {
   const _hasLocalSignals = !!(
     state.grilledConstraints ||
     state.activeBrowserSessionId ||
-    state.creatorSkillName ||
-    state.projectSkillPlan ||
-    state.matchedSkillName ||
-    state.matchedSkillDomain
+    state.projectSkillPlan
   );
   const _tc = state._taskClassification;
   const _screenCtx = state._priorScreenContext;
@@ -1476,8 +1523,6 @@ function _buildSystemPrompt(userMessage, state) {
   // core-file load failure falls back to the full original prompt (Tier 3).
   const _isRecoveryOrComplex = !!(
     state.recoveryContext ||
-    state.creatorPlanMd ||
-    state.creatorAgentsMd ||
     state._planCorrectionMode
   );
   const _isSimpleQuery = !!(
@@ -1611,13 +1656,13 @@ function _buildSystemPrompt(userMessage, state) {
     // preserves the original "app owns the save" behavior for the common case.
     if (_isEditTask && !_isReadTask) {
       // Edit/mutation task — single run_agent step, NO synthesize
-      result += `\n\n## CRITICAL: APP-AI AUTOMATION (EDIT TASK)\n\nThis task asks to use a named desktop app's built-in AI assistant to MODIFY a file. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, \`cli.agent\`, \`external.skill\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
+      result += `\n\n## CRITICAL: APP-AI AUTOMATION (EDIT TASK)\n\nThis task asks to use a named desktop app's built-in AI assistant to MODIFY a file. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, \`cli.agent\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
     } else if (_isReadTask && !_isEditTask) {
       // Examine/retrieve task — run_app_flow THEN synthesize to present the answer
-      result += `\n\n## CRITICAL: APP-AI AUTOMATION (EXAMINE TASK)\n\nThis task asks to use a named desktop app's built-in AI assistant to READ and EXPLAIN content. You MUST produce TWO steps:\n1. \`app.agent\` with \`action: "run_app_flow"\`, \`appName: "<AppName from message>"\`, and \`goal: "<the user's full request>"\` — opens the file and uses the app's AI to analyze it.\n2. \`synthesize\` with \`prompt: "<rephrase the user's question>"\` — presents the app's answer to the user.\nDo NOT use \`shell.run\`, \`cli.agent\`, \`external.skill\`, or any other skill to read the file. The target app owns the file view.\n`;
+      result += `\n\n## CRITICAL: APP-AI AUTOMATION (EXAMINE TASK)\n\nThis task asks to use a named desktop app's built-in AI assistant to READ and EXPLAIN content. You MUST produce TWO steps:\n1. \`app.agent\` with \`action: "run_app_flow"\`, \`appName: "<AppName from message>"\`, and \`goal: "<the user's full request>"\` — opens the file and uses the app's AI to analyze it.\n2. \`synthesize\` with \`prompt: "<rephrase the user's question>"\` — presents the app's answer to the user.\nDo NOT use \`shell.run\`, \`cli.agent\`, or any other skill to read the file. The target app owns the file view.\n`;
     } else {
       // Ambiguous — default to edit path (preserves current behavior)
-      result += `\n\n## CRITICAL: APP-AI AUTOMATION\n\nThis task asks to use a named desktop app's built-in AI assistant. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, \`cli.agent\`, \`external.skill\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
+      result += `\n\n## CRITICAL: APP-AI AUTOMATION\n\nThis task asks to use a named desktop app's built-in AI assistant. You MUST produce exactly ONE \`app.agent\` step with \`action: "run_agent"\`. Pass the file path from the user message as \`filePath\` and the AI instruction as \`prompt\`. Do NOT use \`synthesize\`, \`shell.run\`, \`cli.agent\`, or any other skill to perform the edit. The target app owns the file and its save shortcut.\n`;
     }
   }
 
@@ -1635,7 +1680,7 @@ function _buildSystemPrompt(userMessage, state) {
     if (state.activeBrowserSessionId) {
       result += `\n\n## ACTIVE BROWSER SESSION\n\nA browser automation session is already open${state.activeBrowserUrl ? ` at ${state.activeBrowserUrl}` : ''} (sessionId: "${state.activeBrowserSessionId}"). THE VISIBLE PAGE IS THE DEFAULT REFERENT — if this request acts on that page or its service (fill, write, click, reply, read, scroll — even when the prompt does not say "this page"), emit ONLY \`dom.act\`/\`form.fill.agent\`/\`turn.loop.agent\` steps with args.sessionId "${state.activeBrowserSessionId}". \`url.first.agent\` is for NEW destinations only — re-navigating moves the user's real tab away from the page they mean. Emit it only when the prompt asks to go somewhere else (a different site/service, or explicit "go to/leave/switch to" language).\n\nFor page READS on that open page, emit \`browser.act\` { action: "getPageText", sessionId: "${state.activeBrowserSessionId}" } — NOT \`app.agent\` scan_page (OS-level clipboard copy cannot read the automation window).`;
     }
-  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects/scrolls on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit", "scroll to the bottom"). Optional \`agentHint\` (emit when intent is clear): \`"tab.map.agent"\` (multi-field forms and dialogs/overlays — fill several fields then submit; navigate-and-extract goals like "search the page for X" or "read the results"), \`"just.type.agent"\` (single-field typing into a focused or autofocused input — AI chat prompts, search bars — and single keypress/scroll goals like "press Enter" or "scroll to the bottom"), \`"meta.find.agent"\` (locate/click specific named text on the page — e.g. a named conversation in a chat-history list), \`"shortcut.keys.agent"\` (open/create/compose/new actions on apps with documented hotkeys — Google Calendar 'c' opens the event dialog, Gmail 'c' composes, '/' searches. Prefer this over scanning the landing page when a create/open intent maps to a known app hotkey; it self-falls-back to tab.map when the site has no shortcut table. NOT for content searches or multi-field entry), \`"turn.loop.agent"\` (dense commerce grids, multi-step action sequences, or typing when no input is focused), \`"gesture.agent"\` (drag/slider/swipe), \`"arrow.grid.agent"\` (spreadsheet cells). Emit \`args.pageCategory\` on dom.act steps when the site class is known (\`ai_chat\`, \`email_compose\`, \`shopping\`, \`spreadsheet\`, \`search_engine\`, \`social_feed\`, \`messaging\` — else omit).\n\nCONTRACT — fills never submit: \`form.fill.agent\` and dom.act fill goals do NOT press submit/send/post. A send/post/submit goal needs an explicit submit step or a workflow-capable skill — for email compose on Gmail, emit a SINGLE \`dom.act\` step with \`pageCategory: "email_compose"\` carrying the goal text (it parses To/Cc/Bcc/Subject/Body and sends with verification); do NOT emit \`form.fill.agent\` for email compose (it resolves profile fields, not goal-carried values, and never sends).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction. Emit ONLY for silent-failure mutations whose outcome isn't provable from step results (add-to-cart, checkout, purchase, submit, send, post, delete). Do NOT emit for create/navigate/read flows — url.first's landed URL and dom.act's result already prove the outcome; synthesize confirms from step results.\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nCRITICAL: EVERY browser step for a service must carry that service's \`args.agentId\` — including \`turn.loop.agent\` verify steps. Steps without agentId run in a parallel lane with no browser session.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "agentId": "amazon.agent", "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n\nCalendar/compose example — shortcut opens the dialog, tab.map fills it:\n[\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "google_calendar.agent", "task": "Open Google Calendar" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "google_calendar.agent", "agentHint": "shortcut.keys.agent", "task": "Open the create-event dialog" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "google_calendar.agent", "agentHint": "tab.map.agent", "task": "Fill title 'Dentist appointment', date next Tuesday, time 2pm, then Save" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the dentist appointment was created" } }\n]\n`;
+  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects/scrolls on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit", "scroll to the bottom"). Optional \`agentHint\` (emit when intent is clear): \`"tab.map.agent"\` (multi-field forms and dialogs/overlays — fill several fields then submit; navigate-and-extract goals like "search the page for X" or "read the results"), \`"just.type.agent"\` (single-field typing into a focused or autofocused input — AI chat prompts, search bars — and single keypress/scroll goals like "press Enter" or "scroll to the bottom"), \`"meta.find.agent"\` (locate/click specific named text on the page — e.g. a named conversation in a chat-history list), \`"shortcut.keys.agent"\` (open/create/compose/new actions on apps with documented hotkeys — Google Calendar 'c' opens the event dialog, Gmail 'c' composes, '/' searches. Prefer this over scanning the landing page when a create/open intent maps to a known app hotkey; it self-falls-back to tab.map when the site has no shortcut table. NOT for content searches or multi-field entry), \`"turn.loop.agent"\` (dense commerce grids, multi-step action sequences, or typing when no input is focused), \`"gesture.agent"\` (drag/slider/swipe), \`"arrow.grid.agent"\` (spreadsheet cells). Emit \`args.pageCategory\` on dom.act steps when the site class is known (\`ai_chat\`, \`email_compose\`, \`shopping\`, \`spreadsheet\`, \`search_engine\`, \`social_feed\`, \`messaging\` — else omit).\n\nCONTRACT — fills never submit: \`form.fill.agent\` and dom.act fill goals do NOT press submit/send/post. A send/post/submit goal needs an explicit submit step or a workflow-capable skill — for email compose on Gmail, emit a SINGLE \`dom.act\` step with \`pageCategory: "email_compose"\` carrying the goal text (it parses To/Cc/Bcc/Subject/Body and sends with verification); do NOT emit \`form.fill.agent\` for email compose (it resolves profile fields, not goal-carried values, and never sends).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction. Emit ONLY for silent-failure mutations whose outcome isn't provable from step results (add-to-cart, checkout, purchase, submit, send, post, delete). Do NOT emit for create/navigate/read flows — url.first's landed URL and dom.act's result already prove the outcome; synthesize confirms from step results.\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nCRITICAL: EVERY browser step for a service must carry that service's \`args.agentId\` — including \`turn.loop.agent\` verify steps. Steps without agentId run in a parallel lane with no browser session.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "agentId": "amazon.agent", "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n\nCalendar/compose example — the deep-link lands DIRECTLY on the creation surface (eventedit/compose); do NOT emit an "open the dialog" step:\n[\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "google_calendar.agent", "task": "Create a Google Calendar event 'Dentist appointment' next Tuesday 2pm" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "google_calendar.agent", "agentHint": "form.fill.agent", "task": "Fill title 'Dentist appointment', date next Tuesday, time 2pm, then Save" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the dentist appointment was created" } }\n]\n\nConditional steps — "if/when X then Y" phrasing needs a capture step then a gated step. The read/extract step stores its output under \`args.captureAs\` (a variable name); the action step carries \`args.runIf\` = {"var": "<name>", "op": "contains|eq|match|ne|exists", "value": "…"} and executes only when the captured value satisfies it (deterministic check, no model):\n[\n  { "skill": "browser.agent", "stepType": "extract", "args": { "agentId": "google_calendar.agent", "action": "extract_items", "task": "Read the title of the next upcoming calendar event", "captureAs": "next_event" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "smartthings.agent", "task": "Turn off the living room light", "runIf": { "var": "next_event", "op": "match", "value": "bedtime" } } },\n  { "skill": "synthesize", "args": { "prompt": "Report what the next event was and whether the light was turned off" } }\n]\n`;
 
     // ── Commerce routing note ──────────────────────────────────────────────
     // For Amazon/eBay/Etsy add-to-cart, checkout, filter, or sort tasks,
@@ -1733,10 +1778,15 @@ function _buildSystemPrompt(userMessage, state) {
     const _dlType = _classifyDeepLinkType(_pa.deepLinkUrl);
     const _dlNote =
       _dlType === 'creation' ? 'CREATION deep link — the URL creates the blank entity and opens it. Do NOT emit a "create a new X" step, but the URL performs NO other work: every requested field (title, name, dates, columns, content) still REQUIRES follow-on dom.act step(s)'
-      : _dlType === 'compose' ? 'COMPOSE deep link — the compose dialog opens automatically. Do NOT emit a "click Compose/New" step — emit only fill/send steps (dom.act)'
+      : _dlType === 'compose' ? 'COMPOSE deep link — the create/compose surface is ALREADY OPEN at this URL (it may be a full page, not a dialog). Do NOT emit ANY open/launch/create/show-dialog step of any kind — emit only fill/submit steps (dom.act)'
       : _dlType === 'search' ? 'SEARCH deep link — results are already loaded at this URL. Do NOT emit a step that types the query into a search box'
       : null;
     _destLines.push(`- ${_pa.agentId}: ${_pa.deepLinkUrl}${_dlNote ? ` — ${_dlNote}` : ''}`);
+    // taskFacts.entities: values the URL already carries (buildUrl-parsed
+    // title/dates). The planner must not emit steps re-entering them.
+    if (state.taskFacts?.agentId === _pa.agentId && state.taskFacts?.entities) {
+      _destLines.push(`  PREFILLED VALUES already in the URL: ${JSON.stringify(state.taskFacts.entities)} — do NOT emit fill steps for these; verify/pass-through only.`);
+    }
   }
   if (_destLines.length > 0) {
     result += `\n\n## RESOLVED DESTINATIONS (url.first.agent will navigate here — mandatory)\n\n${_destLines.join('\n')}\n\nurl.first.agent performs NAVIGATION ONLY — it never types, clicks, or fills. After each url.first.agent step, emit the dom.act / turn.loop.agent steps the task still needs (0-N per destination). A url.first.agent step by itself never completes a create/fill/send/add goal. If the task has multiple destinations, emit a url.first.agent + action-step group per destination.\n\nPure display-open requests ("open gmail", "go to calendar", nothing else) need no automation session — emit app.agent { action: "navigate_url", url: "<site url>" } instead of url.first.agent.`;
@@ -2172,38 +2222,6 @@ async function planSkillsV2(state) {
     return { ...state, skillPlan: _resumePlan, skillCursor: 0, planError: null };
   }
 
-  // ── Creator shortcut: skill already built by creatorPlanning ─────────────
-  if (state.creatorSkillName && !recoveryContext && !state.forceSkillBuild) {
-    const _csName = state.creatorSkillName;
-    const SKILLS_DIR = path.join(homeDir, '.thinkdrop', 'skills');
-    const _csPath = path.join(SKILLS_DIR, _csName.replace(/\./g, '_'), 'index.cjs');
-    if (fs.existsSync(_csPath)) {
-      logger.info(`[Node:PlanSkillsV2] Creator shortcut: ${_csName}`);
-      
-      // ── Agent-first: ensure parent agent exists ──────────────────────────────
-      const _domainFromSkill = _csName.split('.')[0];
-      const _agentName = `${_domainFromSkill}.agent`;
-      const _agentPath = path.join(os.homedir(), '.thinkdrop', 'agents', `${_agentName}.md`);
-      const _needsBrowserAgent = _csName.includes('.') && !fs.existsSync(_agentPath);
-      
-      const plan = [];
-      if (_needsBrowserAgent) {
-        logger.info(`[Node:PlanSkillsV2] Creator shortcut: ${_agentName} not found, prepending build_agent step`);
-        plan.push({
-          skill: 'browser.agent',
-          args: { action: 'build_agent', service: _domainFromSkill },
-          description: `Build ${_agentName} for ${_domainFromSkill} domain`,
-        });
-      }
-      
-      plan.push({ skill: 'external.skill', description: `Run ${_csName}`, args: { name: _csName } });
-
-      const _guardedPlan = _ensureSynthesizeStep(plan, userMessage);
-      if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-      return { ...state, skillPlan: _guardedPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
-    }
-  }
-
   // ── LLM backend ──────────────────────────────────────────────────────────
   const backend = llmBackend;
   if (!backend) {
@@ -2215,16 +2233,6 @@ async function planSkillsV2(state) {
   const _now = new Date();
   const _currentDate = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-${String(_now.getDate()).padStart(2, '0')}`;
   const _agentIdentity = `AGENT IDENTITY: You are ThinkDrop, a desktop automation agent running on ${_osName} (${os.release()}). You have FULL system access: shell commands, filesystem read/write, app control, and native ${_osName} APIs. You are NOT a web chatbot. Your job is to output a JSON skill plan.\n\nCURRENT DATE: ${_currentDate} — always use the current year (${_now.getFullYear()}) when generating dates for calendar events, deadlines, or any time-sensitive commands. Never use past years.`;
-
-  // ── Creator planning context ──────────────────────────────────────────────
-  let creatorContextNote = '';
-  if (state.creatorPlanMd || state.creatorAgentsMd) {
-    const parts = [];
-    if (state.creatorPlanMd)   parts.push('## Project Plan (from creator.agent)\n' + state.creatorPlanMd.slice(0, 2000));
-    if (state.creatorAgentsMd) parts.push('## Agent Specs (from creator.agent)\n' + state.creatorAgentsMd.slice(0, 1500));
-    if (state.creatorBddTests) parts.push('## BDD Acceptance Tests\n' + state.creatorBddTests.slice(0, 800));
-    creatorContextNote = '\n\nCREATOR PLAN CONTEXT (pre-validated architecture):\n' + parts.join('\n\n');
-  }
 
   // ── Recovery / correction notes ───────────────────────────────────────────
   let recoveryNote = '';
@@ -2505,7 +2513,7 @@ async function planSkillsV2(state) {
     // (e.g. gmail compose URL) — inject it into browser.agent run args.url so
     // browser.agent selects URL-first navigation instead of a blind start page.
     const detPlan = _taskAgentPlan || _sanitizeSkillPlan(_lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
-      _stripRedundantVerifySteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger),
+      _stripRedundantVerifySteps(_markSatisfiedOpenSteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger), state, logger),
       userMessage), logger), logger, state._extSessions, userMessage), state);
     // Messaging follow-up body: the service_task template passes the raw
     // message as task ("send this info to X"), so the browser agent never sees
@@ -2564,7 +2572,12 @@ async function planSkillsV2(state) {
   // this the LLM planned tool.discover/app.agent flows against the Reminders
   // app — auth walls and ask-user loops — while the reminder lives in
   // SkillScheduler (registered by the schedule pseudo-skill).
-  if (!recoveryContext && /\b(cancel|delete|remove|clear|stop|turn\s+off|disable)\b/i.test(userMessage)
+  // Exclusion: calendar/service artifacts are NOT in-app reminders — "delete
+  // that event I just set" must reach the event's service lane (nylas/google),
+  // not a "No pending reminders" schedule_cancel no-op.
+  const _namesServiceArtifact = /\b(events?|meetings?|appointments?|calendar)\b/i.test(userMessage)
+    && !/\b(reminders?|alarms?|alerts?|timers?)\b/i.test(userMessage);
+  if (!recoveryContext && !_namesServiceArtifact && /\b(cancel|delete|remove|clear|stop|turn\s+off|disable)\b/i.test(userMessage)
       && /\b(reminder|reminders|alarm|alarms|alert|alerts|scheduled\s+\w+|cron)\b/i.test(userMessage)) {
     const _cancelQuery = String(userMessage)
       // Strip injected context markers — "(Context from prior turn: …)" /
@@ -2606,32 +2619,22 @@ async function planSkillsV2(state) {
   // preflightAgents node runs between gatherPlanContext → planSkills and populates
   // state.preflightResult with skill contracts, CLI checks, agent registry, trained recipes.
   // Fallback: if preflightResult is missing (e.g. recovery path skipped preflight), do inline fetch.
-  let skillContractNote = '';
-  let _shellContractMd = null;
   let _preflightCliMap = {};
   let cliPreflightNote = '';
   let agentContextNote = '';
   let discoveredToolNote = '';
-  let orphanedSkillsNote = '';
   let _registeredAgentServiceMap = {};
-  const shellSkillNames = new Set();
-  let installedSkillsList = [];
   let _trainedRecipeMap = {};
 
   if (state.preflightResult) {
     // ── Fast path: use preflightAgents results ──────────────────────────────
     const pf = state.preflightResult;
-    skillContractNote = pf.skillContractNote || '';
-    _shellContractMd = pf.shellContractMd || null;
     cliPreflightNote = pf.cliPreflightNote || '';
     agentContextNote = pf.agentContextNote || '';
     discoveredToolNote = pf.discoveredToolNote || '';
-    orphanedSkillsNote = pf.orphanedSkillsNote || '';
     _preflightCliMap = pf.preflightCliMap || {};
     _registeredAgentServiceMap = pf.registeredAgentServiceMap || {};
     _trainedRecipeMap = pf.trainedRecipeMap || {};
-    installedSkillsList = pf.installedSkillsList || [];
-    for (const name of (pf.shellSkillNames || [])) shellSkillNames.add(name);
     const mapSize = Object.keys(_trainedRecipeMap).length;
     logger.info(`[Node:PlanSkillsV2] Preflight result found: ${mapSize} recipe variants, ${Object.keys(_registeredAgentServiceMap).length} registered agents`);
     if (mapSize > 0) {
@@ -2641,35 +2644,6 @@ async function planSkillsV2(state) {
     // ── Fallback: inline preflight fetches (recovery path or skipped preflight) ──
     logger.info('[Node:PlanSkillsV2] No preflightResult — running inline preflight fetches');
     await Promise.all([
-      // ── Skill contract ────────────────────────────────────────────────────
-      (async () => {
-        if (!state.matchedSkillName) return;
-        try {
-          const scRes = await mcpAdapter.callService('user-memory', 'skill.get', { name: state.matchedSkillName }, { timeoutMs: 3000 }).catch(() => null);
-          const scData = scRes?.data || scRes;
-          const contractMd = scData?.contractMd || scData?.contract_md || '';
-          if (contractMd?.trim()) {
-            const _fmMatch = contractMd.match(/^---\s*\n([\s\S]*?)\n---/);
-            const _isNodeSkill = _fmMatch && /exec_type:\s*node\b/i.test(_fmMatch[1]);
-            const _isPythonSkill = _fmMatch && /exec_type:\s*python\b/i.test(_fmMatch[1]);
-            const _isInstructionSkill = _fmMatch && /exec_type:\s*instruction\b/i.test(_fmMatch[1]);
-            const _isShellContract = !_isNodeSkill && !_isPythonSkill && !_isInstructionSkill;
-            if (_isNodeSkill || _isPythonSkill) {
-              const _runtimeType = _isPythonSkill ? 'Python' : 'Node.js';
-              skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is a ${_runtimeType} runtime skill (exec_type: ${_isPythonSkill ? 'python' : 'node'}). Generate a SINGLE step: { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n2. FORBIDDEN: Do NOT generate shell.run or curl steps.\n3. FORBIDDEN: Do NOT expand the implementation — just call external.skill.\n\n${contractMd.slice(0, 2000)}`;
-            } else if (_isInstructionSkill) {
-              // Instruction skills: knowledge/prompt-only. external.skill returns the
-              // markdown body; a synthesize step uses it to answer the user's question.
-              skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. This is an instruction/knowledge skill (exec_type: instruction). It returns knowledge content, not a direct answer.\n2. Generate TWO steps:\n   a. { "skill": "external.skill", "args": { "name": "${state.matchedSkillName}" } }\n   b. { "skill": "synthesize", "args": { "prompt": "Using the instruction content from the previous step, answer the user's question: ${userMessage.replace(/"/g, '\\"').slice(0, 300)}" } }\n3. The external.skill step returns the instruction markdown as output.\n4. The synthesize step uses that output to answer the user's question.\n5. FORBIDDEN: Do NOT generate shell.run, curl, or browser.agent steps for this skill.\n\n${contractMd.slice(0, 2000)}`;
-            } else if (_isShellContract) {
-              skillContractNote = `\n\nSKILL CONTRACT for "${state.matchedSkillName}" — CRITICAL RULES:\n1. You MUST generate shell.run steps with curl commands from the ## Commands section below.\n2. FORBIDDEN: Do NOT use "${state.matchedSkillName}" as a skill name in any step.\n3. FORBIDDEN: Do NOT use external.skill for this.\n\n${contractMd.slice(0, 3000)}`;
-              _shellContractMd = contractMd;
-              shellSkillNames.add(state.matchedSkillName);
-            }
-          }
-        } catch (_) {}
-      })(),
-
       // ── CLI pre-flight ────────────────────────────────────────────────────
       (async () => {
         if (recoveryContext) return;
@@ -2695,7 +2669,14 @@ async function planSkillsV2(state) {
                   lines.push(`${c.service}: ${c.cli} NOT INSTALLED — install: ${installCmd}`);
                 } else {
                   const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : '');
-                  lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.service}.agent', task: '...' }`);
+                  // c.agentId is only set for registered agents — fabricating
+                  // "<svc>.agent" for a merely-detected CLI makes the planner
+                  // emit agentIds that don't exist in the registry.
+                  if (c.agentId) {
+                    lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.agentId}', task: '...' }`);
+                  } else {
+                    lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — no registered agent; use cli.agent { action: 'run', task: '...' } (generic loop drives ${c.cli}) or shell.run`);
+                  }
                 }
               }
             }
@@ -2762,20 +2743,12 @@ async function planSkillsV2(state) {
             agentContextNote = `\n\nREGISTERED AGENTS (use the matching executor — type 'cli' → cli.agent { action: "run", agentId: "<id>", task: "..." }; type 'browser' → atomic browser skills with agentId "<id>": url.first.agent opens the destination, then dom.act / turn.loop.agent steps do the on-page work. Agents with status 'not_installed' need their CLI installed first):\n${agentLines.join('\n')}`;
 
             if (trainedRecipeLines.length > 0) {
-              agentContextNote += `\n\nTRAINED RECIPES (when user mentions these, use browser.agent/cli.agent — NOT external.skill):\n${trainedRecipeLines.join('\n')}`;
+              agentContextNote += `\n\nTRAINED RECIPES (when user mentions these, use browser.agent/cli.agent):\n${trainedRecipeLines.join('\n')}`;
             }
           }
         } catch (_) {}
       })(),
 
-      // ── Installed skills list ─────────────────────────────────────────────
-      (async () => {
-        try {
-          const ilRes = await mcpAdapter.callService('user-memory', 'skill.list', {}, { timeoutMs: 3000 }).catch(() => null);
-          const il = ilRes?.data || ilRes || [];
-          if (Array.isArray(il)) installedSkillsList = il;
-        } catch (_) {}
-      })(),
     ]);
 
     // ── Disk-scan fallback ────────────────────────────────────────────────────
@@ -2839,68 +2812,6 @@ async function planSkillsV2(state) {
   const dateRange = resolveDateRange(userMessage);
   if (dateRange) {
     dateRangeNote = `\n\nDATE RANGE RESOLVED (use THESE values in shell.run commands — do NOT compute dates yourself):\n- timeMin: ${dateRange.timeMin}\n- timeMax: ${dateRange.timeMax}\n- UNIX_MIN: ${dateRange.UNIX_MIN}\n- UNIX_MAX: ${dateRange.UNIX_MAX}\n- DATE_MIN: ${dateRange.DATE_MIN}\n- DATE_MAX: ${dateRange.DATE_MAX}`;
-  }
-
-  // ── Domain skill fast-path ────────────────────────────────────────────────
-  if (state.matchedSkillType === 'domain' && state.matchedSkillName && !recoveryContext) {
-    logger.info(`[Node:PlanSkillsV2] Domain skill fast-path: ${state.matchedSkillName}`);
-    
-    // ── Agent-first: ensure parent agent exists before running skill ─────────
-    const _domainFromSkill = state.matchedSkillName.split('.')[0];
-    const _agentName = `${_domainFromSkill}.agent`;
-    const _agentPath = path.join(os.homedir(), '.thinkdrop', 'agents', `${_agentName}.md`);
-    const _needsBrowserAgent = state.matchedSkillName.includes('.') && !fs.existsSync(_agentPath);
-    
-    const domainPlan = [];
-    if (_needsBrowserAgent) {
-      logger.info(`[Node:PlanSkillsV2] Agent-first: ${_agentName} not found, prepending build_agent step`);
-      domainPlan.push({
-        skill: 'browser.agent',
-        args: { action: 'build_agent', service: _domainFromSkill },
-        description: `Build ${_agentName} for ${_domainFromSkill} domain`,
-      });
-    }
-    
-    domainPlan.push({
-      skill: 'external.skill',
-      description: `Run domain skill: ${state.matchedSkillName}`,
-      args: { name: state.matchedSkillName, ...(state.matchedSkillParams || {}) },
-    });
-
-    const _guardedDomainPlan = _ensureSynthesizeStep(domainPlan, userMessage);
-    if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedDomainPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-    return { ...state, skillPlan: _guardedDomainPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null, domainSkillFastPath: true };
-  }
-
-  // ── Contract-driven fast-path (shell skills) ──────────────────────────────
-  if (_shellContractMd && state.matchedSkillName && !recoveryContext) {
-    const parsed = parseContractCommands(_shellContractMd);
-    if (parsed && parsed.commands?.length > 0) {
-      logger.info(`[Node:PlanSkillsV2] Contract fast-path: ${parsed.commands.length} templates for "${state.matchedSkillName}"`);
-      try {
-        const runtimeParams = buildRuntimeParams(runtimeParamMessage || userMessage, profileContext, _priorForParams);
-        const sel = parsed.commands.length === 1
-          ? { index: 0, substitutions: [], params: {} }
-          : await selectCommandTemplate(parsed.commands, userMessage, backend, require('../utils/askDecision').makeAskDecision(mcpAdapter));
-
-        if (sel !== null) {
-          const selectedCmd = parsed.commands[sel.index];
-          let code = applyContractParams(selectedCmd.code, sel);
-          const mergedParams = { ...runtimeParams, ...(dateRange || {}) };
-          code = substituteTokens(code, mergedParams, logger);
-
-          const contractPlan = [];
-          if (parsed.authScript) {
-            contractPlan.push({ skill: 'shell.run', description: 'Authenticate', args: { cmd: 'bash', argv: ['-c', parsed.authScript] } });
-          }
-          contractPlan.push({ skill: 'shell.run', description: selectedCmd.heading, args: { cmd: 'bash', argv: ['-c', code] } });
-
-          const _guardedContractPlan = _ensureSynthesizeStep(contractPlan, userMessage);
-          if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedContractPlan.map((s, i) => ({ index: i, ...s })), intent: 'command_automate' });
-          return { ...state, skillPlan: _guardedContractPlan, skillCursor: 0, planError: null, recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null };
-        }
-      } catch (_) {}
-    }
   }
 
   // ── Trained recipe fuzzy match fast-path ──────────────────────────────────
@@ -3203,25 +3114,6 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
     logger.info(`[Node:PlanSkillsV2] Resolved file path injected: ${_fileRes.path}`);
   }
 
-  // ── External skill prohibition (when parseSkill found no match) ─────────────
-  let externalSkillProhibition = '';
-  if (state._noInstalledSkillMatch && !recoveryContext) {
-    externalSkillProhibition = `
-
-⚠️ CRITICAL SKILL CONSTRAINT — NO INSTALLED SKILL MATCH:
-The user's request does NOT match any installed skill.
-
-**FORBIDDEN:** You MUST NOT use "external.skill" — it will fail because no such skill is installed.
-
-**USE INSTEAD:**
-- **browser.agent** — For web-based services (w3schools, perplexity, gmail, etc.)
-- **cli.agent** — For command-line tools (git, npm, docker, etc.)
-- **shell.run** — For one-off shell commands
-
-**WHY:** external.skill only works for pre-installed Node.js/Python skills with an index.cjs file. It CANNOT auto-install or create skills.`;
-    logger.info(`[Node:PlanSkillsV2] Injecting external.skill prohibition (no installed skill match)`);
-  }
-
   // ── System info fresh-data note ──────────────────────────────────────────
   // System info (disk, memory, CPU, battery) is time-sensitive. On follow-up
   // queries the planner may generate a synthesize-only plan relying on stale
@@ -3269,17 +3161,13 @@ The user's request does NOT match any installed skill.
   const planningQuery = [
     _agentIdentity,
     SKILL_SYSTEM_PROMPT,
-    creatorContextNote,
     recoveryNote,
     correctionNote,
     priorResultsNote,
     conversationNote,
-    skillContractNote,
     cliPreflightNote,
     agentContextNote,
     discoveredToolNote,
-    orphanedSkillsNote,
-    externalSkillProhibition,
     routeChoiceNote,
     singleRouteNote,
     resolvedFileNote,
@@ -3353,9 +3241,15 @@ The user's request does NOT match any installed skill.
         llmBackend: backend,
       });
       
-      // Replace only the failed step, keep rest of plan
+      // Plan-lock semantics: the failed step stays in place marked superseded
+      // (renders skipped — never silently rewritten); the replacement inserts
+      // at cursor+1. Plan length grows by one; indices stay consistent
+      // between the runtime and the emitted plan_ready list.
+      const _failedOrig = skillPlanToUse[state.skillCursor];
       let newPlan = [
         ...skillPlanToUse.slice(0, state.skillCursor),
+        { ..._failedOrig, skipped: true, superseded: true,
+          skipReason: `superseded — replanned after ${recoveryContext?.failedSkill || _failedOrig?.skill || 'step'} failed` },
         replacementStep,
         ...skillPlanToUse.slice(state.skillCursor + 1),
       ];
@@ -3377,6 +3271,9 @@ The user's request does NOT match any installed skill.
             description: s.description || buildStepDescription(s),
             args: s.args,
             runGroup: s.runGroup || undefined,
+            skipped: s.skipped || undefined,
+            superseded: s.superseded || undefined,
+            skipReason: s.skipReason || undefined,
           })),
           intent: intent?.type || 'command_automate',
           singleStepReplan: true,  // Signal this is a single-step replan (preserve prior step statuses)
@@ -3676,7 +3573,7 @@ The user's request does NOT match any installed skill.
   // ── Inject direct deep-link URLs from preflight ───────────────────────────
   // Shared with the deterministic-template path (which adopts plans before the
   // LLM section below) — see _injectPreflightDeepLinks for the mechanics.
-  skillPlan = _stripRedundantVerifySteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(skillPlan, state, logger), logger), state, logger);
+  skillPlan = _stripRedundantVerifySteps(_markSatisfiedOpenSteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(skillPlan, state, logger), logger), state, logger), state, logger);
 
   // ── Clarification / error objects from LLM ────────────────────────────────
   if (!Array.isArray(skillPlan) && skillPlan?.ask) {
@@ -3709,39 +3606,11 @@ The user's request does NOT match any installed skill.
     return { ...state, planError: humanError, commandExecuted: false, answer: humanError };
   }
 
-  // ── Contract guard: shell skills must not use external.skill ─────────────
-  if (Array.isArray(skillPlan) && shellSkillNames.size > 0) {
-    const contractViolation = skillPlan.find(s => s.skill === 'external.skill' && s.args?.name && shellSkillNames.has(s.args.name));
-    if (contractViolation) {
-      const badName = contractViolation.args.name;
-      logger.warn(`[Node:PlanSkillsV2] Contract guard: retrying for shell skill "${badName}"`);
-      const forceMsg = [
-        `CRITICAL CORRECTION: You generated { "skill": "external.skill", "args": { "name": "${badName}" } } — this is WRONG.`,
-        `"${badName}" is a shell contract skill (exec_type: shell). It is NOT a Node.js module.`,
-        `You MUST generate shell.run steps with curl commands from the contract below.`,
-        `Do NOT use external.skill. Output ONLY a valid JSON array with shell.run (and optionally synthesize) steps.`,
-        _shellContractMd ? `\nCONTRACT:\n${_shellContractMd.slice(0, 2500)}` : '',
-      ].filter(Boolean).join('\n');
-      const retryPayload2 = { ...payload, messages: [...(payload.messages || []), { role: 'user', content: forceMsg }] };
-      try {
-        const rawRetry2 = await backend.generateAnswer(planningQuery, retryPayload2, payload.options, null);
-        const retryPlan2 = parsePlan(rawRetry2, logger);
-        if (retryPlan2 && !retryPlan2.find(s => s.skill === 'external.skill' && shellSkillNames.has(s.args?.name))) {
-          skillPlan = retryPlan2;
-          logger.info(`[Node:PlanSkillsV2] Contract guard: retry succeeded for "${badName}"`);
-        } else {
-          if (progressCallback) progressCallback({ type: 'plan_error', error: `Skill "${badName}" is a shell contract and cannot run via external.skill.` });
-          return { ...state, planError: `Contract skill "${badName}" cannot be executed via external.skill.` };
-        }
-      } catch (_) {}
-    }
-  }
-
   // ── browser.act bypass detector ───────────────────────────────────────────
   const _BYPASS_GUARD_SERVICES = new Set(['perplexity','grok','claude','deepseek','mistral','copilot','suno','midjourney','runway','chatgpt','gemini','openai']);
   const _NAV_ACTIONS = new Set(['navigate','tab-new','newPage']);
 
-  if (Array.isArray(skillPlan) && !state.domainSkillFastPath) {
+  if (Array.isArray(skillPlan)) {
     const _collectBypasses = (plan) => {
       const found = [];
       for (const s of plan) {
@@ -4108,25 +3977,6 @@ The user's request does NOT match any installed skill.
     skillPlan = await analyzeAndAddParallelGroups(skillPlan, userMessage, backend, logger);
   }
 
-  // ── Save skill intent detection ───────────────────────────────────────────
-  if (detectSaveSkillIntent(userMessage) && state._lastShellRun) {
-    const { lastExecution } = state;
-    if (lastExecution?.skill === 'shell.run') {
-      const pythonCode = (lastExecution.args?.cmd === 'python3' && Array.isArray(lastExecution.args?.argv))
-        ? lastExecution.args.argv.slice(1).join(' ')
-        : null;
-      if (pythonCode) {
-        const skillName = deriveSkillName(userMessage.replace(/save this|as a skill|make this reusable/gi, '').trim() || capability);
-        logger.info(`[Node:PlanSkillsV2] Save skill intent: "${skillName}"`);
-        skillPlan = [{
-          skill: 'skillCreator.skill',
-          description: `Save script as ${skillName}`,
-          args: { name: skillName, code: pythonCode, language: 'python' },
-        }];
-      }
-    }
-  }
-
   // ── Fallback browser cleanup ──────────────────────────────────────────────
   // Close any Playwright browsers left open by preflight auth probes or deep-link
   // resolution. The persistent profile retains cookies; only the browser process is killed.
@@ -4381,7 +4231,7 @@ The user's request does NOT match any installed skill.
   if (progressCallback) {
     progressCallback({
       type: 'plan_ready',
-      steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })),
+      steps: skillPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined, skipped: s.skipped || undefined, superseded: s.superseded || undefined, skipReason: s.skipReason || undefined })),
       intent: state.intent?.type || 'command_automate',
       singleStepReplan: state.singleStepReplan || false,  // Preserve single-step replan context for UI
     });

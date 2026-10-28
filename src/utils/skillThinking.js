@@ -47,9 +47,6 @@ function generateSkillThinking(skill, args = {}, context = {}) {
     case 'synthesize':
       return generateSynthesizeThinking(args, prefix);
       
-    case 'external.skill':
-      return `${prefix}🔗 External skill: ${args.skillId || args.skill || 'unknown'}`;
-      
     default:
       return `${prefix}⚙️ Preparing ${skill}...`;
   }

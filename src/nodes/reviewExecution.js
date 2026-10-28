@@ -410,18 +410,6 @@ module.exports = async function reviewExecution(state) {
     }
   }
 
-  // ── external.skill short-circuit ────────────────────────────────────────────
-  // external.skill returns a structured object (e.g. { success: true, navigatedTo: "..." }).
-  // It does NOT produce page text — content-based hollow checks must never fire on these
-  // results. If any external.skill step succeeded, treat the plan as VERIFIED.
-  const _hasExternalSkillSuccess = skillResults.some(r =>
-    r.skill === 'external.skill' && (r.success === true || r.ok === true)
-  );
-  if (_hasExternalSkillSuccess) {
-    logger.info('[Node:ReviewExecution] external.skill step succeeded — skipping hollow check (structured result, no page text)');
-    return { ...state, reviewVerdict: 'VERIFIED' };
-  }
-
   // ── meta-skill short-circuit ──────────────────────────────────────────────
   // api_suggest, needs_skill, schedule, ask_user are UI card primitives — they surface
   // a question/offer to the user and return ok:true. They produce no browser page output

@@ -6,62 +6,10 @@ const { parseLlmJson } = require('./parseLlmJson');
  * planSkillsHelpers.js — contract-driven execution helpers extracted from planSkills.js
  *
  * Pure utility functions (no stategraph state, no side effects):
- *   - parseContractCommands   — parse ## Auth + ## Commands from a skill.md contract
  *   - resolveDateRange        — NL date phrases → UTC ISO token set (no LLM)
  *   - extractMessageParams    — extract phone/email/url/amount from user message
  *   - buildRuntimeParams      — compose full param set (message + profile + prior body)
  *   - substituteTokens        — replace {{TOKEN}} placeholders in a code string
- *   - selectCommandTemplate   — LLM call to pick template index (PII scrubbed)
- *   - applyContractParams     — apply LLM substitutions + date tokens to a command template
- *   - detectSaveSkillIntent   — detect "save this as a skill" intent
- *   - deriveSkillName         — derive snake_case skill name from description
- */
-
-/**
- * Parse the ## Auth block and all ## Commands code blocks from a skill.md contract.
- *
- * Returns:
- *   { authScript: string | null, commands: [{ heading, code }] }
- * or null if no ## Commands section / no parseable code blocks.
- */
-function parseContractCommands(contractMd) {
-  if (!contractMd || typeof contractMd !== 'string') return null;
-
-  let authScript = null;
-  const authSectionBody = contractMd.match(/##\s+Auth\s*\n([\s\S]*?)(?=\n##\s)/i);
-  if (authSectionBody) {
-    const authCodeBlock = authSectionBody[1].match(/```(?:bash|sh)?\s*\n([\s\S]*?)\n```/i);
-    if (authCodeBlock) authScript = authCodeBlock[1].trim();
-  }
-
-  const cmdSectionMatch = contractMd.match(/##\s+Commands\s*\n([\s\S]*?)(?=\n##\s|\n---|\s*$)/i);
-  if (!cmdSectionMatch) return null;
-
-  const cmdSection = cmdSectionMatch[1];
-  const commands = [];
-  const cmdBlockRe = /###\s+(.+?)\n[\s\S]*?```(?:bash|sh)?\s*\n([\s\S]*?)\n```/gi;
-  let m;
-  while ((m = cmdBlockRe.exec(cmdSection)) !== null) {
-    commands.push({ heading: m[1].trim(), code: m[2].trim() });
-  }
-
-  if (commands.length === 0) {
-    const rawBlockRe = /```(?:bash|sh)?\s*\n([\s\S]*?)\n```/gi;
-    let idx = 0;
-    while ((m = rawBlockRe.exec(cmdSection)) !== null) {
-      commands.push({ heading: `Command ${++idx}`, code: m[1].trim() });
-    }
-  }
-
-  if (commands.length === 0) return null;
-  return { authScript, commands };
-}
-
-/**
- * Deterministically resolve natural-language temporal phrases in a user message into
- * concrete UTC ISO 8601 date ranges. Zero LLM involvement.
- *
- * Returns an 8-token object when matched, or null otherwise.
  */
 function resolveDateRange(userMessage, now = new Date()) {
   const msg = userMessage.toLowerCase();
@@ -257,137 +205,10 @@ function substituteTokens(code, params, logger) {
   return result;
 }
 
-/**
- * Ask the LLM to pick the right command template by index only.
- * PII (phone, email, message body) is NOT sent to the LLM.
- * Returns { index, substitutions: [], params: {} } or null on failure.
- */
-async function selectCommandTemplate(commands, userMessage, backend, askDecision) {
-  const _scrubbedMsg = userMessage
-    .replace(/\+?1?[\s.-]?\(?[2-9]\d{2}\)?[\s.-]?\d{3}[\s.-]?\d{4}/g, '[PHONE]')
-    .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[EMAIL]')
-    .replace(/https?:\/\/\S+/g, '[URL]');
-
-  const commandList = commands.map((c, i) => `--- Template ${i}: ${c.heading} ---`).join('\n');
-
-  // ── Local decision fast path — bounded index pick over templates ────────
-  if (typeof askDecision === 'function' && commands.length <= 26) {
-    try {
-      const { boundedDecision } = require('./askDecision');
-      const _local = await boundedDecision({
-        site: 'planSkillsHelpers.selectCommandTemplate',
-        askDecision,
-        questions: [{
-          id: 'tpl', type: 'choice',
-          question: 'Which command template best matches the user request?',
-          options: commands.map(c => c.heading || 'command'),
-        }],
-        state: `User request: "${_scrubbedMsg}"`,
-        local: (a) => {
-          const i = a.tpl?.index;
-          return (i != null && i < commands.length) ? { index: i, substitutions: [], params: {} } : null;
-        },
-        remote: async () => null,
-        logger: null,
-      });
-      if (_local) return _local;
-    } catch (_) { /* fall through to numbered LLM call */ }
-  }
-
-  const query = `User request: "${_scrubbedMsg}"
-
-Available command templates:
-${commandList}
-
-Output ONLY valid JSON with the best matching template index (0-based):
-{ "index": <number> }`;
-
-  try {
-    const raw = await backend.generateAnswer(query, {
-      query,
-      context: { conversationHistory: [], systemInstructions: 'You are a command template selector. Pick the best matching template index and output only { "index": N }. Do not output anything else.', intent: 'command_automate' },
-      options: { maxTokens: 20, temperature: 0, fastMode: true },
-    }, { maxTokens: 20, temperature: 0, fastMode: true, taskType: 'classification' }, null);
-
-    const parsed = parseLlmJson(raw, null, 'planSkillsHelpers:selectCommandTemplate');
-    if (!parsed) return null;
-    if (typeof parsed.index !== 'number' || parsed.index < 0 || parsed.index >= commands.length) return null;
-    return { index: parsed.index, substitutions: [], params: {} };
-  } catch (_) {
-    return null;
-  }
-}
-
-/**
- * Substitute parameter values into a command template.
- * Replaces $(date ...) subshells with pre-computed ISO strings when available,
- * then applies {{TOKEN}} replacements.
- */
-function applyContractParams(code, sel) {
-  let result = code;
-
-  const substitutions = Array.isArray(sel.substitutions) ? sel.substitutions : [];
-  const sorted = [...substitutions]
-    .filter(s => s && typeof s.find === 'string' && s.find.length > 0 && s.replace !== undefined)
-    .filter(s => !/^\$\{?[A-Z_][A-Z0-9_]*\}?$/.test(s.find.trim()))
-    .filter(s => !/^\$\(date\b/.test(s.find.trim()))
-    .sort((a, b) => b.find.length - a.find.length);
-  for (const { find, replace } of sorted) {
-    result = result.split(find).join(String(replace));
-  }
-
-  const params = sel.params || {};
-  if (params.timeMin) {
-    result = result.replace(/\$\(date[^)]*%Y-%m-%dT%H:%M:%SZ[^)]*\)/g, params.timeMin);
-    result = result.replace(/\$\(date[^)]*%Y-%m-%dT00:00:00Z[^)]*\)/g, params.timeMin);
-    result = result.replace(/\$\(date[^)]*%Y-%m-%dT[^)]*\)/g, params.timeMin);
-  }
-  if (params.timeMax) {
-    result = result.replace(/(\?|&)(timeMax=)[^&"\s]*/g, `$1$2${params.timeMax}`);
-    if (!result.includes('timeMax=')) result = result.replace(/(\?[^"]*)(")/, `$1&timeMax=${params.timeMax}$2`);
-  }
-  if (params.date) result = result.replace(/\$\(date[^)]*\)/g, params.date);
-  for (const [k, v] of Object.entries(params)) {
-    if (k === 'timeMin' || k === 'timeMax' || k === 'date') continue;
-    const _tok = `{{${k}}}`;
-    if (result.includes(_tok)) result = result.split(_tok).join(String(v));
-  }
-
-  return result;
-}
-
-/**
- * Detect if user wants to save a Python script as a skill.
- */
-function detectSaveSkillIntent(message) {
-  const saveSkillPatterns = [
-    /save this (as|for) (a skill|later)/i,
-    /make this (reusable|a skill)/i,
-    /remember this (script|command|automation)/i,
-    /turn this into (a skill|something reusable)/i,
-    /create (a|this) skill from (this|that|it)/i,
-    /store this (script|command|automation)/i,
-  ];
-  return saveSkillPatterns.some(pattern => pattern.test(message || ''));
-}
-
-/**
- * Derive a snake_case skill name from a description string.
- */
-function deriveSkillName(description) {
-  if (!description) return 'custom_skill';
-  return description.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim()
-    .replace(/\s+/g, '_').substring(0, 30) || 'custom_skill';
-}
 
 module.exports = {
-  parseContractCommands,
   resolveDateRange,
   extractMessageParams,
   buildRuntimeParams,
   substituteTokens,
-  selectCommandTemplate,
-  applyContractParams,
-  detectSaveSkillIntent,
-  deriveSkillName,
 };

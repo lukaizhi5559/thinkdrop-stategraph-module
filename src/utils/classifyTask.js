@@ -137,12 +137,12 @@ Field rules:
   - "app_automation": the user wants to use a named desktop application's built-in AI assistant or agent to do work inside that app. The phrase "in [app] use the AI" or "use the AI in [app]" or "ask [app] AI to ..." are strong signals. Examples: "In Devin use the AI to add tests to this file", "Ask Claude in Slack to summarize the thread", "Use Cursor's AI to refactor the file". These are handled by app.agent run_agent, which opens the file and uses the app's AI assistant. Use "app_automation" whenever the user explicitly asks to invoke an app's AI assistant, even if the task also mentions a file path.
   - "browser": navigate, search, open a website, go to a URL, look something up online, or interact with a web page via precise DOM access — ONLY for web browser tasks that go beyond the currently visible page. NOT for tasks that inspect, use, or interact with a native desktop app's UI (e.g. Slack, Figma, Zoom, Discord) — those are "local_system" or "app_automation" or "query" even if a service name is mentioned. ALWAYS "browser" for interacting with elements on the CURRENTLY VISIBLE or open browser page — "fill out this form on my screen", "fill this form but don't submit", "click the link on this page", "type into the field on my tab" — the extension controls the bound tab directly; no navigation is required for "browser". "local_system" is ONLY for native macOS/desktop UI (app menus, dialogs, windows, keyboard-driven OS actions), never web-page content. IMPORTANT: "Open [known web service]" (e.g. "Open Spotify and play my playlist", "Open YouTube and search for X", "Open Notion and create a page") is ALWAYS "browser" — the word "open" here means "launch the web service", not "click a visible element on the current page". Known web services include: Spotify, YouTube, Notion, Slack, Discord, Gmail, GitHub, Twitter/X, LinkedIn, Reddit, TikTok, Instagram, Facebook, Perplexity, ChatGPT, Claude, and any other service with a web player or web app. The local_system "click, open, or select a visible text element" rule does NOT apply when "open" is followed by a named web service. NOT "browser" when the user only wants to read, describe, or summarize the CURRENTLY VISIBLE page ("what does this page say", "read this article on screen", "sum up what's showing") — that is passive observation → "query" (handled by screen_intelligence; no navigation needed).
   - "messaging": send email, text, SMS, Slack, Discord, notify someone
-  - "scheduling": set a LOCAL reminder/alarm, defer a task for later, recurring/cron job — remind-me semantics only. NEVER for creating or modifying events inside a named external service (Google Calendar, Outlook, Calendly, Eventbrite, Notion calendar) — "set a google event", "add to my calendar", "create a meeting on Zoom" are "browser" (the event is created by automating the service's web app, not by registering a local reminder).
+  - "scheduling": set a LOCAL reminder/alarm, defer a task for later, recurring/cron job — remind-me semantics only. NEVER for creating, modifying, or DELETING events inside a named external service (Google Calendar, Outlook, Calendly, Eventbrite, Notion calendar, Nylas) — "set a google event", "add to my calendar", "create a meeting on Zoom", "delete that event I just set", "cancel my calendar meeting" are "browser" (the event is managed by automating the service, not the local reminder store). A delete/cancel of an existing artifact that names no service is still NOT 'scheduling' unless it explicitly targets an in-app reminder/alarm.
   - "query": question, lookup, retrieve memory, general knowledge — includes asking about or locating UI elements in a desktop app ("show me where X is in Slack", "where is the toolbar in Figma"). Use for tasks that ask to find, describe, or explain something without sending or modifying anything. ALSO "query" for PASSIVE SCREEN OBSERVATION — reading, describing, summarizing, or answering about content currently visible on screen or the open page ("what's on my screen", "describe this page", "explain what's showing", "tell me what this says"). This INCLUDES scan/read/check-verb phrasing aimed at the live surface — "scan the screen and tell me the best price", "scan this page for the cheapest option", "check this page and tell me what it says", "read this tab" — the report clause is answered from the live capture; it is NOT a web_search. These route to screen_intelligence (capture + answer), not automation. NOT "query" when the task is an imperative action ON the screen (highlight, scroll, capture, monitor, annotate) — those are "local_system"; imperative actions on PAGE CONTENT inside a browser (click, type, fill, select) are "browser". NOT "query" when the task explicitly asks to use an app's AI assistant — those are "app_automation".
   - "ambiguous": genuinely unclear even with history
 
 - isFollowUp: true when the message refers to something established in RECENT CONVERSATION via any of these signal CATEGORIES (examples are illustrative, not exhaustive):
-  1. Pronouns & demonstratives: it, this, that, these, those, they, them, one, same, such, the former, the latter, there, here
+  1. Pronouns & demonstratives: it, this, that, these, those, they, them, one, same, such, the former, the latter, there, here — AND person pronouns: he, she, him, his, her, theirs. "look up videos for him", "play her songs", "send it to them" refer to a PERSON/entity named in recent history — followUpTarget = that person's name or the entity (e.g. after discussing Mike Winger, "videos for him" → followUpTarget="Mike Winger"). Do NOT interpret "for me"/"for us" as referential — those are politeness, not follow-up signals.
   2. Definite-article references to prior context: "the file", "the folder", "the result", "the script", "the code", "the project", "the email", "the document", "the previous [X]", "the above", "that [X]" (e.g. "that folder", "that python", "that directory")
   3. Temporal/additive continuation signals: "now [action]" (e.g. "now email that"), "also", "as well", "too", "what about [X]", "how about [X]"
   4. Clarification/confirmation questions about the assistant's prior claims or an established topic: "are you referring to X", "do you mean X", "did you mean X", "when you say X", "are you talking about X", "is that what you mean", "are you asking about X", "you mean X?" — these continue the prior topic even though they name a concrete noun (e.g. "models") instead of using a pronoun.
@@ -191,7 +191,7 @@ Field rules:
 - needsClarification: true ONLY when a truly critical piece is missing AND conversation history does NOT resolve it:
   - WHO to send to (messaging tasks with no recipient anywhere)
   - WHICH service (when multiple equally valid options exist and user gave no hint)
-  - For scheduling tasks (reminders, alarms, cron, recurring): set needsClarification:true when the user did NOT specify how they want to be notified/delivered. Notification methods include: macOS notification, ThinkDrop in-app alert, email, text message, write to file. If the user said "email me", "text me", "notify me", "show an alert", "send a notification", "osascript notification", etc. → needsClarification:false (method is specified). If they only said "remind me to X" or "set a reminder for X" with no delivery method → needsClarification:true.
+  - For scheduling tasks that CREATE a reminder/alarm ("remind me to X", "set an alarm"): set needsClarification:true when the user did NOT specify how they want to be notified/delivered. This delivery-method question does NOT apply to deleting/cancelling/rescheduling an existing event or reminder — there is nothing to deliver → needsClarification:false. Notification methods include: macOS notification, ThinkDrop in-app alert, email, text message, write to file. If the user said "email me", "text me", "notify me", "show an alert", "send a notification", "osascript notification", etc. → needsClarification:false (method is specified). If they only said "remind me to X" or "set a reminder for X" with no delivery method → needsClarification:true.
   - Missing or ambiguous file/folder path for app_automation or local_file tasks that the system cannot resolve automatically:
     * A bare basename with NO extension and NO path separator (e.g. "UnifiedOverlay", "the readme", "the config file") → needsClarification:true
     * A filename WITH an extension (e.g. "instruction.runner.cjs", "main.py", "README.md") → needsClarification:false (system can search the project tree)
@@ -327,6 +327,8 @@ EXAMPLES (genuine follow-ups — isFollowUp true, followUpTarget resolved):
   User: "I need the links for these as well" (after listing videos) → {"taskType":"query","isFollowUp":true,"followUpTarget":"video links"}
   User: "are you referring to the models still" (after a screen answer comparing AI models and a short exchange about them) → {"taskType":"query","isFollowUp":true,"followUpTarget":"the AI model comparison","isScreenFollowUp":false}
   User: "what does this error mean" (screen shows an npm error not yet discussed) → {"taskType":"query","isScreenFollowUp":true}
+  User: "delete that event I just set" (after a calendar event was created) → {"taskType":"browser","isFollowUp":true,"followUpTarget":"the calendar event just created","interactiveActions":["delete"]}
+  User: "use nylas to delete it" (after a calendar event was created via nylas) → {"taskType":"browser","isFollowUp":true,"followUpTarget":"the calendar event just created","targetService":"nylas","interactiveActions":["delete"]}
 
 EXAMPLES (image analysis — isImageAnalysis MUST be true):
   User: "scan the images and tell me what they are" → {"taskType":"local_file","isFollowUp":false,"followUpTarget":null,"isImageAnalysis":true}
@@ -444,13 +446,25 @@ function deriveResolution(tc, userMessage, hasAttachedCard) {
 // the raw message for downstream planning nodes.
 function _stripAttachmentTags(text) {
   let t = String(text || '');
+  // Leading multi-line tag block FIRST — the injection format is
+  // "[Highlighted: …]\n\n<user text>", so the true terminator is the LAST ']'
+  // before the blank line or end-of-string. This must run before the
+  // single-line loop, which would otherwise cut at the blob's first ']'
+  // and strand the rest (observed: 10KB page dumps reaching the model).
+  t = t.replace(/^\s*\[(?:Thought|File|Folder|Context|Highlighted):[\s\S]*\](?=\n\n)/, '');
+  t = t.replace(/^\s*\[(?:Thought|File|Folder|Context|Highlighted):[\s\S]*\]\s*$/, '');
   // Single-line tags: each occupies one line ending in ']'
   const lineTag = /^[ \t]*\[(?:Thought|File|Folder|Context|Highlighted):[^\n]*\][ \t]*\n?/;
   while (lineTag.test(t)) t = t.replace(lineTag, '');
-  // Leading multi-line tag block (e.g. a multi-line [Highlighted: …]) —
-  // lazy match to the first ']' is sufficient here.
-  t = t.replace(/^\s*\[(?:Thought|File|Folder|Context|Highlighted):[\s\S]*?\]\s*/, '');
   return t.trim();
+}
+
+// One-line turn preview for classifier context — tag-stripped, collapsed,
+// capped. Keeps referents ("that event I just set") resolvable while a 10KB
+// highlight dump no longer rides into the decision model.
+function _preview(content, maxChars = 300) {
+  const s = _stripAttachmentTags(content).replace(/\s+/g, ' ').trim();
+  return s.length > maxChars ? s.slice(0, maxChars - 1) + '…' : s;
 }
 
 // ── Local decision-model decomposition ─────────────────────────────────────
@@ -472,7 +486,7 @@ const _DC_TASK_TYPES = [
   ['app_automation', 'use a named desktop app\'s built-in AI assistant to do work inside that app'],
   ['browser', 'navigate/search/open a website or interact with a web page — including typing/clicking/filling elements on the CURRENTLY VISIBLE or open browser tab'],
   ['messaging', 'send email/text/SMS/Slack/Discord/notify someone'],
-  ['scheduling', 'local reminders/alarms, recurring/cron/deferred tasks — NOT creating events in a named web service (that is browser)'],
+  ['scheduling', 'local reminders/alarms, recurring/cron/deferred tasks — NOT creating OR DELETING/modifying events in a named web service (that is browser)'],
   ['query', 'answer a question — knowledge, or PASSIVE observation of what is currently on screen/page'],
   ['ambiguous', 'none of the above fits'],
 ];
@@ -563,6 +577,11 @@ function _lexicalTargetService(msg) {
 const _noulQ = ([f, hint]) => ({ id: f, type: 'noul', question: `Does the current message ${hint}?` });
 
 async function _classifyViaDecision(askDecision, promptState, logger, userMessage) {
+  // tev1-class models pay prompt-eval per character — the assembled envelope
+  // (history + app blocks + message) can reach ~10KB → 2–4s measured. The
+  // decision needs only the tail: CURRENT USER MESSAGE + freshest turns.
+  const _decState = String(promptState || '').length > 2000
+    ? String(promptState).slice(-2000) : promptState;
   // Core batch — exactly 12 questions → ONE call (~1.5–2.5s vs two sequential
   // chunk calls for the old 21-question batch). The screen/doc/media family
   // moves to a lazy second call that only fires when relevant.
@@ -575,7 +594,7 @@ async function _classifyViaDecision(askDecision, promptState, logger, userMessag
       question: 'What web-access mode does this task need?' },
     ..._DC_CORE_BOOLS.map(_noulQ),
   ];
-  const r = await askDecision(_coreQs, { state: promptState });
+  const r = await askDecision(_coreQs, { state: _decState });
   const a = r?.answers ? { ...r.answers } : null;
   if (!a?.taskType) return null;
   const pick = (ans, table) => {
@@ -606,7 +625,7 @@ async function _classifyViaDecision(askDecision, promptState, logger, userMessag
       ..._DC_LAZY_BOOLS.map(_noulQ),
     ];
     try {
-      const r2 = await askDecision(_lazyQs, { state: promptState });
+      const r2 = await askDecision(_lazyQs, { state: _decState });
       const a2 = r2?.answers;
       if (a2) {
         for (const [f] of _DC_LAZY_BOOLS) parsed[f] = !!a2[f]?.bool;
@@ -710,8 +729,12 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       }
       return m.role === 'user' ? 'User' : 'Assistant';
     };
-    const recentCtx = (conversationHistory || []).slice(-16)
-      .map(m => `${_roleLabel(m)}: ${String(m.content || '').slice(0, 500)}`)
+    // Turn previews, not dumps — the classifier needs referent context, not
+    // full messages. 16×500 chars (~8KB) made the LOCAL decision leg take
+    // 2.5–4.4s (prompt eval dominates a 0.8b); previews keep pronoun/follow-up
+    // resolution at ~1/10 the tokens and speed the remote leg too.
+    const recentCtx = (conversationHistory || []).slice(-8)
+      .map(m => `${_roleLabel(m)}: ${_preview(m.content)}`)
       .join('\n');
 
     // Cross-session semantic matches are merged into conversationHistory and
@@ -720,8 +743,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // resolution for older-session referents still works.
     const semanticCtx = (conversationHistory || [])
       .filter(m => (m.source === 'semantic' || m.source === 'semantic-result' || m.source === 'prior-session') && m.content && m.content.trim())
-      .slice(-8)
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 300)}`)
+      .slice(-4)
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${_preview(m.content, 200)}`)
       .join('\n');
 
     const screenBlock = priorScreenSummary ? `\n\n${priorScreenSummary}` : '';
@@ -749,13 +772,32 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // and keeps REMOTE authoritative. Malformed/unavailable → remote path.
     let parsed = null;
     let _decShadowP = null;
+    let _adaptiveParsed = false;
     const _askDec = typeof options.askDecision === 'function' ? options.askDecision : null;
     const _decOn = !!_askDec && process.env.DECISION_LOCAL !== '0';
     const { shadowSite: _shadowSite } = require('./askDecision');
     const _decShadow = _decOn && _shadowSite('classifyTask');
-    if (_decShadow) {
+    // Adaptive mode — DECISION_ADAPTIVE=1: prefer whichever leg has been
+    // faster (EWMA); race both on cold start/resample, first valid wins.
+    if (_decOn && !_decShadow && require('../../../shared/decision-state.cjs').adaptiveEnabled()) {
+      const _remoteLeg = async () => {
+        const raw = await llmBackend.generateAnswer(prompt, {
+          query: prompt,
+          context: { systemInstructions: options.systemPrompt || CLASSIFY_SYSTEM_PROMPT },
+        }, { maxTokens: 120, temperature: 0, fastMode: true, taskType: 'classification' });
+        const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
+        return parseLlmJson(text, logger, 'classifyTask');
+      };
+      parsed = await require('../../../shared/decision-state.cjs')
+        .adaptiveChoose('classifyTask',
+          () => _classifyViaDecision(_askDec, prompt, logger, classifiedMessage),
+          _remoteLeg, { logger })
+        .catch(() => null);
+      _adaptiveParsed = parsed != null;
+    }
+    if (!_adaptiveParsed && _decShadow) {
       _decShadowP = _classifyViaDecision(_askDec, prompt, logger, classifiedMessage).catch(() => null);
-    } else if (_decOn) {
+    } else if (_decOn && !_adaptiveParsed) {
       try {
         parsed = await _classifyViaDecision(_askDec, prompt, logger, classifiedMessage);
       } catch (e) {
@@ -784,7 +826,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
         logger.debug('[classifyTask] No JSON in response — using default');
         return _withResolution(_default);
       }
-    } else if (_decOn && !_decShadow) {
+    } else if (_decOn && !_decShadow && !_adaptiveParsed) {
       logger.info('[classifyTask] Local decision answered — skipping remote call');
     }
 
@@ -880,6 +922,30 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       if (_lexical) {
         logger.info(`[classifyTask] targetService recovered lexically: "${_lexical}" (LLM emitted null)`);
         parsedTargetService = _lexical;
+      }
+    }
+
+    // Mutation post-guard — a task carrying create/send/book/schedule verbs
+    // against a service target is NEVER public_read/none/download. The LLM
+    // verdict is nondeterministic: "set a google event…" classified
+    // public_read → deep-link resolution gated out in preflightAgents →
+    // route=desktop → keyboard-shortcut plan. Same deterministic-guard class
+    // as the phantom-service check; runs AFTER lexical recovery so a
+    // recovered service also coerces, and inside classifyTask so memo-cached
+    // verdicts were already coerced at production.
+    const _MUTATION_VERB_RE = /\b(set|create|add|make|new|schedule|book|plan|arrange|organize|send|post|publish|upload|submit|reply|forward|compose|delete|remove|edit|update|rename|invite|share|join|confirm|rsvp|buy|order|checkout|pay|reserve|fill|sign|apply|register)\b/i;
+    const _MUTATION_NOUN_RE = /\b(event|events|meeting|meetings|appointment|appointments|reminder|reminders|calendar|e-?mail|emails|message|messages|dm|post|posts|tweet|tweets|comment|comments|order|orders|booking|bookings|reservation|reservations|doc|document|documents|file|files|note|notes|task|tasks|list|lists|playlist|playlists|photo|photos|video|videos|call|calls|form|forms)\b/i;
+    if (parsed.taskType === 'browser' && webAccessMode !== 'interactive' && parsedTargetService
+        && _MUTATION_VERB_RE.test(_mentionCorpus) && _MUTATION_NOUN_RE.test(_mentionCorpus)) {
+      const _act = /\b(send|reply|forward|compose|e-?mail|message|dm)\b/i.test(_mentionCorpus) ? 'send_message'
+        : /\b(book|schedule|reserve|appointment|meeting|event|reminder|calendar)\b/i.test(_mentionCorpus) ? 'book_reservation'
+        : /\b(buy|order|checkout|pay|cart|purchase)\b/i.test(_mentionCorpus) ? 'add_to_cart'
+        : 'create';
+      logger.info(`[classifyTask] mutation post-guard: webAccessMode ${webAccessMode}→interactive (service=${parsedTargetService}, action=${_act})`);
+      webAccessMode = 'interactive';
+      requiresDOM = true;
+      if (!Array.isArray(parsed.interactiveActions) || !parsed.interactiveActions.length) {
+        parsed.interactiveActions = [_act];
       }
     }
 

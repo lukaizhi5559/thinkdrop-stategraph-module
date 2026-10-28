@@ -25,6 +25,20 @@ const fs   = require('fs');
 const path = require('path');
 const os   = require('os');
 
+/**
+ * Cache-complete test: a plan file is reusable content when status is
+ * 'complete' — OR it's a completed comms-graph task plan (status 'done' +
+ * kind: task_plan) whose flattened skill_plan_json was bridged in by
+ * planRunner on terminal write. Task plans keep 'done' for the Plans UI;
+ * skill_plan_json presence is what certifies the file as a compiled,
+ * replayable procedure.
+ */
+function _isCacheCompleteContent(content, status) {
+  if (status === 'complete') return true;
+  if (status !== 'done') return false;
+  return /kind:\s*task_plan/.test(content) && /skill_plan_json:\s*'/.test(content);
+}
+
 const PLANS_DIR = path.join(os.homedir(), '.thinkdrop', 'plans');
 const SKILLS_DIR = path.join(os.homedir(), '.thinkdrop', 'skills');
 
@@ -81,6 +95,160 @@ function slotSetsEqual(a, b) {
   return true;
 }
 
+// Slots must be extracted from arg VALUES, not JSON.stringify(args) — the
+// serialized form puts every key/string in quotes, polluting quotedStrings
+// with JSON syntax ('"cmd"', '"git"'…) that no real prompt ever carries,
+// which makes every argv-literal plan ambiguous against any new prompt.
+function _slotText(v, out = []) {
+  if (typeof v === 'string') out.push(v);
+  else if (Array.isArray(v)) v.forEach(x => _slotText(x, out));
+  else if (v && typeof v === 'object') Object.values(v).forEach(x => _slotText(x, out));
+  return out.join(' ');
+}
+
+function extractSlotsFromArgs(args) {
+  return extractSlots(_slotText(args));
+}
+
+// Raw-case extraction for rebinding — extractSlots lowercases for equality
+// semantics, but a substituted path must keep the prompt's original case or
+// the rebound plan points at a path that doesn't exist on case-sensitive FS.
+function _extractSlotsRaw(text) {
+  const slots = {};
+  const stripped = String(text || '').replace(_SLOT_RES.emails, ' ');
+  for (const [key, re] of Object.entries(_SLOT_RES)) {
+    const src = key === 'emails' ? String(text || '') : stripped;
+    re.lastIndex = 0;
+    const hits = [];
+    let m;
+    while ((m = re.exec(src)) !== null) {
+      const val = (m[1] || m[2] || m[3] || m[0]).trim();
+      if (val) hits.push(val);
+    }
+    slots[key] = [...new Set(hits)];
+  }
+  return slots;
+}
+
+// ── Parameterized plan replay ─────────────────────────────────────────────────
+// Saved plans are the user-skill store — replaying them literally is wrong when
+// the new request names different targets ("commit thinkdrop" → replay for
+// "commit my-api"). rebindPlanSlots substitutes the plan's slot values with the
+// new prompt's same-type values (positional, both sides sorted → deterministic),
+// generalizing planExecutor's one-off stale-filename replace.
+//
+// Safety contract — rebind only produces auto-execute-safe output when:
+//   - every differing slot binds 1:1 positionally (count mismatch → ambiguous)
+//   - every resulting filePaths value exists on disk (corrupted/moved → reject)
+// numbers are never rebound (a bare "5" would corrupt ports/versions — a diff
+// there just keeps the hit at suggestion level).
+const _REBIND_TYPES = new Set(['filePaths', 'urls', 'emails', 'quotedStrings']);
+
+function _expandTilde(p) {
+  return typeof p === 'string' ? p.replace(/^~(?=\/|$)/, os.homedir()) : p;
+}
+
+/**
+ * Merge extractSlots output across a plan's step args — used to write the
+ * slots_json frontmatter manifest at save time.
+ */
+function mergePlanSlots(skillPlan) {
+  const merged = {};
+  for (const step of (Array.isArray(skillPlan) ? skillPlan : [])) {
+    const s = extractSlotsFromArgs(step?.args || {});
+    for (const [k, vals] of Object.entries(s)) {
+      if (!Array.isArray(vals) || vals.length === 0) continue;
+      merged[k] = [...new Set([...(merged[k] || []), ...vals])].sort();
+    }
+  }
+  return merged;
+}
+
+/**
+ * Rebind a cached plan's slot values to the new prompt's targets.
+ * @param {Array}  skillPlan  decoded step array
+ * @param {string} newPrompt  the fresh request text
+ * @param {object} opts       { logger, refsPaths: string[] }
+ * @returns {{ ok:boolean, skillPlan:Array, bindings:Array, reason:string|null }}
+ */
+function rebindPlanSlots(skillPlan, newPrompt, opts = {}) {
+  const { logger = null, refsPaths = [] } = opts;
+  const out = { ok: false, skillPlan, bindings: [], reason: null };
+  if (!Array.isArray(skillPlan) || skillPlan.length === 0) return out;
+
+  const newSlots = _extractSlotsRaw(newPrompt || '');
+  if (refsPaths.length) {
+    const extra = refsPaths.map(p => String(p).trim()).filter(Boolean);
+    newSlots.filePaths = [...new Set([...(newSlots.filePaths || []), ...extra])];
+  }
+
+  const planJson = JSON.stringify(skillPlan);
+  const planSlots = _extractSlotsRaw(_slotText(skillPlan.map(s => s?.args)));
+  let reboundJson = planJson;
+  let ambiguous = null;
+  const bindings = [];
+
+  for (const [type, oldVals] of Object.entries(planSlots)) {
+    const newVals = newSlots[type] || [];
+    const oldLow = new Set(oldVals.map(v => v.toLowerCase()));
+    const newLow = new Set(newVals.map(v => v.toLowerCase()));
+    // Non-rebindable slot types (numbers): any diff makes the hit ambiguous —
+    // a bare "5" can't be positionally substituted without corrupting ports,
+    // versions, and counts embedded in args.
+    if (!_REBIND_TYPES.has(type)) {
+      const _differ = oldVals.length !== newVals.length
+        || !oldVals.every((v, i) => v.toLowerCase() === (newVals[i] || '').toLowerCase());
+      if (_differ && oldVals.length && newVals.length) {
+        ambiguous = `${type}: plan ${JSON.stringify(oldVals)} vs prompt ${JSON.stringify(newVals)}`;
+      }
+      continue;
+    }
+    // Values the plan carries that the new prompt doesn't name → candidates
+    // for replacement; values the new prompt adds beyond the plan → sources.
+    // Diff is case-insensitive (a URL typed differently is still the same
+    // target) but substitution preserves the prompt's raw case.
+    const toReplace = oldVals.filter(v => !newLow.has(v.toLowerCase()));
+    const sources   = newVals.filter(v => !oldLow.has(v.toLowerCase()));
+    if (toReplace.length === 0) continue;
+    if (toReplace.length !== sources.length) {
+      ambiguous = `${type}: ${toReplace.length} plan value(s) vs ${sources.length} new value(s)`;
+      continue;
+    }
+    for (let i = 0; i < toReplace.length; i++) {
+      reboundJson = reboundJson.split(toReplace[i]).join(sources[i]);
+      bindings.push({ type, from: toReplace[i], to: sources[i] });
+    }
+  }
+
+  if (ambiguous) {
+    out.reason = `ambiguous rebind — ${ambiguous}`;
+    logger && logger.info(`[PlanCache] rebindPlanSlots rejected: ${out.reason}`);
+    return out;
+  }
+
+  // Path-existence gate — a bound (or saved) path that no longer exists means
+  // a corrupted or moved target; never auto-execute against it.
+  const reboundPlan = JSON.parse(reboundJson);
+  const boundPaths = _extractSlotsRaw(_slotText(reboundPlan.map(s => s?.args))).filePaths || [];
+  const missing = boundPaths.filter(p => {
+    const expanded = _expandTilde(p);
+    try { return !fs.existsSync(expanded); } catch (_) { return true; }
+  });
+  if (missing.length) {
+    out.reason = `bound path(s) missing on disk: ${missing.slice(0, 2).join(', ')}`;
+    logger && logger.info(`[PlanCache] rebindPlanSlots rejected: ${out.reason}`);
+    return out;
+  }
+
+  out.ok = true;
+  out.skillPlan = reboundPlan;
+  out.bindings = bindings;
+  if (bindings.length) {
+    logger && logger.info(`[PlanCache] rebindPlanSlots rebound ${bindings.length} slot(s): ${bindings.map(b => `${b.from}→${b.to}`).join('; ')}`);
+  }
+  return out;
+}
+
 // ── Cache invalidation: deprecated browser.act plans for named services ───────
 const _NAMED_SERVICE_RE = /\b(google|biblegateway|wikipedia|duckduckgo|reddit|youtube|stackoverflow|amazon|ebay|twitter|x\.com|facebook|instagram|pinterest|linkedin|yelp|tripadvisor|imdb|spotify|netflix|hulu|twitch|tiktok|chatgpt|gemini|perplexity|claude|grok|deepseek|mistral|copilot|midjourney|suno|notion|slack|discord|telegram|whatsapp|github|gitlab|bitbucket)\b/i;
 
@@ -94,30 +262,35 @@ function _isStaleBrowserActPlan(skillPlan, prompt) {
 
 // ── Cache invalidation: plans referencing deleted skills ──────────────────────
 /**
- * Validate that all external.skill steps in a plan reference existing skills.
- * Returns { valid: boolean, missing: string[] } with names of missing skills.
+ * Validate cached plans referencing external.skill steps.
+ * external.skill now resolves trained recipes only (recipe.run) — a cached
+ * plan step stays valid only while its recipe file still exists on disk.
+ * Returns { valid: boolean, missing: string[] }.
  */
 function _validatePlanSkills(skillPlan) {
   if (!Array.isArray(skillPlan)) return { valid: false, missing: [] };
 
   const missing = [];
   for (const step of skillPlan) {
-    const skillName = step.skill;
-    // Skip built-in skills that don't need files
-    if (skillName === 'browser.act' || skillName === 'browser.agent' ||
-        skillName === 'cli.agent' || skillName === 'shell.run' ||
-        skillName === 'creator.agent' || skillName === 'reviewer.agent' ||
-        skillName === 'skillCreator.skill' || skillName === 'system.introspect') {
-      continue;
-    }
-    // Check external.skill references
-    if (skillName === 'external.skill' && step.args?.name) {
-      const skillDir = path.join(SKILLS_DIR, step.args.name);
-      const indexPath = path.join(skillDir, 'index.cjs');
-      if (!fs.existsSync(indexPath)) {
-        missing.push(step.args.name);
-      }
-    }
+    if (step.skill !== 'external.skill') continue;
+    const name = step.args?.name;
+    if (!name) { missing.push('external.skill'); continue; }
+    const variants = [name, name.replace(/\./g, '_'), name.replace(/\./g, '-')];
+    const found = variants.some(v =>
+      fs.existsSync(path.join(SKILLS_DIR, v, 'skill.json')) ||
+      fs.existsSync(path.join(SKILLS_DIR, v, 'recipe.json'))
+    ) || (() => {
+      try {
+        for (const dir of fs.readdirSync(SKILLS_DIR)) {
+          for (const v of variants) {
+            if (fs.existsSync(path.join(SKILLS_DIR, dir, `${v}.skill.json`)) ||
+                fs.existsSync(path.join(SKILLS_DIR, dir, `${v}.json`))) return true;
+          }
+        }
+      } catch (_) {}
+      return false;
+    })();
+    if (!found) missing.push(name);
   }
 
   return { valid: missing.length === 0, missing };
@@ -408,7 +581,7 @@ function findPlanByName(planName, logger) {
       try {
         const content = fs.readFileSync(planPath, 'utf8');
         const statusMatch = content.match(/^status:\s*(.+)/m);
-        if (!statusMatch || statusMatch[1].trim() !== 'complete') continue;
+        if (!statusMatch || !_isCacheCompleteContent(content, statusMatch[1].trim())) continue;
         const nameMatch = content.match(/^name:\s*([^\s]+)/m);
         if (!nameMatch || nameMatch[1].trim() !== planName) continue;
         const jsonMatch = content.match(/^skill_plan_json:\s*'([^']+)'/m);
@@ -468,7 +641,7 @@ function sweepStalePlans(logger, maxAgeMs = STALE_PLAN_MAX_AGE_MS) {
         const head = fs.readFileSync(planPath, 'utf8').slice(0, 800);
         const statusMatch = head.match(/^status:\s*(.+)/m);
         const status = statusMatch ? statusMatch[1].trim() : 'pending';
-        if (status === 'complete') continue; // cache content — never delete
+        if (_isCacheCompleteContent(head, status)) continue; // cache content — never delete
         fs.unlinkSync(planPath);
         removed++;
       } catch (_) {}
@@ -507,7 +680,7 @@ function _collectCandidatePlans(sessionId = null) {
     try {
       const content = fs.readFileSync(planPath, 'utf8');
       const statusMatch = content.match(/^status:\s*(.+)/m);
-      if (!statusMatch || statusMatch[1].trim() !== 'complete') continue;
+      if (!statusMatch || !_isCacheCompleteContent(content, statusMatch[1].trim())) continue;
       const jsonMatch = content.match(/^skill_plan_json:\s*'([^']+)'/m);
       if (!jsonMatch) continue;
       const titleMatch  = content.match(/^# Plan:\s*(.+)/m);
@@ -558,7 +731,7 @@ async function _getEmbeddings(texts, mcpAdapter) {
  * @param {string} sessionId     optional: scope search to current session only
  * @returns {Promise<{ planFile, title, file, similarity, skillPlan, autoExecute } | null>}
  */
-async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = null) {
+async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = null, opts = {}) {
   // Fast path: dot-syntax named recall → always auto-execute
   const _dotName = extractDotNameFromPrompt(prompt);
   if (_dotName) {
@@ -630,20 +803,33 @@ async function findSimilarCompletePlan(prompt, mcpAdapter, logger, sessionId = n
       }
       // Slot-gated auto-execute: a near-identical paraphrase (cosine ≥ 0.90)
       // whose extracted slots are identical is the same plan re-asked — run it
-      // without the modal. Any slot difference (different email, URL, path,
-      // quoted string, number) means different args → stay a suggestion.
+      // without the modal. Slot differences mean different args — attempt a
+      // positional rebind to the new prompt's targets; ambiguous binding or a
+      // missing bound path keeps the hit at suggestion level (never silent).
       const _slotsEqual = slotSetsEqual(best.planPrompt, prompt);
-      const _autoExec = bestScore >= SLOT_AUTOEXECUTE_THRESHOLD && _slotsEqual;
+      let _plan = skillPlan;
+      let _clean = _slotsEqual;
+      let _rebindNote = '';
+      if (!_slotsEqual) {
+        const _rb = rebindPlanSlots(skillPlan, prompt, { logger, refsPaths: opts.refsPaths || [] });
+        if (_rb.ok) {
+          _plan = _rb.skillPlan;
+          _clean = true;
+          _rebindNote = _rb.bindings.length ? ` (rebound ${_rb.bindings.length} slot(s))` : '';
+        }
+      }
+      const _autoExec = bestScore >= SLOT_AUTOEXECUTE_THRESHOLD && _clean;
       logger && logger.info(
-        `[PlanCache] Semantic match found (cosine=${bestScore.toFixed(3)}, slots=${_slotsEqual ? 'equal' : 'DIFFER'}, autoExecute=${_autoExec}): ${best.file}`
+        `[PlanCache] Semantic match found (cosine=${bestScore.toFixed(3)}, slots=${_slotsEqual ? 'equal' : 'DIFFER'}, rebind=${_clean && !_slotsEqual ? 'ok' : 'n/a'}, autoExecute=${_autoExec}): ${best.file}`
       );
       return {
         planFile: best.planPath,
         title: best.title,
         file: best.file,
         similarity: bestScore,
-        skillPlan,
+        skillPlan: _plan,
         autoExecute: _autoExec,
+        rebound: _rebindNote || undefined,
         content: best.content,
       };
     } catch (_) { return null; }
@@ -928,6 +1114,8 @@ module.exports = {
   SLOT_AUTOEXECUTE_THRESHOLD,
   extractSlots,
   slotSetsEqual,
+  mergePlanSlots,
+  rebindPlanSlots,
   sweepStalePlans,
   normalizePrompt,
   cosineDistance,
@@ -953,4 +1141,5 @@ module.exports = {
   isCorrectionSignal,
   DOMAIN_ALIASES,
   demotePlanFile,
+  _isCacheCompleteContent,
 };

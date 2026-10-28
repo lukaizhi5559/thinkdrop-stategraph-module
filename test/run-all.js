@@ -8,7 +8,6 @@
  *
  * Deliberately EXCLUDED:
  *   - intent-classifier.test.js    — stale intent taxonomy expectations
- *   - parse-skill.test.js          — requires live MCP skill services
  *   - preflightAgents.test.js      — env-dependent (credential callbacks, auth state)
  *   - destination-resolver.test.js — 1 stale expectation ("google cheap flights")
  *   - browser-count-grounding.manual.js — imports command-service skill internals
@@ -60,6 +59,7 @@ const TESTS = [
   'reliability.test.js',
   'sanitize-install-rewrite.test.js',
   'preflight-cli-ledger.test.js',
+  'authored-plans.test.js',
   'unit.test.js',
 ];
 

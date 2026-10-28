@@ -412,8 +412,19 @@ const TEMPLATES = [
   },
   {
     n: 13, id: 'schedule_cancel', lowRisk: false,
-    describe: 'cancel/delete a scheduled reminder or alarm — args: {query (label words) or all:true}',
-    validate: (a) => ((typeof a.query === 'string' && a.query.trim()) || a.all === true) ? null : 'query missing',
+    describe: 'cancel/delete a ThinkDrop IN-APP scheduled reminder, alarm, or timer — args: {query (label words) or all:true}. NOT for calendar events, meetings, or appointments on any service (Google Calendar, Nylas, Outlook) — those are service_task/browser deletes; if the prompt says event/meeting/appointment/calendar and not reminder/alarm, do NOT pick this.',
+    validate: (a, m) => {
+      // Calendar-event deletes hijacked this template ("delete that event I
+      // just set" → "No pending reminders" hollow step). The skill only knows
+      // ThinkDrop's own reminder store — an event/meeting-named prompt that
+      // never says reminder/alarm/timer belongs to the service lane.
+      const _m = String(m || '');
+      if (/\b(events?|meetings?|appointments?|calendar)\b/i.test(_m)
+          && !/\b(reminders?|alarms?|alerts?|timers?)\b/i.test(_m)) {
+        return 'calendar/event artifact — not an in-app reminder';
+      }
+      return ((typeof a.query === 'string' && a.query.trim()) || a.all === true) ? null : 'query missing';
+    },
     build: (a) => [{ skill: 'schedule_cancel',
       args: a.all === true ? { query: String(a.query || '').trim(), all: true } : { query: String(a.query || '').trim() },
       description: a.all === true ? 'Cancel all pending reminders' : `Cancel reminder matching "${String(a.query || '').trim()}"` }],
@@ -446,6 +457,34 @@ const TEMPLATES = [
     },
     build: (a, m) => {
       const name = _canonicalService(a.service);
+      // Services whose mutation intent carries a parameterized buildUrl — the
+      // resolved URL lands on a prefilled form, so the on-page work is a
+      // bounded fill+submit and a URL-transition verify, not a whole-task goal
+      // handed to the runtime router. Umbrella services ("google") qualify
+      // only when the message names the sub-product. dom.act stays the
+      // executor for services without a templated mutation surface.
+      const _pm = (() => {
+        const e = _PARAM_MUTATION_SERVICES[name];
+        if (!e || !_CREATE_GOAL_RE.test(m)) return null;
+        if (e.when && !e.when.test(m)) return null;
+        return e;
+      })();
+      if (_pm) {
+        return [
+          { skill: 'url.first.agent', stepType: 'navigate',
+            args: { task: m, agentId: `${name}.agent`, service: name },
+            description: `Navigate to ${name}` },
+          { skill: 'form.fill.agent', stepType: 'on-page-action',
+            args: { task: m, agentId: `${name}.agent`, submit: true },
+            description: `${name}: fill and submit — ${String(m).slice(0, 60)}` },
+          { skill: 'turn.loop.agent', stepType: 'verify',
+            args: { mode: 'verify', goal: `Confirm the submission completed on ${name}` },
+            description: 'Verify the submission completed' },
+          { skill: 'synthesize', stepType: 'verify',
+            args: { prompt: 'Report whether the requested action completed, in one short sentence.' },
+            description: 'Report outcome' },
+        ];
+      }
       // Atomic browser agents: url.first resolves the deep link and navigates
       // (e.g. gmail #inbox?compose=new), then dom.act routes the on-page work
       // to the right executor (tab.map for compose forms). Splitting nav from
@@ -815,6 +854,17 @@ const SERVICE_ALIASES = {
   google_docs:     ['google docs'],
   google_sheets:   ['google sheets'],
 };
+
+// Services whose mutation intent carries a parameterized buildUrl in
+// KNOWN_BROWSER_SERVICES (command-service browser.agent) — url.first lands on
+// a prefilled creation form, so service_task emits bounded fill+submit+verify
+// steps instead of delegating the whole task to dom.act's runtime router.
+// `when` gates umbrella services to the sub-product the message names.
+const _PARAM_MUTATION_SERVICES = {
+  google_calendar: { submit: true },
+  google: { when: /\b(?:calendar|events?|meetings?|appointments?|schedul)/i, submit: true },
+};
+const _CREATE_GOAL_RE = /\b(?:create|creates|creating|made|make|makes|schedule|schedules|scheduling|books?|booking|add|adds|new|arrange|plan|set\s+(?:up|a|an|the))\b/i;
 function _canonicalService(svc) {
   const s = String(svc || '').trim().toLowerCase().replace(/\.agent$/, '').replace(/\s+/g, '_');
   if (!s) return null;

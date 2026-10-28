@@ -104,6 +104,29 @@ module.exports = async function planExecutor(state) {
 
   const originalPrompt = extractOriginalPrompt(content) || state.originalPrompt || state.message || '';
 
+  // 4a. Slot rebind — a resume whose new request names different targets
+  //     ("run git.sync on my-api") substitutes the plan's slot values with
+  //     the new prompt's. Ambiguous binding or missing bound paths keeps the
+  //     literal plan (the suggestion/approval surface still shows it).
+  const _newPrompt = state.resolvedMessage || state.message || '';
+  if (_newPrompt && _newPrompt.trim() !== originalPrompt.trim()) {
+    try {
+      const { rebindPlanSlots } = require('../utils/planCacheHelpers');
+      const _refsPaths = ((state.refs || state.context?.refs || []))
+        .filter(r => r && (r.type === 'folder' || r.type === 'file') && typeof r.path === 'string')
+        .map(r => r.path);
+      const _rb = rebindPlanSlots(skillPlan, _newPrompt, { logger, refsPaths: _refsPaths });
+      if (_rb.ok && _rb.bindings.length) {
+        skillPlan = _rb.skillPlan;
+        logger.info(`[Node:PlanExecutor] Rebound ${_rb.bindings.length} slot(s) for resume: ${_rb.bindings.map(b => `${b.from}→${b.to}`).join('; ')}`);
+      } else if (!_rb.ok && _rb.reason) {
+        logger.info(`[Node:PlanExecutor] Rebind skipped (${_rb.reason}) — running literal plan`);
+      }
+    } catch (_rbErr) {
+      logger.warn(`[Node:PlanExecutor] Rebind failed: ${_rbErr.message} — running literal plan`);
+    }
+  }
+
   // 4b. Detect context mismatch and ask for a filename when the cached plan
   //     hardcoded a name derived from a prior browser context.
   //     Gate 1: only run when the plan actually has browser steps — the question
