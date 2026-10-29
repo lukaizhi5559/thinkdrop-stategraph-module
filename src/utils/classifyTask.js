@@ -777,9 +777,15 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const _decOn = !!_askDec && process.env.DECISION_LOCAL !== '0';
     const { shadowSite: _shadowSite } = require('./askDecision');
     const _decShadow = _decOn && _shadowSite('classifyTask');
+    // shared/decision-state.cjs resolves to repo/shared in-place and to
+    // node_modules/@thinkdrop/shared under the synced package — guard the
+    // require so a missing copy only skips adaptive mode instead of taking
+    // the whole classification down to defaults.
+    let _decStateMod = null;
+    try { _decStateMod = require('../../../shared/decision-state.cjs'); } catch (_) {}
     // Adaptive mode — DECISION_ADAPTIVE=1: prefer whichever leg has been
     // faster (EWMA); race both on cold start/resample, first valid wins.
-    if (_decOn && !_decShadow && require('../../../shared/decision-state.cjs').adaptiveEnabled()) {
+    if (_decOn && !_decShadow && _decStateMod && _decStateMod.adaptiveEnabled()) {
       const _remoteLeg = async () => {
         const raw = await llmBackend.generateAnswer(prompt, {
           query: prompt,
@@ -788,7 +794,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
         const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
         return parseLlmJson(text, logger, 'classifyTask');
       };
-      parsed = await require('../../../shared/decision-state.cjs')
+      parsed = await _decStateMod
         .adaptiveChoose('classifyTask',
           () => _classifyViaDecision(_askDec, prompt, logger, classifiedMessage),
           _remoteLeg, { logger })

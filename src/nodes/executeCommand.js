@@ -548,6 +548,27 @@ async function _thinPostFailureHandler(state) {
   const _pageUnchanged = !!(_pageSig && _lastPageSig && !_pageSig.probeError
     && JSON.stringify(_pageSig) === JSON.stringify(_lastPageSig));
 
+  // ── Internal-error gate — before every patch/escalation path ──────────────
+  // A JS engine error (ReferenceError/TypeError/SyntaxError) means the
+  // executor itself is broken — the skill call already returned and its side
+  // effects may have landed. Replanning re-emits the same step through the
+  // same broken code and escalation re-executes the mutation, so neither can
+  // help. Surface the defect honestly, once.
+  if (failedStep._internalError) {
+    logger.error(`[ExecuteCommand:ThinRecovery] INTERNAL_ERROR: ${failedStep.skill} step ${skillCursor + 1} hit a runtime defect (${_errClass}) — no patch/replan can fix code; surfacing to user`);
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      pendingQuestion: {
+        question: `Internal runtime error while running "${failedStep.description || failedStep.skill}": ${_errClass}. The step's work may actually have completed — this is a defect in the executor, not the plan. How should I proceed?`,
+        options: [],
+      },
+      patchHistory: [...patchHistory, { action: 'INTERNAL_ERROR', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
   // ── Missing-information gate ─────────────────────────────────────────────
   // A skill reporting reason:'missing-information' discovered mid-run that a
   // required input can't be resolved from any source (goal args, gathered
@@ -8653,7 +8674,14 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       };
     }
 
-    const updatedResults = [...skillResults, enrichedStepResult];
+    // Normalise result: copy `output` → `stdout` when a skill reports output but
+    // no stdout (recipe.run / external.skill tombstone) so review/synthesize and
+    // captureAs treat it like shell.run output without special-casing.
+    const _normalizedResult = (enrichedStepResult.ok && enrichedStepResult.output && !enrichedStepResult.stdout)
+      ? { ...enrichedStepResult, stdout: enrichedStepResult.output }
+      : enrichedStepResult;
+
+    const updatedResults = [...skillResults, _normalizedResult];
 
     // ── captureAs — Trigger primitive: persist a step's output into
     // _gatheredVars so a later step's runIf predicate can branch on a captured
@@ -9713,6 +9741,15 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       ok: false,
       error: isSearchExit1 ? 'search_no_results: search returned no results for the given query' : error.message
     };
+    // A JS engine error (ReferenceError/TypeError/SyntaxError) reaching this
+    // catch means the runtime itself is broken — the skill call already
+    // returned and its side effects may have landed. Tag it so
+    // _thinPostFailureHandler surfaces it honestly instead of escalating or
+    // replanning (re-running a mutation against a code defect re-executes
+    // side effects and can never succeed).
+    if (error instanceof ReferenceError || error instanceof TypeError || error instanceof SyntaxError) {
+      stepResult._internalError = true;
+    }
 
     if (!isSearchExit1) {
       logger.error('[Node:ExecuteCommand] Unexpected error:', error.message);

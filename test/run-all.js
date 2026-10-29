@@ -60,6 +60,8 @@ const TESTS = [
   'sanitize-install-rewrite.test.js',
   'preflight-cli-ledger.test.js',
   'authored-plans.test.js',
+  'internal-error-guard.test.js',
+  'classify-followup.test.js',
   'unit.test.js',
 ];
 
