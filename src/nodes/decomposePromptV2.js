@@ -828,8 +828,15 @@ module.exports = async function decomposePromptV2(state) {
   // Multi-goal conjunctions stay on the LLM path — templates are single-goal.
   // External templates (service_task) carry _deterministicExternal → preflight
   // still auth-checks the pinned agent.
+  // Eligibility is NOT vocabulary-gated: the regex only prefires the classify
+  // call early (latency); here the model verdict (suggestedIntent) or a live
+  // prefire admits the candidate and the classify itself decides fit — a
+  // re-worded request ("play the video using the URL") can never be regex-
+  // blocked from the deterministic lane.
   if (!_hasMultiGoalConjunction
-      && (_tc._detPrefirePromise || looksLikeLocalOp(message))) {
+      && (_tc._detPrefirePromise
+        || _tc.suggestedIntent === 'command_automate'
+        || looksLikeLocalOp(message))) {
     const _fastTmpl = await _classifyDeterministic(message, _tc, state.llmBackend, logger, state._pinnedAgentId || null);
     if (_fastTmpl) {
       logger.info(`[Node:DecomposePromptV2] Deterministic fast lane → command_automate (${_fastTmpl.template}, ${_fastTmpl.skillPlan.length} steps)`);

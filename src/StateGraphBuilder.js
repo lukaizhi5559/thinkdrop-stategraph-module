@@ -342,6 +342,13 @@ class StateGraphBuilder {
           logger.info('[StateGraph:Router] preflightAgents has planError → logConversation');
           return 'logConversation';
         }
+        // Scoped-readiness escalation — a needed agent is unregistered,
+        // unauthenticated, or missing its binary. Exit cleanly so
+        // handoffRunner reports 'needs_plan' and the compiler onboards it.
+        if (state._needsPlan) {
+          logger.info(`[StateGraph:Router] preflightAgents: _needsPlan (${state._needsPlan.reason}) — exiting to logConversation for planning escalation`);
+          return 'logConversation';
+        }
         logger.debug('[StateGraph:Router] preflightAgents → gatherPlanContext');
         return 'gatherPlanContext';
       },
@@ -379,6 +386,13 @@ class StateGraphBuilder {
         // handoffRunner reports 'plan_update' and comms revises + resumes.
         if (state._planUpdate) {
           logger.info(`[StateGraph:Router] executeCommand: _planUpdate → logConversation (${String(state._planUpdate.reason || '').slice(0, 60)})`);
+          return 'logConversation';
+        }
+        // Mid-run onboarding gap — a step named an agent that isn't
+        // registered; the compiler onboards it and resumes. Same contract
+        // as the preflight/gatherPlanContext needs_plan escalations.
+        if (state._needsPlan) {
+          logger.info(`[StateGraph:Router] executeCommand: _needsPlan (${state._needsPlan.reason}) → logConversation`);
           return 'logConversation';
         }
         // Thin recovery handler already ran inline in executeCommand and set recoveryAction.

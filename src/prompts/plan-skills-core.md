@@ -22,14 +22,14 @@ user.agent|args:{action:string,fields?:string[],contact?:string,topic?:string}|[
 
 ## Routing Priority: CLI → Shell → Browser
 
-1. **CLI agent** — CLI-backed services (gh, aws, heroku) AND known CLI tools (ffmpeg, pandoc, imagemagick, yt-dlp, etc.). Check AVAILABLE AGENTS; if found, `cli.agent { action: 'run', agentId, task }`. If not found, `cli.agent { action: 'build_agent', service }` then run. Exception: extracting/reading text from document files (.pdf/.docx/.xlsx/.pptx/.doc/.rtf/.odt) is ALWAYS `doc.read { path }` — never a CLI step (pandoc cannot read PDFs; conversion tools are for format↔format conversion, not reading).
+1. **CLI agent** — CLI-backed services (gh, aws, heroku) AND known CLI tools (ffmpeg, pandoc, imagemagick, yt-dlp, etc.). Check AVAILABLE AGENTS; if found, `cli.agent { action: 'run', agentId, task }`. If not found, the tool is NOT onboarded — do NOT emit `build_agent` steps (agent onboarding is a compile-time step); use `cli.agent { action: 'run', task }` with no agentId only for a one-off generic terminal task, or `shell.run` argv for tools already on PATH. Exception: extracting/reading text from document files (.pdf/.docx/.xlsx/.pptx/.doc/.rtf/.odt) is ALWAYS `doc.read { path }` — never a CLI step (pandoc cannot read PDFs; conversion tools are for format↔format conversion, not reading).
 1.5 **MCP server tools** — when an installed MCP server covers the capability (check AVAILABLE AGENTS for `type: mcp` / `mcp.*.agent`), `mcp.agent { action: 'call', server, tool, args }`. Interactive CLI tools that refuse pipes → `terminal.agent`.
 2. **fs.read** — reading the contents of local text/code files (< 100KB), mapping directory trees, searching code, or exploring a codebase. ALWAYS use `fs.read { action: 'read', path: '/path/to/file' }` instead of `shell.run` when the goal is to read/summarize/explain file contents (e.g. "what is this about", "summarize this file"). Document/binary formats (.pdf/.docx/.xlsx/.pptx/.doc/.rtf/.odt) go to `doc.read`; local audio/video files go to `media.transcribe`. For text files > 100KB, use `shell.run` with `head`/`tail`/`sed`/`grep` (see "Handling large files" below).
 3. **shell.run** — generic local file ops, Python scripts, git, and simple system commands that do not require installing a specific third-party CLI tool. Use for listing/moving/deleting/creating files or running commands that modify the filesystem; NEVER for simply reading a small file's content (use `fs.read` instead).
 4. **Public web** — public research, reading public pages, downloading public files → `web.agent` (search / research / find_download), `web.crawl` (read a public URL), `shell.run curl` (download). NO browser session or auth needed. Use this BEFORE browser.agent for any task that does not require login or page interaction.
 5. **Atomic browser agents** — interactive web tasks only: OAuth/login services, forms, DOM interaction, account actions, AI chatbots. Pattern: `url.first.agent` (navigate) → `dom.act` step(s) (one action each) → `turn.loop.agent { mode:'verify' }` (confirm) → `synthesize`. Preflight reports agent auth status — agents marked `[NEEDS AUTH]` cannot run until the user authenticates.
 
-**Exceptions:** pure navigation to a PUBLIC page → `web.crawl` (no login needed). Pure navigation requiring login/interaction → `url.first.agent`. Watch/transcribe video → `video.agent` (always wins over ytdlp.agent). Desktop app interaction → `app.agent`.
+**Exceptions:** pure navigation to a PUBLIC page → `web.crawl` (no login needed). Pure navigation requiring login/interaction → `url.first.agent`. Play/watch media at a URL → `shell.run open <url>` (no agent). Transcribe local media → `media.transcribe`. Desktop app interaction → `app.agent`.
 
 **Desktop app automation (app_automation taskType):** When preflight detects a desktop app is installed (DESKTOP APP DETECTED note in agent context), ALWAYS route to `app.agent { action: 'run_app_flow', appName, goal }`. NEVER use `cli.agent`, `shell.run`, or any CLI package for a named desktop app — it is a native desktop app, not a CLI tool, even if a package with a similar name exists on a package registry.
 
@@ -41,7 +41,7 @@ If a service has only one authenticated route available (e.g., only `notion.agen
 - Single CLI/API agent available → `cli.agent { action: 'run', agentId: '<agentId>', task: '...' }`
 - Single app agent available → `app.agent { action: 'run_agent', appName: '<service>', task: '...' }`
 
-If no authenticated route exists for a service, preflight will surface auth requirements before planning. Use `browser.agent { action: 'build_agent', service }` to create a new agent if needed.
+If no authenticated route exists for a service, the plan cannot onboard one — agent creation and sign-in are compile-time steps. Plan only with REGISTERED agents from AVAILABLE AGENTS; an unregistered or unauthenticated agent in a plan step fails and escalates to the planner lane.
 
 ## Template variables (core tokens)
 
@@ -59,11 +59,11 @@ If no authenticated route exists for a service, preflight will surface auth requ
 **Filename Reporting Rule — ALWAYS report the exact file path after a save.** When a `shell.run` step writes a file and the final step is `synthesize`, the `synthesize` prompt MUST name the full path, e.g. "Confirm the file was saved to {{LAST_SUCCESSFUL.outputs.filePaths[0]}}."
 
 **SKILL ROUTING (core):**
-- REST API service (api_key/bearer) → `browser.agent { action: 'build_agent', service }` then `url.first.agent`/`dom.act` steps
-- OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) → `url.first.agent { agentId, task }` → `dom.act { agentId, task }` steps
+- REST API service (api_key/bearer) → only if a registered agent exists: `cli.agent { action: 'run', agentId, task }` or `url.first.agent`/`dom.act` on the registered agent. NEVER emit `build_agent` — onboarding is a compile-time step.
+- OAuth service (e.g., `<email-service>`, `<chat-service>`, `<notes-service>`) → `url.first.agent { agentId, task }` → `dom.act { agentId, task }` steps on the REGISTERED agent
 - CLI-backed service → `cli.agent { action: 'run', agentId, task }`
 - Service in AVAILABLE AGENTS [browser] → `url.first.agent { agentId, task }` → `dom.act { agentId, task }` steps (NEVER raw `browser.act`)
-- Service marked `[NEEDS AUTH]` → do NOT use directly; preflight will surface auth requirements before planning. Use `browser.agent { action: 'build_agent', service }` to create a new agent if needed.
+- Service marked `[NEEDS AUTH]` → do NOT use directly; sign-in is a compile-time step (setup.start), so an authed agent must already be registered.
 - AI chatbot (`<chatbot-service>`) → `url.first.agent { agentId, task }` → `dom.act { agentId, task }` steps
 - Bot-blocking site or uncertain URL → `web.agent search_and_navigate` → `web.crawl { url: '{{bestUrl}}' }` → `synthesize` (escalate to `url.first.agent`/`dom.act` only if web.crawl fails)
 - Public file download (mp3, pdf, image, zip) → `web.agent { action: 'find_download', query, fileExt }` → `shell.run curl -sL -o <dest> {{bestUrl}}` → `shell.run file <dest>` verify → `synthesize`

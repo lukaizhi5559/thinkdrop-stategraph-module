@@ -100,8 +100,18 @@ async function _classifyDeterministic(message, tc, llmBackend, logger, pinnedAge
     // page_nav_scan hijacked a chatgpt.agent-pinned task into a Google
     // search). The only exception: an external template whose own
     // serviceAgent IS the pinned agent — same lane, deterministic is fine.
-    if (hit && hit !== '__error' && pinnedAgentId) {
-      const _pin = String(pinnedAgentId).toLowerCase().replace(/\.agent$/, '');
+    // Normalize first: capability ids ('video.ffmpeg') are not agent ids and
+    // must never veto — observed: a malformed pin vetoed a media_play plan.
+    const _pinNorm = pinnedAgentId
+      ? (String(pinnedAgentId).toLowerCase().endsWith('.agent')
+          ? String(pinnedAgentId).toLowerCase()
+          : (!String(pinnedAgentId).includes('.') ? `${String(pinnedAgentId).toLowerCase()}.agent` : null))
+      : null;
+    if (pinnedAgentId && !_pinNorm) {
+      logger?.info?.(`[localPlanTemplates] ignoring malformed pin "${pinnedAgentId}" — capability ids are not agent ids (no veto)`);
+    }
+    if (hit && hit !== '__error' && _pinNorm) {
+      const _pin = _pinNorm.replace(/\.agent$/, '');
       const _hitAgent = String(hit.serviceAgent || '').toLowerCase().replace(/\.agent$/, '');
       if (!hit.external || _hitAgent !== _pin) {
         logger?.info?.(`[localPlanTemplates] ${hit.template} bypasses pinned agent ${pinnedAgentId} — vetoing; pin wins`);
@@ -794,6 +804,37 @@ const TEMPLATES = [
       steps.push({ skill: 'app.agent', args: { action: 'type_text', appName, text: String(a.text) + (_submit ? '{ENTER}' : '') }, description: `Type "${String(a.text).slice(0, 40)}" in ${appName}` });
       steps.push({ skill: 'synthesize', args: { prompt: `Report that "${String(a.text).slice(0, 80)}" was typed into ${appName}${_submit ? ' and sent' : ' and left unsubmitted'} — report only what happened, never claim inability.` }, description: 'Report' });
       return steps;
+    },
+  },
+  {
+    // "play/watch/stream <media> using the URL <u>" — a media URL plus a play
+    // verb is deterministic: open the URL in the user's default browser. No
+    // agent, no auth, no CLI — observed: 'play <youtube watch url>' escalated
+    // through catt/ffmpeg/curl agent fabrication and 3 graph runs; the
+    // correct plan is this one step. Casting to a device ("cast to Bedroom
+    // TV") names a route and belongs to the planner, not this template.
+    n: 26, id: 'media_play', lowRisk: true,
+    describe: 'play/watch/stream a video, movie, song, or other media at a given URL — args: {url} (URL verbatim from the message). "play the X video using the URL <u>", "watch <u>", "stream <u>", "play <u>". NOT for casting to a device (cast/play on the TV → planner), and NOT for a named site without a literal URL (url_open).',
+    validate: (a, m) => {
+      const raw = String(a.url || '').trim();
+      if (!raw) return 'url missing';
+      if (!String(m || '').includes(raw)) return 'url not message-verbatim';
+      if (/^https?:\/\//i.test(raw)) { try { new URL(raw); } catch (_) { return 'bad url'; } }
+      else if (!/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}([/?#][^\s]*)?$/i.test(raw)) return 'bad url';
+      // A named cast/device target means the user asked for a route, not a
+      // browser open — defer to the planner.
+      if (/\b(cast|chromecast|airplay)\b|\bto\s+(?:the\s+|my\s+)?(?:tv|television|speaker|bedroom|living\s*room|kitchen)\b/i.test(String(m || ''))) return 'cast/device route — not a browser play';
+      // Must actually be a media/play task — a bare "open <url>" is url_open.
+      // URLs are stripped first: '?v=' and '/watch' inside the link itself
+      // must not count as the play cue.
+      const _cueText = String(m || '').replace(/https?:\/\/\S+/gi, ' ');
+      if (!/\b(play|played|playing|watch|watching|stream|listen|video|movie|song|music|episode|trailer|film)\b/i.test(_cueText)) return 'no play/media cue';
+      return null;
+    },
+    build: (a) => {
+      const raw = String(a.url || '').trim();
+      const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+      return [{ skill: 'shell.run', args: { cmd: 'open', argv: [url] }, description: `Play ${url}` }];
     },
   },
 ];

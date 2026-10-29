@@ -3,13 +3,16 @@
 /**
  * sanitize-install-rewrite.test.js
  *
- * Regression test for _sanitizeSkillPlan's shell.run → cli.agent build_agent
- * rewrite. The rule exists so blind `shell.run` install steps get rerouted to
- * cli.agent's observe→adapt loop, but the verb match was too broad:
+ * Regression test for _sanitizeSkillPlan's shell.run → cli.agent install
+ * rewrite. Install-shaped steps reroute to cli.agent's observe→adapt loop as
+ * an honest `run` task ("Install and set up <svc>: <goal>") — the runtime
+ * NEVER fabricates agent descriptors (build_agent was retired; onboarding is
+ * compile-time via capability.select/setup.start). The verb match is narrow
+ * because earlier versions rewrote non-installs too:
  *
- *   "…pipe output to get first 50KB of content"  →  build_agent service="first"
- *   "get a new API key"                          →  build_agent service="new"
- *   "download the pdf"                           →  build_agent service="pdf"
+ *   "…pipe output to get first 50KB of content"  →  service="first"
+ *   "get a new API key"                          →  service="new"
+ *   "download the pdf"                           →  service="pdf"
  *
  * A rewrite destroys the step's real work AND sends cli.agent hunting a
  * nonexistent tool ("No CLI found for 'first'"). The fix: install-shaped
@@ -56,16 +59,16 @@ function sanitizeOne(step) {
 {
   const s = sanitizeOne({ skill: 'shell.run', args: { goal: 'Install pdftotext' }, description: 'Install pdftotext' });
   check(
-    '"Install pdftotext" → cli.agent build_agent service=pdftotext',
-    s.skill === 'cli.agent' && s.args?.action === 'build_agent' && s.args?.service === 'pdftotext',
+    '"Install pdftotext" → cli.agent run (honest install task, no descriptor)',
+    s.skill === 'cli.agent' && s.args?.action === 'run' && /pdftotext/i.test(s.args?.task || '') && !s.args?.service,
     JSON.stringify({ skill: s.skill, args: s.args })
   );
 }
 {
   const s = sanitizeOne({ skill: 'shell.run', args: { goal: 'Set up yt-dlp for video downloads' }, description: 'Set up yt-dlp' });
   check(
-    '"Set up yt-dlp" → build_agent yt-dlp',
-    s.skill === 'cli.agent' && s.args?.action === 'build_agent' && s.args?.service === 'ytdlp',
+    '"Set up yt-dlp" → cli.agent run task mentions ytdlp',
+    s.skill === 'cli.agent' && s.args?.action === 'run' && /ytdlp/i.test(s.args?.task || '') && !s.args?.service,
     JSON.stringify({ skill: s.skill, args: s.args })
   );
 }
@@ -133,8 +136,8 @@ function sanitizeOne(step) {
     args: { cmd: 'npm', argv: ['install', '-g', 'zzz-unproven-pkg-9x'] },
   });
   check(
-    'argv "npm install -g zzz-unproven-pkg-9x" → build_agent service=zzzunprovenpkg9x',
-    s.skill === 'cli.agent' && s.args?.action === 'build_agent' && s.args?.service === 'zzzunprovenpkg9x',
+    'argv "npm install -g zzz-unproven-pkg-9x" → cli.agent run task mentions the package',
+    s.skill === 'cli.agent' && s.args?.action === 'run' && /zzzunprovenpkg9x/i.test(s.args?.task || '') && !s.args?.service,
     JSON.stringify({ skill: s.skill, args: s.args })
   );
 }

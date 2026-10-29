@@ -3,30 +3,33 @@
 /**
  * preflightAgents.js — StateGraph node
  *
- * Sits between gatherPlanContext → planSkills.
- * Runs agent readiness checks BEFORE plan generation:
- *   1. CLI pre-flight (cli.agent preflight_check)
- *   2. Agent registry (agent.list — single shared snapshot)
- *   3. Disk-scan for trained recipes (no trainer.agent calls)
- *   4. Browser agent auth decision (authentication ledger — edge-triggered)
- *   5. App agent build (app.agent build_agent — Phase 2)
- *   6. vet CLI presence check (secure script installer)
- *   7. Monthly CLI version validation (timestamp-gated, calls validate_agent)
- *   8. MCP service health ping
- *   9. PATH health check
- *  10. Stale agent detection (registered agent whose CLI is gone)
+ * Sits between resolveAgent → gatherPlanContext.
+ * Scoped readiness check for the agents a plan/pin actually names.
  *
- * Emits progress events with agent favicon icons for visual UI feedback.
- * When auth is needed, emits preflight:auth_required so UI can route user to AgentsTab.
+ * The compiler (comms-graph planning) owns capability discovery, install,
+ * and onboarding (capability.probe → setup.start → capability.select). This
+ * runtime node therefore only:
+ *   1. resolves file references for local_file/app_automation tasks
+ *   2. computes taskFacts (consumed by executeCommand/planSkills)
+ *   3. evaluates guardian rules
+ *   4. checks the agents the plan/pin names: registry membership + auth
+ *      ledger + binary presence on PATH
+ *   5. escalates via _needsPlan when a needed agent is unregistered,
+ *      unauthenticated, or its binary is missing — the compiler onboards
+ *      it, the runtime never repairs it
+ *
+ * It NEVER: LLM-extracts services from the prompt, build_agent's, probes
+ * auth/CLIs, runs tool.discover/monthly validation/route mandates, or emits
+ * sign-in cards (sign-in is a compile-time trigger via setup.start).
  *
  * State outputs:
  *   state.preflightResult = {
- *     cliPreflightNote,       // string for planSkills prompt
+ *     cliPreflightNote,       // string for planSkills prompt ('' — no CLI scan)
  *     agentContextNote,       // string for planSkills prompt
- *     preflightCliMap,        // { service: { hasCli } }
- *     registeredAgentServiceMap, // { service: agentId }
+ *     preflightCliMap,        // { service: { hasCli } } — registry-derived
+ *     registeredAgentServiceMap, // { service: agentId } — registry-derived
  *     trainedRecipeMap,       // { variant: { agentId, skillName, agentType } }
- *     agents,                 // array of readiness info with iconUrl
+ *     agents,                 // readiness info for NEEDED agents only
  *     vetAvailable,           // boolean — vet CLI installed?
  *     warnings,               // array of { type, message } non-fatal warnings
  *   }
@@ -35,28 +38,7 @@
 const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
-
-// ── Grill-Me probe layer (Phase A) ───────────────────────────────────────────
-const { probeDesktopApp } = require('../utils/probeDesktopApp');
-const { probeTCC } = require('../utils/probeTCC');
-const { resolveRoute } = require('../utils/resolveRoute');
-const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
-
-// ── Preflight state file (monthly validation persistence) ────────────────────
-const PREFLIGHT_STATE_FILE = path.join(os.homedir(), '.thinkdrop', 'preflight-state.json');
-// Env-overridable so tests don't pollute the real ledger file. Resolved at
-// call time so tests can set THINKDROP_PREFLIGHT_AUTH_CACHE after require.
-function _authCacheFile() {
-  return process.env.THINKDROP_PREFLIGHT_AUTH_CACHE
-    || path.join(os.homedir(), '.thinkdrop', 'preflight-auth-cache.json');
-}
-const VALIDATION_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
-
-// ── Session-level auth cache (persists across StateGraph runs within same process) ──
-// Key: agentId (lowercase)  Value: { ts, authed }
-// TTL: 30 minutes — re-check filesystem after this expires
-const PREFLIGHT_AUTH_CACHE_TTL_MS = 30 * 60 * 1000;
-const _authCache = new Map();
+const { extractContextRefs } = require('../utils/contextRefs.cjs');
 
 // ── Persistent auth ledger (survives app restart) ────────────────────────────
 // Key: agentId (lowercase)
@@ -70,6 +52,15 @@ const _authCache = new Map();
 // This replaces the old 24h TTL + 7-day cookie-mtime gates, which re-verified
 // sessions that were almost never actually dead. Verification now happens on
 // transition edges (first contact / after logout), not per-run.
+// Env-overridable so tests don't pollute the real ledger file. Resolved at
+// call time so tests can set THINKDROP_PREFLIGHT_AUTH_CACHE after require.
+function _authCacheFile() {
+  return process.env.THINKDROP_PREFLIGHT_AUTH_CACHE
+    || path.join(os.homedir(), '.thinkdrop', 'preflight-auth-cache.json');
+}
+const PREFLIGHT_AUTH_CACHE_TTL_MS = 30 * 60 * 1000;
+const _authCache = new Map();
+
 let _persistentAuthCache = null; // lazy-loaded
 let _persistentAuthCachePath = null; // path the loaded cache belongs to
 let _persistentAuthCacheMtime = 0; // mtimeMs at last load — cross-process refresh
@@ -115,54 +106,43 @@ function markAgentAuthed(agentId) {
   const key = agentId.toLowerCase();
   const entry = { ts: Date.now(), authed: true };
   _authCache.set(key, entry);
-  // Persist to disk (24h TTL)
+  // Persist to disk
   const cache = _loadPersistentAuthCache();
   cache[key] = entry;
   _savePersistentAuthCache(cache);
 }
 
 function _getCachedAuth(agentId) {
-  const entry = _authCache.get(agentId.toLowerCase());
-  if (!entry) return null;
-  if (Date.now() - entry.ts > PREFLIGHT_AUTH_CACHE_TTL_MS) {
-    _authCache.delete(agentId.toLowerCase());
-    return null;
-  }
-  return entry;
+  const key = agentId.toLowerCase();
+  const entry = _authCache.get(key);
+  if (entry && (Date.now() - entry.ts) < PREFLIGHT_AUTH_CACHE_TTL_MS) return entry;
+  const persistent = _loadPersistentAuthCache();
+  return persistent[key] || null;
 }
 
-// ── Ledger read/write ───────────────────────────────────────────────────────
-// `authed` has no TTL — trusted until `authed:false`/`lastAuthFailedAt` is
-// written by a runtime login-wall observation or a failed verify.
 function _getLedgerAuth(agentId) {
-  const cache = _loadPersistentAuthCache();
-  return cache[agentId.toLowerCase()] || null;
+  return _getCachedAuth(agentId);
 }
 
 function _writeLedgerAuth(agentId, patch) {
-  if (!agentId) return;
-  const cache = _loadPersistentAuthCache();
   const key = agentId.toLowerCase();
+  const cache = _loadPersistentAuthCache();
   cache[key] = { ...(cache[key] || {}), ...patch, ts: Date.now() };
   _savePersistentAuthCache(cache);
 }
 
-// Written when a verify fails or a runtime login wall is re-detected — next
-// run goes straight to auth-required instead of trusting the stale session.
 function markAgentAuthFailed(agentId, reason) {
   if (!agentId) return;
-  _authCache.delete(agentId.toLowerCase());
-  _writeLedgerAuth(agentId, {
-    authed: false,
-    lastAuthFailedAt: Date.now(),
-    lastAuthFailedReason: reason || null,
-  });
+  const key = agentId.toLowerCase();
+  const entry = { ts: Date.now(), authed: false, lastAuthFailedAt: Date.now(), lastAuthFailedReason: String(reason || 'unknown').slice(0, 200) };
+  _authCache.set(key, entry);
+  const cache = _loadPersistentAuthCache();
+  cache[key] = { ...(cache[key] || {}), ...entry };
+  _savePersistentAuthCache(cache);
 }
 
-// CLI-agent ledger consult — same newest-evidence-wins rule as the browser
-// path: authed:true is trusted until a failure stamped at/after it proves it
-// stale. Used only when the CLI probe is INCONCLUSIVE (verifyCmd absent or
-// 'unknown') — an inconclusive probe is no observation, not a broken one.
+// CLI ledger read — authed only when the last success postdates the last
+// failure. Probe verdicts that mean "couldn't determine" are not failures.
 function _cliLedgerAuth(agentId) {
   const ledger = _getLedgerAuth(agentId);
   if (!ledger) return { authed: false, failed: false };
@@ -171,9 +151,6 @@ function _cliLedgerAuth(agentId) {
   const authedAt = ledger.authed === true ? _tsOf(ledger.ts) : 0;
   return { authed: authedAt > failedAt, failed: failedAt > 0 && failedAt >= authedAt };
 }
-
-// Probe verdicts that mean "couldn't determine" — not proof of broken auth.
-const _CLI_AUTH_INCONCLUSIVE = new Set(['unknown', 'no_auth_check', 'configured_unverified', 'no_token_returned']);
 
 // Browser-profile existence check — NOT a staleness check. Existence is only
 // the migration signal (pre-ledger session); it cannot prove login.
@@ -188,8 +165,8 @@ function _browserProfileHasCookies(agentId) {
 // ── Static needs-auth knowledge ──────────────────────────────────────────────
 // 1 = interactive use of this service clearly requires an account.
 // 0 = the service's interactive flows work anonymously.
-// Unknown services fall through to a one-time 0/1 LLM judgment, then the
-// answer is recorded in the ledger as `needsAuth` permanently per service.
+// Unknown services with no ledger signal escalate to the compiler — first
+// contact is onboarding, and setup.start verifies there.
 const _SERVICE_NEEDS_AUTH = new Map(Object.entries({
   gmail: 1, google: 1, google_docs: 1, google_sheets: 1, google_calendar: 1,
   google_drive: 1, google_cloud: 1, google_maps: 1, google_photos: 1,
@@ -266,23 +243,6 @@ function _parseSetupInfo(descriptor) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-function _loadPreflightState() {
-  try {
-    if (fs.existsSync(PREFLIGHT_STATE_FILE)) {
-      return JSON.parse(fs.readFileSync(PREFLIGHT_STATE_FILE, 'utf8'));
-    }
-  } catch (_) {}
-  return { lastValidatedAt: null, cliVersions: {}, failedInstalls: {} };
-}
-
-function _savePrefflightState(data) {
-  try {
-    const dir = path.dirname(PREFLIGHT_STATE_FILE);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(PREFLIGHT_STATE_FILE, JSON.stringify(data, null, 2), 'utf8');
-  } catch (_) {}
-}
 
 function _whichSync(cmd) {
   try {
@@ -432,51 +392,6 @@ async function _llmExtractFileCandidate(llmBackend, userMessage, logger) {
   }
 }
 
-// Quick LLM classification: does this prompt require the user to be logged in
-// or signed in to accomplish the goal? Returns 0 (no login needed) or 1 (login
-// required). Defaults to 1 on any error so we never silently skip auth.
-async function _llmNeedsLoginCheck(llmBackend, userMessage, logger, askDecision) {
-  if (!llmBackend && typeof askDecision !== 'function') return 1;
-  return boundedDecision({
-    site: 'preflightAgents.needsLogin',
-    askDecision,
-    questions: [{
-      id: 'needsLogin', type: 'noul',
-      question: 'Does this request fundamentally need the user logged into an account? false for anonymous/public tasks (browse, search, view listings, read prices, add to a guest cart, read public pages/videos/maps). true only for tasks needing an account: send/read email or DMs, post content, account pages, order history, saved playlists, checkout/payment, or anything asking for "my" account data.',
-    }],
-    state: `User request: "${userMessage}"`,
-    local: (a) => a.needsLogin?.bool == null ? null : (a.needsLogin.bool ? 1 : 0),
-    remote: async () => {
-      try {
-        const prompt = `You are a task classifier. Determine whether the following user request requires the user to be logged in or signed into an account to accomplish the goal. Return ONLY a single digit: 0 if the task can be completed without logging in, 1 if a login/sign-in is required.
-
-Return 0 (no login needed) for tasks that work anonymously on public sites:
-- Browsing, searching, viewing products/listings, reading prices or reviews
-- Adding items to a shopping cart on retail/marketplace sites (Walmart, Amazon, Target, eBay, Etsy, etc.) — guest carts work without an account
-- Reading public pages, documentation, videos, maps, directions, store locators
-
-Return 1 (login required) only for tasks that fundamentally need an account:
-- Sending/reading email, DMs, or posting content
-- Accessing account pages, order history, saved playlists/libraries, subscriptions
-- Checkout, payment, or purchase completion (NOT just adding to cart)
-- Anything explicitly asking for "my" account data (orders, messages, playlists)
-
-User request: "${userMessage}"`;
-        const raw = await llmBackend.generateAnswer(prompt, { query: prompt }, { maxTokens: 5, temperature: 0, taskType: 'classification' });
-        const text = (typeof raw === 'string' ? raw : raw?.text || raw?.content || '').trim();
-        if (text.startsWith('0')) { logger.info(`[Node:PreflightAgents] LLM login-need check answered "0" (no login) for: "${userMessage.slice(0, 80)}"`); return 0; }
-        if (text.startsWith('1')) { logger.info(`[Node:PreflightAgents] LLM login-need check answered "1" (login required) for: "${userMessage.slice(0, 80)}"`); return 1; }
-        logger.warn(`[Node:PreflightAgents] LLM login-need check returned unexpected value: "${text}" — defaulting to 1`);
-        return 1;
-      } catch (e) {
-        logger.warn(`[Node:PreflightAgents] LLM login-need check failed: ${e.message}`);
-        return 1;
-      }
-    },
-    logger,
-  });
-}
-
 async function _probeFilesystem(mcpAdapter, candidate, logger) {
   if (!candidate || !mcpAdapter) return { status: 'none' };
 
@@ -611,8 +526,7 @@ module.exports = async function preflightAgents(state) {
   }
 
   let userMessage = state.resolvedMessage || state.message || '';
-  // Inject follow-up target context so preflight consumers (deep-link resolution,
-  // cli preflight_check, tool.discover, agent-relevance filter) see the full task
+  // Inject follow-up target context so preflight consumers see the full task
   // context, not just a vague follow-up like "I need you to check again".
   // gatherPlanContext does the same injection later, but preflight runs BEFORE it.
   const _tc = state._taskClassification || {};
@@ -622,19 +536,15 @@ module.exports = async function preflightAgents(state) {
     logger.info(`[Node:PreflightAgents] Follow-up target injected: "${_tc.followUpTarget}"`);
   }
   const recoveryContext = state.recoveryContext || null;
-  const confirmInstallCallback = state.confirmInstallCallback || null;
 
-  // ── Pure in-page navigation — skip file-probe and deep-link resolution ─────
+  // ── Pure in-page navigation — skip file-probe ──────────────────────────────
   // "go back for me on this page" / "reload this page" operate on the tab the
-  // user is already looking at. There is no file to probe and no destination
-  // to deep-link — but the activeDocTarget injection ("Amazon.com product
-  // page") used to trip the file-candidate gate (extracted "Amazon.com" →
-  // resolved amazon_product_reviews.txt) and the deep-link loop web-searched a
-  // homepage URL that later minted a fresh tab. Detect pure in-page nav and
-  // skip both probes. Named-destination variants ("go back to my ebay tab")
-  // still aren't in-page actions, but they need no file/deep-link either —
-  // they read as tab-select and are left to the lint; only skip when the
-  // prompt has no destination at all.
+  // user is already looking at. There is no file to probe — but the
+  // activeDocTarget injection ("Amazon.com product page") used to trip the
+  // file-candidate gate (extracted "Amazon.com" → resolved
+  // amazon_product_reviews.txt). Named-destination variants ("go back to my
+  // ebay tab") still aren't in-page actions, but they need no file resolution
+  // either; only skip when the prompt has no destination at all.
   const _isInPageNav = (() => {
     const p = String(userMessage || '').split('\n')[0]; // literal prompt only — not injected context
     if (!/\b(go\s+back|navigate\s+back|go\s+back\s+(?:a|one)\s+page|previous\s+page|go\s+forward|reload|refresh)\b/i.test(p)) return false;
@@ -667,7 +577,6 @@ module.exports = async function preflightAgents(state) {
     return Array.isArray(live) && live.some(x => String(x).toLowerCase() === id);
   };
   const gatherAnswerCallback = state.gatherAnswerCallback || null;
-  const gatherCredentialCallback = state.gatherCredentialCallback || null;
 
   // _emitProgress — safe wrapper that no-ops if progressCallback is null
   const _emitProgress = (data) => {
@@ -685,21 +594,6 @@ module.exports = async function preflightAgents(state) {
   const _pfT0 = Date.now();
   const _pfDur = {};
   const _mark = (k) => { _pfDur[k] = Date.now() - _pfT0; };
-
-  // ── First-contact login-need check (one 0/1 LLM call, lazily fired) ───────
-  // Only used for browser agents with NO evidence either way (no ledger entry,
-  // no profile cookies, not a static-map service, not a public-web task). The
-  // answer is recorded per-service in the ledger as `needsAuth` — so this runs
-  // at most once per service ever, on the transition edge, not per run.
-  let _firstContactLoginNeedPromise = null;
-  const _firstContactLoginNeed = () => {
-    if (_firstContactLoginNeedPromise === null) {
-      _firstContactLoginNeedPromise = state.llmBackend
-        ? _llmNeedsLoginCheck(state.llmBackend, userMessage, logger, makeAskDecision(mcpAdapter)).catch(() => 1)
-        : Promise.resolve(1);
-    }
-    return _firstContactLoginNeedPromise;
-  };
 
   // ── File reference resolution (app_automation / local_file tasks) ──────────
   // Extract a file/folder name from the user message and probe the filesystem
@@ -798,48 +692,32 @@ module.exports = async function preflightAgents(state) {
   _emitProgress({ type: 'preflight:start', message: 'Preparing agents for your task...' });
 
   // Initialize result containers
-  let _preflightCliMap = {};
+  const _preflightCliMap = {};
   let cliPreflightNote = '';
   let agentContextNote = '';
-  let _registeredAgentServiceMap = {};
-  let _trainedRecipeMap = {};
+  const _registeredAgentServiceMap = {};
+  const _trainedRecipeMap = {};
   const agentReadiness = []; // { type, agentId, ready, authed, iconUrl, ... }
-  let vetAvailable = false;
-  let vetPath = null;
-  let discoveredToolNote = '';
+  const vetAvailable = !!_whichSync('vet');
   const warnings = []; // { type, message } non-fatal warnings
   const _allowAutoGeneratedRecipes = process.env.THINKDROP_ALLOW_AUTOGENERATED_RECIPES === 'true';
 
-  // ── Grill-Me Phase A: probe results + route decision ──────────────────────
-  const _grillMode = process.env.THINKDROP_GRILL_MODE === '1';
-  const _probes = {};        // { service: { desktop, tcc, cli } }
-  const _routeDecision = {}; // { service: { route, agentId, reason, probes, createAgent } }
-
-  // ── ResolveAgent result: which agents to preflight and which to create ─────
+  // ── ResolveAgent result: which agents the plan/pin names ──────────────────
   const resolveAgentResult = state.resolveAgentResult || null;
   const selectedAgentIds = new Set();
   const createAgentSpecs = [];
-  const _resolverTypeMap = {}; // agentId (lowercase) → declared type from resolver
   if (resolveAgentResult && Array.isArray(resolveAgentResult.agents)) {
     for (const a of resolveAgentResult.agents) {
       if (!a || !a.agentId) continue;
-      const idLower = a.agentId.toLowerCase();
-      selectedAgentIds.add(idLower);
-      if (a.type) _resolverTypeMap[idLower] = a.type;
-      if (a.create) {
-        createAgentSpecs.push(a);
-      }
+      selectedAgentIds.add(a.agentId.toLowerCase());
+      if (a.create) createAgentSpecs.push(a);
     }
   }
 
   // ── Shared agent registry snapshot ────────────────────────────────────────
-  // The registry used to be fetched 2–3× per run (CLI filter, demote check,
-  // enumeration). One lazy fetch shared by all consumers; invalidated only
-  // when createAgentSpecs actually builds a new agent mid-run.
+  // One agent.list call shared by all consumers.
   let _agentsSnapshot = null;
-  let _agentsCreated = false;
   const _fetchAgents = async () => {
-    if (_agentsCreated) { _agentsSnapshot = null; _agentsCreated = false; }
     if (_agentsSnapshot) return _agentsSnapshot;
     const res = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
     _agentsSnapshot = Array.isArray(res?.data) ? res.data : (Array.isArray(res) ? res : []);
@@ -847,7 +725,7 @@ module.exports = async function preflightAgents(state) {
   };
 
   // Canonical service lookup key — "google docs"/"googledocs" → google_docs so
-  // routeDecision/probe lookups agree with classification output.
+  // taskFacts agrees with classification output.
   const _canonSvc = (s) => {
     try {
       const { _canonicalService } = require('../utils/localPlanTemplates');
@@ -877,26 +755,11 @@ module.exports = async function preflightAgents(state) {
     }
   }
 
-  // ── Fast path: no agents selected + local/public-web task → skip heavy preflight ──
-  // When resolveAgent selected 0 agents, no agents need creating, and the task
-  // is local_file, local_system, or a public web task (download/public_read —
-  // fetch a file or read public info via web.agent/web.crawl/curl), no service
-  // agents, no CLI preflight, no tool discovery, no MCP pings, and crucially NO
-  // browser-auth probes are needed. Build a minimal empty preflight result and
-  // return early. This removes ~5s of MCP calls and prevents spurious
-  // "Sign in to X" banners on tasks that never needed an agent.
-  // Mutation guard (second net — the classifyTask post-guard is the first):
-  // a public_read verdict carrying create/send/book phrasing against a
-  // named service is a classification flake, not a public-read task — the
-  // deep-link lane must still resolve ("set a google event" → public_read
-  // → no deep-link → desktop keyboard-shortcut plan).
   // ── taskFacts: canonical task-truth object ─────────────────────────────────
-  // Six layers used to re-derive service/intent/mutation independently and
-  // could disagree (public_read verdict → no deep-link → desktop route →
-  // keyboard-shortcut plan). Facts are computed ONCE here — the earliest node
-  // holding _taskClassification + agentReadiness + MCP access — then frozen on
-  // state; every downstream consumer (public-web gate, resolveRoute, planner
-  // dedup, eyes postcondition) reads facts instead of re-deriving.
+  // Facts are computed ONCE here — the earliest node holding
+  // _taskClassification + agentReadiness + MCP access — then frozen on state;
+  // every downstream consumer (public-web gate, planner dedup, eyes
+  // postcondition) reads facts instead of re-deriving.
   const _MUTATION_TASK_RE = /\b(set|create|add|make|new|schedule|book|send|post|publish|upload|submit|reply|forward|compose|delete|edit|update|invite|share|buy|order|checkout|pay|reserve|fill|sign|register)\b[^.]{0,50}\b(event|meeting|appointment|reminder|calendar|e-?mail|message|post|comment|order|booking|reservation|doc|document|file|note|task|list|photo|video|call|form)\b/i;
   const _msgHasMutation = _MUTATION_TASK_RE.test(String(userMessage || ''));
   // The pinned/resolved agent IS a service signal when classification is thin —
@@ -928,8 +791,7 @@ module.exports = async function preflightAgents(state) {
   logger.info(`[Node:PreflightAgents] taskFacts: service=${taskFacts.service || 'none'} isMutation=${taskFacts.isMutation} action=${taskFacts.mutationAction || 'n/a'} webAccessMode=${_tc.webAccessMode || 'n/a'}`);
 
   // Entities — one deterministic extraction, consumed by fill steps AND the
-  // guardian-rules seam below. URL params recorded later (deep-link block)
-  // override these because buildUrl's parse is more precise.
+  // guardian-rules seam below.
   try {
     const _em = String(userMessage || '');
     const _ent = {};
@@ -993,16 +855,11 @@ module.exports = async function preflightAgents(state) {
   }
   const _isPublicWebTask = (_tc.webAccessMode === 'download' || _tc.webAccessMode === 'public_read')
     && !taskFacts.isMutation;
-  // Pure query tasks (research/Q&A, no named service) take the same exit —
-  // tool.discover + generic CLI preflight burned ~17s on prompts that only
-  // ever needed web.agent/llm skills. A query naming a service
-  // (targetService set) keeps full preflight — it may legitimately need
-  // service discovery or an agent.
+  // Pure query tasks (research/Q&A, no named service) take the same exit.
   const _isPureQuery = _tc.taskType === 'query' && !_tc.targetService;
   if (selectedAgentIds.size === 0 && createAgentSpecs.length === 0 && !recoveryContext &&
       (_tc.taskType === 'local_file' || _tc.taskType === 'local_system' || _isPublicWebTask || _tc.activeDocRef === 'file' || _isPureQuery)) {
     logger.info(`[Node:PreflightAgents] Fast path — no agents selected, taskType=${_tc.taskType} webAccessMode=${_tc.webAccessMode || 'n/a'} → skipping heavy preflight`);
-    const _vetPath = _whichSync('vet');
     _emitProgress({ type: 'preflight:complete', agents: [], warnings: [] });
     return {
       ...state,
@@ -1015,2237 +872,203 @@ module.exports = async function preflightAgents(state) {
         registeredAgentServiceMap: {},
         trainedRecipeMap: {},
         agents: [],
-        vetAvailable: !!_vetPath,
+        vetAvailable,
         warnings: [],
       },
     };
   }
 
-  // Run CLI preflight only when CLI is actually selected (or when no explicit
-  // agent selection exists and discovery mode still needs capability checks).
-  // ── Grill-Me Phase A4: skip CLI preflight for local_system tasks ──────────
-  // local_system tasks (OS/shell queries, screen interactions) are handled by
-  // generic skills (shell.run, app.agent) — never by service CLI agents. Running
-  // CLI preflight on these caused phantom agent fabrication (e.g. spotify.agent
-  // for "Open Spotify and play my playlist" classified as local_system).
-  let _shouldRunCliPreflight = !recoveryContext;
-  if (_shouldRunCliPreflight && _tc.taskType === 'local_system') {
-    _shouldRunCliPreflight = false;
-    logger.info('[Node:PreflightAgents] CLI preflight skipped — taskType is local_system (no service CLI needed)');
-  }
-  if (_shouldRunCliPreflight && _tc.taskType === 'app_automation') {
-    _shouldRunCliPreflight = false;
-    logger.info('[Node:PreflightAgents] CLI preflight skipped — taskType is app_automation (desktop/browser automation, no service CLI needed)');
-  }
-  // Pure query (research/Q&A) never needs a CLI capability scan — the generic
-  // preflight_check costs ~20s answering a question that only uses web/llm
-  // skills. A named service keeps the check — it may be a CLI-backed tool.
-  if (_shouldRunCliPreflight && _tc.taskType === 'query' && !_tc.targetService) {
-    _shouldRunCliPreflight = false;
-    logger.info('[Node:PreflightAgents] CLI preflight skipped — taskType is query with no named service');
-  }
-  let _selectedCliAgents = []; // descriptors of selected CLI agents to pass explicitly
-  let _isGenericPreflight = false; // true when running discovery scan without typed CLI agents
-  if (!recoveryContext && selectedAgentIds.size > 0) {
-    try {
-      const agSnapshot = await _fetchAgents();
-      _selectedCliAgents = agSnapshot.filter(a =>
-        selectedAgentIds.has(String(a?.id || '').toLowerCase()) && a?.type === 'cli'
-      );
-      _shouldRunCliPreflight = _selectedCliAgents.length > 0;
-      if (!_shouldRunCliPreflight) {
-        // Check if any selected agent IDs are unregistered AND could be CLI.
-        // Use the resolver's declared type — if the resolver explicitly said
-        // type: 'browser' or type: 'app', do NOT treat it as a CLI candidate.
-        const _unregisteredCliCandidates = [...selectedAgentIds].filter(id => {
-          if (!id.endsWith('.agent')) return false;
-          const declaredType = _resolverTypeMap[id];
-          return !declaredType || declaredType === 'cli';
-        });
-        if (_unregisteredCliCandidates.length > 0) {
-          _shouldRunCliPreflight = true;
-          _isGenericPreflight = _unregisteredCliCandidates.length > 0 && _selectedCliAgents.length === 0;
-          logger.info(`[Node:PreflightAgents] CLI preflight enabled for unregistered agent(s): ${_unregisteredCliCandidates.join(', ')}`);
-        } else {
-          _shouldRunCliPreflight = false;
-          logger.info('[Node:PreflightAgents] CLI preflight skipped — selected agents are non-CLI');
-        }
-      }
-    } catch (_) {
-      // Keep safe default (run) if snapshot is unavailable.
-      _shouldRunCliPreflight = true;
-      _isGenericPreflight = true;
-    }
-  } else if (!recoveryContext && selectedAgentIds.size === 0) {
-    _isGenericPreflight = true;
+  // ── Scoped readiness — the compiler owns discovery/install/onboarding ──────
+  //
+  // comms-graph planning compiles plans and onboards capabilities
+  // (capability.probe → setup.start → capability.select). This runtime node
+  // therefore checks ONLY the agents the plan/pin actually names: registry
+  // membership + auth ledger + binary presence on PATH. It never:
+  //   - LLM-extracts services from the prompt (cli.agent preflight_check)
+  //   - builds/registers agents (build_agent / createAgentSpecs)
+  //   - probes auth status, CLIs, vet/yt-dlp/ffmpeg, MCP health, or PATH
+  //   - runs tool.discover, monthly validation, or route mandates
+  //   - emits sign-in cards — needed agents that are unregistered or
+  //     unauthenticated escalate via _needsPlan so the compiler onboards them.
+
+  const _registry = (await _fetchAgents()).filter(a => a && a.id);
+  const _byId = new Map();
+  for (const a of _registry) _byId.set(String(a.id).toLowerCase(), a);
+
+  // Registry-derived maps for the live-plan path (recovery replan) — one
+  // agent.list call, zero probes.
+  for (const a of _registry) {
+    const stem = String(a.id || '').replace(/\.agent$/, '').toLowerCase();
+    const svc = String(a.service || stem).toLowerCase();
+    if (svc) _registeredAgentServiceMap[svc] = a.id;
+    if (stem && stem !== svc) _registeredAgentServiceMap[stem] = a.id;
+    _preflightCliMap[stem] = { hasCli: !!(a.cliTool || a.cli_tool) };
   }
 
-  // ── Create any agents marked create:true by resolveAgent ───────────────────
-  if (createAgentSpecs.length > 0) {
-    const failedCreates = [];
-    const noCliFailures = []; // CLI agent builds that failed because no CLI exists for the service
-    for (const spec of createAgentSpecs) {
-      // Per-service 'app' agents are not creatable through this path — the
-      // app.agent build_agent contract requires appName (not service) and the
-      // desktop route is handled by the generic app.agent skill. resolveAgent
-      // already coerces these, but guard here too for specs arriving from
-      // other callers (e.g. recoveryContext).
-      if (spec.type === 'app') {
-        logger.info(`[Node:PreflightAgents] Coercing create spec ${spec.agentId} from type 'app' → 'browser'`);
-        spec.type = 'browser';
-      }
-      const skillName = spec.type === 'cli' ? 'cli.agent' : 'browser.agent';
-      try {
-        _emitProgress({
-          type: 'preflight:building_agent',
-          agentType: spec.type,
-          agentId: spec.agentId,
-          message: `Building ${spec.service} agent…`,
-          iconUrl: serviceToIconUrl(spec.service, spec.startUrl),
-        });
-        const buildArgs = {
-          action: 'build_agent',
-          service: spec.service,
-        };
-        if (spec.startUrl) buildArgs.startUrl = spec.startUrl;
-        // command-service exposes skills through /command.automate, not direct /<skill> routes.
-        const buildRes = await mcpAdapter.callService('command', 'command.automate', {
-          skill: skillName,
-          args: buildArgs,
-        }, { timeoutMs: 30000 }).catch(() => null);
-        const buildPayload = buildRes?.data || buildRes || {};
-        if (buildPayload?.ok) {
-          if (buildPayload.agentId && buildPayload.agentId !== spec.agentId) {
-            logger.warn(`[Node:PreflightAgents] Agent ID mismatch: requested "${spec.agentId}" but builder created "${buildPayload.agentId}" — using actual agentId`);
-            spec.agentId = buildPayload.agentId;
-          }
-          // Track whether build_agent actually created a new agent or found an existing one.
-          // When alreadyExists=true, the agent has a persistent profile with valid cookies —
-          // don't force auth without probe (the CDP cookie check will detect existing auth).
-          spec._alreadyExisted = !!buildPayload.alreadyExists;
-          if (spec._alreadyExisted) {
-            logger.info(`[Node:PreflightAgents] Agent ${spec.agentId} already exists — skipping _newlyCreated flag`);
-          } else {
-            _agentsCreated = true; // invalidate the shared agent.list snapshot
-            logger.info(`[Node:PreflightAgents] Created ${skillName} agent: ${spec.agentId}`);
-          }
-        } else {
-          const errMsg = buildPayload?.error || 'unknown error';
-          logger.warn(`[Node:PreflightAgents] Failed to create ${spec.agentId}: ${errMsg}`);
-          const failure = { agentId: spec.agentId, error: errMsg, type: spec.type };
-          failedCreates.push(failure);
-          // cli.agent returns noCli: true when the LLM lookup found no CLI tool for
-          // the service (e.g. a hallucinated "system_time" service). Soft-fail these
-          // so planning can fall back to generic shell.run instead of hard-crashing.
-          if (spec.type === 'cli' && buildPayload?.noCli === true) {
-            noCliFailures.push(failure);
-          }
-        }
-      } catch (err) {
-        logger.warn(`[Node:PreflightAgents] Agent creation failed for ${spec.agentId}: ${err.message}`);
-        failedCreates.push({ agentId: spec.agentId, error: err.message, type: spec.type });
-      }
-    }
-
-    if (failedCreates.length > 0) {
-      warnings.push({
-        type: 'agent_create_failed',
-        message: `Failed to create agent(s): ${failedCreates.map(c => c.agentId).join(', ')}`,
-      });
-      // Hard-fail only when every requested agent failed AND none of the failures
-      // were noCli soft-fails. noCli failures mean the resolver hallucinated a CLI
-      // service that doesn't exist — planning should fall back to generic shell.run
-      // rather than aborting the whole pipeline with "Automation failed".
-      const allFailed = failedCreates.length === createAgentSpecs.length;
-      const allNoCli = noCliFailures.length === failedCreates.length && noCliFailures.length > 0;
-      if (allFailed && !allNoCli) {
-        const planError = `I couldn't create the required agent(s): ${failedCreates.map(c => `${c.agentId} (${c.error})`).join('; ')}.`;
-        logger.error(`[Node:PreflightAgents] ${planError}`);
-        _emitProgress({ type: 'preflight:agent_create_failed', message: planError, failures: failedCreates });
-        return {
-          ...state,
-          preflightDone: true,
-          planError,
-          preflightResult: {
-            warnings,
-            agents: agentReadiness,
-            agentContextNote: '',
-          },
-        };
-      }
-      if (noCliFailures.length > 0) {
-        logger.info(`[Node:PreflightAgents] noCli soft-fail for ${noCliFailures.length} agent(s): ${noCliFailures.map(c => c.agentId).join(', ')} — falling back to generic shell.run planning`);
-        _emitProgress({
-          type: 'preflight:agent_create_skipped',
-          message: `No CLI agent available for ${noCliFailures.map(c => c.agentId).join(', ')} — will plan with generic shell commands.`,
-          failures: noCliFailures,
-        });
-        // Drop noCli-failed agents from the selected set so the downstream
-        // readiness check ("Selected agents are not ready") doesn't block
-        // planning. These agents were never built, so they have no readiness
-        // state — planning should proceed with generic shell.run instead.
-        for (const f of noCliFailures) {
-          selectedAgentIds.delete(String(f.agentId).toLowerCase());
-        }
-      }
-    }
-
-  }
-
-  // ── Pre-inject newly-created browser agents into agentReadiness ─────────────
-  // The agent.list call inside Promise.all runs concurrently and may miss agents
-  // that were just registered by build_agent (DB flush delay / race). Pre-populating
-  // here guarantees every newly-created browser agent enters the auth loop.
-  // Skip agents that already existed — agent.list will pick them up and run the
-  // normal auth probe (which detects existing CDP cookies in the persistent profile).
-  for (const spec of createAgentSpecs) {
-    if (spec.type !== 'browser') continue;
-    if (spec._alreadyExisted) continue; // agent.list will handle it — no _newlyCreated flag
-    const _newAgentId = spec.agentId.endsWith('.agent') ? spec.agentId : `${spec.agentId}.agent`;
-    const _newBypassed = _bypassAuth.has(_newAgentId.toLowerCase());
-    agentReadiness.push({
-      type: 'browser',
-      agentId: _newAgentId,
-      ready: true,
-      authed: _isPublicWebTask || _newBypassed,
-      authBypassed: _newBypassed,
-      authType: 'browser_oauth',
-      iconUrl: agentIdToIconUrl(_newAgentId, spec.startUrl),
-      startUrl: spec.startUrl || null,
-      needsLogin: !(_isPublicWebTask || _newBypassed),
-      _newlyCreated: true,
-    });
-  }
-
-  // ── Parallel preflight fetches ──────────────────────────────────────────────
-  await Promise.all([
-    // ── CLI pre-flight ────────────────────────────────────────────────────
-    (async () => {
-      if (!_shouldRunCliPreflight) return;
-      try {
-        _emitProgress({
-          type: 'preflight:building_agent',
-          agentType: _isGenericPreflight ? 'preflight' : 'cli',
-          agentId: _isGenericPreflight ? 'preflight' : 'cli.preflight',
-          message: _isGenericPreflight ? 'Checking tools and authentication...' : 'Checking CLI tools and authentication...',
-          iconUrl: null,
-        });
-
-        // Helper: enrich missing setupInfo via web.agent discover_setup (fallback only)
-        // --help discovery is already done in cli.agent preflight_check, so web search
-        // is only needed when setupInfo is still incomplete AND the CLI isn't installed.
-        const _enrichSetupInfo = async (existingSetupInfo, service, cliTool, isInstalled) => {
-          // If --help already provided authCmd or initCmd + instructions, that's enough
-          if (existingSetupInfo && (existingSetupInfo.authCmd || existingSetupInfo.initCmd) && existingSetupInfo.instructions) {
-            return existingSetupInfo;
-          }
-          // Only do web search for CLIs that aren't installed (can't run --help)
-          // or when --help didn't yield enough info
-          if (isInstalled && existingSetupInfo && (existingSetupInfo.authCmd || existingSetupInfo.initCmd)) {
-            return existingSetupInfo; // --help gave us the key commands, good enough
-          }
-          try {
-            const dsRes = await mcpAdapter.callService('command', 'command.automate', {
-              skill: 'web.agent',
-              args: { action: 'discover_setup', service, cliTool },
-            }, { timeoutMs: 8000 }).catch(() => null);
-            const ds = dsRes?.data || dsRes;
-            if (ds?.ok && ds.setupInfo) {
-              // Merge: existing values take priority, fill missing from discovery
-              return { ...(ds.setupInfo || {}), ...(existingSetupInfo || {}) };
-            }
-          } catch (_) {}
-          return existingSetupInfo;
-        };
-
-        // Helper: generate specific reason message from authStatus + setupInfo
-        const _buildReason = (service, cli, authStatus, setupInfo) => {
-          const creds = setupInfo?.credentials || [];
-          const cmd = setupInfo?.initCmd || setupInfo?.authCmd;
-          if (authStatus === 'oauth_required' || creds.includes('oauth')) {
-            return `${service} requires OAuth client ID and secret${cmd ? ` — run '${cmd}' to configure` : ''}`;
-          }
-          if (authStatus === 'api_key_required' || creds.includes('api_key')) {
-            return `${service} requires API key${cmd ? ` — run '${cmd}' to configure` : ''}`;
-          }
-          if (authStatus === 'init_required' || setupInfo?.initCmd) {
-            return `${service} needs initialization — run '${setupInfo.initCmd}' to configure`;
-          }
-          if (authStatus === 'not_installed') {
-            return `${service} CLI tool (${cli}) is not installed`;
-          }
-          if (authStatus === 'not_authenticated') {
-            return `${service} CLI tool (${cli}) is installed but not authenticated${cmd ? ` — run '${cmd}'` : ''}`;
-          }
-          if (authStatus === 'token_expired') {
-            return `${service} CLI tool (${cli}) token has expired — re-authentication required${cmd ? ` — run '${cmd}'` : ''}`;
-          }
-          return `${service} CLI tool (${cli}) is installed but not authenticated${cmd ? ` — run '${cmd}'` : ''}`;
-        };
-
-        const pfRes = await mcpAdapter.callService('command', 'command.automate', {
-          skill: 'cli.agent',
-          args: {
-            action: 'preflight_check',
-            task: userMessage,
-            ...(Array.isArray(_selectedCliAgents) && _selectedCliAgents.length > 0
-              ? { agents: _selectedCliAgents.map(a => ({
-                  id:            a.id,
-                  service:       a.service || (a.id || '').replace(/\.agent$/, ''),
-                  cliTool:       a.cli_tool || a.cliTool || null,
-                  setupInfo:     _parseSetupInfo(a.descriptor),
-                })) }
-              : {}),
-          },
-        }, { timeoutMs: 20000 }).catch(() => null);
-        const pf = pfRes?.data || pfRes;
-        if (pf?.ok) {
-          const lines = [];
-          if (!pf.brew?.installed) lines.push('brew: NOT INSTALLED — install first');
-          else lines.push('brew: installed ✓');
-          if (!pf.curl?.installed) lines.push('curl: NOT INSTALLED');
-          else lines.push('curl: installed ✓');
-          if (Array.isArray(pf.detectedClis)) {
-            for (const c of pf.detectedClis) {
-              _preflightCliMap[c.service.toLowerCase()] = { hasCli: !!c.cli, authStatus: c.authStatus || null, authed: null };
-              const iconUrl = serviceToIconUrl(c.service);
-
-              if (!c.cli) {
-                const provider = c.isOAuth ? 'OAuth-based' : c.isApiKey ? 'API key required' : 'unknown';
-                lines.push(`${c.service}: ${provider} — use browser.agent { action: 'build_agent' } then { action: 'run' }`);
-                const _agentId = c.agentId || `${c.service}.agent`;
-                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli, false);
-                const _reason = _buildReason(c.service, c.cli, c.authStatus, _enrichedSetupInfo);
-                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: false, iconUrl, service: c.service, reason: _reason, setupInfo: _enrichedSetupInfo });
-                // Surface API-key or OAuth requirements to the UI during preflight.
-                if (c.isApiKey || c.isOAuth) {
-                  _emitProgress({
-                    type: 'preflight:auth_required',
-                    agentId: _agentId,
-                    serviceName: c.service,
-                    cliTool: c.cli || null,
-                    authType: 'cli_setup',
-                    iconUrl,
-                    message: `${c.service} needs configuration`,
-                    reason: _reason,
-                    setupInfo: _enrichedSetupInfo,
-                  });
-                }
-                continue;
-              }
-              if (!c.installed) {
-                const installCmd = c.installMethod === 'npm' ? `npm install -g ${c.installPkg}` : `brew install ${c.installPkg || c.cli}`;
-                lines.push(`${c.service}: ${c.cli} NOT INSTALLED — install: ${installCmd}`);
-                const _agentId = c.agentId || `${c.service}.agent`;
-                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli, false);
-                const _reason = _buildReason(c.service, c.cli, 'not_installed', _enrichedSetupInfo);
-                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: false, iconUrl, service: c.service, reason: _reason, setupInfo: _enrichedSetupInfo });
-                // Surface CLI install requirement to the UI during preflight.
-                _emitProgress({
-                  type: 'preflight:auth_required',
-                  agentId: _agentId,
-                  serviceName: c.service,
-                  cliTool: c.cli || null,
-                  authType: 'cli_setup',
-                  iconUrl,
-                  message: `${c.service} needs configuration`,
-                  reason: _reason,
-                  setupInfo: _enrichedSetupInfo,
-                });
-              } else {
-                const authNote = c.authUser ? ` — authenticated as ${c.authUser}` : (c.authStatus === 'authenticated' ? ' — authenticated' : (c.authStatus === 'configured' ? ' — configured' : (c.authStatus === 'not_required' ? ' — no auth required' : '')));
-
-                // Eager registration — an installed CLI with no registered agent
-                // gets its descriptor built now so notes/readiness/mandate below
-                // reference a real agentId. Enforces the 1:1 invariant:
-                // installed CLI → registered <svc>.agent. On failure the path
-                // degrades to honest "no registered agent" guidance.
-                if (!c.agentId) {
-                  _emitProgress({
-                    type: 'preflight:building_agent',
-                    agentType: 'cli',
-                    agentId: `${c.service}.agent`,
-                    message: `Registering ${c.service} agent…`,
-                    iconUrl,
-                  });
-                  const _eagerRes = await mcpAdapter.callService('command', 'command.automate', {
-                    skill: 'cli.agent',
-                    args: { action: 'build_agent', service: c.service },
-                  }, { timeoutMs: 60000 }).catch(() => null);
-                  const _eager = _eagerRes?.data || _eagerRes || {};
-                  if (_eager?.ok && _eager.agentId) {
-                    c.agentId = _eager.agentId;
-                    _agentsCreated = true; // invalidate the shared agent.list snapshot
-                    logger.info(`[Node:PreflightAgents] Eager-registered CLI agent ${_eager.agentId} for detected CLI ${c.cli}`);
-                  } else {
-                    logger.warn(`[Node:PreflightAgents] Eager build_agent failed for ${c.service}: ${_eager?.error || 'unknown'} — falling back to unregistered guidance`);
-                  }
-                }
-                const _registered = !!c.agentId;
-                const _agentId = c.agentId || `${c.service}.agent`;
-
-                // macOS Local Network permission denial — surfaced by the
-                // command-service kernel probe. Not an auth problem and no
-                // setup-terminal lane exists for it — emit a local_network
-                // event so the Agents tab shows the System Settings
-                // instructions instead of a fake login flow.
-                if (c.localNetworkBlocked) {
-                  const _lanReason = 'macOS is blocking this app from local-network devices — grant Local Network permission, then re-check';
-                  const _lanSetupInfo = {
-                    ...(c.setupInfo || {}),
-                    instructions: 'macOS is blocking this app from reaching devices on your local network (e.g. Chromecast). Open System Settings → Privacy & Security → Local Network, enable this app, then click Re-check.',
-                    setupUrl: 'x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork',
-                  };
-                  lines.push(`${c.service}: ${c.cli} installed ✓ — LOCAL NETWORK ACCESS BLOCKED — enable this app in System Settings → Privacy & Security → Local Network`);
-                  agentReadiness.push({ type: 'cli', agentId: _agentId, ready: false, authed: true, iconUrl, service: c.service, reason: _lanReason, setupInfo: _lanSetupInfo, localNetworkBlocked: true });
-                  _emitProgress({
-                    type: 'preflight:auth_required',
-                    agentId: _agentId,
-                    serviceName: c.service,
-                    cliTool: c.cli || null,
-                    authType: 'local_network',
-                    iconUrl,
-                    message: `${c.service} needs Local Network permission`,
-                    reason: _lanReason,
-                    setupInfo: _lanSetupInfo,
-                  });
-                  continue;
-                }
-
-                if (_registered) {
-                  lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — use cli.agent { action: 'run', agentId: '${c.agentId}', task: '...' }`);
-                } else {
-                  lines.push(`${c.service}: ${c.cli} installed${authNote} ✓ — no registered agent; use cli.agent { action: 'run', task: '...' } (generic loop drives ${c.cli}) or shell.run`);
-                }
-                let authed = !!c.authUser || c.authed === true || c.authStatus === 'authenticated' || c.authStatus === 'configured' || c.authStatus === 'not_required';
-                // Declared-secrets override — a CLI agent that declares env
-                // credentials is only authed when they're actually stored;
-                // a happy verify probe can't see missing env vars.
-                if (authed) {
-                  try {
-                    const _svcMap = require('../../../shared/service-map.cjs');
-                    const _desc = _svcMap.describeAgent(_agentId);
-                    if (_desc && Array.isArray(_desc.secrets) && _desc.secrets.length > 0) {
-                      const { resolveAgentSecrets } = require('../../../shared/secret-resolve.cjs');
-                      const _res = await resolveAgentSecrets(_agentId, _desc.secrets);
-                      if (_res && _res.missing && _res.missing.length > 0) {
-                        authed = false;
-                        logger.info(`[Node:PreflightAgents] ${_agentId}: declared secrets missing (${_res.missing.join(', ')}) → not authed`);
-                      }
-                    }
-                  } catch (_) {}
-                }
-                // CLI bypass — same "proceed without" escape hatch the
-                // browser lanes honor; a live bypass must not be ignored.
-                if (!authed && _isBypassedNow(_agentId)) {
-                  authed = true;
-                  logger.info(`[Node:PreflightAgents] ${_agentId}: auth bypassed by user — proceeding`);
-                }
-                // Two-way ledger — same trust model as browser agents:
-                // inconclusive probe + ledger-authed ⇒ pass (a blind probe is
-                // no observation of broken); definitive probe verdicts write
-                // the ledger so next run reflects what was just observed.
-                if (!authed && _CLI_AUTH_INCONCLUSIVE.has(c.authStatus) && _cliLedgerAuth(_agentId).authed) {
-                  authed = true;
-                  logger.info(`[Node:PreflightAgents] ${_agentId}: probe inconclusive (${c.authStatus}) but ledger is authed — proceeding`);
-                }
-                if (c.authStatus === 'authenticated' || c.authStatus === 'configured' || c.authStatus === 'not_required' || c.authUser) markAgentAuthed(_agentId);
-                else if (c.authStatus === 'not_authenticated' || c.authStatus === 'token_expired') markAgentAuthFailed(_agentId, `preflight probe: ${c.authStatus}`);
-                const _enrichedSetupInfo = await _enrichSetupInfo(c.setupInfo, c.service, c.cli, true);
-                agentReadiness.push({ type: 'cli', agentId: _agentId, ready: true, authed, iconUrl, service: c.service, setupInfo: _enrichedSetupInfo, _unregistered: !_registered });
-                const _cliMapEntry = _preflightCliMap[(c.service || '').toLowerCase()];
-                if (_cliMapEntry) _cliMapEntry.authed = authed;
-
-                if (!authed) {
-                  const _reason = _buildReason(c.service, c.cli, c.authStatus, _enrichedSetupInfo);
-                  // Emit auth required for CLI setup — redirect to Agents tab
-                  _emitProgress({
-                    type: 'preflight:auth_required',
-                    agentId: _agentId,
-                    serviceName: c.service,
-                    cliTool: c.cli || null,
-                    authType: 'cli_setup',
-                    iconUrl,
-                    message: `${c.service} agent`,
-                    reason: _reason,
-                    setupInfo: _enrichedSetupInfo,
-                  });
-                }
-              }
-            }
-          }
-          if (lines.length > 0) cliPreflightNote = `\n\nCLI PRE-FLIGHT:\n${lines.join('\n')}`;
-        }
-        // Probe unavailable — name the real cause instead of the misleading
-        // downstream "selected agent did not complete preflight" dead end.
-        if (!pf?.ok && _selectedCliAgents.length > 0) {
-          logger.warn(`[Node:PreflightAgents] preflight_check returned no data — marking ${_selectedCliAgents.length} selected CLI agent(s) unavailable`);
-          for (const a of _selectedCliAgents) {
-            if (agentReadiness.some(r => r.agentId === a.id)) continue;
-            agentReadiness.push({
-              type: 'cli', agentId: a.id, ready: false, authed: false,
-              iconUrl: serviceToIconUrl(a.service || a.id), service: a.service,
-              reason: 'preflight_check unavailable (timed out or failed) — retry the task',
-            });
-          }
-        }
-      } catch (_) {}
-    })(),
-
-    // ── Agent registry ────────────────────────────────────────────────────
-    (async () => {
-      try {
-        const allAgents = await _fetchAgents();
-        // Filter to task-relevant agents only — don't check auth for agents
-        // the user's task doesn't need (e.g. youtube when sending gmail).
-        // If resolveAgent selected agents, always include those regardless of task text.
-        const taskLower = userMessage.toLowerCase();
-        const chosenSvc = (state.chosenService || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        const agents = Array.isArray(allAgents) ? allAgents.filter(a => {
-          if (a.type !== 'browser' && a.type !== 'cli' && a.type !== 'api_key' && a.type !== 'bearer' && a.type !== 'basic') return true; // keep non-agent entries
-          const idLower = (a.id || '').toLowerCase();
-          const svcKey = idLower.replace('.agent', '').replace(/[^a-z0-9]/g, '');
-          if (selectedAgentIds.size > 0 && selectedAgentIds.has(idLower)) return true;
-          if (chosenSvc && svcKey === chosenSvc) return true;
-          if (taskLower.includes(svcKey)) return true;
-          return false;
-        }) : [];
-        if (Array.isArray(agents) && agents.length > 0) {
-          const agentLines = [];
-
-          for (const a of agents) {
-            // Skip agents already pre-injected (newly created) to avoid duplicate auth checks
-            if (agentReadiness.some(r => r._newlyCreated && r.agentId === a.id)) continue;
-            const _agentBaseDesc = `${a.type} agent${a.start_url ? ` (starts at ${a.start_url})` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`;
-            const svc = (a.id || '').replace('.agent', '').toLowerCase();
-            if (svc) _registeredAgentServiceMap[svc] = a.id;
-
-            // ── Browser agent auth decision — the authentication LEDGER ──────
-            // Verification is edge-triggered, not per-run:
-            //   ledger authed / authed_at  → trusted permanently (no probe)
-            //   ledger authed:false / recent failure → auth-required (no probe)
-            //   needsAuth:0 recorded → login not required
-            //   profile Cookies exist, no ledger → pre-ledger session migration:
-            //     optimistic authed + one-time background verify (stamps ledger)
-            //   nothing at all → first contact: static map or one 0/1 LLM call,
-            //     recorded permanently as `needsAuth`
-            // Only a runtime login-wall observation or failed verify flips a
-            // trusted entry — never cookie age or elapsed time.
-            if (a.type === 'browser') {
-              const iconUrl = agentIdToIconUrl(a.id, a.start_url);
-              const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
-              const profileDir = `${svcKey}_agent`;
-              const profilePath = path.join(BROWSER_PROFILES_DIR, profileDir);
-              // F14: under extension-first, the user's real Chrome IS the
-              // session — an engine profile dir proves nothing about their
-              // login state. A bound ext tab for this service is hard evidence
-              // of a live session; the login wall itself is detected in-page.
-              const _extSvcBound = !!state._extConnected && (state._extSessions || []).some(s => {
-                try {
-                  const host = new URL(s.url || '').hostname.replace(/^www\./, '');
-                  const svcHost = (a.start_url ? new URL(a.start_url).hostname.replace(/^www\./, '') : '') || `${svcKey}.`;
-                  return host === svcHost || host.endsWith('.' + svcHost) || svcHost.endsWith('.' + host) || host.split('.')[0] === svcKey;
-                } catch (_) { return false; }
-              });
-              const hasSession = fs.existsSync(profilePath) || state._extConnected === true;
-              const profileCookies = _browserProfileHasCookies(a.id);
-
-              const _cachedAuth = _getCachedAuth(a.id);
-              const _provisionalAuthedAt = a.authedAt || _cachedAuth?.ts || null;
-              const _authBypassed = _bypassAuth.has(a.id.toLowerCase());
-              const _ledger = _getLedgerAuth(a.id);
-              const _ledgerNeedsAuth = _ledger ? _ledger.needsAuth : undefined;
-              // Newest evidence wins: an authed_at / ledger authed stamped
-              // AFTER a failure means the user re-authenticated since — the
-              // failure is stale. authed:false without a newer success fails.
-              const _tsOf = (t) => (typeof t === 'number' ? t : Date.parse(t)) || 0;
-              const _failedAt = _ledger
-                ? Math.max(_ledger.lastAuthFailedAt || 0, _ledger.authed === false ? (_ledger.ts || 0) : 0)
-                : 0;
-              const _authedEvidenceTs = Math.max(
-                _tsOf(_provisionalAuthedAt),
-                _ledger && _ledger.authed === true ? (_ledger.ts || 0) : 0,
-              );
-              const _ledgerFailed = _failedAt > 0 && _failedAt >= _authedEvidenceTs;
-              const _ledgerAuthed = _authedEvidenceTs > _failedAt;
-
-              let authed = false;
-              let _authTag = ' [NEEDS AUTH — user must authenticate before this agent can run]';
-              let _authedReason = '';
-              let _forceAuthRequired = false;
-              if (_authBypassed) {
-                authed = true; _authedReason = 'bypassed';
-                _authTag = ' [AUTH BYPASSED — running unauthenticated per user choice]';
-              } else if (_isPublicWebTask) {
-                authed = true; _authedReason = 'public-web';
-                _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
-              } else if (_ledgerFailed && !state._extConnected) {
-                _forceAuthRequired = true;
-              } else if (_ledgerAuthed || _provisionalAuthedAt) {
-                authed = true; _authedReason = 'ledger';
-                _authTag = ' [AUTHENTICATED — session on record]';
-              } else if (_ledgerNeedsAuth === 0) {
-                authed = true; _authedReason = 'needsAuth0';
-                _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
-              } else if (_extSvcBound) {
-                // F14 bound-session short-circuit: the user's real Chrome has
-                // a live tab on this service — that IS the session. The login
-                // wall (if any) surfaces on first in-page load and triggers the
-                // NEED_AUTH pause/banner/resume flow truthfully.
-                authed = true; _authedReason = 'ext-bound';
-                _authTag = ' [AUTHENTICATED — live bound session in real Chrome]';
-              } else if (profileCookies) {
-                // Pre-ledger session migration — can't prove login from a Cookies
-                // file, but the profile was likely authenticated before tracking
-                // existed. Optimistic authed + one-time background verify below.
-                authed = true; _authedReason = 'profile-migration';
-                _authTag = ' [AUTHENTICATED — existing profile, verifying in background]';
-              } else {
-                // True first contact — nothing known about this service.
-                let _need = _SERVICE_NEEDS_AUTH.get(svcKey);
-                if (_need === undefined) {
-                  _need = await _firstContactLoginNeed();
-                  logger.info(`[Node:PreflightAgents] First-contact login-need for ${a.id}: ${_need}`);
-                }
-                _writeLedgerAuth(a.id, { needsAuth: _need });
-                if (_need === 1) {
-                  if (state._extConnected) {
-                    // F14: don't pre-gate on an engine-era answer — drive the
-                    // user's real Chrome; an actual login wall pauses in-page.
-                    authed = true; _authedReason = 'ext-first-optimistic';
-                    _authTag = ' [SESSION VIA USER CHROME — login wall detected in-page]';
-                  } else {
-                    _forceAuthRequired = true;
-                  }
-                } else {
-                  authed = true; _authedReason = 'first-contact-public';
-                  _authTag = ' [LOGIN NOT REQUIRED — proceeding without sign-in]';
-                }
-              }
-
-              agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_authTag}`);
-              if (_authBypassed) {
-                warnings.push({
-                  type: 'auth_bypassed',
-                  message: `${a.id} sign-in skipped by user — running unauthenticated`,
-                });
-                logger.info(`[Node:PreflightAgents] ${a.id} auth bypassed by user — marking authed for this run only`);
-                _emitProgress({
-                  type: 'preflight:agent_ready',
-                  agentId: a.id,
-                  iconUrl,
-                  message: `${a.id} proceeding without sign-in`,
-                });
-              } else if (_authedReason && _authedReason !== 'ledger' && _authedReason !== 'profile-migration') {
-                logger.info(`[Node:PreflightAgents] ${a.id} login not required (${_authedReason}) — marking authed`);
-                _emitProgress({
-                  type: 'preflight:agent_ready',
-                  agentId: a.id,
-                  iconUrl,
-                  message: `${a.id} login not required`,
-                });
-              }
-
-              const _agentAuthType = _deriveAgentAuthType(a.descriptor);
-              const _readiness = {
-                type: 'browser',
-                agentId: a.id,
-                ready: true,
-                authed,
-                authBypassed: _authBypassed,
-                authType: _agentAuthType,
-                iconUrl,
-                startUrl: a.start_url,
-                needsLogin: !authed && !hasSession,
-                authedAt: _provisionalAuthedAt,
-              };
-              if (_forceAuthRequired) _readiness._forceAuthRequired = true;
-              // One-time migration verify: fire the existing headless
-              // authenticate probe in the background; bounded-await at the
-              // auth boundary so the profile lock is released before any
-              // execution session opens it.
-              if (_authedReason === 'profile-migration' && mcpAdapter) {
-                _readiness._verifyPromise = mcpAdapter.callService('command', 'command.automate', {
-                  skill: 'browser.agent',
-                  args: {
-                    action: 'authenticate',
-                    agentId: a.id,
-                    task: `Authenticate to ${a.id}`,
-                    url: a.start_url,
-                    manualLogin: false,
-                    preflightProbe: true,
-                    requireCookieConfirmation: true,
-                  },
-                }, { timeoutMs: 45000 }).catch(err => ({ ok: false, error: `verify transport error: ${err?.message || 'failed'}` }));
-              }
-              agentReadiness.push(_readiness);
-            } else if (a.type === 'api_key' || a.type === 'bearer' || a.type === 'basic') {
-              // Credential agents are not browser-authenticated; they need a stored token.
-              const iconUrl = agentIdToIconUrl(a.id, a.start_url);
-              const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
-              agentLines.push(`- ${a.id}: ${_agentBaseDesc} [NEEDS CREDENTIAL]`);
-              agentReadiness.push({
-                type: a.type,
-                agentId: a.id,
-                ready: true,
-                authed: false,
-                authType: a.type,
-                iconUrl,
-                startUrl: a.start_url,
-                needsLogin: true,
-              });
-              _emitProgress({
-                type: 'preflight:auth_required',
-                agentId: a.id,
-                serviceName: svcKey,
-                cliTool: a.cli_tool || a.cliTool || null,
-                authType: a.type,
-                iconUrl,
-                message: `${a.id} requires ${a.type} credentials before planning`,
-              });
-            } else if (a.type === 'cli') {
-              // CLI agents already handled in preflight_check above
-              // Stale agent detection: registered CLI agent whose CLI is no longer installed
-              const svcKey = (a.id || '').replace('.agent', '').toLowerCase();
-              const cliInfo = _preflightCliMap[svcKey];
-              // cliMap now carries the real probe verdict — authed (incl.
-              // not_required) → no tag; probed-and-blocked → [NEEDS AUTH];
-              // unprobed service → no tag either (nothing was checked, don't
-              // claim auth is needed).
-              const _cliAuthed = cliInfo ? cliInfo.authed === true : false;
-              const _cliProbedBlocked = cliInfo && cliInfo.authed === false && cliInfo.hasCli;
-              const _cliAuthTag = _cliAuthed ? '' : (_cliProbedBlocked ? ' [NEEDS AUTH]' : '');
-              agentLines.push(`- ${a.id}: ${_agentBaseDesc}${_cliAuthTag}`);
-              if (cliInfo && !cliInfo.hasCli) {
-                const iconUrl = agentIdToIconUrl(a.id, a.start_url);
-                agentReadiness.push({
-                  type: 'cli',
-                  agentId: a.id,
-                  ready: false,
-                  authed: false,
-                  iconUrl,
-                  service: svcKey,
-                  reason: 'stale — CLI no longer installed',
-                  stale: true,
-                });
-                warnings.push({
-                  type: 'stale_agent',
-                  message: `${a.id} registered but its CLI is no longer detected — consider rebuilding or removing`,
-                });
-              }
-            } else {
-              // Other agent types — push without auth tag
-              agentLines.push(`- ${a.id}: ${_agentBaseDesc}`);
-            }
-          }
-
-          agentContextNote = `\n\nREGISTERED AGENTS (use browser.agent { action: "run", agentId: "<id>", task: "..." } for these — do NOT use raw browser.act navigate):\n${agentLines.join('\n')}`;
-        }
-      } catch (_) {}
-    })(),
-
-    // ── vet CLI presence check + auto-install ────────────────────────────
-    (async () => {
-      try {
-        vetPath = _whichSync('vet');
-        vetAvailable = !!vetPath;
-
-        if (!vetAvailable) {
-          // Check if a previous install attempt failed — skip retrying until cache expires (7 days)
-          const pfState = _loadPreflightState();
-          const failedInstalls = pfState.failedInstalls || {};
-          const vetFailedAt = failedInstalls['vet'];
-          const INSTALL_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-          if (vetFailedAt && (Date.now() - new Date(vetFailedAt).getTime()) < INSTALL_RETRY_MS) {
-            logger.info(`[Node:PreflightAgents] vet install previously failed (${vetFailedAt}) — skipping retry for 7 days`);
-            warnings.push({ type: 'vet_not_installed', message: 'vet CLI not installed — install with: brew tap vet-run/vet && brew install vet-run' });
-            vetAvailable = false;
-          } else {
-
-          logger.info('[Node:PreflightAgents] vet CLI not found — attempting auto-install');
-
-          // Step A: Try brew install
-          const brewPath = _whichSync('brew');
-          if (brewPath) {
-            _emitProgress({
-              type: 'preflight:building_agent',
-              agentType: 'cli',
-              agentId: 'vet',
-              message: 'Installing vet CLI via Homebrew...',
-              iconUrl: null,
-            });
-            try {
-              const { execSync } = require('child_process');
-              execSync('brew tap vet-run/vet', { encoding: 'utf8', timeout: 30000, stdio: 'pipe' });
-              execSync('brew install vet-run/vet/vet-run', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
-              vetPath = _whichSync('vet');
-              vetAvailable = !!vetPath;
-              if (vetAvailable) {
-                logger.info(`[Node:PreflightAgents] vet CLI installed via brew at ${vetPath}`);
-              }
-            } catch (brewErr) {
-              logger.warn(`[Node:PreflightAgents] vet brew install failed: ${brewErr.message}`);
-            }
-          }
-
-          // Step B: Script download + UI approval (brew unavailable or failed)
-          if (!vetAvailable) {
-            const { execSync } = require('child_process');
-            const tmpFile = path.join(os.tmpdir(), `vet-install-${Date.now()}.sh`);
-            try {
-              execSync(`curl -fsSL https://getvet.sh/install.sh -o ${tmpFile}`, { encoding: 'utf8', timeout: 15000, stdio: 'pipe' });
-              const scriptContent = fs.readFileSync(tmpFile, 'utf8');
-
-              if (confirmInstallCallback) {
-                _emitProgress({
-                  type: 'preflight:vet_script_review',
-                  scriptContent,
-                  scriptUrl: 'https://getvet.sh/install.sh',
-                  tempPath: tmpFile,
-                  message: 'vet CLI requires manual installation. Please review the install script below.',
-                });
-                const approved = await confirmInstallCallback('vet');
-                if (approved) {
-                  _emitProgress({
-                    type: 'preflight:building_agent',
-                    agentType: 'cli',
-                    agentId: 'vet',
-                    message: 'Installing vet CLI from reviewed script...',
-                    iconUrl: null,
-                  });
-                  // Use INSTALL_DIR to target Homebrew's writable bin (avoids /usr/local/bin permission error on macOS)
-                  const brewBin = _whichSync('brew');
-                  const installDir = brewBin ? require('path').dirname(brewBin) : '/usr/local/bin';
-                  execSync(`INSTALL_DIR=${installDir} sh ${tmpFile}`, { encoding: 'utf8', timeout: 60000, stdio: 'pipe' });
-                  vetPath = _whichSync('vet');
-                  vetAvailable = !!vetPath;
-                  if (vetAvailable) {
-                    logger.info(`[Node:PreflightAgents] vet CLI installed via script at ${vetPath}`);
-                  } else {
-                    logger.warn('[Node:PreflightAgents] vet script install completed but vet not found in PATH');
-                  }
-                } else {
-                  logger.info('[Node:PreflightAgents] User declined vet script install');
-                }
-              } else {
-                // No callback available (bridge mode, etc.) — skip auto-install
-                logger.info('[Node:PreflightAgents] No confirmInstallCallback — cannot prompt for vet script approval');
-              }
-            } catch (scriptErr) {
-              logger.warn(`[Node:PreflightAgents] vet script download/install failed: ${scriptErr.message}`);
-            } finally {
-              try { if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile); } catch (_) {}
-            }
-          }
-
-          // Step C: Fallback warning if still not installed
-          if (!vetAvailable) {
-            warnings.push({
-              type: 'vet_not_installed',
-              message: 'vet CLI not installed — secure script installation unavailable. Install with: brew tap vet-run/vet && brew install vet-run',
-            });
-            _emitProgress({
-              type: 'preflight:auth_required',
-              agentId: 'vet',
-              serviceName: 'vet',
-              cliTool: 'vet',
-              authType: 'cli_install',
-              iconUrl: null,
-              message: 'vet CLI not installed — recommended for secure installations: brew tap vet-run/vet && brew install vet-run',
-            });
-            // Cache the install failure so we don't retry every run (7-day cooldown)
-            try {
-              const _pfStateCurrent = _loadPreflightState();
-              _savePrefflightState({
-                ..._pfStateCurrent,
-                failedInstalls: { ...(_pfStateCurrent.failedInstalls || {}), vet: new Date().toISOString() },
-              });
-            } catch (_) {}
-          }
-          } // close else (not in cooldown period)
-        }
-
-        logger.info(`[Node:PreflightAgents] vet CLI: ${vetAvailable ? 'installed at ' + vetPath : 'NOT INSTALLED'}`);
-      } catch (vetBlockErr) {
-        logger.warn(`[Node:PreflightAgents] vet auto-install block error: ${vetBlockErr.message}`);
-      }
-    })(),
-
-    // ── MCP service health check ─────────────────────────────────────────
-    (async () => {
-      try {
-        const services = ['command', 'user-memory'];
-        for (const svc of services) {
-          try {
-            await mcpAdapter.callService(svc, 'ping', {}, { timeoutMs: 2000 });
-          } catch (_) {}
-        }
-      } catch (_) {}
-    })(),
-
-    // ── PATH health check ────────────────────────────────────────────────
-    (async () => {
-      try {
-        const envPath = process.env.PATH || '';
-        const criticalPaths = ['/usr/local/bin', '/opt/homebrew/bin'];
-        const missing = criticalPaths.filter(p => !envPath.includes(p));
-        if (missing.length > 0) {
-          warnings.push({
-            type: 'path_issue',
-            message: `PATH missing critical directories: ${missing.join(', ')}. Some CLIs may not be found.`,
-          });
-          logger.warn(`[Node:PreflightAgents] PATH missing: ${missing.join(', ')}`);
-        }
-      } catch (_) {}
-    })(),
-
-    // ── Monthly CLI version validation ───────────────────────────────────
-    (async () => {
-      if (recoveryContext) return;
-      try {
-        const pfState = _loadPreflightState();
-        const now = Date.now();
-        const lastVal = pfState.lastValidatedAt ? new Date(pfState.lastValidatedAt).getTime() : 0;
-        const needsValidation = (now - lastVal) > VALIDATION_INTERVAL_MS;
-
-        if (!needsValidation) {
-          logger.info(`[Node:PreflightAgents] Monthly validation skipped — last validated ${pfState.lastValidatedAt}`);
-          return;
-        }
-
-        _emitProgress({
-          type: 'preflight:building_agent',
-          agentType: 'cli',
-          agentId: 'cli.validation',
-          message: 'Monthly CLI validation running...',
-          iconUrl: null,
-        });
-
-        // Get current CLI versions from preflight_check
-        const pfRes = await mcpAdapter.callService('command', 'command.automate', {
-          skill: 'cli.agent',
-          args: { action: 'preflight_check', task: userMessage },
-        }, { timeoutMs: 8000 }).catch(() => null);
-        const pf = pfRes?.data || pfRes;
-        if (!pf?.ok || !Array.isArray(pf.detectedClis)) {
-          logger.warn('[Node:PreflightAgents] Monthly validation: preflight_check returned no data');
-          return;
-        }
-
-        const currentVersions = {};
-        const driftedClis = [];
-        for (const c of pf.detectedClis) {
-          if (c.installed && c.cli && c.version) {
-            const svcKey = c.service.toLowerCase();
-            currentVersions[svcKey] = c.version;
-            const prevVersion = pfState.cliVersions?.[svcKey];
-            if (prevVersion && prevVersion !== c.version) {
-              driftedClis.push({ service: svcKey, cli: c.cli, oldVersion: prevVersion, newVersion: c.version });
-            }
-          }
-        }
-
-        // For each drifted CLI, call validate_agent to check health
-        for (const drifted of driftedClis) {
-          const agentId = `${drifted.service}.agent`;
-          const iconUrl = serviceToIconUrl(drifted.service);
-          logger.info(`[Node:PreflightAgents] Version drift: ${drifted.cli} ${drifted.oldVersion} → ${drifted.newVersion}`);
-          try {
-            const valRes = await mcpAdapter.callService('command', 'command.automate', {
-              skill: 'cli.agent',
-              args: { action: 'validate_agent', id: agentId },
-            }, { timeoutMs: 30000 }).catch(() => null);
-            const val = valRes?.data || valRes;
-            if (val?.verdict && val.verdict !== 'healthy') {
-              _emitProgress({
-                type: 'preflight:auth_required',
-                agentId,
-                serviceName: drifted.service,
-                cliTool: drifted.cli || null,
-                authType: 'cli_update_needed',
-                iconUrl,
-                message: `${drifted.cli} updated (${drifted.oldVersion} → ${drifted.newVersion}) — validation: ${val.verdict}`,
-              });
-              warnings.push({
-                type: 'cli_version_drift',
-                message: `${drifted.cli} (${drifted.service}): ${drifted.oldVersion} → ${drifted.newVersion} — validate_agent: ${val.verdict}`,
-              });
-            }
-          } catch (valErr) {
-            logger.warn(`[Node:PreflightAgents] validate_agent failed for ${agentId}: ${valErr.message}`);
-          }
-        }
-
-        // Update state file with current versions + timestamp
-        _savePrefflightState({
-          lastValidatedAt: new Date().toISOString(),
-          cliVersions: { ...pfState.cliVersions, ...currentVersions },
-        });
-        logger.info(`[Node:PreflightAgents] Monthly validation complete: ${Object.keys(currentVersions).length} CLIs checked, ${driftedClis.length} drifted`);
-      } catch (valErr) {
-        logger.warn(`[Node:PreflightAgents] Monthly validation error: ${valErr.message}`);
-      }
-    })(),
-
-    // ── Ad-block list refresh (every N days, configurable via ADBLOCK_REFRESH_DAYS) ──
-    (async () => {
-      try {
-        const result = await mcpAdapter.callService('command', 'adblock.refresh', {}, { timeoutMs: 30000 });
-        const r = result?.data || result;
-        if (r?.refreshed) {
-          logger.info(`[Node:PreflightAgents] Ad-block list refreshed: ${r.count} domains (${r.source})`);
-        }
-      } catch (_) {}
-    })(),
-
-    // ── yt-dlp system dependency check + auto-install ────────────────────
-    // video.agent uses yt-dlp to extract subtitles without downloading video.
-    // Auto-install/upgrade silently so new open-source installs work out of the box.
-    (async () => {
-      try {
-        const { execSync } = require('child_process');
-        const INSTALL_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-        const pfState = _loadPreflightState();
-        const failedInstalls = pfState.failedInstalls || {};
-
-        // Detect current yt-dlp state
-        let ytdlpInstalled = false;
-        let ytdlpStale = false;
-        try {
-          const verOut = execSync('yt-dlp --version 2>/dev/null', { encoding: 'utf8', timeout: 5000 }).trim();
-          // version format: "2026.06.09"
-          const m = verOut.match(/(\d{4})\.(\d{2})\.(\d{2})/);
-          if (m) {
-            ytdlpInstalled = true;
-            const vDate = new Date(`${m[1]}-${m[2]}-${m[3]}`);
-            const ageDays = Math.floor((Date.now() - vDate.getTime()) / 86400000);
-            ytdlpStale = ageDays > 60;
-            logger.info(`[Node:PreflightAgents] yt-dlp version ${verOut} (${ageDays}d old)${ytdlpStale ? ' — stale, will upgrade' : ' ✓'}`);
-          }
-        } catch (_) {
-          ytdlpInstalled = false;
-        }
-
-        if (!ytdlpInstalled) {
-          // Check 7-day cooldown
-          const ytdlpFailedAt = failedInstalls['ytdlp'];
-          if (ytdlpFailedAt && (Date.now() - new Date(ytdlpFailedAt).getTime()) < INSTALL_RETRY_MS) {
-            logger.info(`[Node:PreflightAgents] yt-dlp install previously failed (${ytdlpFailedAt}) — skipping retry for 7 days`);
-            warnings.push({ type: 'ytdlp_not_installed', message: 'yt-dlp not installed — install with: pip3 install yt-dlp' });
-            return;
-          }
-
-          logger.info('[Node:PreflightAgents] yt-dlp not found — attempting pip3 install...');
-          try {
-            execSync('pip3 install yt-dlp --quiet --user', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
-            logger.info('[Node:PreflightAgents] yt-dlp installed successfully via pip3');
-          } catch (installErr) {
-            logger.warn(`[Node:PreflightAgents] yt-dlp pip3 install failed: ${installErr.message?.slice(0, 100)}`);
-            warnings.push({ type: 'ytdlp_not_installed', message: 'yt-dlp could not be installed — run: pip3 install yt-dlp' });
-            // Cache the failure so we skip retrying for 7 days
-            try {
-              _savePrefflightState({ ...pfState, failedInstalls: { ...failedInstalls, ytdlp: new Date().toISOString() } });
-            } catch (_) {}
-          }
-        } else if (ytdlpStale) {
-          logger.info('[Node:PreflightAgents] yt-dlp is stale — upgrading via pip3...');
-          try {
-            execSync('pip3 install --upgrade yt-dlp --quiet', { encoding: 'utf8', timeout: 120000, stdio: 'pipe' });
-            logger.info('[Node:PreflightAgents] yt-dlp upgraded successfully');
-          } catch (upgradeErr) {
-            logger.warn(`[Node:PreflightAgents] yt-dlp pip3 upgrade failed (non-fatal): ${upgradeErr.message?.slice(0, 100)}`);
-          }
-        }
-      } catch (ytdlpBlockErr) {
-        logger.warn(`[Node:PreflightAgents] yt-dlp check block error: ${ytdlpBlockErr.message}`);
-      }
-    })(),
-
-    // ── Tool discovery pre-flight ───────────────────────────────────────
-    // Assesses whether browser.agent can handle the task well; if not,
-    // searches for external AI tools and injects a note for the planner.
-    // Skip when resolveAgent already selected (or created) agents — avoid inventing fake tools.
-    // ── Desktop app guard: skip tool discovery for any desktop app task ──
-    // If the classifier set taskType to 'app_automation' the user has explicitly
-    // named a desktop app to use. Tool discovery must NOT run because it may
-    // invent a CLI package (e.g. a PyPI project with the same name as the app).
-    // Also skip when the Grill-Me probe has already resolved a desktop route.
-    (async () => {
-      if (recoveryContext) return;
-      if (!userMessage || userMessage.length < 10) return;
-      // Pure query tasks don't need tool discovery — a research/Q&A prompt is
-      // answered by web.agent/llm skills; searching for external AI tools is
-      // wasted latency (and occasionally invents irrelevant tools).
-      if (_tc?.taskType === 'query' && !_canonSvc(_tc.targetService)) {
-        logger.info('[Node:PreflightAgents] Tool discovery skipped — taskType is query with no named service');
-        return;
-      }
-      if (selectedAgentIds.size > 0) {
-        logger.info('[Node:PreflightAgents] resolveAgent selected agents — skipping tool discovery');
-        return;
-      }
-      // Strong desktop app guard: taskType 'app_automation' means the user named
-      // a native desktop app. Do not search for CLI packages that happen to share
-      // the same name (e.g. "llm-devin" when the user means the desktop app).
-      const _targetSvcForGuard = _canonSvc(_tc.targetService);
-      if (_tc?.taskType === 'app_automation' && _targetSvcForGuard) {
-        logger.info(`[Node:PreflightAgents] Tool discovery skipped — taskType is app_automation for "${_targetSvcForGuard}"`);
-        return;
-      }
-      // Fallback guard: if the Grill-Me probe already resolved the route, skip.
-      if (_targetSvcForGuard && _routeDecision[_targetSvcForGuard]?.route === 'desktop') {
-        logger.info(`[Node:PreflightAgents] Tool discovery skipped — desktop app detected for "${_targetSvcForGuard}"`);
-        return;
-      }
-      try {
-        // Step 1: Assess — can browser.agent do this task well?
-        const assessRes = await mcpAdapter.callService('command', 'command.automate', {
-          skill: 'tool.discover',
-          args: { action: 'assess', task: userMessage },
-        }, { timeoutMs: 12000 }).catch(() => null);
-
-        const assess = assessRes?.data || assessRes;
-        if (!assess?.ok || !assess?.shouldDelegate) return;
-
-        logger.info(`[Node:PreflightAgents] Tool discovery: shouldDelegate=true (${assess.reason})`);
-
-        // Step 2: Recall — check for cached tool (playbook)
-        const recallRes = await mcpAdapter.callService('command', 'command.automate', {
-          skill: 'tool.discover',
-          args: { action: 'recall', task: userMessage },
-        }, { timeoutMs: 5000 }).catch(() => null);
-
-        const recall = recallRes?.data || recallRes;
-        let bestTool = recall?.ok ? recall.tool : null;
-
-        // Step 3: Discover — web search for best tool (if no cache)
-        if (!bestTool) {
-          _emitProgress({
-            type: 'preflight:building_agent',
-            agentType: 'tool_discover',
-            agentId: 'tool.discover',
-            message: 'Searching for AI tools that can help with this task...',
-            iconUrl: null,
-          });
-
-          const discoverRes = await mcpAdapter.callService('command', 'command.automate', {
-            skill: 'tool.discover',
-            args: { action: 'discover', task: userMessage },
-          }, { timeoutMs: 25000 }).catch(() => null);
-
-          const discover = discoverRes?.data || discoverRes;
-          if (!discover?.ok) return;
-
-          // Paid tool → ASK_USER
-          if (discover.askUser) {
-            _emitProgress({
-              type: 'preflight:tool_approval',
-              tools: discover.tools,
-              message: 'Only paid AI tools found — user approval needed',
-            });
-            // Still inject a note so the planner can surface the question
-            const toolList = (discover.tools || []).map(t => `- ${t.name}: ${t.url} (${t.tier})`).join('\n');
-            discoveredToolNote = `\n\nDISCOVERED AI TOOLS (PAID — user approval needed before proceeding):\n${toolList}\n\nAsk the user which tool to use, or if they want to proceed with a paid tool.`;
-            return;
-          }
-
-          bestTool = discover.bestTool || null;
-        }
-
-        if (bestTool) {
-          const tierLabel = bestTool.tier === 'free_no_account' ? 'free, no account'
-            : bestTool.tier === 'free_account' ? 'free, account needed'
-            : bestTool.tier === 'free_no_auth' ? 'free CLI, no auth'
-            : bestTool.tier === 'free_api_key' ? 'free CLI, API key needed'
-            : 'paid';
-
-          const agentSkill = bestTool.type === 'cli' ? 'cli.agent' : 'browser.agent';
-          discoveredToolNote = `\n\nDISCOVERED AI TOOL (use this tool for the task — browser.agent cannot do it well):\n` +
-            `Tool: ${bestTool.name}\nURL: ${bestTool.url}\nType: ${bestTool.type}\nTier: ${tierLabel}\n` +
-            `Usage: ${bestTool.howToUse || 'Navigate to the tool and interact with it.'}\n` +
-            `Plan: ${agentSkill} { action: 'build_agent', service: '${bestTool.serviceName}' } then ${agentSkill} { action: 'run', agentId: '${bestTool.serviceName}.agent', task: '...' }`;
-
-          _emitProgress({
-            type: 'preflight:building_agent',
-            agentType: bestTool.type,
-            agentId: `${bestTool.serviceName}.agent`,
-            message: `Found AI tool: ${bestTool.name} (${tierLabel})`,
-            iconUrl: bestTool.iconUrl || null,
-          });
-
-          logger.info(`[Node:PreflightAgents] Tool discovery: found ${bestTool.name} (${bestTool.tier}) at ${bestTool.url}`);
-        }
-      } catch (e) {
-        logger.warn(`[Node:PreflightAgents] Tool discovery error: ${e.message}`);
-      }
-    })(),
-
-    // ── ffmpeg system dependency check + auto-install ─────────────────────
-    // yt-dlp uses ffmpeg for subtitle conversion. Also used by video processing skills.
-    // Detects both missing AND broken installs (dylib drift on macOS) and auto-fixes.
-    (async () => {
-      try {
-        const { execSync } = require('child_process');
-        const INSTALL_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
-        const pfState = _loadPreflightState();
-        const failedInstalls = pfState.failedInstalls || {};
-
-        // Detect current ffmpeg state: check both presence AND runtime health
-        let ffmpegMissing = false;
-        let ffmpegBroken = false;
-        const ffmpegPath = _whichSync('ffmpeg');
-
-        if (!ffmpegPath) {
-          ffmpegMissing = true;
-        } else {
-          // Binary exists — test it actually runs (dylib errors show up here)
-          try {
-            execSync(`${ffmpegPath} -version`, { encoding: 'utf8', timeout: 5000, stdio: 'pipe' });
-            logger.info(`[Node:PreflightAgents] ffmpeg ✓ (${ffmpegPath})`);
-          } catch (testErr) {
-            const errText = (testErr.stderr || testErr.message || '').toLowerCase();
-            if (/library not loaded|dylib|no such file|symbol not found/i.test(errText)) {
-              ffmpegBroken = true;
-              logger.warn(`[Node:PreflightAgents] ffmpeg binary broken (dylib error) at ${ffmpegPath} — will reinstall`);
-            } else {
-              // Some other error — still log but don't attempt reinstall
-              logger.warn(`[Node:PreflightAgents] ffmpeg test failed (non-dylib): ${errText.slice(0, 120)}`);
-            }
-          }
-        }
-
-        if (!ffmpegMissing && !ffmpegBroken) return; // healthy
-
-        // Check 7-day cooldown
-        const ffmpegFailedAt = failedInstalls['ffmpeg'];
-        if (ffmpegFailedAt && (Date.now() - new Date(ffmpegFailedAt).getTime()) < INSTALL_RETRY_MS) {
-          logger.info(`[Node:PreflightAgents] ffmpeg install previously failed (${ffmpegFailedAt}) — skipping retry for 7 days`);
-          warnings.push({ type: 'ffmpeg_not_installed', message: 'ffmpeg not available — install with: brew install ffmpeg' });
-          return;
-        }
-
-        const brewPath = _whichSync('brew');
-        if (!brewPath) {
-          warnings.push({ type: 'ffmpeg_not_installed', message: 'ffmpeg not available and brew not found — install Homebrew then run: brew install ffmpeg' });
-          return;
-        }
-
-        const installCmd = ffmpegBroken ? 'brew reinstall ffmpeg' : 'brew install ffmpeg';
-        const logVerb = ffmpegBroken ? 'Reinstalling broken' : 'Installing missing';
-        logger.info(`[Node:PreflightAgents] ${logVerb} ffmpeg via: ${installCmd}`);
-
-        try {
-          execSync(installCmd, { encoding: 'utf8', timeout: 300000, stdio: 'pipe' });
-          logger.info(`[Node:PreflightAgents] ffmpeg ${ffmpegBroken ? 'reinstalled' : 'installed'} successfully`);
-        } catch (installErr) {
-          logger.warn(`[Node:PreflightAgents] ffmpeg ${installCmd} failed: ${installErr.message?.slice(0, 100)}`);
-          warnings.push({ type: 'ffmpeg_not_installed', message: `ffmpeg could not be installed — run: ${installCmd}` });
-          // Cache failure so we skip retrying for 7 days
-          try {
-            _savePrefflightState({ ...pfState, failedInstalls: { ...failedInstalls, ffmpeg: new Date().toISOString() } });
-          } catch (_) {}
-        }
-      } catch (ffmpegBlockErr) {
-        logger.warn(`[Node:PreflightAgents] ffmpeg check block error: ${ffmpegBlockErr.message}`);
-      }
-    })(),
-
-    // ── Grill-Me Phase A: desktop + TCC probes for targetService ──────────
-    // Only runs when THINKDROP_GRILL_MODE=1 and a targetService is classified.
-    // Probes the desktop app (installed? capable? logged in?) and TCC permission,
-    // then calls resolveRoute for the authoritative route decision.
-    // SKIPPED when a single registered authed browser agent already owns the
-    // service — the single-route mandate below is predetermined in that case
-    // (it doesn't consume probe output), so desktop/TCC probing is dead work.
-    (async () => {
-      if (!_grillMode) return;
-      let targetSvc = _canonSvc(_tc.targetService);
-      if (!targetSvc) return;
-
-      // Service-family matching — separator-insensitive plus prefix matching
-      // so "google_docs" matches the registered "google" agent (and vice
-      // versa). Prefix requires ≥4 chars on the shorter side so "x.agent"
-      // can't match "xenon".
-      const _normSvc = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const _svcFamilyMatch = (aSvc, tSvc) => {
-        const a = _normSvc(aSvc), t = _normSvc(tSvc);
-        if (!a || !t) return false;
-        if (a === t) return true;
-        const short = Math.min(a.length, t.length);
-        return short >= 4 && (a.startsWith(t) || t.startsWith(a));
-      };
-      const _agentSvcOf = a => a.service || (a.agentId || a.id || '').replace(/\.agent$/, '');
-
-      try {
-        // Skip probes when the mandate outcome is already determined:
-        // exactly one registered browser agent for the service family, and the
-        // ledger/registry says it's authed. Uses the shared registry snapshot,
-        // NOT agentReadiness (racy — enumeration runs in the same batch).
-        const _regAgents = await _fetchAgents();
-        const svcAgents = (_regAgents || []).filter(a => _svcFamilyMatch(_agentSvcOf(a), targetSvc));
-        const _browserSvcAgents = svcAgents.filter(a => a.type === 'browser');
-        const _singleAuthedBrowser = _browserSvcAgents.length === 1 && svcAgents.length === 1
-          && (_browserSvcAgents[0].authedAt || _getLedgerAuth(_browserSvcAgents[0].id)?.authed === true);
-        if (_singleAuthedBrowser) {
-          const _a = _browserSvcAgents[0];
-          _routeDecision[targetSvc] = {
-            route: 'browser',
-            agentId: _a.id,
-            reason: 'single registered authed browser agent — mandate predetermined, probes skipped',
-          };
-          // Alias under the agent's own service key so gatherPlanContext's
-          // agent-derived lookup hits even when names differ.
-          const _agentSvc = String(_agentSvcOf(_a) || '').toLowerCase();
-          if (_agentSvc && _agentSvc !== targetSvc) _routeDecision[_agentSvc] = _routeDecision[targetSvc];
-          logger.info(`[Node:PreflightAgents] Grill-Me probes skipped for ${targetSvc} — route predetermined (${_a.id})`);
-          return;
-        }
-
-        const [desktopResult, tccResult] = await Promise.all([
-          probeDesktopApp(targetSvc, logger),
-          probeTCC(logger),
-        ]);
-        _probes[targetSvc] = { desktop: desktopResult, tcc: tccResult, cli: null };
-
-        // Find CLI probe result for this service (from cli preflight if it ran)
-        const cliResult = _preflightCliMap[targetSvc] || null;
-        if (cliResult) _probes[targetSvc].cli = cliResult;
-
-        const svcAgentsR = (agentReadiness || []).filter(a =>
-          _svcFamilyMatch(_agentSvcOf(a), targetSvc));
-
-        // Resolve route
-        _routeDecision[targetSvc] = resolveRoute({
-          serviceName: targetSvc,
-          desktopProbe: desktopResult,
-          tccProbe: tccResult,
-          cliProbe: cliResult ? { cli: cliResult.hasCli, installed: cliResult.hasCli, authed: !!cliResult.authUser } : null,
-          registeredAgents: svcAgentsR.map(a => ({ id: a.agentId, type: a.type, authed: a.authed })),
-          taskClassification: _tc,
-        }, logger);
-
-        // Alias under each matched agent's service key for lookup consistency.
-        for (const a of svcAgentsR) {
-          const aKey = String(_agentSvcOf(a) || '').toLowerCase();
-          if (aKey && aKey !== targetSvc && !_routeDecision[aKey]) _routeDecision[aKey] = _routeDecision[targetSvc];
-        }
-
-        logger.info(`[Node:PreflightAgents] Grill-Me route decision for ${targetSvc}: ${_routeDecision[targetSvc].route} — ${_routeDecision[targetSvc].reason}`);
-
-        // taskFacts route override: a mutation task against a service with a
-        // ready browser agent takes the browser lane — a desktop app being
-        // installed (Chrome.app detected → NutJS keyboard) must not pull a
-        // service-mapped mutation off the deep-link/form-fill path.
-        if (taskFacts.isMutation && taskFacts.service === targetSvc
-            && _routeDecision[targetSvc]?.route === 'desktop'
-            && svcAgentsR.some(a => a.type === 'browser' && a.authed)) {
-          logger.info(`[Node:PreflightAgents] taskFacts override: ${targetSvc} route desktop→browser (isMutation + authed browser agent)`);
-          _routeDecision[targetSvc] = { ..._routeDecision[targetSvc], route: 'browser', reason: 'taskFacts.isMutation — browser lane for service mutation' };
-          for (const a of svcAgentsR) {
-            const aKey = String(_agentSvcOf(a) || '').toLowerCase();
-            if (aKey && _routeDecision[aKey]?.route === 'desktop') _routeDecision[aKey] = _routeDecision[targetSvc];
-          }
-        }
-
-        // Route-order override: an authed cli/api/mcp-typed pinned agent
-        // claims the task before any browser/app lane (order: cli/mcp/api →
-        // extension navigate → app/playwright). A cli pin landing 'browser'
-        // or 'desktop' forces planSkillsV2's family guard to repair the plan
-        // — prevent the mismatch upstream instead.
-        try {
-          const _pinId = String(state._pinnedAgentId || '').toLowerCase();
-          const _pinRec = _pinId && [...svcAgentsR, ...agentReadiness]
-            .find(a => String(a.agentId || '').toLowerCase() === _pinId);
-          const _pinType = String(_pinRec?.type || '').toLowerCase();
-          const _pinIsCli = ['cli', 'api_key', 'bearer', 'basic', 'mcp'].includes(_pinType);
-          if (_pinIsCli && _pinRec.authed !== false) {
-            const _svc = String(_agentSvcOf(_pinRec) || targetSvc || '').toLowerCase();
-            if (_svc && _routeDecision[_svc] && _routeDecision[_svc].route !== 'cli') {
-              logger.info(`[Node:PreflightAgents] taskFacts override: ${_svc} route ${_routeDecision[_svc].route}→cli (cli-typed pin ${_pinId})`);
-              _routeDecision[_svc] = { ..._routeDecision[_svc], route: 'cli', reason: `cli/api/mcp pin ${_pinId} — cli lane wins over browser/desktop` };
-            }
-          }
-        } catch (_) {}
-      } catch (probeErr) {
-        logger.warn(`[Node:PreflightAgents] Grill-Me probe failed for ${targetSvc}: ${probeErr.message}`);
-      }
-    })(),
-  ]);
-  _mark('parallelBatchMs');
-
-  // ── Desktop app routing note + grill on not-installed ──────────────────────
-  // When the Grill-Me probe detected a desktop app for the target service:
-  //   (a) If installed → inject a strong routing note for the planner
-  //   (b) If not installed AND taskType is app_automation → grill the user
-  //       (offer to open the download page)
-  {
-    const _targetSvc = _canonSvc(_tc.targetService);
-    if (_targetSvc && _routeDecision[_targetSvc]) {
-      const _route = _routeDecision[_targetSvc].route;
-      const _appName = _routeDecision[_targetSvc].probes?.desktop?.appName || _targetSvc;
-
-      if (_route === 'desktop') {
-        // (a) Inject routing note — tell the planner to use app.agent run_app_flow
-        const _routingNote = `DESKTOP APP DETECTED: "${_appName}" is installed on this machine. Route to app.agent { action: 'run_app_flow', appName: '${_appName}', goal: '<user goal>' }. Do NOT use cli.agent, shell.run, or any CLI package to emulate this app. A native desktop app named "${_appName}" is installed; it is the ONLY correct execution route, even if a PyPI / npm / similar package with a related name exists.`;
-        agentContextNote = agentContextNote
-          ? `${agentContextNote}\n\n${_routingNote}`
-          : _routingNote;
-        logger.info(`[Node:PreflightAgents] Injected desktop routing note for "${_targetSvc}" (app: "${_appName}")`);
-      } else if (_route === 'unknown' && _tc.taskType === 'app_automation') {
-        // Safety: route=unknown can't be right if a registered browser/app
-        // agent matches the service (e.g. uncanonicalized "googledocs" vs
-        // google_docs.agent). Skip the grill — the browser lane can proceed.
-        const _normSvc2 = v => String(v || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        const _registeredMatch = (agentReadiness || []).find(a =>
-          _normSvc2(a.service || (a.agentId || '').replace(/\.agent$/, '')) === _normSvc2(_targetSvc));
-        if (_registeredMatch) {
-          logger.warn(`[Node:PreflightAgents] route=unknown for "${_targetSvc}" but a registered agent matches — correcting route to browser (${_registeredMatch.agentId}); name-normalization miss upstream`);
-          _routeDecision[_targetSvc] = {
-            ..._routeDecision[_targetSvc],
-            route: 'browser',
-            agentId: _registeredMatch.agentId,
-            reason: `Registered agent ${_registeredMatch.agentId} matched normalized service name`,
-          };
-        } else {
-        // (b) App not installed — grill the user
-        const _candidates = (() => {
-          try {
-            const { _deriveAppNames } = require('../utils/probeDesktopApp');
-            return _deriveAppNames(_targetSvc);
-          } catch (_) { return []; }
-        })();
-        const _displayName = _candidates[0] || _targetSvc;
-        const _downloadUrls = {
-          devin: 'https://devin.ai/download',
-          cursor: 'https://cursor.com/download',
-          vscode: 'https://code.visualstudio.com/download',
-          vs_code: 'https://code.visualstudio.com/download',
-          visual_studio_code: 'https://code.visualstudio.com/download',
-          windsurf: 'https://windsurf.com/download',
-          zed: 'https://zed.dev/download',
-          slack: 'https://slack.com/downloads/mac',
-          discord: 'https://discord.com/download',
-          notion: 'https://www.notion.so/desktop',
-          figma: 'https://www.figma.com/downloads/',
-        };
-        const _downloadUrl = _downloadUrls[_targetSvc] || null;
-
-        warnings.push({
-          type: 'desktop_app_not_installed',
-          message: `"${_displayName}" is not installed on this machine.${_downloadUrl ? ` Download: ${_downloadUrl}` : ''}`,
-        });
-
-        // Fail-fast: the target desktop app is not installed and there is no
-        // CLI/browser fallback. Surface a batched Grill-Me QuestionCard with a
-        // download link (if known), then return a planError so the run ends
-        // cleanly instead of stalling on the legacy single-string gather prompt.
-        const _questionId = `app_not_installed:${_targetSvc}`;
-        const _planErrorMsg = _downloadUrl
-          ? `"${_displayName}" is not installed on this machine. Install it from ${_downloadUrl} and try again.`
-          : `"${_displayName}" is not installed on this machine. Please install it and try again.`;
-
-        _emitProgress({
-          type: 'preflight:app_not_installed',
-          serviceName: _targetSvc,
-          appName: _displayName,
-          downloadUrl: _downloadUrl,
-          message: _planErrorMsg,
-        });
-
-        if (gatherAnswerCallback) {
-          const _options = [];
-          if (_downloadUrl) {
-            _options.push({ label: 'Open download page', value: 'open_download', primary: true });
-          }
-          _options.push({ label: 'Cancel', value: 'cancel' });
-
-          const _question = {
-            id: _questionId,
-            text: _planErrorMsg,
-            type: 'confirm',
-            options: _options,
-            freeText: false,
-            link: _downloadUrl ? { label: `↗ Download ${_displayName}`, url: _downloadUrl } : undefined,
-          };
-
-          try {
-            const _batchId = `app_not_installed_${_targetSvc}_${Date.now()}`;
-            const _batchAnswers = await gatherAnswerCallback({
-              batch: true,
-              batchId: _batchId,
-              questions: [_question],
-              routeConfirmation: null,
-            });
-            const _choice = String((_batchAnswers && _batchAnswers[_questionId]) || '').trim().toLowerCase();
-
-            if (_choice === 'open_download' && _downloadUrl) {
-              try {
-                const { execSync } = require('child_process');
-                if (process.platform === 'darwin') {
-                  execSync(`open "${_downloadUrl}"`, { timeout: 3000 });
-                } else {
-                  execSync(`start "" "${_downloadUrl}"`, { timeout: 3000 });
-                }
-                logger.info(`[Node:PreflightAgents] Opened download page for "${_displayName}": ${_downloadUrl}`);
-              } catch (openErr) {
-                logger.warn(`[Node:PreflightAgents] Could not open download page: ${openErr.message}`);
-              }
-            } else {
-              logger.info(`[Node:PreflightAgents] User cancelled missing-app prompt for "${_displayName}"`);
-            }
-          } catch (grillErr) {
-            logger.warn(`[Node:PreflightAgents] App-not-installed batch prompt failed: ${grillErr.message}`);
-          }
-        } else {
-          logger.info(`[Node:PreflightAgents] App "${_displayName}" not installed — no gatherAnswerCallback, failing fast`);
-        }
-
-        logger.error(`[Node:PreflightAgents] ${_planErrorMsg}`);
-        return {
-          ...state,
-          preflightDone: true,
-          planError: _planErrorMsg,
-          preflightResult: {
-            warnings,
-            agents: agentReadiness,
-            agentContextNote,
-          },
-        };
-        }
-      }
-    }
-  }
-
-  // ── Route choice gate (CLI-first) ──────────────────────────────────────────
-  // When multiple execution routes (CLI/API, browser, app) are available for
-  // the same service, CLI takes precedence. Only surface a choice to the user
-  // when CLI is not available or cannot be configured. Browser/app are fallback.
-  const preflightRouteChoice = {};
-  const _ROUTE_TYPE_MAP = {
-    cli_api: ['cli', 'api_key', 'bearer', 'basic'],
-    browser: ['browser'],
-    app:     ['app'],
+  // Needed agents = resolver picks ∪ pin ∪ deterministic-external service
+  // agent ∪ agentIds named in plan steps. create:true specs land here too —
+  // the registry check below catches them (runtime never builds agents).
+  const _normAgentId = (v) => {
+    const s = String(v || '').trim().toLowerCase();
+    if (!s) return null;
+    if (s.endsWith('.agent')) return s;
+    if (!s.includes('.')) return `${s}.agent`;
+    return null; // capability ids like 'video.ffmpeg' are not agent ids
   };
-
-  function _svcFromAgent(a) {
-    return (a.service || (a.agentId || '').replace(/\.app\.agent$/, '').replace(/\.agent$/, '')).toLowerCase();
+  const _neededIds = new Set();
+  for (const id of selectedAgentIds) { const n = _normAgentId(id); if (n) _neededIds.add(n); }
+  for (const spec of createAgentSpecs) { const n = _normAgentId(spec.agentId); if (n) _neededIds.add(n); }
+  if (state._pinnedAgentId) {
+    const n = _normAgentId(state._pinnedAgentId);
+    if (n) _neededIds.add(n);
+    else logger.warn(`[Node:PreflightAgents] Ignoring malformed pin "${state._pinnedAgentId}" — not a .agent id`);
+  }
+  if (state._deterministicServiceAgent) {
+    const n = _normAgentId(state._deterministicServiceAgent);
+    if (n) _neededIds.add(n);
+  }
+  const _planSteps = (Array.isArray(state._deterministicPlan) ? state._deterministicPlan : null)
+    || (Array.isArray(state._skillPlan) ? state._skillPlan : null) || [];
+  for (const s of _planSteps) {
+    const n = _normAgentId(s?.args?.agentId);
+    if (n) _neededIds.add(n);
+  }
+  if (createAgentSpecs.length > 0) {
+    logger.info(`[Node:PreflightAgents] ${createAgentSpecs.length} create:true spec(s) — runtime never builds agents; routing through registry check`);
   }
 
-  function _routeTypeFromAgent(a) {
-    if (['cli', 'api_key', 'bearer', 'basic'].includes(a.type)) return 'cli_api';
-    if (a.type === 'browser') return 'browser';
-    if (a.type === 'app') return 'app';
-    return null;
-  }
+  const _notOnboarded = [];  // needed but absent from the registry
+  const _notAuthed = [];     // registered but ledger says auth required
+  const _missingBins = new Set(); // required binaries absent from PATH
 
-  {
-    const _candidatesByService = new Map();
-    for (const a of agentReadiness) {
-      // _unregistered entries name an agentId that doesn't exist in the
-      // registry — they can't satisfy a route, only pretend to.
-      if (!a.ready || a._unregistered) continue;
-      const svcKey = _svcFromAgent(a);
-      if (!svcKey) continue;
-      const routeType = _routeTypeFromAgent(a);
-      if (!routeType) continue;
-      if (!_candidatesByService.has(svcKey)) _candidatesByService.set(svcKey, []);
-      _candidatesByService.get(svcKey).push({ agent: a, routeType });
-    }
-
-    for (const [svcKey, entries] of _candidatesByService) {
-      const routeTypes = new Set(entries.map(e => e.routeType));
-      if (routeTypes.size <= 1) continue;
-
-      // CLI-first: if a CLI/API route exists, auto-select it and suppress browser/app
-      if (routeTypes.has('cli_api')) {
-        const cliAgent = entries.find(e => e.routeType === 'cli_api').agent;
-        preflightRouteChoice[svcKey] = 'cli_api';
-        logger.info(`[Node:PreflightAgents] CLI-first routing for ${svcKey}: auto-selected ${cliAgent.agentId} (suppressing ${[...routeTypes].filter(r => r !== 'cli_api').join(', ')})`);
-
-        // Remove non-CLI routes for this service from agentReadiness
-        const keepTypes = _ROUTE_TYPE_MAP['cli_api'] || [];
-        for (let i = agentReadiness.length - 1; i >= 0; i--) {
-          const a = agentReadiness[i];
-          if (_svcFromAgent(a) === svcKey && !keepTypes.includes(a.type)) {
-            agentReadiness.splice(i, 1);
-          }
-        }
-        // Update selectedAgentIds
-        for (const id of [...selectedAgentIds]) {
-          const idSvc = id.replace(/\.app\.agent$/, '').replace(/\.agent$/, '').toLowerCase();
-          if (idSvc === svcKey) {
-            const stillPresent = agentReadiness.some(a => a.agentId.toLowerCase() === id);
-            if (!stillPresent) selectedAgentIds.delete(id);
-          }
-        }
-        selectedAgentIds.add(cliAgent.agentId.toLowerCase());
-        continue; // Skip user route choice — CLI is authoritative
-      }
-
-      // No CLI route — surface remaining routes to user
-      const iconUrl = entries[0].agent.iconUrl || serviceToIconUrl(svcKey);
-      const options = [];
-
-      if (routeTypes.has('cli_api')) {
-        const c = entries.find(e => e.routeType === 'cli_api').agent;
-        options.push({
-          route: 'cli_api',
-          label: 'CLI/API',
-          recommended: true,
-          description: 'More reliable, faster execution',
-          agentId: c.agentId,
-          authType: c.authType || (c.type === 'cli' ? 'cli_token' : c.type),
-          requiresSetup: !c.authed,
-        });
-      }
-      if (routeTypes.has('browser')) {
-        const c = entries.find(e => e.routeType === 'browser').agent;
-        options.push({
-          route: 'browser',
-          label: 'Browser Agent',
-          recommended: false,
-          description: 'Uses browser automation, may be slower',
-          agentId: c.agentId,
-          authType: c.authType || 'browser_oauth',
-          requiresSetup: !c.authed,
-        });
-      }
-      if (routeTypes.has('app')) {
-        const c = entries.find(e => e.routeType === 'app').agent;
-        options.push({
-          route: 'app',
-          label: 'Desktop App',
-          recommended: false,
-          description: 'Uses native app automation',
-          agentId: c.agentId,
-          authType: 'none',
-          requiresSetup: false,
-          appInstalled: true,
-        });
-      }
-
-      _emitProgress({
-        type: 'preflight:route_choice',
-        serviceName: svcKey,
+  for (const id of _neededIds) {
+    const rec = _byId.get(id);
+    const startUrl = rec?.startUrl || rec?.start_url || null;
+    const iconUrl = agentIdToIconUrl(id, startUrl);
+    if (!rec) {
+      _notOnboarded.push(id);
+      agentReadiness.push({
+        type: 'unknown', agentId: id, ready: false, authed: false,
+        reason: 'no registered agent — onboarding is a compile-time step',
         iconUrl,
-        options,
-      });
-
-      if (gatherAnswerCallback) {
-        try {
-          const choiceAnswer = await gatherAnswerCallback(`route_choice:${svcKey}`);
-          const chosenRoute = String(choiceAnswer || '').trim().toLowerCase();
-
-          if (chosenRoute && routeTypes.has(chosenRoute)) {
-            preflightRouteChoice[svcKey] = chosenRoute;
-            logger.info(`[Node:PreflightAgents] Route choice for ${svcKey}: ${chosenRoute}`);
-
-            // Filter agentReadiness to keep only the chosen route for this service
-            const keepTypes = _ROUTE_TYPE_MAP[chosenRoute] || [];
-            for (let i = agentReadiness.length - 1; i >= 0; i--) {
-              const a = agentReadiness[i];
-              if (_svcFromAgent(a) === svcKey && !keepTypes.includes(a.type)) {
-                agentReadiness.splice(i, 1);
-              }
-            }
-
-            // Update selectedAgentIds: remove non-chosen, add chosen
-            for (const id of [...selectedAgentIds]) {
-              const idSvc = id.replace(/\.app\.agent$/, '').replace(/\.agent$/, '').toLowerCase();
-              if (idSvc === svcKey) {
-                const stillPresent = agentReadiness.some(a => a.agentId.toLowerCase() === id);
-                if (!stillPresent) selectedAgentIds.delete(id);
-              }
-            }
-            const chosenAgent = agentReadiness.find(a => _svcFromAgent(a) === svcKey);
-            if (chosenAgent) selectedAgentIds.add(chosenAgent.agentId.toLowerCase());
-          } else {
-            logger.info(`[Node:PreflightAgents] No valid route choice for ${svcKey} — keeping all routes`);
-          }
-        } catch (choiceErr) {
-          logger.warn(`[Node:PreflightAgents] Route choice gather failed for ${svcKey}: ${choiceErr.message}`);
-        }
-      }
-    }
-  }
-
-  // ── Browser / credential agent authentication (Phase 1.5) ─────────────────
-  // THE LEDGER MODEL: browser-agent auth is already decided at enumeration —
-  // a trusted ledger entry skips everything here, and an untrusted one emits
-  // preflight:auth_required directly (no probe). This phase:
-  //   1. awaits any one-time migration verifies fired during enumeration —
-  //      bounded (15s) so the Chrome profile lock releases before execution
-  //      opens the same profile (SingletonLock),
-  //   2. emits auth-required for ledger-untrusted browser agents, and
-  //   3. still runs the real verify probe for credential agents
-  //      (api_key/bearer/basic) — a stored token is real evidence.
-  const _AUTH_BOUNDARY_TIMEOUT_MS = 15 * 1000;
-  for (const a of agentReadiness) {
-    if (!a._verifyPromise) continue;
-    try {
-      const res = await Promise.race([
-        a._verifyPromise,
-        new Promise(r => setTimeout(() => r({ ok: false, verifyTimeout: true }), _AUTH_BOUNDARY_TIMEOUT_MS)),
-      ]);
-      const payload = res?.data || res || {};
-      if (payload && payload.authRequired === true) {
-        logger.info(`[Node:PreflightAgents] ${a.agentId} migration verify: login wall — flipping to auth-required`);
-        a.authed = false;
-        a.ready = false;
-        a._forceAuthRequired = true;
-        markAgentAuthFailed(a.agentId, 'migration verify: auth required');
-      } else if (payload && payload.ok && (payload.authVerified === true || payload.authed === true)) {
-        markAgentAuthed(a.agentId);
-        _emitProgress({
-          type: 'preflight:agent_ready',
-          agentId: a.agentId,
-          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
-          message: `${a.agentId} authenticated (verified)`,
-        });
-        logger.info(`[Node:PreflightAgents] ${a.agentId} migration verify: authenticated — ledger stamped`);
-      } else {
-        // Timeout / transport / unverifiable — keep optimistic authed.
-        // Runtime login-wall detection is the safety net for a truly dead
-        // session; never mark unauthenticated on an inconclusive probe.
-        logger.info(`[Node:PreflightAgents] ${a.agentId} migration verify inconclusive (${payload.error || payload.verifyTimeout ? 'timeout/transport' : 'unverifiable'}) — staying optimistic`);
-      }
-    } catch (verifyErr) {
-      logger.warn(`[Node:PreflightAgents] ${a.agentId} migration verify error: ${verifyErr.message}`);
-    }
-    delete a._verifyPromise;
-  }
-
-  const _AUTH_AGENT_TYPES = new Set(['browser', 'api_key', 'bearer', 'basic']);
-  const browserAgentsNeedingAuth = agentReadiness.filter(
-    a => _AUTH_AGENT_TYPES.has(a.type) && !a.authed
-  );
-
-  if (browserAgentsNeedingAuth.some(a => a.type === 'browser')) {
-    _emitProgress({
-      type: 'preflight:building_agent',
-      agentType: 'browser',
-      agentId: 'browser.preflight',
-      message: 'Checking browser authentication sessions...',
-      iconUrl: null,
-    });
-  }
-
-  async function _authenticateBrowserAgent(a) {
-    const svcKey = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
-    const iconUrl = a.iconUrl || agentIdToIconUrl(a.agentId);
-    try {
-      const authRes = await mcpAdapter.callService('command', 'command.automate', {
-        skill: 'browser.agent',
-        args: {
-          action: 'authenticate',
-          agentId: a.agentId,
-          task: `Authenticate to ${a.agentId}`,
-          url: a.startUrl,
-          manualLogin: false,
-          preflightProbe: true,
-          requireCookieConfirmation: !!a._requireCookieConfirmation,
-        },
-      // 60s cap — a wedged command-service must not swallow the whole task
-      // budget (observed: 600s auth probe stall on a dead MCP socket turned a
-      // "remind me" task into a 10-minute timeout). On timeout this fails
-      // open (transport error → probe skipped) — same as every other probe.
-      }, { timeoutMs: 60 * 1000 }).catch((err) => ({
-        ok: false,
-        // Transport failure = probe inconclusive, not an auth denial — mark
-        // unverifiable so the task parks on a sign-in/bypass card instead of
-        // hard-failing planning (observed: wedged :3007 socket → todoist task
-        // died outright even though auth itself was fine).
-        unverifiable: true,
-        error: `auth check transport error: ${err?.message || 'unknown error'}`,
-      }));
-      const authPayload = authRes?.data || authRes || {};
-      // Only surface the sign-in banner for a REAL auth need — a login wall
-      // (authRequired) or a credential ask (api_key/bearer/basic). Emitting
-      // auth_required on any failure (probe crash, transport error) shows a
-      // misleading "Sign into X" card while the retry is still in flight —
-      // and the buttons can't resolve mid-run.
-      if (!authPayload.ok && (authPayload.authRequired === true || authPayload.askUser === true)) {
-        _emitProgress({
-          type: 'preflight:auth_required',
-          agentId: a.agentId,
-          serviceName: svcKey,
-          authType: a.authType || 'browser_oauth',
-          iconUrl,
-          message: `${a.agentId} requires ${a.authType && a.authType !== 'browser_oauth' ? a.authType : 'login'} before planning`,
-        });
-      }
-      return authRes;
-    } catch (err) {
-      return { ok: false, error: err.message };
-    }
-  }
-
-  const authFailures = [];
-  for (const a of browserAgentsNeedingAuth) {
-    // ── Live mid-run bypass: user clicked "Proceed without" while preflight
-    // was running. Mark authed for this run only — no probe, no failure.
-    if (_isBypassedNow(a.agentId)) {
-      logger.info(`[Node:PreflightAgents] ${a.agentId} bypassed mid-run by user — marking authed for this run only`);
-      a.authed = true;
-      a.ready = true;
-      a.authBypassed = true;
-      warnings.push({ type: 'auth_bypassed', message: `${a.agentId} sign-in skipped by user — running unauthenticated` });
-      _emitProgress({
-        type: 'preflight:agent_ready',
-        agentId: a.agentId,
-        iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
-        message: `${a.agentId} proceeding without sign-in`,
       });
       continue;
     }
-
-    // ── Browser agents: the ledger already decided at enumeration ───────────
-    // !authed here means deterministic auth-required — covers _newlyCreated,
-    // ledger-failed (authed:false/lastAuthFailedAt), needsAuth=1, and
-    // first-contact=1. No probe: verification lives on transition edges now.
-    if (a.type === 'browser') {
-      const _svcKey = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
-      const _iconUrl = a.iconUrl || agentIdToIconUrl(a.agentId);
-      logger.info(`[Node:PreflightAgents] ${a.agentId} needs auth (${a._newlyCreated ? 'newly built' : 'ledger/first-contact classified'}) — surfacing auth_required without probe`);
-      _emitProgress({
-        type: 'preflight:auth_required',
-        agentId: a.agentId,
-        serviceName: _svcKey,
-        authType: a.authType || 'browser_oauth',
-        iconUrl: _iconUrl,
-        message: `${a.agentId}`,
-        _newlyCreated: !!a._newlyCreated,
-      });
-      a.authed = false;
-      a.ready = false;
-      a.reason = 'authentication required';
-      authFailures.push({ agentId: a.agentId, reason: 'auth required' });
-      continue;
+    const type = rec.type || 'browser';
+    const bypassed = _isBypassedNow(id);
+    let authed = true;
+    let reason = null;
+    if (['browser', 'api_key', 'bearer', 'basic'].includes(type)) {
+      const svc = id.replace(/\.agent$/, '');
+      const ledger = _getLedgerAuth(id) || {};
+      const knownNeed = _SERVICE_NEEDS_AUTH.has(svc) ? _SERVICE_NEEDS_AUTH.get(svc)
+        : (ledger.needsAuth === 0 ? 0 : ledger.needsAuth === 1 ? 1 : undefined);
+      const anonymousOk = knownNeed === 0 || _isPublicWebTask;
+      authed = bypassed || anonymousOk || ledger.authed === true
+        || (knownNeed === undefined && _browserProfileHasCookies(id));
+      if (!authed) { reason = 'authentication is required'; _notAuthed.push(id); }
+    } else if (type === 'cli') {
+      const bin = rec.cliTool || rec.cli_tool || id.replace(/\.agent$/, '');
+      if (!_whichSync(bin)) {
+        _missingBins.add(`${id} (${bin})`);
+        agentReadiness.push({
+          type, agentId: id, ready: false, authed: true,
+          reason: `CLI binary not on PATH: ${bin}`, iconUrl, startUrl, cliTool: bin,
+        });
+        continue;
+      }
+      // Auth-gated only when the descriptor declares an auth surface —
+      // setupInfo.authCmd/credentials or an 'authentication' capability.
+      // Auth-less CLIs pass unconditionally: a probe that can't prove login
+      // is not a wall (observed: fabricated ffmpeg agent → phantom auth gate).
+      const setupInfo = _parseSetupInfo(rec.descriptor || '');
+      const caps = Array.isArray(rec.capabilities) ? rec.capabilities.map(c => String(c).toLowerCase()) : [];
+      const declaresAuth = !!(setupInfo?.authCmd || setupInfo?.credentials || caps.includes('authentication'));
+      if (declaresAuth) {
+        const la = _cliLedgerAuth(id);
+        authed = la.authed || bypassed;
+        if (!authed) { reason = 'authentication is required'; _notAuthed.push(id); }
+      }
     }
-
-    // ── Credential agents (api_key/bearer/basic): real stored-token verify ──
-    // The probe is kept here — a stored credential is concrete evidence worth
-    // checking, and the askUser/credential-gather flows below are the actual
-    // credential setup UX.
-    a._requireCookieConfirmation = !a.authedAt && !a._newlyCreated;
-
-    // Emit actual agentId so main.js cancel handler can derive the correct session
-    _emitProgress({
-      type: 'preflight:auth_starting',
-      agentId: a.agentId,
-      message: `Authenticating ${a.agentId}...`,
+    agentReadiness.push({
+      type, agentId: id, ready: true, authed, needsLogin: !authed, reason,
+      iconUrl, startUrl,
+      cliTool: type === 'cli' ? (rec.cliTool || rec.cli_tool || null) : undefined,
     });
-    let attempts = 0;
-    let authRes = null;
-    while (attempts < 2) {
-      // Bypass may have arrived while the previous attempt was in flight.
-      if (_isBypassedNow(a.agentId)) {
-        logger.info(`[Node:PreflightAgents] ${a.agentId} bypassed mid-probe by user — stopping auth attempts`);
-        a.authed = true;
-        a.ready = true;
-        a.authBypassed = true;
-        authRes = { ok: true, bypassed: true };
-        _emitProgress({
-          type: 'preflight:agent_ready',
-          agentId: a.agentId,
-          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
-          message: `${a.agentId} proceeding without sign-in`,
-        });
-        break;
-      }
-      authRes = await _authenticateBrowserAgent(a);
-      const authPayload = authRes?.data || authRes || {};
-      if (authPayload.ok && (authPayload.authVerified === true || authPayload.authed === true)) {
-        markAgentAuthed(a.agentId);
-        a.authed = true;
-        a.ready = true;
-        _emitProgress({
-          type: 'preflight:agent_ready',
-          agentId: a.agentId,
-          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
-          message: `${a.agentId} authenticated`,
-        });
-        break;
-      }
+  }
 
-      if (authPayload.ok && authPayload.authVerified !== true && authPayload.authed !== true) {
-        authRes = { ok: false, error: 'authentication result was not verified by the selected driver' };
-        break;
-      }
-
-      // Browser crashed (chromeCrash) — retryable. browser.agent already
-      // escalates silent probes to hidden-headed mode internally, so a second
-      // attempt covers genuine transient crashes (profile lock races, etc).
-      if (authPayload.chromeCrash === true) {
-        logger.warn(`[Node:PreflightAgents] ${a.agentId} auth probe crashed — retrying once`);
-        attempts++;
-        continue;
-      }
-
-      // Headless preflight probe detected a login wall. The preflight:auth_required
-      // event is emitted by _authenticateBrowserAgent; stop retrying so the UI banner
-      // can prompt the user to sign in before planning proceeds.
-      if (authPayload.authRequired) {
-        logger.info(`[Node:PreflightAgents] ${a.agentId} requires browser login — surfacing preflight:auth_required`);
-        authRes = { ok: false, authRequired: true, error: authPayload.error || 'auth required' };
-        break;
-      }
-
-      if (authPayload.askUser) {
-        // Credential-style question (email / API key / bearer / basic)
-        if (authPayload.needsCredentials) {
-          if (!authPayload.credentialKey) {
-            logger.warn(`[Node:PreflightAgents] ${a.agentId} requested credentials but did not supply a credentialKey`);
-            _emitProgress({
-              type: 'preflight:auth_failed',
-              agentId: a.agentId,
-              message: `${a.agentId} requested credentials but did not provide a storage key.`,
-            });
-            break;
-          }
-          if (!gatherCredentialCallback) {
-            logger.warn(`[Node:PreflightAgents] ${a.agentId} requires credentials but no gatherCredentialCallback is available`);
-            const noCallbackErr = `${a.agentId} requires a credential, but the UI credential prompt is not available.`;
-            _emitProgress({
-              type: 'preflight:auth_failed',
-              agentId: a.agentId,
-              message: noCallbackErr,
-            });
-            authRes = { ok: false, error: noCallbackErr };
-            break;
-          }
-          _emitProgress({
-            type: 'gather_credential',
-            key: authPayload.credentialKey,
-            message: authPayload.question,
-          });
-          let credentialStored = false;
-          try {
-            const credResult = await gatherCredentialCallback(authPayload.credentialKey);
-            credentialStored = credResult && (credResult.stored === true || credResult.stored === undefined);
-          } catch (credErr) {
-            logger.warn(`[Node:PreflightAgents] Credential gather failed for ${a.agentId}: ${credErr.message}`);
-          }
-          if (!credentialStored) {
-            logger.warn(`[Node:PreflightAgents] Credential for ${a.agentId} was not stored — aborting auth`);
-            _emitProgress({
-              type: 'preflight:auth_failed',
-              agentId: a.agentId,
-              message: `${a.agentId} credential was not provided or not stored.`,
-            });
-            break;
-          }
-          attempts++;
-          continue;
-        }
-        // Plain question
-        if (!gatherAnswerCallback) {
-          logger.warn(`[Node:PreflightAgents] ${a.agentId} asks a question but no gatherAnswerCallback is available`);
-          const noCallbackErr = `${a.agentId} needs input, but the UI question prompt is not available.`;
-          _emitProgress({
-            type: 'preflight:auth_failed',
-            agentId: a.agentId,
-            message: noCallbackErr,
-          });
-          authRes = { ok: false, error: noCallbackErr };
-          break;
-        }
-        _emitProgress({
-          type: 'ask_user',
-          question: authPayload.question,
-          source: 'preflightAgents',
-        });
-        try {
-          const answer = await gatherAnswerCallback(authPayload.question);
-          if (!answer) break;
-        } catch (ansErr) {
-          logger.warn(`[Node:PreflightAgents] Answer gather failed for ${a.agentId}: ${ansErr.message}`);
-          break;
-        }
-        attempts++;
-        continue;
-      }
-
-      // Non-OK, non-askUser result is a hard auth failure.
-      break;
-    }
-
-    if (!a.authed) {
-      const authPayload = authRes?.data || authRes || {};
-      const failureReason = authPayload.error || 'auth did not complete';
-      a.ready = false;
-      a.reason = failureReason;
-      // Persistent unverifiable probe (bot wall / blank page even in hidden
-      // headed mode) — auth state unknown. Park the task as auth-required so
-      // the user gets a working sign-in/bypass card instead of a hard fail.
-      if (authPayload.unverifiable === true) {
-        const _svcKey2 = (a.agentId || '').replace(/\.agent$/, '').toLowerCase();
-        logger.info(`[Node:PreflightAgents] ${a.agentId} auth state unverifiable — surfacing preflight:auth_required`);
-        _emitProgress({
-          type: 'preflight:auth_required',
-          agentId: a.agentId,
-          serviceName: _svcKey2,
-          authType: a.authType || 'browser_oauth',
-          iconUrl: a.iconUrl || agentIdToIconUrl(a.agentId),
-          message: `Couldn't verify ${a.agentId} — sign-in may be required`,
-        });
-        authFailures.push({ agentId: a.agentId, reason: 'auth required' });
-        continue;
-      }
-      // For browser login walls the preflight:auth_required banner is already shown;
-      // don't also show a scary auth-failed warning. Still record the failure so planning
-      // is blocked until the user authenticates.
-      if (!authPayload.authRequired) {
-        logger.error(`[Node:PreflightAgents] I couldn't authenticate ${a.agentId} before planning: ${failureReason}`);
-        _emitProgress({
-          type: 'preflight:auth_failed',
-          agentId: a.agentId,
-          message: `I couldn't authenticate ${a.agentId}: ${failureReason}`,
-        });
-      } else {
-        logger.info(`[Node:PreflightAgents] ${a.agentId} auth pending — waiting for user to sign in via banner`);
-      }
-      authFailures.push({ agentId: a.agentId, reason: failureReason });
+  // Sanity-check binaries named in deterministic/saved plan steps — ~1ms
+  // each. A saved plan can outlive the tools it was compiled against; a
+  // missing binary here means the plan can't run → escalate so the compiler
+  // reinstalls (or re-plans around it). Never installs, never probes.
+  for (const s of _planSteps) {
+    const cmd = s?.args?.cmd;
+    if (s?.skill === 'shell.run' && typeof cmd === 'string'
+        && /^[a-zA-Z0-9._-]+$/.test(cmd)) {
+      if (!_whichSync(cmd)) _missingBins.add(`plan step (${cmd})`);
     }
   }
 
-  // ── Mid-run "Proceed without" may have landed after an agent already
-  // failed — un-fail bypassed agents so the run can continue instead of
-  // parking for a decision the user already made.
-  for (let i = authFailures.length - 1; i >= 0; i--) {
-    if (_isBypassedNow(authFailures[i].agentId)) {
-      const _unfailed = authFailures[i].agentId;
-      authFailures.splice(i, 1);
-      const _ua = browserAgentsNeedingAuth.find(x => x.agentId === _unfailed);
-      if (_ua) { _ua.authed = true; _ua.ready = true; _ua.authBypassed = true; }
-      warnings.push({ type: 'auth_bypassed', message: `${_unfailed} sign-in skipped by user — running unauthenticated` });
-      _emitProgress({
-        type: 'preflight:agent_ready',
-        agentId: _unfailed,
-        iconUrl: _ua?.iconUrl || agentIdToIconUrl(_unfailed),
-        message: `${_unfailed} proceeding without sign-in`,
-      });
-      logger.info(`[Node:PreflightAgents] ${_unfailed} bypassed mid-run — cleared auth failure`);
+  const _escalate = (reason, detail) => {
+    if (state._allowPlannerFallback) {
+      warnings.push({ type: 'readiness', message: `${reason}: ${detail} — planner fallback active, continuing` });
+      return null;
     }
-  }
-
-  // ── Mid-run "I've already signed in" — user asserts auth completed during
-  // the probe window. Re-verify queued agents once; a pass clears the failure.
-  const _continueQueued = Array.isArray(state._authContinueQueued) ? state._authContinueQueued : [];
-  for (const _qc of _continueQueued) {
-    const _qid = String(_qc).toLowerCase();
-    const _failIdx = authFailures.findIndex(f => (f.agentId || '').toLowerCase() === _qid);
-    if (_failIdx < 0) continue;
-    const _qa = browserAgentsNeedingAuth.find(x => (x.agentId || '').toLowerCase() === _qid);
-    if (!_qa) continue;
-    logger.info(`[Node:PreflightAgents] re-verifying ${_qid} after mid-run auth_continue`);
-    _emitProgress({
-      type: 'preflight:auth_starting',
-      agentId: _qa.agentId,
-      message: `Re-verifying ${_qa.agentId} sign-in...`,
-    });
-    const _reRes = await _authenticateBrowserAgent(_qa);
-    const _rePayload = _reRes?.data || _reRes || {};
-    if (_rePayload.ok && (_rePayload.authVerified === true || _rePayload.authed === true)) {
-      markAgentAuthed(_qa.agentId);
-      _qa.authed = true;
-      _qa.ready = true;
-      authFailures.splice(_failIdx, 1);
-      _emitProgress({
-        type: 'preflight:agent_ready',
-        agentId: _qa.agentId,
-        iconUrl: _qa.iconUrl || agentIdToIconUrl(_qa.agentId),
-        message: `${_qa.agentId} authenticated`,
-      });
-      logger.info(`[Node:PreflightAgents] ${_qid} verified after mid-run auth_continue`);
-    }
-  }
-
-  if (authFailures.length > 0) {
-    const isAuthRequired = authFailures.some(f => f.reason === 'auth required');
-    const planError = `I couldn't authenticate before planning: ${authFailures
-      .map(f => `${f.agentId} (${f.reason})`)
-      .join('; ')}`;
+    logger.warn(`[Node:PreflightAgents] Scoped readiness → needs_plan (${reason}): ${detail}`);
+    _emitProgress({ type: 'preflight:complete', agents: agentReadiness, warnings });
     return {
       ...state,
+      taskFacts,
       preflightDone: true,
-      planError,
-      preflightAuthRequired: isAuthRequired,
-      // Which agents failed auth — handoffRunner carries these into the
-      // pending-resume ctx so "proceed" bypasses the actual failures. Without
-      // it the resume replays with an empty bypass list → auth-required again
-      // → infinite auth-resume loop (observed in E2E).
-      preflightAuthAgents: authFailures.map(f => f.agentId).filter(Boolean),
+      _needsPlan: {
+        reason,
+        detail,
+        seedPrompt: `${userMessage}\n\n[Runtime readiness: ${reason} — ${detail}]`,
+        refs: extractContextRefs(userMessage),
+        gatheredContext: (state.planGatheringAnswers || []),
+        missingAgents: [..._notOnboarded, ..._notAuthed],
+      },
       preflightResult: {
-        warnings,
-        agents: agentReadiness,
+        cliPreflightNote: '',
         agentContextNote: '',
+        preflightCliMap: _preflightCliMap,
+        registeredAgentServiceMap: _registeredAgentServiceMap,
+        trainedRecipeMap: _trainedRecipeMap,
+        agents: agentReadiness,
+        vetAvailable,
+        warnings,
       },
     };
-  }
+  };
 
-  _mark('authSectionMs');
-
-  // ── Single-route mandate (post-auth) ──────────────────────────────────────
-  // When a service has exactly one executable route and it is now ready+
-  // authed, treat that route as authoritative. The planner is forbidden from
-  // falling back to api_suggest or alternative routes for that service.
-  // Public web tasks (public_read/download — _isPublicWebTask set above) must
-  // NOT pin a service route — they run through web.agent/web.crawl/shell.run
-  // per the planner's public-web hard constraint. A browser mandate here would
-  // contradict that constraint (and produced youtube.agent for "find videos
-  // from X" listing prompts).
-  const singleRouteMandate = {};
-  // A pinned/selected service agent is a concrete "use this service" signal —
-  // under ext-first a named-service nav always rides the browser lane, so the
-  // public_read label must not suppress the mandate (observed: "go to youtube"
-  // → mandate skipped → grill asked "Open YouTube in your browser?" on a
-  // route that was already predetermined).
-  const _pinnedSvc = state._pinnedAgentId ? String(state._pinnedAgentId).replace(/\.agent$/i, '').toLowerCase() : null;
-  if (_isPublicWebTask && !_pinnedSvc) {
-    logger.info(`[Node:PreflightAgents] Skipping single-route mandate — webAccessMode=${_tc.webAccessMode} (public web task, no service agent)`);
-  } else {
-    const _readyByService = new Map();
-    for (const a of agentReadiness) {
-      // _unregistered entries must never pin a mandate — the agentId they
-      // carry was fabricated and doesn't exist in the agents registry.
-      if (!a.ready || !a.authed || a._unregistered) continue;
-      const svcKey = _svcFromAgent(a);
-      if (!svcKey) continue;
-      const routeType = _routeTypeFromAgent(a);
-      if (!routeType) continue;
-      if (!_readyByService.has(svcKey)) _readyByService.set(svcKey, []);
-      _readyByService.get(svcKey).push({ agent: a, routeType });
-    }
-
-    for (const [svcKey, entries] of _readyByService) {
-      if (entries.length !== 1) continue;
-      const { agent: a, routeType } = entries[0];
-      singleRouteMandate[svcKey] = {
-        route: routeType,
-        agentId: a.agentId,
-        authType: a.authType || (a.type === 'cli' ? 'cli_token' : a.type),
+  if (_notOnboarded.length > 0) {
+    const esc = _escalate('agent_not_onboarded', `needed agent(s) not registered: ${_notOnboarded.join(', ')}`);
+    if (esc) return esc;
+    // Planner-fallback mode — drop unregistered agents so planning proceeds
+    // without them rather than re-escalating (user declined the planning lane).
+    if (state.resolveAgentResult?.agents) {
+      state.resolveAgentResult = {
+        ...state.resolveAgentResult,
+        agents: state.resolveAgentResult.agents.filter(a => !_notOnboarded.includes(_normAgentId(a?.agentId))),
       };
-      _emitProgress({
-        type: 'preflight:single_route_mandate',
-        serviceName: svcKey,
-        agentId: a.agentId,
-        route: routeType,
-      });
-      logger.info(`[Node:PreflightAgents] Single-route mandate for ${svcKey}: ${routeType} via ${a.agentId}`);
     }
   }
-
-  // ── Task-specific deep-link resolution for authenticated browser agents ─────
-  // Delegates to browser.agent's resolve_deep_link action which has the full
-  // resolution chain: intent templates → authenticated eval → web.agent → web.crawl → LLM.
-  // Results are cached per agentId+taskHash (5min TTL) to avoid re-resolution.
-  const _deepLinkCache = new Map();
-  const _DEEP_LINK_CACHE_TTL = 5 * 60 * 1000;
-
-  async function _resolveDeepLinkForAgent(a, task) {
-    if (!a.startUrl) return null;
-
-    // Check cache
-    const _cacheKey = `${a.agentId}:${task.slice(0, 100)}`;
-    const _cached = _deepLinkCache.get(_cacheKey);
-    if (_cached && (Date.now() - _cached.ts) < _DEEP_LINK_CACHE_TTL) {
-      logger.info(`[Node:PreflightAgents] deep-link: cache hit for ${a.agentId} → ${_cached.url}`);
-      return { url: _cached.url, source: _cached.source || null, intent: _cached.intent || null, baseHost: _cached.baseHost || null, deepLinkType: _cached.deepLinkType || null, taskKeywords: _cached.taskKeywords || null };
-    }
-
-    // Delegate to browser.agent resolve_deep_link
-    // Pass headed:false + hidden:true so ALL browser operations during deep-link
-    // resolution (navigate, evaluate, web.crawl fallback) are headless/hidden.
-    // This prevents the blank visible Chrome window that appeared during preflight.
-    try {
-      const res = await mcpAdapter.callService('command', 'command.automate', {
-        skill: 'browser.agent',
-        args: {
-          action: 'resolve_deep_link',
-          agentId: a.agentId,
-          serviceKey: (a.agentId || '').replace(/\.agent$/, ''),
-          startUrl: a.startUrl,
-          task,
-          sessionId: (a.agentId || '').replace(/\.agent$/, '_agent'),
-          headed: false,
-          hidden: true,
-          // Forward the once-per-turn semantic classification so the deep-link
-          // resolver can veto fuzzy search-criteria matches on mutation tasks
-          // (e.g. "email me X" must not become a Gmail #search/ URL).
-          taskClassification: _tc,
-        },
-        // 75s (was 30s): the resolution chain (template → session eval →
-        // web.agent → crawl → suggest) can legitimately run ~60s; a mid-chain
-        // timeout abandons the work and url.first.agent re-runs the identical
-        // chain at execution — the observed duplicate-resolution latency.
-      }, { timeoutMs: 75000 }).catch(() => null);
-      const result = res?.data || res;
-      if (result?.ok && result?.deepLinkUrl) {
-        const _facts = { url: result.deepLinkUrl, source: result.deepLinkSource || null, intent: result.deepLinkIntent || null, baseHost: result.baseHost || null, deepLinkType: result.deepLinkType || null, taskKeywords: result.taskKeywords || null };
-        _deepLinkCache.set(_cacheKey, { ..._facts, ts: Date.now() });
-        return _facts;
-      }
-    } catch (err) {
-      logger.debug(`[Node:PreflightAgents] deep-link resolution failed for ${a.agentId}: ${err.message}`);
-    }
-    return null;
+  if (_notAuthed.length > 0) {
+    const esc = _escalate('auth_required', `needed agent(s) not authenticated: ${_notAuthed.join(', ')} — sign-in is a compile-time step (setup.start)`);
+    if (esc) return esc;
+  }
+  if (_missingBins.size > 0) {
+    const esc = _escalate('cli_not_installed', `required binaries missing from PATH: ${[..._missingBins].join(', ')}`);
+    if (esc) return esc;
   }
 
-  // Deep-links resolve to a SINGLE page (e.g. one watch?v= URL) — wrong for
-  // public_read listing/search tasks that need a SERP, and the resolution
-  // chain itself burns web-search + crawl calls the task doesn't need.
-  // In-page nav ("go back on this page") has no destination at all — resolving
-  // one minted a fresh tab for a history request.
-  // F15: bare nav to a named service (newDestination, no interactive actions)
-  // goes to the canonical startUrl — a cached deep-link overrides it with a
-  // stale page ("go to youtube" → a random watch?v= video; "go to amazon" →
-  // the prime upsell redirect). Deep-links belong to content-targeted tasks.
-  const _bareNav = _tc?.newDestination === true && !(_tc?.interactiveActions || []).length;
-  for (const a of (_isPublicWebTask || _isInPageNav || _bareNav) ? [] : agentReadiness.filter(x => x.type === 'browser' && x.authed)) {
-    const deepLink = await _resolveDeepLinkForAgent(a, userMessage);
-    if (deepLink) {
-      a.deepLinkUrl = deepLink.url || deepLink;
-      a.deepLinkSource = deepLink.source || null;
-      logger.info(`[Node:PreflightAgents] Deep-link for ${a.agentId}: ${a.deepLinkUrl} (source=${a.deepLinkSource})`);
-      // Record the resolution into taskFacts — ONE canonical destination,
-      // first resolved wins. intent/baseHost/type come straight from the
-      // resolver (no re-derivation downstream).
-      if (!taskFacts.destination && typeof deepLink === 'object' && deepLink.url) {
-        let _dlType = deepLink.deepLinkType || null;
-        if (!_dlType) {
-          try {
-            let _p = __dirname;
-            for (let _i = 0; _i < 6; _i++) {
-              const _cand = path.join(_p, 'mcp-services/command-service/src/skill-helpers/deep-link-types.cjs');
-              if (fs.existsSync(_cand)) { _dlType = require(_cand).classifyDeepLinkType(deepLink.url); break; }
-              _p = path.dirname(_p);
-            }
-          } catch (_) {}
-        }
-        taskFacts.agentId = a.agentId;
-        taskFacts.intent = deepLink.intent || taskFacts.intent;
-        taskFacts.serviceHost = deepLink.baseHost || taskFacts.serviceHost;
-        taskFacts.destination = { url: deepLink.url, source: deepLink.source, deepLinkType: _dlType || 'none', expectsOverlay: _dlType === 'compose' };
-        // Entities ride the URL params — buildUrl already parsed the task
-        // string, so reading them back is deterministic (never re-extracted).
-        try {
-          const _sp = new URL(deepLink.url).searchParams;
-          const _ent = {};
-          if (_sp.get('text')) _ent.title = _sp.get('text');
-          if (_sp.get('dates')) _ent.dates = _sp.get('dates');
-          if (_sp.get('subject')) _ent.subject = _sp.get('subject');
-          if (_sp.get('to') || _sp.get('mailto')) _ent.to = _sp.get('to') || _sp.get('mailto');
-          if (Object.keys(_ent).length) taskFacts.entities = _ent;
-        } catch (_) {}
-        if (['creation', 'compose', 'edit'].includes(_dlType)) {
-          taskFacts.postcondition = { kind: 'urlTransition', from: deepLink.url };
-        }
-        logger.info(`[Node:PreflightAgents] taskFacts: destination=${deepLink.url} type=${_dlType || 'none'} intent=${taskFacts.intent || 'n/a'} entities=${JSON.stringify(taskFacts.entities)}`);
-      }
-    }
+  // Literal URL in the prompt IS the destination — no deep-link resolution.
+  // (The old resolver search-wrapped the whole prompt into a YouTube search
+  // URL even when the watch URL was right there.)
+  const _literalUrl = (String(userMessage).match(/https?:\/\/[^\s"'<>\])}]+/i) || [])[0];
+  if (_literalUrl && !taskFacts.destination) {
+    taskFacts.destination = { url: _literalUrl, source: 'message', deepLinkType: null, expectsOverlay: false };
   }
-  _mark('deepLinkMs');
 
   // ── Disk-scan fallback: load recipes directly from filesystem ────────────────
   try {
@@ -3299,8 +1122,7 @@ module.exports = async function preflightAgents(state) {
   if (mapSize > 0) {
     state._trainedRecipeMap = _trainedRecipeMap;
     // Regenerate the planner-facing TRAINED RECIPES note from the final
-    // disk-derived map (the per-agent trainer.agent list_skills calls that
-    // used to build this were removed — disk scan covers the same data free).
+    // disk-derived map.
     const _byAgent = {};
     const _seenSkill = new Set();
     for (const v of Object.keys(_trainedRecipeMap)) {
@@ -3318,62 +1140,34 @@ module.exports = async function preflightAgents(state) {
     }
   }
 
-  const selectedReadinessFailures = [];
-  for (const agentId of selectedAgentIds) {
-    // App-type agents (local desktop apps) have no credentials to validate.
-    // Installation is already verified by the desktop probe above, which grills
-    // the user with a download prompt if the app is missing. Skip the readiness
-    // gate for these agents — it doesn't apply.
-    if (_resolverTypeMap[agentId] === 'app' || agentId.endsWith('.app.agent')) {
-      logger.info(`[Node:PreflightAgents] Skipping readiness check for app agent: ${agentId}`);
-      continue;
-    }
-    const agent = agentReadiness.find(a => String(a.agentId || '').toLowerCase() === agentId);
-    if (!agent) {
-      selectedReadinessFailures.push({ agentId, reason: 'selected agent did not complete preflight' });
-      continue;
-    }
-    if (!agent.ready) {
-      selectedReadinessFailures.push({ agentId, reason: agent.reason || 'agent is not ready' });
-      continue;
-    }
-    if (['browser', 'cli', 'api_key', 'bearer', 'basic'].includes(agent.type) && !agent.authed) {
-      selectedReadinessFailures.push({ agentId, reason: 'authentication is required' });
-    }
+  // Planner-facing notes — needed-agent readiness + the registered catalog,
+  // for the live-plan path (recovery replan). Deterministic runs never read
+  // these. Registry-derived only — zero probes.
+  if (agentReadiness.length > 0) {
+    agentContextNote += `\n\nNEEDED-AGENT READINESS:\n${agentReadiness.map(a => `- ${a.agentId} [${a.type}] ready=${a.ready} authed=${a.authed}${a.reason ? ` (${a.reason})` : ''}`).join('\n')}`;
   }
-  if (selectedReadinessFailures.length > 0) {
-    const planError = `Selected agents are not ready: ${selectedReadinessFailures.map(f => `${f.agentId} (${f.reason})`).join('; ')}`;
-    logger.error(`[Node:PreflightAgents] ${planError}`);
-    return {
-      ...state,
-      preflightDone: true,
-      planError,
-      preflightAuthRequired: selectedReadinessFailures.some(f => /authentication is required/i.test(f.reason)),
-      preflightResult: {
-        warnings,
-        agents: agentReadiness,
-        agentContextNote: '',
-      },
-    };
+  const _catalogLines = _registry
+    .filter(a => ['browser', 'cli', 'api_key', 'bearer', 'basic', 'mcp', 'local'].includes(a.type))
+    .slice(0, 60)
+    .map(a => `- ${a.id}: type=${a.type}${(a.cliTool || a.cli_tool) ? `, cli=${a.cliTool || a.cli_tool}` : ''}${(a.startUrl || a.start_url) ? `, start=${a.startUrl || a.start_url}` : ''}${Array.isArray(a.capabilities) ? ` — capabilities: ${a.capabilities.slice(0, 5).join(', ')}` : ''}`);
+  if (_catalogLines.length > 0) {
+    agentContextNote += `\n\nREGISTERED AGENTS (use the matching executor — type 'cli' → cli.agent { action: "run", agentId: "<id>", task: "..." }; type 'browser' → atomic browser skills with agentId "<id>": url.first.agent opens the destination, then dom.act / turn.loop.agent steps do the on-page work):\n${_catalogLines.join('\n')}`;
   }
 
   // ── Build preflightResult ───────────────────────────────────────────────────
   const preflightResult = {
     cliPreflightNote,
     agentContextNote,
-    discoveredToolNote,
+    discoveredToolNote: '',
     preflightCliMap: _preflightCliMap,
     registeredAgentServiceMap: _registeredAgentServiceMap,
     trainedRecipeMap: _trainedRecipeMap,
     agents: agentReadiness,
     vetAvailable,
     warnings,
-    routeChoice: preflightRouteChoice,
-    singleRouteMandate,
-    // ── Grill-Me Phase A outputs ────────────────────────────────────────────
-    probes: _probes,           // { service: { desktop, tcc, cli } }
-    routeDecision: _routeDecision, // { service: { route, agentId, reason, probes, createAgent } }
-    durations: _pfDur,          // per-phase ms timings (elapsed since node start)
+    routeChoice: {},
+    singleRouteMandate: {},
+    durations: _pfDur,
   };
 
   // Emit complete
@@ -3390,18 +1184,16 @@ module.exports = async function preflightAgents(state) {
   });
 
   _mark('totalMs');
-  logger.info(`[Node:PreflightAgents] Preflight complete: ${agentReadiness.length} agents checked, ${agentReadiness.filter(a => !a.ready).length} not ready, ${agentReadiness.filter(a => !a.authed).length} need auth | timings: ${JSON.stringify(_pfDur)}`);
+  logger.info(`[Node:PreflightAgents] Preflight complete (scoped): ${agentReadiness.length} needed agents checked, ${agentReadiness.filter(a => !a.ready).length} not ready, ${agentReadiness.filter(a => !a.authed).length} need auth | timings: ${JSON.stringify(_pfDur)}`);
 
   return {
     ...state,
     taskFacts,
     preflightResult,
-    preflightRouteChoice,
+    preflightRouteChoice: {},
     preflightDone: true,
     _trainedRecipeMap: mapSize > 0 ? _trainedRecipeMap : state._trainedRecipeMap,
-    // ── Grill-Me Phase A: expose route decision on state for gatherPlanContext ──
-    routeDecision: _routeDecision,
-    // ── File reference resolution (for app_automation / local_file tasks) ──────
+    routeDecision: {},
     _fileResolution: _fileResolution,
     resolvedMessage: userMessage !== (state.resolvedMessage || state.message || '')
       ? userMessage
@@ -3415,4 +1207,9 @@ module.exports._getLedgerAuth = _getLedgerAuth;
 module.exports._cliLedgerAuth = _cliLedgerAuth;
 module.exports.clearAuthCache = function clearAuthCache(agentId) {
   if (agentId) _authCache.delete(agentId.toLowerCase());
+  try {
+    const cache = _loadPersistentAuthCache();
+    if (agentId) delete cache[agentId.toLowerCase()];
+    _savePersistentAuthCache(cache);
+  } catch (_) {}
 };

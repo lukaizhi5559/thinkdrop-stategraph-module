@@ -695,8 +695,12 @@ module.exports = async function resolveReferencesV2(state) {
   } else {
     // Prefire the deterministic-plan classify in parallel with classifyTask
     // when the message lexically resembles a local op — the two LLM calls
-    // otherwise serialize (~7s + ~3s). Decompose awaits this promise via
-    // _classifyDeterministic; a resolved followUpTarget reclassifies there.
+    // otherwise serialize (~7s + ~3s). This regex is a LATENCY HINT ONLY, never
+    // an eligibility gate: a miss just means classify starts later — every
+    // command_automate path downstream calls _classifyDeterministic
+    // unconditionally, and the model decides fit. Decompose awaits this
+    // promise via _classifyDeterministic; a resolved followUpTarget reclassifies
+    // there.
     // tc-lite for the prefire: the live page URL is already known from
     // memory.getActiveAppContext, so page_scan/page_print can hit even
     // before classifyTask lands. Without it the prefired classify ran with

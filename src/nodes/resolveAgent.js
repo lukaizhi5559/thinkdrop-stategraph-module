@@ -692,10 +692,10 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
       logger.info(`[Node:ResolveAgent] Coercing create spec ${agentId} from type 'app' → 'browser' (per-service app agents are not creatable)`);
       type = 'browser';
     }
-    let startUrl = a.startUrl || null;
-    if (create && (type === 'browser' || type === 'api_key' || type === 'bearer' || type === 'basic') && !startUrl) {
-      startUrl = await _resolveStartUrlForService(service, userMessage, mcpAdapter, logger);
-    }
+    // Unregistered (create:true) specs escalate via preflight's registry check
+    // — onboarding (incl. startUrl resolution) is a compile-time step, so the
+    // runtime never resolves URLs for agents it won't build.
+    const startUrl = a.startUrl || null;
 
     normalized.agents.push({
       agentId,
@@ -743,10 +743,6 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
       logger.info(`[Node:ResolveAgent] URL/domain mismatch — rejecting ${rejected.map(a => a.agentId).join(', ')} (startUrl doesn't match targetService="${targetService}") — creating ${targetAgentId} instead`);
       normalized.agents = normalized.agents.filter(a => !rejected.includes(a));
       if (!normalized.agents.some(a => a.agentId === targetAgentId)) {
-        let startUrl = null;
-        if (!targetRegistered) {
-          startUrl = await _resolveStartUrlForService(targetService, userMessage, mcpAdapter, logger);
-        }
         normalized.agents.push({
           agentId: targetAgentId,
           role: rejected[0]?.role || '',
@@ -754,7 +750,7 @@ async function _normalizeAgentResult(result, registeredAgents, userMessage, mcpA
           create: !targetRegistered,
           type: 'browser',
           service: targetService,
-          startUrl,
+          startUrl: null,
         });
       }
     }
@@ -804,15 +800,15 @@ module.exports = async function resolveAgent(state) {
         reasoning: 'deterministic service template', question: null,
       } };
     }
-    logger.info(`[Node:ResolveAgent] Pinned agent ${svcAgent} not registered — dropping deterministic service plan, falling back to LLM planning`);
-    state = {
-      ...state,
-      _deterministicPlan: null,
-      _deterministicTemplate: null,
-      _deterministicLowRisk: null,
-      _deterministicExternal: null,
-      _deterministicServiceAgent: null,
-    };
+    // Pinned service agent not registered — keep the plan coverage and let
+    // preflight escalate 'agent_not_onboarded' so the compiler onboards the
+    // agent (then the same plan executes). Dropping the det plan into LLM
+    // selection just re-derives a worse answer.
+    logger.info(`[Node:ResolveAgent] Pinned agent ${svcAgent} not registered — keeping deterministic plan; preflight will escalate for onboarding`);
+    return { ...state, resolveAgentResult: {
+      agents: [{ agentId: svcAgent, role: resolvedMessage || message || '', exists: false, create: false, type: 'browser' }],
+      reasoning: 'deterministic service template — agent not onboarded', question: null,
+    } };
   }
 
   // ── Skip: deterministic plan — catalog skills never need service agents ────
@@ -863,8 +859,25 @@ module.exports = async function resolveAgent(state) {
   // prompt to catt.agent). Verify it's actually registered — then bind it
   // directly, bypassing LLM selection AND the local_system skip below (the pin
   // is stronger evidence than the taskType heuristic).
-  const _pinned = state._pinnedAgentId && String(state._pinnedAgentId).toLowerCase();
-  if (_pinned && _pinned.endsWith('.agent')) {
+  // Normalize: bare stems ('catt') → 'catt.agent'. Ids that are neither bare
+  // nor .agent-suffixed ('video.ffmpeg') are capability ids, not agent ids —
+  // log a verdict and ignore rather than silently falling through to LLM
+  // selection (observed: 'video.ffmpeg' pin dropped silently → generic
+  // preflight fabricated video/http/ffmpeg agents).
+  const _pinnedRaw = state._pinnedAgentId && String(state._pinnedAgentId).toLowerCase();
+  const _pinned = _pinnedRaw && (_pinnedRaw.endsWith('.agent')
+    ? _pinnedRaw
+    : (!_pinnedRaw.includes('.') ? `${_pinnedRaw}.agent` : null));
+  if (_pinnedRaw && !_pinned) {
+    logger.warn(`[Node:ResolveAgent] Ignoring malformed pin "${_pinnedRaw}" — capability ids are not agent ids (pin must resolve to a registered .agent id)`);
+    // Clear the phantom so downstream consumers (the deterministic-classify
+    // pin veto, preflight, gatherPlanContext) never honor a pin that was
+    // rejected here — observed: 'video.ffmpeg' vetoed a media_play plan.
+    state._pinnedAgentId = null;
+    state._capabilityReason = null;
+    state._pinnedAgentRejected = { id: _pinnedRaw, reason: 'malformed' };
+  }
+  if (_pinned) {
     let _pinOk = true;
     let _pinType = null;
     try {
@@ -886,6 +899,9 @@ module.exports = async function resolveAgent(state) {
       } };
     }
     logger.warn(`[Node:ResolveAgent] Pinned agent ${_pinned} not registered — dropping pin`);
+    state._pinnedAgentId = null;
+    state._capabilityReason = null;
+    state._pinnedAgentRejected = { id: _pinned, reason: 'not_registered' };
   }
 
   // ── Skip: local_system tasks need no service agent ──────────────────────────

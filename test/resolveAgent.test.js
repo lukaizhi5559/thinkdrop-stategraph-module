@@ -332,7 +332,12 @@ async function runTests() {
     if (agents.length !== 1) throw new Error(`Expected 1 agent, got ${agents.length}`);
     if (agents[0].type !== 'browser') throw new Error(`Expected type 'browser', got '${agents[0].type}'`);
     if (agents[0].agentId !== 'figma.agent') throw new Error(`Expected figma.agent, got ${agents[0].agentId}`);
-    if (!agents[0].startUrl) throw new Error('Expected a startUrl to be resolved for the coerced browser agent');
+    // New contract: runtime never resolves startUrls for unregistered
+    // (create:true) specs — onboarding, including startUrl resolution, is a
+    // compile-time step. The spec flows to preflight's agent_not_onboarded
+    // escalation instead.
+    if (agents[0].exists !== false) throw new Error(`Expected exists:false (unregistered), got ${agents[0].exists}`);
+    if (agents[0].startUrl) throw new Error(`Runtime must not resolve startUrls for unregistered specs — got ${agents[0].startUrl}`);
   });
 
   section('Task-type guards');

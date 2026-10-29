@@ -885,11 +885,13 @@ function _sanitizeSkillPlan(skillPlan, state) {
           step.args = { action: 'run', task: (_goalText || step.description || '').trim() };
           _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: rewrote shell.run auth/setup step → cli.agent run "${step.args.task.slice(0, 80)}"`);
         } else if (_svc && !_filler.has(_svc) && _svc.length >= 2 && !/^\d/.test(_svc)) {
-          // install/setup of a named tool → build_agent discovers the real
-          // package (no hallucinated names), installs, verifies, registers.
+          // install/setup of a named tool — the generic cli.agent run loop
+          // drives the install in the terminal without fabricating a
+          // descriptor. Registering <svc>.agent is compile-time work
+          // (capability.select), not a step in this plan.
           step.skill = 'cli.agent';
-          step.args = { action: 'build_agent', service: _svc };
-          _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: rewrote shell.run install step → cli.agent build_agent service="${_svc}"`);
+          step.args = { action: 'run', task: `Install and set up ${_svc}: ${(_goalText || step.description || '').trim()}`.slice(0, 400) };
+          _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: rewrote shell.run install step → cli.agent run for "${_svc}" (no descriptor fabrication)`);
         }
       }
       // Coerce argv object entries to strings — the planner LLM sometimes wraps
@@ -2242,7 +2244,7 @@ async function planSkillsV2(state) {
       // api_suggest/needs_skill are UI card primitives — "no page content" is expected, not a real failure.
       // The previous plan correctly avoided [NEEDS AUTH] agents. Do NOT fall back to a browser agent that
       // requires authentication. Use a REST API alternative (build_agent) or surface the offer again.
-      recoveryNote = `\n\nRECOVERY CONTEXT:\n- Previous plan used ${recoveryContext.failedSkill} (a UI information card — NOT a task executor). The card surfaced correctly; the plan is not truly failed.\n- Failure reason reported: ${recoveryContext.failureReason}\n⚠️ CRITICAL AUTH CONSTRAINT: The registered browser agents for this service are marked [NEEDS AUTH] and cannot execute tasks. DO NOT use browser.agent { action: "run" } with any [NEEDS AUTH] agent. You MUST use browser.agent { action: "build_agent", service: "sendgrid" } (or mailgun) to set up a REST API sender, OR surface api_suggest again if the user has not yet chosen a provider.`;
+      recoveryNote = `\n\nRECOVERY CONTEXT:\n- Previous plan used ${recoveryContext.failedSkill} (a UI information card — NOT a task executor). The card surfaced correctly; the plan is not truly failed.\n- Failure reason reported: ${recoveryContext.failureReason}\n⚠️ CRITICAL AUTH CONSTRAINT: The registered browser agents for this service are marked [NEEDS AUTH] and cannot execute tasks. DO NOT use browser.agent { action: "run" } with any [NEEDS AUTH] agent, and DO NOT emit build_agent steps — onboarding is a compile-time step. Use an already-registered REST API agent if one exists, or surface api_suggest again if the user has not yet chosen a provider.`;
     } else {
       recoveryNote = `\n\nRECOVERY CONTEXT (previous attempt failed — DO NOT repeat the same plan):\n- Failed step: ${recoveryContext.failedSkill} (step ${recoveryContext.failedStep})\n- Failure reason: ${recoveryContext.failureReason}\n- Actual URL reached: ${recoveryContext.actualUrl || 'unknown'}\n- Suggestion: ${recoveryContext.suggestion}\n- Constraint: ${recoveryContext.constraint || 'none'}\nYou MUST produce a DIFFERENT plan. RECOVERY TOOL CONSTRAINT: Any step that previously used a browser agent MUST keep the same browser route — url.first.agent for navigation plus dom.act / turn.loop.agent action steps for on-page work.`;
     }
@@ -2661,7 +2663,7 @@ async function planSkillsV2(state) {
                 _preflightCliMap[c.service.toLowerCase()] = { hasCli: !!c.cli };
                 if (!c.cli) {
                   const provider = c.isOAuth ? 'OAuth-based' : c.isApiKey ? 'API key required' : 'unknown';
-                  lines.push(`${c.service}: ${provider} — use browser.agent { action: 'build_agent' } then { action: 'run' }`);
+                  lines.push(`${c.service}: ${provider} — no CLI route; use a REGISTERED agent only (onboarding new agents is a compile-time step — do not emit build steps)`);
                   continue;
                 }
                 if (!c.installed) {
@@ -3540,11 +3542,13 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
         }
       }
 
-      // No mandate — replace with a generic browser.agent build_agent
+      // No mandate — replace with a browser.agent run on the named service.
+      // If the agent isn't registered, run returns needsBuild and execution
+      // escalates to compile-time onboarding — never a fabricated build step.
       return {
         skill: 'browser.agent',
-        args: { action: 'build_agent', service: targetService || 'unknown' },
-        description: step.description || `Build agent for ${targetService || 'service'}`,
+        args: { action: 'run', agentId: `${targetService || 'unknown'}.agent`, task: step.description || userMessage || `Use ${targetService || 'the service'}` },
+        description: step.description || `Use ${targetService || 'service'}`,
       };
     });
 
@@ -3631,6 +3635,24 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
 
     const bypasses = _collectBypasses(skillPlan);
     if (bypasses.length > 0) {
+      // Runtime never builds agents — a bypass that needs an unregistered
+      // agent escalates to the compiler (capability.select onboards it),
+      // rather than splicing a build_agent step into the live plan.
+      const _nb = bypasses.filter(b => b.needsBuild);
+      if (_nb.length > 0 && !state._allowPlannerFallback) {
+        logger.warn(`[Node:PlanSkillsV2] browser.act bypass needs unregistered agent(s): [${_nb.map(b => b.agentId).join(', ')}] — escalating needs_plan (agent_not_onboarded)`);
+        return {
+          ...state,
+          _needsPlan: {
+            reason: 'agent_not_onboarded',
+            detail: `plan needs unregistered agent(s): ${_nb.map(b => b.agentId).join(', ')} — onboard at compile time (capability.select)`,
+            seedPrompt: `${state.resolvedMessage || state.message || userMessage || ''}\n\n[Runtime readiness: agent_not_onboarded — ${_nb.map(b => b.agentId).join(', ')}]`,
+            refs: [],
+            gatheredContext: (state.planGatheringAnswers || []),
+            missingAgents: _nb.map(b => b.agentId),
+          },
+        };
+      }
       logger.warn(`[Node:PlanSkillsV2] browser.act bypass detected: [${bypasses.map(b => b.service).join(', ')}] — rewriting`);
       const bypassKeys = new Set(bypasses.map(b => b.service));
       const rewritten = [];

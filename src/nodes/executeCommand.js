@@ -773,17 +773,31 @@ async function _thinPostFailureHandler(state) {
     const _installish = /\b(install|set\s?up|setup|get|configure|authenticat\w+|sign\s?in|log\s?in|connect|authoriz\w+|download)\b/i.test(_goalText)
       || /\b(npm|brew|pip3?|pipx|apt(-get)?|gem|cargo)\s+(install|i|add)\b/i.test(_argvStr);
     if (_isGoalMode || _installish) {
-      // Install of a named tool → build_agent (discovers the real package,
-      // verifies, registers the agent for later steps). Other goals → the
-      // generic run loop with the failure evidence attached.
+      // Install of a named tool is compile-time work — runtime never splices
+      // a build_agent step (same fabrication class as the missing-agent
+      // splice). Escalate so the compiler onboards the tool and re-emits the
+      // plan. Non-install goal failures still get the generic run retry.
       const _svcM = _argvStr.match(/(?:npm|brew|pip3?|pipx|apt(?:-get)?|gem|cargo)\s+(?:install|i|add)\s+(?:-g\s+|--global\s+)?["']?(@?[\w./@-]+)/i)
         || _goalText.match(/\b(?:install|set\s?up|setup|get|add)\s+(?:the\s+|a\s+|an\s+)?["']?([a-zA-Z0-9][\w.-]*)/i);
       const _svc = _svcM?.[1]
         ? (_svcM[1].startsWith('@') ? _svcM[1].split('/')[0].slice(1) : _svcM[1].split('@')[0]).replace(/-?cli$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '')
         : '';
-      const _evidence = `Previous attempt failed: ${_argvStr || '(argv resolved from goal)'} → ${String(failedStep.error || 'failed').slice(0, 300)}`;
       const _filler = new Set(['the', 'a', 'an', 'it', 'this', 'my', 'your', 'to', 'on', 'in', 'for', 'with']);
       const _useBuild = _installish && _svc && !_filler.has(_svc) && _svc.length >= 2;
+      if (_useBuild && !state._allowPlannerFallback) {
+        logger.warn(`[ExecuteCommand:ThinRecovery] shell.run step ${skillCursor + 1} failed on install of "${_svc}" — escalating needs_plan (cli_not_installed); runtime never installs tools`);
+        return {
+          ...state,
+          _needsPlan: {
+            reason: 'cli_not_installed',
+            detail: `plan step tried to install ${_svc} — tool install is a compile-time step (capability.select / setup.start)`,
+            seedPrompt: `${resolvedMessage || message || ''}\n\n[Runtime readiness: cli_not_installed — ${_svc}]`,
+            refs: [],
+            gatheredContext: (state.planGatheringAnswers || []),
+          },
+        };
+      }
+      const _evidence = `Previous attempt failed: ${_argvStr || '(argv resolved from goal)'} → ${String(failedStep.error || 'failed').slice(0, 300)}`;
       // Carry the original request + prior step discoveries into the
       // substituted agent run — without them the generic loop re-derives the
       // world from a bare goal (observed: an escalated "find uncommitted
@@ -802,12 +816,10 @@ async function _thinPostFailureHandler(state) {
       patchedPlan[skillCursor] = {
         ...patchedPlan[skillCursor],
         skill: 'cli.agent',
-        args: _useBuild
-          ? { action: 'build_agent', service: _svc, protectedPaths: _protectedPaths }
-          : { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}${_ctxBlock ? `\n${_ctxBlock}` : ''}`, cwd: failedStep.args?.cwd || undefined, protectedPaths: _protectedPaths },
-        description: failedStep.description || (_useBuild ? `Install & register ${_svc}` : `Retry agentically: ${(_goalText || _argvStr).slice(0, 60)}`),
+        args: { action: 'run', task: `${_goalText || _argvStr || 'complete the failed shell step'} — ${_evidence}${_ctxBlock ? `\n${_ctxBlock}` : ''}`, cwd: failedStep.args?.cwd || undefined, protectedPaths: _protectedPaths },
+        description: failedStep.description || `Retry agentically: ${(_goalText || _argvStr).slice(0, 60)}`,
       };
-      logger.info(`[ExecuteCommand:ThinRecovery] AGENT_ESCALATE: shell.run step ${skillCursor + 1} failed (${(failedStep.error || '').slice(0, 80)}) — substituting cli.agent ${_useBuild ? `build_agent service=${_svc}` : 'generic run'}`);
+      logger.info(`[ExecuteCommand:ThinRecovery] AGENT_ESCALATE: shell.run step ${skillCursor + 1} failed (${(failedStep.error || '').slice(0, 80)}) — substituting cli.agent generic run`);
       return {
         ...state,
         recoveryAction: 'auto_patch',
@@ -903,42 +915,29 @@ async function _thinPostFailureHandler(state) {
     };
   }
 
-  // ── cli.agent run on a missing agent → splice build_agent before it ───────
+  // ── cli.agent run on a missing agent → escalate to compile-time onboarding ──
   // needsBuild means the referenced agentId isn't in the registry — typically
-  // a fabricated "<svc>.agent" minted for a merely-detected CLI. cli.agent's
-  // run self-heals when the binary is already on PATH; a needsBuild reaching
-  // recovery means the binary is missing too (or the auto-build declined) —
-  // schedule the explicit build step, then let the run retry against the real
-  // agent. Mirrors the browser.agent needsBuild → REPLAN contract. Once per
-  // cursor — a second failure falls through to normal recovery.
-  const _nbAgentId = failedStep.skill === 'cli.agent' && failedStep.needsBuild
+  // a fabricated "<svc>.agent" minted for a merely-detected CLI. Runtime never
+  // builds agents (splicing a build_agent step was the same fabrication class
+  // as preflight's eager registrations): escalate needs_plan so the compiler
+  // onboards the capability (capability.probe → setup.start → capability.select)
+  // and resumes with a corrected plan. Browser-agent needsBuild takes the same
+  // path — one onboarding lane for every executor kind.
+  const _nbAgentId = (failedStep.skill === 'cli.agent' || failedStep.skill === 'browser.agent') && failedStep.needsBuild
     ? String(failedStep.args?.agentId || '') : '';
   const _nbSvcKey = _nbAgentId.replace(/\.agent$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '');
-  if (_nbSvcKey.length >= 2
-      && failedStep.args?.action === 'run'
-      && Array.isArray(skillPlan) && skillPlan[skillCursor]
-      && !(patchHistory || []).some(p => p.action === 'AGENT_BUILD' && p.cursor === skillCursor)) {
-    const patchedPlan = [...skillPlan];
-    patchedPlan.splice(skillCursor, 0, {
-      skill: 'cli.agent',
-      args: { action: 'build_agent', service: _nbSvcKey, protectedPaths: _protectedPaths },
-      description: `Build the ${_nbSvcKey} agent (register CLI descriptor)`,
-    });
-    // Normalize the deferred run step's agentId to match what build_agent
-    // creates — a fabricated "my-svc.agent" would re-miss even after
-    // "mysvc.agent" registers.
-    const _runStep = patchedPlan[skillCursor + 1];
-    if (_runStep?.args?.agentId) {
-      _runStep.args = { ..._runStep.args, agentId: `${_nbSvcKey}.agent` };
-    }
-    logger.info(`[ExecuteCommand:ThinRecovery] AGENT_BUILD: cli.agent step ${skillCursor + 1} references unregistered ${_nbSvcKey}.agent — inserting build_agent before retry`);
+  if (_nbSvcKey.length >= 2) {
+    logger.warn(`[ExecuteCommand:ThinRecovery] Step ${skillCursor + 1} references unregistered agent ${_nbAgentId} — escalating needs_plan (agent_not_onboarded)`);
     return {
       ...state,
-      recoveryAction: 'auto_patch',
-      skillPlan: patchedPlan,
-      recoveryNote: `The ${_nbSvcKey} agent isn't set up yet — building it first, then retrying.`,
-      patchHistory: [...patchHistory, { action: 'AGENT_BUILD', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
-      stepRetryCount: stepRetryCount + 1,
+      _needsPlan: {
+        reason: 'agent_not_onboarded',
+        detail: `plan step references unregistered agent ${_nbAgentId} — onboard ${failedStep.skill === 'cli.agent' ? 'the CLI tool' : 'the service'} at compile time and resume`,
+        seedPrompt: `${state.resolvedMessage || state.message || ''}\n\n[Runtime readiness: agent_not_onboarded — ${_nbAgentId}]`,
+        refs: [],
+        gatheredContext: (state.planGatheringAnswers || []),
+        missingAgents: [_nbAgentId],
+      },
       failedStep: null,
       commandExecuted: false,
     };
