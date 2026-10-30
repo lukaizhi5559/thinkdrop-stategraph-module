@@ -3160,6 +3160,36 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
     logger.info(`[Node:PlanSkillsV2] File-edit constraint injected (file=${_attachedEditFile})`);
   }
 
+  // ── Filesystem grounding — the runtime planner invents paths without it ────
+  // Mirrors comms-graph's stepgen block: verified paths + repo topology + a
+  // hard rule against invented roots. The journal IS the compile→runtime
+  // handoff — paths verified at plan-compile surface here as KNOWN PATHS.
+  let _pathGroundingNote = '';
+  try {
+    const _pc = require('../../../shared/path-context.cjs');
+    const _gAttach = new Set();
+    if (_fileRes && _fileRes.path && fs.existsSync(_fileRes.path)) _gAttach.add(_fileRes.path);
+    for (const a of (getAttachedFilePaths(userMessage) || [])) {
+      const p = a && a.resolved;
+      if (p && fs.existsSync(p)) _gAttach.add(p);
+    }
+    const _gKnown = [...new Set([..._gAttach, ...(_pc.journalRelevantPaths(userMessage) || [])])].slice(0, 15);
+    const _gBits = [
+      `Runtime environment: HOME=${homeDir}, cwd=${process.cwd()}.`,
+      _gKnown.length ? `KNOWN PATHS (verified to exist — use these instead of inventing a root):\n${_gKnown.map(p => `- ${p}`).join('\n')}` : '',
+    ];
+    if (/\b(repo|repos|repositories|git|commit|push|pull|branch|merge)\b/i.test(String(userMessage || ''))) {
+      const _gRepos = new Set();
+      for (const p of _gKnown) {
+        for (const r of _pc.repoTopology(p)) _gRepos.add(r);
+        if (_gRepos.size >= 15) break;
+      }
+      if (_gRepos.size) _gBits.push(`REPOSITORIES (verified — commit/push targets may ONLY come from this list):\n${[..._gRepos].slice(0, 15).map(r => `- ${r}`).join('\n')}`);
+    }
+    _gBits.push('Emit ONLY absolute paths that exist — from KNOWN PATHS/REPOSITORIES, attached files, or paths a step discovers at run time. Never invent a project root or a repository directory name.');
+    _pathGroundingNote = `\n\n${_gBits.filter(Boolean).join('\n')}`;
+  } catch (_) {}
+
   const planningQuery = [
     _agentIdentity,
     SKILL_SYSTEM_PROMPT,
@@ -3181,6 +3211,7 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
     _systemInfoFreshDataNote,
     _publicWebConstraint,
     _fileEditConstraint,
+    _pathGroundingNote,
     `\n\nUser request: "${(runtimeParamMessage || userMessage).replace(/"/g, '\\"').slice(0, 2000)}"`,
   ].filter(Boolean).join('\n');
 
@@ -3416,6 +3447,34 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
     }
     if (!Array.isArray(skillPlan)) return { ...state, planError: `Cannot parse skill plan — no step array found` };
   }
+
+  // ── Filesystem gate A: verify → repair → informed retry ───────────────────
+  // The grounding note is advisory; this is the floor. Runs BEFORE the heavy
+  // post-processing so a retried plan still flows through every transform.
+  try {
+    const _pc = require('../../../shared/path-context.cjs');
+    const _missA = _pc.missingInputPaths(skillPlan);
+    if (_missA.length) {
+      const _repA = _pc.repairMissingPaths(skillPlan, _missA);
+      if (_repA.repairs.length) {
+        logger.info(`[Node:PlanSkillsV2] Path repair applied: ${_repA.repairs.map(r => `${r.from} → ${r.to}`).join('; ')}`);
+      }
+      if (_repA.stillMissing.length && backend) {
+        logger.warn(`[Node:PlanSkillsV2] Plan references missing path(s) — informed retry: ${_repA.stillMissing.map(m => m.path).join(', ')}`);
+        if (progressCallback) progressCallback({ type: 'planning', message: 'Fixing path references…' });
+        const _pathQuery = `${planningQuery}\n\nINVALID PATHS IN PRIOR DRAFT (verified NOT to exist on this machine — use only KNOWN PATHS/discovered paths, or drop the steps that need them):\n${_repA.stillMissing.map(m => `- ${m.path}`).join('\n')}`;
+        try {
+          const _rawRetry2 = await backend.generateAnswer(_pathQuery, payload, payload.options, null);
+          let _retryPlan = parsePlan(_rawRetry2, logger);
+          if (_retryPlan && !Array.isArray(_retryPlan)) {
+            if (_retryPlan.skill) _retryPlan = [_retryPlan];
+            else if (Array.isArray(_retryPlan.steps)) _retryPlan = _retryPlan.steps;
+          }
+          if (Array.isArray(_retryPlan) && _retryPlan.length) skillPlan = _retryPlan;
+        } catch (_) {}
+      }
+    }
+  } catch (_) {}
 
   // ── Post-parse backstop: rewrite browser/playwright/app.agent → web for public modes ──
   // Even with the hard constraint, the LLM may still emit browser.agent due to
@@ -4178,6 +4237,30 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
       logger.info(`[Node:PlanSkillsV2] Injected resolvedFilePath into ${_injected} app.agent step(s): ${_fileRes.path}`);
     }
   }
+
+  // ── Filesystem gate B: final verify before the plan is saved/approved ──────
+  // Post-processing injects only verified paths, but the check is cheap — a
+  // doomed plan fails here, honestly, instead of executing into cli.agent
+  // "does not exist" loops (observed: ~6 min burned on invented repos).
+  try {
+    const _pc = require('../../../shared/path-context.cjs');
+    const _missB = _pc.missingInputPaths(skillPlan);
+    if (_missB.length) {
+      const _repB = _pc.repairMissingPaths(skillPlan, _missB);
+      if (_repB.repairs.length) {
+        logger.info(`[Node:PlanSkillsV2] Final path repair applied: ${_repB.repairs.map(r => `${r.from} → ${r.to}`).join('; ')}`);
+      }
+      if (_repB.stillMissing.length) {
+        const _list = [...new Set(_repB.stillMissing.map(m => m.path))].join(', ');
+        logger.warn(`[Node:PlanSkillsV2] Plan rejected — missing path(s): ${_list}`);
+        return { ...state, planError: `The plan references path(s) that don't exist on this machine: ${_list}. Point me at the right location or rephrase.` };
+      }
+    }
+    // Verified inputs earn journal entries — the runtime lane's contribution
+    // back to the shared path map (deferred follow-up, landed here).
+    const _verified = _pc.collectMustExistPaths(skillPlan).map(x => x.path);
+    if (_verified.length) _pc.journalRecord(_verified);
+  } catch (_) {}
 
   // ── Save plan to disk ─────────────────────────────────────────────────────
   let _skillPlanFile = state._skillPlanFile || null;

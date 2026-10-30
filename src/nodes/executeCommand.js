@@ -514,7 +514,7 @@ function _tryAutoSkipIndependentStep(state) {
 // deterministic-plan short-circuit and the agent-failure ask_user path.
 const _AGENT_SKILLS_FOR_RECOVERY = new Set(['browser.agent', 'cli.agent', 'playwright.agent', 'url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'task.agent']);
 
-async function _thinPostFailureHandler(state) {
+async function _thinPostFailureHandlerImpl(state) {
   const { failedStep, skillPlan, skillCursor, skillResults = [], llmBackend, message, resolvedMessage, stepRetryCount = 0, replanCount = 0, patchHistory = [], mcpAdapter } = state;
   const logger = state.logger || console;
 
@@ -631,6 +631,63 @@ async function _thinPostFailureHandler(state) {
       },
       replanCount: replanCount + 1,
       patchHistory: [...patchHistory, { action: 'MISSING_INFO', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
+  // ── Missing-path gate ────────────────────────────────────────────────────
+  // A step whose input paths verified as nonexistent at dispatch is a
+  // planning defect, not an execution bug — replanning (grounded in
+  // planSkillsV2's KNOWN PATHS/REPOSITORIES) or the authoring plan lane is
+  // the only fix. Same shape as missing-information: plan task → plan_update
+  // loop-back; repeat signature → ask_user; else replan_step.
+  if (failedStep.reason === 'missing-path' && !failedStep.askUser) {
+    const _missingPaths = Array.isArray(failedStep.missingPaths) ? failedStep.missingPaths : [];
+    const _pathList = _missingPaths.join(', ') || 'unknown path';
+    if (state._planId) {
+      logger.info(`[ExecuteCommand:ThinRecovery] missing-path on plan task — plan_update loop-back (${_pathList})`);
+      return {
+        ...state,
+        recoveryAction: null,
+        _planUpdate: {
+          reason: `missing-path: step "${failedStep.skill}" references path(s) that do not exist on this machine: ${_pathList}`,
+          proposal: `Re-emit the step with verified absolute paths (KNOWN PATHS/REPOSITORIES), or drop it. Never invent a repository or project-root directory name.`,
+          missingPaths: _missingPaths,
+          planId: state._planId,
+          taskNum: state._planTaskNum || null,
+        },
+        patchHistory: [...patchHistory, { action: 'MISSING_PATH_PLAN', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
+    if ((patchHistory || []).some(p => p.action === 'MISSING_PATH' && p.sig === _failSig)) {
+      logger.warn(`[ExecuteCommand:ThinRecovery] missing-path survived a replan — asking user: ${_pathList}`);
+      return {
+        ...state,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: `I can't find this location: ${_pathList}. Where should I look — or should I skip this step?`,
+          options: [],
+          _missingPaths,
+        },
+        patchHistory: [...patchHistory, { action: 'MISSING_PATH_ASK', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        commandExecuted: false,
+      };
+    }
+    logger.info(`[ExecuteCommand:ThinRecovery] missing-path on ${failedStep.skill} (${_pathList}) — replan_step`);
+    return {
+      ...state,
+      recoveryAction: 'replan_step',
+      recoveryContext: {
+        failedSkill: failedStep.skill,
+        failedStep,
+        failureReason: `missing-path: ${failedStep.skill} referenced path(s) that do not exist on this machine: ${_pathList} — re-emit with verified absolute paths from KNOWN PATHS/REPOSITORIES, never an invented directory name`,
+        missingPaths: _missingPaths,
+      },
+      replanCount: replanCount + 1,
+      patchHistory: [...patchHistory, { action: 'MISSING_PATH', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
       failedStep: null,
       commandExecuted: false,
     };
@@ -1414,6 +1471,48 @@ async function _thinPostFailureHandler(state) {
     patchHistory: [...(_ph || []), { action: 'ASK_USER', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
     commandExecuted: false,
   };
+}
+
+// ── step_recovering emitter ─────────────────────────────────────────────────
+// The impl above returns a new state carrying recoveryAction/recoveryNote/
+// pendingQuestion/_planUpdate — none of which reached the UI, so a failed step
+// stayed pinned red for the entire agent-recovery loop (observed: a commit run
+// showed a wall of red Xs while cli.agent was actively fixing each step).
+// This wrapper inspects the impl's chosen path once and emits step_recovering
+// (plus the plan: mirror) so the renderer can show "hit a snag — trying
+// another way" instead of a terminal-looking failure.
+async function _thinPostFailureHandler(state) {
+  const result = await _thinPostFailureHandlerImpl(state);
+  try {
+    const cb = state.progressCallback;
+    const failedStep = state.failedStep;
+    if (!cb || !failedStep || !result || result === state) return result;
+    const action = result.recoveryAction || null;
+    const planUpdate = result._planUpdate || null;
+    const needsUser = !!result.pendingQuestion;
+    const needsPlan = !!result._needsPlan;
+    if (!action && !planUpdate && !needsUser && !needsPlan) return result;
+    // `via` = the substituted skill at the same cursor (cli.agent escalation,
+    // edit→app.agent, browser re-route). Same-skill auto_patch/retry → null.
+    const newSkill = Array.isArray(result.skillPlan) && result.skillPlan[state.skillCursor]
+      ? result.skillPlan[state.skillCursor].skill : null;
+    const via = newSkill && newSkill !== failedStep.skill ? newSkill : null;
+    const note = result.recoveryNote || planUpdate?.reason || needsPlan?.detail || '';
+    const evt = {
+      type: 'step_recovering',
+      stepIndex: state.skillCursor,
+      skill: failedStep.skill,
+      description: failedStep.description || failedStep.skill,
+      error: String(failedStep.error || failedStep.detail || '').slice(0, 300),
+      action: planUpdate ? 'replan' : needsPlan ? 'needs_plan' : action,
+      note,
+      via,
+      needsUser,
+    };
+    cb(evt);
+    if (state._skillPlanFile) cb({ ...evt, type: 'plan:step_recovering' });
+  } catch (_) { /* progress emission must never break recovery */ }
+  return result;
 }
 
 // ── Heartbeat wrapper for long-running MCP calls ───────────────────────────
@@ -2812,12 +2911,31 @@ module.exports = async function executeCommand(state) {
       prevStdout = '(previous step produced no output)';
     }
     if (prevStdout) {
-      // Case-insensitive: match {{PREV_OUTPUT}} and {{prev_stdout}} (planner sometimes emits lowercase)
-      const injectPrev = (val) => typeof val === 'string'
-        ? val.replace(/\{\{PREV_OUTPUT\}\}/gi, prevStdout).replace(/\{\{prev_stdout\}\}/gi, prevStdout)
-        : val;
+      // Case-insensitive: match {{PREV_OUTPUT}} and {{prev_stdout}} (planner sometimes emits lowercase).
+      // Deep-walk: markers live inside argv arrays / nested arg objects (the
+      // contract for dynamic commit messages is argv:['-m','{{synthesisAnswer}}'])
+      // — a top-level-only pass left them literal and the generic
+      // unresolved-placeholder guard hard-failed the step (observed failure).
+      // Shell-destined values get a sanitized variant: markdown code fences
+      // and backticks in argv trip shell.run's BLOCKED_ARG_PATTERNS — the
+      // step is rejected before it can even run.
+      const _shellStrip = (s) => s.replace(/```[^\n`]*\n?/g, '').replace(/`/g, "'");
+      const _isShellArgKey = (k) => /^(argv|cmd|command|script|cmdline)$/i.test(String(k));
+      const injectPrev = (val, inShell) => {
+        if (typeof val === 'string') {
+          const sub = inShell ? _shellStrip(prevStdout) : prevStdout;
+          return val.replace(/\{\{PREV_OUTPUT\}\}/gi, sub).replace(/\{\{prev_stdout\}\}/gi, sub);
+        }
+        if (Array.isArray(val)) return val.map(v => injectPrev(v, inShell));
+        if (val && typeof val === 'object') {
+          const o = {};
+          for (const [k2, v2] of Object.entries(val)) o[k2] = injectPrev(v2, inShell || _isShellArgKey(k2));
+          return o;
+        }
+        return val;
+      };
       const newArgs = {};
-      for (const [k, v] of Object.entries(args)) newArgs[k] = injectPrev(v);
+      for (const [k, v] of Object.entries(args)) newArgs[k] = injectPrev(v, _isShellArgKey(k));
       args = newArgs;
     }
 
@@ -2828,7 +2946,16 @@ module.exports = async function executeCommand(state) {
       const _tmpFile = `/tmp/thinkdrop_pipe_${Date.now()}.txt`;
       try {
         require('fs').writeFileSync(_tmpFile, prevStdout, 'utf8');
-        const injectFile = (val) => typeof val === 'string' ? val.replace(/\{\{PREV_OUTPUT_FILE\}\}/g, _tmpFile) : val;
+        const injectFile = (val) => {
+          if (typeof val === 'string') return val.replace(/\{\{PREV_OUTPUT_FILE\}\}/g, _tmpFile);
+          if (Array.isArray(val)) return val.map(injectFile);
+          if (val && typeof val === 'object') {
+            const o = {};
+            for (const [k2, v2] of Object.entries(val)) o[k2] = injectFile(v2);
+            return o;
+          }
+          return val;
+        };
         const fileArgs = {};
         for (const [k, v] of Object.entries(args)) fileArgs[k] = injectFile(v);
         args = { ...fileArgs, _prevOutputFile: _tmpFile };
@@ -2840,8 +2967,16 @@ module.exports = async function executeCommand(state) {
   // ── Unresolved-marker guard ─────────────────────────────────────────────
   // A literal {{PREV_OUTPUT}}/{{prev_stdout}} must never reach the LLM (it
   // answers "no text was provided" and that text can land in saveToFile over a
-  // real file). Fail the step so recoverSkill replans instead.
-  const _leftoverMarker = Object.values(args).find(v => typeof v === 'string' && /\{\{(PREV_OUTPUT|prev_stdout)\}\}/i.test(v));
+  // real file). Fail the step so recoverSkill replans instead. Deep-walk —
+  // the argv-nested marker case used to slip past this top-level-only check
+  // and surface as a generic "plan is malformed" instead of a targeted replan.
+  const _findMarkerDeep = (val) => {
+    if (typeof val === 'string') return /\{\{(PREV_OUTPUT|prev_stdout)\}\}/i.test(val) ? val : null;
+    if (Array.isArray(val)) { for (const v of val) { const f = _findMarkerDeep(v); if (f) return f; } return null; }
+    if (val && typeof val === 'object') { for (const v of Object.values(val)) { const f = _findMarkerDeep(v); if (f) return f; } return null; }
+    return null;
+  };
+  const _leftoverMarker = _findMarkerDeep(args);
   if (_leftoverMarker) {
     const _prevSkill = skillResults[skillResults.length - 1]?.skill || 'none';
     const _mErr = `Step references {{PREV_OUTPUT}} but there is no injectable output from a previous step (prev=${_prevSkill}) — replan with a concrete source`;
@@ -5681,14 +5816,25 @@ Please try again or search with different terms.`;
   }
   if (synthesisAnswer || synthesisAnswerFile || prevStdout || prevWatchId || webAgentBestUrl || JSON.stringify(args).includes('{{fallbackUrls}}')) {
     let argsJson = JSON.stringify(args);
+    // Shell-destined values must not carry markdown — argv elements
+    // containing backticks or code fences trip shell.run's
+    // BLOCKED_ARG_PATTERNS and the step is rejected before it can run
+    // (observed: synthesized commit messages wrapped in ``` fences killed
+    // every literal `git commit -m {{synthesisAnswer}}` step). Only
+    // deterministic cmd/argv steps get the safe variant — goal-mode prose
+    // keeps its formatting.
+    const _deterministicShell = skill === 'shell.run' && (args.cmd || args.argv);
+    const _shellSafe = (s) => _deterministicShell
+      ? String(s).replace(/```[^\n`]*\n?/g, '').replace(/`/g, "'")
+      : s;
     if (synthesisAnswer) {
-      argsJson = argsJson.replace(/\{\{synthesisAnswer\}\}/g, synthesisAnswer.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
+      argsJson = argsJson.replace(/\{\{synthesisAnswer\}\}/g, _shellSafe(synthesisAnswer).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
     }
     if (synthesisAnswerFile) {
       argsJson = argsJson.replace(/\{\{synthesisAnswerFile\}\}/g, synthesisAnswerFile.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
     }
     if (prevStdout) {
-      argsJson = argsJson.replace(/\{\{prev_stdout\}\}/g, prevStdout.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
+      argsJson = argsJson.replace(/\{\{prev_stdout\}\}/g, _shellSafe(prevStdout).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n'));
     }
     if (prevWatchId) {
       argsJson = argsJson.replace(/\{\{prev_watchId\}\}/g, prevWatchId.replace(/\\/g, '\\\\').replace(/"/g, '\\"'));
@@ -5967,6 +6113,35 @@ Please try again or search with different terms.`;
       argv: resolvedArgs.argv.map(a => typeof a === 'string' ? a.replace(/~/g, _homeDir) : a),
     };
   }
+
+  // ── Dispatch-time path gate ──────────────────────────────────────────────
+  // Compile-time verification can't see {{PREV_OUTPUT}}-injected paths or
+  // compile→run drift (a file moved mid-run). Check the RESOLVED args now —
+  // a miss fails into thin recovery typed 'missing-path' (grounded replan /
+  // plan_update / ask_user) instead of executing "cd: no such file" into a
+  // cli.agent loop. The prefix slice supplies provided-paths: a step may
+  // legitimately cd into a dir an earlier step created.
+  try {
+    const _pc = require('../../../shared/path-context.cjs');
+    const _miss = _pc.missingInputPaths([
+      ...skillPlan.slice(0, skillCursor),
+      { ...step, args: resolvedArgs },
+    ]).filter(m => m.stepIndex === skillCursor);
+    if (_miss.length) {
+      const _paths = [...new Set(_miss.map(m => m.path))];
+      const _mpErr = `path does not exist: ${_paths.join(', ')}`;
+      logger.warn(`[Node:ExecuteCommand] Step ${skillCursor + 1} (${skill}) — ${_mpErr} (dispatch gate)`);
+      if (progressCallback) progressCallback({
+        type: 'step_failed', stepIndex: skillCursor, skill,
+        description, error: _mpErr,
+      });
+      return {
+        ...state,
+        failedStep: { step: skillCursor + 1, skill, description, error: _mpErr, reason: 'missing-path', missingPaths: _paths, args: resolvedArgs || {} },
+        commandExecuted: false,
+      };
+    }
+  } catch (_) {}
 
   // Protected-path sandbox — files the user attached via [File: …]/[Folder: …]
   // tags must never be rewritten by raw shell commands; they belong to
