@@ -512,7 +512,7 @@ function _tryAutoSkipIndependentStep(state) {
 // Skills whose steps carry their own internal observe→adapt loop — replaying
 // them verbatim (DET_RETRY) is guaranteed-identical output. Shared by the
 // deterministic-plan short-circuit and the agent-failure ask_user path.
-const _AGENT_SKILLS_FOR_RECOVERY = new Set(['browser.agent', 'cli.agent', 'playwright.agent', 'url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent']);
+const _AGENT_SKILLS_FOR_RECOVERY = new Set(['browser.agent', 'cli.agent', 'playwright.agent', 'url.first.agent', 'dom.act', 'just.type.agent', 'meta.find.agent', 'shortcut.keys.agent', 'tab.map.agent', 'gesture.agent', 'arrow.grid.agent', 'turn.loop.agent', 'task.agent']);
 
 async function _thinPostFailureHandler(state) {
   const { failedStep, skillPlan, skillCursor, skillResults = [], llmBackend, message, resolvedMessage, stepRetryCount = 0, replanCount = 0, patchHistory = [], mcpAdapter } = state;
@@ -1090,7 +1090,7 @@ async function _thinPostFailureHandler(state) {
   // they fall through to LLM recovery/ask_user instead.
   if (failedStep
       && failedStep.skill !== 'cli.agent' && failedStep.skill !== 'terminal.agent'
-      && failedStep.skill !== 'edit.agent'
+      && failedStep.skill !== 'edit.agent' && failedStep.skill !== 'task.agent'
       && !_WEB_FETCH_SKILLS.has(failedStep.skill)
       && !failedStep.askUser && !failedStep.delegateTo
       && !_browserish(failedStep.skill)
@@ -2463,6 +2463,10 @@ module.exports = async function executeCommand(state) {
   } = state;
 
   const logger = state.logger || console;
+  // Hoisted above all uses — the skipped/superseded early-return below writes
+  // stepContracts back into state; a late `const` here left that path in a TDZ
+  // (observed: "Cannot access 'stepContracts' before initialization" crash).
+  const stepContracts = state.stepContracts || [];
   const _rawProgressCallback = state.progressCallback || null;
   // When a skill plan file is tracked, fan-out plan:* mirror events alongside native events
   const progressCallback = (_rawProgressCallback && state._skillPlanFile)
@@ -2782,7 +2786,6 @@ module.exports = async function executeCommand(state) {
   // ── Auto-inject from prior step contracts ────────────────────────────────
   // Before template resolution, scan prior contracts to fill missing args
   let args = step.args || {};
-  const stepContracts = state.stepContracts || [];
   args = autoInjectFromContracts(args, skill, stepContracts, logger);
 
   // ── {{PREV_OUTPUT}} template injection ───────────────────────────────────

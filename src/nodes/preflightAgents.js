@@ -724,6 +724,19 @@ module.exports = async function preflightAgents(state) {
     return _agentsSnapshot;
   };
 
+  // ── Dispatchable skill ids (one skill.list call, contract-vocab fallback) ──
+  // *.agent ids that are command-service SKILLS (edit.agent, browser.agent, …)
+  // execute through command.automate — they are NOT registry agents and must
+  // never enter _notOnboarded. Observed: a plan pinning edit.agent escalated
+  // needs_plan (agent_not_onboarded) and the run hung for 40min.
+  let _skillIdsSnapshot = null;
+  const _fetchSkillIds = async () => {
+    if (_skillIdsSnapshot) return _skillIdsSnapshot;
+    const { dispatchableSkills } = require('../utils/skillIds.js');
+    _skillIdsSnapshot = await dispatchableSkills(mcpAdapter);
+    return _skillIdsSnapshot;
+  };
+
   // Canonical service lookup key — "google docs"/"googledocs" → google_docs so
   // taskFacts agrees with classification output.
   const _canonSvc = (s) => {
@@ -940,12 +953,23 @@ module.exports = async function preflightAgents(state) {
   const _notOnboarded = [];  // needed but absent from the registry
   const _notAuthed = [];     // registered but ledger says auth required
   const _missingBins = new Set(); // required binaries absent from PATH
+  const _skillIds = await _fetchSkillIds();
 
   for (const id of _neededIds) {
     const rec = _byId.get(id);
     const startUrl = rec?.startUrl || rec?.start_url || null;
     const iconUrl = agentIdToIconUrl(id, startUrl);
     if (!rec) {
+      // Dispatchable command-service skill — executes via command.automate,
+      // not the agent registry. Registry precedence: a real registered agent
+      // with the same id would have matched above and kept its auth checks.
+      if (_skillIds.has(id)) {
+        agentReadiness.push({
+          type: 'skill', agentId: id, ready: true, authed: true,
+          reason: 'dispatchable command-service skill', iconUrl,
+        });
+        continue;
+      }
       _notOnboarded.push(id);
       agentReadiness.push({
         type: 'unknown', agentId: id, ready: false, authed: false,

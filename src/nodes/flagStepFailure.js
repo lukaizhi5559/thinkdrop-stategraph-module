@@ -6,11 +6,18 @@
  */
 module.exports = async function flagStepFailure(state) {
   const logger = state.logger || console;
-  logger.warn(`[Node:FlagStepFailure] failedStep without recoveryAction — defaulting to replan (skill: ${state.failedStep?.skill})`);
+  // A failed step without a recoveryAction means thin recovery declined —
+  // the failure is localized to one step, so single-step replan (626ms path)
+  // is the right first move, not a 54KB full-plan regen (observed: 147s).
+  // replanCount still increments and the stall guard escalates to ask_user
+  // if replacements keep failing — full replan remains reachable via
+  // evaluateSkills FIX verdicts.
+  logger.warn(`[Node:FlagStepFailure] failedStep without recoveryAction — defaulting to replan_step (skill: ${state.failedStep?.skill})`);
   return {
-    recoveryAction: 'replan',
+    recoveryAction: 'replan_step',
     recoveryContext: {
       failedSkill: state.failedStep.skill,
+      failedStep: state.failedStep,
       failureReason: state.failedStep.error,
       succeededSteps: (state.skillResults || [])
         .filter(r => r.ok)

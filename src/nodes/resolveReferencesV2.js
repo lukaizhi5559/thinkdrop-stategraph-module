@@ -616,8 +616,14 @@ module.exports = async function resolveReferencesV2(state) {
     || /\b(?:here|there|this\s+one)\b/i.test(message || '')
     || (NAV_VERB_START_RE.test(message || '') && !/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|edu|gov|us)\b/i.test(message || '') && !NAMED_APP_RE.test(message || ''));
   if (_livePageRef && !_priorScreenContext?.url && _extSessions.length) {
-    // Most recently touched bound tab is the page "here" refers to.
-    const _liveTab = _extSessions.slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
+    // "this page" means the tab the user is actually on — ext:default (the
+    // real active tab) beats agent-bound sessions, which can hold a stale URL
+    // from an unrelated tab (observed: the youtube_agent homepage winning over
+    // the user's live video tab). A PLAYING tab is next — "this video" can
+    // mean the one making sound — then the most recently touched bound tab.
+    const _liveTab = _extSessions.find(s => s.sessionId === 'ext:default')
+      || _extSessions.find(s => s.playing)
+      || _extSessions.slice().sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0))[0];
     _priorScreenContext = {
       ...(_priorScreenContext || {}),
       url: _liveTab.url,

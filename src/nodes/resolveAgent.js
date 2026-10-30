@@ -782,12 +782,28 @@ module.exports = async function resolveAgent(state) {
     // agent via startUrl resolution instead of asserting existence).
     let _pinVerified = !mcpAdapter || !svcAgent; // no registry to check → pin
     let _registered = [];
+    let _pinIsSkill = false;
     if (mcpAdapter && svcAgent) {
       try {
-        const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
-        _registered = (agRes?.data || agRes || []).filter(a => a && a.id);
-        _pinVerified = _registered.some(a => String(a.id).toLowerCase() === String(svcAgent).toLowerCase());
-      } catch (_) { _pinVerified = true; /* registry unreachable — pin anyway */ }
+        const { dispatchableSkills } = require('../utils/skillIds.js');
+        _pinIsSkill = (await dispatchableSkills(mcpAdapter)).has(String(svcAgent).toLowerCase());
+      } catch (_) {}
+      if (!_pinIsSkill) {
+        try {
+          const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+          _registered = (agRes?.data || agRes || []).filter(a => a && a.id);
+          _pinVerified = _registered.some(a => String(a.id).toLowerCase() === String(svcAgent).toLowerCase());
+        } catch (_) { _pinVerified = true; /* registry unreachable — pin anyway */ }
+      }
+    }
+    // A dispatchable *.agent SKILL (edit.agent et al.) needs no registry entry —
+    // it executes through command.automate. Bind it as a skill, not an agent.
+    if (_pinIsSkill) {
+      logger.info(`[Node:ResolveAgent] Deterministic plan — pinned skill ${svcAgent} (command-service dispatch)`);
+      return { ...state, resolveAgentResult: {
+        agents: [{ agentId: svcAgent, role: resolvedMessage || message || '', exists: true, create: false, type: 'skill' }],
+        reasoning: 'deterministic service template — dispatchable skill', question: null,
+      } };
     }
     if (_pinVerified) {
       logger.info(`[Node:ResolveAgent] Deterministic service plan — pinned agent ${svcAgent}`);
@@ -880,16 +896,33 @@ module.exports = async function resolveAgent(state) {
   if (_pinned) {
     let _pinOk = true;
     let _pinType = null;
+    let _pinIsSkill = false;
     try {
-      const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
-      const registered = (agRes?.data || agRes || []).filter(a => a && a.id);
-      _pinOk = registered.some(a => String(a.id).toLowerCase() === _pinned);
-      // Truthful registry type — a cli/api pin must not leave the planner
-      // thinking the lane is browser-shaped (browser appendix vocabulary →
-      // url.first/dom.act steps bound to an agent that can't run them).
-      _pinType = registered
-        .find(a => String(a.id).toLowerCase() === _pinned)?.type || null;
-    } catch (_) { /* registry unreachable — honor the pin anyway */ }
+      const { dispatchableSkills } = require('../utils/skillIds.js');
+      _pinIsSkill = (await dispatchableSkills(mcpAdapter)).has(_pinned);
+    } catch (_) {}
+    if (!_pinIsSkill) {
+      try {
+        const agRes = await mcpAdapter.callService('command', 'agent.list', {}, { timeoutMs: 3000 }).catch(() => null);
+        const registered = (agRes?.data || agRes || []).filter(a => a && a.id);
+        _pinOk = registered.some(a => String(a.id).toLowerCase() === _pinned);
+        // Truthful registry type — a cli/api pin must not leave the planner
+        // thinking the lane is browser-shaped (browser appendix vocabulary →
+        // url.first/dom.act steps bound to an agent that can't run them).
+        _pinType = registered
+          .find(a => String(a.id).toLowerCase() === _pinned)?.type || null;
+      } catch (_) { /* registry unreachable — honor the pin anyway */ }
+    }
+    if (_pinIsSkill) {
+      // Dispatchable command-service skill pinned as an agent id — bind it
+      // directly; it executes via command.automate, not the agent registry.
+      logger.info(`[Node:ResolveAgent] Pinned skill ${_pinned} — binding directly (command-service dispatch)${state._capabilityReason ? ` (selector: ${state._capabilityReason})` : ''}`);
+      return { ...state, resolveAgentResult: {
+        agents: [{ agentId: _pinned, role: userMessage, exists: true, create: false, type: 'skill' }],
+        reasoning: 'pinned dispatchable skill', question: null,
+        _message: userMessage,
+      } };
+    }
     if (_pinOk) {
       logger.info(`[Node:ResolveAgent] Pinned agent ${_pinned} — binding directly${state._capabilityReason ? ` (selector: ${state._capabilityReason})` : ''}`);
       return { ...state, resolveAgentResult: {
