@@ -183,6 +183,24 @@ function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
   const _out = [];
   let _rewritten = 0;
   for (const step of skillPlan) {
+    // Contract mismatch — a dom.act step the planner TYPED as 'navigate' is
+    // a navigation step wearing the wrong skill (observed: a live-page-bound
+    // plan emitted stepType:'navigate' + skill:'dom.act', which scanned the
+    // stale tab instead of navigating). stepType is the intent annotation —
+    // it wins over the skill field.
+    if (step?.skill === 'dom.act' && (step.stepType === 'navigate' || step.stepType === 'verify')) {
+      const a = step.args || {};
+      if (step.stepType === 'navigate') {
+        _out.push({ ...step, skill: 'url.first.agent',
+          args: _clean({ task: a.task || a.goal, agentId: a.agentId, url: a.url, service: a.service, sessionId: a.sessionId, headed: a.headed }) });
+        _navigatedAgents.add(String(a.agentId || '').toLowerCase());
+      } else {
+        _out.push({ ...step, skill: 'turn.loop.agent',
+          args: _clean({ goal: a.task || a.goal, mode: 'verify', agentId: a.agentId, sessionId: a.sessionId, url: a.url }) });
+      }
+      _rewritten++;
+      continue;
+    }
     if (step?.skill !== 'browser.agent' || step.args?.action !== 'run') { _out.push(step); continue; }
     const a = step.args || {};
     const agentKey = String(a.agentId || '').toLowerCase();
@@ -231,7 +249,7 @@ function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
 // app.agent real-browser lane when nothing reuses the session.
 function _lintAtomicPlan(p, logger, extConnectedOrSessions, prompt, state) {
   const extSessions = Array.isArray(extConnectedOrSessions) ? extConnectedOrSessions : null;
-  return lintAtomicBrowserPlan(p, logger, {
+  const linted = lintAtomicBrowserPlan(p, logger, {
     extConnected: extSessions ? extSessions.length > 0 : !!extConnectedOrSessions,
     extSessions,
     prompt,
@@ -241,6 +259,92 @@ function _lintAtomicPlan(p, logger, extConnectedOrSessions, prompt, state) {
     taskClassification: state?._taskClassification || null,
     onScreenRef: state?._onScreenRef || null,
   }).plan;
+  return _guardVideoSteps(linted, extSessions, logger);
+}
+
+// ── video.agent live-tab guard ───────────────────────────────────────────────
+// The compile-time bake in handoff can't cover LLM-planned or replanned steps.
+// Same rule there and here, defined once in shared/live-tabs.cjs: a video.agent
+// live-watch step with no URL binds the tab media state says is the video —
+// never a discovery step, never prompt text. A step we can't bind stays
+// unbound (the skill resolves at runtime or fails into its own recovery —
+// never into cli.agent).
+//
+// Plan-session coherence comes first: when the plan itself navigated a tab
+// this turn (url.first.agent / browser.agent navigate), the page holding the
+// video is THAT session — observed failure: url.first opened youtube_agent on
+// a watch?v= URL while watch_live probed ext:default's unrelated front tab.
+// Binding falls back to pickVideoTab only when the plan didn't navigate.
+function _guardVideoSteps(plan, extSessions, logger) {
+  if (!Array.isArray(plan) || !plan.length) return plan;
+  const lt = require('../../../shared/live-tabs.cjs');
+  const _deriveSession = (a) => {
+    const raw = String(a?.agentId || 'default').trim();
+    if (/^(ext:|open:|bg:)/i.test(raw)) return raw;
+    return `${raw.replace(/\.agent$/i, '').replace(/_agent$/i, '').replace(/\s+/g, '_')}_agent`;
+  };
+  // url.first maps agent-derived names to ext: form when the extension owns
+  // the session — prefer the bound form when a same-named ext session exists.
+  const _extForm = (sid) => {
+    const m = (extSessions || []).find(x => x && (x.sessionId === sid || x.sessionId === `ext:${sid}`));
+    return m ? m.sessionId : sid;
+  };
+  let planNavSession = null;
+  let planNavUrl = null;
+  for (const s of plan) {
+    const sk = s?.skill;
+    if (sk === 'url.first.agent'
+        || (sk === 'browser.agent' && ['navigate', 'run'].includes(s.args?.action))) {
+      planNavSession = s.args?.sessionId || _deriveSession(s.args);
+      if (s.args?.url) planNavUrl = s.args.url;
+      continue;
+    }
+    if (sk !== 'video.agent') continue;
+    // A bg/extraction session is never a valid live-watch target — strip it
+    // even when there are no live sessions to re-resolve (runtime fallback).
+    if (lt.isBackgroundSession(s.args && s.args.sessionId)) {
+      delete s.args.sessionId;
+      (logger || console).info(`[Node:PlanSkillsV2] video.agent guard — stripped bg sessionId from ${(s.args && s.args.action) || 'watch_video'}`);
+    }
+    const args = s.args || {};
+    const action = args.action || 'watch_video';
+    const stepUrl = String(args.videoUrl || args.pageUrl || '');
+    // Unresolved token forms — {{_ctx_url_3}} ask-user vars, {{skill.url}}
+    // result refs — are not real URLs; the step needs binding, not a skip.
+    const placeholderUrl = /_ctx_|\{\{/.test(stepUrl);
+    const urlMatchesNav = !!(planNavUrl && stepUrl && stepUrl === planNavUrl);
+    // Bind the plan's navigated session when the watch target IS that page:
+    // no URL yet, an unresolved context token, or the same URL the nav used.
+    // A video-host nav URL also covers a placeholder token pointing at it.
+    const navIsVideo = !!(planNavUrl && lt.isVideoHost(planNavUrl));
+    if (planNavSession && !lt.isBackgroundSession(planNavSession)
+        && (lt.wantsLiveTab(s) || placeholderUrl || urlMatchesNav || (navIsVideo && !stepUrl))) {
+      const sid = _extForm(planNavSession);
+      s.args = {
+        ...args,
+        ...(navIsVideo && (!stepUrl || placeholderUrl) ? { videoUrl: planNavUrl } : {}),
+        sessionId: sid,
+        ...(action === 'watch_live' ? { liveTab: true } : {}),
+      };
+      (logger || console).info(`[Node:PlanSkillsV2] video.agent guard — ${action} bound to plan session ${sid}${planNavUrl ? ` (${planNavUrl})` : ''}`);
+      continue;
+    }
+    if (!lt.wantsLiveTab(s)) continue;
+    if (!Array.isArray(extSessions) || !extSessions.length) continue;
+    const tab = lt.pickVideoTab(extSessions);
+    if (!tab) {
+      (logger || console).info(`[Node:PlanSkillsV2] video.agent guard — live step unbound (no playing/video tab), runtime will resolve`);
+      continue;
+    }
+    s.args = {
+      ...args,
+      ...(tab.url ? { videoUrl: tab.url } : {}),
+      sessionId: tab.sessionId,
+      ...(action === 'watch_live' ? { liveTab: true } : {}),
+    };
+    (logger || console).info(`[Node:PlanSkillsV2] video.agent guard — ${action} bound to ${tab.sessionId} (${tab.url || 'no url'})`);
+  }
+  return plan;
 }
 
 // interactiveActions vocabulary values that imply on-page mutation — used to
@@ -938,18 +1042,46 @@ function _sanitizeSkillPlan(skillPlan, state) {
     // When the user refers to the open document ("print this", "read this
     // page", "fix this file") the planner may emit a doc skill with no
     // concrete target. Fill it from the live screen context rather than
-    // failing at dispatch or degrading to ask_user.
+    // failing at dispatch or degrading to ask_user. When no active doc is in
+    // context, fall back to a path mined from the step's own text, then the
+    // preflight file resolution, then the prompt's [File:] attachments —
+    // observed: steps dispatching fs.read path:"" / edit.agent no_file while
+    // the path sat right there in the step description.
+    const _stepPathFallback = () => {
+      if (_fileHint) return _fileHint;
+      let mined = null;
+      try {
+        const { minePathFromText } = require('../utils/planHelpers');
+        const texts = [step?.args?.goal, step?.args?.task, step?.args?.prompt, step?.description,
+                       state?.resolvedMessage, state?.message];
+        for (const t of texts) { mined = minePathFromText(t); if (mined) break; }
+      } catch (_) {}
+      if (mined) return mined;
+      if (state?._fileResolution?.path) return state._fileResolution.path;
+      try {
+        const attached = getAttachedFilePaths(state?.resolvedMessage || state?.message || '');
+        if (attached.length) return attached[0].resolved;
+      } catch (_) {}
+      return null;
+    };
+    const _targetPath = _stepPathFallback();
     if (step?.skill === 'edit.agent') {
       const a = step.args || (step.args = {});
-      if (!a.filePath && !a.path && !a.file && _fileHint) {
-        a.filePath = _fileHint;
-        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled edit.agent.filePath from active doc: ${_fileHint}`);
+      if (!a.filePath && !a.path && !a.file && _targetPath) {
+        a.filePath = _targetPath;
+        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled edit.agent.filePath from ${_fileHint ? 'active doc' : 'step/context'}: ${_targetPath}`);
       }
     } else if (step?.skill === 'fs.read') {
       const a = step.args || (step.args = {});
-      if (!a.path && _fileHint) {
-        a.path = _fileHint;
-        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled fs.read.path from active doc: ${_fileHint}`);
+      if (!a.path && _targetPath) {
+        a.path = _targetPath;
+        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled fs.read.path from ${_fileHint ? 'active doc' : 'step/context'}: ${_targetPath}`);
+      }
+    } else if (step?.skill === 'image.analyze') {
+      const a = step.args || (step.args = {});
+      if (!a.filePath && !a.imagePath && !a.path && _targetPath && /\.(png|jpe?g|gif|webp|bmp|tiff?|heic)$/i.test(_targetPath)) {
+        a.filePath = _targetPath;
+        _log.info(`[Node:PlanSkillsV2] _sanitizeSkillPlan: filled image.analyze.filePath from ${_fileHint ? 'active doc' : 'step/context'}: ${_targetPath}`);
       }
     } else if (step?.skill === 'web.crawl') {
       const a = step.args || (step.args = {});
@@ -1054,6 +1186,21 @@ function _repairStepPlaceholders(skillPlan, state) {
     }
 
     if (needsAskUser) {
+      // video.agent with an unresolvable URL token — the media URL was meant
+      // to come from a step that no longer produces one. video.agent resolves
+      // the URL itself from a query: degrade to find_and_watch instead of
+      // asking the user for a link we can discover headlessly.
+      if (step.skill === 'video.agent' && /^(videoUrl|pageUrl|url)$/i.test(String(firstBadKey || ''))) {
+        const q = step.args.query || step.args.task || step.args.goal || step.description || '';
+        delete step.args.videoUrl;
+        delete step.args.pageUrl;
+        delete step.args.url;
+        step.args.action = 'find_and_watch';
+        if (q && !step.args.query) step.args.query = q;
+        _log.info(`[Node:PlanSkillsV2] _repairStepPlaceholders: video.agent step ${i + 1} had unresolvable "${firstBadKey}" — degraded to find_and_watch{query:"${String(q).slice(0, 60)}"} instead of ask_user`);
+        out.push(step);
+        continue;
+      }
       repairCount++;
       const keyHint = firstBadKey ? ` for "${firstBadKey}"` : '';
       _log.info(`[Node:PlanSkillsV2] _repairStepPlaceholders: step ${i + 1} (${step.skill}) referenced unresolvable token(s) — inserting ask_user (varName=${varName}) to collect the missing input`);
@@ -1682,7 +1829,8 @@ function _buildSystemPrompt(userMessage, state) {
     if (state.activeBrowserSessionId) {
       result += `\n\n## ACTIVE BROWSER SESSION\n\nA browser automation session is already open${state.activeBrowserUrl ? ` at ${state.activeBrowserUrl}` : ''} (sessionId: "${state.activeBrowserSessionId}"). THE VISIBLE PAGE IS THE DEFAULT REFERENT — if this request acts on that page or its service (fill, write, click, reply, read, scroll — even when the prompt does not say "this page"), emit ONLY \`dom.act\`/\`form.fill.agent\`/\`turn.loop.agent\` steps with args.sessionId "${state.activeBrowserSessionId}". \`url.first.agent\` is for NEW destinations only — re-navigating moves the user's real tab away from the page they mean. Emit it only when the prompt asks to go somewhere else (a different site/service, or explicit "go to/leave/switch to" language).\n\nFor page READS on that open page, emit \`browser.act\` { action: "getPageText", sessionId: "${state.activeBrowserSessionId}" } — NOT \`app.agent\` scan_page (OS-level clipboard copy cannot read the automation window).`;
     }
-  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects/scrolls on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit", "scroll to the bottom"). Optional \`agentHint\` (emit when intent is clear): \`"tab.map.agent"\` (multi-field forms and dialogs/overlays — fill several fields then submit; navigate-and-extract goals like "search the page for X" or "read the results"), \`"just.type.agent"\` (single-field typing into a focused or autofocused input — AI chat prompts, search bars — and single keypress/scroll goals like "press Enter" or "scroll to the bottom"), \`"meta.find.agent"\` (locate/click specific named text on the page — e.g. a named conversation in a chat-history list), \`"shortcut.keys.agent"\` (open/create/compose/new actions on apps with documented hotkeys — Google Calendar 'c' opens the event dialog, Gmail 'c' composes, '/' searches. Prefer this over scanning the landing page when a create/open intent maps to a known app hotkey; it self-falls-back to tab.map when the site has no shortcut table. NOT for content searches or multi-field entry), \`"turn.loop.agent"\` (dense commerce grids, multi-step action sequences, or typing when no input is focused), \`"gesture.agent"\` (drag/slider/swipe), \`"arrow.grid.agent"\` (spreadsheet cells). Emit \`args.pageCategory\` on dom.act steps when the site class is known (\`ai_chat\`, \`email_compose\`, \`shopping\`, \`spreadsheet\`, \`search_engine\`, \`social_feed\`, \`messaging\` — else omit).\n\nCONTRACT — fills never submit: \`form.fill.agent\` and dom.act fill goals do NOT press submit/send/post. A send/post/submit goal needs an explicit submit step or a workflow-capable skill — for email compose on Gmail, emit a SINGLE \`dom.act\` step with \`pageCategory: "email_compose"\` carrying the goal text (it parses To/Cc/Bcc/Subject/Body and sends with verification); do NOT emit \`form.fill.agent\` for email compose (it resolves profile fields, not goal-carried values, and never sends).\n- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction. Emit ONLY for silent-failure mutations whose outcome isn't provable from step results (add-to-cart, checkout, purchase, submit, send, post, delete). Do NOT emit for create/navigate/read flows — url.first's landed URL and dom.act's result already prove the outcome; synthesize confirms from step results.\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nCRITICAL: EVERY browser step for a service must carry that service's \`args.agentId\` — including \`turn.loop.agent\` verify steps. Steps without agentId run in a parallel lane with no browser session.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "agentId": "amazon.agent", "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n\nCalendar/compose example — the deep-link lands DIRECTLY on the creation surface (eventedit/compose); do NOT emit an "open the dialog" step:\n[\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "google_calendar.agent", "task": "Create a Google Calendar event 'Dentist appointment' next Tuesday 2pm" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "google_calendar.agent", "agentHint": "form.fill.agent", "task": "Fill title 'Dentist appointment', date next Tuesday, time 2pm, then Save" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the dentist appointment was created" } }\n]\n\nConditional steps — "if/when X then Y" phrasing needs a capture step then a gated step. The read/extract step stores its output under \`args.captureAs\` (a variable name); the action step carries \`args.runIf\` = {"var": "<name>", "op": "contains|eq|match|ne|exists", "value": "…"} and executes only when the captured value satisfies it (deterministic check, no model):\n[\n  { "skill": "browser.agent", "stepType": "extract", "args": { "agentId": "google_calendar.agent", "action": "extract_items", "task": "Read the title of the next upcoming calendar event", "captureAs": "next_event" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "smartthings.agent", "task": "Turn off the living room light", "runIf": { "var": "next_event", "op": "match", "value": "bedtime" } } },\n  { "skill": "synthesize", "args": { "prompt": "Report what the next event was and whether the light was turned off" } }\n]\n`;
+  result += `\n\n## STEP TYPE CLASSIFICATION (REQUIRED for browser steps)\n\nBrowser steps decompose by intent — emit the matching atomic skill (with a \`stepType\` field for validation):\n\n- \`"navigate"\` → \`url.first.agent\` — opens a URL/searches/goes to a page (e.g., "Search Amazon for X", "Open Gmail")\n- \`"on-page-action"\` → \`dom.act\` — clicks/types/selects/scrolls on the CURRENT page (e.g., "Click the first result, then Add to Cart", "Fill the form and submit", "scroll to the bottom"). Optional \`agentHint\` (emit when intent is clear): \`"tab.map.agent"\` (multi-field forms and dialogs/overlays — fill several fields then submit; navigate-and-extract goals like "search the page for X" or "read the results"), \`"just.type.agent"\` (single-field typing into a focused or autofocused input — AI chat prompts, search bars — and single keypress/scroll goals like "press Enter" or "scroll to the bottom"), \`"meta.find.agent"\` (locate/click specific named text on the page — e.g. a named conversation in a chat-history list), \`"shortcut.keys.agent"\` (open/create/compose/new actions on apps with documented hotkeys — Google Calendar 'c' opens the event dialog, Gmail 'c' composes, '/' searches. Prefer this over scanning the landing page when a create/open intent maps to a known app hotkey; it self-falls-back to tab.map when the site has no shortcut table. NOT for content searches or multi-field entry), \`"turn.loop.agent"\` (dense commerce grids, multi-step action sequences, or typing when no input is focused), \`"gesture.agent"\` (drag/slider/swipe), \`"arrow.grid.agent"\` (spreadsheet cells). Emit \`args.pageCategory\` on dom.act steps when the site class is known (\`ai_chat\`, \`email_compose\`, \`shopping\`, \`spreadsheet\`, \`search_engine\`, \`social_feed\`, \`messaging\` — else omit).\n\nCONTRACT — fills never submit: \`form.fill.agent\` and dom.act fill goals do NOT press submit/send/post. A send/post/submit goal needs an explicit submit step or a workflow-capable skill — for email compose on Gmail, emit a SINGLE \`dom.act\` step with \`pageCategory: "email_compose"\` carrying the goal text (it parses To/Cc/Bcc/Subject/Body and sends with verification); do NOT emit \`form.fill.agent\` for email compose (it resolves profile fields, not goal-carried values, and never sends).\n- \`"watch-video"\` → \`video.agent\` — any watch/find/search-a-video goal (e.g., "watch a video about X", "find a Mike Winger video about Mormonism"). Emit \`{action:'find_and_watch', platform, query, goal}\` for discovery — it resolves the video URL itself, never decompose into dom.act/web.* search+extract chains; \`{action:'watch_video', videoUrl?, goal}\` for a known URL or the current tab; \`{action:'watch_live'}\` only when real-time playback is the point. On a watch_live failure, replan \`watch_video\` (extraction) — never dom.act/meta.find page scraping.
+- \`"verify"\` → \`turn.loop.agent\` with \`mode:'verify'\` — confirms a result without interaction. Emit ONLY for silent-failure mutations whose outcome isn't provable from step results (add-to-cart, checkout, purchase, submit, send, post, delete). Do NOT emit for create/navigate/read flows — url.first's landed URL and dom.act's result already prove the outcome; synthesize confirms from step results.\n- \`"extract"\` → \`browser.agent\` with \`action:'extract_items'\` — reads/extracts structured content for display\n\nCRITICAL: A step that refers to a "search results page" or "product page" in its task text is an \`"on-page-action"\` — it operates on the page the browser is ALREADY on. Do NOT emit \`url.first.agent\` for it.\n\nCRITICAL: EVERY browser step for a service must carry that service's \`args.agentId\` — including \`turn.loop.agent\` verify steps. Steps without agentId run in a parallel lane with no browser session.\n\nExample: [\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "amazon.agent", "task": "Search Amazon for 'children\\\\'s Bible storybook'" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "amazon.agent", "agentHint": "turn.loop.agent", "task": "Click on the first result to open its product page, then click the Add to Cart button" } },\n  { "skill": "turn.loop.agent", "stepType": "verify", "args": { "agentId": "amazon.agent", "goal": "Confirm the item was added to the cart", "mode": "verify" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the item was added to the cart" } }\n]\n\nCalendar/compose example — the deep-link lands DIRECTLY on the creation surface (eventedit/compose); do NOT emit an "open the dialog" step:\n[\n  { "skill": "url.first.agent", "stepType": "navigate", "args": { "agentId": "google_calendar.agent", "task": "Create a Google Calendar event 'Dentist appointment' next Tuesday 2pm" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "google_calendar.agent", "agentHint": "form.fill.agent", "task": "Fill title 'Dentist appointment', date next Tuesday, time 2pm, then Save" } },\n  { "skill": "synthesize", "args": { "prompt": "Confirm the dentist appointment was created" } }\n]\n\nConditional steps — "if/when X then Y" phrasing needs a capture step then a gated step. The read/extract step stores its output under \`args.captureAs\` (a variable name); the action step carries \`args.runIf\` = {"var": "<name>", "op": "contains|eq|match|ne|exists", "value": "…"} and executes only when the captured value satisfies it (deterministic check, no model):\n[\n  { "skill": "browser.agent", "stepType": "extract", "args": { "agentId": "google_calendar.agent", "action": "extract_items", "task": "Read the title of the next upcoming calendar event", "captureAs": "next_event" } },\n  { "skill": "dom.act", "stepType": "on-page-action", "args": { "agentId": "smartthings.agent", "task": "Turn off the living room light", "runIf": { "var": "next_event", "op": "match", "value": "bedtime" } } },\n  { "skill": "synthesize", "args": { "prompt": "Report what the next event was and whether the light was turned off" } }\n]\n`;
 
     // ── Commerce routing note ──────────────────────────────────────────────
     // For Amazon/eBay/Etsy add-to-cart, checkout, filter, or sort tasks,
@@ -4160,6 +4308,7 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
       onScreenRef: state._onScreenRef || null,
     });
     skillPlan = _atomicLint.plan;
+    skillPlan = _guardVideoSteps(skillPlan, state._extSessions, logger);
     // A mutation-classified task whose plan is STILL nav-only end-to-end was
     // not repairable by the lint (every destination was described as pure
     // navigation) — fail honestly rather than let synthesize claim success
@@ -4385,3 +4534,4 @@ module.exports._ensureSynthesizeForAppFlow = _ensureSynthesizeStep;
 module.exports._resolveCtxUrlTokens = _resolveCtxUrlTokens;
 module.exports._rewriteBrowserStepsToAtomicAgents = _rewriteBrowserStepsToAtomicAgents;
 module.exports._repairStepPlaceholders = _repairStepPlaceholders;
+module.exports._guardVideoSteps = _guardVideoSteps;

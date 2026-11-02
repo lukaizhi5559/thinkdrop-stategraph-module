@@ -197,6 +197,39 @@ function _fallbackStartUrl(serviceKey) {
   return `https://www.${serviceKey}.com`;
 }
 
+// Bounded edit distance (early-exits past cap) — used for typo-tolerant
+// destination verification ("cacthy" vs "cathay" = 2 edits).
+function _levenshtein(a, b, cap = 3) {
+  const m = a.length, n = b.length;
+  if (Math.abs(m - n) > cap) return cap + 1;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// Typo-tolerant name match — search engines correct misspellings, so the
+// canonical site can't contain the typo'd token ("cacthy" → cathaypacific.com
+// fails exact matching). Every non-trivial display-name token must match a
+// host label or title token exactly or within 2 edits.
+function _fuzzyNameMatch(host, titleLower, displayName) {
+  const dispToks = (String(displayName || '').toLowerCase().match(/[a-z0-9]{4,}/g) || []);
+  if (!dispToks.length) return false;
+  const hayToks = new Set([
+    ...String(host || '').split(/[^a-z0-9]+/).filter(t => t.length >= 3),
+    ...(String(titleLower || '').match(/[a-z0-9]{3,}/g) || []),
+  ]);
+  return dispToks.every(dt =>
+    [...hayToks].some(ht =>
+      ht.includes(dt) || dt.includes(ht)
+      || (dt.length >= 5 && _levenshtein(dt, ht) <= 2)));
+}
+
 function _isParkingContent(text = '') {
   const t = text.toLowerCase();
   return /\bdomain\s+(for\s+sale|is\s+for\s+sale|available\s+for\s+sale)\b/.test(t)
@@ -241,7 +274,7 @@ async function _httpGetBody(url, maxBytes = 4096, timeoutMs = 6000, redirectDept
   });
 }
 
-async function _verifyDiscoveredUrl(url, serviceKey) {
+async function _verifyDiscoveredUrl(url, serviceKey, displayName) {
   let parsed;
   try { parsed = new URL(url); } catch (_) { return { ok: false, reason: 'invalid-url' }; }
   const probe = await _httpGetBody(url, 4096, 6000);
@@ -255,17 +288,29 @@ async function _verifyDiscoveredUrl(url, serviceKey) {
 
   const host = parsed.hostname.toLowerCase();
   const service = serviceKey.toLowerCase();
+  // Multi-word names ("cathay pacific" → key "cathaypacific") can't match a
+  // spaced title or a dotted host unless both sides normalize — compare the
+  // display name AND the squashed key, plus the host's root label.
+  const disp = String(displayName || '').toLowerCase().trim();
+  const _squash = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
   const acceptedHosts = [service, ...(SERVICE_HOST_ALIASES[service] || [])];
-  const hostMatch = acceptedHosts.some(a => host === a || host.endsWith('.' + a));
-  const textMatch = title.toLowerCase().includes(service) || probe.body.toLowerCase().includes(service);
-  if (!hostMatch && !textMatch) {
+  const hostMatch = acceptedHosts.some(a => {
+    const aa = String(a || '').toLowerCase().replace(/^www\./, '');
+    return host === aa || host.endsWith('.' + aa) || host.split('.')[0] === _squash(aa) || _squash(host) === _squash(aa);
+  });
+  const titleL = title.toLowerCase();
+  const bodyL = probe.body.toLowerCase();
+  const textMatch = (!!service && (titleL.includes(service) || bodyL.includes(service)))
+    || (!!disp && (titleL.includes(disp) || bodyL.includes(disp)))
+    || (!!disp && _squash(titleL).includes(_squash(disp)));
+  if (!hostMatch && !textMatch && !_fuzzyNameMatch(host, titleL, disp)) {
     return { ok: false, reason: 'domain-mismatch' };
   }
 
   return { ok: true, finalUrl: probe.finalUrl || url };
 }
 
-async function _discoverVerifiedStartUrl(serviceKey, mcpAdapter, logger) {
+async function _discoverVerifiedStartUrl(serviceKey, mcpAdapter, logger, displayName) {
   if (!mcpAdapter) return _fallbackStartUrl(serviceKey);
 
   // 1. Check user-memory cache first.
@@ -275,7 +320,7 @@ async function _discoverVerifiedStartUrl(serviceKey, mcpAdapter, logger) {
     }, { timeoutMs: 2000 }).catch(() => null);
     const cachedUrl = cached?.data?.valueRef;
     if (cachedUrl) {
-      const verified = await _verifyDiscoveredUrl(cachedUrl, serviceKey);
+      const verified = await _verifyDiscoveredUrl(cachedUrl, serviceKey, displayName);
       if (verified.ok) return cachedUrl;
       logger.info(`[Node:ResolveAgent] Cached start URL ${cachedUrl} failed verification — rediscovering ${serviceKey}`);
     }
@@ -283,14 +328,16 @@ async function _discoverVerifiedStartUrl(serviceKey, mcpAdapter, logger) {
     logger.debug(`[Node:ResolveAgent] Cache lookup failed for ${serviceKey}: ${err.message}`);
   }
 
-  // 2. Discover via web.agent.
+  // 2. Discover via web.agent — the display name ("cathay pacific") searches
+  // better than the squashed key ("cathaypacific").
+  const _q = String(displayName || '').trim() || serviceKey;
   let bestUrl = null;
   try {
     const webRes = await mcpAdapter.callService('command', 'command.automate', {
       skill: 'web.agent',
       args: {
         action: 'search_and_navigate',
-        query: `${serviceKey} official website`,
+        query: `${_q} official website`,
         preferDomain: serviceKey,
       },
     }, { timeoutMs: 12000 }).catch(() => null);
@@ -305,7 +352,7 @@ async function _discoverVerifiedStartUrl(serviceKey, mcpAdapter, logger) {
 
   // 3. Verify and cache.
   if (bestUrl) {
-    const verified = await _verifyDiscoveredUrl(bestUrl, serviceKey);
+    const verified = await _verifyDiscoveredUrl(bestUrl, serviceKey, displayName);
     if (verified.ok) {
       try {
         await mcpAdapter.callService('user-memory', 'profile.set', {
@@ -333,7 +380,7 @@ async function _resolveStartUrlForService(service, userMessage, mcpAdapter, logg
     const host = hostMatch[1].toLowerCase();
     return `https://${host}`;
   }
-  return _discoverVerifiedStartUrl(key, mcpAdapter, logger);
+  return _discoverVerifiedStartUrl(key, mcpAdapter, logger, service);
 }
 
 const SYSTEM_PROMPT = `You are an agent selection assistant for a desktop automation system.
@@ -1154,3 +1201,5 @@ module.exports._httpGetBody = _httpGetBody;
 module.exports._messageMentionsServiceOrAgent = _messageMentionsServiceOrAgent;
 module.exports._messageMentionsAgent = _messageMentionsAgent;
 module.exports._domainsMatchService = _domainsMatchService;
+module.exports._levenshtein = _levenshtein;
+module.exports._fuzzyNameMatch = _fuzzyNameMatch;

@@ -683,7 +683,10 @@ async function retrieveMemory(state) {
           startDate: episodicDateRange.startDate,
           endDate: episodicDateRange.endDate,
           filters: {
-            type: 'screen_capture',
+            // screen_capture + audio_journal — ambient audio transcripts are
+            // chunked into the same episodic store; "what did that video/
+            // podcast/call say" recall needs them alongside screen rows.
+            type: ['screen_capture', 'audio_journal'],
             // excludeOverlay was removed: the overlay's rect is masked before
             // OCR now, and the old loose signature had tainted nearly every
             // historic capture — excluding them emptied all date-range results.

@@ -11,6 +11,7 @@ const fs = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
+const { detectInfraFailure, buildInfraPendingQuestion } = require('../utils/infraFailure');
 const MAX_EVAL_RETRIES = 4;
 
 // ThinkDrop environment map — where state, logs, and services live. Injected
@@ -463,6 +464,34 @@ Output ONLY valid JSON.`;
     const _failedSkill = _failedStep.skill || null;
     const _isAgentFailure = _failedAgentId && (_failedSkill === 'browser.agent' || _failedSkill === 'cli.agent' || _failedSkill === 'playwright.agent');
     const _baseQuestion = `I ran into an issue and need your help: ${verdict.reason}`;
+
+    // ── Infrastructure-failure backstop ────────────────────────────────────
+    // The judge writes honest internals ("circuit breaker is open on the
+    // command service — check logs/command.log") as reason text, which used
+    // to land verbatim in a free-text QuestionCard — meaningless to the user
+    // and unanswerable. Detect infra signatures deterministically (structured
+    // tag from executeCommand, the failed step's error, or the verdict's own
+    // reason) and surface the structured system-failure card instead — for
+    // agent and non-agent failures alike, since an open circuit isn't
+    // fixable by "correct and retry" or recipe recording.
+    const _infraDetail = (_failedStep._infraError && _failedStep._infraError.signature)
+      ? _failedStep._infraError
+      : detectInfraFailure(_failedStep.error || _failedStep.detail || verdict.reason);
+    if (_infraDetail) {
+      return {
+        ...state,
+        evaluationVerdict: 'ASK_USER',
+        recoveryAction: 'ask_user',
+        pendingQuestion: buildInfraPendingQuestion({
+          detail: _infraDetail,
+          failedStep: _failedStep,
+          skillCursor: state.skillCursor ?? 0,
+          uiStepIndex: state._resumeStepIndex ?? state.skillCursor ?? 0,
+        }),
+        answer: `ThinkDrop hit an internal problem: ${_infraDetail.signature}${_infraDetail.service ? ` (${_infraDetail.service})` : ''} — ${verdict.reason}`
+      };
+    }
+
     return {
       ...state,
       evaluationVerdict: 'ASK_USER',

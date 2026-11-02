@@ -38,7 +38,12 @@ function emitAskUser(state, source) {
       keepSession:     pq.keepSession === true,
       originalTask:    pq.originalTask || null,
       skill:           pq.skill || null,
-      freeText: true,
+      // kind:'infra_failure' + infra detail drive the SystemFailureCard —
+      // plain summary + retry/report/dismiss, no text input (freeText:false).
+      kind:            pq.kind || null,
+      infra:           pq.infra || null,
+      uiStepIndex:     pq.uiStepIndex ?? null,
+      freeText: pq.freeText === false ? false : true,
     });
   } catch (_) { /* progress callback must never block execution */ }
 }

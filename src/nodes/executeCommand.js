@@ -34,6 +34,7 @@ const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { detectInfraFailure, buildInfraPendingQuestion } = require('../utils/infraFailure');
 
 // ── Terminal activity ticker — step-boundary lines for the collapsed drawer ──
 // Fire-and-forget POST to main.js /agent-turn → renderer 'terminal:activity'.
@@ -352,7 +353,7 @@ const _READ_ONLY_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search', 'fs.r
 // Web-fetch subset of the read-only set — also excluded from the cli.agent
 // TERMINAL_DEBUG fallbacks: a shell loop cannot out-crawl the crawl skill,
 // so fetch failures go to auto-skip or LLM recovery instead.
-const _WEB_FETCH_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search']);
+const _WEB_FETCH_SKILLS = new Set(['web.crawl', 'web.agent', 'web.search', 'video.agent', 'screen.capture', 'media.transcribe']);
 
 // Atomic browser skills that share a session — used by the per-step arg
 // enrichment (serial + runGroup paths) and the session-tracking block.
@@ -565,6 +566,32 @@ async function _thinPostFailureHandlerImpl(state) {
       },
       patchHistory: [...patchHistory, { action: 'INTERNAL_ERROR', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
       failedStep: null,
+      commandExecuted: false,
+    };
+  }
+
+  // ── Infrastructure-failure gate — before every patch/escalation path ──────
+  // A dead/hung MCP service (open circuit, loopback transport failure, hung
+  // agent registry) is not a task failure and not user-fixable — patching or
+  // replanning re-runs the same step against the same dead endpoint, and a
+  // free-text question is meaningless ("check command.log" is not an answer).
+  // Surface a structured system-failure card instead: Try again (auto-fires
+  // after the cooldown), Report issue (records for an engineer), Dismiss.
+  const _infraDetail = (failedStep._infraError && failedStep._infraError.signature)
+    ? failedStep._infraError
+    : detectInfraFailure(failedStep.error || failedStep.detail);
+  if (_infraDetail) {
+    logger.error(`[ExecuteCommand:ThinRecovery] INFRA_FAILURE: ${failedStep.skill} step ${skillCursor + 1} — ${_infraDetail.signature}${_infraDetail.service ? ` (${_infraDetail.service})` : ''}: ${_errClass}`);
+    return {
+      ...state,
+      recoveryAction: 'ask_user',
+      pendingQuestion: buildInfraPendingQuestion({
+        detail: _infraDetail,
+        failedStep,
+        skillCursor,
+        uiStepIndex: state._resumeStepIndex ?? skillCursor,
+      }),
+      patchHistory: [...patchHistory, { action: 'INFRA_FAILURE', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
       commandExecuted: false,
     };
   }
@@ -1133,6 +1160,46 @@ async function _thinPostFailureHandlerImpl(state) {
       failedStep: null,
       commandExecuted: false,
     };
+  }
+
+  // ── video.agent targeted patch — BEFORE the universal terminal fallback ───
+  // A missing videoUrl is a binding problem, not a terminal problem (observed:
+  // "watch this video" → video.agent no-URL fast-fail → cli.agent probed the
+  // `watch` binary → generic refusal). Re-resolve the live tab from extension
+  // session/media state and patch args in place — same skill, real URL. When
+  // nothing binds, the step falls through to LLM recovery/ask_user — never
+  // cli.agent (video.agent is in _WEB_FETCH_SKILLS now).
+  if (failedStep
+      && failedStep.skill === 'video.agent'
+      && Array.isArray(skillPlan) && skillPlan[skillCursor]
+      && !(patchHistory || []).some(p => p.action === 'VIDEO_URL_PATCH' && p.cursor === skillCursor)) {
+    const _ltV = require('../../../shared/live-tabs.cjs');
+    const _step = skillPlan[skillCursor];
+    const _action = _step?.args?.action || 'watch_video';
+    const _tab = _ltV.pickVideoTab(state._extSessions);
+    if (_ltV.wantsLiveTab(_step) && _tab) {
+      const patchedPlan = [...skillPlan];
+      patchedPlan[skillCursor] = {
+        ..._step,
+        args: {
+          ..._step.args,
+          ...(_tab.url ? { videoUrl: _tab.url } : {}),
+          sessionId: _tab.sessionId,
+          ...(_action === 'watch_live' ? { liveTab: true } : {}),
+        },
+      };
+      logger.info(`[ExecuteCommand:ThinRecovery] VIDEO_URL_PATCH: video.agent step ${skillCursor + 1} lacked a URL — bound ${_tab.sessionId} (${_tab.url || 'no url'}) and retrying`);
+      return {
+        ...state,
+        recoveryAction: 'auto_patch',
+        skillPlan: patchedPlan,
+        recoveryNote: 'Found the video tab — retrying the video step with it bound.',
+        patchHistory: [...patchHistory, { action: 'VIDEO_URL_PATCH', cursor: skillCursor, note: failedStep.error, attempt: stepRetryCount + 1, sig: _failSig, pageSig: _pageSig }],
+        stepRetryCount: stepRetryCount + 1,
+        failedStep: null,
+        commandExecuted: false,
+      };
+    }
   }
 
   // ── Universal terminal fallback — observe→adapt before replan/ask ─────────
@@ -2108,6 +2175,52 @@ function autoInjectFromContracts(args, skill, stepContracts = [], logger) {
   return newArgs;
 }
 
+// ── Missing-path backfill ────────────────────────────────────────────────────
+// Plans frequently carry the target file in the step TEXT ("Open `/a/b.tsx`…")
+// while emitting no path arg — or an arg name the skill doesn't read — so the
+// step dies as "path is required"/"no_file". Mine an absolute path from the
+// step's own goal/task/description, then fall back to resolved prompt context.
+const _PATH_ARG_SKILLS = {
+  'edit.agent': ['filePath', 'path', 'file', 'target'],
+  'fs.read': ['path', 'filePath', 'file', 'target'],
+  'doc.read': ['filePath', 'path', 'file', 'target'],
+  'image.analyze': ['filePath', 'imagePath', 'path', 'file', 'target'],
+  'media.transcribe': ['filePath', 'path', 'file', 'target'],
+  'file.watch': ['path', 'filePath'],
+  'file.bridge': ['filePath', 'path'],
+};
+
+function _fillMissingPathArg(args, skill, step, state, logger) {
+  if (!args || typeof args !== 'object') return args;
+  const keys = _PATH_ARG_SKILLS[skill];
+  if (!keys) return args;
+  if (keys.some(k => typeof args[k] === 'string' && args[k].trim())) return args;
+
+  const texts = [args.goal, args.task, args.prompt, step?.description,
+                 state?.resolvedMessage, state?.message];
+  let found = null;
+  let _mine = null;
+  try { _mine = require('../utils/planHelpers').minePathFromText; } catch (_) {}
+  if (_mine) {
+    for (const t of texts) { found = _mine(t); if (found) break; }
+  }
+  if (!found) {
+    found = state?._fileResolution?.path || null;
+    if (!found) {
+      try {
+        const { getAttachedFilePaths } = require('../utils/planHelpers');
+        found = getAttachedFilePaths(state?.resolvedMessage || state?.message || '')[0]?.resolved || null;
+      } catch (_) {}
+    }
+    if (!found) found = state?._priorScreenContext?.filePath || null;
+  }
+  if (!found) return args;
+
+  args[keys[0]] = found;
+  logger.info(`[Node:ExecuteCommand] filled missing ${skill}.${keys[0]} from step text/context: ${found}`);
+  return args;
+}
+
 /**
  * Resolve step args for the runGroup dispatch path. The serial path resolves
  * args before dispatch (autoInjectFromContracts, {{PREV_OUTPUT}}, {{CONTRACT[N]}}
@@ -2127,6 +2240,7 @@ function autoInjectFromContracts(args, skill, stepContracts = [], logger) {
 function _resolveGroupStepArgs(rawArgs, skill, ctx = {}) {
   const { skillResults = [], priorResults = [], stepContracts = [], logger = console } = ctx;
   let resolved = autoInjectFromContracts({ ...(rawArgs || {}) }, skill, stepContracts, logger);
+  resolved = _fillMissingPathArg(resolved, skill, ctx.step, ctx.state, logger);
 
   // {{PREV_OUTPUT}} / {{prev_stdout}} — output of the immediately preceding
   // completed step. Mirrors the serial block (~PREV_OUTPUT template injection):
@@ -2886,6 +3000,10 @@ module.exports = async function executeCommand(state) {
   // Before template resolution, scan prior contracts to fill missing args
   let args = step.args || {};
   args = autoInjectFromContracts(args, skill, stepContracts, logger);
+  // Backfill a missing file-path arg from step text / resolved context —
+  // plan steps routinely carry the target in description text while the
+  // arg slot stays empty ("path is required" / no_file dispatch failures).
+  args = _fillMissingPathArg(args, skill, step, state, logger);
 
   // ── {{PREV_OUTPUT}} template injection ───────────────────────────────────
   // Allows multi-step plans to pass data from one step to the next.
@@ -7119,7 +7237,7 @@ Please try again or search with different terms.`;
       // {{...}} tokens reached the skill (image.analyze got filePath=
       // "{{PREV_OUTPUT}}" → extname '' → "Unsupported image format: .").
       const _resolved = _resolveGroupStepArgs(gs.args || {}, gs.skill, {
-        skillResults, priorResults, stepContracts, logger,
+        skillResults, priorResults, stepContracts, logger, step: gs, state,
       });
       if (_resolved.error) {
         if (progressCallback) progressCallback({
@@ -9927,6 +10045,12 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
     if (error instanceof ReferenceError || error instanceof TypeError || error instanceof SyntaxError) {
       stepResult._internalError = true;
     }
+    // Infrastructure failure (dead/hung MCP service, open circuit) — tag the
+    // structured detail so _thinPostFailureHandler can surface a real
+    // system-failure card instead of letting recovery/LLM verdicts paraphrase
+    // the transport error into a meaningless user question.
+    const _infraHit = detectInfraFailure(error);
+    if (_infraHit) stepResult._infraError = _infraHit;
 
     if (!isSearchExit1) {
       logger.error('[Node:ExecuteCommand] Unexpected error:', error.message);

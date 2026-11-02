@@ -236,7 +236,7 @@ Field rules:
 - mediaListing: the user wants a SET/LIST of media results returned (cards with links), not to play, watch, open, or interact with one specific item:
   - "video": find/list/show/pull/recommend videos, tutorials, episodes, sermons, or clips — e.g. "find videos from mike winger on Christ in the old testament", "list of mike winger videos", "show me sourdough tutorial videos", "get me some videos about X". ALSO true for follow-ups whose resolved referent is a video list (e.g. "pull list with links", "I need the links for these" after a video-listing turn).
   - "image": show/find/get pictures, photos, pics, images, or artwork of X — e.g. "show me a picture of X", "find pics of baby clothes", "what does X look like".
-  - "none": everything else — including playing/watching/opening a SPECIFIC video ("watch the mike winger video", "play this on youtube"), downloading a media file (that's webAccessMode="download"), and all non-media tasks.
+  - "none": everything else — including playing/watching/opening a SPECIFIC video ("watch the X video", "play this on youtube"), downloading a media file (that's webAccessMode="download"), and all non-media tasks.
   mediaListing is independent of targetService: "show pics of baby clothes on amazon" is still "image" (the named site is handled downstream).
 
 - isActivityQuery: true when the user asks about their RECENT ACTIVITY, WORK, SCREEN TIME, or CONTENT CONSUMPTION — i.e., queries that should be answered from episodic memory / screen captures / app usage, NOT from the chat transcript and NOT from personal profile data. Signals: "what have I been working on", "what was I working on today", "what did I do yesterday", "what did I watch", "what did I listen to", "what apps did I use", "what was on my screen", "what was I doing", "what have I been up to". When true, the memory retrieval node should use a broad activity query (NOT the raw prompt) and a low similarity threshold, and the answer node should focus on activity/screen/app memories — NOT surface personal profile data (email, phone, address) unless explicitly asked. false for: personal profile queries ("what is my email", "what is my name"), conversation-recall meta-questions (those are isConversationRecall), and non-memory tasks (web search, automation).
@@ -880,6 +880,22 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       webAccessMode = 'public_read';
       requiresDOM = false;
       parsed.interactiveActions = [];
+    }
+
+    // Spec invariant — interactive MUST name its actions (line ~232: "When
+    // webAccessMode is interactive, this array MUST be non-empty"). The model
+    // sometimes emits interactive/requiresDOM with interactiveActions:[]
+    // (observed: "go to YouTube and watch a Mike Wenger video" →
+    // requiresDOM:true + [] → planHelpers' sessionish check forced every
+    // step into the dom.act lane). requiresDOM means DOM work — with no
+    // actions there is no DOM work, so drop the flag. Interactive keeps its
+    // mode but backfills 'view_page' the same way the bound-session rules do.
+    if (requiresDOM && !_interactiveActions.length) {
+      logger.info(`[classifyTask] requiresDOM with empty interactiveActions — dropping requiresDOM: "${userMessage.slice(0, 80)}"`);
+      requiresDOM = false;
+    }
+    if (webAccessMode === 'interactive' && !_interactiveActions.length) {
+      parsed.interactiveActions = ['view_page'];
     }
 
     if (requiresDOM) webAccessMode = 'interactive';

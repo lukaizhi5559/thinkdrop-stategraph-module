@@ -1094,6 +1094,25 @@ module.exports = async function preflightAgents(state) {
     taskFacts.destination = { url: _literalUrl, source: 'message', deepLinkType: null, expectsOverlay: false };
   }
 
+  // Named destination ("goto cathay pacific") — resolve ONCE here so every
+  // downstream nav step consumes taskFacts.destination instead of
+  // re-resolving. resolveReferencesV2 marks the nav-verb object as a
+  // destination via state._navDestination; resolveAgent's discovery chain
+  // (user-memory cache → web.agent search → verify → cache) turns the name
+  // into a URL. Registry lookups can't enumerate real-world names.
+  if (!taskFacts.destination && state._navDestination?.name) {
+    try {
+      const { _resolveStartUrlForService } = require('./resolveAgent');
+      const _destUrl = await _resolveStartUrlForService(state._navDestination.name, userMessage, mcpAdapter, logger);
+      if (_destUrl) {
+        taskFacts.destination = { url: _destUrl, source: `discovered:${state._navDestination.name}`, deepLinkType: null, expectsOverlay: false };
+        logger.info(`[Node:PreflightAgents] named destination "${state._navDestination.name}" → ${_destUrl}`);
+      }
+    } catch (e) {
+      logger.warn(`[Node:PreflightAgents] destination discovery failed for "${state._navDestination.name}": ${e.message}`);
+    }
+  }
+
   // ── Disk-scan fallback: load recipes directly from filesystem ────────────────
   try {
     const skillsRoot = path.join(os.homedir(), '.thinkdrop', 'skills');

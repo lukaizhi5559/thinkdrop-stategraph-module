@@ -242,6 +242,24 @@ function _expandHomeDir(p) {
   return p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p;
 }
 
+// First existing absolute path in a text blob — backticked/quoted spans first
+// (may contain spaces), then bare tokens ending in an extension. Used by
+// planSkillsV2's sanitize and executeCommand's dispatch-time path backfill to
+// recover a target file the planner carried in prose instead of an arg slot.
+function _minePathFromText(text) {
+  if (!text || typeof text !== 'string') return null;
+  const cands = [];
+  for (const m of text.matchAll(/`((?:\/|~\/)[^`\n]{3,300})`/g)) cands.push(m[1]);
+  for (const m of text.matchAll(/["']((?:\/|~\/)[^"'\n]{3,300})["']/g)) cands.push(m[1]);
+  for (const m of text.matchAll(/(?:^|\s|\()((?:\/|~\/)[\w@+.,\-\/=]+\.[\w]{1,10})(?=\s|$|[,;:!?)\]])/g)) cands.push(m[1]);
+  for (const c of cands) {
+    const p = String(c).trim();
+    const abs = _expandHomeDir(p);
+    try { if (fs.existsSync(abs)) return abs; } catch (_) {}
+  }
+  return null;
+}
+
 // ThinkDrop attachment tags — same syntax parsed in planSkillsV2 for the
 // FILE CONTEXT table. Controlled markup, not free-form text scanning.
 const _ATTACH_TAG_RE = /\[(?:File|Folder):\s*([^\]]+)\]/gi;
@@ -939,6 +957,15 @@ const _BOUND_READ_PICKS = ['browser.act', 'turn.loop.agent', 'dom.act', 'meta.fi
 const _PUBLIC_WEB_PICKS = ['web.agent', 'web.crawl'];
 const _NAV_PICKS = ['url.first.agent'];
 
+// Video-platform discovery is headless work — video.agent find_and_watch /
+// web.search resolve a query without touching a bound page. When the task's
+// service is a video platform, a search/find/extract step must NOT be governed
+// into the dom.act bucket just because the task is sessionish (observed:
+// "watch a Mike Wenger video" → requiresDOM:true → "Search YouTube for X"
+// adjudicated meta.find → dom.act → tab.map scans → turn.loop exhaustion).
+const _VIDEO_PLATFORM_RE = /\b(?:youtube|vimeo|rumble|bitchute|tiktok|twitch|dailymotion|netflix|hulu|disneyplus?)\b/i;
+const _VIDEO_DISCOVERY_RE = /\b(?:search|find|discover|look\s+for|browse|locate|extract|list)\b/i;
+
 // Surface nouns — a dialog/modal/menu is an on-page element, never a
 // destination. "Open create event dialog using shortcut" matched "open" +
 // newDestination and got force-routed to url.first.agent as "single legal
@@ -985,6 +1012,15 @@ function stepCandidates(step, ctx = {}) {
     return _NAV_PICKS;
   }
 
+  // Video-platform discovery carve-out — a search/find/extract step on a video
+  // service is media discovery (video.agent / web.search territory), not an
+  // on-page DOM action. Return [] so the planner's pick stands instead of
+  // being adjudicated into the bound-action lane below.
+  const _svc = ctx.targetService || tc.targetService;
+  if (_VIDEO_PLATFORM_RE.test(String(_svc || '')) && _VIDEO_DISCOVERY_RE.test(desc)) {
+    return [];
+  }
+
   // Sessionish = the step plausibly acts on a live/automation page: a session
   // was promoted for this task, an earlier step in this plan navigated, or the
   // task itself needs DOM interaction. web.* is never legal for those steps.
@@ -1016,4 +1052,4 @@ function stepCandidates(step, ctx = {}) {
   return [];
 }
 
-module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths, getAttachedFilePaths, FILE_EDIT_INTENT_RE, CONFIRM_ONLY_RE: _CONFIRM_ONLY_RE, lintAtomicBrowserPlan, hasMutationResidue, hasBrowserMutationEvidence, _isActionCapableBrowserStep, ATOMIC_BROWSER_SKILLS: _BROWSER_LANE_SKILLS, stepCandidates };
+module.exports = { serializeSkillPlanToMd, buildStepDescription, parsePlan, lintFileEditPlan: _lintFileEditPlan, getProtectedPaths, getAttachedFilePaths, FILE_EDIT_INTENT_RE, CONFIRM_ONLY_RE: _CONFIRM_ONLY_RE, lintAtomicBrowserPlan, hasMutationResidue, hasBrowserMutationEvidence, _isActionCapableBrowserStep, ATOMIC_BROWSER_SKILLS: _BROWSER_LANE_SKILLS, stepCandidates, minePathFromText: _minePathFromText };

@@ -82,6 +82,79 @@ function stripHtml(text) {
 // assistant synthesis carrying the actual data, e.g. store addresses) often
 // never ranks — only user prompts do. Referents almost always mean the result,
 // so we pull each matched session's last synthesis explicitly.
+// ── Nav-object destination classification ──────────────────────────────────
+// A leading nav verb counts as a live-page reference only when its object is
+// an on-page element ("go to the next page", "open the settings menu").
+// "goto cathay pacific" names a NEW destination and must not bind the current
+// tab (observed: the prompt bound a stale SERP and dom.act scanned it instead
+// of navigating).
+
+// Element nouns + qualifier words — an object composed ONLY of these is an
+// on-page element, never a web destination.
+const _NAV_OBJ_ONPAGE_TOKENS = /^(?:the|a|an|my|this|that|these|those|next|previous|last|first|current|same|new|own|other|another|second|third|\d+(?:st|nd|rd|th)|here|there|page|tab|site|website|section|menu|field|box|button|form|dialog|setting|settings|inbox|screen|window|sidebar|panel|dropdown|toolbar|item|result|listing|option|link|document|doc|file|folder|desktop|terminal|browser|email|e-mail|message|chat|card|sheet|cell|image|photo|picture|video|song|post|comment|notification|list|home|back|forward|search|results?|top|bottom|end|start|beginning)s?$/i;
+
+function _navObjectLooksOnPage(obj) {
+  const o = String(obj || '').trim().toLowerCase().replace(/['"]/g, '');
+  if (!o) return false;
+  const toks = o.split(/[\s\-_/]+/).filter(Boolean);
+  if (!toks.length) return false;
+  if (toks.length === 1) {
+    // Domain-shaped token ("amazon.com") — a destination, not on-page.
+    if (/\.(?:com|org|net|io|dev|ai|app|co|edu|gov|us|info|biz|me|tv|cc|xyz|site|online|store|tech|so|gg|fm|am|ly|to|cc|sh|io)\b/i.test(toks[0])) return false;
+    // File-like object ("report.pdf") — a local target, not a web destination.
+    if (/\.[a-z0-9]{2,5}$/.test(toks[0])) return true;
+  }
+  return toks.every(t => _NAV_OBJ_ONPAGE_TOKENS.test(t));
+}
+
+// Object of a LEADING nav verb — text after the verb up to the first clause
+// boundary ("goto cathay pacific and look up flights" → "cathay pacific").
+function _extractNavStartObject(msg) {
+  const m = String(msg || '').match(NAV_VERB_START_RE);
+  if (!m) return null;
+  const rest = String(msg).slice(m.index + m[0].length).trim();
+  if (!rest) return null;
+  const obj = rest.split(/\s+(?:and|then|&|to|from|for|on|in|with|using|via)\b|[,;]/i)[0].trim();
+  return obj || null;
+}
+
+// Is the nav object a named web destination? Deterministic tiers first
+// (on-page nouns, TLD, named app), then one bounded verdict for the residual
+// — the registry can't enumerate real-world names ("cathay pacific").
+async function _navObjectIsDestination(msg, obj, opts = {}) {
+  const { llmBackend, askDecision, logger } = opts;
+  const defaultWhenUnknown = opts.defaultWhenUnknown !== false;
+  const o = String(obj || '').trim().toLowerCase();
+  if (!o) return false;
+  if (_navObjectLooksOnPage(o)) return false;
+  if (/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|edu|gov|us)\b/i.test(o)) return true;
+  if (NAMED_APP_RE.test(o)) return true;
+  if (!llmBackend && typeof askDecision !== 'function') return defaultWhenUnknown;
+  const verdict = await _boundedDecision({
+    site: 'resolveReferencesV2.navDestination',
+    askDecision,
+    questions: [{
+      id: 'dest', type: 'noul',
+      question: `Does the object after the navigation verb name a website, online service, company, or place to NAVIGATE to — rather than an element or item on the current page, or a local file/app? Prompt: "${msg}" Object: "${obj}". true = named destination (navigate away to it), false = on-page element / local item.`,
+    }],
+    state: `Prompt: "${msg}"`,
+    local: (a) => a.dest?.bool == null ? null : (a.dest.bool ? 1 : 0),
+    remote: async () => {
+      try {
+        const prompt = `In this prompt, does the object of the leading navigation verb name a website, online service, company, or place to navigate to — rather than an element/item on the current page or a local file/app?\n\nPrompt: "${msg}"\nObject: "${obj}"\n\nAnswer ONLY "0" (on-page element / local item / not a place) or "1" (named destination — a website, service, company, or place).`;
+        const raw = await llmBackend.generateAnswer(prompt, {
+          query: prompt,
+          context: { systemInstructions: 'Answer with a single digit: 0 or 1.' },
+        }, { maxTokens: 1, temperature: 0, fastMode: true, taskType: 'classification' });
+        const text = typeof raw === 'string' ? raw : (raw?.text || raw?.content || '');
+        return text.trim() === '1' ? 1 : 0;
+      } catch (_) { return null; }
+    },
+    logger,
+  });
+  return verdict == null ? defaultWhenUnknown : !!verdict;
+}
+
 async function _collectSessionResults(mcpAdapter, sessionIds, currentSessionId, logger) {
   const uniq = [...new Set(sessionIds)]
     .filter(id => id && id !== currentSessionId)
@@ -611,10 +684,37 @@ module.exports = async function resolveReferencesV2(state) {
   // bound yet, so lane decisions (e.g. named video-platform searches) can't
   // rely on session count alone.
   state._extConnected = _extConnected;
+  // A leading nav verb is a live-page ref only when its object is on-page —
+  // "goto cathay pacific" names a NEW destination and must not bind the
+  // current tab (observed: a stale SERP was bound as ext:default and the
+  // plan's dom.act steps scanned it instead of navigating).
+  const _NAV_START_DOMAIN_RE = /\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|edu|gov|us)\b/i;
+  const _navStartMsg = String(message || '');
+  const _navStartIsDest = NAV_VERB_START_RE.test(_navStartMsg)
+    && !_NAV_START_DOMAIN_RE.test(_navStartMsg)
+    && !NAMED_APP_RE.test(_navStartMsg)
+    ? await (async () => {
+        const _navObj = _extractNavStartObject(_navStartMsg);
+        if (!_navObj || _navObjectLooksOnPage(_navObj)) return false;
+        const isDest = await _navObjectIsDestination(_navStartMsg, _navObj, {
+          llmBackend: state.llmBackend || null,
+          askDecision: _makeAskDecision(mcpAdapter),
+          logger,
+          // 'open'/'browse' keep the legacy live-page default when no verdict
+          // is available; outbound verbs default to destination.
+          defaultWhenUnknown: !/^\s*(?:open|browse)\b/i.test(_navStartMsg),
+        });
+        if (isDest) {
+          logger.info(`[Node:ResolveReferencesV2] nav-verb object "${_navObj}" is a named destination — not a live-page ref`);
+          state._navDestination = { name: _navObj, source: 'nav-verb-object' };
+        }
+        return isDest;
+      })()
+    : false;
   const _livePageRef = LIVE_PAGE_REF_RE.test(message || '')
     || PAGE_ITEM_REF_RE.test(message || '')
     || /\b(?:here|there|this\s+one)\b/i.test(message || '')
-    || (NAV_VERB_START_RE.test(message || '') && !/\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|edu|gov|us)\b/i.test(message || '') && !NAMED_APP_RE.test(message || ''));
+    || (NAV_VERB_START_RE.test(message || '') && !_navStartIsDest && !_NAV_START_DOMAIN_RE.test(message || '') && !NAMED_APP_RE.test(message || ''));
   if (_livePageRef && !_priorScreenContext?.url && _extSessions.length) {
     // "this page" means the tab the user is actually on — ext:default (the
     // real active tab) beats agent-bound sessions, which can hold a stale URL
@@ -654,6 +754,29 @@ module.exports = async function resolveReferencesV2(state) {
     state._extSessions = [{ sessionId: _pseudoSid, url: state.priorBrowserContext?.url || null, title: null, pseudo: true }];
     state._extSessionHint = { sessionId: _pseudoSid, url: state.priorBrowserContext?.url || null, title: null };
     logger.info(`[Node:ResolveReferencesV2] live-page referent with empty registry → pseudo-session ${_pseudoSid} (prior=${_priorSid || 'none'})`);
+  }
+
+  // ── Skill-driven live-video hint ─────────────────────────────────────────
+  // A compiled plan carrying an unbound live-video step (video.agent with no
+  // videoUrl) is itself the referent — no prompt-text matching needed. Give
+  // classify/context the same hint the lexical live-page path produces so a
+  // "watch this video" compile resolves against the real tab downstream.
+  if (!state._extSessionHint && _extSessions.length) {
+    try {
+      const lt = require('../../../shared/live-tabs.cjs');
+      const _plan = typeof state._skillPlan === 'string'
+        ? JSON.parse(Buffer.from(state._skillPlan, 'base64').toString('utf8'))
+        : (Array.isArray(state._skillPlan) ? state._skillPlan : (Array.isArray(state.compiledPlan) ? state.compiledPlan : []));
+      if (_plan.some(s => lt.wantsLiveTab(s))) {
+        const _vtab = lt.pickVideoTab(_extSessions);
+        if (_vtab) {
+          state._extSessionHint = { sessionId: _vtab.sessionId, url: _vtab.url, title: _vtab.title };
+          if (!_activeAppContext) _activeAppContext = {};
+          if (_vtab.url) _activeAppContext.url = _vtab.url;
+          logger.info(`[Node:ResolveReferencesV2] live-video plan step → extSessionHint ${_vtab.sessionId} (${_vtab.url || 'no url'})`);
+        }
+      }
+    } catch (_) { /* decode/pick failures leave the hint unset — the guard still resolves at plan time */ }
   }
 
   // ── Classify task once — all downstream nodes read from _taskClassification ──────────
@@ -858,7 +981,10 @@ module.exports = async function resolveReferencesV2(state) {
       return [..._named].some(s => { const n = s.replace(/_/g, ''); return n.length >= 3 && (norm.includes(n) || n.includes(norm)); });
     };
     const _QUALIFIED_VERB_RE = /\b(open|go\s+to|goto|switch\s+to|load)\s+/gi;
-    let _leadAway = _UNQUALIFIED_DEPART_RE.test(_msg);
+    // A leading nav verb whose object is a named destination ("goto cathay
+    // pacific") is itself a lead-away — the token scans below can't
+    // enumerate real-world names.
+    let _leadAway = _navStartIsDest || _UNQUALIFIED_DEPART_RE.test(_msg);
     for (const m of _msg.matchAll(_QUALIFIED_VERB_RE)) {
       if (_isDestObject(_msg.slice(m.index + m[0].length))) { _leadAway = true; break; }
     }
@@ -1398,4 +1524,7 @@ module.exports = async function resolveReferencesV2(state) {
 // Exported for tests — chronological merge used inside the node above.
 module.exports._mergeConversationHistory = _mergeConversationHistory;
 module.exports._collectSessionResults = _collectSessionResults;
+module.exports._navObjectLooksOnPage = _navObjectLooksOnPage;
+module.exports._extractNavStartObject = _extractNavStartObject;
+module.exports._navObjectIsDestination = _navObjectIsDestination;
 module.exports.REFERENTIAL_RE = REFERENTIAL_RE;
