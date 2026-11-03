@@ -1008,6 +1008,7 @@ async function _thinPostFailureHandlerImpl(state) {
   // and resumes with a corrected plan. Browser-agent needsBuild takes the same
   // path — one onboarding lane for every executor kind.
   const _nbAgentId = (failedStep.skill === 'cli.agent' || failedStep.skill === 'browser.agent') && failedStep.needsBuild
+    && failedStep.args?.agentId !== failedStep.skill // self-brand → generic loop, not an onboardable service
     ? String(failedStep.args?.agentId || '') : '';
   const _nbSvcKey = _nbAgentId.replace(/\.agent$/i, '').toLowerCase().replace(/[^a-z0-9]/g, '');
   if (_nbSvcKey.length >= 2) {
@@ -1283,8 +1284,12 @@ async function _thinPostFailureHandlerImpl(state) {
     // Web-fetch skills stay out — a terminal loop can't fix a dead crawl;
     // they fall to the ask_user path below. edit.agent too — a PTY session
     // cannot out-edit the structured editor (see EDIT_ESCALATE above).
+    // Browser-lane too — a shell loop cannot repair a dead page/session; it
+    // self-brands 'cli.agent' and the resume fabricates a registry id that
+    // can never resolve (observed: 36min "No agent found: cli.agent" loop).
     if (!_WEB_FETCH_SKILLS.has(failedStep.skill)
         && failedStep.skill !== 'edit.agent'
+        && !_browserish(failedStep.skill)
         && !(patchHistory || []).some(p => p.action === 'TERMINAL_DEBUG' && p.cursor === skillCursor)) {
       const _dbgArgv = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
       const _dbgTask = `${failedStep.args?.goal || failedStep.description || _dbgArgv || 'complete the failed step'} — previous attempts failed: ${(_dbgArgv ? `\`${_dbgArgv}\` → ` : '')}${String(failedStep.error || 'failed').slice(0, 300)}`;
@@ -8613,6 +8618,11 @@ Please try again or search with different terms.`;
       url: raw.url ?? null,
       sessionId: raw.sessionId ?? null,
       resolvedAgent: raw.resolvedAgent ?? null,
+      // Agent-onboarding escalation fields — a skill reporting an unregistered
+      // agentId (No agent found) must reach failedStep so the needs_plan
+      // escalation below fires instead of a generic ask_user loop.
+      needsBuild: raw.needsBuild === true,
+      missingAgent: raw.missingAgent === true,
       routeRule: raw.routeRule ?? null,
       deepLinkType: raw.deepLinkType ?? null,
       actionHistory: Array.isArray(raw.actionHistory) ? raw.actionHistory : null,

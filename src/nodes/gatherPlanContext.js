@@ -531,7 +531,12 @@ module.exports = async function gatherPlanContext(state) {
       && !state.recoveryContext
       && !state.isMultiIntent
       && !(state.planGatheringAnswers || []).length
-      && !state._taskClassification?.isBrowseOnly) {
+      && !state._taskClassification?.isBrowseOnly
+      // Seeded RouteDecision envelope says the task is a single concrete
+      // deliverable (local file/system/query) — the bounded planner handles
+      // it; authoring a named plan here just stalls it (observed: "give me
+      // code for hello world in python" → 96s planning + 2 questions).
+      && state._taskClassification?.planShape !== 'single') {
     logger.info(`[Node:GatherPlanContext] No deterministic coverage → needs_plan escalation (no grill): "${_gatherMsg.slice(0, 80)}"`);
     return {
       ...state,

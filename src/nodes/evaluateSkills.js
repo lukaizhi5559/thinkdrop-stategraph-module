@@ -544,8 +544,9 @@ Output ONLY valid JSON.`;
     // is a guess — and guesses canonized as rules fight the deterministic
     // probe/routing gates downstream (observed: nylas-cli rules resurrected a
     // nonexistent @nylas/cli package and banned cli.agent outright).
-    const ROUTING_RX = /npm\s+i(nstall)?\b|brew\s+install\b|pip3?\s+install\b|apt(-get)?\s+install\b|\bshell\.run\b|\bcli\.agent\b|\bbuild_agent\b|\bbrowser\.agent\b|do\s+not\s+use\s+(a\s+)?\w*agent/i;
-    const rulePrescribesCommand = ROUTING_RX.test(verdict.ruleText);
+    // Canonical RX lives in shared/rule-guard.cjs — the same check guards the
+    // command-service write paths (cli.agent save_rule, browser.act diagnose).
+    const rulePrescribesCommand = require('../../../shared/rule-guard.cjs').rulePrescribesRouting(verdict.ruleText);
     if (rulePrescribesCommand) {
       logger.warn(`[Node:EvaluateSkills] Bad-rule guard: skipping DuckDB write — rule prescribes commands/routing, not facts. ruleText: "${verdict.ruleText.slice(0, 120)}"`);
     }
