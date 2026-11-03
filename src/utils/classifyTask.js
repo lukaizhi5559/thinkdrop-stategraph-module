@@ -467,6 +467,25 @@ function _preview(content, maxChars = 300) {
   return s.length > maxChars ? s.slice(0, maxChars - 1) + '…' : s;
 }
 
+// Pipeline-injected metadata blocks ride the enriched prompt — "(Resolved
+// referent — …)", "[Resolved file path: …]", "[Additional context: …]",
+// "[Runtime readiness: …]", "(Context from prior turn: …)". They are system
+// annotations for the model, never user-authored text: the deterministic
+// lexical guards below (service recovery, literal-path coercion, mutation
+// cues) must not pattern-match them (observed: a bogus "(Resolved referent —
+// message (titled "nothing to commit, working tree clean,") …" blob made
+// FILE_PATH_RE coerce a draft-request to local_file).
+function _stripInjectedBlocks(text) {
+  let t = String(text || '');
+  // End-anchored first — injected clauses are appended last and carry nested
+  // parens ("(titled …)", "(task id)") a non-greedy match would strand.
+  t = t.replace(/\((?:Resolved referent|Context from prior turn)\b[\s\S]*\)\s*$/gi, ' ');
+  // Mid-text occurrences — one level of balanced nesting.
+  t = t.replace(/\((?:Resolved referent|Context from prior turn)\s*[^()]*(?:\([^()]*\)[^()]*)*\)/gi, ' ');
+  t = t.replace(/\[(?:Resolved file path|Additional context|Runtime readiness|Live tabs)[^\]]*\]/gi, ' ');
+  return t.replace(/\s{2,}/g, ' ').trim();
+}
+
 // ── Local decision-model decomposition ─────────────────────────────────────
 // The remote classifier answers a 25-field JSON schema in one shot. The local
 // decision model answers the same schema as one batched question set — every
@@ -558,7 +577,9 @@ function _registeredServiceNames() {
 
 function _lexicalTargetService(msg) {
   if (!msg) return null;
-  const m = ` ${String(msg).toLowerCase()} `;
+  // Email addresses are recipients/content, not service mentions — a pasted
+  // draft's "@gmail.com" must not recover gmail (same scrub detectAgent uses).
+  const m = ` ${String(msg).toLowerCase().replace(/\S+@\S+/g, ' ')} `;
   for (const [canon, aliases] of Object.entries(SERVICE_ALIASES)) {
     for (const al of aliases) {
       const esc = al.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -690,6 +711,10 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
 
   // Classify the user's actual text, not overlay-injected attachment tags.
   const classifiedMessage = _stripAttachmentTags(userMessage) || userMessage;
+  // The deterministic guards run on user-authored text only — injected
+  // pipeline metadata stays available to the LLM prompt (classifiedMessage)
+  // but must not feed lexical matches.
+  const lexicalMessage = _stripInjectedBlocks(classifiedMessage) || classifiedMessage;
   const _hasAttachedCard = (conversationHistory || []).some(m => m.attachedToMessage);
   const _withResolution = (tc) => {
     tc.resolution = deriveResolution(tc, classifiedMessage, _hasAttachedCard);
@@ -705,8 +730,8 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
   // Keep the pattern narrow — only meta-questions about the chat transcript itself,
   // NOT queries about past activity/episodic memory (those are memory_retrieve).
   // Canonical pattern: CONVERSATION_RECALL_META_RE in shared/text-patterns.cjs.
-  if (CONVERSATION_RECALL_META_RE.test(classifiedMessage)) {
-    logger.info(`[classifyTask] Deterministic conversation-recall match: "${classifiedMessage.slice(0, 80)}"`);
+  if (CONVERSATION_RECALL_META_RE.test(lexicalMessage)) {
+    logger.info(`[classifyTask] Deterministic conversation-recall match: "${lexicalMessage.slice(0, 80)}"`);
     return {
       ..._default,
       taskType: 'query',
@@ -928,8 +953,14 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // Follow-up replies are bare ("yes", "go ahead") — the service name lives
     // in the resolved followUpTarget (the accepted offer), not the reply
     // itself. Check both so a legitimately inherited service isn't dropped.
+    // The drop-guard scans the FULL enriched corpus — a legitimately bound
+    // referent ("that nylas event") names its service inside the injection.
     const _mentionCorpus = parsedFollowUpTarget
       ? `${classifiedMessage} ${parsedFollowUpTarget}` : classifiedMessage;
+    // Lexical recovery + mutation cues scan user-authored text only —
+    // injected metadata is not the user naming a service.
+    const _lexicalCorpus = parsedFollowUpTarget
+      ? `${lexicalMessage} ${parsedFollowUpTarget}` : lexicalMessage;
     if (parsedTargetService && webAccessMode !== 'interactive' && !requiresDOM &&
         !_serviceMentioned(parsedTargetService, _mentionCorpus)) {
       logger.info(`[classifyTask] Phantom targetService "${parsedTargetService}" not mentioned in message — dropping (webAccessMode=${webAccessMode})`);
@@ -937,10 +968,14 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     }
     // Deterministic recovery — a bare token that names a registered service
     // ("open chatgpt") is ground truth even when the remote classifier emits
-    // null. Same _lexicalTargetService the local-decision path uses; scans the
-    // same mention corpus the phantom check used.
-    if (!parsedTargetService) {
-      const _lexical = _lexicalTargetService(_mentionCorpus);
+    // null. Same _lexicalTargetService the local-decision path uses; scans
+    // user-authored text (never injected metadata) and only for taskTypes a
+    // service can serve — a query/passive taskType never recovers a service
+    // (observed: a pasted draft containing "@gmail.com" and "git" tokens
+    // recovered gmail/git onto a polish-request classified 'query').
+    const _SERVICE_CAPABLE = new Set(['browser', 'messaging', 'app_automation', 'scheduling']);
+    if (!parsedTargetService && _SERVICE_CAPABLE.has(parsed.taskType)) {
+      const _lexical = _lexicalTargetService(_lexicalCorpus);
       if (_lexical) {
         logger.info(`[classifyTask] targetService recovered lexically: "${_lexical}" (LLM emitted null)`);
         parsedTargetService = _lexical;
@@ -958,10 +993,10 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const _MUTATION_VERB_RE = /\b(set|create|add|make|new|schedule|book|plan|arrange|organize|send|post|publish|upload|submit|reply|forward|compose|delete|remove|edit|update|rename|invite|share|join|confirm|rsvp|buy|order|checkout|pay|reserve|fill|sign|apply|register)\b/i;
     const _MUTATION_NOUN_RE = /\b(event|events|meeting|meetings|appointment|appointments|reminder|reminders|calendar|e-?mail|emails|message|messages|dm|post|posts|tweet|tweets|comment|comments|order|orders|booking|bookings|reservation|reservations|doc|document|documents|file|files|note|notes|task|tasks|list|lists|playlist|playlists|photo|photos|video|videos|call|calls|form|forms)\b/i;
     if (parsed.taskType === 'browser' && webAccessMode !== 'interactive' && parsedTargetService
-        && _MUTATION_VERB_RE.test(_mentionCorpus) && _MUTATION_NOUN_RE.test(_mentionCorpus)) {
-      const _act = /\b(send|reply|forward|compose|e-?mail|message|dm)\b/i.test(_mentionCorpus) ? 'send_message'
-        : /\b(book|schedule|reserve|appointment|meeting|event|reminder|calendar)\b/i.test(_mentionCorpus) ? 'book_reservation'
-        : /\b(buy|order|checkout|pay|cart|purchase)\b/i.test(_mentionCorpus) ? 'add_to_cart'
+        && _MUTATION_VERB_RE.test(_lexicalCorpus) && _MUTATION_NOUN_RE.test(_lexicalCorpus)) {
+      const _act = /\b(send|reply|forward|compose|e-?mail|message|dm)\b/i.test(_lexicalCorpus) ? 'send_message'
+        : /\b(book|schedule|reserve|appointment|meeting|event|reminder|calendar)\b/i.test(_lexicalCorpus) ? 'book_reservation'
+        : /\b(buy|order|checkout|pay|cart|purchase)\b/i.test(_lexicalCorpus) ? 'add_to_cart'
         : 'create';
       logger.info(`[classifyTask] mutation post-guard: webAccessMode ${webAccessMode}→interactive (service=${parsedTargetService}, action=${_act})`);
       webAccessMode = 'interactive';
@@ -999,7 +1034,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // flaked to taskType:'query' once, letting a passive suggestedIntent carry
     // it to a "I can't read files" hallucination. Any POSIX path token in the
     // message means the task touches the filesystem; coerce a passive typing.
-    if (FILE_PATH_RE.test(classifiedMessage)
+    if (FILE_PATH_RE.test(lexicalMessage)
         && (!parsed.taskType || parsed.taskType === 'query' || parsed.taskType === 'ambiguous')) {
       logger.info(`[classifyTask] Literal path in message but taskType='${parsed.taskType}' — coercing to local_file`);
       parsed.taskType = 'local_file';
@@ -1012,7 +1047,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // reminder and the run claims a Google event was created (observed).
     const _EXT_SVC_RE = /\b(google|gmail|calendar\.google|calendly|outlook|eventbrite|notion|spotify|zoom|meet|teams|slack|discord|github|linkedin|twitter)\b/i;
     if (parsed.taskType === 'scheduling'
-        && (parsedTargetService || _EXT_SVC_RE.test(classifiedMessage))) {
+        && (parsedTargetService || _EXT_SVC_RE.test(lexicalMessage))) {
       logger.info(`[classifyTask] taskType='scheduling' but external service named (targetService=${parsedTargetService || 'none'}) — coercing to browser`);
       parsed.taskType = 'browser';
     }

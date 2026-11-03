@@ -63,6 +63,8 @@ const TESTS = [
   'internal-error-guard.test.js',
   'classify-followup.test.js',
   'unit.test.js',
+  'page-nav-scan.test.js',
+  'classify-injected-blocks.test.js',
 ];
 
 let pass = 0, fail = 0;

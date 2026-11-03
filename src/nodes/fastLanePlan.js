@@ -27,6 +27,7 @@
  */
 
 const { SCREEN_OBSERVATION_RE, LIVE_PAGE_REF_RE } = require('../utils/textPatterns.cjs');
+const { SITE_SEARCH_URLS, _extractNavQuery } = require('../utils/localPlanTemplates');
 
 const ABS_URL_RE = /(https?:\/\/[^\s"'<>)\]]+)/i;
 const HOST_RE = /\b((?:[a-z0-9-]+\.)+(?:com|net|org|io|ai|dev|app|co|edu|gov|info|me|us|uk|de|fr|jp|au|ca))((?:\/|#|\?)[^\s"'<>)\]]*)?/i;
@@ -131,6 +132,13 @@ function _eligible(state) {
   // the guard keys on _planTask, not _deterministicPlan generally.
   if (state._planTask) return false;
   if (state.recoveryContext || state.isMultiIntent || state._planCorrectionMode) return false;
+  // Nav/scan deterministic templates already encode the real-browser shape the
+  // task wants (shell.run open + OS scan_page) — swapping them for a nav_task/
+  // web-agent plan reintroduces the url.first/turn-loop chain the template
+  // exists to avoid (observed: "go to the channel" → nav_task → turn-loop).
+  // Lookup-answer templates (bible_verse…) keep the override.
+  const _NAV_TEMPLATES = new Set(['page_nav_scan', 'url_open', 'page_scan', 'service_browse', 'browser_history', 'tab_close']);
+  if (state._deterministicPlan?.length && _NAV_TEMPLATES.has(state._deterministicTemplate)) return false;
   return isBrowseFastLaneTc(state._taskClassification, state.resolvedMessage || state.message);
 }
 
@@ -192,9 +200,25 @@ module.exports = async function fastLanePlan(state) {
   const _svc = _tc2.targetService
     || _inferServiceFromText(_tc2.followUpTarget)
     || _inferServiceFromText(message);
+  // Named site with a deterministic search URL → the user's nav spec: open
+  // the site-search URL via shell.run `open`, then OS-path scan_page — never
+  // nav_task/url.first/extension lanes for site+search tasks. The query uses
+  // the same nav-verb/site-name stripper the template applies — a raw "goto
+  // youtube and look for mike winger" must not search for its own verbs.
+  const _svcSearchQuery = String(_tc2.followUpTarget || '').trim()
+    || _extractNavQuery(message)
+    || _searchQuery;
+  const _searchUrl = _svc && SITE_SEARCH_URLS[String(_svc).toLowerCase()]
+    ? SITE_SEARCH_URLS[String(_svc).toLowerCase()](_svcSearchQuery) : null;
   const plan = url
     ? [fetchStep, synthStep]
-    : _svc
+    : _searchUrl
+      ? [
+          { skill: 'shell.run', args: { cmd: 'open', argv: [_searchUrl] }, description: `Open ${_searchUrl.slice(0, 70)}` },
+          { skill: 'app.agent', args: { action: 'scan_page', preferOs: true, maxWaitMs: 20000, timeoutMs: 30000 }, description: 'Read the loaded page' },
+          synthStep,
+        ]
+      : _svc
       ? [
           {
             skill: 'app.agent',

@@ -246,14 +246,16 @@ describe('service_task (external tier)', () => {
     assert.equal(hit.template, 'service_task');
     assert.equal(hit.external, true);
     assert.equal(hit.serviceAgent, 'twitter.agent');
-    assert.equal(hit.skillPlan[0].skill, 'browser.agent');
+    // Atomic split: url.first.agent navigates the deep link, dom.act drives
+    // the on-page work, synthesize reports — never a whole-task browser.agent.
+    assert.equal(hit.skillPlan[0].skill, 'url.first.agent');
+    assert.equal(hit.skillPlan[0].stepType, 'navigate');
     assert.equal(hit.skillPlan[0].args.agentId, 'twitter.agent');
     // task is the verbatim user message — no model-synthesized instructions
     assert.equal(hit.skillPlan[0].args.task, 'post a tweet saying hello world');
-    assert.equal(hit.skillPlan[1].skill, 'synthesize');
-    // No forced stepType — 'on-page-action' would make browser.agent skip
-    // deep-link resolution and unset URL-first navigation entirely.
-    assert.equal(hit.skillPlan[0].stepType, undefined);
+    assert.equal(hit.skillPlan[1].skill, 'dom.act');
+    assert.equal(hit.skillPlan[1].args.agentId, 'twitter.agent');
+    assert.equal(hit.skillPlan[2].skill, 'synthesize');
   });
 
   it('accepts x.com alias → twitter.agent', async () => {

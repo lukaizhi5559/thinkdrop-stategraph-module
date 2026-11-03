@@ -170,6 +170,64 @@ function browseState(tc, message = 'yes') {
     expect(r._skillPlan[0].args.action).toBe('read_url');
   });
 
+  // ── deterministic nav/scan templates are never overridden ──────────────────
+
+  await it('page_nav_scan deterministic plan is not overridden by the fast lane', async () => {
+    const detPlan = [
+      { step: 1, skill: 'shell.run', args: { cmd: 'open', argv: ['https://www.youtube.com/results?search_query=x'] } },
+      { step: 2, skill: 'app.agent', args: { action: 'scan_page', preferOs: true } },
+    ];
+    const state = {
+      ...browseState({ targetService: 'youtube' }, 'goto youtube and look for x'),
+      _deterministicPlan: detPlan,
+      _deterministicTemplate: 'page_nav_scan',
+    };
+    const r = await fastLanePlan(state);
+    if (r._skillPlan) throw new Error('fast lane must not emit _skillPlan over a nav template');
+    expect(r._deterministicPlan).toEqual(detPlan);
+  });
+
+  await it('lookup templates (bible_verse) still get overridden', async () => {
+    const state = {
+      ...browseState({ targetService: 'biblegateway' }, 'goto biblegateway and show me exodus 1'),
+      _deterministicPlan: [{ step: 1, skill: 'shell.run', args: {} }],
+      _deterministicTemplate: 'bible_verse',
+    };
+    const r = await fastLanePlan(state);
+    if (!r._skillPlan) throw new Error('expected the fast lane to override a non-nav template');
+    expect(r._deterministicPlan).toBe(null);
+  });
+
+  // ── whitelisted site-search → literal open + OS scan ───────────────────────
+
+  await it('whitelisted service (youtube) → shell.run open + preferOs scan_page, not nav_task', async () => {
+    const r = await fastLanePlan(browseState(
+      { targetService: 'youtube' },
+      'goto youtube and look for mike winger',
+    ));
+    const plan = r._skillPlan;
+    expect(plan.length).toBe(3);
+    expect(plan[0].skill).toBe('shell.run');
+    expect(plan[0].args.cmd).toBe('open');
+    expect(plan[0].args.argv[0]).toBe('https://www.youtube.com/results?search_query=mike%20winger');
+    expect(plan[1].skill).toBe('app.agent');
+    expect(plan[1].args.action).toBe('scan_page');
+    expect(plan[1].args.preferOs).toBe(true);
+    expect(plan[2].skill).toBe('synthesize');
+    if (plan.some(s => s.args?.action === 'nav_task' || s.skill === 'url.first.agent')) {
+      throw new Error('site-search must never route to nav_task/url.first');
+    }
+  });
+
+  await it('non-whitelisted service (biblegateway) keeps nav_task', async () => {
+    const r = await fastLanePlan(browseState(
+      { targetService: 'biblegateway' },
+      'goto biblegateway and show me exodus 1',
+    ));
+    expect(r._skillPlan[0].skill).toBe('app.agent');
+    expect(r._skillPlan[0].args.action).toBe('nav_task');
+  });
+
   console.log(`\n❌ ${_failed} failed, ✅ ${_passed} passed`);
   if (_failed > 0) {
     for (const f of _failures) console.log(`  - ${f.label}: ${f.error}`);

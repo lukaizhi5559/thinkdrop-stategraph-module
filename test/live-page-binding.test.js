@@ -80,6 +80,10 @@ const _backend = (script) => ({ generateAnswer: async () => (typeof script === '
 const _json = (n, args) => JSON.stringify({ n, args });
 
 (async () => {
+  // The nav URL now rides in shell.run argv[0] (deterministic `open` lane);
+  // bound-session plans still carry it in app.agent navigate_url's args.url.
+  const _navUrl = h => h?.skillPlan?.[0]?.args?.url || h?.skillPlan?.[0]?.args?.argv?.[0] || '';
+
   // Classifier picks {site:'google'} for a site-less follow-up; the task's
   // resolved service (amazon) must win — the observed google hijack.
   let hit = await forceClassifyLocalPlan(
@@ -88,7 +92,7 @@ const _json = (n, args) => JSON.stringify({ n, args });
     _backend(_json(19, { site: 'google', query: 'baby clothes' })),
     logger,
   );
-  check('coerced follow-up builds an amazon search url', !!hit && /amazon\.com\/s\?k=baby/.test(hit.skillPlan?.[0]?.args?.url || ''), hit?.skillPlan?.[0]?.args?.url);
+  check('coerced follow-up builds an amazon search url', !!hit && /amazon\.com\/s\?k=baby/.test(_navUrl(hit)), _navUrl(hit));
 
   // An explicitly-named site is the user's choice — never coerced.
   hit = await forceClassifyLocalPlan(
@@ -97,7 +101,7 @@ const _json = (n, args) => JSON.stringify({ n, args });
     _backend(_json(19, { site: 'google', query: 'baby clothes' })),
     logger,
   );
-  check('explicit "go to google" keeps the google url', !!hit && /google\.com\/search/.test(hit.skillPlan?.[0]?.args?.url || ''), hit?.skillPlan?.[0]?.args?.url);
+  check('explicit "go to google" keeps the google url', !!hit && /google\.com\/search/.test(_navUrl(hit)), _navUrl(hit));
 
   // Fresh (non-follow-up) requests keep the classifier's site.
   hit = await forceClassifyLocalPlan(
@@ -106,7 +110,7 @@ const _json = (n, args) => JSON.stringify({ n, args });
     _backend(_json(19, { site: 'google', query: 'baby clothes' })),
     logger,
   );
-  check('non-follow-up keeps the picked site', !hit || /google\.com/.test(hit.skillPlan?.[0]?.args?.url || '') || hit.skillPlan?.[0]?.args?.url == null, hit?.skillPlan?.[0]?.args?.url);
+  check('non-follow-up keeps the picked site', !hit || /google\.com/.test(_navUrl(hit)) || _navUrl(hit) === '', _navUrl(hit));
 
   console.log('\n--- shared ordinal resolver ---');
   check('"click the third item" → nth=3', ordinalNth('click the third item') === 3);

@@ -626,7 +626,11 @@ const TEMPLATES = [
         return null;
       }
       if (raw) {
-        if (!m.includes(raw)) return 'url not message-verbatim';
+        // Message-verbatim, or the URL this turn's referent/doc resolution
+        // produced ("go to the channel", "open that link" — the concrete URL
+        // lives in tc, not the prompt text).
+        const _resolvedUrl = String(tc?.followUpTarget || tc?.activeDocTarget || '').trim();
+        if (!m.includes(raw) && raw !== _resolvedUrl) return 'url not message-verbatim';
         if (/^https?:\/\//i.test(raw)) { try { new URL(raw); return null; } catch (_) { return 'bad url'; } }
         if (/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}([/?#][^\s]*)?$/i.test(raw)) return null;
         return 'bad url';
@@ -640,15 +644,29 @@ const TEMPLATES = [
       const url = raw && !SITE_SEARCH_URLS[raw.toLowerCase()]
         ? (/^https?:\/\//i.test(raw) ? raw : `https://${raw}`)
         : SITE_SEARCH_URLS[siteKey](String(a.query || '').trim() || _extractNavQuery(m));
+      const _scanArgs = { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 };
       // Bound-search coercion stamped a session → navigate THE BOUND TAB to its
       // own search results (not a fresh tab) so follow-ups like "click the
-      // first result" act on the same SERP the user just watched appear.
+      // first result" act on the same SERP the user just watched appear. That
+      // lane must drive the bound tab through its ext session — the session
+      // binding is what makes the follow-up addressable.
       const _bSid = String(tc?._boundSearchSessionId || '').trim() || undefined;
-      const _navArgs = { action: 'navigate_url', url, timeoutMs: 15000 };
-      const _scanArgs = { action: 'scan_page', maxWaitMs: 20000, timeoutMs: 30000 };
-      if (_bSid) { _navArgs.sessionId = _bSid; _scanArgs.sessionId = _bSid; }
+      if (_bSid) {
+        _scanArgs.sessionId = _bSid;
+        return [
+          { skill: 'app.agent', args: { action: 'navigate_url', url, sessionId: _bSid, timeoutMs: 15000 }, description: `Open ${url.slice(0, 70)}` },
+          { skill: 'app.agent', args: _scanArgs, description: 'Read the loaded page' },
+          { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's request using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
+        ];
+      }
+      // Default lane — deterministic OS `open` of the site-search URL (never
+      // the extension/playwright stack; same shape url_open already ships),
+      // then an OS-path scan of the page that just loaded. preferOs keeps
+      // scan_page from rebinding to a stale ext session and reading the wrong
+      // tab — the just-opened tab isn't session-bound by construction.
+      _scanArgs.preferOs = true;
       return [
-        { skill: 'app.agent', args: _navArgs, description: `Open ${url.slice(0, 70)}` },
+        { skill: 'shell.run', args: { cmd: 'open', argv: [url] }, description: `Open ${url.slice(0, 70)}` },
         { skill: 'app.agent', args: _scanArgs, description: 'Read the loaded page' },
         { skill: 'synthesize', stepType: 'verify', args: { prompt: `Answer the user's request using the scanned page content. User asked: "${String(m).slice(0, 300)}"` }, description: 'Answer from page content' },
       ];
@@ -835,6 +853,50 @@ const TEMPLATES = [
       const raw = String(a.url || '').trim();
       const url = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
       return [{ skill: 'shell.run', args: { cmd: 'open', argv: [url] }, description: `Play ${url}` }];
+    },
+  },
+  {
+    // "draft/write/polish a reply to this message" — the referent is content
+    // on the open page (or the resolved doc), the deliverable is reply TEXT.
+    // A scan + draft synthesize is the whole task — observed: "give me a
+    // response to the message" decomposed into "Find and open the
+    // conversation" → url.first.agent browser driving → no_skill_coverage.
+    // Send/post cues stay with the planner (real mutation).
+    n: 27, id: 'reply_draft', lowRisk: true,
+    describe: 'draft/write/polish a reply or response to a message/post/email — the content is on the open page or in the prompt itself; produces reply TEXT only ("give me a response to the message", "draft a reply", "polish this response", "what should I say back", "help me respond to this email") — args: {}. NOT for sending/posting (planner/service_task), NOT for editing a local file (file_*).',
+    validate: (a, m, t, tc) => {
+      const msg = String(m || '');
+      // Draft-shape cue — the request produces text for the user to review.
+      if (!/\b(reply|replies|response|respond|message|msg|e-?mail|comment|dm|text|answer|invite|invitation)\b/i.test(msg)
+          || !/\b(draft|write|compose|polish|rewrite|re-?write|update|improve|fix\s+up|edit|give\s+me|come\s+up\s+with|suggest|help\s+me\s+(?:write|respond|reply)|what\s+should\s+i\s+(?:say|write|respond|reply))\b/i.test(msg)) {
+        return 'no draft-a-reply shape';
+      }
+      // Send/post means the task delivers — a real mutation the planner owns.
+      if (/\b(send|post|submit|publish|deliver|hit\s+send|attach\s+and\s+send)\b/i.test(msg)) return 'send/post cue — planner task';
+      // The referent must be on screen or resolved — a bare "write me an
+      // email to my landlord" is content creation, not a reply-to-something.
+      if (!(tc?.activeDocRef === 'url' || tc?.activeDocRef === 'screen'
+            || LIVE_PAGE_REF_RE.test(msg) || SCREEN_OBSERVATION_RE.test(msg)
+            || /\b(this|that|the|his|her|their)\s+(?:message|msg|email|e-?mail|post|comment|dm|text|thread|invite|invitation|request)\b/i.test(msg)
+            || /\b(reply|respond|response|answer)\s+to\b/i.test(msg))) {
+        return 'no on-screen/resolved referent';
+      }
+      return null;
+    },
+    build: (a, m, tc) => {
+      const target = String(tc?.activeDocTarget || '');
+      // Resolved URL target with no live deixis → read that page; "this/the
+      // message" on screen → scan the frontmost page. preferOs — the draft
+      // referent is the visible tab, never an inferred ext session.
+      const read = /^https?:\/\//i.test(target) && !LIVE_PAGE_REF_RE.test(m) && !SCREEN_OBSERVATION_RE.test(m)
+        ? { skill: 'app.agent', args: { action: 'read_url', url: target, cleanup: 'deselect', httpFirst: true, crawlFallback: true }, description: `Read ${target.slice(0, 70)}` }
+        : { skill: 'app.agent', args: { action: 'scan_page', preferOs: true, maxWaitMs: 20000, timeoutMs: 30000 }, description: 'Read the open page' };
+      return [
+        read,
+        { skill: 'synthesize', stepType: 'verify', args: {
+          prompt: `Draft a reply/response for the user from the message content read. Output ONLY the drafted reply text — polished, ready to send, matching the conversation's tone and language. No preamble, no "Here is your reply". User asked: "${String(m).slice(0, 300)}"`,
+        }, description: 'Draft the reply' },
+      ];
     },
   },
 ];
@@ -1109,4 +1171,4 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
   }
 }
 
-module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS, _canonicalService, SERVICE_ALIASES, _CLASSIFY_PROMPT, _serviceHomeUrl };
+module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS, _extractNavQuery, _canonicalService, SERVICE_ALIASES, _CLASSIFY_PROMPT, _serviceHomeUrl };
