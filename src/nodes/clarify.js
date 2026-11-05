@@ -68,8 +68,11 @@ async function _generateClarifyQuestions(state, logger) {
   const cardText = state._thoughtAttachment?.text
     || (conversationHistory || []).find(m => m.attachedToMessage)?.content
     || '';
+  // Judgments read each turn's ask — requestText-scoped history keeps pasted
+  // material from steering the question (observed: "YouTube rule or emoji?"
+  // conflated a prior turn's paste — plan 4.7).
   const recentCtx = (conversationHistory || []).slice(-6)
-    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').slice(0, 150)}`)
+    .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String((m.role === 'user' && m.requestText) || m.content || '').slice(0, 150)}`)
     .join('\n');
 
   const prompt = `USER MESSAGE: "${message || resolvedMessage || ''}"

@@ -308,6 +308,36 @@ function _msgMeta(msg) {
   return md;
 }
 
+// AGENTS.md requestText convention applied to history: judgments about a past
+// turn (classifyTask history, referent resolution, clarify/grill question-gen)
+// read the turn's persisted ask — not the paste it carried. md.requestText is
+// written at log time (comms server.cjs); deriveRequestText covers older rows
+// and handoff logs that don't carry the field.
+const _deriveAsk = (() => {
+  try { return require('../../../shared/turn-facts.cjs').deriveRequestText; }
+  catch (_) { return (t) => t; }
+})();
+
+function _historyEntry(msg, md, source, extra = {}) {
+  const content = stripHtml(msg.text || msg.content || '');
+  const role = msg.sender === 'user' ? 'user' : 'assistant';
+  const isCard = msg.sender === 'assistant' && md?.source === 'thought_engine';
+  const entry = {
+    id: msg.id,
+    role,
+    content,
+    timestamp: msg.timestamp,
+    source,
+    ...extra,
+    ...(isCard ? { isThoughtCard: true, thoughtId: md.thoughtId || null } : {}),
+  };
+  if (role === 'user') {
+    entry.requestText = (md && typeof md.requestText === 'string' && md.requestText)
+      || _deriveAsk(content) || content;
+  }
+  return entry;
+}
+
 module.exports = async function resolveReferencesV2(state) {
   const { mcpAdapter, context } = state;
   const logger = state.logger || console;
@@ -429,21 +459,9 @@ module.exports = async function resolveReferencesV2(state) {
       const histData = histResult.data || histResult;
       const recentMessages = (histData.messages || [])
         .filter(msg => msg.sender !== 'system')
-        .map(msg => {
-          const md = _msgMeta(msg);
-          // Persisted Thought cards ride in history as assistant rows — flag
-          // them so the classifier renders them labeled as cards (same label
-          // as the live-injected 'thought-attachment' turn).
-          const isCard = msg.sender === 'assistant' && md?.source === 'thought_engine';
-          return {
-            id: msg.id,
-            role: msg.sender === 'user' ? 'user' : 'assistant',
-            content: stripHtml(msg.text || msg.content || ''),
-            timestamp: msg.timestamp,
-            source: 'recent',
-            ...(isCard ? { isThoughtCard: true, thoughtId: md.thoughtId || null } : {}),
-          };
-        })
+        // Thought cards ride in history as assistant rows — _historyEntry
+        // flags them (isThoughtCard) so the classifier labels them as cards.
+        .map(msg => _historyEntry(msg, _msgMeta(msg), 'recent'))
         .reverse();
 
       // Empty-session fallback: the routed session has no messages (new or just
@@ -465,19 +483,7 @@ module.exports = async function resolveReferencesV2(state) {
             }, _ENRICH_OPTS);
             priorSessionMessages = (((res?.data || res)?.messages) || [])
               .filter(m => m.sender !== 'system')
-              .map(m => {
-                const md = _msgMeta(m);
-                const isCard = m.sender === 'assistant' && md?.source === 'thought_engine';
-                return {
-                  id: m.id,
-                  role: m.sender === 'user' ? 'user' : 'assistant',
-                  content: stripHtml(m.text || m.content || ''),
-                  timestamp: m.timestamp,
-                  source: 'prior-session',
-                  sessionId: prevSid,
-                  ...(isCard ? { isThoughtCard: true, thoughtId: md.thoughtId || null } : {}),
-                };
-              })
+              .map(m => _historyEntry(m, _msgMeta(m), 'prior-session', { sessionId: prevSid }))
               .reverse();
             if (priorSessionMessages.length > 0) {
               logger.debug(`[Node:ResolveReferencesV2] Empty session — pulled ${priorSessionMessages.length} prior-session message(s) from ${prevSid}`);
@@ -492,20 +498,10 @@ module.exports = async function resolveReferencesV2(state) {
         const searchData = searchResult.data || searchResult;
         semanticMessages = (searchData.messages || [])
           .filter(msg => msg.sender !== 'system')
-          .map(msg => {
-            const md = _msgMeta(msg);
-            const isCard = msg.sender === 'assistant' && md?.source === 'thought_engine';
-            return {
-              id: msg.id,
-              role: msg.sender === 'user' ? 'user' : 'assistant',
-              content: stripHtml(msg.text || msg.content || ''),
-              timestamp: msg.timestamp,
-              source: 'semantic',
-              sessionId: msg.sessionId,
-              sessionTitle: msg.sessionTitle,
-              ...(isCard ? { isThoughtCard: true, thoughtId: md.thoughtId || null } : {}),
-            };
-          });
+          .map(msg => _historyEntry(msg, _msgMeta(msg), 'semantic', {
+            sessionId: msg.sessionId,
+            sessionTitle: msg.sessionTitle,
+          }));
       }
 
       // Session-result enrichment: pull each contributing session's last
@@ -1453,7 +1449,9 @@ module.exports = async function resolveReferencesV2(state) {
     const _extract = (turns) => {
       const cands = new Set();
       for (const turn of turns.slice(0, 6)) {
-        const content = String(turn?.content || '');
+        // Referent resolution is a judgment — read the turn's ask, not its
+        // paste (a quoted bio's names must not resolve "him/her").
+        const content = String((turn?.role === 'user' && turn?.requestText) || turn?.content || '');
         let m;
         while ((m = _NAME_RE.exec(content)) !== null) {
           const cand = m[1];
@@ -1523,6 +1521,7 @@ module.exports = async function resolveReferencesV2(state) {
 
 // Exported for tests — chronological merge used inside the node above.
 module.exports._mergeConversationHistory = _mergeConversationHistory;
+module.exports._historyEntry = _historyEntry;
 module.exports._collectSessionResults = _collectSessionResults;
 module.exports._navObjectLooksOnPage = _navObjectLooksOnPage;
 module.exports._extractNavStartObject = _extractNavStartObject;

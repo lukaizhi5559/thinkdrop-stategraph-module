@@ -618,6 +618,21 @@ const TEMPLATES = [
         if (SITE_SEARCH_URLS[_svcCanon]) { a.site = _svcCanon; a.url = ''; siteKey = _svcCanon; }
         else return `named service "${_svc}" has no deterministic nav URL — defer to agent path`;
       }
+      // Public-research veto — a question the envelope calls a context-free
+      // public read ("tell me about X… do a search online") is answered by
+      // the web_search SERP lane, not by driving the user's browser to a
+      // search engine and scanning it. The picked site is usually an
+      // invented 'google' default here, so only an explicit site mention or
+      // nav-verb lead keeps the template (observed: Gmail highlight +
+      // "tell me about smoothstack" → page_nav_scan opened google.com and
+      // synthesized a report about the automation instead of an answer).
+      const _siteMentioned = siteKey
+        && new RegExp(`\\b${siteKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(m);
+      const _navLead = /^\s*(?:goto|go\s+to|open|navigate\s+to|visit|launch|browse)\b/i.test(m);
+      if (!_rawIsLiteralUrl && tc?.webAccessMode === 'public_read' && !_svc && !_boundHost
+          && !_siteMentioned && !_navLead) {
+        return 'context-free public research — web_search lane owns it';
+      }
       if (siteKey) {
         // Query: model-supplied (must be verbatim) or deterministically
         // extracted (message-derived by construction — can't invent content).

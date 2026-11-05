@@ -104,6 +104,25 @@ describe('page_nav_scan — deterministic site-search nav', () => {
     assert.equal(hit.template, 'page_nav_scan');
     assert.match(hit.skillPlan[0].args.argv[0], /youtube\.com\/results\?search_query=mike%20winger/);
   });
+
+  it('context-free public research with an invented google site → web_search lane, not nav', async () => {
+    // Observed: Gmail highlight + "tell me about the company smoothstack… do a
+    // search online" → envelope public_read → the classifier picked site:
+    // 'google' by default and the browser was driven to a SERP. The web_search
+    // lane owns this shape.
+    const hit = await _hit('tell me about the company smoothstack any issues or problems do a search online',
+      _json(19, { site: 'google', query: 'smoothstack company' }),
+      { taskType: 'browser', webAccessMode: 'public_read' });
+    assert.equal(hit, null);
+  });
+
+  it('explicit google nav lead keeps page_nav_scan even on public_read', async () => {
+    const hit = await _hit('goto google and search for smoothstack reviews',
+      _json(19, { site: 'google', query: 'smoothstack reviews' }),
+      { taskType: 'browser', webAccessMode: 'public_read' });
+    assert.equal(hit.template, 'page_nav_scan');
+    assert.match(hit.skillPlan[0].args.argv[0], /google\.com\/search\?q=smoothstack%20reviews/);
+  });
 });
 
 describe('reply_draft — scan the page, draft the reply, never automate', () => {

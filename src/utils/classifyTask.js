@@ -758,8 +758,13 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // full messages. 16×500 chars (~8KB) made the LOCAL decision leg take
     // 2.5–4.4s (prompt eval dominates a 0.8b); previews keep pronoun/follow-up
     // resolution at ~1/10 the tokens and speed the remote leg too.
+    // Judgments read each turn's ask — entries normalized by resolveReferencesV2
+    // carry requestText (the ask segment, no paste); raw {role,content} callers
+    // fall back to content. Referent resolution still sees what the user ASKED,
+    // not what they pasted (clarify conflation fix — plan 4.7).
+    const _judgeText = (m) => (m && m.role === 'user' && m.requestText) ? m.requestText : m?.content;
     const recentCtx = (conversationHistory || []).slice(-8)
-      .map(m => `${_roleLabel(m)}: ${_preview(m.content)}`)
+      .map(m => `${_roleLabel(m)}: ${_preview(_judgeText(m))}`)
       .join('\n');
 
     // Cross-session semantic matches are merged into conversationHistory and
@@ -769,7 +774,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const semanticCtx = (conversationHistory || [])
       .filter(m => (m.source === 'semantic' || m.source === 'semantic-result' || m.source === 'prior-session') && m.content && m.content.trim())
       .slice(-4)
-      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${_preview(m.content, 200)}`)
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${_preview(_judgeText(m), 200)}`)
       .join('\n');
 
     const screenBlock = priorScreenSummary ? `\n\n${priorScreenSummary}` : '';

@@ -9555,7 +9555,7 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
       if (_rulesMod && _normalizedResult.ok) {
         try {
           const _tf = state.taskFacts || {};
-          const _hits = _rulesMod.evaluate({
+          const _cmpCtx = {
             prompt: String(state.resolvedMessage || state.message || ''),
             service: _tf.service,
             host: (() => { try { return new URL(_tf.destination?.url || '').hostname; } catch (_) { return ''; } })(),
@@ -9563,7 +9563,34 @@ Conservative threshold: only flag as APP_ERROR when the failure is clear and una
             entities: _tf.entities || {},
             vars: state._gatheredVars || {},
             intent: _tf.intent,
-          }, 'completion');
+          };
+          // SemanticMatch rules need the caller's judge — phi4 decision.answer
+          // via mcpAdapter; absent client → semantic rules just don't fire.
+          let _cmpJudge = null;
+          if (_rulesMod.hasSemanticRules()) {
+            const _ask = makeAskDecision(mcpAdapter);
+            if (_ask) {
+              _cmpJudge = async (frame, exempt) => {
+                const r = await _ask([
+                  {
+                    id: 'frame', type: 'choice',
+                    question: `Does this completed task's content present "${frame}" — not merely mentioning or quoting it?`,
+                    options: ['YES', 'NO'],
+                  },
+                  {
+                    id: 'exempt', type: 'choice',
+                    question: `Is the content ${exempt || 'ordinary informational, news, educational, or task-related material'}?`,
+                    options: ['YES', 'NO'],
+                  },
+                ], {
+                  state: `Request: ${String(_cmpCtx.prompt).slice(0, 1200)}\nService: ${_tf.service || ''}\nIntent: ${_tf.intent || ''}\nResult: ${String(state._gatheredVars?.result || '').slice(0, 800)}`,
+                }).catch(() => null);
+                const a = r?.answers || {};
+                return (a.frame?.label === 'YES' && a.exempt?.label !== 'YES') ? 'YES' : 'NO';
+              };
+            }
+          }
+          const _hits = await _rulesMod.evaluateAsync(_cmpCtx, 'completion', _cmpJudge);
           for (const _rule of _hits) {
             const _then = _rule.then || {};
             if (_then.action === 'enqueue_task' && _then.prompt) {

@@ -39,6 +39,7 @@ const path = require('path');
 const fs   = require('fs');
 const os   = require('os');
 const { extractContextRefs } = require('../utils/contextRefs.cjs');
+const { makeAskDecision } = require('../utils/askDecision');
 
 // ── Persistent auth ledger (survives app restart) ────────────────────────────
 // Key: agentId (lowercase)
@@ -836,12 +837,43 @@ module.exports = async function preflightAgents(state) {
   } catch (_) {}
   if (_rulesMod) {
     try {
-      const _hit = _rulesMod.firstGuardHit({
+      const _guardCtx = {
         prompt: userMessage,
         service: taskFacts.service,
         entities: taskFacts.entities || {},
         intent: taskFacts.intent,
-      }, 'preflight');
+      };
+      let _hit = _rulesMod.firstGuardHit(_guardCtx, 'preflight');
+      // Semantic guard rules — concept conditions (when.semanticMatch) the
+      // deterministic matcher can't express. Deterministic fields AND first
+      // inside evaluateAsync; judge = phi4 decision.answer via mcpAdapter.
+      // No local decision client → semantic rules simply don't fire here
+      // (fail-open, same convention as monitorService).
+      if (!_hit && _rulesMod.hasSemanticRules()) {
+        const _ask = makeAskDecision(mcpAdapter);
+        if (_ask) {
+          const _semJudge = async (frame, exempt) => {
+            const r = await _ask([
+              {
+                id: 'frame', type: 'choice',
+                question: `Does this request present "${frame}" as what the user is actually asking for — not merely mentioning, quoting, or discussing it?`,
+                options: ['YES', 'NO'],
+              },
+              {
+                id: 'exempt', type: 'choice',
+                question: `Is this request ${exempt || 'an ordinary informational question, news discussion, or educational topic'}?`,
+                options: ['YES', 'NO'],
+              },
+            ], {
+              state: `Request: ${String(userMessage || '').slice(0, 1500)}\nService: ${taskFacts.service || ''}\nIntent: ${taskFacts.intent || ''}\nEntities: ${JSON.stringify(taskFacts.entities || {}).slice(0, 800)}`,
+            }).catch(() => null);
+            const a = r?.answers || {};
+            return (a.frame?.label === 'YES' && a.exempt?.label !== 'YES') ? 'YES' : 'NO';
+          };
+          const _semHits = await _rulesMod.evaluateAsync(_guardCtx, 'preflight', _semJudge);
+          _hit = _semHits.find(r => ['block', 'ask'].includes(r?.then?.action)) || null;
+        }
+      }
       if (_hit) {
         const _act = _hit.then?.action;
         logger.warn(`[Node:PreflightAgents] guardian rule ${_hit.id} matched preflight — action=${_act}`);
