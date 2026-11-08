@@ -20,6 +20,7 @@
 const fs = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
+const { stripProtocolFrames } = require('../../../shared/protocol-frames.cjs');
 
 // Load intent rules from answer.md at startup — editable without touching code
 function loadAnswerPrompts() {
@@ -481,6 +482,14 @@ module.exports = async function answer(state) {
     }
   }
 
+  // Conversational-referent binding: "the <entity>" / "that <thing>"
+  // referents bind to the most recent in-conversation candidate — stored
+  // facts and older cross-session messages are fallbacks. Applies to every
+  // intent that carries conversation history into the answer call.
+  if (conversationHistory.length > 0) {
+    systemInstructions += '\n- CONVERSATIONAL REFERENT RULE: When the question points at an entity via "the <role>" / "that <thing>" (e.g. "the recruiter", "the email", "the restaurant") and a message in the RECENT CONVERSATION HISTORY names a candidate, the in-conversation referent is what the user means — it wins over stored facts and older cross-session messages. Stored profile facts apply to the user\'s OWN attributes ("my name", "my birthday"), not to third-party referents introduced in conversation.';
+  }
+
   // declined_ack: the user refused an offer — acknowledge and stop. Never
   // answer or act on the offer's content.
   if (_isDeclinedAck) {
@@ -503,13 +512,17 @@ module.exports = async function answer(state) {
       const rel = mem.formattedDate?.relative || '';
       const type = mem.metadata?.type || mem.type || 'memory';
       const isScreenCapture = type === 'screen_capture';
+      // audio_journal rows carry the media's title/URL in metadata — without
+      // the metaLine the LLM sees an anonymous transcript fragment and can't
+      // connect it to "watched a video" (observed: "no record" with 6 merged).
+      const isAudioJournal = type === 'audio_journal';
       const app = mem.metadata?.appName || '';
-      const win = mem.metadata?.windowTitle || '';
+      const win = mem.metadata?.windowTitle || mem.metadata?.title || '';
       const url = mem.metadata?.url || '';
-      const metaLine = isScreenCapture && (app || win || url)
+      const metaLine = (isScreenCapture || isAudioJournal) && (app || win || url)
         ? `App: ${app}${win ? ' | Window: ' + win : ''}${url ? ' | URL: ' + url : ''}\n`
         : '';
-      const textLimit = isScreenCapture ? 500 : 200;
+      const textLimit = (isScreenCapture || isAudioJournal) ? 500 : 200;
       return `[Memory ${i + 1} — ${date}${rel ? ' ' + rel : ''}] (${type}):\n${metaLine}${mem.text?.substring(0, textLimit) || 'No text'}`;
     }).join('\n');
     systemInstructions += `\n\n=== SCREEN ACTIVITY & MEMORIES ===\n${memoryBlock}\n=== END MEMORIES ===`;
@@ -758,62 +771,15 @@ module.exports = async function answer(state) {
     }
     const _preStrip = finalAnswer;
     finalAnswer = _stripToolMarkup(finalAnswer);
+    // Bare-JSON tool frames + sentinel chunks — _stripToolMarkup covers the
+    // XML spellings; this catches {"id":"0",...} tool-call frames the model
+    // sometimes emits as prose (observed: an entire answer body of two frames).
+    finalAnswer = stripProtocolFrames(finalAnswer);
     if (finalAnswer !== _preStrip && isStreaming && typeof streamCallback === 'function') {
       streamCallback('\x00REPLACE\x00' + finalAnswer);
     }
 
     logger.debug(`[Node:Answer] Answer generated (${finalAnswer.length} chars) via ${backend.getInfo().name}`);
-
-    // ── Anti-Hallucination: Detect fake YouTube URLs ────────────────────────────
-    // If answer contains YouTube URLs that weren't in web search results or memories,
-    // the LLM is hallucinating. Replace with honest failure message.
-    const _YOUTUBE_URL_REGEX = /https?:\/\/(?:www\.)?youtube\.com\/watch\?v=[a-zA-Z0-9_-]+/g;
-    const _answerUrls = finalAnswer.match(_YOUTUBE_URL_REGEX) || [];
-    
-    if (_answerUrls.length > 0) {
-      // Build set of real YouTube URLs from context
-      const _realUrls = new Set();
-      // From web search results
-      if (contextDocs && contextDocs.length > 0) {
-        contextDocs.forEach(doc => {
-          if (doc.url && doc.url.includes('youtube.com/watch')) {
-            _realUrls.add(doc.url);
-          }
-          // Also check content
-          const contentUrls = (doc.text || '').match(_YOUTUBE_URL_REGEX) || [];
-          contentUrls.forEach(url => _realUrls.add(url));
-        });
-      }
-      // From memories
-      if (filteredMemories && filteredMemories.length > 0) {
-        filteredMemories.forEach(mem => {
-          const memUrls = (mem.text || '').match(_YOUTUBE_URL_REGEX) || [];
-          memUrls.forEach(url => _realUrls.add(url));
-        });
-      }
-      
-      // Find hallucinated URLs (in answer but not in context)
-      const _hallucinatedUrls = _answerUrls.filter(url => !_realUrls.has(url));
-      
-      if (_hallucinatedUrls.length > 0) {
-        logger.error(`[Node:Answer] LLM hallucinated ${_hallucinatedUrls.length} fake YouTube URL(s): ${_hallucinatedUrls.join(', ')}`);
-        // Replace with honest failure - but preserve any real context
-        const _hasRealVideoContent = _realUrls.size > 0;
-        finalAnswer = `⚠️ **Search Issue Detected**: The system found workout video titles but could not extract their actual YouTube URLs from the search results.
-
-${_hasRealVideoContent ? 'Some video links were found, but others appear to be incorrect. ' : ''}The search results may have contained:
-- YouTube's search page structure that the browser couldn't parse
-- Results requiring login to view
-- Dynamic content that wasn't captured
-
-Please try asking: "help me track down the video links for each one of these workouts" to trigger browser automation that can extract the actual URLs.`;
-        
-        // Re-stream the corrected answer if streaming
-        if (isStreaming && typeof streamCallback === 'function') {
-          streamCallback('\x00REPLACE\x00' + finalAnswer);
-        }
-      }
-    }
 
     // In non-streaming mode, still emit via streamCallback so UI receives it
     if (!isStreaming && typeof streamCallback === 'function' && finalAnswer) {

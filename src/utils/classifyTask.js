@@ -35,7 +35,7 @@
  */
 
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { CONVERSATION_RECALL_META_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE, SCREEN_VISUAL_KIND_RE, SCREEN_DELIVERABLE_RE, VISUAL_INTO_APP_RE, SCREEN_CHART_RE, SCREEN_DECK_RE, SCREEN_DOC_RE, SCREEN_SCENE_RE, SCREEN_THREE_RE } = require('./textPatterns.cjs');
+const { CONVERSATION_RECALL_META_RE, ACTIVITY_RECALL_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE, SCREEN_VISUAL_KIND_RE, SCREEN_DELIVERABLE_RE, VISUAL_INTO_APP_RE, SCREEN_CHART_RE, SCREEN_DECK_RE, SCREEN_DOC_RE, SCREEN_SCENE_RE, SCREEN_THREE_RE } = require('./textPatterns.cjs');
 const { _canonicalService, SERVICE_ALIASES } = require('./localPlanTemplates');
 
 // ── Deterministic screen-output detection ──────────────────────────────────
@@ -736,6 +736,28 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       ..._default,
       taskType: 'query',
       isConversationRecall: true,
+      isFollowUp: false,
+      followUpTarget: null,
+    };
+  }
+
+  // ── Deterministic activity-recall pre-check ────────────────────────────────
+  // First-person past-activity questions ("what videos have I been watch
+  // today", "what did I listen to", "what was I working on") must route to
+  // memory_retrieve — the episodic store holds screen captures and audio
+  // journals. The LLM flakes on ungrammatical/STT-mangled phrasings
+  // (observed: "what videos have I been watch today" → isActivityQuery:false,
+  // suggestedIntent:null → command_automate → shell.run "Query Chrome
+  // history" → garbage answer). suggestedIntent:'memory_retrieve' seeds the
+  // decompose concur path so the flaky number call is skipped outright.
+  // Canonical pattern: ACTIVITY_RECALL_RE in shared/text-patterns.cjs.
+  if (ACTIVITY_RECALL_RE.test(lexicalMessage)) {
+    logger.info(`[classifyTask] Deterministic activity-recall match: "${lexicalMessage.slice(0, 80)}"`);
+    return {
+      ..._default,
+      taskType: 'query',
+      isActivityQuery: true,
+      suggestedIntent: 'memory_retrieve',
       isFollowUp: false,
       followUpTarget: null,
     };

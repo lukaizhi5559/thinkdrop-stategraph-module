@@ -4,11 +4,11 @@ const fs   = require('fs');
 const path = require('path');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 const { makeAskDecision, boundedDecision } = require('../utils/askDecision');
-const { suggestIntent } = require('../utils/routeTable');
+const { suggestIntent, generativeOnly, ACTION_TASK_TYPES, MULTI_GOAL_CONJUNCTIONS } = require('../utils/routeTable');
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
 // Media routing uses the classifier's mediaListing flag (see media-search guard
 // below), not the IMAGE_REQUEST_RES regexes in text-patterns.
-const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, LOCAL_FS_PROBE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, SCRIPTURE_REF_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
+const { SCREEN_OBSERVATION_RE, DEICTIC_CONTINUATION_RE, DEICTIC_ARTIFACT_RE, SCREEN_OUTPUT_RE, LOOKUP_THEN_DISPLAY_RE, DEVICE_STATE_RE, LOCAL_FS_PROBE_RE, FILE_PATH_RE, SCREEN_CAPTURE_RE, SCREEN_VISUAL_KIND_RE, VISUAL_INTO_APP_RE, LOCAL_DATA_SUBJECT_RE, NAMED_APP_RE, SCREEN_IMG_URL_RE, SCREEN_IMG_PATH_RE, SCRIPTURE_REF_RE, inferScreenOutput } = require('../utils/textPatterns.cjs');
 const { TEMPLATES: _LOCAL_TEMPLATES } = require('../utils/localPlanTemplates.js');
 const { _classifyDeterministic, looksLikeLocalOp } = require('../utils/localPlanTemplates.js');
 const { isBrowseFastLaneTc } = require('./fastLanePlan.js');
@@ -35,6 +35,24 @@ function writeDecomposeLog(entry) {
   catch (_) {}
 }
 
+// Carried-hint vocabulary — normalize hint spellings once; shared by the
+// decompose body and the shadow-emit ctx (same normalization, same verdict).
+const _HINT_VOCAB = { screen_analysis: 'screen_intelligence' };
+
+// Runtime context the decompose guards read but _taskClassification doesn't
+// carry — the routeTable needs the same inputs to faithfully mirror them.
+function _shadowCtx(state) {
+  const rawHint = typeof state._carriedHint === 'string' ? state._carriedHint : null;
+  const boundSession = (Array.isArray(state._extSessions) ? state._extSessions : [])
+    .some(s => s && /^ext:/.test(String(s.sessionId || ''))
+      && s.alive !== false && s.url && !/^about:|^chrome:/.test(s.url))
+    || /^ext:/.test(String(state._extSessionHint?.sessionId || ''))
+    || /^https?:/.test(String(state.activeBrowserUrl || ''));
+  const hasHighlightContext = !!(state.selectedText && String(state.selectedText).trim())
+    || /\[Highlighted:/.test(state.message || '');
+  return { carriedHint: rawHint ? (_HINT_VOCAB[rawHint] || rawHint) : null, boundSession, hasHighlightContext };
+}
+
 // ── Emit intent:decided progress event so the renderer can play intent sounds ──
 // Fires earlier than parseIntentV2 (decompose runs first), giving faster audio feedback.
 // The renderer deduplicates: only the first intent:decided per task plays a sound.
@@ -47,10 +65,27 @@ function _emitIntentDecided(state, intent, confidence) {
   // Stage E shadow mode: compare the deterministic routeTable suggestion
   // against the path that actually decided. Log-only — no behavior change.
   // Divergences here are the cutover dataset for replacing the LLM
-  // number-call with the table.
+  // number-call with the table. The JSONL entry lands in intent-classifier.log
+  // — the same sink every decompose decision writes — so the dataset covers
+  // the live comms-graph path, not just Electron-log listeners.
   try {
-    const shadow = suggestIntent(state._taskClassification, state.resolvedMessage || state.message);
+    const ctx = _shadowCtx(state);
+    const shadow = suggestIntent(state._taskClassification, state.resolvedMessage || state.message, ctx);
     const log = state.logger || console;
+    if (shadow) {
+      const tc = state._taskClassification || {};
+      writeDecomposeLog({
+        ts: new Date().toISOString(),
+        parser: 'intent-shadow',
+        decided: intent,
+        table: shadow.intent,
+        rule: shadow.rule,
+        agree: shadow.intent === intent,
+        message: String(state.message || '').slice(0, 120),
+        tc: { taskType: tc.taskType, isFollowUp: tc.isFollowUp, webAccessMode: tc.webAccessMode, targetService: tc.targetService, activeDocRef: tc.activeDocRef, suggestedIntent: tc.suggestedIntent },
+        ctx,
+      });
+    }
     if (shadow && shadow.intent !== intent) {
       log.info(`[IntentShadow] DIVERGENCE: decided=${intent} table=${shadow.intent} rule=${shadow.rule} msg="${String(state.message || '').slice(0, 80)}"`);
     } else if (shadow) {
@@ -272,6 +307,7 @@ DECISION RULES (check in order):
 - "what app am I in/what's on my screen" → 1 (screen observation)
 - "look online for X / find info about X / any new X out recently / what's the latest X" → 2 (web research with NO named site to interact with — NOT command_automate)
 - Questions whose answer requires probing the user's OWN machine — file/folder counts or contents ("how many files are on my desktop", "what's in my downloads"), git status/diff/commit, running processes, listening ports, clipboard contents → 0 (command_automate). There is no text answer to recall — a shell command must run.
+- Questions whose answer requires probing a LIVE SERVICE/ACCOUNT — counts, lists, or totals of emails/messages/events/orders/transactions on an account the tools can query ("how many emails from X", "unread count", "how many messages did she send", "list my recent orders") → 0 (command_automate). A time range on SERVICE data is a query filter, not past-activity recall — memory_retrieve can't count what it never indexed.
 - "search the web / google X / look up X online" → 2 (web search — no site interaction)
 - Naming a site to INTERACT with (post/send/create/add to cart/log in/fill a form) → 0; naming a site only to look something up on it → 2
 - When in doubt → 0 (command_automate is the safest single-step default)
@@ -518,7 +554,6 @@ module.exports = async function decomposePromptV2(state) {
   // comms-graph's intentGuesser speaks comms vocabulary — normalize at the
   // seam. 'screen_analysis' was silently dropped (indexOf → -1) leaving
   // screen prompts hint-less at the number-call.
-  const _HINT_VOCAB = { screen_analysis: 'screen_intelligence' };
   const _rawHint = typeof state._carriedHint === 'string' ? state._carriedHint : null;
   const _carriedHint = _rawHint ? (_HINT_VOCAB[_rawHint] || _rawHint) : null;
   const _msgLower = String(message || '').toLowerCase();
@@ -551,7 +586,7 @@ module.exports = async function decomposePromptV2(state) {
     && !SCREEN_OUTPUT_RE.test(message) && !LOOKUP_THEN_DISPLAY_RE.test(message);
   const _hasMultiGoalConjunction = _MULTI_GOAL_CONJUNCTIONS.test(_msgLower) && !_OPEN_THEN_SERVICE_ACTION.test(_msgLower) && !_AND_REPORT_BACK.test(_msgLower) && !_IF_THEN.test(_msgLower) && !_scanThenReport;
   const _SINGLE_STEP_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser']);
-  const _ACTION_TASK_TYPES = new Set(['local_file', 'local_system', 'app_automation', 'browser', 'messaging', 'scheduling']);
+  const _ACTION_TASK_TYPES = ACTION_TASK_TYPES;
   // Ambient-artifact misresolution: a bare-deictic continuation ("tell me
   // more about that", "when was that") can only refer to the conversation,
   // yet classifyTask sometimes resolves the deictic to the open file/url
@@ -581,7 +616,59 @@ module.exports = async function decomposePromptV2(state) {
     && ['file', 'url'].includes(_tc.activeDocRef)
     // A deictic followed by an artifact/content noun ("that file", "this
     // error") legitimately resolves to the ambient referent — exempt it.
-    && !/\b(?:that|this|it|those|them)\s+(?:file|page|site|website|tab|document|doc|folder|screen|window|app|dialog|error|link|article|video|song|post|image|photo|picture|recipe|message|email)\b/i.test(message);
+    && !DEICTIC_ARTIFACT_RE.test(message);
+  // ── Authoritative route decision — table → envelope → guards → LLM ────────
+  // suggestIntent() is the deterministic mirror of the guard chain below —
+  // the shadow dataset measured 91% agreement with executed decisions, and
+  // the divergences skewed table-right (~80%). When it fires, its verdict IS
+  // this function's answer. Failing that, the envelope's suggestedIntent
+  // binds — comms-graph's one classification per turn, consumed downstream
+  // per the envelope contract. Only when BOTH abstain do the lexical guards
+  // and LLM number-call run: re-litigating an already-correct verdict is the
+  // measured flake source (greeting on "what have I asked", status_check on
+  // "which one is cheapest", screen_intelligence on gibberish).
+  {
+    // Compounds keep the decompose path — a single bound intent can't express
+    // "search X and screenshot it". The table already abstains on hasMultiGoal;
+    // the envelope branch must too (planShape 'complex' or conjunction text).
+    const _isCompound = MULTI_GOAL_CONJUNCTIONS.test(String(message || '').toLowerCase())
+      || _tc.planShape === 'complex';
+    const _routeTable = suggestIntent(_tc, message, _shadowCtx(state));
+    // Generative-only asks never bind an executor lane from the envelope either
+    // ("help me write a haiku" + suggestedIntent command_automate is the same
+    // misroute the table guard suppresses — don't reintroduce it one level down).
+    const _envelopeExecutorVeto = generativeOnly(message)
+      && _tc.suggestedIntent === 'command_automate';
+    const _authoritative = _routeTable
+      || (!_isCompound && !_envelopeExecutorVeto && _tc.suggestedIntent ? { intent: _tc.suggestedIntent, rule: 'envelope' } : null);
+    if (_authoritative) {
+      const _intent = _authoritative.intent;
+      logger.info(`[Node:DecomposePromptV2] authoritative route — ${_authoritative.rule} → ${_intent}`);
+      const subPrompts = [{
+        text: message,
+        estimatedIntent: _intent,
+        confidence: 0.9,
+        order: 0,
+        dependsOn: [],
+        isLongRunning: false,
+        dataTemplate: null,
+      }];
+      const durationMs = Date.now() - t0;
+      writeDecomposeLog({
+        ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+        parser: `route-${_authoritative.rule}`, intent: _intent,
+        subPromptCount: 1, durationMs,
+        subPrompts: [{ order: 0, text: message, estimatedIntent: _intent, dependsOn: [], isLongRunning: false, dataTemplate: null }],
+      });
+      _emitIntentDecided(state, _intent, 0.9);
+      return {
+        ...state,
+        _decomposedIntent: _intent,
+        _decomposedBy: _authoritative.rule,
+        intentPlan: subPrompts,
+      };
+    }
+  }
   // ── Declined-ack guard — checked BEFORE every intent guard ───────────────
   // resolution==='declined_ack' means the user refused an attached card/offer —
   // a complete answer, not a task. Emit a single general_knowledge step; the
@@ -1391,6 +1478,45 @@ module.exports = async function decomposePromptV2(state) {
     };
   }
 
+  // ── Activity-recall guard — AFTER the screen guard, BEFORE the follow-up
+  // guard and number call ───────────────────────────────────────────────────
+  // isActivityQuery is the typed flag for "what did I watch / listen to / was
+  // I doing" — the answer lives in episodic memory (screen captures + audio
+  // journals), never in browser automation. Two flake modes motivated this:
+  // the LLM flags isActivityQuery but leaves suggestedIntent null (the number
+  // call then flakes — observed: "what videos have I been watch today" →
+  // command_automate → shell.run "Query Chrome history" → garbage), and a
+  // bound-tab veto could demote a passive pick on an episodic question.
+  // A contradicting hint vetoes the same way the deictic guard does.
+  if (_tc.isActivityQuery
+      && !_hasMultiGoalConjunction
+      && (!_carriedHint || _carriedHint === 'memory_retrieve')) {
+    logger.info('[Node:DecomposePromptV2] Activity-recall guard: isActivityQuery=true — routing to memory_retrieve, skipping number call');
+    const subPrompts = [{
+      text: message,
+      estimatedIntent: 'memory_retrieve',
+      confidence: 0.85,
+      order: 0,
+      dependsOn: [],
+      isLongRunning: false,
+      dataTemplate: null,
+    }];
+    const durationMs = Date.now() - t0;
+    writeDecomposeLog({
+      ts: new Date().toISOString(), message, carriedHint: _carriedHint,
+      parser: 'activity-recall-guard', intent: 'memory_retrieve',
+      subPromptCount: 1, durationMs,
+      subPrompts: [{ order: 0, text: message, estimatedIntent: 'memory_retrieve', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+    });
+    _emitIntentDecided(state, 'memory_retrieve', 0.85);
+    return {
+      ...state,
+      _decomposedIntent: 'memory_retrieve',
+      _decomposedBy: 'activity-recall-guard',
+      intentPlan: subPrompts,
+    };
+  }
+
   // ── Unresolved-follow-up guard ────────────────────────────────────────────
   // When classifyTask flagged isFollowUp but could not resolve a concrete
   // followUpTarget, the message is a referent-less continuation (e.g. a bare
@@ -1559,8 +1685,11 @@ module.exports = async function decomposePromptV2(state) {
   // Bound-referent veto — a resolved live tab IS an on-page action; a passive
   // pick (web_search etc.) contradicting it is wrong by definition, not a
   // disagreement to debate. Deterministic, after every model vote.
+  // isActivityQuery exempt: the referent is episodic memory (past captures/
+  // audio journals), never the bound page — a live tab must not veto recall.
   if (_boundRef && _fastDecision >= 0 && _fastDecision <= 6
-      && _PASSIVE_HINTS.has(_SINGLE_STEP_INTENTS[_fastDecision])) {
+      && _PASSIVE_HINTS.has(_SINGLE_STEP_INTENTS[_fastDecision])
+      && !_tc.isActivityQuery) {
     logger.info(`[Node:DecomposePromptV2] bound-referent veto: ${_SINGLE_STEP_INTENTS[_fastDecision]} → command_automate (bound ${_boundHost || state._onScreenRef?.sessionId || 'tab'})`);
     _fastDecision = 0;
   }

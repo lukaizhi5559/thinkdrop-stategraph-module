@@ -172,6 +172,86 @@ function _inferStepType(step) {
 function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
   if (!_ATOMIC_BROWSER_AGENTS || !Array.isArray(skillPlan)) return skillPlan;
   const _clean = (o) => { for (const k of Object.keys(o)) if (o[k] === undefined) delete o[k]; return o; };
+  // Browser-automation kill switch — url.first/turn.loop/dom.act aren't
+  // dispatchable when settings.browserAutomation is off, so rewrite to the
+  // proven OS path instead: navigate → shell.run `open <url>` + app.agent
+  // scan_page (the fastLanePlan shape — opens the user's real default
+  // browser, no driving); verify → scan_page. On-page steps for surviving
+  // skills (form.fill/tab.map) pass through; steps for disabled skills are
+  // emitted as-is and reported by the executor's typed backstop error.
+  const _browserOff = (() => {
+    try { return !require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled(); } catch (_) { return false; }
+  })();
+  if (_browserOff) {
+    const { SITE_COMPOSE_URL } = require('../utils/localPlanTemplates.js');
+    const _composeSvc = (step) => {
+      const cand = step?.args?.service || step?.args?.agentId || step?.service || '';
+      const key = String(cand).replace(/\.?agent$|_agent$/i, '').trim();
+      return key && SITE_COMPOSE_URL(key, { text: '{{prev_stdout_url}}' }) ? key : null;
+    };
+    // An ACT-shaped step on a compose-capable service ("type the tweet and
+    // post", "reply to the email") degrades to: synthesize the artifact
+    // from prior context → shell.run `open` the prefilled composer in the
+    // user's real browser. The {{prev_stdout}} marker rides in argv — the
+    // serial injectPrev deep-walk substitutes the composed text at run
+    // time, so the composer opens with the artifact already loaded.
+    const _emitComposePair = (step, svc, out) => {
+      const goal = step?.args?.task || step?.args?.goal || step?.description || '';
+      out.push({ skill: 'synthesize',
+        description: `Compose the ${svc} content`,
+        args: { prompt: `Compose exactly the content to paste into ${svc} for this request — no commentary, just the artifact text.\n\nRequest: ${goal}` } });
+      const _cu = SITE_COMPOSE_URL(svc, { text: '{{prev_stdout_url}}' });
+      out.push({ skill: 'shell.run', stepType: 'navigate',
+        description: `Open prefilled ${svc} composer`,
+        args: { cmd: 'open', argv: [_cu] } });
+    };
+    const _out0 = [];
+    for (const step of skillPlan) {
+      const a = step?.args || {};
+      const stepType = step?.stepType || _inferStepType(step);
+      const isNav = step?.skill === 'url.first.agent'
+        || step?.skill === 'browser.act'
+        || (step?.skill === 'dom.act' && stepType === 'navigate')
+        || (step?.skill === 'browser.agent' && step?.args?.action === 'run' && stepType === 'navigate');
+      const isVerify = (step?.skill === 'dom.act' && stepType === 'verify')
+        || step?.skill === 'turn.loop.agent'
+        || (step?.skill === 'browser.agent' && step?.args?.action === 'run' && stepType === 'verify');
+      // ACT-shaped driving step on a compose-capable service → degrade to
+      // [compose, open-deep-link] instead of a disabled-skill error.
+      const _isDrivingAct = !isNav && !isVerify && (
+        step?.skill === 'dom.act' || step?.skill === 'turn.loop.agent'
+        || step?.skill === 'browser.act'
+        || (step?.skill === 'browser.agent' && step?.args?.action === 'run'));
+      if (_isDrivingAct) {
+        const _svc = _composeSvc(step);
+        if (_svc) { _emitComposePair(step, _svc, _out0); continue; }
+        _out0.push(step); // no compose surface — executor backstop reports it
+        continue;
+      }
+      if (isNav) {
+        const _u = a.url || a.resolvedUrl;
+        if (_u) {
+          _out0.push({ ...step, skill: 'shell.run', stepType: 'navigate',
+            description: step.description || `Open ${String(_u).slice(0, 70)}`,
+            args: { cmd: 'open', argv: [_u] } });
+          _out0.push({ skill: 'app.agent', stepType: 'verify',
+            description: 'Read the loaded page',
+            args: { action: 'scan_page', preferOs: true, maxWaitMs: 20000, timeoutMs: 30000 } });
+        } else {
+          _out0.push(step); // no URL to open — let the executor backstop report it
+        }
+        continue;
+      }
+      if (isVerify) {
+        _out0.push({ ...step, skill: 'app.agent', stepType: 'verify',
+          description: step.description || 'Read the loaded page',
+          args: { action: 'scan_page', preferOs: true, maxWaitMs: 20000, timeoutMs: 30000 } });
+        continue;
+      }
+      _out0.push(step);
+    }
+    return _out0;
+  }
   // Track which agents already have a navigation step in this plan — a legacy
   // nav+act fused step (no stepType, e.g. localPlanTemplates service_task) must
   // split into url.first + dom.act so navigation isn't silently dropped.
@@ -693,6 +773,10 @@ function _argsForRepairedSkill(skill, step, ctx) {
     };
     case 'web.agent':       return { action: 'site_search', query: desc || prev.query, domain: ctx.targetService || prev.domain };
     case 'web.crawl':       return { url: prev.url || ctx.urlHint };
+    // Browser-off substitutes: nav repairs land here as literal-argv opens;
+    // read/action repairs land as the OS-lane scan.
+    case 'shell.run':       return { cmd: 'open', argv: [prev.url || ctx.urlHint || ctx.homeUrl].filter(Boolean) };
+    case 'app.agent':       return { action: 'scan_page', preferOs: true, appName: prev.appName };
     default:                return prev;
   }
 }
@@ -1563,6 +1647,13 @@ function _inferOutputSchemaFallback(userMessage) {
 
 function _buildSystemPrompt(userMessage, state) {
   const isWindows = process.platform === 'win32';
+  // Browser-driving skills are kill-switched (settings.browserAutomation:false
+  // or THINKDROP_BROWSER_AUTOMATION=off). When off, the browser lane's
+  // vocabulary (url.first/dom.act/turn.loop) is replaced by the browser-off
+  // canon: shell.run open + app.agent scan_page + cli.agent.
+  const _browserOff = (() => {
+    try { return !require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled(); } catch (_) { return false; }
+  })();
 
   const _hasExplicitUrl = _URL_RE.test(userMessage);
   const _hasLocalSignals = !!(
@@ -1710,7 +1801,11 @@ function _buildSystemPrompt(userMessage, state) {
   if (!base) return null;
   state._promptTier = _promptTier;
 
-  let result = `## PRIMACY RULE\nThe CURRENT USER REQUEST below is the source of truth. Prior conversation and screen context are provided ONLY for pronoun resolution ("it", "that", "this"). If the current request names a specific task, service, or topic, plan for THAT task — do not continue prior tasks. Step args that carry user content (text to type, email/message bodies, search terms, titles) MUST be copied verbatim from the CURRENT USER REQUEST — never substitute prior step results, assistant replies, or screen context into them (observed: a compose step typed leaked prior-result text instead of the requested body).\n\n` + base;
+  let result = `## PRIMACY RULE\nThe CURRENT USER REQUEST below is the source of truth. Prior conversation and screen context are provided ONLY for pronoun resolution ("it", "that", "this"). If the current request names a specific task, service, or topic, plan for THAT task — do not continue prior tasks. Step args that carry user content (text to type, email/message bodies, search terms, titles) MUST be copied verbatim from the CURRENT USER REQUEST — never substitute prior step results, assistant replies, or screen context into them (observed: a compose step typed leaked prior-result text instead of the requested body).\n\n`
+    + (_browserOff
+      ? `## ENVIRONMENT CONSTRAINT\nBrowser automation is DISABLED in this environment: url.first.agent, dom.act, turn.loop.agent, browser.act, browser.agent, playwright.agent, gesture.agent, arrow.grid.agent are NOT dispatchable — a step emitting one fails with 'browser_automation_disabled' (this overrides any vocabulary the base prompt or examples teach). Navigate via shell.run {cmd:"open",argv:[url]}; read pages via app.agent {action:"scan_page",preferOs:true}; CLI services via cli.agent.\n\n`
+      : '')
+    + base;
   const appendices = [];
 
   // Domain appendices are appended in skill-preference order: shell/CLI → image → app → browser.
@@ -1723,7 +1818,7 @@ function _buildSystemPrompt(userMessage, state) {
     if (_isMacOS) appendices.push('plan-skills-macos.md');
     if (_needsApp) appendices.push('plan-skills-app.md');
     if (_needsWebFetch) appendices.push('plan-skills-webfetch.md');
-    if (_needsBrowser) appendices.push('plan-skills-browser.md');
+    if (_needsBrowser) appendices.push(_browserOff ? 'plan-skills-browser-off.md' : 'plan-skills-browser.md');
   }
 
   // Public web fetch appendix is mandatory for public_read/download tasks even
@@ -1767,6 +1862,13 @@ function _buildSystemPrompt(userMessage, state) {
     || SCREEN_DELIVERABLE_RE.test(userMessage || '');
   if (_isDeliverableTask && !appendices.includes('plan-skills-screen.md')) {
     appendices.push('plan-skills-screen.md');
+  }
+
+  // Browser-off escape-hatch — recovery/complex plans skip domain appendices,
+  // but the browser-off canon is exactly what a replanner needs after a step
+  // failed on a disabled skill. Always present under the kill switch.
+  if (_browserOff && !appendices.includes('plan-skills-browser-off.md')) {
+    appendices.push('plan-skills-browser-off.md');
   }
 
   for (const filename of appendices) {
@@ -2489,6 +2591,19 @@ async function planSkillsV2(state) {
       .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${String(m.content || '').trim().slice(0, 400)}`);
     if (_semanticTurns.length > 0) {
       conversationNote += `\n\nRELEVANT EARLIER CONTEXT (older sessions — use only to resolve references in the current request):\n${_semanticTurns.join('\n')}`;
+    }
+
+    // Referent bodies — the full material a follow-up refers to
+    // (highlighted/pasted content, prior answers). Truncated turns above
+    // show fragments; these are enough for the planner to recognize the
+    // content exists in-context. Synthesize receives the full bodies
+    // automatically — a live-extraction step to re-fetch them is wasted
+    // work and can drive the wrong tab.
+    if (_isFollowUp && Array.isArray(state._referentBodies) && state._referentBodies.length) {
+      const _rb = state._referentBodies.slice(0, 4)
+        .map(b => `=== ${b.role === 'assistant' ? 'Prior answer' : 'Shared content'} (${b.source || 'history'}) ===\n${b.text.slice(0, 1200)}`)
+        .join('\n\n');
+      conversationNote += `\n\nREFERENCED CONTENT (material the request refers to — injected into the synthesize step automatically):\n${_rb}\nDo NOT emit live-page/browser extraction steps (dom.act, browser.act, turn.loop.agent) solely to re-fetch content already present above — reference it in the synthesize step's prompt instead.`;
     }
 
     priorSynthesizedContent = _selectPriorSynthesis(conversationHistory) || '';

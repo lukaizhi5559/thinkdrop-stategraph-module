@@ -31,6 +31,10 @@ const DANGEROUS_CMD_RE = /\b(?:rm\s+-(?:r|f|rf|fr)|rmdir|mkfs|dd\s+.*of=|shutdow
 const _q = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 const _b64 = (s) => Buffer.from(String(s), 'utf8').toString('base64');
 
+// Document formats that need a decoder — route to doc.read, not fs.read
+// (fs.read would either hit its size cap or return binary garbage).
+const _DOC_READ_EXTS = new Set(['docx', 'xlsx', 'pptx', 'pdf', 'doc', 'rtf', 'odt', 'wordml']);
+
 // Site-search URL constructors for page_nav_scan — deterministic templates,
 // never model-invented. Only the verbatim query text is interpolated.
 const _eq = (s) => encodeURIComponent(String(s || '').trim());
@@ -54,6 +58,43 @@ const SITE_SEARCH_URLS = {
   twitter:       q => `https://x.com/search?q=${_eq(q)}`,
   x:             q => `https://x.com/search?q=${_eq(q)}`,
 };
+
+// Compose deep-links — the degradation-ladder handoff tier. When browser
+// automation is off (settings.browserAutomation) a "post/tweet/email" task
+// can't drive the composer — but `shell.run open <url>` lands the user on
+// a prefilled form in their REAL browser one click from done. Each entry
+// takes a fields object ({text,to,subject,body,title,url,repo,dates,details})
+// and returns the deep link; null = no compose surface for the service.
+// {{prev_stdout}} markers must survive encoding — the runtime substitution
+// injects the composed artifact AFTER plan-write time, so a text slot
+// carrying the marker stays literal until then.
+const _eqm = (s) => /\{\{(?:prev_stdout|prev_stdout_url|PREV_OUTPUT|PREV_OUTPUT_URL)\}\}/i.test(String(s || '')) ? String(s) : _eq(s);
+const SITE_COMPOSE_URLS = {
+  twitter:  f => `https://x.com/intent/tweet?text=${_eqm(f.text)}`,
+  x:        f => `https://x.com/intent/tweet?text=${_eqm(f.text)}`,
+  gmail:    f => `https://mail.google.com/mail/?view=cm&fs=1&to=${_eqm(f.to)}&su=${_eqm(f.subject)}&body=${_eqm(f.body || f.text)}`,
+  'google calendar': f => `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${_eqm(f.title)}&dates=${_eqm(f.dates)}&details=${_eqm(f.details || f.text)}`,
+  calendar: f => `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${_eqm(f.title)}&dates=${_eqm(f.dates)}&details=${_eqm(f.details || f.text)}`,
+  linkedin: f => `https://www.linkedin.com/feed/?shareActive=true&sharePlaylistId=`,
+  reddit:   f => `https://www.reddit.com/submit?title=${_eqm(f.title)}&selftext=true&text=${_eqm(f.text)}`,
+  hackernews:    f => `https://news.ycombinator.com/submitlink?t=${_eqm(f.title)}&u=${_eqm(f.url)}`,
+  'hacker news': f => `https://news.ycombinator.com/submitlink?t=${_eqm(f.title)}&u=${_eqm(f.url)}`,
+  github:   f => f.repo ? `https://github.com/${f.repo}/issues/new?title=${_eqm(f.title)}&body=${_eqm(f.body || f.text)}` : null,
+};
+
+/**
+ * SITE_COMPOSE_URL(service, fields) → compose deep link or null.
+ * Matches the service name loosely (canonical alias + substring on
+ * agentId stems like "twitter_agent").
+ */
+function SITE_COMPOSE_URL(service, fields = {}) {
+  const canon = (_canonicalService(service) || String(service || '').trim().toLowerCase())
+    .replace(/\.?agent$|_agent$/i, '').trim();
+  const fn = SITE_COMPOSE_URLS[canon]
+    || SITE_COMPOSE_URLS[Object.keys(SITE_COMPOSE_URLS).find(k => canon === k || canon.includes(k) || k.includes(canon))];
+  if (!fn) return null;
+  try { return fn(fields); } catch (_) { return null; }
+}
 
 // Deterministic query extraction for nav-scan when the classifier returns a
 // site but no query ("goto amazon and search for mechanical pencils" →
@@ -263,7 +304,12 @@ const TEMPLATES = [
     n: 3, id: 'file_read', lowRisk: true,
     describe: 'read a file or answer a question about a file\'s contents ("read X", "what does this file say", "what\'s this file about", "summarize this file") — args: {path}',
     validate: (a, m, t) => _validatePaths(a, ['path'], m, t),
-    build: (a) => [{ skill: 'fs.read', args: { action: 'read', path: a.path }, description: `Read ${a.path}` }],
+    build: (a) => {
+      const _ext = (String(a.path).split('.').pop() || '').toLowerCase();
+      return _DOC_READ_EXTS.has(_ext)
+        ? [{ skill: 'doc.read', args: { path: a.path }, description: `Read ${a.path}` }]
+        : [{ skill: 'fs.read', args: { action: 'read', path: a.path }, description: `Read ${a.path}` }];
+    },
   },
   {
     n: 4, id: 'file_list', lowRisk: true,
@@ -1186,4 +1232,4 @@ async function forceClassifyLocalPlan(message, taskClassification, llmBackend, l
   }
 }
 
-module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS, _extractNavQuery, _canonicalService, SERVICE_ALIASES, _CLASSIFY_PROMPT, _serviceHomeUrl };
+module.exports = { forceClassifyLocalPlan, _classifyDeterministic, looksLikeLocalOp, TEMPLATES, DANGEROUS_CMD_RE, SITE_SEARCH_URLS, SITE_COMPOSE_URLS, SITE_COMPOSE_URL, _extractNavQuery, _canonicalService, SERVICE_ALIASES, _CLASSIFY_PROMPT, _serviceHomeUrl };

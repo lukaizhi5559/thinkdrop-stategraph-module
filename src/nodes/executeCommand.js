@@ -1132,7 +1132,18 @@ async function _thinPostFailureHandlerImpl(state) {
   const _APP_BROWSER_ACTIONS = new Set(['scan_page', 'navigate_url', 'read_url', 'nav_task', 'print_page']);
   const _browserish = (s) => _BROWSER_LANE.has(s) || s === 'form.fill.agent'
     || (s === 'app.agent' && _APP_BROWSER_ACTIONS.has(String(failedStep?.args?.action || '')));
+  // Browser-off kill switch: with browserAutomation disabled the escalate
+  // target (turn.loop.agent) isn't dispatchable — patching to it just relabels
+  // the failure. And a `browser_automation_disabled` error is a capability
+  // rejection, not a runtime fault: a shell loop can't diagnose it and a
+  // same-class retry can't fix it — it belongs in evaluateSkills replan,
+  // which rebuilds with the actually-enabled skill set.
+  const _browserOff = (() => {
+    try { return !require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled(); } catch (_) { return false; }
+  })();
+  const _disabledErr = /browser_automation_disabled/i.test(String(failedStep?.error || ''));
   if (failedStep
+      && !_browserOff && !_disabledErr
       && _browserish(failedStep.skill)
       && failedStep.skill !== 'turn.loop.agent'
       && !failedStep.askUser && !failedStep.delegateTo
@@ -1219,6 +1230,7 @@ async function _thinPostFailureHandlerImpl(state) {
       && !_WEB_FETCH_SKILLS.has(failedStep.skill)
       && !failedStep.askUser && !failedStep.delegateTo
       && !_browserish(failedStep.skill)
+      && !_disabledErr
       && Array.isArray(skillPlan) && skillPlan[skillCursor]
       && !(patchHistory || []).some(p => (p.action === 'TERMINAL_DEBUG' || p.action === 'AGENT_ESCALATE' || p.action === 'DELEGATE_REROUTE' || p.action === 'BROWSER_ESCALATE') && p.cursor === skillCursor)
       // Timeout-shaped failures in deterministic plans still get the cheap
@@ -1353,6 +1365,15 @@ async function _thinPostFailureHandlerImpl(state) {
   if (failedStep.botBlocked) {
     const _botSkipped = _tryAutoSkipIndependentStep(state);
     if (_botSkipped) return _botSkipped;
+  }
+
+  // Kill-switch fast-path — a step blocked by browser_automation_disabled
+  // can't be fixed by replan (the skill is off, not misconfigured). Skip it
+  // when nothing downstream depends on its output; synthesis surfaces the
+  // degradation via disabledStepNotes instead of a hollow failure.
+  if (failedStep.automationDisabled) {
+    const _disSkipped = _tryAutoSkipIndependentStep(state);
+    if (_disSkipped) return _disSkipped;
   }
 
   // No LLM backend — surface to user
@@ -2262,6 +2283,8 @@ function _resolveGroupStepArgs(rawArgs, skill, ctx = {}) {
       for (const k of Object.keys(resolved)) {
         if (typeof resolved[k] === 'string') {
           resolved[k] = resolved[k]
+            .replace(/\{\{PREV_OUTPUT_URL\}\}/gi, encodeURIComponent(prevStdout))
+            .replace(/\{\{prev_stdout_url\}\}/gi, encodeURIComponent(prevStdout))
             .replace(/\{\{PREV_OUTPUT\}\}/gi, prevStdout)
             .replace(/\{\{prev_stdout\}\}/gi, prevStdout);
         }
@@ -3047,7 +3070,15 @@ module.exports = async function executeCommand(state) {
       const injectPrev = (val, inShell) => {
         if (typeof val === 'string') {
           const sub = inShell ? _shellStrip(prevStdout) : prevStdout;
-          return val.replace(/\{\{PREV_OUTPUT\}\}/gi, sub).replace(/\{\{prev_stdout\}\}/gi, sub);
+          // {{prev_stdout_url}} — URL-encoded variant for embedding prior
+          // output inside a URL (compose deep links); raw injection would
+          // split on & ? #. Check BEFORE the bare-marker patterns — the
+          // suffix must not be consumed first.
+          return val
+            .replace(/\{\{PREV_OUTPUT_URL\}\}/gi, encodeURIComponent(sub))
+            .replace(/\{\{prev_stdout_url\}\}/gi, encodeURIComponent(sub))
+            .replace(/\{\{PREV_OUTPUT\}\}/gi, sub)
+            .replace(/\{\{prev_stdout\}\}/gi, sub);
         }
         if (Array.isArray(val)) return val.map(v => injectPrev(v, inShell));
         if (val && typeof val === 'object') {
@@ -4562,6 +4593,14 @@ module.exports = async function executeCommand(state) {
       .filter(r => (r.botBlocked || r.blocked) && r.step > lastSynthesizeStep)
       .map(r => `- Step ${r.step} (${r.description || r.skill}): BLOCKED — bot wall detected, content not retrieved`);
 
+    // ── Disabled-automation notes ──────────────────────────────────────────
+    // Steps typed-blocked by settings.browserAutomation. Synthesis must
+    // report these as degradations ("automation is off — here's the artifact,
+    // paste it yourself"), never as failures or false success claims.
+    const disabledStepNotes = skillResults
+      .filter(r => r.automationDisabled && r.step > lastSynthesizeStep)
+      .map(r => `- Step ${r.step} (${r.description || r.skill}): browser automation is OFF — could not be performed directly`);
+
     // ── Action-outcome notes ────────────────────────────────────────────────
     // browser.agent mutation steps report "Completed: …" and are deliberately
     // excluded from pageTextResults (they carry no page text). But a verify/
@@ -5066,9 +5105,28 @@ module.exports = async function executeCommand(state) {
       }
     }
 
-    const _rawSynthesisContext = allContextParts.length > 0
-      ? allContextParts.join('\n\n') + _truthfulnessNote
-      : (crossTurnContext || skillResults.filter(r => r.ok && (r.result || r.stdout)).map(r => String(r.result || r.stdout)).join('\n\n')) + _truthfulnessNote;
+    // Referent injection — a follow-up's referent usually lives in history
+    // (highlighted/pasted content, prior answers), not on the live page or
+    // in this run's step outputs. History consumers display-truncate to
+    // ~300 chars; resolveReferences kept the full bodies on
+    // state._referentBodies. Gated on _isReferentialTask — a fresh task
+    // must not inherit unrelated prior content (task_94e38046).
+    let referentContext = '';
+    if (_isReferentialTask) {
+      const _bodies = (state._referentBodies || [])
+        .map(b => `=== ${b.role === 'assistant' ? 'Prior answer' : 'Shared content'} (${b.source || 'history'}) ===\n${b.text}`)
+        .join('\n\n');
+      if (_bodies) {
+        referentContext = `\n\nREFERENCED PRIOR CONTENT — the current request refers to this material; history displays truncate it, these are the full bodies:\n\n${_bodies}`;
+        logger.info(`[Node:ExecuteCommand] synthesize: injecting ${(state._referentBodies || []).length} referent bod(ies) (${_bodies.length} chars)`);
+      }
+    }
+
+    const _rawSynthesisContext = (allContextParts.length > 0
+      ? allContextParts.join('\n\n')
+      : (crossTurnContext || skillResults.filter(r => r.ok && (r.result || r.stdout)).map(r => String(r.result || r.stdout)).join('\n\n')))
+      + _truthfulnessNote
+      + referentContext;
     // Cap context to ~60k chars (~15k tokens) to prevent LLM context overflow on large fs.read/explore results.
     // Trim from the middle so we keep the directory tree (start) and most recent file content (end).
     const _SYNTH_CTX_LIMIT = 60000;
@@ -5107,6 +5165,10 @@ module.exports = async function executeCommand(state) {
     
     const skippedStepsNote = skippedStepNotes.length > 0
       ? `\n\nNOTE — The following steps were skipped because the service was unavailable or not ready:\n${skippedStepNotes.join('\n')}\nPlease acknowledge these gaps in the summary.`
+      : '';
+
+    const disabledStepsNote = disabledStepNotes.length > 0
+      ? `\n\nNOTE — The following steps were blocked because browser automation is disabled:\n${disabledStepNotes.join('\n')}\nDo NOT report these as failures and do NOT claim the action was performed. Present any produced artifact (draft, message, comment, reply text) as ready-to-use and tell the user exactly what to do with it — e.g. "paste this yourself", or "I opened the prefilled composer in your browser; review and click send".`
       : '';
     let synthesisFilePath = args.saveToFile || null;
 
@@ -5240,10 +5302,10 @@ module.exports = async function executeCommand(state) {
       }
 
       const synthesisQuery = hasSystemInfoShellOutput
-        ? `${synthesisPrompt}${skippedStepsNote}\n\nHere is the raw output from system commands (do NOT repeat it — extract ONLY the answer):\n\n${synthesisContext}`
+        ? `${synthesisPrompt}${skippedStepsNote}${disabledStepsNote}\n\nHere is the raw output from system commands (do NOT repeat it — extract ONLY the answer):\n\n${synthesisContext}`
         : hasFileContent
-        ? `${synthesisPrompt}${skippedStepsNote}\n\nHere is the current file content:\n\n${synthesisContext}`
-        : `${synthesisPrompt}${skippedStepsNote}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
+        ? `${synthesisPrompt}${skippedStepsNote}${disabledStepsNote}\n\nHere is the current file content:\n\n${synthesisContext}`
+        : `${synthesisPrompt}${skippedStepsNote}${disabledStepsNote}\n\nHere is the content collected from each source:\n\n${synthesisContext}`;
       // Detect response language from the original user message (same approach as answer.js).
       // Voice: read sessionLanguage from journal. Text: detect from script/accent heuristics.
       const _SYNTH_LANG_NAMES = { zh: 'Chinese (Mandarin)', es: 'Spanish', fr: 'French', pt: 'Portuguese', ar: 'Arabic', ja: 'Japanese', ko: 'Korean', hi: 'Hindi', de: 'German', it: 'Italian', ru: 'Russian' };
@@ -8704,6 +8766,10 @@ Please try again or search with different terms.`;
       aborted:         skill === 'app.agent' ? (raw.aborted         ?? false) : undefined,
       botBlocked:      raw.botBlocked === true,
       blocked:         (raw.blocked === true || raw.botBlocked === true) || undefined,
+      // Typed kill-switch error from command-service — the skill is
+      // capability-disabled (settings.browserAutomation), not broken.
+      // Synthesis surfaces this as a degradation, not a failure.
+      automationDisabled: raw.error === 'browser_automation_disabled',
       steps:        skill === 'video.agent' ? (raw.steps       || null) : undefined,
       pageTitle:    skill === 'video.agent' ? (raw.pageTitle   || null) : undefined,
       pageContent:  skill === 'video.agent' ? (raw.pageContent || null) : undefined,

@@ -554,6 +554,16 @@ function _stepAgentKey(step) {
  */
 function lintAtomicBrowserPlan(plan, logger, ctx = {}) {
   if (!Array.isArray(plan) || plan.length === 0) return { plan, rewrites: [], navOnlyLeftover: [] };
+  // Browser-automation kill switch: this lint exists to normalize the atomic
+  // browser lane (url.first→dom.act splices, bound-session stamps). When the
+  // lane is disabled those skills aren't dispatchable and the rewrites would
+  // only produce more disabled steps — _rewriteBrowserStepsToAtomicAgents
+  // already owns the off-shape conversion upstream.
+  try {
+    if (!require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled()) {
+      return { plan, rewrites: [], navOnlyLeftover: [] };
+    }
+  } catch (_) {}
   const rewrites = [];
   const navOnlyLeftover = [];
   const steps = [...plan];
@@ -993,11 +1003,26 @@ function _deepLinkableSurface(desc, targetService) {
   return false;
 }
 
+// Browser-off legal substitutes — when the driving lane is disabled, the
+// buckets collapse to the skills that actually dispatch: navigation →
+// shell.run open, page reads/interaction → app.agent (scan_page/OS lane).
+// Emitting a disabled skill under browser-off gets repaired to these.
+const _OFF_NAV_PICKS = ['shell.run'];
+const _OFF_ACTION_PICKS = ['app.agent'];
+const _OFF_READ_PICKS = ['app.agent'];
+
 function stepCandidates(step, ctx = {}) {
   const skill = step?.skill;
   if (!skill || !_GOVERNED_STEP_SKILLS.has(skill)) return [];
   const tc = ctx.tc || {};
   const desc = String(step.description || step.args?.task || step.args?.goal || step.args?.query || '');
+
+  const _browserOff = (() => {
+    try { return !require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled(); } catch (_) { return false; }
+  })();
+  const _NAV = _browserOff ? _OFF_NAV_PICKS : _NAV_PICKS;
+  const _ACTION = _browserOff ? _OFF_ACTION_PICKS : _BOUND_ACTION_PICKS;
+  const _READ = _browserOff ? _OFF_READ_PICKS : _BOUND_READ_PICKS;
 
   // A service/URL token makes "open X" a navigation; an item-noun makes it
   // an on-page action ("open the first result" → click, not nav).
@@ -1009,7 +1034,7 @@ function stepCandidates(step, ctx = {}) {
     || tc.newDestination === true;
   const _surfaceBlocked = _STEP_SURFACE_RE.test(desc) && !_deepLinkableSurface(desc, ctx.targetService);
   if (_STEP_NAV_VERB_RE.test(desc) && mentionsDest && !_STEP_ITEM_RE.test(desc) && !_surfaceBlocked) {
-    return _NAV_PICKS;
+    return _NAV;
   }
 
   // Video-platform discovery carve-out — a search/find/extract step on a video
@@ -1039,13 +1064,13 @@ function stepCandidates(step, ctx = {}) {
     const _isFormWork = /\b(fill|enter|type|set)\b[^.]{0,40}\b(form|field|title|date|time|detail|name|description|event|event details)\b/i.test(desc)
       || /\bfill in\b/i.test(desc);
     const _actionPicks = _isEmailWork
-      ? _BOUND_ACTION_PICKS.filter(s => s !== 'form.fill.agent')
+      ? _ACTION.filter(s => s !== 'form.fill.agent')
       : _isFormWork
-        ? ['form.fill.agent', ..._BOUND_ACTION_PICKS.filter(s => s !== 'form.fill.agent')]
-        : _BOUND_ACTION_PICKS;
+        ? ['form.fill.agent', ..._ACTION.filter(s => s !== 'form.fill.agent')]
+        : _ACTION;
     if (_STEP_ACTION_RE.test(desc)) return _actionPicks;
-    if (_STEP_READ_RE.test(desc)) return _BOUND_READ_PICKS;
-    return [..._actionPicks.slice(0, 4), 'browser.act'];
+    if (_STEP_READ_RE.test(desc)) return _READ;
+    return _browserOff ? _actionPicks : [..._actionPicks.slice(0, 4), 'browser.act'];
   }
 
   if (ctx.publicWeb) return _PUBLIC_WEB_PICKS;

@@ -66,6 +66,7 @@ You will receive a structured execution log. Here is what each field means:
 2. **Check `result` length and content** — empty result (`""` or `<200 chars`) from `getPageText`/`waitForStableText` means the page had no useful content. If `result` starts with "about:blank" or contains only navigation links, the step failed silently.
 3. **Check `title`** — a Wikipedia `List_of_X` title means an index page was loaded, not a content article. A "Sign in" title means auth redirect.
 4. **Check `error` field** — any non-null error means the step hard-failed.
+   - **Capability errors are ENVIRONMENT facts, not service failures** — `browser_automation_disabled` (browser automation is off in settings), `screen_recording_permission_denied` (grant Screen Recording permission to the app), `*_not_installed` (a binary/dependency is missing). Any user-facing text must name the actual blocker and fix ("enable browser automation in settings", "grant Screen Recording permission", "install X") — NEVER attribute it to the service or step's domain (a disabled browser lane does NOT mean "Nylas or other web-based integrations" are broken — nylas is a CLI). A plan that emitted a disabled skill should be REPLANNED with enabled skills (cli.agent for CLI services, shell.run open + app.agent scan_page for page work), not retried.
 5. **Check FINAL ANSWER** — if the answer is "Done! Browser is open at …" for a task that should have produced content (rankings, summaries, data), that is a failure.
 6. **Check `exitCode`** — shell steps with non-zero exit are failures.
 

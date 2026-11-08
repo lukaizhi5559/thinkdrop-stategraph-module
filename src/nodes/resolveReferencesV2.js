@@ -1501,6 +1501,52 @@ module.exports = async function resolveReferencesV2(state) {
     }
   }
 
+  // Referent bodies — full-text recovery for content consumers downstream.
+  // History turns are display-truncated everywhere they render (200-300
+  // chars), so a follow-up like "give me a response to this" loses the
+  // actual email/document body the user shared. Synthesize and the planner
+  // read this for the material the request refers to — without it the
+  // planner emits a live-extraction step for content already in context.
+  let _referentBodies = [];
+  try {
+    const _tf = require('../../../shared/turn-facts.cjs').computeTurnFacts;
+    const _seen = new Set();
+    const _push = (role, source, text, cap) => {
+      const t = String(text || '').trim();
+      if (!t) return;
+      const k = t.slice(0, 160);
+      if (_seen.has(k)) return;
+      _seen.add(k);
+      _referentBodies.push({ role, source, text: t.slice(0, cap) });
+    };
+    const _isUser = m => m && (m.role === 'user' || m.sender === 'user');
+    // Shared-material blobs ([Highlighted:]/[Context:]/[Thought:]) riding in
+    // user turns — the user's explicitly shared selection/paste.
+    for (const m of conversationHistory.slice(-10)) {
+      if (!_isUser(m) || !m.content) continue;
+      try {
+        for (const a of _tf({ rawText: m.content }).attachments || []) {
+          if (a.kind === 'file' || a.kind === 'folder' || String(a.value || '').length < 40) continue;
+          _push('user', m.source || 'recent', `[${a.kind}] ${a.value}`, 6000);
+        }
+      } catch (_) {}
+    }
+    // Long user bodies — untagged pastes whose content IS the referent.
+    for (const m of conversationHistory.slice(-8)) {
+      if (!_isUser(m) || !m.content) continue;
+      const c = m.content.trim();
+      if (c.length > 400) _push('user', m.source || 'recent', c, 4000);
+    }
+    // Prior assistant results — the answer a follow-up ("send that",
+    // "summarize it") actually points at.
+    for (const m of semanticHistory.slice(-4)) {
+      if (_isUser(m) || !m.content) continue;
+      _push('assistant', m.source || 'semantic', m.content, 4000);
+    }
+    let _total = 0;
+    _referentBodies = _referentBodies.filter(b => (_total += b.text.length) <= 24000);
+  } catch (_) { _referentBodies = []; }
+
   return {
     ...state,
     // Card replies: `message` is the reply-only text everywhere downstream —
@@ -1510,6 +1556,7 @@ module.exports = async function resolveReferencesV2(state) {
     originalMessage:        message,
     conversationHistory,
     semanticHistory,
+    _referentBodies,
     _taskClassification,
     _thoughtAttachment:     _thoughtCtx || null,
     _priorScreenContext:    _priorScreenContext || null,

@@ -56,7 +56,8 @@ eq(suggestIntent({ ...baseFollowUp, targetService: 'spotify' }, 'x'), null, 'tar
 eq(suggestIntent({ ...baseFollowUp, requiresDOM: true }, 'x'), null, 'requiresDOM suppresses');
 eq(suggestIntent({ ...baseFollowUp, followUpTarget: '/Users/me/notes.txt' }, 'x'), null, 'path target suppresses');
 eq(suggestIntent({ ...baseFollowUp, followUpTarget: 'report.pdf' }, 'x'), null, 'file-ext target suppresses');
-eq(suggestIntent({ ...baseFollowUp, isActivityQuery: true }, 'x'), null, 'isActivityQuery suppresses');
+eq(suggestIntent({ ...baseFollowUp, isActivityQuery: true }, 'x')?.intent,
+  'memory_retrieve', 'isActivityQuery suppresses query-followup, hits activity-recall rule');
 eq(suggestIntent({ ...baseFollowUp, isAppUiInspection: true }, 'x'), null, 'isAppUiInspection suppresses');
 eq(suggestIntent({ ...baseFollowUp, isSpatialAnalysis: true }, 'x'), null, 'isSpatialAnalysis suppresses');
 eq(suggestIntent({ ...baseFollowUp, needsFreshScreen: true }, 'x'), null, 'needsFreshScreen suppresses');
@@ -100,6 +101,51 @@ eq(suggestIntent(null, 'x'), null, 'null tc → null');
 eq(suggestIntent({}, 'x'), null, 'empty tc → null');
 eq(suggestIntent({ taskType: 'messaging', targetService: 'slack' }, 'tell John hi'),
   null, 'messaging task → no opinion (LLM decides)');
+
+// ── public-research — ctx/guard-mirror exclusions (task_fb887853 class) ──────
+// The unguarded rule diverged on "click the first result" — bound Amazon tab,
+// activeDocRef=url — suggesting web_search where the runtime correctly ran
+// on-page automation.
+eq(suggestIntent({ taskType: 'browser', isFollowUp: true, followUpTarget: 'Amazon navigation', webAccessMode: 'public_read', activeDocRef: 'url' }, 'click the first result')?.intent,
+  'command_automate', 'public-research: activeDocRef blocks → local-short-circuit (bound doc case)');
+eq(suggestIntent({ taskType: 'browser', isFollowUp: true, followUpTarget: 'Amazon navigation', webAccessMode: 'public_read' }, 'click the first result', { boundSession: true })?.intent,
+  'command_automate', 'public-research: in-page follow-up on bound session → command_automate');
+eq(suggestIntent({ taskType: 'browser', isFollowUp: true, followUpTarget: 'Amazon navigation', webAccessMode: 'public_read' }, 'click the first result', { boundSession: false })?.intent,
+  'web_search', 'public-research: no bound session → public_read follow-up still researches');
+eq(suggestIntent({ taskType: 'browser', webAccessMode: 'public_read' }, 'look online for standing desks', { carriedHint: 'command_automate' })?.intent,
+  'command_automate', 'public-research: carriedHint=command_automate blocks → short-circuit');
+eq(suggestIntent({ taskType: 'browser', webAccessMode: 'public_read' }, 'look online for standing desks', { carriedHint: 'web_search' })?.intent,
+  'web_search', 'public-research: non-automate hint does not block');
+eq(suggestIntent({ taskType: 'browser', webAccessMode: 'public_read' }, 'search the web and save it to ~/out/report.md')?.intent,
+  'command_automate', 'public-research: literal file path blocks → short-circuit');
+eq(suggestIntent({ taskType: 'browser', webAccessMode: 'public_read' }, "what's on my screen right now")?.intent,
+  'command_automate', 'public-research: live-surface vocabulary blocks → short-circuit');
+
+// ── unresolved-followup — guard-mirror exclusions ────────────────────────────
+eq(suggestIntent({ taskType: 'messaging', isFollowUp: true, suggestedIntent: 'command_automate' }, 'text mom that i am late'),
+  null, 'unresolved-followup: action-shaped message (action type + automate hint) → no opinion');
+eq(suggestIntent({ taskType: 'messaging', isFollowUp: true, targetService: 'imessage' }, 'tell john yes'),
+  null, 'unresolved-followup: resolved service → no opinion');
+eq(suggestIntent({ taskType: 'query', isFollowUp: true, activeDocRef: 'screen' }, 'what is this'),
+  null, 'unresolved-followup: screen referent is live observation, not recall');
+eq(suggestIntent({ taskType: 'local_system', isFollowUp: true, needsFreshScreen: true }, 'what is this'),
+  null, 'unresolved-followup: needsFreshScreen blocks (screen-observation lane)');
+eq(suggestIntent({ taskType: 'query', isFollowUp: true }, 'tell me more', { hasHighlightContext: true }),
+  null, 'unresolved-followup: highlight context supplies the referent');
+// ambient-misref trigger — bare deictic + file/url activeDocRef → memory_retrieve
+eq(suggestIntent({ taskType: 'query', activeDocRef: 'url' }, 'tell me more about that')?.intent,
+  'memory_retrieve', 'ambient-misref: bare deictic + url ref → memory_retrieve');
+eq(suggestIntent({ taskType: 'query', activeDocRef: 'file' }, 'tell me more about that file'),
+  null, 'ambient-misref: deictic+artifact noun resolves legitimately → no opinion');
+eq(suggestIntent({ taskType: 'query', activeDocRef: 'url' }, 'tell me more about that', { hasHighlightContext: true }),
+  null, 'ambient-misref: highlight context suppresses the misref trigger');
+eq(suggestIntent({ taskType: 'query', activeDocRef: 'screen' }, 'tell me more about that'),
+  null, 'ambient-misref: screen ref is not an ambient doc misref');
+
+// ── ACTION_TASK_TYPES export ─────────────────────────────────────────────────
+const { ACTION_TASK_TYPES } = require('../src/utils/routeTable');
+eq(ACTION_TASK_TYPES.has('messaging') && ACTION_TASK_TYPES.has('browser') && ACTION_TASK_TYPES.size === 6,
+  true, 'ACTION_TASK_TYPES = SINGLE_STEP + messaging/scheduling');
 
 console.log(`\n${'='.repeat(60)}\n  Total: ${passed + failed}  Passed: ${passed}  Failed: ${failed}\n${'='.repeat(60)}`);
 process.exit(failed ? 1 : 0);

@@ -492,6 +492,12 @@ async function retrieveMemory(state) {
 
     logger.debug(`[Node:RetrieveMemory] Search query: "${enrichedSearchQuery}" | dateRange: ${dateRange ? JSON.stringify(dateRange) : 'none'} | isActivityQuery: ${isActivityQuery} | minSimilarity: ${minSimilarity}`);
 
+    // Kick off the app-name extraction NOW — it is independent of the
+    // profile lookup and both are LLM calls; serializing them stacks their
+    // latencies on every retrieval (see await site below).
+    const _episodicAppNameP = _extractAppNameFilter(resolvedMessage || message, mcpAdapter, dateRange, context, logger)
+      .catch(e => { logger.debug(`[Node:RetrieveMemory] app-name extraction failed: ${e.message}`); return null; });
+
     // ── Primary profile lookup for personal-attribute queries ───────────────
     // Before running noisy semantic search across thousands of screen captures,
     // check the structured user_profile KV store for known personal attributes.
@@ -532,7 +538,10 @@ async function retrieveMemory(state) {
     // Extract a canonical app name from the query so episodic search can filter
     // exactly when the user asks about a specific app (e.g. "VS Code yesterday").
     // Now DB-driven: queries episodic_memory for actual app names the user has used.
-    const episodicAppName = await _extractAppNameFilter(resolvedMessage || message, mcpAdapter, dateRange, context, logger);
+    // Independent of the profile lookup above — race them instead of
+    // serializing two LLM calls on every retrieval (observed: 60s+ simple
+    // fact lookups with sequential per-call latency stacking up).
+    const episodicAppName = await _episodicAppNameP;
 
     // ── DB keyword enrichment for BM25 ──────────────────────────────────────
     // Fetch top app/window pairs from the date range to enrich the BM25 query
@@ -662,6 +671,20 @@ async function retrieveMemory(state) {
           : (dbKeywords.length > 0 ? `${cleanedQuery} ${dbKeywords.join(' ')}` : cleanedQuery);
         const rangeMs = new Date(episodicDateRange.endDate) - new Date(episodicDateRange.startDate);
         const isWideRange = rangeMs > 86400000; // > 1 day
+        // "today" to a user means "recently" — the literal 5am→5am window drops
+        // last-night's sessions (observed: audio journals at 22:37–23:36 local
+        // cut by a Nov-6 10:00 UTC window start). Pad short activity windows
+        // back ~30h for the fetch; rangeMs/isWideRange keep the pre-pad values
+        // so a padded "today" doesn't inherit the multi-day limit/diverseDays.
+        // Copy, never mutate — episodicDateRange may alias state.dateRange.
+        const queryRange = (isActivityQuery && rangeMs > 0 && rangeMs < 36 * 3600 * 1000)
+          ? (() => {
+              const s = new Date(episodicDateRange.startDate); s.setHours(s.getHours() - 30);
+              const pad = n => String(n).padStart(2, '0');
+              const iso = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+              return { ...episodicDateRange, startDate: iso(s) };
+            })()
+          : episodicDateRange;
         let episodicLimit = 10;
         if (_isWideEpisodicRecall) {
           episodicLimit = 50;
@@ -674,14 +697,14 @@ async function retrieveMemory(state) {
           else if (rangeDays <= 365) episodicLimit = 300; // Increased from 100
           else episodicLimit = 500; // Increased from 200
         }
-        logger.debug(`[Node:RetrieveMemory] Episodic dateRange: start=${episodicDateRange.startDate} end=${episodicDateRange.endDate} | rangeMs=${rangeMs} (${Math.round(rangeMs/86400000)} days) | wideRange=${isWideRange} | limit=${episodicLimit}`);
+        logger.debug(`[Node:RetrieveMemory] Episodic dateRange: start=${queryRange.startDate} end=${queryRange.endDate} | rangeMs=${rangeMs} (${Math.round(rangeMs/86400000)} days) | wideRange=${isWideRange} | limit=${episodicLimit}${queryRange !== episodicDateRange ? ' | startDate padded' : ''}`);
         logger.debug(`[Node:RetrieveMemory] Episodic BM25 query: "${episodicQuery}" | limit: ${episodicLimit} | wideRange: ${isWideRange}`);
         return mcpAdapter.callService('user-memory', 'episodic.search', {
           query: episodicQuery,
           limit: episodicLimit,
           userId: context?.userId,
-          startDate: episodicDateRange.startDate,
-          endDate: episodicDateRange.endDate,
+          startDate: queryRange.startDate,
+          endDate: queryRange.endDate,
           filters: {
             // screen_capture + audio_journal — ambient audio transcripts are
             // chunked into the same episodic store; "what did that video/
@@ -694,7 +717,7 @@ async function retrieveMemory(state) {
           },
           dedup: true,
           diverseDays: isWideRange
-        }).then(result => {
+        }).then(async result => {
           // Log temporal diversity of retrieved memories
           if (result && result.data && result.data.results) {
             const uniqueDates = new Set();
@@ -705,6 +728,40 @@ async function retrieveMemory(state) {
               }
             });
             logger.debug(`[Node:RetrieveMemory] Retrieved ${result.data.results.length} memories spanning ${uniqueDates.size} unique dates: ${Array.from(uniqueDates).sort().join(', ')}`);
+          }
+          // Boilerplate BM25 + a small limit drowns transcript-type rows under
+          // the screen-capture flood (thousands/day vs a handful of journals —
+          // transcripts matching zero boilerplate terms score 0 and rank last).
+          // Fetch audio journals on their own type filter with the real query
+          // terms and merge, so the answer LLM can actually see them.
+          if (isActivityQuery) {
+            try {
+              const audioRes = await mcpAdapter.callService('user-memory', 'episodic.search', {
+                query: cleanedQuery,
+                limit: 20,
+                userId: context?.userId,
+                startDate: queryRange.startDate,
+                endDate: queryRange.endDate,
+                filters: {
+                  type: ['audio_journal'],
+                  ...(episodicAppName ? { appName: episodicAppName } : {})
+                },
+                dedup: true
+              });
+              const audioRows = audioRes?.data?.results || audioRes?.results || [];
+              if (audioRows.length) {
+                const bucket = (result && (result.data || result)) || {};
+                bucket.results = Array.isArray(bucket.results) ? bucket.results : [];
+                const seen = new Set(bucket.results.map(m => m.id));
+                let added = 0;
+                for (const a of audioRows) {
+                  if (!seen.has(a.id)) { bucket.results.push(a); seen.add(a.id); added++; }
+                }
+                if (added) logger.debug(`[Node:RetrieveMemory] audio_journal side-fetch merged ${added} row(s) (${audioRows.length} fetched)`);
+              }
+            } catch (e) {
+              logger.warn('[Node:RetrieveMemory] audio_journal side-fetch failed:', e.message);
+            }
           }
           return result;
         }).catch(err => {
@@ -781,6 +838,7 @@ async function retrieveMemory(state) {
       const formattedDate = formatTimestamp(mem.created_at);
       return {
         id: mem.id,
+        type: mem.type,
         text: mem.text,
         similarity: mem.similarity,
         entities: mem.entities || [],

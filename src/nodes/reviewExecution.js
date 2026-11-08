@@ -704,15 +704,52 @@ module.exports = async function reviewExecution(state) {
     }
 
     if (isHollow) {
+      // ── Page-arbitration gate ─────────────────────────────────────────────
+      // Both the fulfillment verdict above and the contradiction-correction
+      // below assume the correct answer is observable on the final page —
+      // true only for retrieval tasks. For compose/generate deliverables
+      // (draft a reply, write bullets) the page holds the request or an
+      // unrelated state; the corrector sees ONLY page text, so it can never
+      // reproduce answers built on non-page sources (doc.read/fs.read) —
+      // it returns a restatement of the request instead (observed: a streamed
+      // 3180-char drafted reply replaced by "Robert Love is requesting 1-2
+      // bullet points… the user has not yet provided these bullet points").
+      const _synthLen = String(synthesizeOutput || '').trim().length;
+      const _genEvidence = `${synthesizeStep?.description || ''} ${synthesizeStep?.args?.task || ''} ${userMessage}`;
+      const _pageRef = /\b(?:this|the|current)\s+(?:page|article|site|post|video|tweet|thread|listing|tab)|on (?:the|this)\s+(?:page|site|screen)\b/i.test(userMessage);
+      const _generationTask = /\b(?:draft|compose|write|create|generate|respond|response|reply|reword|rewrite|author|produce|formulate|come up with)\b/i.test(_genEvidence) && !_pageRef;
+      const _nonPageSource = skillResults.some(r => r.ok !== false
+        && !ATOMIC_BROWSER_SKILLS.has(r.skill) && r.skill !== 'synthesize'
+        && String(r.stdout || r.result || '').trim().length > 200);
+      const _pageCantArbitrate = _generationTask || _nonPageSource;
+      const _hardUnproven = _unprovenMutations.length > 0 && !hasBrowserMutationEvidence(skillResults);
+      // A page-goal mismatch isn't failure evidence for these tasks — a real
+      // synthesized answer exists, so accept it unverifiable rather than
+      // replanning or swapping it for page text. hardUnproven stays exempt —
+      // zero-evidence mutation claims are real failure, not a judgment quirk.
+      if (_pageCantArbitrate && _synthLen > 400 && !regexHollow && !_hardUnproven) {
+        logger.warn(`[Node:ReviewExecution] Page verdict inapplicable — deliverable is ${_generationTask ? 'composed/generated' : 'non-page-source'} content the page can't contain (synth ${_synthLen} chars) — accepting as UNVERIFIABLE`);
+        return { ...state, reviewVerdict: 'UNVERIFIABLE' };
+      }
+
       // ── Answer-only contradiction check ──────────────────────────────────────
       // Before triggering a replan, check if the page text actually contains the
       // answer the user asked for but the synthesis got it wrong. If so, correct
       // the answer directly from page text — no replan needed.
-      if (snapshot && llmBackend && synthesizeOutput) {
+      if (snapshot && llmBackend && synthesizeOutput && !_pageCantArbitrate) {
         let contradiction = await assessAnswerContradiction(
           userMessage, synthesizeOutput, snapshot, llmBackend, context, logger, makeAskDecision(mcpAdapter)
         );
         if (contradiction?.corrected) {
+          // Last-line guard: a "corrected" answer that restates the request or
+          // shrinks a substantive synthesis to a stub isn't an answer — the
+          // page just doesn't hold one. Ignore it; the hollow path below
+          // surfaces the run honestly instead of swapping in a meta-summary.
+          const _corrText = String(contradiction.answer || '').trim();
+          const _RESTATE_RE = /(?:has|have) not yet (?:provided|supplied|given|shared|generated|completed|been)|is (?:still )?(?:requesting|asking for|waiting for)|needs? to (?:provide|supply|share|send|give|write|draft)|the user (?:has|needs|wants|asked|requested|must|should|did not|didn't|hasn't)/i;
+          if (_RESTATE_RE.test(_corrText) || (_corrText.length > 0 && _corrText.length < Math.max(150, _synthLen * 0.15))) {
+            logger.warn(`[Node:ReviewExecution] Corrected answer rejected — request restatement or stub (${_corrText.length} chars vs synth ${_synthLen}): "${_corrText.slice(0, 140)}" — ignoring`);
+          } else {
           logger.info(`[Node:ReviewExecution] Answer-only contradiction detected — correcting synthesis from page text: ${contradiction.reason}`);
 
           // ── Truncation recovery ──────────────────────────────────────────
@@ -739,7 +776,7 @@ module.exports = async function reviewExecution(state) {
                 const reContradiction = await assessAnswerContradiction(
                   userMessage, synthesizeOutput, reSnapshot, llmBackend, context, logger, makeAskDecision(mcpAdapter)
                 );
-                if (reContradiction?.corrected && !TRUNCATION_INDICATORS.test(reContradiction.answer)) {
+                if (reContradiction?.corrected && !TRUNCATION_INDICATORS.test(reContradiction.answer) && !_RESTATE_RE.test(String(reContradiction.answer || ''))) {
                   logger.info(`[Node:ReviewExecution] Re-capture recovery succeeded — full response obtained`);
                   contradiction = reContradiction;
                   snapshot = reSnapshot;
@@ -769,6 +806,7 @@ module.exports = async function reviewExecution(state) {
             answer: contradiction.answer,
             skillResults,
           };
+          }
         }
       }
 

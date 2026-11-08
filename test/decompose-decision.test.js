@@ -147,7 +147,10 @@ describe('decomposePromptV2 — command_automate contradiction guard', () => {
     let planCalls = 0;
     const r = await _decompose('summarize what I worked on recently',
       _backend('0', () => { planCalls++; return _plan('memory_retrieve'); }),
-      { taskType: 'query', isActivityQuery: true });
+      // isActivityQuery:false — a true flag routes via the activity-recall
+      // guard before the number call (see activity-recall-routing.test.js);
+      // this case exercises the escalation path when the flag is absent.
+      { taskType: 'query', isActivityQuery: false });
     assert.equal(planCalls, 1, 'full decompose must run once');
     assert.equal(r._decomposedIntent, 'memory_retrieve');
   });

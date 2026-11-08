@@ -361,6 +361,25 @@ module.exports = async function parseIntentV2(state) {
       finalIntent = 'memory_retrieve';
     }
 
+    // Seeded memory_retrieve verdicts must not be re-lost to SERP or shell.
+    // The RouteDecision envelope rode the handoff in as _taskClassification
+    // — when it names memory_retrieve, a passive or automation pick is the
+    // decomposer ignoring the seeded answer and re-classifying (observed:
+    // "what time is my standup" → webSearch returned Agile-methodology
+    // articles; "what is my wifi network called" → command_automate ran a
+    // shell probe, both while the stored fact sat in memory). The envelope
+    // is flaky at spotting recall shapes, so the deterministic possessive
+    // question pattern ("what is my X", "when is my X") is a parallel
+    // trigger — a personal-fact ask is memory-first by product design; a
+    // retrieval miss answers honestly "not stored" instead of answering a
+    // fact question with a system action.
+    const _possessiveRecall = /\b(?:what|when|where|who|which)(?:'s|\s+(?:is|are|was|were|did|do|does))\s+my\b/i.test(classifyMessage);
+    if ((state._taskClassification?.suggestedIntent === 'memory_retrieve' || _possessiveRecall)
+        && ['question', 'general_knowledge', 'web_search', 'command_automate'].includes(finalIntent)) {
+      logger.info(`[Node:ParseIntentV2] memory_retrieve override (${state._taskClassification?.suggestedIntent === 'memory_retrieve' ? 'envelope' : 'possessive-question'}): ${finalIntent} → memory_retrieve for "${classifyMessage.slice(0, 80)}"`);
+      finalIntent = 'memory_retrieve';
+    }
+
     // Scheduling tasks (reminders, timers, alarms, cron) must be command_automate,
     // not memory_store. The fast-decision classifier can confuse "remind me" (action)
     // with "remember that" (store). Override to command_automate so planSkills
@@ -502,7 +521,7 @@ module.exports = async function parseIntentV2(state) {
     logger.info(`[Node:ParseIntentV2] taskClassification override (app_automation) → command_automate: "${classifyMessage.slice(0, 60)}"`);
   }
   else if (/\b(remember|my name is|i am|my email|note that|store that|save that)\b/.test(lower)) fallbackIntent = 'memory_store';
-  else if (/\b(what did i|do you know my|recall|retrieve|look up my|what was)\b/.test(lower)) fallbackIntent = 'memory_retrieve';
+  else if (/\b(what did i|do you know my|recall|retrieve|look up my|what was|what'?s my|what is my|what are my|when is my|when was my|when are my|where is my|where are my|who is my|who was my|which is my)\b/.test(lower)) fallbackIntent = 'memory_retrieve';
   // Social media actions on named platforms → command_automate (verb+platform avoids false positives)
   else if (hasNamedPlatform && /\b(post|tweet|share|publish|comment|reply|message|dm|upload|like|follow|retweet|schedule)\b/.test(lower)) {
     fallbackIntent = 'command_automate';
