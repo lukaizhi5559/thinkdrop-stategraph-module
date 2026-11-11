@@ -25,6 +25,40 @@ const { formatHistoryTurns } = require('../utils/formatHistoryTurns');
 const { parseLlmJson } = require('../utils/parseLlmJson');
 const { canonicalAgent } = require('../utils/agentCanonical.cjs');
 
+const PLAN_GENERATION_TIMEOUT_MS = parseInt(
+  process.env.THINKDROP_PLAN_GENERATION_TIMEOUT_MS || '180000',
+  10,
+);
+
+// Plan generation is a provider call, not an MCP step, so the executor's
+// normal skill heartbeat never sees it. Keep the queue card alive while the
+// provider is actively working, but retain a finite provider deadline so a
+// hung plan call becomes a recoverable planError instead of a 240s stall.
+function _runWithPlanningHeartbeat(promise, progressCallback, intervalMs = 15000) {
+  if (typeof progressCallback !== 'function') return promise;
+  let settled = false;
+  let timer = null;
+  const tick = () => {
+    if (settled) return;
+    try {
+      progressCallback({ type: 'planning', message: 'Still planning steps…' });
+    } catch (_) {}
+    timer = setTimeout(tick, intervalMs);
+    timer.unref?.();
+  };
+  timer = setTimeout(tick, intervalMs);
+  timer.unref?.();
+  const clear = () => {
+    settled = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+  return Promise.resolve(promise).then(
+    value => { clear(); return value; },
+    error => { clear(); throw error; },
+  );
+}
+
 // Resolve classifyDeepLinkType from command-service (walk up to find
 // mcp-services) — same pattern executeCommand uses. Used to label resolved
 // deep-link URLs in the planner prompt so the LLM knows a creation/search/
@@ -3666,12 +3700,38 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
       }
     });
 
-    rawPlan = await backend.generateAnswer(
+    const _planAbort = new AbortController();
+    const _planSignal = state.abortSignal && typeof AbortSignal.any === 'function'
+      ? AbortSignal.any([state.abortSignal, _planAbort.signal])
+      : (state.abortSignal || _planAbort.signal);
+    payload.options.abortSignal = _planSignal;
+    let _planTimedOut = false;
+    const _planTimer = setTimeout(() => {
+      _planTimedOut = true;
+      _planAbort.abort();
+    }, PLAN_GENERATION_TIMEOUT_MS);
+    _planTimer.unref?.();
+    const _planPromise = backend.generateAnswer(
       planningQuery,
       payload,
       payload.options,
-      typeof progressCallback === 'function' ? (token) => { _planParser.feed(token); } : null
+      typeof progressCallback === 'function'
+        ? (token) => { _planParser.feed(token); }
+        : null
     );
+    try {
+      rawPlan = await _runWithPlanningHeartbeat(_planPromise, progressCallback);
+    } catch (err) {
+      if (_planTimedOut) {
+        throw new Error(`LLM planning timed out after ${PLAN_GENERATION_TIMEOUT_MS}ms`);
+      }
+      throw err;
+    } finally {
+      clearTimeout(_planTimer);
+    }
+    if (_planTimedOut) {
+      throw new Error(`LLM planning timed out after ${PLAN_GENERATION_TIMEOUT_MS}ms`);
+    }
     logger.info(`[Node:PlanSkillsV2] Plan stream complete — ${_planParser.getObjectCount()} step(s) revealed incrementally`);
   } catch (err) {
     logger.error(`[Node:PlanSkillsV2] LLM call failed: ${err.message}`);
@@ -4650,3 +4710,4 @@ module.exports._resolveCtxUrlTokens = _resolveCtxUrlTokens;
 module.exports._rewriteBrowserStepsToAtomicAgents = _rewriteBrowserStepsToAtomicAgents;
 module.exports._repairStepPlaceholders = _repairStepPlaceholders;
 module.exports._guardVideoSteps = _guardVideoSteps;
+module.exports._runWithPlanningHeartbeat = _runWithPlanningHeartbeat;

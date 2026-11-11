@@ -77,6 +77,9 @@ function _emitIntentDecided(state, intent, confidence) {
       writeDecomposeLog({
         ts: new Date().toISOString(),
         parser: 'intent-shadow',
+        intent,
+        confidence,
+        subPrompts: [{ order: 0, text: state.resolvedMessage || state.message, estimatedIntent: intent }],
         decided: intent,
         table: shadow.intent,
         rule: shadow.rule,
@@ -529,6 +532,25 @@ module.exports = async function decomposePromptV2(state) {
   if (state.skillBuildRequest || state.intentPlan || state._planFile || state._skillPlan || state._planTask ||
       state._gatherQuestionPending || state.pendingQuestion?._isGatherPlanQuestion) {
     logger.debug('[Node:DecomposePromptV2] Structural fast-path — skipping decomposition');
+    // Compiled/plan tasks arrive with the route already decided upstream
+    // (comms-graph's compiler hoist or the plan runner) — but intent-
+    // classifier.log is the audit trail for "what lane did this turn take",
+    // and skipping it leaves graphIntent unobservable for exactly the
+    // automation-heavy prompts. Emit the decided row so the log stays
+    // complete; _skillPlan/_deterministicPlan executions are command_automate
+    // by contract (non-skill envelopes are vetoed before dispatch).
+    if ((state._skillPlan || (state._planTask && Array.isArray(state._deterministicPlan) && state._deterministicPlan.length))
+        && typeof message === 'string' && message.trim()) {
+      try {
+        writeDecomposeLog({
+          ts: new Date().toISOString(), message,
+          carriedHint: typeof state._carriedHint === 'string' ? (_HINT_VOCAB[state._carriedHint] || state._carriedHint) : null,
+          parser: 'precompiled-plan', intent: 'command_automate',
+          subPromptCount: 1, durationMs: 0,
+          subPrompts: [{ order: 0, text: message, estimatedIntent: 'command_automate', dependsOn: [], isLongRunning: false, dataTemplate: null }],
+        });
+      } catch (_) { /* logging must never affect routing */ }
+    }
     return state;
   }
 
@@ -545,6 +567,11 @@ module.exports = async function decomposePromptV2(state) {
 
   const t0 = Date.now();
   let parsedJson = null; // Store parsed JSON for intent preservation
+  // `message` may be the referent-substituted resolvedMessage — audit rows
+  // must still carry what the user actually typed so intent-classifier.log
+  // consumers (e2e driver, divergence analysis) can match the original turn.
+  const _origMessage = state.originalMessage || state.message;
+  const _wdl = (entry) => writeDecomposeLog({ originalMessage: _origMessage, ...entry });
 
   // ── Local single-step short-circuit (no LLM call) ──────────────────────────
   // Use _taskClassification from resolveReferences to skip the LLM number call
@@ -629,10 +656,14 @@ module.exports = async function decomposePromptV2(state) {
   // "which one is cheapest", screen_intelligence on gibberish).
   {
     // Compounds keep the decompose path — a single bound intent can't express
-    // "search X and screenshot it". The table already abstains on hasMultiGoal;
-    // the envelope branch must too (planShape 'complex' or conjunction text).
+    // "search X and screenshot it". Do not use planShape here: the ingress
+    // envelope deliberately labels *every follow-up* complex so the compiler
+    // preserves context, and treating that marker as a compound would reopen
+    // the exact follow-up reclassification bug this gate is meant to remove.
     const _isCompound = MULTI_GOAL_CONJUNCTIONS.test(String(message || '').toLowerCase())
-      || _tc.planShape === 'complex';
+      || _tc.suggestedIntent === 'multi_step'
+      || _tc.isRecurring === true
+      || _tc.needsClarification === true;
     const _routeTable = suggestIntent(_tc, message, _shadowCtx(state));
     // Generative-only asks never bind an executor lane from the envelope either
     // ("help me write a haiku" + suggestedIntent command_automate is the same
@@ -654,7 +685,7 @@ module.exports = async function decomposePromptV2(state) {
         dataTemplate: null,
       }];
       const durationMs = Date.now() - t0;
-      writeDecomposeLog({
+      _wdl({
         ts: new Date().toISOString(), message, carriedHint: _carriedHint,
         parser: `route-${_authoritative.rule}`, intent: _intent,
         subPromptCount: 1, durationMs,
@@ -685,7 +716,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'declined-ack-guard', intent: 'general_knowledge',
       subPromptCount: 1, durationMs,
@@ -868,7 +899,7 @@ module.exports = async function decomposePromptV2(state) {
     }
     const subPrompts = _needsFetch ? [fetchStep, displayStep] : [displayStep];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'screen-output-guard', intent: 'screen_display',
       subPromptCount: subPrompts.length, durationMs,
@@ -931,7 +962,7 @@ module.exports = async function decomposePromptV2(state) {
         text: message, estimatedIntent: 'command_automate', confidence: 0.9,
         order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
       }];
-      writeDecomposeLog({
+      _wdl({
         ts: new Date().toISOString(), message, carriedHint: _carriedHint,
         parser: 'deterministic-fastlane', intent: 'command_automate',
         subPromptCount: 1, durationMs: Date.now() - t0,
@@ -956,7 +987,7 @@ module.exports = async function decomposePromptV2(state) {
       text: message, estimatedIntent: 'command_automate', confidence: 0.9,
       order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
     }];
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'browse-fastlane', intent: 'command_automate',
       subPromptCount: 1, durationMs: Date.now() - t0,
@@ -999,7 +1030,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'media-search-guard', intent: 'web_search',
       subPromptCount: 1, durationMs,
@@ -1032,7 +1063,7 @@ module.exports = async function decomposePromptV2(state) {
       text: message, estimatedIntent: 'command_automate', confidence: 0.9,
       order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
     }];
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'active-doc-guard', intent: 'command_automate',
       subPromptCount: 1, durationMs: Date.now() - t0,
@@ -1073,7 +1104,7 @@ module.exports = async function decomposePromptV2(state) {
   if (_SERVICE_SEARCH_RE.test(message) && !_hasMultiGoalConjunction) {
     logger.info(`[Node:DecomposePromptV2] Service-search short-circuit: "${message.slice(0, 60)}" → command_automate`);
     const subPrompts = [{ text: message, estimatedIntent: 'command_automate', confidence: 0.9, order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null }];
-    writeDecomposeLog({ ts: new Date().toISOString(), message, carriedHint: _carriedHint, parser: 'service-search-guard', intent: 'command_automate', subPromptCount: 1, durationMs: Date.now() - t0, subPrompts });
+    _wdl({ ts: new Date().toISOString(), message, carriedHint: _carriedHint, parser: 'service-search-guard', intent: 'command_automate', subPromptCount: 1, durationMs: Date.now() - t0, subPrompts });
     _emitIntentDecided(state, 'command_automate', 0.9);
     return { ...state, _decomposedIntent: 'command_automate', _decomposedBy: 'service-search-guard', intentPlan: subPrompts };
   }
@@ -1110,7 +1141,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'public-research-guard', intent: 'web_search',
       subPromptCount: 1, durationMs,
@@ -1167,7 +1198,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'query-followup-guard', intent: 'web_search',
       subPromptCount: 1, durationMs,
@@ -1216,7 +1247,7 @@ module.exports = async function decomposePromptV2(state) {
       text: message, estimatedIntent: 'command_automate', confidence: 0.9,
       order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
     }];
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'device-state-guard', intent: 'command_automate',
       subPromptCount: 1, durationMs: Date.now() - t0,
@@ -1239,7 +1270,7 @@ module.exports = async function decomposePromptV2(state) {
       text: message, estimatedIntent: 'command_automate', confidence: 0.9,
       order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
     }];
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'local-probe-guard', intent: 'command_automate',
       subPromptCount: 1, durationMs: Date.now() - t0,
@@ -1264,7 +1295,7 @@ module.exports = async function decomposePromptV2(state) {
       text: message, estimatedIntent: 'command_automate', confidence: 0.88,
       order: 0, dependsOn: [], isLongRunning: false, dataTemplate: null,
     }];
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'site-service-guard', intent: 'command_automate',
       subPromptCount: 1, durationMs: Date.now() - t0,
@@ -1320,7 +1351,7 @@ module.exports = async function decomposePromptV2(state) {
         order: 1, dependsOn: [0], isLongRunning: false,
         dataTemplate: `Save this result to ${_dst}: {{result[0]}}` },
     ];
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'fetch-save-guard', intent: 'command_automate',
       subPromptCount: 2, durationMs: Date.now() - t0, subPrompts,
@@ -1341,7 +1372,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'local-short-circuit', intent: 'command_automate',
       subPromptCount: 1, durationMs,
@@ -1373,7 +1404,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'local-short-circuit', intent: 'memory_retrieve',
       subPromptCount: 1, durationMs,
@@ -1424,7 +1455,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'screen-observation-guard', intent: 'screen_intelligence',
       subPromptCount: 1, durationMs,
@@ -1463,7 +1494,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'deictic-continuation-guard', intent: 'memory_retrieve',
       subPromptCount: 1, durationMs,
@@ -1502,7 +1533,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'activity-recall-guard', intent: 'memory_retrieve',
       subPromptCount: 1, durationMs,
@@ -1581,7 +1612,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'unresolved-followup-guard', intent: 'memory_retrieve',
       subPromptCount: 1, durationMs,
@@ -1622,7 +1653,7 @@ module.exports = async function decomposePromptV2(state) {
       dataTemplate: null,
     }];
     const durationMs = Date.now() - t0;
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'thought-reply-guard', intent: _thoughtIntent,
       subPromptCount: 1, durationMs,
@@ -1865,7 +1896,7 @@ module.exports = async function decomposePromptV2(state) {
     const origText   = message.toLowerCase().trim();
     const isSame     = singleText === origText || origText.includes(singleText) || singleText.includes(origText);
 
-    writeDecomposeLog({
+    _wdl({
       ts: new Date().toISOString(), message, carriedHint: _carriedHint,
       parser: 'llm-decompose', intent: sp.estimatedIntent,
       subPromptCount: 1, durationMs,
@@ -1897,7 +1928,7 @@ module.exports = async function decomposePromptV2(state) {
   // plan with a bogus ask_user step.
   const collapsed = _hasMultiGoalConjunction ? subPrompts : collapseLinearCAChain(subPrompts, message, logger);
 
-  writeDecomposeLog({
+  _wdl({
     ts: new Date().toISOString(), message, carriedHint: _carriedHint,
     parser: 'llm-decompose', intent: collapsed[0]?.estimatedIntent,
     subPromptCount: collapsed.length, durationMs,

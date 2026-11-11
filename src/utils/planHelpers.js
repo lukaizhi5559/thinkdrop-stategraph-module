@@ -393,7 +393,7 @@ function _lintFileEditPlan(plan, logger, ctx = {}) {
     let exists = false;
     try { exists = fs.existsSync(abs); } catch (_) {}
     if (!exists) return step;
-    const goal = String(step.args.prompt || '')
+    const goal = String(step.args?.prompt || '')
       .replace(/\{\{[^}]*\}\}/g, '')
       .replace(/\s+/g, ' ')
       .trim() || step.description || `Edit ${path.basename(abs)}`;
@@ -429,7 +429,7 @@ function _lintFileEditPlan(plan, logger, ctx = {}) {
     ['edit.agent', 'fs.write', 'fs.writeFile', 'shell.run'].includes(s?.skill));
   if (steps.length > 1 && last?.skill === 'synthesize' && !last.args?.saveToFile
       && String(last.args?.prompt || '').length < 400
-      && _CONFIRM_ONLY_RE.test(String(last.args.prompt))
+      && _CONFIRM_ONLY_RE.test(String(last.args?.prompt))
       && _hasArtifactStep) {
     rewrites.push({ index: steps.length - 1, kind: 'drop-confirm-step' });
     steps = steps.slice(0, -1);

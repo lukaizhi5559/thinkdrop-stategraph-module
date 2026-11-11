@@ -74,12 +74,12 @@ async function main() {
   ok(s._decomposedBy !== 'envelope',
     `compound prompt does not bind via gate (got ${s._decomposedBy}/${s._decomposedIntent})`);
 
-  // 5. planShape 'complex' also keeps the envelope from binding.
+  // 5. An explicit multi_step envelope keeps the compound decompose path.
   s = await decompose(_state(
-    { taskType: 'query', suggestedIntent: 'web_search', planShape: 'complex' },
+    { taskType: 'query', suggestedIntent: 'multi_step', planShape: 'complex' },
     'check the weather then summarize it'
   ));
-  ok(s._decomposedBy !== 'envelope', `planShape complex skips envelope bind (got ${s._decomposedBy})`);
+  ok(s._decomposedBy !== 'envelope', `multi_step skips envelope bind (got ${s._decomposedBy})`);
 
   // 6. Generative asks abstain — "help me write a haiku" must not bind
   //    command_automate (observed: local-short-circuit vs general_knowledge).

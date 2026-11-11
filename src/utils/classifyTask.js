@@ -35,8 +35,61 @@
  */
 
 // Canonical patterns live in shared/text-patterns.cjs — update there, not here.
-const { CONVERSATION_RECALL_META_RE, ACTIVITY_RECALL_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE, SCREEN_VISUAL_KIND_RE, SCREEN_DELIVERABLE_RE, VISUAL_INTO_APP_RE, SCREEN_CHART_RE, SCREEN_DECK_RE, SCREEN_DOC_RE, SCREEN_SCENE_RE, SCREEN_THREE_RE } = require('./textPatterns.cjs');
+const { CONVERSATION_RECALL_META_RE, ACTIVITY_RECALL_RE, MEMORY_STORE_DIRECTIVE_RE, ELLIPTICAL_FOLLOWUP_RE, BARE_AFFIRM_RE, BARE_DECLINE_RE, FILE_PATH_RE, SCREEN_VISUAL_KIND_RE, SCREEN_DELIVERABLE_RE, VISUAL_INTO_APP_RE, SCREEN_CHART_RE, SCREEN_DECK_RE, SCREEN_DOC_RE, SCREEN_SCENE_RE, SCREEN_THREE_RE, SCREEN_OBSERVATION_RE, LIVE_PAGE_REF_RE } = require('./textPatterns.cjs');
 const { _canonicalService, SERVICE_ALIASES } = require('./localPlanTemplates');
+
+function _historyUserTexts(history) {
+  if (Array.isArray(history)) {
+    return history
+      .filter(m => m && (m.role === 'user' || m.sender === 'user'))
+      .map(m => String(m.requestText || m.content || m.text || '').trim())
+      .filter(Boolean);
+  }
+  return String(history || '').split(/\n/).reduce((out, line) => {
+    const m = /^\s*User:\s*(.+)$/i.exec(line);
+    if (m && m[1].trim()) out.push(m[1].trim());
+    return out;
+  }, []);
+}
+
+/**
+ * Recover the minimum safe follow-up envelope when the classifier provider
+ * abstains or confidently misreads a short elliptical continuation. The prior
+ * user turn is the referent source; lane inference is deliberately coarse:
+ * activity/video turns → memory, public-research turns → web, draft turns →
+ * text answer, and everything else → context-aware memory retrieval.
+ */
+function _inferEllipticalFollowUp(message, history) {
+  if (!ELLIPTICAL_FOLLOWUP_RE.test(String(message || ''))) return null;
+  // Live-surface asks are NOT prior-turn continuations: "what do you see on
+  // the screen" / "on the web page… what is this" carry their own referent.
+  // Binding them to the last turn injects a bogus suggestedIntent +
+  // followUpTarget that demotes the handoff into a SERP (observed: screen
+  // question → web_search with a careers-question target).
+  const _msg = String(message || '');
+  if (SCREEN_OBSERVATION_RE.test(_msg) || LIVE_PAGE_REF_RE.test(_msg)) return null;
+  const users = _historyUserTexts(history);
+  if (!users.length) return null;
+  // Chained follow-ups ("what else did it say" → "who was mentioned in it"):
+  // the immediately-prior user turn is itself elliptical and carries no
+  // referent — walk back to the newest SUBSTANTIVE turn for target+lane.
+  const prior = [...users].reverse().find(u => !ELLIPTICAL_FOLLOWUP_RE.test(u)) || users[users.length - 1];
+  const p = prior.toLowerCase();
+  const target = prior.slice(0, 220);
+  if (ACTIVITY_RECALL_RE.test(prior) || /\b(?:videos?|podcasts?|music|articles?|readings?|watch(?:ed|es|ing)?|listen(?:ed|ing|s)?|activit(?:y|ies)|marathons?)\b/i.test(prior)) {
+    return { taskType: 'query', isActivityQuery: true, suggestedIntent: 'memory_retrieve', followUpTarget: target };
+  }
+  if (/\b(?:search(?:es|ed|ing)?|look(?:ing)?\s+up|find|research(?:es|ed|ing)?|hotels?|flights?|reviews?|prices?|news|restaurants?)\b/i.test(p)) {
+    return { taskType: 'query', webAccessMode: 'public_read', suggestedIntent: 'web_search', followUpTarget: target };
+  }
+  if (/\b(?:drafts?|writ(?:e|es|ing|ten)|composes?|composed|poems?|haikus?|emails?|messages?|letters?|paragraphs?)\b/i.test(p)) {
+    return { taskType: 'query', suggestedIntent: 'general_knowledge', followUpTarget: target };
+  }
+  if (/\b(?:files?|folders?|downloads?|desktops?|finder|opens?|creates?|renames?|moves?|deletes?)\b/i.test(p)) {
+    return { taskType: 'local_file', suggestedIntent: 'command_automate', followUpTarget: target };
+  }
+  return { taskType: 'query', suggestedIntent: 'memory_retrieve', followUpTarget: target };
+}
 
 // ── Deterministic screen-output detection ──────────────────────────────────
 // The LLM's isScreenOutput flag is advisory — phrasing is unambiguous enough
@@ -763,6 +816,22 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     };
   }
 
+  // Explicit memory writes are deterministic even when the remembered
+  // content looks like a scheduling/local-system task ("my license expires
+  // in March", "my dentist appointment is Friday"). Without this pre-check,
+  // the same fact-shaped sentence can be planning, handoff, or memory_store
+  // depending on the remote classifier's sample.
+  if (MEMORY_STORE_DIRECTIVE_RE.test(lexicalMessage)) {
+    logger.info(`[classifyTask] Deterministic memory-store match: "${lexicalMessage.slice(0, 80)}"`);
+    return {
+      ..._default,
+      taskType: 'query',
+      suggestedIntent: 'memory_store',
+      isFollowUp: false,
+      followUpTarget: null,
+    };
+  }
+
   try {
     // Keep enough context to survive a few short conversational turns between
     // a screen answer and a clarification. The classifier previously saw only
@@ -882,10 +951,56 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
       }
       if (!parsed) {
         logger.debug('[classifyTask] No JSON in response — using default');
-        return _withResolution(_default);
+        const _fallbackFollowUp = _inferEllipticalFollowUp(classifiedMessage, conversationHistory);
+        if (!_fallbackFollowUp) return _withResolution(_default);
+        parsed = { ..._default, ..._fallbackFollowUp, isFollowUp: true };
       }
     } else if (_decOn && !_decShadow && !_adaptiveParsed) {
       logger.info('[classifyTask] Local decision answered — skipping remote call');
+    }
+
+    // A short continuation is a stronger structural signal than a flaky
+    // screen/command answer from the provider. Keep an explicit provider
+    // follow-up untouched, but repair an explicit false/absent verdict from
+    // the canonical prior-turn history before downstream routing consumes it.
+    // Extension: a CONFIDENT but passive suggestion on an elliptical
+    // continuation is equally repairable — "what else did it say" resolved to
+    // "the marathon story (Rachel Apa)" still classified general_knowledge,
+    // and "who was mentioned in it" flaked to web_search, because the
+    // substituted text loses the "this is about our prior retrieval" signal.
+    // The prior-turn lane inference restores it. Action lanes stay exempt:
+    // command_automate/screen_* with a real action verb ("delete the oldest",
+    // "open the biggest one") is the provider seeing something the prior-turn
+    // keyword guess cannot — and command_automate WITHOUT an action verb
+    // ("summarize the second one") is exactly the flake being repaired.
+    const _ellipticalFollowUp = _inferEllipticalFollowUp(classifiedMessage, conversationHistory);
+    if (_ellipticalFollowUp && !parsed.isConversationRecall) {
+      const _ACTION_VERB_RE = /\b(?:delete|remove|erase|open|click|tap|select|send|email|text|message|post|book|schedule|download|upload|play|pause|buy|order|pay|share|forward|reply|create|set|add|edit|update|rename|move|copy|print|save|close|quit|launch|run|install|uninstall|mute|volume|turn|search|find|look)\b/i;
+      const _correctableSuggestion = !parsed.suggestedIntent
+        || ['general_knowledge', 'greeting', 'web_search', 'memory_store', 'memory_retrieve'].includes(parsed.suggestedIntent)
+        || (parsed.suggestedIntent === 'command_automate' && !_ACTION_VERB_RE.test(classifiedMessage));
+      // Preserve a clean provider-resolved target — "the marathon story
+      // (Rachel Apa)" beats the prior-turn text the inference supplies.
+      // Answer-dump-shaped targets fail the same test the sanitizer applies
+      // downstream; they must not survive via this preserve path.
+      const _parsedTargetClean = typeof parsed.followUpTarget === 'string' && parsed.followUpTarget.trim()
+        && !/[\n\r]/.test(parsed.followUpTarget)
+        && !/^\s*[-*•–—]\s/.test(parsed.followUpTarget)
+        && !/\*\*|__|```|\[[^\]]*\]\(/.test(parsed.followUpTarget);
+      if (parsed.isFollowUp !== true || _correctableSuggestion) {
+        const _keepTarget = parsed.isFollowUp === true && _parsedTargetClean
+          ? { followUpTarget: parsed.followUpTarget.trim() } : {};
+        logger.info(`[classifyTask] Elliptical follow-up floor → ${_ellipticalFollowUp.suggestedIntent || 'context'} (target="${String(_keepTarget.followUpTarget || _ellipticalFollowUp.followUpTarget).slice(0, 80)}")`);
+        parsed = {
+          ...parsed,
+          ..._ellipticalFollowUp,
+          ..._keepTarget,
+          isFollowUp: true,
+          activeDocRef: null,
+          isScreenFollowUp: false,
+          needsFreshScreen: false,
+        };
+      }
     }
 
     // Sanitize webAccessMode — only the four known values; requiresDOM forces
@@ -893,7 +1008,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     const _VALID_WEB_MODES = new Set(['none', 'download', 'public_read', 'interactive']);
     let webAccessMode = _VALID_WEB_MODES.has(parsed.webAccessMode) ? parsed.webAccessMode : 'none';
     let requiresDOM = !!parsed.requiresDOM;
-    const _interactiveActions = Array.isArray(parsed.interactiveActions) ? parsed.interactiveActions : [];
+    let _interactiveActions = Array.isArray(parsed.interactiveActions) ? parsed.interactiveActions : [];
 
     // ── Search-to-extract guard: "click/open the first result" is URL selection
     // for public read, not a DOM interaction, unless the user also wants to
@@ -909,6 +1024,7 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     if (_isFirstResultExtract && _boundSessions.length && (webAccessMode === 'interactive' || requiresDOM)) {
       logger.info(`[classifyTask] first-result pattern but ${_boundSessions.length} bound session(s) live — keeping interactive: "${userMessage.slice(0, 80)}"`);
       parsed.interactiveActions = _interactiveActions.length ? _interactiveActions : ['view_page'];
+      _interactiveActions = parsed.interactiveActions;
       if (!requiresDOM) requiresDOM = true;
       webAccessMode = 'interactive';
     }
@@ -919,13 +1035,23 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     // bound session overrides that.
     const _PAGE_DEICTIC_RE = /\b(?:click|open|follow|select|tap|press|scroll|type|fill|check|read|close|expand|play|pause|next|back|dismiss|choose)\b[\s\S]{0,40}\b(?:first|second|third|top|next|last|it|that|this|the|those|these|result|item|link|listing|page|one|down|up|box|button|email|message|video)\b/i;
     const _BARE_SEARCH_MSG_RE = /^\s*(?:please\s+)?(?:now\s+)?(?:then\s+)?(?:search|find|look)\s+(?:for|up)\b/i;
+    const _EXPLICIT_PAGE_SEARCH_RE = /\b(?:on|within|inside|from|in)\s+(?:this|the\s+current|my|the)\s+(?:page|site|results?|tab|screen)\b/i;
+    // A stale/open browser tab is not evidence that a new bare lookup belongs
+    // in that tab. Standalone "search for X" is safer and more common as
+    // public research; only a follow-up or explicit page/site wording binds
+    // it to the live surface.
+    const _boundSearch = _BARE_SEARCH_MSG_RE.test(userMessage)
+      && (parsed.isFollowUp === true || _EXPLICIT_PAGE_SEARCH_RE.test(userMessage));
     if (_boundSessions.length && !parsed.newDestination
-        && (_PAGE_DEICTIC_RE.test(userMessage) || _BARE_SEARCH_MSG_RE.test(userMessage))
+        && (_PAGE_DEICTIC_RE.test(userMessage) || _boundSearch)
         && (webAccessMode !== 'interactive' || !requiresDOM)) {
       logger.info(`[classifyTask] page-deictic/bare-search with ${_boundSessions.length} bound session(s) — forcing interactive: "${userMessage.slice(0, 80)}"`);
       webAccessMode = 'interactive';
       requiresDOM = true;
-      if (!_interactiveActions.length) parsed.interactiveActions = ['view_page'];
+      if (!_interactiveActions.length) {
+        parsed.interactiveActions = ['view_page'];
+        _interactiveActions = parsed.interactiveActions;
+      }
     }
     if (_isFirstResultExtract && !_boundSessions.length && (webAccessMode === 'interactive' || requiresDOM)) {
       logger.info(`[classifyTask] Search-to-extract first-result pattern detected — forcing public_read: "${userMessage.slice(0, 80)}"`);
@@ -955,7 +1081,52 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
 
     const parsedIsScreenFollowUp = !!parsed.isScreenFollowUp;
     const parsedIsFollowUp = !!parsed.isFollowUp;
-    const parsedFollowUpTarget = parsed.followUpTarget || null;
+    // followUpTarget sanitization — the classifier sometimes resolves a
+    // deictic to a raw EXCERPT of the prior answer (markdown dump, bullet
+    // fragment) instead of a clean referent ("who was mentioned in it" →
+    // "- **Cause of Death:** Her fami…"). The substituted message then reads
+    // like a public-research query and the route table binds web_search on
+    // garbage. A referent is a noun phrase, not answer content: drop targets
+    // with markdown structure, list bullets, or answer-dump length; a merely
+    // long-but-clean target is truncated, not dropped.
+    let parsedFollowUpTarget = typeof parsed.followUpTarget === 'string' && parsed.followUpTarget.trim()
+      ? parsed.followUpTarget.trim() : null;
+    if (parsedFollowUpTarget) {
+      const _t = parsedFollowUpTarget;
+      // Markdown/list structure is never a referent — it is answer or paste
+      // content the classifier dumped into the field. Drop it outright; the
+      // elliptical floor / history supplies a clean target downstream.
+      const _contentShaped = /[\n\r]/.test(_t)
+        || /^\s*[-*•–—]\s/.test(_t)
+        || /\*\*|__|```|\[[^\]]*\]\(/.test(_t);
+      if (_contentShaped) {
+        logger.info(`[classifyTask] followUpTarget dropped (answer-dump shape): "${_t.slice(0, 70)}"`);
+        parsedFollowUpTarget = null;
+      } else if (_t.length > 160) {
+        parsedFollowUpTarget = _t.slice(0, 160).replace(/[\s,;:.\-–—]+$/, '');
+      }
+    }
+
+    // Unresolved follow-up → no web surface. A pronoun continuation whose
+    // referent could not be resolved must not run a context-free SERP or DOM
+    // session — "search for it" answering about the wrong subject is worse
+    // than a context-aware memory answer (routeTable's unresolved-followup
+    // rule needs webAccessMode:'none' to fire; the envelope vetoes intent 8
+    // on the same signal). Resolved targets keep their mode. Exempt the
+    // other referent channels: a live bound tab, a screen/file/url doc ref,
+    // or screen-follow-up flags ARE the referent — followUpTarget stays
+    // null by design there.
+    const _otherReferentChannel = _boundSessions.length > 0
+      || parsedIsScreenFollowUp
+      || ['file', 'url', 'screen'].includes(parsed.activeDocRef);
+    if (parsedIsFollowUp && !parsedFollowUpTarget && !_otherReferentChannel
+        && (webAccessMode !== 'none' || requiresDOM)) {
+      logger.info(`[classifyTask] Unresolved follow-up — suppressing web access (was ${webAccessMode}${requiresDOM ? '+DOM' : ''}): "${String(userMessage || '').slice(0, 70)}"`);
+      webAccessMode = 'none';
+      requiresDOM = false;
+      parsed.interactiveActions = [];
+      _interactiveActions = [];
+    }
 
     // Phantom-service guard: the classifier sometimes INVENTS a targetService
     // the user never named ("pull up John 3:16" → "biblegateway"), which blocks
@@ -991,6 +1162,21 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     if (parsedTargetService && webAccessMode !== 'interactive' && !requiresDOM &&
         !_serviceMentioned(parsedTargetService, _mentionCorpus)) {
       logger.info(`[classifyTask] Phantom targetService "${parsedTargetService}" not mentioned in message — dropping (webAccessMode=${webAccessMode})`);
+      parsedTargetService = null;
+    }
+    // Query-taskType service drop — a pure information ask ('query') with no
+    // DOM/interactive surface cannot ACT on a service; a targetService that
+    // survives only because the resolved followUpTarget names one ("list
+    // details about them" → "the YouTube videos…" → service=youtube) pins the
+    // comms capability gate into a planning grill for what is really a
+    // memory_retrieve. The service name must appear in USER-AUTHORED text to
+    // count on a query — "search youtube for X" keeps it, referent-bleed
+    // doesn't. Action taskTypes are untouched (they legitimately inherit the
+    // referent's service — "delete that nylas event").
+    if (parsedTargetService && parsed.taskType === 'query'
+        && webAccessMode !== 'interactive' && !requiresDOM
+        && !_serviceMentioned(parsedTargetService, lexicalMessage)) {
+      logger.info(`[classifyTask] Query-taskType targetService "${parsedTargetService}" named only inside followUpTarget — dropping`);
       parsedTargetService = null;
     }
     // Deterministic recovery — a bare token that names a registered service
@@ -1134,6 +1320,17 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
     }), userMessage);
   } catch (err) {
     logger.debug(`[classifyTask] Failed (non-fatal): ${err.message} — using default`);
+    const _fallbackFollowUp = _inferEllipticalFollowUp(classifiedMessage, conversationHistory);
+    if (_fallbackFollowUp) {
+      return _withResolution({
+        ..._default,
+        ..._fallbackFollowUp,
+        isFollowUp: true,
+        activeDocRef: null,
+        isScreenFollowUp: false,
+        needsFreshScreen: false,
+      });
+    }
     return _applyScreenDetect(_withResolution(_default), userMessage);
   }
 }

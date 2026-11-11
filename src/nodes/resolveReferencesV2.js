@@ -903,6 +903,9 @@ module.exports = async function resolveReferencesV2(state) {
     // Bare "search/find/look for X" — a page action when a searchable site is
     // bound in front (Amazon search box), a web search otherwise.
     const _BARE_SEARCH_RE = /^\s*(?:please\s+)?(?:now\s+)?(?:then\s+)?(?:search|find|look)\s+(?:for|up)\b/i;
+    const _EXPLICIT_PAGE_SEARCH_RE = /\b(?:on|within|inside|from|in)\s+(?:this|the\s+current|my|the)\s+(?:page|site|results?|tab|screen)\b/i;
+    const _boundSearch = _BARE_SEARCH_RE.test(_msg)
+      && (_taskClassification.isFollowUp === true || _EXPLICIT_PAGE_SEARCH_RE.test(_msg));
     const _SEARCHABLE_HOST_RE = /(amazon|ebay|etsy|walmart|target|bestbuy|aliexpress|youtube|reddit|pinterest|imdb|yelp|airbnb|booking|zillow|indeed|spotify|netflix|tiktok|wikipedia|stackoverflow|github|gitlab|npmjs|pypi|quora|medium|substack|goodreads|wayfair|homedepot|lowes|newegg|chewy|instacart|doordash|ubereats|grubhub|depop|poshmark|mercari|craigslist|realtor|redfin|kayak|expedia|hotels|trivago|nordstrom|macys|kohls|sephora|ulta|shein|temu|discogs|bandcamp|soundcloud|vimeo|dailymotion|twitch|flickr|unsplash|pexels|archive\.org|genius|allrecipes|foodnetwork|bbcgoodfood|seriouseats)\./i;
     const _PASSIVE_SI = new Set(['screen_intelligence', 'web_search', 'question', 'general_knowledge', 'memory_retrieve', 'query']);
     const _si = String(_taskClassification.suggestedIntent || '');
@@ -913,7 +916,7 @@ module.exports = async function resolveReferencesV2(state) {
       || _si === 'command_automate'
       || (Array.isArray(_taskClassification.interactiveActions) && _taskClassification.interactiveActions.length > 0)
       || (_PASSIVE_SI.has(_si) && _PAGE_VERB_RE.test(_msg))
-      || (_PASSIVE_SI.has(_si) && _BARE_SEARCH_RE.test(_msg));
+      || (_PASSIVE_SI.has(_si) && _boundSearch);
     if (!_browserish) return null;
 
     // Live page candidates — bound extension tabs + the frontmost browser URL.
@@ -992,7 +995,7 @@ module.exports = async function resolveReferencesV2(state) {
     // "search for baby mittens" with ext:amazon_agent bound arrived with
     // newDestination:true hallucinated by the classifier). Most recently
     // active bound tab wins; non-searchable live pages fall through.
-    if (!_named.size && _BARE_SEARCH_RE.test(_msg)) {
+    if (!_named.size && _boundSearch) {
       const _searchable = _live
         .filter(c => _SEARCHABLE_HOST_RE.test(_hostOf(c.url)))
         .sort((a, b) => (b.lastSeen || 0) - (a.lastSeen || 0));
@@ -1078,13 +1081,19 @@ module.exports = async function resolveReferencesV2(state) {
   if (state._extSessionHint && (_livePageRef || state._onScreenRef) && _taskClassification && typeof _taskClassification === 'object') {
     const _PASSIVE_INTENTS = new Set(['screen_intelligence', 'web_search', 'question', 'general_knowledge', 'memory_retrieve']);
     const _si = _taskClassification.suggestedIntent;
+    const _conversationReferent = _taskClassification.isFollowUp === true
+      && !!_taskClassification.followUpTarget;
+    const _memoryContext = _conversationReferent
+      || _taskClassification.isActivityQuery === true
+      || _taskClassification.isConversationRecall === true
+      || _si === 'memory_retrieve';
     // Page-interaction verbs aimed at the live tab — "fill out this form",
     // "click the link on this page". A bound ext session means the browser
     // lane can act on the page directly; a local_system/app_automation
     // classification for these is the pre-extension app.agent assumption.
     const _PAGE_ACTION_RE = /\b(fill|complete|click|type|enter|select|choose|check|tick|press|scroll|submit|sign\s*up|apply|paste|write|answer)\b/i;
     const _isPageInteraction = _PAGE_ACTION_RE.test(message || '');
-    if (!state._planTask && (!_si || _PASSIVE_INTENTS.has(_si)
+    if (!state._planTask && !_memoryContext && (!_si || _PASSIVE_INTENTS.has(_si)
         || (_isPageInteraction && ['local_system', 'app_automation', 'ambiguous'].includes(_taskClassification.taskType)))) {
       logger.info(`[Node:ResolveReferencesV2] live-page demotion: "${_si}"/${_taskClassification.taskType} → command_automate/browser (bound ext session ${state._extSessionHint.sessionId})`);
       _taskClassification.suggestedIntent = 'command_automate';

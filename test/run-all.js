@@ -46,6 +46,7 @@ const TESTS = [
   'carried-hint.test.js',
   'answer-degenerate.test.js',
   'screen-referent-routing.test.js',
+  'screen-intelligence-degrade.test.js',
   'decompose-decision.test.js',
   'llm-backend-watchdog.test.js',
   'synthesize-crossturn-guard.test.js',

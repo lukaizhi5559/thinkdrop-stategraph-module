@@ -752,7 +752,7 @@ const TEMPLATES = [
   },
   {
     n: 21, id: 'screen_read', lowRisk: true,
-    describe: 'read or describe what is currently on the user\'s screen — real browser page scan when a browser is frontmost, OCR otherwise ("what\'s on my screen", "what am I looking at", "read my screen", "scan the screen", "scan this page") — args: {}',
+    describe: 'read or describe what is currently on the user\'s screen — real browser page scan when a browser is frontmost, OCR otherwise ("what\'s on my screen", "what am I looking at", "read my screen", "scan the screen") — args: {}. NOT for "scan this page"/"the page" — that is page_scan.',
     validate: () => null,
     build: () => [{ skill: 'app.agent', args: { action: 'read_screen', timeoutMs: 30000 }, description: 'Read the screen' }],
   },

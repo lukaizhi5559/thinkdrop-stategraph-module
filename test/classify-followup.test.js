@@ -63,6 +63,43 @@ async function run() {
     console.log('  (skipped synced-package checks — node_modules/@thinkdrop/stategraph not present)');
   }
 
+  // ── 3. Provider-down elliptical fallback ────────────────────────────────
+  // A short continuation must not become a screen/command task merely because
+  // the remote classifier is unavailable. The prior user turn supplies the
+  // referent and the activity lane.
+  const offline = {
+    generateAnswer: async () => { throw new Error('provider unavailable'); },
+  };
+  const fallback = await require('../src/utils/classifyTask.js').classifyTask(
+    'summarize the second one',
+    [{ role: 'user', content: 'what videos did I watch yesterday' }],
+    offline,
+    logger,
+  );
+  check('offline elliptical follow-up isFollowUp=true', fallback.isFollowUp === true, JSON.stringify(fallback));
+  check('offline elliptical follow-up uses memory_retrieve', fallback.suggestedIntent === 'memory_retrieve', fallback.suggestedIntent);
+  check('offline elliptical follow-up clears screen referent', fallback.activeDocRef === null, fallback.activeDocRef);
+
+  // ── 4. Live-surface asks are not elliptical follow-ups ───────────────────
+  // "what do you see on the screen" / "on the web page…" carry their own
+  // referent — the floor must not bind them to the prior turn (observed:
+  // injected suggestedIntent=web_search + a careers-question target demoted
+  // a screen/page handoff into a garbage SERP).
+  const liveSurface = await require('../src/utils/classifyTask.js').classifyTask(
+    'what do you see on the screen right here can you tell me about these all events',
+    HISTORY,
+    offline,
+    logger,
+  );
+  check('live-surface prompt does NOT floor to web_search', liveSurface.suggestedIntent !== 'web_search', liveSurface.suggestedIntent);
+  const livePage = await require('../src/utils/classifyTask.js').classifyTask(
+    'on the web page here I need you to help me figure out what this is all about',
+    HISTORY,
+    offline,
+    logger,
+  );
+  check('live-page prompt does NOT floor to web_search', livePage.suggestedIntent !== 'web_search', livePage.suggestedIntent);
+
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
 }
