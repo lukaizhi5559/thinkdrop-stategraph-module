@@ -69,7 +69,7 @@ function _describeScreenFailure(errMsg) {
     return {
       code: 'screen_recording_permission_denied',
       reason: 'macOS denied Screen Recording permission to the screen-capture service.',
-      fix: hint || `Grant Screen Recording permission to ThinkDrop (System Settings → Privacy & Security → Screen Recording), then retry. Open it directly: ${SCREEN_SETTINGS_LINK}`,
+      fix: hint || `Grant Screen Recording permission to "ThinkDrop Screen Helper" (System Settings → Privacy & Security → Screen Recording — it appears under its own name), then retry. Open it directly: ${SCREEN_SETTINGS_LINK}`,
     };
   }
   if (code === 'screenshot_capture_failed') {
@@ -200,7 +200,11 @@ module.exports = async function screenIntelligence(state) {
     // Recording permission, so on a denied machine it is the ONLY working
     // capture path (observed: monitor dead → read_screen skipped → a stale
     // page was answered from history while the user was on a different tab).
-    if (!_tryReadScreen && !state._priorScreenContext) {
+    // A monitor that is alive-but-capture-denied leaves stale/missing prior
+    // context — same empty signal as a dead monitor, so the live frontmost
+    // probe runs whenever prior context hasn't already proven a browser.
+    // Cost of a wrong try is one honest non-browser error from read_screen.
+    if (!_tryReadScreen) {
       try {
         const ctxRes = await mcpAdapter.callService('user-memory', 'memory.getActiveAppContext', {});
         const app = (ctxRes?.data || ctxRes)?.app;

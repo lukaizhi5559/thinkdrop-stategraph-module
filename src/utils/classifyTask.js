@@ -67,7 +67,12 @@ function _inferEllipticalFollowUp(message, history) {
   // followUpTarget that demotes the handoff into a SERP (observed: screen
   // question → web_search with a careers-question target).
   const _msg = String(message || '');
-  if (SCREEN_OBSERVATION_RE.test(_msg) || LIVE_PAGE_REF_RE.test(_msg)) return null;
+  if (SCREEN_OBSERVATION_RE.test(_msg) || LIVE_PAGE_REF_RE.test(_msg)
+      // Screen locative is live-surface evidence too: a deictic whose referent
+      // is located "on (my|the) screen" points at the live capture, not the
+      // prior turn — "look into this company on my screen" must not anchor to
+      // whatever topic the conversation last touched.
+      || /\bon\s+(?:my\s+|the\s+)?screen\b/i.test(_msg)) return null;
   const users = _historyUserTexts(history);
   if (!users.length) return null;
   // Chained follow-ups ("what else did it say" → "who was mentioned in it"):

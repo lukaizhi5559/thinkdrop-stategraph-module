@@ -99,6 +99,19 @@ async function run() {
     logger,
   );
   check('live-page prompt does NOT floor to web_search', livePage.suggestedIntent !== 'web_search', livePage.suggestedIntent);
+  // Screen locative — "look into this company on my screen" refers to the
+  // live surface, not the prior turn's topic (observed: the elliptical floor
+  // bound it to "American Water website" and suggestedIntent=memory_retrieve).
+  const screenLocative = await require('../src/utils/classifyTask.js').classifyTask(
+    'look into this company on my screen for me and tell me what they\'re about',
+    HISTORY,
+    offline,
+    logger,
+  );
+  check('screen-locative prompt does NOT bind to prior topic',
+    !/wingfeather/i.test(screenLocative.followUpTarget || ''), screenLocative.followUpTarget);
+  check('screen-locative prompt does NOT floor to memory_retrieve',
+    screenLocative.suggestedIntent !== 'memory_retrieve', screenLocative.suggestedIntent);
 
   console.log(`\n${passed} passed, ${failed} failed`);
   process.exit(failed ? 1 : 0);
