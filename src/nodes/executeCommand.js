@@ -447,6 +447,15 @@ async function _fillScreenDisplayArgs(callArgs, allResults, priorResults, state,
     } else if ((_dispKind === 'text' || _dispKind === 'alert') && !callArgs.text && !callArgs.title) {
       const _srcText = _priorTexts[_priorTexts.length - 1];
       if (_srcText) callArgs.text = _srcText;
+    } else if (_dispKind === 'emoji' && !callArgs.emoji) {
+      // Plan emitted kind=emoji with no glyph — derive one from the step's
+      // own text + the user's ask via the shared emoji catalog.
+      const { glyphForText } = require('../../shared/emoji-catalog.cjs');
+      const g = glyphForText([callArgs.title, callArgs.text, callArgs.mood, _userMsg].filter(Boolean).join(' '));
+      if (g) {
+        callArgs.emoji = g;
+        logger.info(`[Node:ExecuteCommand] screen.display emoji filled: ${g}`);
+      }
     }
   } catch (e) {
     logger.warn(`[Node:ExecuteCommand] screen.display fill failed (display step proceeds as-is): ${e.message}`);
@@ -592,6 +601,45 @@ async function _thinPostFailureHandlerImpl(state) {
         uiStepIndex: state._resumeStepIndex ?? skillCursor,
       }),
       patchHistory: [...patchHistory, { action: 'INFRA_FAILURE', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      commandExecuted: false,
+    };
+  }
+
+  // ── Timeout dedup gate ───────────────────────────────────────────────────
+  // A command that already timed out once will time out again on an identical
+  // payload — the only fix is a DIFFERENT (bounded) command. The first timeout
+  // may still be patched (a bad flag is a quick fix), but a repeat timeout on
+  // the same failure signature skips the LLM decision and escalates to
+  // replan_step — or ask_user once replans are exhausted. This is the
+  // shell-lane stall guard (the page-state guard below only sees browser
+  // steps — shell timeouts had no dedup and could re-fire indefinitely).
+  const _isTimeoutErr = /timed? ?out after|request timeout/i.test(_errClass);
+  if (_isTimeoutErr && _sigCount >= 1) {
+    if ((state.replanCount || replanCount) >= 2) {
+      logger.warn(`[ExecuteCommand:ThinRecovery] TIMEOUT-ESCALATE: "${_failSig}" timed out ${_sigCount + 1}x and replans are exhausted — asking user`);
+      return {
+        ...state,
+        recoveryAction: 'ask_user',
+        pendingQuestion: {
+          question: `Step "${failedStep.skill}" keeps timing out (${_errClass}) — the command is likely unbounded. How should I proceed?`,
+          options: [],
+        },
+        patchHistory: [...patchHistory, { action: 'TIMEOUT_ESCALATE', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+        commandExecuted: false,
+      };
+    }
+    logger.warn(`[ExecuteCommand:ThinRecovery] TIMEOUT-ESCALATE: "${_failSig}" timed out ${_sigCount + 1}x — forcing replan_step for a bounded variant`);
+    return {
+      ...state,
+      recoveryAction: 'replan_step',
+      recoveryContext: {
+        failedSkill: failedStep.skill,
+        failedStep,
+        failureReason: `${_errClass} — the command timed out ${_sigCount + 1}x; emit a bounded variant (e.g. mdfind -count, find -maxdepth N, head -n, du -sh, ls | wc -l) or narrow the path/predicate`,
+      },
+      replanCount: replanCount + 1,
+      patchHistory: [...patchHistory, { action: 'TIMEOUT_ESCALATE', sig: _failSig, pageSig: _pageSig, note: failedStep.error, attempt: stepRetryCount + 1 }],
+      failedStep: null,
       commandExecuted: false,
     };
   }
@@ -1228,6 +1276,7 @@ async function _thinPostFailureHandlerImpl(state) {
       && failedStep.skill !== 'cli.agent' && failedStep.skill !== 'terminal.agent'
       && failedStep.skill !== 'edit.agent' && failedStep.skill !== 'task.agent'
       && !_WEB_FETCH_SKILLS.has(failedStep.skill)
+      && failedStep.skill !== 'screen.display'   // a terminal loop can't fix a display contract
       && !failedStep.askUser && !failedStep.delegateTo
       && !_browserish(failedStep.skill)
       && !_disabledErr
@@ -1300,6 +1349,7 @@ async function _thinPostFailureHandlerImpl(state) {
     // self-brands 'cli.agent' and the resume fabricates a registry id that
     // can never resolve (observed: 36min "No agent found: cli.agent" loop).
     if (!_WEB_FETCH_SKILLS.has(failedStep.skill)
+        && failedStep.skill !== 'screen.display'
         && failedStep.skill !== 'edit.agent'
         && !_browserish(failedStep.skill)
         && !(patchHistory || []).some(p => p.action === 'TERMINAL_DEBUG' && p.cursor === skillCursor)) {

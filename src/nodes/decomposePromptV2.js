@@ -39,6 +39,21 @@ function writeDecomposeLog(entry) {
 // decompose body and the shadow-emit ctx (same normalization, same verdict).
 const _HINT_VOCAB = { screen_analysis: 'screen_intelligence' };
 
+// Handoff acknowledgements ("Checking now." …) are transient openers, not the
+// prior turn's substance — same set screenOutput.js builds for _lastAssistantText.
+const _HANDOFF_ACKS = (() => {
+  const set = new Set();
+  try {
+    const phrases = require('../../comms-graph/src/handoffPhrases.json');
+    for (const pool of Object.values(phrases || {})) {
+      for (const list of Object.values(pool || {})) {
+        for (const p of list || []) set.add(String(p).trim());
+      }
+    }
+  } catch (_) {}
+  return set;
+})();
+
 // Runtime context the decompose guards read but _taskClassification doesn't
 // carry — the routeTable needs the same inputs to faithfully mirror them.
 function _shadowCtx(state) {
@@ -644,6 +659,26 @@ module.exports = async function decomposePromptV2(state) {
     // A deictic followed by an artifact/content noun ("that file", "this
     // error") legitimately resolves to the ambient referent — exempt it.
     && !DEICTIC_ARTIFACT_RE.test(message);
+  // ── Scripture screen-continuation ────────────────────────────────────────
+  // "show John 3:16 on my screen" paints a verse; a bare "john 3:16" (or "now
+  // exodus 2") follow-up means the SAME thing — the display surface is already
+  // the referent. The lexical guard below needs a display verb the follow-up
+  // doesn't carry; detect it structurally: isFollowUp + a scripture ref + the
+  // last substantive assistant turn being the "## Screen" display ack. It
+  // takes the identical scripture-fetch → screen_display path a fresh request
+  // would — never planning/general_knowledge.
+  const _scriptureScreenContinuation = (() => {
+    if (_tc.isFollowUp !== true || !SCRIPTURE_REF_RE.test(message)) return false;
+    const hist = Array.isArray(conversationHistory) ? conversationHistory : [];
+    for (let i = hist.length - 1; i >= 0; i--) {
+      const m = hist[i];
+      if (!m || m.role !== 'assistant' || typeof m.content !== 'string' || !m.content.trim()) continue;
+      const c = m.content.trim();
+      if (m.isPlaceholder || m.isAck || _HANDOFF_ACKS.has(c)) continue; // transient openers
+      return c.startsWith('## Screen');
+    }
+    return false;
+  })();
   // ── Authoritative route decision — table → envelope → guards → LLM ────────
   // suggestIntent() is the deterministic mirror of the guard chain below —
   // the shadow dataset measured 91% agreement with executed decisions, and
@@ -670,8 +705,10 @@ module.exports = async function decomposePromptV2(state) {
     // misroute the table guard suppresses — don't reintroduce it one level down).
     const _envelopeExecutorVeto = generativeOnly(message)
       && _tc.suggestedIntent === 'command_automate';
-    const _authoritative = _routeTable
-      || (!_isCompound && !_envelopeExecutorVeto && _tc.suggestedIntent ? { intent: _tc.suggestedIntent, rule: 'envelope' } : null);
+    // A scripture screen-continuation is a fetch+display pair, never a bound
+    // single-step answer — veto the table/envelope so the guard below runs.
+    const _authoritative = _scriptureScreenContinuation ? null : (_routeTable
+      || (!_isCompound && !_envelopeExecutorVeto && _tc.suggestedIntent ? { intent: _tc.suggestedIntent, rule: 'envelope' } : null));
     if (_authoritative) {
       const _intent = _authoritative.intent;
       logger.info(`[Node:DecomposePromptV2] authoritative route — ${_authoritative.rule} → ${_intent}`);
@@ -773,7 +810,7 @@ module.exports = async function decomposePromptV2(state) {
   // action). The screen_display is a DEPENDENT step of that plan, not the
   // whole task; short-circuiting here skips agent resolution entirely.
   const _serviceCompound = !!(_tc.targetService && Array.isArray(_tc.interactiveActions) && _tc.interactiveActions.length);
-  const _screenOutFlag = (_tc.isScreenOutput && !_fileOpShape) || _screenOutputLex;
+  const _screenOutFlag = (_tc.isScreenOutput && !_fileOpShape) || _screenOutputLex || _scriptureScreenContinuation;
   if (_screenOutFlag && !_isScreenCapture && !_serviceCompound
       && (!_hasMultiGoalConjunction || _lookupThenDisplay)) {
     logger.info(`[Node:DecomposePromptV2] Screen-output guard: routing to screen_display (action=${_tc.screenOutputAction || 'show'} kind=${_tc.screenOutputKind || 'text'}) — skipping command_automate short-circuit`);

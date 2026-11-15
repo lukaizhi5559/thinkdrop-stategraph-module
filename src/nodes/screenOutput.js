@@ -51,12 +51,35 @@ async function _post(path, body, logger) {
   }
 }
 
-/** Last assistant utterance — prefers real turns over proactive cards. */
+// Handoff acknowledgements ("Checking now.", "Searching the web for you
+// now."…) are transient openers, not content — "show this on screen" must
+// never paint one. Loaded across every lane + language pool.
+const _HANDOFF_ACKS = (() => {
+  const set = new Set();
+  try {
+    const phrases = require('../../comms-graph/src/handoffPhrases.json');
+    for (const pool of Object.values(phrases || {})) {
+      for (const list of Object.values(pool || {})) {
+        for (const p of list || []) set.add(String(p).trim());
+      }
+    }
+  } catch (_) {}
+  return set;
+})();
+
+/** Last SUBSTANTIVE assistant utterance — skips thought cards, screen-display
+ *  acks ("## Screen\nDisplayed …"), placeholder/ack markers, and handoff
+ *  acknowledgement phrases. Returns null when nothing real remains so callers
+ *  fall through to the honest "nothing on hand" path. */
 function _lastAssistantText(history) {
   if (!Array.isArray(history)) return null;
   const real = history.filter(m => m && m.role === 'assistant' && typeof m.content === 'string' && m.content.trim());
-  const nonCard = real.filter(m => !m.isThoughtCard && m.source !== 'thought-attachment');
-  const pick = nonCard[nonCard.length - 1] || real[real.length - 1];
+  const substantive = real.filter(m =>
+    !m.isThoughtCard && m.source !== 'thought-attachment'
+    && !m.isPlaceholder && !m.isAck
+    && !m.content.trim().startsWith('## Screen')
+    && !_HANDOFF_ACKS.has(m.content.trim()));
+  const pick = substantive[substantive.length - 1];
   return pick ? pick.content.trim() : null;
 }
 
