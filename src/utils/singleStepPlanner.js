@@ -8,6 +8,48 @@
 'use strict';
 
 const { parseLlmJson } = require('./parseLlmJson');
+const { isPlanLegalSkill, GRAPH_INTERNAL_SKILLS, dispatchableSkills } = require('./skillIds');
+
+// Authoritative skill vocabulary — generated from shared/skill-contracts.cjs
+// so the list can never drift stale again (the old hardcoded list predated
+// cli.agent/app.agent, and the LLM echoed graph node names like
+// 'evaluate_skills' as skill ids — which then hit 'Unknown skill' at dispatch).
+function _skillVocab() {
+  try {
+    const { contractsVocabularyBlock } = require('../../../shared/skill-contracts.cjs');
+    const block = contractsVocabularyBlock();
+    if (block && block.trim()) return block;
+  } catch (_) {}
+  return `- shell.run: Execute shell commands. Args: { cmd, argv } OR { goal }
+- fs.read: Read files/directories. Args: { path, filePath, dir, action: 'tree'|'list' }
+- fs.write: Write files. Args: { path, filePath, content }
+- cli.agent: CLI/terminal agentic run. Args: { action: 'run', task, agentId? }
+- app.agent: Native macOS app automation. Args: { action, appName, task?|goal?|filePath+prompt }
+- web.agent: Web search/navigation. Args: { action, query }
+- web.crawl: Fetch readable text from a public URL. Args: { url }
+- synthesize: LLM synthesis. Args: { prompt }`;
+}
+
+// Is this skill id actually dispatchable? Contract vocabulary first (sync,
+// offline-safe); then the command-service dispatch table when an adapter is
+// available (covers skills outside the contract list).
+async function _isDispatchable(skill, mcpAdapter) {
+  if (!skill) return false;
+  if (GRAPH_INTERNAL_SKILLS.has(String(skill).toLowerCase())) return true;
+  if (isPlanLegalSkill(skill)) return true;
+  if (!mcpAdapter) return false;
+  try {
+    return (await dispatchableSkills(mcpAdapter)).has(String(skill).toLowerCase());
+  } catch (_) {
+    return false;
+  }
+}
+
+// A retry of a non-dispatchable failedSkill can only fail the same way —
+// signal full replan instead of splicing a dead step into the plan.
+function _fullReplanSignal(reason, skill) {
+  return { _needsFullReplan: true, _invalidSkill: skill || null, _reason: reason };
+}
 
 /**
  * Generate a replacement step for the failed step
@@ -20,7 +62,9 @@ const { parseLlmJson } = require('./parseLlmJson');
  * @param {Array} options.priorResults - Results from prior successful steps
  * @param {string} options.userMessage - Original user request
  * @param {Object} options.llmBackend - LLM backend for generation
- * @returns {Object} Replacement step { skill, args, description }
+ * @param {Object} options.mcpAdapter - command-service adapter (dispatch table check)
+ * @returns {Object} Replacement step { skill, args, description } — or
+ *   { _needsFullReplan: true } when the only viable step isn't dispatchable.
  */
 async function generateSingleStep({
   failedStep,
@@ -30,10 +74,14 @@ async function generateSingleStep({
   constraint,
   priorResults,
   userMessage,
-  llmBackend
+  llmBackend,
+  mcpAdapter
 }) {
   if (!llmBackend) {
     // Fallback: return a simple modified version of the failed step
+    if (!(await _isDispatchable(failedSkill, mcpAdapter))) {
+      return _fullReplanSignal('failed skill is not dispatchable', failedSkill);
+    }
     return {
       skill: failedSkill,
       args: { ...failedArgs, _replanAttempt: true },
@@ -50,16 +98,8 @@ async function generateSingleStep({
   const SYSTEM_PROMPT = `You are an automation step generator. Generate a replacement step to fix a failed step.
 Output ONLY valid JSON: { "skill": "skill.name", "args": {...}, "description": "..." }
 
-Available skills:
-- shell.run: Execute shell commands. Args: { cmd, argv } OR { goal }
-- fs.read: Read files/directories. Args: { path, filePath, dir, action: 'tree'|'list' }
-- fs.write: Write files. Args: { path, filePath, content }
-- browser.act: Browser actions. Args: { action, url, sessionId }
-- url.first.agent: Navigate to a service/page via deep link. Args: { agentId, task, url? }
-- dom.act: On-page action (fill/click/submit) — routes to the right executor. Args: { task, agentId, agentHint? }
-- turn.loop.agent: Verify a browser goal was achieved. Args: { goal, mode: 'verify', agentId }
-- web.agent: Web search/navigation. Args: { action, query }
-- synthesize: LLM synthesis. Args: { prompt }
+Available skills (authoritative dispatchable set — ONLY these skill names are valid; names like "evaluate_skills" or "recover_skill" are graph node internals, NEVER skills):
+${_skillVocab()}
 
 Rules:
 - Use shell.run with { goal } for complex shell tasks (safer than raw cmd/argv)
@@ -101,6 +141,9 @@ Output ONLY JSON:
     if (!parsed) {
       console.error('[SingleStepPlanner] Failed to parse LLM response:', response.slice(0, 200));
       // Fallback: return modified failed step
+      if (!(await _isDispatchable(failedSkill, mcpAdapter))) {
+        return _fullReplanSignal('failed skill is not dispatchable', failedSkill);
+      }
       return {
         skill: failedSkill,
         args: { ...failedArgs, _replanParseError: true },
@@ -111,11 +154,23 @@ Output ONLY JSON:
     // Validate required fields
     if (!parsed.skill || !parsed.args) {
       console.error('[SingleStepPlanner] Missing required fields:', parsed);
+      if (!(await _isDispatchable(failedSkill, mcpAdapter))) {
+        return _fullReplanSignal('failed skill is not dispatchable', failedSkill);
+      }
       return {
         skill: failedSkill,
         args: { ...failedArgs, _replanMissingFields: true },
         description: `Retry ${failedSkill} (validation fallback)`
       };
+    }
+
+    // Gate: the emitted skill must be dispatchable — a graph node name or an
+    // invented skill would splice a guaranteed 'Unknown skill' failure into
+    // the plan (observed: replacement {skill:'evaluate_skills'} → dispatch
+    // error → a second 12-turn recovery loop chasing internal vocabulary).
+    if (!(await _isDispatchable(parsed.skill, mcpAdapter))) {
+      console.error(`[SingleStepPlanner] LLM emitted non-dispatchable skill "${parsed.skill}" — signaling full replan`);
+      return _fullReplanSignal('emitted skill is not dispatchable', parsed.skill);
     }
 
     return {
@@ -127,6 +182,9 @@ Output ONLY JSON:
   } catch (err) {
     console.error('[SingleStepPlanner] LLM generation failed:', err.message);
     // Fallback: return modified failed step
+    if (!(await _isDispatchable(failedSkill, mcpAdapter))) {
+      return _fullReplanSignal('failed skill is not dispatchable', failedSkill);
+    }
     return {
       skill: failedSkill,
       args: { ...failedArgs, _replanError: true },

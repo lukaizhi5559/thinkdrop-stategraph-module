@@ -8,6 +8,19 @@ Domain-specific guidance for macOS system behavior. File-operation patterns (mdf
 - **Closing a file on macOS** — use `osascript -e 'tell application "AppName" to close (every document whose name is "filename")'`. NEVER use `lsof | kill`, `kill -9`, or `xargs kill` — those kill the whole app or random processes. To find which app has the file open: `mdls -name kMDItemLastUsedApp "/path/to/file"`. For .txt files the app is usually "TextEdit". For PDFs use "Preview". Always close the document, not the application (unless the user explicitly says "quit TextEdit").
 - **osascript / AppleScript** — use `shell.run bash -c 'osascript -e "..."'` only for simple AppleScript commands that no skill can do (e.g. closing a specific document). Do NOT use osascript to open or focus apps — that is handled by `app.agent`. Note: macOS requires the user to grant Automation permission in System Settings → Privacy & Security → Automation before osascript can control other apps.
 
+## Reminders vs Calendar — pick the tool by the user's wording
+
+**Reminders ≠ Calendar.** A "reminder" lives in Reminders.app; an "appointment"/"event"/"meeting" lives in Calendar.app. NEVER route a calendar request to Reminders tooling or vice versa — `remindctl` cannot create calendar events, and Calendar AppleScript cannot create reminders.
+
+- **Reminders** ("remind me", "add a reminder", "my reminders list") → `remindctl` when installed. Verify first with `command -v remindctl`. Read: `remindctl list`, `remindctl show`. Write: `remindctl add "<title>" --due "<date>"`. If `remindctl` is absent → `osascript` on Reminders.app or a `cli.agent` run to install/probe.
+- **Calendar events** ("appointment", "event", "meeting", "add to my calendar", "schedule") → `osascript` on Calendar.app:
+  ```bash
+  osascript -e 'tell application "Calendar" to tell calendar "Calendar" to make new event with properties {summary:"<title>", start date:date "<date string>", end date:date "<date string>"}'
+  ```
+  `calendar "Calendar"` is the default display name of the primary calendar — list real names first when unsure: `osascript -e 'tell application "Calendar" to get name of every calendar'`. For users on Google Calendar, `gcalcli` is an acceptable alternative when installed.
+- **app.agent `run_agent` is NOT for these mutations** — it drives a file-open + in-app AI-assistant flow; it cannot write events or reminders. Deterministic writes go through `shell.run` (osascript/remindctl).
+- **Verify every mutation** — after creating an event/reminder, add a read step proving it exists (`remindctl list`, or `osascript -e 'tell application "Calendar" to get summary of every event of calendar "Calendar" whose start date ≥ date "<d>"'`). Never emit a bare write → synthesize — an unverified "added it" has lied to the user before.
+
 ## System Settings / System Preferences
 
 NEVER use `browser.act` for System Settings, System Preferences, or ANY native macOS system dialogs. Playwright-cli controls web browsers ONLY — it cannot interact with macOS native apps or system dialogs.

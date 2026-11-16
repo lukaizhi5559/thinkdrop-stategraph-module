@@ -167,6 +167,10 @@ const _SYNTHESIZE_EXEMPT_SKILLS = new Set([
   'edit.agent',
 ]);
 
+// Graph-internal step names — handled by executeCommand directly, never sent
+// to command-service dispatch. Canonical set lives in utils/skillIds.js
+// (GRAPH_INTERNAL_SKILLS); _sanitizeSkillPlan's gate consults it.
+
 // ── Atomic browser agents (Phase 6 of the monolith decomposition) ───────────
 // When ATOMIC_BROWSER_AGENTS is enabled, browser.agent {action:'run'} steps are
 // rewritten post-generation to the deterministic atomic skills based on the
@@ -898,12 +902,25 @@ async function _adjudicateSkillPicks(skillPlan, state, logger, mcpAdapter, userM
   return out;
 }
 
-function _sanitizeSkillPlan(skillPlan, state) {
+function _sanitizeSkillPlan(skillPlan, state, opts = {}) {
   if (!Array.isArray(skillPlan)) return skillPlan;
   const _log = state?.logger || console;
   const _fileHint = state?._priorScreenContext?.filePath || null;
   const _appHint = state?._priorScreenContext?.appName || null;
   const _urlHint = state?._priorScreenContext?.url || null;
+  const _dispatchable = opts.dispatchable instanceof Set ? opts.dispatchable : null;
+  const _isSkillDispatchable = (id) => {
+    if (!id) return true; // empty handled elsewhere
+    try {
+      const { isPlanLegalSkill, GRAPH_INTERNAL_SKILLS } = require('../utils/skillIds.js');
+      const key = String(id).toLowerCase();
+      if (GRAPH_INTERNAL_SKILLS.has(key)) return true;
+      // Live dispatch table (contract ∪ /skill.list) is authoritative when
+      // fetched; isPlanLegalSkill is the contract+internal+on-disk fallback.
+      if (_dispatchable) return _dispatchable.has(key);
+      return isPlanLegalSkill(id);
+    } catch (_) { return true; }
+  };
 
   // ── Anti-hallucination URL guard ──────────────────────────────────────────
   // The planner has filled recipe <URL> placeholders with defaults (google.com
@@ -1021,6 +1038,17 @@ function _sanitizeSkillPlan(skillPlan, state) {
   let _urlVarIdx = 0;
   const _guardedPlan = [];
   for (const step of skillPlan) {
+    // ── Dispatchable-skill gate ───────────────────────────────────────────
+    // A graph node name ('evaluate_skills') or invented skill id reaching
+    // dispatch always fails 'Unknown skill' and burns a recovery loop —
+    // observed in the wild. Mark it skipped with an honest reason instead of
+    // splicing a guaranteed failure into the plan.
+    if (step && typeof step === 'object' && step.skill && !step.skipped && !step.superseded
+        && !_isSkillDispatchable(step.skill)) {
+      step.skipped = true;
+      step.skipReason = `skill "${step.skill}" is not dispatchable — the planner emitted a name the runtime can't execute`;
+      _log.warn(`[Node:PlanSkillsV2] _sanitizeSkillPlan: marked non-dispatchable skill "${step.skill}" skipped`);
+    }
     if (step && typeof step === 'object') step._urlVarIdx = _urlVarIdx;
     const _inserted = _guardStepUrls(step);
     if (_inserted) { _guardedPlan.push(_inserted); _urlVarIdx++; }
@@ -1210,6 +1238,69 @@ function _sanitizeSkillPlan(skillPlan, state) {
     }
     _guardedPlan.push(step);
   }
+
+  // ── Browser-off read-back gate ──────────────────────────────────────────
+  // `shell.run open <url>` only opens the page — nothing reads it. Without a
+  // scan_page step the plan reports unverified success (observed: the flight
+  // follow-up opened Google Flights then synthesized 'ambiguous' because no
+  // step ever read the page). With browser automation off, append a
+  // scan_page after each open-url step that has no read step following it.
+  try {
+    const { isBrowserAutomationEnabled } = require('../../../shared/browser-automation.cjs');
+    if (!isBrowserAutomationEnabled()) {
+      for (let i = 0; i < _guardedPlan.length; i++) {
+        const s = _guardedPlan[i];
+        if (!s || s.skill !== 'shell.run' || s.skipped || s.superseded) continue;
+        const _cmdText = [s.args?.cmd, ...(Array.isArray(s.args?.argv) ? s.args.argv : [])]
+          .filter(Boolean).join(' ');
+        if (!/\bopen\b/.test(_cmdText) || !/https?:\/\//.test(_cmdText)) continue;
+        const nxt = _guardedPlan[i + 1];
+        const readsPage = nxt && !nxt.skipped && (
+          (nxt.skill === 'app.agent' && /^(scan_page|read_screen|extract_content)/.test(String(nxt.args?.action || '')))
+          || nxt.skill === 'web.crawl'
+        );
+        if (readsPage) continue;
+        _guardedPlan.splice(i + 1, 0, {
+          skill: 'app.agent',
+          args: { action: 'scan_page', preferOs: true },
+          description: 'Read the opened page to verify what loaded',
+        });
+        _log.info('[Node:PlanSkillsV2] _sanitizeSkillPlan: appended app.agent scan_page after shell.run open (browser-off verify)');
+        i++;
+      }
+    }
+  } catch (_) {}
+
+  // ── Stale-year URL repair ───────────────────────────────────────────────
+  // The planner hand-rolls date-bearing URLs and picks the wrong year
+  // (observed: Google Flights q=…2025-12-12 for a request made in 2026).
+  // Rewrite a PAST year to the current year only when the user never
+  // mentioned that year — a year the user typed is intent, not invention.
+  try {
+    const _yr = new Date().getFullYear();
+    // URLs are stripped first — a year inside a pasted/carried URL is the
+    // page's own date, not a year the user typed as intent.
+    const _msgText = `${state?.resolvedMessage || ''} ${state?.message || ''}`.replace(/https?:\/\/\S+/gi, ' ');
+    const _fixYear = (txt) => typeof txt === 'string'
+      // (?<=%20) catches years glued to URL-encoded space ("…on%202025-12-12");
+      // (?<!\d) stops the match when the year sits inside a longer digit run.
+      ? txt.replace(/(?:(?<=%20)|(?<!\d))(19|20)\d{2}(?=[-/]\d{1,2}[-/]\d{1,2})/g, (m, c) => {
+          const n = parseInt(m, 10);
+          return (n < _yr && !_msgText.includes(m)) ? String(_yr) : m;
+        })
+      : txt;
+    for (const s of _guardedPlan) {
+      if (!s || s.skipped || s.superseded) continue;
+      if (s.skill === 'shell.run') {
+        if (typeof s.args?.cmd === 'string') s.args.cmd = _fixYear(s.args.cmd);
+        if (typeof s.args?.goal === 'string') s.args.goal = _fixYear(s.args.goal);
+        if (Array.isArray(s.args?.argv)) s.args.argv = s.args.argv.map(_fixYear);
+      } else if (typeof s.args?.url === 'string') {
+        s.args.url = _fixYear(s.args.url);
+      }
+    }
+  } catch (_) {}
+
   return _guardedPlan;
 }
 
@@ -2379,7 +2470,21 @@ async function planSkillsV2(state) {
   const logger = state.logger || console;
   const progressCallback = state.progressCallback || null;
   const homeDir = process.env.HOME || process.env.USERPROFILE || '/Users/unknown';
-  
+
+  // Dispatchable-skill set for _sanitizeSkillPlan's gate — lazily fetched once
+  // (skillIds caches for 60s, so post-preflight calls are nearly free). A step
+  // naming a non-dispatchable skill ('evaluate_skills', invented ids) can only
+  // fail 'Unknown skill' at dispatch — sanitize marks it skipped instead.
+  let _dispatchableSet = null;
+  const _getDispatchable = async () => {
+    if (_dispatchableSet) return _dispatchableSet;
+    try {
+      const { dispatchableSkills } = require('../utils/skillIds.js');
+      _dispatchableSet = await dispatchableSkills(mcpAdapter);
+    } catch (_) { _dispatchableSet = null; }
+    return _dispatchableSet;
+  };
+
   // Debug logging for single-step replan
   if (state.singleStepReplan || recoveryContext?.replanMode === 'single_step') {
     logger.info(`[Node:PlanSkillsV2] DEBUG: singleStepReplan=${state.singleStepReplan}, recoveryMode=${recoveryContext?.replanMode}`);
@@ -2813,7 +2918,7 @@ async function planSkillsV2(state) {
     // browser.agent selects URL-first navigation instead of a blind start page.
     const detPlan = _taskAgentPlan || _sanitizeSkillPlan(_lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
       _stripRedundantVerifySteps(_markSatisfiedOpenSteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger), state, logger),
-      userMessage), logger), logger, state._extSessions, userMessage), state);
+      userMessage), logger), logger, state._extSessions, userMessage), state, { dispatchable: await _getDispatchable() });
     // Messaging follow-up body: the service_task template passes the raw
     // message as task ("send this info to X"), so the browser agent never sees
     // the actual content and invents a placeholder body. Attach the resolved
@@ -3569,8 +3674,17 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
         priorResults: skillResults,
         userMessage: resolvedMessage || message,
         llmBackend: backend,
+        mcpAdapter: state.mcpAdapter,
       });
-      
+
+      if (replacementStep?._needsFullReplan) {
+        // The only viable replacement isn't dispatchable (LLM emitted a graph
+        // node name like 'evaluate_skills', or the failed skill itself can't
+        // be retried). Splicing it would guarantee an 'Unknown skill'
+        // dispatch failure — fall through to the full replan below.
+        logger.warn(`[Node:PlanSkillsV2] Single-step replan produced non-dispatchable skill "${replacementStep._invalidSkill}" (${replacementStep._reason}) — falling back to full replan`);
+      } else {
+
       // Plan-lock semantics: the failed step stays in place marked superseded
       // (renders skipped — never silently rewritten); the replacement inserts
       // at cursor+1. Plan length grows by one; indices stay consistent
@@ -3587,7 +3701,7 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
       // Single-step replan output must clear the same gates as full plans —
       // unproven install argv, invented URLs, etc. Otherwise the recovery path
       // silently reintroduces exactly what sanitize strips.
-      newPlan = _sanitizeSkillPlan(newPlan, state);
+      newPlan = _sanitizeSkillPlan(newPlan, state, { dispatchable: await _getDispatchable() });
 
       logger.info(`[Node:PlanSkillsV2] Single-step replan complete: replaced step ${state.skillCursor} with new ${newPlan[state.skillCursor]?.skill}`);
       
@@ -3617,6 +3731,7 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
         planError: null,
         recoveryContext: null, recoveryAction: null, failedStep: null, singleStepReplan: null,  // Clear after use
       };
+      }
     } else {
       logger.warn(`[Node:PlanSkillsV2] Single-step replan requested but no valid skillPlan found - falling back to full replan`);
     }
@@ -4533,7 +4648,7 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
 
   // ── Malformed-step guard: shell.run without cmd/goal → ask_user ────────────
   if (Array.isArray(skillPlan)) {
-    skillPlan = _sanitizeSkillPlan(skillPlan, state);
+    skillPlan = _sanitizeSkillPlan(skillPlan, state, { dispatchable: await _getDispatchable() });
     // Repair {{token}}s that can never resolve at their position (e.g.
     // {{PREV_OUTPUT_FILE}} in step 1) — otherwise the step dies at dispatch
     // as "Unresolved placeholder(s)" after the user already approved the plan.

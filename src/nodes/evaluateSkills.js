@@ -610,7 +610,10 @@ Output ONLY valid JSON.`;
       failedStep: null,
       answer: undefined,
       recoveryContext: {
-        failedSkill: isFailurePath ? (recoveryContext?.failedSkill || 'evaluate_skills') : 'evaluate_skills',
+        // Carry the REAL failed skill — 'evaluate_skills' is this node, not a
+        // dispatchable skill; leaking it into recoveryContext made single-step
+        // replans emit `evaluate_skills` as a plan step (Unknown skill).
+        failedSkill: state.failedStep?.skill || recoveryContext?.failedSkill || null,
         failedStep: (skillPlan || []).length,
         failureReason: verdict.reason,
         suggestion: verdict.retryHint || 'Apply the stored context rule and retry',

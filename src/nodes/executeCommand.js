@@ -1190,6 +1190,13 @@ async function _thinPostFailureHandlerImpl(state) {
     try { return !require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled(); } catch (_) { return false; }
   })();
   const _disabledErr = /browser_automation_disabled/i.test(String(failedStep?.error || ''));
+  // Contract/validation failures are planner bugs, not terminal problems —
+  // a PTY loop can't fix a malformed step; it burns turns probing the
+  // wrapper's internal vocabulary as if it were real products (observed: the
+  // malformed app.agent run_agent step → cli.agent probed
+  // 'reminders_app_agent'/'dentist' as installable CLIs). Skip the terminal
+  // fallback so the failure reaches evaluateSkills/replan instead.
+  const _contractErr = /unknown skill:|\bis required\b|unknown [\w.]+ action|app not installed|could not extract filePath/i.test(String(failedStep?.error || ''));
   if (failedStep
       && !_browserOff && !_disabledErr
       && _browserish(failedStep.skill)
@@ -1280,6 +1287,7 @@ async function _thinPostFailureHandlerImpl(state) {
       && !failedStep.askUser && !failedStep.delegateTo
       && !_browserish(failedStep.skill)
       && !_disabledErr
+      && !_contractErr
       && Array.isArray(skillPlan) && skillPlan[skillCursor]
       && !(patchHistory || []).some(p => (p.action === 'TERMINAL_DEBUG' || p.action === 'AGENT_ESCALATE' || p.action === 'DELEGATE_REROUTE' || p.action === 'BROWSER_ESCALATE') && p.cursor === skillCursor)
       // Timeout-shaped failures in deterministic plans still get the cheap
@@ -1352,6 +1360,7 @@ async function _thinPostFailureHandlerImpl(state) {
         && failedStep.skill !== 'screen.display'
         && failedStep.skill !== 'edit.agent'
         && !_browserish(failedStep.skill)
+        && !_contractErr
         && !(patchHistory || []).some(p => p.action === 'TERMINAL_DEBUG' && p.cursor === skillCursor)) {
       const _dbgArgv = [failedStep.args?.cmd, ...(failedStep.args?.argv || [])].filter(Boolean).join(' ');
       const _dbgTask = `${failedStep.args?.goal || failedStep.description || _dbgArgv || 'complete the failed step'} — previous attempts failed: ${(_dbgArgv ? `\`${_dbgArgv}\` → ` : '')}${String(failedStep.error || 'failed').slice(0, 300)}`;

@@ -60,7 +60,39 @@ function isContractSkill(id) {
   return _contractSkillIds().includes(String(id).toLowerCase());
 }
 
+// Graph-internal step names — executeCommand handles these directly; they are
+// legitimately absent from both the contract table and the /skill.list
+// dispatch table. Dispatchability gates must not flag them.
+const GRAPH_INTERNAL_SKILLS = new Set([
+  'ask_user', 'needs_skill', 'schedule', 'schedule_cancel', 'api_suggest',
+  'profile.store_secret', 'smartfill', 'skill.install', 'list_skills',
+  'project_build', 'project_launch', 'project_edit', 'project_stop',
+  'ui.waitfor', 'ui.screen.verify',
+]);
+
+/** On-disk skill check — shared/skill-index scans command-service's skills
+ *  dir, so runtime-only skills (file.bridge, just.type.agent) resolve even
+ *  when /skill.list is unreachable. Over-matches non-dispatch helper files
+ *  (trainer.agent et al.) — acceptable as a fallback tier: the live set is
+ *  authoritative when fetched; this tier exists for the offline case. */
+function _skillFileExists(id) {
+  try {
+    const { skillExists } = require('../../../shared/skill-index.cjs');
+    return skillExists(String(id));
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Contract-skill OR graph-internal step OR on-disk skill file — the full
+ *  plan-legal vocabulary short of a live /skill.list fetch. */
+function isPlanLegalSkill(id) {
+  if (!id) return false;
+  const key = String(id).toLowerCase();
+  return GRAPH_INTERNAL_SKILLS.has(key) || isContractSkill(id) || _skillFileExists(id);
+}
+
 /** Test hook — reset the TTL cache between cases. */
 function _resetCache() { _cache = { at: 0, ids: null }; }
 
-module.exports = { dispatchableSkills, isContractSkill, _resetCache };
+module.exports = { dispatchableSkills, isContractSkill, isPlanLegalSkill, GRAPH_INTERNAL_SKILLS, _resetCache };
