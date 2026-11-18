@@ -1,6 +1,6 @@
 ## Appendix: Desktop App Automation (app.agent)
 
-Domain-specific guidance for `app.agent`. General skill list, routing hierarchy, output format, and template variables are in the base prompt. For desktop tasks, prefer `shell.run` first; use `app.agent` only when the task requires direct app interaction.
+Domain-specific guidance for `app.agent`. General skill list, routing hierarchy, output format, and template variables are in the base prompt. For desktop tasks, prefer `shell.run` first; use `screen.task.agent` when the task requires UI interaction (click/type/menus/shortcuts in an app's window — it opens/focuses the app itself and verifies every action on screen); `app.agent` remains for passive reads, monitoring, and highlighting only.
 
 ## ACTIVE SCREEN CONTEXT — use `App` and `File` for app-agent tasks
 
@@ -9,15 +9,17 @@ The system prompt includes an `ACTIVE SCREEN (...)` line with the current (or mo
 - For "the file that's open" with no explicit app name → use `App` and `File` from ACTIVE SCREEN CONTEXT as `appName` / `filePath`.
 - For "close/minimize/hide/quit this app" → use `shell.run` osascript (see plan-skills-shell.md). `app.agent` is NOT for window management.
 - **Exception:** "close this tab" / "close the tab" is an in-app action, NOT window management → use `app.agent execute_shortcut` with `appName: "browser"` and `shortcutOverride: "Cmd+W"`. NEVER emit `osascript key code N` or `keystroke "x" using command down` for known app/browser shortcuts — raw key codes are easy to get wrong (key code 17 is Cmd+T, not Cmd+W); `execute_shortcut` resolves the correct keystroke from the shortcut tables.
-- `app.agent` is for **in-app interactions** only: undo/redo/cut/copy/paste, find/replace, tab navigation (new tab, close tab, switch tab), toggle sidebar/dark mode, scroll/read content, app AI assistant (run_agent / run_app_flow).
+- **In-app interactions** — undo/redo/cut/copy/paste, find/replace, tab navigation (new tab, close tab, switch tab), toggle sidebar/dark mode, clicking/typing: emit ONE `screen.task.agent` step with the goal verbatim (e.g. "close this tab" → `{"skill":"screen.task.agent","args":{"prompt":"close this tab"}}`) — it resolves ⌘W itself. `app.agent` is for passive reads/monitors/highlighting only.
 
 ## Three-Tier Priority
 
 | Tier | Skill | When to use |
 |------|-------|-------------|
 | **1 — Shell (most stable)** | `shell.run` | Any task achievable via unix/macOS CLI command |
-| **2 — Shortcut** | `app.agent execute_shortcut` | Only when shell cannot do it AND app is verified focused |
-| **3 — NutJS / low-level** | `app.agent` low-level | Only when no shortcut exists or shortcut fails twice |
+| **2 — Screen task** | `screen.task.agent` | Any UI interaction in an app's window — clicks, typing, menus, shortcuts, multi-step flows. It opens/focuses the app itself (verified frontmost), resolves shortcuts internally, and verifies + recovers on screen after every action. Pass the goal verbatim as `args.prompt`. |
+| **3 — Passive read/monitor** | `app.agent` | Read-only/monitoring actions below (scan_page, read_screen, scroll reads, monitors, highlighting) — NOT for clicking/typing/driving the UI |
+
+**Generate-then-type:** "write a report/poem/email into <app>" → `synthesize` the content first, then `screen.task.agent` with `args.text:"{{prev_stdout}}"` (pasted, not typed) + `args.title` for "save as X".
 
 ## Actions Reference
 

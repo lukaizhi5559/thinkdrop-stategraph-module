@@ -207,88 +207,216 @@ function _inferStepType(step) {
   return 'on-page-action';
 }
 
-function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
+// Semantic-goal dedupe — when a screen.task.agent step already covers the UI
+// goal, any second step whose text is the same request (service-prefixed
+// variants like "spotify: <goal>" or wrapped forms like "Diagnose and
+// complete: ...") would re-drive the same UI. Observed: screen.task succeeded,
+// then a cli.agent step internally re-dispatched screen.task with a
+// "spotify:"-prefixed prompt and failed, poisoning the result set.
+// Match = ≥90% of the screen-task goal's content words appear in the other
+// step's combined args+description text.
+const _DEDUPE_STOP = new Set(['the','a','an','to','it','on','in','of','for','and','or','my','me','please','can','you','i','that','this','with','into','called','make','create','new','add','drive','ui','complete','diagnose','do','go']);
+function _dedupeUiGoalSteps(plan, logger) {
+  if (!Array.isArray(plan) || plan.length < 2) return plan;
+  const _words = (s) => new Set(
+    String(s || '')
+      .replace(/^[a-z][\w.-]{1,30}:\s+/i, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, ' ')
+      .trim()
+      .split(/\s+/)
+      .filter(w => w && !_DEDUPE_STOP.has(w))
+  );
+  const _stepFields = (st) => {
+    const a = st?.args || {};
+    return [a.prompt, a.task, a.goal, a.description, st?.description]
+      .filter(Boolean).map(t => _words(t)).filter(w => w.size > 0);
+  };
+  const _union = (st) => {
+    const u = new Set();
+    for (const w of _stepFields(st)) for (const x of w) u.add(x);
+    return u;
+  };
+  const screenGoalIdx = plan
+    .map((s, i) => (s?.skill === 'screen.task.agent' ? { i, w: _union(s) } : null))
+    .filter(x => x && x.w.size > 0);
+  if (!screenGoalIdx.length) return plan;
+  const _DROPPABLE = new Set([
+    'cli.agent', 'app.agent', 'browser.agent', 'browser.act', 'dom.act',
+    'turn.loop.agent', 'playwright.agent', 'gesture.agent', 'arrow.grid.agent',
+    'form.fill.agent', 'web.agent', 'url.first.agent', 'screen.task.agent',
+  ]);
+  const _covers = (sw, sg) => {
+    let hit = 0;
+    for (const w of sw) if (sg.has(w)) hit++;
+    // the step's words are essentially a subset of the screen-task goal —
+    // the screen step already owns this request
+    return hit / sw.size >= 0.9;
+  };
+  const _keptScreenIdx = new Set();
+  let _dropped = 0;
+  const out = plan.filter((st, idx) => {
+    if (!st?.skill || !_DROPPABLE.has(st.skill)) return true;
+    // Per-field coverage: ANY single text field whose words are ~wholly inside
+    // a screen goal marks a duplicate — cli.agent wraps goals in noise like
+    // 'Diagnose and complete: "..." failed: typed text not found', which would
+    // dilute a joined-field score, while its clean description still matches.
+    const fields = _stepFields(st);
+    if (!fields.length) return true;
+    // For screen.task steps compare only against EARLIER kept screen goals —
+    // a step always covers itself.
+    const targets = st.skill === 'screen.task.agent'
+      ? [..._keptScreenIdx].map(i => screenGoalIdx.find(g => g.i === i)?.w).filter(Boolean)
+      : screenGoalIdx.map(g => g.w);
+    const covered = fields.some(sw => targets.some(sg => _covers(sw, sg)));
+    if (covered) {
+      _dropped++;
+      logger?.warn?.(`[Node:PlanSkillsV2] dropped duplicate UI-goal step ${st.skill} — screen.task.agent already covers it`);
+      return false;
+    }
+    if (st.skill === 'screen.task.agent') _keptScreenIdx.add(idx);
+    return true;
+  });
+  return _dropped ? out : plan;
+}
+
+function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger, userMessage) {
   if (!_ATOMIC_BROWSER_AGENTS || !Array.isArray(skillPlan)) return skillPlan;
   const _clean = (o) => { for (const k of Object.keys(o)) if (o[k] === undefined) delete o[k]; return o; };
+
+  // ── Dormant-driver lockdown (unconditional) ─────────────────────────────
+  // The legacy UI-driver stack is DORMANT: still registered/dispatchable for
+  // internal callers, but planners must never emit it. Any step that slips
+  // through (cached plan, template, prompt residue) is rewritten here —
+  // driving actions collapse to screen.task.agent (observe→resolve→act→
+  // verify in the user's real app), page reads to screen.act copy_page.
+  const _DORMANT_UI = new Set([
+    'app.agent', 'browser.agent', 'playwright.agent', 'browser.act',
+    'dom.act', 'turn.loop.agent', 'gesture.agent', 'arrow.grid.agent',
+    'form.fill.agent', 'web.agent',
+  ]);
+  const _APP_READ_ACTIONS = new Set(['scan_page', 'read_screen', 'get_recent_ocr', 'read_url']);
+  {
+    let _dormantHit = false;
+    const _out = [];
+    // Consecutive UI-driving steps merge into ONE screen.task step — clause-split
+    // UI goals ("make playlist X" / "add A" / "add B") must reach the executor
+    // as a single prompt or learned-flow lookup and entity slots can't see
+    // the whole request. screen.task.agent itself is mergeable for the same
+    // reason: two adjacent screen.task steps are one UI segment.
+    // url.first.agent is dormant for plan emission too — navigation folds
+    // into the screen.task step that owns the goal (screen.task navigates
+    // via `open` itself; a standalone nav step is a dead end). It was the
+    // one gap in the lockdown: guide.step→url.first→dom.act→turn.loop
+    // leaked through as [guide, url.first, screen.task, synth].
+    const _MERGEABLE_UI = new Set([..._DORMANT_UI, 'url.first.agent', 'screen.task.agent', 'screen.act.agent']);
+    let _pending = null;
+    const _flush = () => {
+      if (!_pending) return;
+      _out.push(_pending.read
+        ? { skill: 'screen.act.agent',
+            description: _pending.desc || 'Read the visible page',
+            args: { goal: 'copy the visible page text', steps: [{ action: 'copy_page', why: 'page-read' }] } }
+        : { skill: 'screen.task.agent',
+            description: _pending.desc || `Drive the UI: ${_pending.goal.slice(0, 70)}`,
+            // The user's verbatim request wins over planner paraphrase —
+            // reworded goals ("In the Spotify desktop app, ...") invent
+            // nonexistent targets, fragment learned-flow keys, and drop
+            // entity words the recipe slots need.
+            args: { prompt: userMessage || _pending.goal } });
+      _pending = null;
+    };
+    for (const step of skillPlan) {
+      const _isUiStep = step?.skill && _MERGEABLE_UI.has(step.skill);
+      if (!_isUiStep) { _flush(); _out.push(step); continue; }
+      _dormantHit = _dormantHit || _DORMANT_UI.has(step.skill);
+      const a = step.args || {};
+      const goal = String(a.task || a.goal || a.prompt || step.description || userMessage || '').trim();
+      const isRead = (step.skill === 'app.agent' && _APP_READ_ACTIONS.has(String(a.action || '')))
+        || (step.skill === 'screen.act.agent' && Array.isArray(a.steps) && a.steps.some(s => s?.action === 'copy_page'));
+      if (_pending && (_pending.read !== isRead)) _flush();
+      if (!_pending) _pending = { read: isRead, goal: '', desc: step.description };
+      if (goal && !_pending.goal.includes(goal)) _pending.goal = _pending.goal ? `${_pending.goal} ${goal}` : goal;
+    }
+    _flush();
+    // _out is identical to the input when nothing was rewritten or merged —
+    // assigning unconditionally is safe and covers pure screen.task merges
+    // that set no dormant flag.
+    if (_dormantHit || _out.length !== skillPlan.length) {
+      logger?.warn?.('[Node:PlanSkillsV2] dormant-driver lockdown: rewrote/merged UI-driver step(s) → screen.task/copy_page');
+    }
+    skillPlan = _out;
+
+    // App-launch steps via cli.agent/terminal.agent are setup noise: when a
+    // screen task exists its own deriveSteps setup opens the destination
+    // (web URL or app) — the launch step is redundant and wrong when the
+    // native app isn't installed (observed: "Launch or bring the Spotify
+    // application to the foreground" → cli.agent binary hunt → 8-step fail,
+    // while the task wanted the web player). Bare open-app plans without a
+    // UI step fold to a deterministic `open -a` — never a cli crawl.
+    const _OPENISH = /\b(open|launch|install|start|bring|activate|find|locate)\b[\s\S]{0,80}\b(app|application|program|\.app\b|player|browser|foreground|front)\b|navigate\s+to/i;
+    const _hasScreenTask = skillPlan.some(s => s?.skill === 'screen.task.agent' || s?.skill === 'screen.act.agent');
+    skillPlan = skillPlan.flatMap(step => {
+      const sk = step?.skill;
+      if (sk !== 'cli.agent' && sk !== 'terminal.agent' && sk !== 'shell.run') return [step];
+      const txt = `${step?.description || ''} ${step?.args?.prompt || step?.args?.task || step?.args?.command || step?.args?.goal || ''}`;
+      if (!_OPENISH.test(txt)) return [step];
+      if (_hasScreenTask) {
+        logger?.warn?.(`[Node:PlanSkillsV2] dropped app-launch step ${sk} — screen task setup owns the destination`);
+        return [];
+      }
+      if (sk === 'shell.run') return [step];
+      const m = txt.match(/(?:open|launch|start|bring)\s+(?:or\s+bring\s+)?(?:the\s+)?([A-Za-z0-9 ._'-]{1,30}?)(?:\s+(?:desktop\s+)?(?:app|application|program|player|browser)\b|\.app\b|\s+to\b|$)/i);
+      const app = (m?.[1] || '').trim();
+      return [{ skill: 'shell.run', description: `Open ${app || 'the application'}`,
+                args: { command: app ? `open -a "${app}"` : (step.args?.command || '') } }];
+    });
+  }
   // Browser-automation kill switch — url.first/turn.loop/dom.act aren't
-  // dispatchable when settings.browserAutomation is off, so rewrite to the
-  // proven OS path instead: navigate → shell.run `open <url>` + app.agent
-  // scan_page (the fastLanePlan shape — opens the user's real default
-  // browser, no driving); verify → scan_page. On-page steps for surviving
-  // skills (form.fill/tab.map) pass through; steps for disabled skills are
-  // emitted as-is and reported by the executor's typed backstop error.
+  // dispatchable when settings.browserAutomation is off. UI interaction
+  // (navigate/click/type/verify on a page or in an app) collapses into
+  // screen.task.agent: the screen-driven executor that observes the screen,
+  // resolves visible elements, performs physical CGEvent input, verifies,
+  // and recovers — in the user's real browser/app, no automation session.
+  // It derives its own setup (open URL / focus app via `open`) and steps
+  // from the natural-language goal, and self-verifies, so no separate
+  // verify step follows it.
   const _browserOff = (() => {
     try { return !require('../../../shared/browser-automation.cjs').isBrowserAutomationEnabled(); } catch (_) { return false; }
   })();
   if (_browserOff) {
-    const { SITE_COMPOSE_URL } = require('../utils/localPlanTemplates.js');
-    const _composeSvc = (step) => {
-      const cand = step?.args?.service || step?.args?.agentId || step?.service || '';
-      const key = String(cand).replace(/\.?agent$|_agent$/i, '').trim();
-      return key && SITE_COMPOSE_URL(key, { text: '{{prev_stdout_url}}' }) ? key : null;
-    };
-    // An ACT-shaped step on a compose-capable service ("type the tweet and
-    // post", "reply to the email") degrades to: synthesize the artifact
-    // from prior context → shell.run `open` the prefilled composer in the
-    // user's real browser. The {{prev_stdout}} marker rides in argv — the
-    // serial injectPrev deep-walk substitutes the composed text at run
-    // time, so the composer opens with the artifact already loaded.
-    const _emitComposePair = (step, svc, out) => {
-      const goal = step?.args?.task || step?.args?.goal || step?.description || '';
-      out.push({ skill: 'synthesize',
-        description: `Compose the ${svc} content`,
-        args: { prompt: `Compose exactly the content to paste into ${svc} for this request — no commentary, just the artifact text.\n\nRequest: ${goal}` } });
-      const _cu = SITE_COMPOSE_URL(svc, { text: '{{prev_stdout_url}}' });
-      out.push({ skill: 'shell.run', stepType: 'navigate',
-        description: `Open prefilled ${svc} composer`,
-        args: { cmd: 'open', argv: [_cu] } });
-    };
+    const _UI_DRIVING = new Set([
+      'url.first.agent', 'dom.act', 'turn.loop.agent', 'browser.act',
+      'browser.agent', 'playwright.agent', 'gesture.agent', 'arrow.grid.agent',
+    ]);
+    const _screenStep = (goal, desc) => ({
+      skill: 'screen.task.agent',
+      description: desc || `Drive the UI: ${String(goal).slice(0, 70)}`,
+      args: { prompt: String(goal) },
+    });
+    const _goalOf = (step) =>
+      String(step?.args?.task || step?.args?.goal || step?.description || userMessage || '').trim();
+    // Pure-UI plan (every step is browser-driving or synthesize) → one
+    // screen.task step with the original prompt: it re-derives setup+steps
+    // better than stepwise fragments, and a multi-service prompt stays whole.
+    const _isUiOnly = skillPlan.length > 0 && skillPlan.every(s =>
+      !s?.skill || _UI_DRIVING.has(s.skill) || s.skill === 'synthesize');
+    if (_isUiOnly && userMessage) {
+      const _synth = skillPlan.filter(s => s?.skill === 'synthesize');
+      return _dedupeUiGoalSteps([_screenStep(userMessage), ..._synth], logger);
+    }
     const _out0 = [];
     for (const step of skillPlan) {
-      const a = step?.args || {};
-      const stepType = step?.stepType || _inferStepType(step);
-      const isNav = step?.skill === 'url.first.agent'
-        || step?.skill === 'browser.act'
-        || (step?.skill === 'dom.act' && stepType === 'navigate')
-        || (step?.skill === 'browser.agent' && step?.args?.action === 'run' && stepType === 'navigate');
-      const isVerify = (step?.skill === 'dom.act' && stepType === 'verify')
-        || step?.skill === 'turn.loop.agent'
-        || (step?.skill === 'browser.agent' && step?.args?.action === 'run' && stepType === 'verify');
-      // ACT-shaped driving step on a compose-capable service → degrade to
-      // [compose, open-deep-link] instead of a disabled-skill error.
-      const _isDrivingAct = !isNav && !isVerify && (
-        step?.skill === 'dom.act' || step?.skill === 'turn.loop.agent'
-        || step?.skill === 'browser.act'
-        || (step?.skill === 'browser.agent' && step?.args?.action === 'run'));
-      if (_isDrivingAct) {
-        const _svc = _composeSvc(step);
-        if (_svc) { _emitComposePair(step, _svc, _out0); continue; }
-        _out0.push(step); // no compose surface — executor backstop reports it
-        continue;
+      if (!step?.skill) { _out0.push(step); continue; }
+      if (step.skill === 'screen.task.agent') { _out0.push(step); continue; } // no double-wrap
+      if (_UI_DRIVING.has(step.skill)) {
+        const goal = _goalOf(step);
+        if (goal) _out0.push(_screenStep(goal));
+        continue; // no goal text at all → drop the dead step
       }
-      if (isNav) {
-        const _u = a.url || a.resolvedUrl;
-        if (_u) {
-          _out0.push({ ...step, skill: 'shell.run', stepType: 'navigate',
-            description: step.description || `Open ${String(_u).slice(0, 70)}`,
-            args: { cmd: 'open', argv: [_u] } });
-          _out0.push({ skill: 'app.agent', stepType: 'verify',
-            description: 'Read the loaded page',
-            args: { action: 'scan_page', preferOs: true, maxWaitMs: 20000, timeoutMs: 30000 } });
-        } else {
-          _out0.push(step); // no URL to open — let the executor backstop report it
-        }
-        continue;
-      }
-      if (isVerify) {
-        _out0.push({ ...step, skill: 'app.agent', stepType: 'verify',
-          description: step.description || 'Read the loaded page',
-          args: { action: 'scan_page', preferOs: true, maxWaitMs: 20000, timeoutMs: 30000 } });
-        continue;
-      }
-      _out0.push(step);
+      _out0.push(step); // app.agent reads, shell.run, cli.agent, etc. pass through
     }
-    return _out0;
+    return _dedupeUiGoalSteps(_out0, logger);
   }
   // Track which agents already have a navigation step in this plan — a legacy
   // nav+act fused step (no stepType, e.g. localPlanTemplates service_task) must
@@ -358,7 +486,7 @@ function _rewriteBrowserStepsToAtomicAgents(skillPlan, logger) {
     }
   }
   if (_rewritten) logger?.info(`[Node:PlanSkillsV2] atomic-agents: rewrote ${_rewritten} browser.agent step(s) to atomic skills`);
-  return _out;
+  return _dedupeUiGoalSteps(_out, logger);
 }
 
 // Thin wrapper — apply the atomic-browser plan lint and keep only the plan.
@@ -971,6 +1099,16 @@ function _sanitizeSkillPlan(skillPlan, state, opts = {}) {
     // `curl`), and `web.crawl` — not just _isNavStep.
     {
       const _hostLabel = (u) => { try { return new URL(u).hostname.replace(/^www\./, '').split('.')[0].toLowerCase(); } catch (_) { return ''; } };
+      // Any hostname label the user named sanctions the URL — "open.spotify.com"
+      // for a "...on spotify" prompt is the service's real host, not an
+      // invention. First-label-only matching missed this (observed: an
+      // open.spotify.com literal was judged invented → ask_user paused the run).
+      const _hostLabels = (u) => {
+        try {
+          return new URL(u).hostname.replace(/^www\./, '').split('.')
+            .map(l => l.toLowerCase()).filter(l => l.length >= 3 && !/^(com|net|org|io|co|dev|app|ai|fm|tv|me)$/.test(l));
+        } catch (_) { return []; }
+      };
       const _msgNorm = _msgForUrls.toLowerCase().replace(/[^a-z0-9]/g, '');
       const _named = [];
       bad = bad.filter((u) => {
@@ -978,8 +1116,8 @@ function _sanitizeSkillPlan(skillPlan, state, opts = {}) {
         // Sanctioned search templates are nav destinations only — a google.com
         // literal inside shell.run argv is still an invention.
         if (_isNavStep(step) && label && SITE_SEARCH_URLS[label]) return false;
-        const norm = label.replace(/[^a-z0-9]/g, '');
-        if (norm.length >= 3 && _msgNorm.includes(norm)) { _named.push(u); return false; }
+        const labels = _hostLabels(u);
+        if (labels.some(l => _msgNorm.includes(l.replace(/[^a-z0-9]/g, '')))) { _named.push(u); return false; }
         return true;
       });
       for (const u of _named) {
@@ -1928,7 +2066,7 @@ function _buildSystemPrompt(userMessage, state) {
 
   let result = `## PRIMACY RULE\nThe CURRENT USER REQUEST below is the source of truth. Prior conversation and screen context are provided ONLY for pronoun resolution ("it", "that", "this"). If the current request names a specific task, service, or topic, plan for THAT task — do not continue prior tasks. Step args that carry user content (text to type, email/message bodies, search terms, titles) MUST be copied verbatim from the CURRENT USER REQUEST — never substitute prior step results, assistant replies, or screen context into them (observed: a compose step typed leaked prior-result text instead of the requested body).\n\n`
     + (_browserOff
-      ? `## ENVIRONMENT CONSTRAINT\nBrowser automation is DISABLED in this environment: url.first.agent, dom.act, turn.loop.agent, browser.act, browser.agent, playwright.agent, gesture.agent, arrow.grid.agent are NOT dispatchable — a step emitting one fails with 'browser_automation_disabled' (this overrides any vocabulary the base prompt or examples teach). Navigate via shell.run {cmd:"open",argv:[url]}; read pages via app.agent {action:"scan_page",preferOs:true}; CLI services via cli.agent.\n\n`
+      ? `## ENVIRONMENT CONSTRAINT\nLegacy UI drivers are DORMANT in this environment: app.agent, url.first.agent, dom.act, turn.loop.agent, browser.act, browser.agent, playwright.agent, gesture.agent, arrow.grid.agent, form.fill.agent, web.agent are NOT dispatchable — a step emitting one is rewritten to screen.task.agent (this overrides any vocabulary the base prompt or examples teach). For ANY UI task — navigating, clicking, typing, reading a page, driving a desktop app — emit ONE screen.task.agent step per UI task {prompt:"<the ENTIRE goal, verbatim — do not split a UI task into per-clause steps>"}; it observes the screen, resolves elements, acts physically, and verifies, and learned flows only match whole-goal prompts. For pure page-text reads emit screen.act.agent {goal:"copy the visible page text", steps:[{action:"copy_page"}]}. Navigate via shell.run {cmd:"open",argv:[url]}; CLI services via cli.agent.\n\n`
       : '')
     + base;
   const appendices = [];
@@ -1941,7 +2079,9 @@ function _buildSystemPrompt(userMessage, state) {
     if (_needsCli) appendices.push('plan-skills-cli-first.md');
     if (_needsImage) appendices.push('plan-skills-image.md');
     if (_isMacOS) appendices.push('plan-skills-macos.md');
-    if (_needsApp) appendices.push('plan-skills-app.md');
+    // plan-skills-app.md teaches the dormant app.agent/GhostLayer stack —
+    // not appended while those drivers are dormant (see lockdown above).
+    // if (_needsApp) appendices.push('plan-skills-app.md');
     if (_needsWebFetch) appendices.push('plan-skills-webfetch.md');
     if (_needsBrowser) appendices.push(_browserOff ? 'plan-skills-browser-off.md' : 'plan-skills-browser.md');
   }
@@ -2593,7 +2733,7 @@ async function planSkillsV2(state) {
         // since resolved in live context.
         const _resolvedPlan = _resolveCtxUrlTokens(decoded, state._priorScreenContext?.url, state._gatheredVars, logger);
         // Preserve an explicit skillCursor (e.g. from deferred reminder run) instead of always resetting to 0
-        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger), logger, state._extSessions, userMessage, state);
+        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(_resolvedPlan, userMessage), logger, userMessage), logger, state._extSessions, userMessage, state);
         const _startCursor = (typeof state.skillCursor === 'number' && state.skillCursor >= 0 && state.skillCursor < _guardedPlan.length) ? state.skillCursor : 0;
         logger.info(`[Node:PlanSkillsV2] Pre-approved skill plan: ${_guardedPlan.length} steps (startCursor=${_startCursor})`);
         if (progressCallback) progressCallback({ type: 'plan_ready', steps: _guardedPlan.map((s, i) => ({ index: i, skill: s.skill, description: s.description || buildStepDescription(s), args: s.args, runGroup: s.runGroup || undefined })), intent: state.intent?.type || 'command_automate', isResume: state._skillPlanIsResume === true });
@@ -2608,7 +2748,7 @@ async function planSkillsV2(state) {
   if (state._loginResumeSkillPlan && !recoveryContext) {
     logger.info('[Node:PlanSkillsV2] Login resume: returning existing plan as-is');
     const _resumePlan = Array.isArray(state._loginResumeSkillPlan)
-      ? _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger), logger, state._extSessions, userMessage, state)
+      ? _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep([...state._loginResumeSkillPlan], userMessage), logger, userMessage), logger, state._extSessions, userMessage, state)
       : state._loginResumeSkillPlan;
     return { ...state, skillPlan: _resumePlan, skillCursor: 0, planError: null };
   }
@@ -2848,7 +2988,7 @@ async function planSkillsV2(state) {
     try {
       const cached = await findSimilarCompletePlan(userMessage, PLANS_DIR, logger);
       if (cached && Array.isArray(cached.plan) && cached.plan.length > 0) {
-        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(cached.plan, userMessage), logger), logger, state._extSessions, userMessage, state);
+        const _guardedPlan = _lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(cached.plan, userMessage), logger, userMessage), logger, state._extSessions, userMessage, state);
         if (_guardedPlan.length > cached.plan.length) {
           logger.info(`[Node:PlanSkillsV2] Semantic cache hit: "${cached.planFile}" — appended synthesize step`);
         } else {
@@ -2918,7 +3058,7 @@ async function planSkillsV2(state) {
     // browser.agent selects URL-first navigation instead of a blind start page.
     const detPlan = _taskAgentPlan || _sanitizeSkillPlan(_lintAtomicPlan(_rewriteBrowserStepsToAtomicAgents(_ensureSynthesizeStep(
       _stripRedundantVerifySteps(_markSatisfiedOpenSteps(_fillBrowserStepAgentIds(_injectPreflightDeepLinks(state._deterministicPlan.map((s, i) => ({ ...s, step: i + 1 })), state, logger), logger), state, logger), state, logger),
-      userMessage), logger), logger, state._extSessions, userMessage), state, { dispatchable: await _getDispatchable() });
+      userMessage), logger, userMessage), logger, state._extSessions, userMessage), state, { dispatchable: await _getDispatchable() });
     // Messaging follow-up body: the service_task template passes the raw
     // message as task ("send this info to X"), so the browser agent never sees
     // the actual content and invents a placeholder body. Attach the resolved
@@ -3699,8 +3839,11 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
       ];
 
       // Single-step replan output must clear the same gates as full plans —
-      // unproven install argv, invented URLs, etc. Otherwise the recovery path
-      // silently reintroduces exactly what sanitize strips.
+      // dormant-driver lockdown + unproven install argv, invented URLs, etc.
+      // Otherwise the recovery path silently reintroduces exactly what the
+      // rewrite and sanitize strip (observed: a spliced app.agent step ran
+      // scan_page + keystrokes into the same window mid-screen.task).
+      newPlan = _rewriteBrowserStepsToAtomicAgents(newPlan, logger, userMessage);
       newPlan = _sanitizeSkillPlan(newPlan, state, { dispatchable: await _getDispatchable() });
 
       logger.info(`[Node:PlanSkillsV2] Single-step replan complete: replaced step ${state.skillCursor} with new ${newPlan[state.skillCursor]?.skill}`);
@@ -4586,7 +4729,7 @@ EXAMPLE: [ { "skill": "web.agent", "args": { "action": "search", "query": "A rev
 
   // ── Atomic browser agents: rewrite browser.agent run steps → atomic skills ──
   if (Array.isArray(skillPlan)) {
-    skillPlan = _rewriteBrowserStepsToAtomicAgents(skillPlan, logger);
+    skillPlan = _rewriteBrowserStepsToAtomicAgents(skillPlan, logger, userMessage);
     const _atomicLint = lintAtomicBrowserPlan(skillPlan, logger, {
       extConnected: (state._extSessions || []).length > 0,
       extSessions: state._extSessions,
@@ -4815,6 +4958,7 @@ module.exports._buildSystemPrompt = _buildSystemPrompt;
 module.exports._inferOutputSchemaFallback = _inferOutputSchemaFallback;
 module.exports._selectPriorSynthesis = _selectPriorSynthesis;
 module.exports._sanitizeSkillPlan = _sanitizeSkillPlan;
+module.exports._rewriteBrowserStepsToAtomicAgents = _rewriteBrowserStepsToAtomicAgents;
 module.exports._ensureSynthesizeStep = _ensureSynthesizeStep;
 module.exports._injectPreflightDeepLinks = _injectPreflightDeepLinks;
 module.exports._fillBrowserStepAgentIds = _fillBrowserStepAgentIds;

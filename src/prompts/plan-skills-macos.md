@@ -4,9 +4,9 @@ Domain-specific guidance for macOS system behavior. File-operation patterns (mdf
 
 ## Opening and Closing Apps / Documents
 
-- **Opening/focusing apps** — use `app.agent` (e.g. `execute_shortcut` or `verify_app_focused`), never `shell.run` and never `browser.act`. `app.agent` handles bringing the app to the front internally.
+- **Opening/focusing apps** — `screen.task.agent` handles it internally (`open -a` + verified frontmost) whenever the task involves any UI interaction; for a bare launch with no interaction, `shell.run` `open -a "<App>"` is fine. Never `browser.act`.
 - **Closing a file on macOS** — use `osascript -e 'tell application "AppName" to close (every document whose name is "filename")'`. NEVER use `lsof | kill`, `kill -9`, or `xargs kill` — those kill the whole app or random processes. To find which app has the file open: `mdls -name kMDItemLastUsedApp "/path/to/file"`. For .txt files the app is usually "TextEdit". For PDFs use "Preview". Always close the document, not the application (unless the user explicitly says "quit TextEdit").
-- **osascript / AppleScript** — use `shell.run bash -c 'osascript -e "..."'` only for simple AppleScript commands that no skill can do (e.g. closing a specific document). Do NOT use osascript to open or focus apps — that is handled by `app.agent`. Note: macOS requires the user to grant Automation permission in System Settings → Privacy & Security → Automation before osascript can control other apps.
+- **osascript / AppleScript** — use `shell.run bash -c 'osascript -e "..."'` only for simple AppleScript commands that no skill can do (e.g. closing a specific document). Do NOT use osascript to open or focus apps — `screen.task.agent` (UI tasks) and `open -a` (bare launches) handle that. Note: macOS requires the user to grant Automation permission in System Settings → Privacy & Security → Automation before osascript can control other apps.
 
 ## Reminders vs Calendar — pick the tool by the user's wording
 

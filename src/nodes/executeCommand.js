@@ -1284,6 +1284,12 @@ async function _thinPostFailureHandlerImpl(state) {
       && failedStep.skill !== 'edit.agent' && failedStep.skill !== 'task.agent'
       && !_WEB_FETCH_SKILLS.has(failedStep.skill)
       && failedStep.skill !== 'screen.display'   // a terminal loop can't fix a display contract
+      // A failed screen-driven UI step must NEVER fall to a terminal loop —
+      // cli.agent's "Diagnose and complete" re-dispatches the same UI task
+      // (observed: a verified playlist create was re-driven as "spotify: <goal>",
+      // failed on a typing flake, and poisoned the result set). GUI failures
+      // fall through to LLM recovery/ask_user with honest error evidence.
+      && failedStep.skill !== 'screen.task.agent' && failedStep.skill !== 'screen.act.agent'
       && !failedStep.askUser && !failedStep.delegateTo
       && !_browserish(failedStep.skill)
       && !_disabledErr
@@ -6942,6 +6948,13 @@ Please try again or search with different terms.`;
   // 7 min allows Tab-Flow (up to 210s) + turn-loop recovery + Tab-Flow re-entry.
   if (skill === 'browser.agent' || skill === 'cli.agent') {
     stepTimeoutMs = Math.max(stepTimeoutMs, 420000); // 7 min
+  }
+  // screen.task.agent: screen-driven UI loop — setup (open/focus) + per-step
+  // parse→resolve→act→verify→recover cycles across many steps. A gmail send
+  // is ~15-20s, but multi-service prompts or recovery ladders can run minutes;
+  // progress callbacks keep the UI live during the wait.
+  if (skill === 'screen.task.agent' || skill === 'screen.act.agent') {
+    stepTimeoutMs = Math.max(stepTimeoutMs, 300000); // 5 min
   }
   // form.fill.agent can block on a batched QuestionCard awaiting the user's
   // missing-field answers (10-min gather timeout) — the step must outlive it.

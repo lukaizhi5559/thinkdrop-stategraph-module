@@ -73,6 +73,13 @@ function _inferEllipticalFollowUp(message, history) {
       // prior turn — "look into this company on my screen" must not anchor to
       // whatever topic the conversation last touched.
       || /\bon\s+(?:my\s+|the\s+)?screen\b/i.test(_msg)) return null;
+  // Imperative command-open is NOT a continuation: "Goto google docs and type
+  // up a page…" carries its own destination+action. Without this, question
+  // words + anaphora inside the same prompt ("how he lived…It should be one
+  // page") match the elliptical regex and bind the PRIOR turn's target —
+  // observed: the prompt ran web_search/general_knowledge instead of the
+  // UI task it asked for.
+  if (/^\s*(?:go\s*to|goto|open|launch|navigate(?:\s+to)?|visit|start)\b/i.test(_msg)) return null;
   const users = _historyUserTexts(history);
   if (!users.length) return null;
   // Chained follow-ups ("what else did it say" → "who was mentioned in it"):
@@ -1006,6 +1013,36 @@ async function classifyTask(userMessage, conversationHistory, llmBackend, logger
           needsFreshScreen: false,
         };
       }
+    }
+
+    // ── Imperative-command floor ─────────────────────────────────────────────
+    // "Goto X and do Y" is ALWAYS a command task — a leading nav/open verb on a
+    // named destination plus an action verb can never be a query, no matter how
+    // much question/research phrasing the rest of the sentence carries. The
+    // elliptical floor above can still misfire on self-referential prompts
+    // ("Who was he…It should be one page"), and the provider itself reads the
+    // research clause and answers 'query' — this floor repairs both. Service
+    // resolves to 'browser' (web service/URL) vs 'local_system' (desktop app).
+    const _CMD_OPEN_RE = /^\s*(?:go\s*to|goto|open|launch|navigate\s+to|visit|start)\s+.{1,80}?/i;
+    const _ACTION_TAIL_RE = /\b(?:type|write|send|email|message|post|reply|forward|compose|click|fill|submit|create|add|set|schedule|book|order|buy|delete|remove|edit|update|rename|move|copy|save|print|search|find|look\s*up|check|play|pause|download|upload|install|run|scroll)\b/i;
+    const _DESKTOP_APP_RE = /\b(?:finder|terminal|notes?|reminders?|calendar|textedit|text\s*edit|vs\s*code|vscode|slack|spotify|music|messages?|mail\b|photos?|preview|maps?|system\s*settings|numbers?|pages|keynote|xcode|safari|chrome|firefox)\b/i;
+    const _isPassiveVerdict = parsed.taskType === 'query'
+      || ['general_knowledge', 'greeting', 'web_search', 'memory_store', 'memory_retrieve'].includes(parsed.suggestedIntent);
+    if (_isPassiveVerdict && _CMD_OPEN_RE.test(classifiedMessage) && _ACTION_TAIL_RE.test(classifiedMessage)) {
+      const _isApp = _DESKTOP_APP_RE.test(classifiedMessage)
+        && !/(?:docs?|sheets?|slides?|drive|gmail|youtube|figma|notion|github|amazon|ebay|reddit|twitter|linkedin|facebook|instagram|tiktok|chatgpt|claude|grok|perplexity)\b/i.test(classifiedMessage);
+      logger.info(`[classifyTask] Imperative-command floor → ${_isApp ? 'local_system' : 'browser'} (was ${parsed.taskType}/${parsed.suggestedIntent}): "${classifiedMessage.slice(0, 80)}"`);
+      parsed = {
+        ...parsed,
+        taskType: _isApp ? 'local_system' : 'browser',
+        suggestedIntent: 'command_automate',
+        isFollowUp: false,
+        followUpTarget: null,
+        needsClarification: false,
+        webAccessMode: _isApp ? parsed.webAccessMode : 'interactive',
+        interactiveActions: Array.isArray(parsed.interactiveActions) && parsed.interactiveActions.length
+          ? parsed.interactiveActions : ['view_page'],
+      };
     }
 
     // Sanitize webAccessMode — only the four known values; requiresDOM forces

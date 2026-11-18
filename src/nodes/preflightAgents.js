@@ -363,17 +363,33 @@ const _FILE_REGEX_PATTERNS = [
   /\b([A-Za-z_][A-Za-z0-9_-]*\.[a-zA-Z0-9]+)\b/,
 ];
 
+// Extensions that make a bare dotted token plausibly a filename. The fallback
+// pattern matches ANY dotted identifier — git.agent, recoveryContext.failedSkill,
+// plan.v2 — which are field paths / agent IDs, not files (observed: a git-ops
+// follow-up extracted "git.agent" → probed the filesystem → .gitignore matches
+// → irrelevant "5 files found" QuestionCard).
+const _KNOWN_FILE_EXTS = /^(?:tsx?|jsx?|mjs|cjs|py|rb|go|rs|c|cc|cpp|h|hpp|java|kt|kts|swift|m|mm|cs|php|pl|pm|sh|bash|zsh|fish|ps1|bat|cmd|json|jsonc|ya?ml|toml|ini|cfg|conf|env|xml|xsd|html?|xhtml|css|scss|sass|less|styl|md|markdown|mdx|rst|txt|text|log|csv|tsv|sql|db|sqlite3?|prisma|proto|graphql|gql|vue|svelte|astro|ipynb|png|jpe?g|gif|webp|svg|ico|icns|bmp|tiff?|heic|pdf|docx?|xlsx?|pptx?|pages|numbers|key|zip|tar|gz|tgz|bz2|xz|7z|rar|jar|war|wasm|mp[34]|m4a|mov|avi|mkv|webm|wav|flac|ogg|aac|ttf|otf|woff2?|eot|lock|map|dmg|pkg|deb|rpm|msi|appimage|apk|ipa|bin|dat|dump|patch|diff|cer|crt|pem|key|pub|asc|gpg|p12|jks|keystore|mobileprovision|plist|entitlements|xcconfig|pbxproj|storyboard|xib|gradle|properties|iml|idea|sln|vcxproj|csproj|fsproj|proj|mk|cmake|ninja|gyp|am|ac|in|def|rc|manifest|reg|inf|sys|drv|ko|o|a|so|dylib|dll|exe|out|elf|class|dex|pyc|pyo|egg|whl|gem|podspec|cartfile|xcodeproj|xcworkspace|playground|sketch|fig|xd|psd|ai|eps|indd|blend|fbx|obj|stl|step|stp|iges|dwg|dxf|gltf|glb|hdr|exr|raw|nef|cr2|arw|dng|srt|vtt|ass|ssa|lrc|torrent|ics|vcf|eml|mbox|msg|oft|pst|ost|dbx|edb|nsf|rtf|odt|ods|odp|epub|mobi|azw3?|cbz|cbr|djvu|chm|hlp|tex|bib|cls|sty|aux|toc|lof|lot|out|synctex|r|R|jl|lua|vim|el|clj|cljs|edn|ex|exs|erl|hrl|hs|lhs|ml|mli|fs|fsx|fsi|fsproj|scala|sbt|groovy|gradle|kts|dart|sol|vy|move|cairo|zig|nim|cr|d|pas|pp|inc|asm|s|nasm|masm|f|for|f90|f95|cob|cbl|ada|adb|ads|pro|pl1|rex|tcl|tk|applescript|scpt|osascript|workflow|command|workflow|automator|scptd|wdgt|bundle|plugin|qlgenerator|appex|xpc|mdimporter|spolight|prefpane|saver|screen-saver|screenSaver)$/i;
+
 function _extractFileCandidate(userMessage) {
   let candidate = null;
-  for (const p of _FILE_REGEX_PATTERNS) {
-    const m = userMessage.match(p);
+  let patternIdx = -1;
+  for (let i = 0; i < _FILE_REGEX_PATTERNS.length; i++) {
+    const m = userMessage.match(_FILE_REGEX_PATTERNS[i]);
     if (m && m[1]) {
       candidate = m[1].trim();
+      patternIdx = i;
       break;
     }
   }
   if (candidate && _FILE_STOPWORDS.test(candidate)) {
     candidate = null;
+  }
+  // Bare dotted-token fallback (last pattern): the token must carry a real
+  // file extension — otherwise it's an identifier (git.agent,
+  // recoveryContext.failedSkill), not a filename.
+  if (candidate && patternIdx === _FILE_REGEX_PATTERNS.length - 1) {
+    const ext = candidate.split('.').pop() || '';
+    if (!_KNOWN_FILE_EXTS.test(ext)) candidate = null;
   }
   return candidate;
 }
@@ -538,6 +554,23 @@ module.exports = async function preflightAgents(state) {
   }
   const recoveryContext = state.recoveryContext || null;
 
+  // ── Turn facts — judgments/extraction read the ask, not injected context ──
+  // resolvedMessage/userMessage carry resolveReferences injections
+  // ("(Resolved referent — message created by git.agent …)", "(Context from
+  // prior turn: …)") — extraction that scans them fires on context text, not
+  // the user's ask (observed: "git.agent" and "recoveryContext.failedSkill"
+  // extracted as file names; "message" in referent text → send_message
+  // taskFacts on a git task). facts.userText = blob-stripped ask;
+  // facts.requestText = the trailing ask segment; attachments = deliberate
+  // [File:]/[Folder:]/[Context:] references (real extraction inputs).
+  const _facts = (() => {
+    try {
+      return require('../../../shared/turn-facts.cjs').computeTurnFacts({ rawText: state.message || userMessage });
+    } catch (_) { return null; }
+  })();
+  const _askText = _facts?.userText || String(state.message || userMessage || '');
+  const _requestText = _facts?.requestText || _askText;
+
   // ── Pure in-page navigation — skip file-probe ──────────────────────────────
   // "go back for me on this page" / "reload this page" operate on the tab the
   // user is already looking at. There is no file to probe — but the
@@ -608,15 +641,18 @@ module.exports = async function preflightAgents(state) {
   // the injected activeDocTarget ("Amazon.com product page") is a URL context,
   // not a document reference.
   if (!_isInPageNav && (_tc.taskType === 'app_automation' || _tc.taskType === 'local_file' || _tc.activeDocRef === 'file' || _tc.activeDocTarget)) {
-    let candidate = _extractFileCandidate(userMessage);
+    // [File:]/[Folder:] attachment markers are deliberate references — parse
+    // them before regex extraction (deterministic, no guessing).
+    const _attachRef = (_facts?.attachments || []).find(a => (a.kind === 'file' || a.kind === 'folder') && a.value);
+    let candidate = _attachRef ? _attachRef.value : _extractFileCandidate(_askText);
     // "the file" has no literal name to extract — fall back to the resolved
     // live-document target.
     if (!candidate && _tc.activeDocTarget && /^(\/|~\/)/.test(String(_tc.activeDocTarget))) {
       candidate = String(_tc.activeDocTarget);
     }
-    if (!candidate && /\b(?:open|examine|read|edit|view|show|load|find|import|ask|tell)\b/i.test(userMessage)) {
+    if (!candidate && /\b(?:open|examine|read|edit|view|show|load|find|import|ask|tell)\b/i.test(_askText)) {
       logger.info('[Node:PreflightAgents] No regex match for file name — trying LLM extraction');
-      candidate = await _llmExtractFileCandidate(state.llmBackend, userMessage, logger);
+      candidate = await _llmExtractFileCandidate(state.llmBackend, _askText, logger);
     }
 
     if (candidate) {
@@ -642,7 +678,12 @@ module.exports = async function preflightAgents(state) {
         } catch (_) { /* keep ambiguous */ }
       }
 
-      // If ambiguous or not found, ask the user for disambiguation
+      // If ambiguous, ask the user for disambiguation — but validate the
+      // answer: anything that isn't an existing path or one of the listed
+      // candidates is prose, not a path (observed: "amend commit message not
+      // files" was injected as [Resolved file path:]).
+      // viaGather tags the progress emit — the gather batch card owns this
+      // surface; the askUserPrompt mirror would render a duplicate card.
       if (_fileResolution.status === 'ambiguous' && _fileResolution.candidates?.length > 0 && gatherAnswerCallback) {
         const question = `I found ${_fileResolution.candidates.length} files matching "${candidate}". Which one should I use?`;
         _emitProgress({
@@ -653,28 +694,25 @@ module.exports = async function preflightAgents(state) {
             value: p,
           })),
           source: 'preflightAgents',
+          viaGather: true,
         });
         try {
           const answer = await gatherAnswerCallback(question);
-          if (answer && answer.trim()) {
-            _fileResolution = { status: 'exact', path: answer.trim() };
-            logger.info(`[Node:PreflightAgents] User selected file: ${answer.trim()}`);
+          const picked = String(answer || '').trim();
+          if (picked && (_fileResolution.candidates.includes(picked) || fs.existsSync(picked))) {
+            _fileResolution = { status: 'exact', path: picked };
+            logger.info(`[Node:PreflightAgents] User selected file: ${picked}`);
+          } else if (picked) {
+            logger.info(`[Node:PreflightAgents] Disambiguation answer is not a path ("${picked.slice(0, 80)}") — leaving candidates for the planner`);
           }
         } catch (e) {
           logger.warn(`[Node:PreflightAgents] File disambiguation question failed: ${e.message}`);
         }
-      } else if (_fileResolution.status === 'none' && gatherAnswerCallback) {
-        const question = `I couldn't find a file matching "${candidate}". Please provide the exact file path.`;
-        _emitProgress({ type: 'ask_user', question, source: 'preflightAgents' });
-        try {
-          const answer = await gatherAnswerCallback(question);
-          if (answer && answer.trim()) {
-            _fileResolution = { status: 'exact', path: answer.trim() };
-            logger.info(`[Node:PreflightAgents] User provided file path: ${answer.trim()}`);
-          }
-        } catch (e) {
-          logger.warn(`[Node:PreflightAgents] File path question failed: ${e.message}`);
-        }
+      } else if (_fileResolution.status === 'none') {
+        // A miss on a guessed candidate is not a missing file — asking the
+        // user for a path here produced off-topic QuestionCards on non-file
+        // tasks (observed: "couldn't find git.agent — provide the exact path").
+        logger.info(`[Node:PreflightAgents] File candidate "${candidate}" not found on disk — continuing without a resolved path`);
       }
 
       // Enrich resolvedMessage with the resolved path so downstream nodes can use it
@@ -686,6 +724,133 @@ module.exports = async function preflightAgents(state) {
         // hallucinating a path (task_f605d60d invented an iCloud path).
         userMessage = `${userMessage}\n[Ambiguous file candidates — pick the most likely, use the path verbatim: ${_fileResolution.candidates.join(' | ')}]`;
       }
+    }
+  }
+
+  // ── Git-reference resolution — verified repo↔hash bindings before planning ─
+  // Plan tasks that name a commit hash historically carried no repo path, so
+  // cli.agent guessed a cwd and `git commit --amend` rewrote the WRONG repo's
+  // HEAD (observed: "amend commits 2eb157d/5b4c854" ran in the ThinkDrop root —
+  // produced commit 0628aa4 carrying stategraph-module's message on 21
+  // unrelated files). Resolve bindings deterministically HERE — same "compute
+  // facts once upstream" pattern as _fileResolution — so the planner emits
+  // `git -C /abs/repo` task text instead of the executor guessing.
+  let _gitRefs = null;
+  const _GIT_OPS_RE = /\b(commit|commits|amend|rebase|cherry-?pick|revert|reset|checkout|merge|squash|stash|tag|branch|push|pull|diff|log|hash)\b/i;
+  const _HASH_RE = /\b[0-9a-f]{7,40}\b/gi;
+  if (mcpAdapter && _GIT_OPS_RE.test(_askText)) {
+    try {
+      // Hex candidates — require at least one hex letter beyond digits? No:
+      // git short-hashes can be all digits. But a 7+ char token that is ALL
+      // digits is far more likely a number than a hash — filter those.
+      const _hashes = [...new Set((String(_askText).match(_HASH_RE) || [])
+        .map(h => h.toLowerCase())
+        .filter(h => h.length >= 7 && /[a-f]/.test(h)))];
+      if (_hashes.length) {
+        // Candidate repo set — explicit paths in the ask first, then cwd,
+        // then cwd's immediate children with .git (nested-repo workspaces),
+        // then ~/Desktop/projects children. Bounded: first hit per hash wins.
+        const _candRepos = [];
+        const _pushRepo = (p) => {
+          if (!p) return;
+          try {
+            const abs = path.resolve(String(p).replace(/^~(?=\/|$)/, os.homedir()));
+            if (fs.existsSync(path.join(abs, '.git')) && !_candRepos.includes(abs)) _candRepos.push(abs);
+          } catch (_) {}
+        };
+        for (const m of String(_askText).matchAll(/(?:^|\s)(\/[^\s"'`]+\.\w{0,4}|\/[^\s"'`]{2,}|~\/[^\s"'`]+)/g)) _pushRepo(m[1]);
+        // Bare repo names in the ask ("in stategraph-module", "comms-graph")
+        // resolve against the discoverable dirs below — record names to
+        // prioritize candidates whose basename matches.
+        const _namedRepos = new Set([...String(_askText).matchAll(/\b([a-z][\w-]{2,40})\b/gi)]
+          .map(m => m[1].toLowerCase())
+          .filter(w => /(?:^|[-_])(graph|module|service|services|repo|lib|app|api|cli|core|shared|server|client|web|ui|agent|engine|runtime)(?:[-_]|$)/.test(w)));
+        _pushRepo(process.cwd());
+        const _scanDirForRepos = (dir) => {
+          try {
+            for (const d of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (d.isDirectory()) _pushRepo(path.join(dir, d.name));
+            }
+          } catch (_) {}
+        };
+        _scanDirForRepos(process.cwd());
+        _scanDirForRepos(path.join(os.homedir(), 'Desktop', 'projects'));
+        // Ask-named repos probe first — "in stategraph-module" wins order.
+        _candRepos.sort((a, b) => Number(_namedRepos.has(path.basename(b).toLowerCase())) - Number(_namedRepos.has(path.basename(a).toLowerCase())));
+
+        if (_candRepos.length) {
+          const _runGit = async (argv, timeoutMs = 5000) => {
+            const res = await mcpAdapter.callService('command', 'command.automate', {
+              skill: 'shell.run',
+              args: { cmd: 'git', argv },
+            }, { timeoutMs }).catch(() => null);
+            const data = res?.data || res;
+            return { code: data?.exitCode ?? data?.code ?? 1, stdout: String(data?.stdout || data?.output || '') };
+          };
+          _gitRefs = {};
+          const _unresolved = [];
+          for (const h of _hashes) {
+            let bound = null;
+            for (const repo of _candRepos) {
+              const r = await _runGit(['-C', repo, 'cat-file', '-e', `${h}^{commit}`]);
+              if (r.code === 0) {
+                const s = await _runGit(['-C', repo, 'log', '-1', '--format=%s', h]).catch(() => null);
+                bound = { repoPath: repo, subject: (s?.stdout || '').trim().split('\n')[0] || '' };
+                break;
+              }
+            }
+            if (bound) _gitRefs[h] = bound;
+            else _unresolved.push(h);
+          }
+          const _boundCount = Object.keys(_gitRefs).length;
+          logger.info(`[Node:PreflightAgents] git refs: ${_boundCount}/${_hashes.length} hash(es) bound to repos${_boundCount ? ` (${Object.entries(_gitRefs).map(([h, b]) => `${h}→${b.repoPath}`).join(', ')})` : ''}${_unresolved.length ? `; unverified: ${_unresolved.join(', ')}` : ''}`);
+
+          // Unverified hash → ask which repo it lives in — NEVER guess a cwd
+          // for a hash-mutating task (that's how --amend hit the wrong HEAD).
+          if (_unresolved.length && gatherAnswerCallback) {
+            const question = `I can't find commit ${_unresolved.map(h => `"${h}"`).join(', ')} in the local repositories I checked. Which repository should I use?`;
+            _emitProgress({
+              type: 'ask_user',
+              question,
+              options: _candRepos.map(r => ({ label: path.basename(r), value: r })),
+              source: 'preflightAgents',
+              viaGather: true,
+            });
+            try {
+              const answer = String(await gatherAnswerCallback(question) || '').trim();
+              const pickedRepo = _candRepos.find(r => r === answer || path.basename(r).toLowerCase() === answer.toLowerCase())
+                || (fs.existsSync(answer) ? path.resolve(answer) : null);
+              if (pickedRepo) {
+                for (const h of [..._unresolved]) {
+                  const r = await _runGit(['-C', pickedRepo, 'cat-file', '-e', `${h}^{commit}`]);
+                  if (r.code === 0) {
+                    const s = await _runGit(['-C', pickedRepo, 'log', '-1', '--format=%s', h]).catch(() => null);
+                    _gitRefs[h] = { repoPath: pickedRepo, subject: (s?.stdout || '').trim().split('\n')[0] || '' };
+                    _unresolved.splice(_unresolved.indexOf(h), 1);
+                  }
+                }
+              }
+            } catch (e) {
+              logger.warn(`[Node:PreflightAgents] git repo disambiguation failed: ${e.message}`);
+            }
+          }
+          if (_unresolved.length) {
+            logger.warn(`[Node:PreflightAgents] git hash(es) unverified in all candidate repos: ${_unresolved.join(', ')} — planner must not guess a repo for them`);
+          }
+
+          // Planner-visible binding — the plan's task text must carry `git -C`,
+          // not a bare hash. Unverified hashes are called out so the planner
+          // asks instead of inventing a repository.
+          const _bindNote = [
+            ...Object.entries(_gitRefs).map(([h, b]) => `${h} → ${b.repoPath}${b.subject ? ` ("${b.subject.slice(0, 80)}")` : ''}`),
+            ..._unresolved.map(h => `${h} → UNVERIFIED (not found in checked repos — do NOT guess; ask which repository)`),
+          ];
+          userMessage = `${userMessage}\n[Verified git bindings — use \`git -C <repoPath>\` for every command on these hashes: ${_bindNote.join('; ')}]`;
+        }
+      }
+    } catch (e) {
+      logger.warn(`[Node:PreflightAgents] git-ref resolution failed: ${e.message}`);
+      _gitRefs = null;
     }
   }
 
@@ -775,7 +940,7 @@ module.exports = async function preflightAgents(state) {
   // every downstream consumer (public-web gate, planner dedup, eyes
   // postcondition) reads facts instead of re-deriving.
   const _MUTATION_TASK_RE = /\b(set|create|add|make|new|schedule|book|send|post|publish|upload|submit|reply|forward|compose|delete|edit|update|invite|share|buy|order|checkout|pay|reserve|fill|sign|register)\b[^.]{0,50}\b(event|meeting|appointment|reminder|calendar|e-?mail|message|post|comment|order|booking|reservation|doc|document|file|note|task|list|photo|video|call|form)\b/i;
-  const _msgHasMutation = _MUTATION_TASK_RE.test(String(userMessage || ''));
+  const _msgHasMutation = _MUTATION_TASK_RE.test(_requestText);
   // The pinned/resolved agent IS a service signal when classification is thin —
   // handoff plan-tasks skip full classification so _tc.targetService is empty
   // while resolveAgent already pinned "google.agent" deterministically.
@@ -792,7 +957,7 @@ module.exports = async function preflightAgents(state) {
     isMutation: !!((_tc.targetService || _pinnedSvcCanon) && _msgHasMutation)
       || !!(_tc.webAccessMode === 'interactive' && (_tc.targetService || _pinnedSvcCanon) && (_tc.interactiveActions || []).length),
     mutationAction: (() => {
-      const _m = String(userMessage || '');
+      const _m = _requestText;
       return /\b(send|reply|forward|compose|e-?mail|message|dm)\b/i.test(_m) ? 'send_message'
         : /\b(book|schedule|reserve|appointment|meeting|event|reminder|calendar)\b/i.test(_m) ? 'book_reservation'
         : /\b(buy|order|checkout|pay|cart|purchase)\b/i.test(_m) ? 'add_to_cart'
@@ -805,9 +970,11 @@ module.exports = async function preflightAgents(state) {
   logger.info(`[Node:PreflightAgents] taskFacts: service=${taskFacts.service || 'none'} isMutation=${taskFacts.isMutation} action=${taskFacts.mutationAction || 'n/a'} webAccessMode=${_tc.webAccessMode || 'n/a'}`);
 
   // Entities — one deterministic extraction, consumed by fill steps AND the
-  // guardian-rules seam below.
+  // guardian-rules seam below. Reads the blob-stripped ask — pasted code/logs
+  // must not leak entities (a quoted commit body with "titled 'X'" is not the
+  // user's entity).
   try {
-    const _em = String(userMessage || '');
+    const _em = _askText;
     const _ent = {};
     const _titled = _em.match(/\b(?:titled|named|called)\s+["']([^"']+)["']/i);
     const _saying = _em.match(/\b(?:saying|that says?|with (?:the )?body|with (?:the )?subject|message(?:\s+text)?)\s+["']([^"']+)["']/i);
@@ -887,7 +1054,7 @@ module.exports = async function preflightAgents(state) {
         if (!_allowed) {
           const _why = _hit.then?.reason || `rule ${_hit.id}`;
           return {
-            ...state, taskFacts,
+            ...state, taskFacts, ...(_gitRefs ? { _gitRefs } : {}),
             planError: `Blocked by guardian rule ${_hit.id}: ${_why}`,
             preflightDone: true,
             preflightResult: { agents: [] },
@@ -909,6 +1076,7 @@ module.exports = async function preflightAgents(state) {
     return {
       ...state,
       taskFacts,
+      ...(_gitRefs ? { _gitRefs } : {}),
       preflightDone: true,
       preflightResult: {
         cliPreflightNote: '',
@@ -1075,6 +1243,7 @@ module.exports = async function preflightAgents(state) {
     return {
       ...state,
       taskFacts,
+      ...(_gitRefs ? { _gitRefs } : {}),
       preflightDone: true,
       _needsPlan: {
         reason,
@@ -1264,6 +1433,7 @@ module.exports = async function preflightAgents(state) {
   return {
     ...state,
     taskFacts,
+    ...(_gitRefs ? { _gitRefs } : {}),
     preflightResult,
     preflightRouteChoice: {},
     preflightDone: true,

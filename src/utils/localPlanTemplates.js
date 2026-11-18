@@ -525,33 +525,15 @@ const TEMPLATES = [
         if (e.when && !e.when.test(m)) return null;
         return e;
       })();
-      if (_pm) {
-        return [
-          { skill: 'url.first.agent', stepType: 'navigate',
-            args: { task: m, agentId: `${name}.agent`, service: name },
-            description: `Navigate to ${name}` },
-          { skill: 'form.fill.agent', stepType: 'on-page-action',
-            args: { task: m, agentId: `${name}.agent`, submit: true },
-            description: `${name}: fill and submit — ${String(m).slice(0, 60)}` },
-          { skill: 'turn.loop.agent', stepType: 'verify',
-            args: { mode: 'verify', goal: `Confirm the submission completed on ${name}` },
-            description: 'Verify the submission completed' },
-          { skill: 'synthesize', stepType: 'verify',
-            args: { prompt: 'Report whether the requested action completed, in one short sentence.' },
-            description: 'Report outcome' },
-        ];
-      }
-      // Atomic browser agents: url.first resolves the deep link and navigates
-      // (e.g. gmail #inbox?compose=new), then dom.act routes the on-page work
-      // to the right executor (tab.map for compose forms). Splitting nav from
-      // action keeps each step deterministic — no internal sub-planning.
+      // DORMANT-DRIVER lockdown (plan-skills-core §1): url.first/dom.act/
+      // form.fill/turn.loop are internal executor vocabulary — a plan step
+      // must never emit them. Interactive UI on a named service = ONE
+      // screen.task.agent step carrying the verbatim goal; screen.task
+      // navigates (deep links, prefilled forms), interacts, verifies.
       return [
-        { skill: 'url.first.agent', stepType: 'navigate',
-          args: { task: m, agentId: `${name}.agent`, service: name },
-          description: `Navigate to ${name}` },
-        { skill: 'dom.act', stepType: 'on-page-action',
-          args: { task: m, agentId: `${name}.agent` },
-          description: `${name}: ${String(m).slice(0, 60)}` },
+        { skill: 'screen.task.agent',
+          args: { prompt: m },
+          description: `Drive ${name}: ${String(m).slice(0, 60)}` },
         { skill: 'synthesize', stepType: 'verify',
           args: { prompt: 'Report whether the requested action completed, in one short sentence.' },
           description: 'Report outcome' },

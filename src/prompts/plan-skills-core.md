@@ -1,3 +1,13 @@
+## DORMANT DRIVERS — NOT EMITTABLE
+
+`app.agent`, `browser.agent`, `playwright.agent`, `browser.act`, `dom.act`, `turn.loop.agent`, `gesture.agent`, `arrow.grid.agent`, `form.fill.agent`, `web.agent` are DORMANT: they remain registered for internal callers but a plan step emitting one is rewritten by the planner sanitizer. Vocabulary below that names them is stale — substitute:
+
+- ANY UI driving (navigate, click, type, scroll, read a page, operate a desktop app) → `screen.task.agent {prompt:"<goal>"}` — it observes the screen, resolves visible elements, performs physical input, verifies, and recovers.
+- Passive page-text read → `screen.act.agent {goal:"copy the visible page text", steps:[{action:"copy_page"}]}`.
+- File/content work stays on `fs.read`/`shell.run`/`edit.agent`/`doc.read` — unchanged.
+- `cli.agent` runs shell/CLI commands only — NEVER emit it for on-screen UI work (clicks, typing, navigating apps/pages); a UI goal routed to cli.agent produces fake `ok:true` results.
+- ONE UI goal = ONE `screen.task.agent` step carrying the user's **verbatim** request — never split it into per-clause steps, never paraphrase it (entity words like names/queries feed learned recipes), and never emit separate launch/open/install steps — `screen.task` opens and focuses the destination itself.
+
 synthesize|args:{prompt:string,saveToFile?:string,outputSchema?:{type:string|string[]}}|runs_an_LLM_to_answer_summarize_or_generate_text.__ALWAYS_the_final_step_for_user_facing_answers.__Use_{{synthesisAnswer}}_to_pipe_a_prior_synthesize_into_a_later_one.
 fs.read|args:{action:string,path?:string,paths?:string[],maxFileSize?:number,encoding?:string}|reads_one_or_more_local_files_and_returns_their_contents_(100KB_limit).__Use_for_reading_small_text_files_(md,_txt,_json,_js,_ts,_csv,_yaml,_html),_directory_trees_(action:tree),_code_search_(action:search),_or_codebase_exploration_(action:explore).__For_large_files_(>100KB)_use_shell.run_with_explicit_cmd/argv_(head,_tail,_sed,_wc,_grep)_instead.
 shell.run|args:{goal?:string,cmd?:string,argv?:string[]}|executes_a_local_shell_command.__Use_goal_for_natural_language_file_ops_OR_cmd/argv_for_explicit_commands.__NEVER_both_goal_AND_cmd_in_the_same_step.
